@@ -31,6 +31,34 @@ if os.name == "nt":
         # Another instance is running — focus its window and exit.
         import ctypes.wintypes as _wt
         _WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, _wt.HWND, _wt.LPARAM)
+
+        def _window_belongs_to_this_exe(hwnd) -> bool:
+            pid = _wt.DWORD()
+            try:
+                ctypes.windll.user32.GetWindowThreadProcessId(
+                    hwnd, ctypes.byref(pid))
+                if not pid.value:
+                    return False
+                _k32 = ctypes.windll.kernel32
+                _k32.OpenProcess.restype = _wt.HANDLE
+                h_proc = _k32.OpenProcess(
+                    0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+                if not h_proc:
+                    return False
+                try:
+                    size = _wt.DWORD(32768)
+                    buf = ctypes.create_unicode_buffer(size.value)
+                    ok = _k32.QueryFullProcessImageNameW(
+                        h_proc, 0, buf, ctypes.byref(size))
+                    if not ok:
+                        return False
+                    return (Path(buf.value).name.lower()
+                            == Path(sys.executable).name.lower())
+                finally:
+                    _k32.CloseHandle(h_proc)
+            except Exception:
+                return False
+
         def _find_and_focus(hwnd, _):
             _n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
             if _n > 0:
@@ -43,7 +71,8 @@ if os.name == "nt":
                 # second-instance launch silently exited without
                 # focusing the existing window (audit: main.py:28-47).
                 _tv = _buf.value
-                if "YTArchiver" in _tv or "YT Archiver" in _tv:
+                if _tv in {"YTArchiver", "YT Archiver"} \
+                        and _window_belongs_to_this_exe(hwnd):
                     ctypes.windll.user32.ShowWindow(hwnd, 9) # SW_RESTORE
                     ctypes.windll.user32.SetForegroundWindow(hwnd)
                     return False
@@ -209,6 +238,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         self._chan_art_inflight: set = set()
         self._chan_art_lock = threading.Lock()
         self._pending_metadata_choices: dict = {}
+        self._pending_metadata_choices_lock = threading.Lock()
         self._redwnl_samples: dict = {}
         # Lock for the session-download counter + tray badge update
         # below — read-modify-write under contention from multiple log
@@ -438,6 +468,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             _log.debug("swallowed: %s", e)
 
     def set_window(self, w):
+        """Attach the pywebview window and route backend log output to it."""
         self._window = w
         self._log_stream.set_window(w)
         # NOTE: the "YTArchiver <ver> started" banner is emitted at the TOP
@@ -537,6 +568,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             _log.debug("swallowed: %s", e)
 
     def attach_tray(self, tray):
+        """Attach the optional TrayController after pywebview is created."""
         self._tray = tray
 
     def _reload_config(self):
@@ -730,6 +762,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
 
         # ── Stage 2: Disk walk (staleness-gated) ───────────────────────
         def _stage2_disk_walk():
+            """Refresh disk-scan cache after Stage 1 makes the UI usable."""
             try:
                 from backend.archive_scan import (
                     archive_totals,
@@ -835,6 +868,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # before a new file's register_video invalidates it — the
         # next click just does a fresh DB query. Safe.
         def _stage3_sweep_and_preload():
+            """Run archive sweep and Browse preload after disk state is known."""
             output_dir = (cfg.get("output_dir") or "").strip()
             sweep_result = {"registered": 0, "ingested": 0}
 
@@ -987,9 +1021,19 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # Sequential stages on one background thread — each milestone
         # fires the moment its stage finishes.
         def _run_stages():
+            """Run slow startup stages in order on the boot worker thread."""
             _stage2_disk_walk()
             _stage3_sweep_and_preload()
         threading.Thread(target=_run_stages, daemon=True).start()
+
+
+def _configured_whisper_model_for_restore(valid_models):
+    try:
+        configured = ((load_config() or {}).get("whisper_model") or "").strip()
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
+        configured = ""
+    return configured if configured in valid_models else "small"
 
 
 def main():
@@ -1037,9 +1081,12 @@ def main():
                 _co = _ch.get("output_dir") or ""
                 if _co:
                     _roots.append(_co)
-            # Thumbs + channel-art cache paths live under ROOT/web,
-            # ROOT/thumbs, ROOT/channel_art per the backend cache modules.
-            _roots.extend([str(ROOT), str(WEB)])
+            # Serve only explicit app asset dirs, not the whole app root.
+            _roots.extend([
+                str(WEB),
+                str(ROOT / "thumbs"),
+                str(ROOT / "channel_art"),
+            ])
             _fs.set_allowed_roots(_roots)
         except Exception as _re:
             print(f"[fileserver] could not set allowed roots: {_re}")
@@ -1057,13 +1104,7 @@ def main():
         from backend import cmd_server as _cmd
         def _cmd_log(msg): print(msg)
         def _handle_ping(_body):
-            depth = 0
-            try:
-                q = api._queues.to_ui_payload() or {}
-                depth = len(q.get("gpu", []))
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-            return {"version": APP_VERSION, "gpu_depth": depth}
+            return {"alive": True}
         def _handle_gpu_status(_body):
             try:
                 q = api._queues.to_ui_payload() or {}
@@ -1125,19 +1166,25 @@ def main():
             if not filepath or not os.path.isfile(filepath):
                 return {"ok": False,
                         "error": f"Video not found on disk (id={video_id}, ch={channel})"}
+            filepath = os.path.normpath(filepath)
+            try:
+                from backend.utils import is_within_managed_roots
+                if not is_within_managed_roots(filepath):
+                    return {"ok": False,
+                            "error": "Refusing to retranscribe a file outside the archive."}
+            except Exception as e:
+                _log.warning("cmd retranscribe containment check failed: %s", e)
+                return {"ok": False,
+                        "error": "Could not verify archive containment for video path."}
             # Model swap BEFORE enqueue so this job runs under the
-            # requested model. Capture the prior model so we can
-            # restore it after this job completes — without this, an
-            # ArchivePlayer-driven retranscribe with model="medium"
-            # would persistently leave the worker on medium, and the
-            # next user-initiated retranscribe from the UI would run
-            # under the wrong model (audit: main.py H20).
+            # requested model. Restore to the configured preference,
+            # not the current mutable runtime model; overlapping
+            # one-off requests can otherwise restore each other's
+            # temporary model.
             _restore_model = None
             if model:
-                try:
-                    _restore_model = api._transcribe.current_model()
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                _restore_model = _configured_whisper_model_for_restore(
+                    _valid_models)
                 try:
                     api._transcribe.swap_model(model)
                 except Exception as e:
@@ -1179,7 +1226,6 @@ def main():
         _cmd.register_handler("get", "/cmd/ping", _handle_ping)
         _cmd.register_handler("get", "/cmd/gpu-status", _handle_gpu_status)
         _cmd.register_handler("post", "/cmd/retranscribe", _handle_retranscribe)
-        _cmd.register_handler("post", "/cmd/ping", _handle_ping)
         _cmd.start_server(APP_VERSION, on_log=_cmd_log)
     except Exception as _ce:
         print(f"[cmd] failed to start: {_ce}")
@@ -1266,12 +1312,16 @@ def main():
             _ws_timer[0].start()
     # Register window-event handlers to save state on resize/move/close.
     def _on_resized(w, h):
+        """Persist the latest pywebview window size after resize events."""
         _ws_schedule({"width": int(w), "height": int(h)})
     def _on_moved(x, y):
+        """Persist the latest pywebview window position after move events."""
         _ws_schedule({"x": int(x), "y": int(y)})
     def _on_maximized():
+        """Persist that the window entered maximized state."""
         _ws_schedule({"maximized": True})
     def _on_restored():
+        """Persist that the window left maximized state."""
         _ws_schedule({"maximized": False})
     # X-button behavior is config-driven (.txt close-to-tray request):
     #   "quit"  — shut down immediately (legacy behavior)
@@ -1285,6 +1335,7 @@ def main():
     # Expose to api so the JS-side modal can drive the decision back.
     api._close_state = _truly_quit
     def _on_closing():
+        """Apply close behavior: quit, hide to tray, or ask via JS modal."""
         # _truly_quit flag set by the tray "Quit" menu or by the in-app
         # confirm dialog — let it through unconditionally.
         if _truly_quit.get("flag"):
@@ -1385,6 +1436,8 @@ def main():
             except Exception as e: _log.debug("swallowed: %s", e)
             # 2. Save window geometry one last time.
             try: winstate.save_window_state({})
+            except Exception as e: _log.debug("swallowed: %s", e)
+            try: net_backend.stop_monitor(timeout=1.0)
             except Exception as e: _log.debug("swallowed: %s", e)
             # 3. Stop the tray thread — otherwise pystray keeps the process
             # alive after the window destroys. This was the primary ghost
@@ -1502,6 +1555,7 @@ def main():
 
     # Start tray icon (optional — silently no-ops if pystray is missing)
     def _tray_show():
+        """Restore and foreground the pywebview window from the tray menu."""
         try:
             window.show()
             window.restore()
@@ -1523,16 +1577,19 @@ def main():
             except Exception as e:
                 _log.debug("swallowed: %s", e)
     def _tray_hide():
+        """Hide the pywebview window from the tray menu."""
         try:
             window.hide()
         except Exception as e:
             _log.debug("swallowed: %s", e)
     def _tray_sync():
+        """Start a full sync pass from the tray menu."""
         try:
             api.sync_start_all()
         except Exception as e:
             _log.debug("swallowed: %s", e)
     def _tray_quit():
+        """Request a real app shutdown from the tray menu."""
         # Set the truly-quit flag first so the closing handler skips
         # the modal and proceeds with shutdown.
         _truly_quit["flag"] = True

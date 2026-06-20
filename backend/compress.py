@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -86,13 +87,21 @@ def find_ffmpeg() -> str | None:
 # 500ms each). With the cache, second/third/fourth probe of the same
 # file is instant. Cache key includes mtime so a file modified between
 # probes invalidates correctly.
-_probe_cache: dict[tuple[str, float], tuple[float, str]] = {}
+_probe_cache: OrderedDict[tuple[str, float], tuple[float, str]] = OrderedDict()
 _probe_cache_lock = threading.Lock()
 # LRU bound — old code never evicted, so the cache grew unbounded
 # over a long session and stale entries for replaced files leaked
 # memory (audit: compress.py:88-91). Eviction policy: when the cap
 # is hit on insert, drop oldest insertion-order entry.
 _PROBE_CACHE_MAX = 512
+
+
+def _probe_cache_put(key: tuple[str, float],
+                     value: tuple[float, str]) -> None:
+    _probe_cache[key] = value
+    _probe_cache.move_to_end(key)
+    while len(_probe_cache) > _PROBE_CACHE_MAX:
+        _probe_cache.popitem(last=False)
 
 
 def _probe_video_info(filepath: str, ffmpeg: str) -> tuple[float, str]:
@@ -110,6 +119,7 @@ def _probe_video_info(filepath: str, ffmpeg: str) -> tuple[float, str]:
     with _probe_cache_lock:
         _cached = _probe_cache.get(_key)
         if _cached is not None:
+            _probe_cache.move_to_end(_key)
             return _cached
     try:
         proc = subprocess.run(
@@ -117,25 +127,24 @@ def _probe_video_info(filepath: str, ffmpeg: str) -> tuple[float, str]:
             capture_output=True, text=True, timeout=15,
             startupinfo=_startupinfo,
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError) as e:
+        _log.debug("ffmpeg duration/codec probe failed for %s: %s",
+                   filepath, e)
         result = (0.0, "")
         with _probe_cache_lock:
-            # LRU eviction: drop oldest entry when at cap.
             try:
-                if _key in _probe_cache:
-                    del _probe_cache[_key]
-                while len(_probe_cache) >= _PROBE_CACHE_MAX:
-                    _oldest_key = next(iter(_probe_cache))
-                    del _probe_cache[_oldest_key]
+                _probe_cache_put(_key, result)
             except Exception:
                 pass
-            _probe_cache[_key] = result
         return result
     stderr = proc.stderr or ""
     dur = 0.0
     m = _FFPROBE_DURATION_RE.search(stderr)
     if m:
         dur = float(int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)))
+    elif stderr.strip():
+        _log.debug("ffmpeg duration probe found no parseable Duration line "
+                   "for %s: %r", filepath, stderr[:500])
     codec = ""
     import re as _re
     m2 = _re.search(r"Video:\s*([a-z0-9]+)", stderr, _re.IGNORECASE)
@@ -144,14 +153,9 @@ def _probe_video_info(filepath: str, ffmpeg: str) -> tuple[float, str]:
     result = (dur, codec)
     with _probe_cache_lock:
         try:
-            if _key in _probe_cache:
-                del _probe_cache[_key]
-            while len(_probe_cache) >= _PROBE_CACHE_MAX:
-                _oldest_key = next(iter(_probe_cache))
-                del _probe_cache[_oldest_key]
+            _probe_cache_put(_key, result)
         except Exception:
             pass
-        _probe_cache[_key] = result
     return result
 
 
@@ -169,6 +173,24 @@ def get_video_codec(filepath: str, ffmpeg: str) -> str:
     driver hiccup.
     Patch D: delegates to the shared _probe_video_info cache."""
     return _probe_video_info(filepath, ffmpeg)[1]
+
+
+def _preserve_compressed_output(input_path: str, temp_path: str) -> str:
+    """Rename an untrusted completed encode to a visible review filename."""
+    base, ext = os.path.splitext(input_path)
+    for idx in range(100):
+        suffix = ".compressed" if idx == 0 else f".compressed-{idx + 1}"
+        candidate = base + suffix + ext
+        if os.path.exists(candidate):
+            continue
+        try:
+            os.rename(temp_path, candidate)
+            return candidate
+        except OSError as e:
+            _log.debug("could not rename compressed temp %s to %s: %s",
+                       temp_path, candidate, e)
+            break
+    return temp_path
 
 
 def compress_video(input_path: str, stream: LogStreamer,
@@ -510,6 +532,16 @@ def compress_video(input_path: str, stream: LogStreamer,
     # could still be a 2-minute stub of a 60-minute video. Without this
     # guard the "smaller than orig" check below promotes it, silently
     # destroying the tail.
+    if dur <= 0:
+        kept_path = _preserve_compressed_output(input_path, temp_path)
+        stream.emit_error(
+            "Could not verify the original video's duration, so the "
+            "original was not replaced. The compressed output was kept "
+            f"for review: {kept_path}")
+        return {"ok": False, "error": "source_duration_unknown",
+                "reason": "source_duration_unknown",
+                "kept_path": kept_path}
+
     if dur > 0:
         new_dur = get_video_duration(temp_path, ffmpeg)
         stream.emit([
@@ -542,15 +574,17 @@ def compress_video(input_path: str, stream: LogStreamer,
         [f"codec check: output codec = {new_codec or 'unknown'} "
          f"(expected av1)\n", ["dim"]],
     ])
-    if new_codec and new_codec != "av1":
+    if new_codec != "av1":
+        actual_codec = new_codec or "unknown"
+        reason = "codec_unverified" if not new_codec else "codec_mismatch"
         stream.emit_error(
-            f"Compressed output is {new_codec}, not av1 "
+            f"Compressed output is {actual_codec}, not av1 "
             f"(NVENC silent fallback?) — leaving original intact.")
         try: os.remove(temp_path)
         except OSError: pass
-        return {"ok": False, "error": "codec_mismatch",
-                "reason": "codec_mismatch",
-                "expected": "av1", "actual": new_codec}
+        return {"ok": False, "error": reason,
+                "reason": reason,
+                "expected": "av1", "actual": actual_codec}
 
     # Safety: if output is larger than input, skip the replace
     if new_size >= orig_size:

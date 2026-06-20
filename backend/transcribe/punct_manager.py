@@ -184,19 +184,22 @@ class PunctuationManager:
         # Bug [43]: reset timeout flag at the start of each call so the
         # caller can read it after this call returns.
         self.last_was_timeout = False
-        if self._proc is None or self._proc.poll() is not None:
-            if not self._start():
-                return text
         try:
             req = json.dumps({"text": text}) + "\n"
             with self._lock:
+                if self._proc is None or self._proc.poll() is not None:
+                    if not self._start():
+                        return text
+                if self._proc is None or self._proc.stdin is None:
+                    return text
                 self._proc.stdin.write(req)
                 self._proc.stdin.flush()
                 # Read in a helper thread so we can bound the wait.
                 _result: dict[str, Any] = {"line": None, "err": None}
                 def _reader():
                     try:
-                        _result["line"] = self._proc.stdout.readline()
+                        if self._proc is not None and self._proc.stdout is not None:
+                            _result["line"] = self._proc.stdout.readline()
                     except Exception as _re:
                         _result["err"] = _re
                 _t = threading.Thread(target=_reader, daemon=True)

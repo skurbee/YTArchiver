@@ -29,6 +29,8 @@
   // outside closes. Escape closes. No backdrop dim — the popover is a
   // dropdown, not a modal.
   function initQueueModals() {
+    if (window._queueModalsInited) return;
+    window._queueModalsInited = true;
     const pairs = [
       ["btn-sync-tasks", "popover-sync-tasks"],
       ["btn-gpu-tasks", "popover-gpu-tasks"],

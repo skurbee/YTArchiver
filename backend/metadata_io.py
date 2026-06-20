@@ -167,7 +167,8 @@ def _year_month_from_path(file_path: str) -> tuple[int | None, int | None]:
         return None, None
 
 
-def _read_metadata_jsonl(jsonl_path: str) -> dict[str, dict[str, Any]]:
+def _read_metadata_jsonl(jsonl_path: str, *, strict: bool = False
+                         ) -> dict[str, dict[str, Any]]:
     """Load aggregated metadata JSONL into {video_id: entry}.
     Matches YTArchiver.py:26560.
 
@@ -203,15 +204,14 @@ def _read_metadata_jsonl(jsonl_path: str) -> dict[str, dict[str, Any]]:
                         if _prev is None:
                             existing[vid] = entry
                         else:
-                            _new_fa = str(entry.get("fetched_at") or "")
-                            _prev_fa = str(_prev.get("fetched_at") or "")
-                            # ISO-8601 timestamps sort lexicographically.
-                            if _new_fa >= _prev_fa:
+                            if _metadata_entry_is_newer(entry, _prev):
                                 existing[vid] = entry
                 except json.JSONDecodeError:
                     _bad_lines += 1
                     continue
     except Exception as e:
+        if strict:
+            raise
         _log.debug("swallowed: %s", e)
     if _bad_lines > 0:
         try:
@@ -222,6 +222,34 @@ def _read_metadata_jsonl(jsonl_path: str) -> dict[str, dict[str, Any]]:
         except Exception as e:
             _log.debug("swallowed: %s", e)
     return existing
+
+
+def _fetched_at_epoch(value: Any) -> float | None:
+    """Parse old/new fetched_at strings into comparable epoch seconds."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        return dt.timestamp()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _metadata_entry_is_newer(candidate: dict[str, Any],
+                             previous: dict[str, Any]) -> bool:
+    new_ts = _fetched_at_epoch(candidate.get("fetched_at"))
+    prev_ts = _fetched_at_epoch(previous.get("fetched_at"))
+    if new_ts is not None and prev_ts is not None:
+        return new_ts >= prev_ts
+    if new_ts is not None:
+        return True
+    if prev_ts is not None:
+        return False
+    return str(candidate.get("fetched_at") or "") >= str(
+        previous.get("fetched_at") or "")
 
 
 # Per-jsonl-path serializer. Two threads (sync writer + bulk metadata
@@ -243,7 +271,26 @@ def _lock_for(path: str) -> threading.RLock:
         if lk is None:
             lk = threading.RLock()
             _write_locks[key] = lk
-        return lk
+    return lk
+
+
+def _fsync_parent_dir(path: str) -> None:
+    if os.name == "nt":
+        return
+    parent = os.path.dirname(path) or "."
+    flags = getattr(os, "O_RDONLY", 0) | getattr(os, "O_DIRECTORY", 0)
+    fd = None
+    try:
+        fd = os.open(parent, flags)
+        os.fsync(fd)
+    except OSError as e:
+        _log.debug("parent directory fsync failed for %s: %s", path, e)
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _write_metadata_jsonl(jsonl_path: str,
@@ -273,6 +320,7 @@ def _write_metadata_jsonl(jsonl_path: str,
                 except OSError:
                     pass
             os.replace(tmp_path, jsonl_path)
+            _fsync_parent_dir(jsonl_path)
         except Exception:
             try: os.remove(tmp_path)
             except OSError: pass

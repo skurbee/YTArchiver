@@ -28,9 +28,8 @@
       <!-- feature F7: bulk-actions bar. Appears only when ≥2 Subs rows
            are selected (Ctrl/Shift-click). `_updateSubsBulkBar()` in
            app.js toggles visibility + updates the count label. -->
-      <div class="subs-bulk-bar" id="subs-bulk-bar" hidden
-           style="display:flex;gap:6px;align-items:center;padding:4px 12px;background:rgba(96,160,255,0.08);border-bottom:1px solid #2a3140;">
-        <span class="status-text" id="subs-bulk-count" style="flex:1;">
+      <div class="subs-bulk-bar" id="subs-bulk-bar" hidden>
+        <span class="status-text subs-bulk-count" id="subs-bulk-count">
           0 channels selected
         </span>
         <button class="btn btn-ghost btn-thin" id="btn-bulk-resolution"
@@ -41,9 +40,8 @@
                 title="Queue metadata refresh for all selected">Queue metadata</button>
         <button class="btn btn-ghost btn-thin" id="btn-bulk-clear"
                 title="Clear selection">Clear</button>
-        <button class="btn btn-ghost btn-thin" id="btn-bulk-delete"
-                title="Delete all selected channels"
-                style="color:#e78a8a;">Delete&hellip;</button>
+        <button class="btn btn-ghost btn-thin btn-bulk-delete" id="btn-bulk-delete"
+                title="Delete all selected channels">Delete&hellip;</button>
       </div>
 
       <!-- Channel table -->
@@ -305,4 +303,3 @@
       <div class="main-log mini-log" id="subs-mini-log" tabindex="-1"></div>
     </div>
   </div>
-

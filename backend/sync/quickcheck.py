@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime as _dt
 from datetime import timedelta as _td
@@ -28,7 +29,8 @@ from typing import Any
 
 from .. import utils as _utils
 from ..log import get_logger
-from ..ytarchiver_config import load_config
+from ..process_runner import PROCESS_REGISTRY
+from ..ytarchiver_config import config_transaction, load_config
 from .ytdlp_proc import _ensure_videos_tab, _find_cookie_source, find_yt_dlp
 
 _log = get_logger(__name__)
@@ -37,6 +39,53 @@ _log = get_logger(__name__)
 # Bootstrap batch-cooldown gating.
 _BATCH_LIMIT = 100000           # YTArchiver.py:17503
 _BATCH_COOLDOWN_HOURS = 72      # YTArchiver.py:17504
+_QUICKCHECK_BAD_THRESHOLD = 2
+_QUICKCHECK_COOLDOWN_SEC = 3600.0
+_quickcheck_bad: dict[str, dict[str, float]] = {}
+_quickcheck_bad_lock = threading.Lock()
+
+
+def _quickcheck_key(ch_url: str) -> str:
+    return _ensure_videos_tab(ch_url or "").strip().lower()
+
+
+def _quickcheck_skip_state(ch_url: str) -> dict[str, Any] | None:
+    key = _quickcheck_key(ch_url)
+    now = time.time()
+    with _quickcheck_bad_lock:
+        state = _quickcheck_bad.get(key)
+        if not state:
+            return None
+        until = float(state.get("until") or 0)
+        if until > now:
+            return {
+                "ok": True,
+                "has_new": True,
+                "checked": 0,
+                "fresh_ids": [],
+                "quickcheck_skipped": True,
+                "cooldown_until": until,
+            }
+        if until:
+            _quickcheck_bad.pop(key, None)
+    return None
+
+
+def _record_quickcheck_bad(ch_url: str, reason: str) -> None:
+    key = _quickcheck_key(ch_url)
+    now = time.time()
+    with _quickcheck_bad_lock:
+        state = _quickcheck_bad.setdefault(key, {"count": 0.0, "until": 0.0})
+        state["count"] = float(state.get("count") or 0) + 1.0
+        state["last"] = now
+        state["reason"] = reason
+        if state["count"] >= _QUICKCHECK_BAD_THRESHOLD:
+            state["until"] = now + _QUICKCHECK_COOLDOWN_SEC
+
+
+def _clear_quickcheck_bad(ch_url: str) -> None:
+    with _quickcheck_bad_lock:
+        _quickcheck_bad.pop(_quickcheck_key(ch_url), None)
 
 
 def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
@@ -69,6 +118,22 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
     except Exception as e:
         return {"ok": False, "error": str(e)}
     try:
+        PROCESS_REGISTRY.register(proc)
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
+    timer = None
+    timeout_hit = {"hit": False}
+    try:
+        def _kill_on_timeout() -> None:
+            timeout_hit["hit"] = True
+            try:
+                proc.kill()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+
+        timer = threading.Timer(float(timeout_sec), _kill_on_timeout)
+        timer.daemon = True
+        timer.start()
         deadline = time.time() + float(timeout_sec)
         for line in proc.stdout:
             if time.time() > deadline:
@@ -102,6 +167,11 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
             elif status == "is_upcoming":
                 upcoming += 1
     finally:
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         # Bound the post-kill wait so a child refusing to die can't
         # leak a Windows handle until GC (audit: sync/quickcheck.py:88).
         try: proc.wait(timeout=5)
@@ -110,7 +180,15 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
             except Exception as e: _log.debug("swallowed: %s", e)
             try: proc.wait(timeout=5)
             except Exception as e: _log.debug("swallowed: %s", e)
-    return {"ok": True, "total": total, "lives": lives, "upcoming": upcoming}
+        try:
+            PROCESS_REGISTRY.unregister(proc)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+    result = {"ok": True, "total": total, "lives": lives,
+              "upcoming": upcoming}
+    if timeout_hit.get("hit"):
+        result["timed_out"] = True
+    return result
 
 
 def quick_check_new_uploads(ch_url: str, archived_ids,
@@ -130,6 +208,9 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
     yt_dlp = find_yt_dlp()
     if not yt_dlp or not ch_url:
         return {"ok": False, "error": "yt-dlp missing or no URL"}
+    skipped = _quickcheck_skip_state(ch_url)
+    if skipped is not None:
+        return skipped
     qc_url = _ensure_videos_tab(ch_url)
     cmd = [
         yt_dlp,
@@ -163,6 +244,7 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
         # "no result", which the OLD-behavior empty path treats as
         # "might have new" so the sync pipeline does a full walk
         # rather than skipping (audit: sync/quickcheck.py:129).
+        _record_quickcheck_bad(ch_url, "timeout")
         return {"ok": True, "has_new": True,
                 "checked": 0, "fresh_ids": [], "timed_out": True}
     except Exception as e:
@@ -177,8 +259,10 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
     # Empty result = treat as "might have new" per OLD's behavior
     # (line 17980-17981: `if not ids: return True`).
     if not checked:
+        _record_quickcheck_bad(ch_url, "empty")
         return {"ok": True, "has_new": True,
-                "checked": 0, "fresh_ids": []}
+                "checked": 0, "fresh_ids": [], "empty_probe": True}
+    _clear_quickcheck_bad(ch_url)
     return {"ok": True, "has_new": bool(fresh),
             "checked": len(checked), "fresh_ids": fresh}
 
@@ -234,26 +318,23 @@ def _should_batch_limit(ch: dict[str, Any], ch_total: int) -> bool:
 def set_batch_cooldown(ch_url: str) -> None:
     """Apply a 72h cooldown to a channel (called after a bootstrap run)."""
     from .. import subs as _subs
-    cfg = load_config()
     # Normalize once for the comparison key so trailing slash / www / scheme
     # variants between the live URL and the config-stored URL still match.
     try:
         target = _subs.normalize_channel_url(ch_url)
     except Exception:
         target = ch_url
-    changed = False
-    for cfg_ch in cfg.get("channels", []):
-        cfg_url = cfg_ch.get("url", "")
-        try:
-            cfg_norm = _subs.normalize_channel_url(cfg_url)
-        except Exception:
-            cfg_norm = cfg_url
-        if cfg_norm == target or cfg_url == ch_url:
-            cfg_ch["init_batch_after"] = (_dt.now() + _td(hours=_BATCH_COOLDOWN_HOURS)).isoformat()
-            changed = True
-    if changed:
-        try:
-            from ..ytarchiver_config import save_config as _sc
-            _sc(cfg)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+    try:
+        with config_transaction() as cfg:
+            for cfg_ch in cfg.get("channels", []):
+                cfg_url = cfg_ch.get("url", "")
+                try:
+                    cfg_norm = _subs.normalize_channel_url(cfg_url)
+                except Exception:
+                    cfg_norm = cfg_url
+                if cfg_norm == target or cfg_url == ch_url:
+                    cfg_ch["init_batch_after"] = (
+                        _dt.now() + _td(hours=_BATCH_COOLDOWN_HOURS)
+                    ).isoformat()
+    except Exception as e:
+        _log.debug("set_batch_cooldown config update failed: %s", e)

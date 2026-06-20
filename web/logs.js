@@ -196,11 +196,13 @@
       el.textContent = text;
       // Terminal "complete" lines fade after 45s. Active progress
       // ("Preloading …", "Scanning …") stays visible.
-      if (/\bcomplete\b/i.test(text)) {
+      if (/(?:^|\b)(?:complete|done)(?:[:.!-]|\s*$)/i.test(text)) {
         _indicatorTimers[slot] = setTimeout(() => {
-          if (!el) return;
-          el.hidden = true;
-          el.textContent = "";
+          const current = document.getElementById(
+            "browse-preload-slot-" + slot);
+          if (!current) return;
+          current.hidden = true;
+          current.textContent = "";
           _indicatorTimers[slot] = null;
         }, 45000);
       }
@@ -320,30 +322,30 @@
   // the checkmark regex drops the leading boundary and relies on the
   // label's `\b` on the right side to bound the match.
   const _HIST_HILITE = [
-    [/\b([1-9]\d*)\s+(downloaded|new)\b/gi, "t-hist_green"],
-    [/(\u2713)\s+(downloaded|new)\b/gi, "t-hist_green"],
-    [/\b([1-9]\d*)\s+(transcribed|captions?)\b/gi, "t-hist_blue"],
-    [/(\u2713)\s+(transcribed|captions?)\b/gi, "t-hist_blue"],
-    [/\b([1-9]\d*)\s+(replaced|remade)\b/gi, "t-hist_redwnl"],
-    [/(\u2713)\s+(replaced|remade)\b/gi, "t-hist_redwnl"],
-    [/\b([1-9]\d*)\s+(compressed)\b/gi, "t-hist_compress"],
-    [/(\u2713)\s+(compressed)\b/gi, "t-hist_compress"],
-    [/\b([1-9]\d*)\s+(moved|reorged)\b/gi, "t-hist_reorg"],
-    [/(\u2713)\s+(moved|reorged)\b/gi, "t-hist_reorg"],
+    [() => /\b([1-9]\d*)\s+(downloaded|new)\b/gi, "t-hist_green"],
+    [() => /(\u2713)\s+(downloaded|new)\b/gi, "t-hist_green"],
+    [() => /\b([1-9]\d*)\s+(transcribed|captions?)\b/gi, "t-hist_blue"],
+    [() => /(\u2713)\s+(transcribed|captions?)\b/gi, "t-hist_blue"],
+    [() => /\b([1-9]\d*)\s+(replaced|remade)\b/gi, "t-hist_redwnl"],
+    [() => /(\u2713)\s+(replaced|remade)\b/gi, "t-hist_redwnl"],
+    [() => /\b([1-9]\d*)\s+(compressed)\b/gi, "t-hist_compress"],
+    [() => /(\u2713)\s+(compressed)\b/gi, "t-hist_compress"],
+    [() => /\b([1-9]\d*)\s+(moved|reorged)\b/gi, "t-hist_reorg"],
+    [() => /(\u2713)\s+(moved|reorged)\b/gi, "t-hist_reorg"],
     // Optional-word slot (?:\w+\s+)? catches "N IDs backfilled" or
     // "N comments refreshed" — the in-use phrase forms where a noun
     // sits between the count and the verb. Without this, those
     // phrases matched nothing and rendered in the default color
     // instead of pink.
-    [/\b([1-9]\d*)\s+(?:\w+\s+)?(fetched|refreshed|metadata|backfilled)\b/gi, "t-hist_pink"],
-    [/(\u2713)\s+(?:\w+\s+)?(fetched|refreshed|metadata|backfilled)\b/gi, "t-hist_pink"],
-    [/\b([1-9]\d*)\s+skipped\b/gi, "t-hist_skipped"],
-    [/\b([1-9]\d*)\s+errors?\b/gi, "t-hist_error"],
+    [() => /\b([1-9]\d*)\s+(?:\w+\s+)?(fetched|refreshed|metadata|backfilled)\b/gi, "t-hist_pink"],
+    [() => /(\u2713)\s+(?:\w+\s+)?(fetched|refreshed|metadata|backfilled)\b/gi, "t-hist_pink"],
+    [() => /\b([1-9]\d*)\s+skipped\b/gi, "t-hist_skipped"],
+    [() => /\b([1-9]\d*)\s+errors?\b/gi, "t-hist_error"],
     // Warning-but-not-error states: "N unresolved" (ID backfill
     // couldn't match) and "N ambiguous" (title-match hit multiple
     // candidates). Amber/orange matches the "heads up, look at
     // this but it's not broken" semantic the user wanted.
-    [/\b([1-9]\d*)\s+(unresolved|ambiguous)\b/gi, "t-hist_skipped"],
+    [() => /\b([1-9]\d*)\s+(unresolved|ambiguous)\b/gi, "t-hist_skipped"],
   ];
 
   function _buildHistCell(text, extra, colored, tagCls) {
@@ -355,24 +357,17 @@
     if (baseCls) s.className = baseCls;
     if (text == null || text === "") return s;
 
-    // Build an index of (start, end, cls) ranges.
-    // always reset rx.lastIndex at the END of the loop too
-    // (via try/finally). If an error thrown mid-iteration leaves
-    // lastIndex dirty, the NEXT call's rx.exec starts at that stale
-    // offset — highlights would land at wrong offsets and paint the
-    // wrong text. Guarding with try/finally makes the reset
-    // unconditional.
+    // Build an index of (start, end, cls) ranges. Each pass creates
+    // fresh global regexes so lastIndex cannot leak between calls.
     const ranges = [];
-    for (const [rx, cls] of _HIST_HILITE) {
-      try {
-        let m;
-        rx.lastIndex = 0;
-        while ((m = rx.exec(text)) !== null) {
-          ranges.push({ start: m.index, end: m.index + m[0].length, cls });
-          if (m.index === rx.lastIndex) rx.lastIndex++;
+    for (const [makeRx, cls] of _HIST_HILITE) {
+      const rx = makeRx();
+      let m;
+      while ((m = rx.exec(text)) !== null) {
+        ranges.push({ start: m.index, end: m.index + m[0].length, cls });
+        if (m.index === rx.lastIndex) {
+          rx.lastIndex++;
         }
-      } finally {
-        rx.lastIndex = 0;
       }
     }
     if (!ranges.length) { s.textContent = String(text); return s; }
@@ -517,6 +512,24 @@
    * structured rows without the layout engine breaking a sweat
    * (rows are static text + classes, no event listeners).
    */
+  function _trimActivityLog(el) {
+    const cap = 30000, keep = 25000;
+    if (el.childElementCount > cap) {
+      let toRemove = el.childElementCount - keep;
+      if (toRemove % 2 === 1) toRemove++;
+      for (let i = 0; i < toRemove; i++) el.removeChild(el.firstChild);
+    }
+  }
+
+  function _applyActivityParity(row, previousRow) {
+    try {
+      const prevAlt = previousRow
+        && previousRow.classList.contains("hist_row_alt");
+      if (prevAlt) row.classList.remove("hist_row_alt");
+      else row.classList.add("hist_row_alt");
+    } catch (_e) { /* non-fatal */ }
+  }
+
   window.appendActivityLog = function (entry) {
     const el = document.getElementById("activity-log");
     if (!el) return;
@@ -526,12 +539,7 @@
     // don't trust entry.alt — the backend can lose track
     // after long sessions, leaving same-color rows adjacent. Compute
     // parity from the actual prior row in the DOM each append.
-    try {
-      const prev = row.previousElementSibling;
-      const prevAlt = prev && prev.classList.contains("hist_row_alt");
-      if (prevAlt) row.classList.remove("hist_row_alt");
-      else row.classList.add("hist_row_alt");
-    } catch (_e) { /* non-fatal */ }
+    _applyActivityParity(row, row.previousElementSibling);
     const cap = 30000, keep = 25000;
     if (el.childElementCount > cap) {
       let toRemove = el.childElementCount - keep;
@@ -945,9 +953,6 @@
         // hist_row_alt class, breaking zebra striping after the first
         // few backend-painted rows. Track parity from the last row
         // in DOM and toggle as we append.
-        let prevAlt = false;
-        const _lastDom = el.lastElementChild;
-        if (_lastDom) prevAlt = _lastDom.classList.contains("hist_row_alt");
         // audit LG-1: also check the in-progress fragment for a row
         // with the same row_id before adding a duplicate. Without
         // this, when a [Dwnld] and its retroactive update arrive in
@@ -991,13 +996,13 @@
               continue;
             }
           }
-          // Append path — flip parity from the previous row.
-          if (prevAlt) row.classList.remove("hist_row_alt");
-          else row.classList.add("hist_row_alt");
-          prevAlt = !prevAlt;
+          // Append path — derive parity from the true previous row,
+          // including same-batch rows staged in the fragment.
+          _applyActivityParity(row, frag.lastElementChild || el.lastElementChild);
           frag.appendChild(row);
         }
         el.appendChild(frag);
+        _trimActivityLog(el);
         const st = scrollState.get(el) || {};
         if (!st.userScrolled) el.scrollTop = el.scrollHeight;
       }

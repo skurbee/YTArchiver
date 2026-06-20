@@ -22,10 +22,12 @@ Protocol:
               or { "status": "error", "text": "reason" }
 """
 
+import faulthandler
 import io
 import json
 import os
 import sys
+import traceback
 
 # Save real stdout for our JSON protocol, redirect stdout/stderr to suppress
 # prints from huggingface_hub downloads, tqdm bars, or import warnings.
@@ -38,6 +40,10 @@ import sys
 # readable on abnormal exit.
 _out = sys.stdout
 _real_err = sys.stderr
+try:
+    faulthandler.enable(file=_real_err, all_threads=True)
+except Exception:
+    pass
 sys.stdout = io.StringIO()
 sys.stderr = io.StringIO()
 
@@ -316,5 +322,16 @@ while True:
         _out.write(json.dumps({"status": "ok", "text": text, "segments": seg_data}) + "\n")
         _out.flush()
     except Exception as e:
-        _out.write(json.dumps({"status": "error", "text": str(e)}) + "\n")
+        _trace = traceback.format_exc()[:2000]
+        _text = f"{type(e).__name__}: {e}"
+        try:
+            _real_err.write(_trace + "\n")
+            _real_err.flush()
+        except Exception:
+            pass
+        _out.write(json.dumps({
+            "status": "error",
+            "text": _text,
+            "traceback": _trace,
+        }) + "\n")
         _out.flush()

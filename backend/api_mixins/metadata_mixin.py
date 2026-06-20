@@ -227,8 +227,7 @@ class MetadataMixin:
         if not channels:
             return []
         # Enrich a copy with n_vids so we don't mutate the live config.
-        import copy as _copy
-        ch_copy = _copy.deepcopy(channels)
+        ch_copy = [dict(ch) for ch in channels]
         try:
             # When force=True, rescan disk for fresh n_vids/size before
             # enriching. Otherwise enrich pulls from the cached disk
@@ -252,24 +251,25 @@ class MetadataMixin:
         # for the lock. The bulk variant returns in under a second.
         try:
             from backend.metadata import (
-                count_video_id_status as _cvids,
-            )
-            from backend.metadata import (
                 count_video_id_status_bulk as _cvids_bulk,
             )
         except Exception:
-            _cvids_bulk, _cvids = None, None
+            _cvids_bulk = None
         _id_lookup = _cvids_bulk(ch_copy, force=bool(force)) if _cvids_bulk else {}
         _empty_ids = {"total": 0, "with_id": 0, "missing": 0, "tried_failed": 0}
         rows = []
         for ch in ch_copy:
-            _ch_key = (ch.get("name") or ch.get("folder") or "").lower()
-            _idstats = _id_lookup.get(_ch_key)
+            _idstats = None
+            for _ch_key in {
+                    (ch.get("name") or "").lower(),
+                    (ch.get("folder") or "").lower(),
+            }:
+                if _ch_key:
+                    _idstats = _id_lookup.get(_ch_key)
+                    if _idstats is not None:
+                        break
             if _idstats is None:
-                # Fall back to the per-channel query when the bulk
-                # lookup didn't cover this channel (e.g. case-drift
-                # between config name and DB channel column).
-                _idstats = _cvids(ch) if _cvids else _empty_ids
+                _idstats = _empty_ids
             rows.append({
                 "name": ch.get("name") or ch.get("folder") or "",
                 "folder": ch.get("folder") or "",
@@ -587,13 +587,18 @@ class MetadataMixin:
             # dismissal then resolved the SECOND prompt's event with
             # the wrong choice and the original timed out 120s later
             # defaulting to "skip" (audit: metadata_mixin H1).
-            if not hasattr(self, "_pending_metadata_choices") or \
-                    self._pending_metadata_choices is None:
-                self._pending_metadata_choices = {}
-            self._pending_metadata_choices[token] = result
-            # Legacy single-slot kept only as a fallback for any
-            # resolver caller that doesn't echo the token back.
-            self._pending_metadata_choice = result
+            lock = getattr(self, "_pending_metadata_choices_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                self._pending_metadata_choices_lock = lock
+            with lock:
+                if not hasattr(self, "_pending_metadata_choices") or \
+                        self._pending_metadata_choices is None:
+                    self._pending_metadata_choices = {}
+                self._pending_metadata_choices[token] = result
+                # Legacy single-slot kept only as a fallback for any
+                # resolver caller that doesn't echo the token back.
+                self._pending_metadata_choice = result
             # Create a one-shot global callback the JS side writes into
             js = (
                 "(async () => {"
@@ -608,7 +613,12 @@ class MetadataMixin:
             return {"choice": "skip"}
         finally:
             try:
-                self._pending_metadata_choices.pop(token, None)
+                lock = getattr(self, "_pending_metadata_choices_lock", None)
+                if lock is None:
+                    self._pending_metadata_choices.pop(token, None)
+                else:
+                    with lock:
+                        self._pending_metadata_choices.pop(token, None)
             except Exception:
                 pass
 
@@ -620,8 +630,14 @@ class MetadataMixin:
         the js_api bridge, so the old _-prefixed name was unreachable
         and every prompt timed out to "skip" after 120s."""
         try:
-            pending_map = getattr(self, "_pending_metadata_choices", None) or {}
-            pending = pending_map.get(_token)
+            lock = getattr(self, "_pending_metadata_choices_lock", None)
+            if lock is None:
+                pending_map = getattr(self, "_pending_metadata_choices", None) or {}
+                pending = pending_map.get(_token)
+            else:
+                with lock:
+                    pending_map = getattr(self, "_pending_metadata_choices", None) or {}
+                    pending = pending_map.get(_token)
             if pending is None:
                 # Fallback to single-slot for legacy callers.
                 pending = getattr(self, "_pending_metadata_choice", None)

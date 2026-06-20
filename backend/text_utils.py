@@ -186,6 +186,9 @@ def extract_video_id(
             return False
         return True
 
+    def _shape_ok(cand: str) -> bool:
+        return bool(cand and _ID_RE_11.fullmatch(cand))
+
     if hint:
         h = hint.strip()
         # An explicit hint is AUTHORITATIVE (yt-dlp's DLTRACK %(id)s, or a
@@ -223,16 +226,16 @@ def extract_video_id(
                 "COLLATE NOCASE LIMIT 1",
                 (_norm,),
             ).fetchone()
-            if row and row[0] and _ok(str(row[0])):
-                return str(row[0])
+            if row and row[0] and _shape_ok(str(row[0]).strip()):
+                return str(row[0]).strip()
             if _norm != path:
                 row = conn.execute(
                     "SELECT video_id FROM videos WHERE filepath = ? "
                     "COLLATE NOCASE LIMIT 1",
                     (path,),
                 ).fetchone()
-                if row and row[0] and _ok(str(row[0])):
-                    return str(row[0])
+                if row and row[0] and _shape_ok(str(row[0]).strip()):
+                    return str(row[0]).strip()
         except Exception:
             pass
 

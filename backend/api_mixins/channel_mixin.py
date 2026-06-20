@@ -15,6 +15,15 @@ class ChannelMixin:
 
     # ─── Channel context actions ───────────────────────────────────────
 
+    @staticmethod
+    def _coerce_channel_name(folder_or_name) -> str:
+        if isinstance(folder_or_name, str):
+            return folder_or_name.strip()
+        if isinstance(folder_or_name, dict):
+            return str(folder_or_name.get("name")
+                       or folder_or_name.get("folder") or "").strip()
+        return ""
+
     def chan_open_folder(self, folder_or_name):
         # Validate arg type up front. JS callers can accidentally pass
         # None or a number; without this guard, .get(...) below raises
@@ -29,10 +38,20 @@ class ChannelMixin:
         if not base:
             return {"ok": False, "error": "output_dir not set"}
         # Accept a raw folder name (string) or an identity dict
-        name = folder_or_name if isinstance(folder_or_name, str) else (
-            folder_or_name.get("name") or folder_or_name.get("folder", ""))
-        from backend.sync import sanitize_folder
-        path = os.path.join(base, sanitize_folder(name))
+        name = self._coerce_channel_name(folder_or_name)
+        if not name:
+            return {"ok": False, "error": "Invalid channel argument"}
+        ch = None
+        try:
+            ch = subs_backend.get_channel(folder_or_name if isinstance(
+                folder_or_name, dict) else {"name": name})
+            if not ch:
+                ch = subs_backend.get_channel({"folder": name})
+        except Exception:
+            ch = None
+        from backend.sync import channel_folder_name, sanitize_folder
+        folder_name = channel_folder_name(ch) if ch else sanitize_folder(name)
+        path = os.path.join(base, folder_name)
         # if the folder doesn't exist yet, don't silently
         # CREATE it. Right-clicking "Open folder" on a channel that
         # has never synced (URL-only subscription) used to materialize
@@ -55,21 +74,24 @@ class ChannelMixin:
 
     def chan_open_url(self, folder_or_name):
         import webbrowser
-        name = folder_or_name if isinstance(folder_or_name, str) else (
-            folder_or_name.get("name") or folder_or_name.get("folder", ""))
-        ch = subs_backend.get_channel({"name": name})
-        if not ch or not ch.get("url"):
-            return {"ok": False, "error": "URL not found"}
-        webbrowser.open(ch["url"])
-        return {"ok": True}
+        try:
+            name = self._coerce_channel_name(folder_or_name)
+            if not name:
+                return {"ok": False, "error": "Invalid channel argument"}
+            ch = subs_backend.get_channel({"name": name})
+            if not ch or not ch.get("url"):
+                return {"ok": False, "error": "URL not found"}
+            webbrowser.open(ch["url"])
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
 
     def channel_transcription_stats(self, folder_or_name):
         """Return {total, transcribed, pending, failed} counts for a channel
         from the FTS DB. Used by the edit panel to show coverage at a glance.
         """
-        name = folder_or_name if isinstance(folder_or_name, str) else (
-            folder_or_name.get("name") or folder_or_name.get("folder", ""))
+        name = self._coerce_channel_name(folder_or_name)
         try:
             from backend import index as _idx
             stats = _idx.channel_transcription_stats(name)
@@ -86,8 +108,7 @@ class ChannelMixin:
         first (one-off, NOT persisted to Settings), then enqueues every
         video in the channel that has a transcript file.
         """
-        name = folder_or_name if isinstance(folder_or_name, str) else (
-            folder_or_name.get("name") or folder_or_name.get("folder", ""))
+        name = self._coerce_channel_name(folder_or_name)
         if not name:
             return {"ok": False, "error": "Channel name required"}
         try:
@@ -129,8 +150,7 @@ class ChannelMixin:
         Writes <channel_folder>/.ChannelArt/{avatar,banner}.jpg. Best-effort —
         runs in a background thread so the UI doesn't block.
         """
-        name = folder_or_name if isinstance(folder_or_name, str) else (
-            folder_or_name.get("name") or folder_or_name.get("folder", ""))
+        name = self._coerce_channel_name(folder_or_name)
         ch = subs_backend.get_channel({"name": name})
         if not ch:
             return {"ok": False, "error": "Channel not found"}
@@ -188,8 +208,7 @@ class ChannelMixin:
 
     def chan_art_paths(self, folder_or_name):
         """Return local avatar/banner paths for a channel, if they exist."""
-        name = folder_or_name if isinstance(folder_or_name, str) else (
-            folder_or_name.get("name") or folder_or_name.get("folder", ""))
+        name = self._coerce_channel_name(folder_or_name)
         ch = subs_backend.get_channel({"name": name})
         cfg = load_config()
         base = (cfg.get("output_dir") or "").strip()
@@ -222,8 +241,7 @@ class ChannelMixin:
         that are skipped, and have the queue pending button DIRECTLY
         snipe the info we need."
         """
-        name = folder_or_name if isinstance(folder_or_name, str) else (
-            folder_or_name.get("name") or folder_or_name.get("folder", ""))
+        name = self._coerce_channel_name(folder_or_name)
         ch = subs_backend.get_channel({"name": name})
         if not ch:
             return {"ok": False, "error": "Channel not found"}
@@ -310,20 +328,14 @@ class ChannelMixin:
             import uuid as _uuid
             bulk_id = _uuid.uuid4().hex[:12]
             bulk_total = len(bulk)
-            # Dedupe above is best-effort: the lock was released after
-            # the `queued_paths` snapshot, so between the snapshot and
-            # the loop below a worker can complete one of our paths
-            # and we'd re-enqueue. TranscribeManager.enqueue accepts
-            # the duplicate; the worker then re-runs Whisper on an
-            # already-fresh transcript, which is wasted compute but
-            # not data-corrupting (audit: channel_mixin H15 PARTIAL —
-            # documented rather than fixed; a stricter dedupe would
-            # require an enqueue-time check in TranscribeManager).
             for idx, (video, title) in enumerate(bulk):
-                self._transcribe.enqueue(video, title, channel=name,
-                                         bulk_id=bulk_id, bulk_total=bulk_total,
-                                         bulk_index=idx)
-                queued += 1
+                if self._transcribe.enqueue(video, title, channel=name,
+                                            bulk_id=bulk_id,
+                                            bulk_total=bulk_total,
+                                            bulk_index=idx):
+                    queued += 1
+                else:
+                    skipped += 1
 
         self._log_stream.emit([
             ["[GPU] ", "trans_bracket"],
@@ -387,8 +399,7 @@ class ChannelMixin:
         "Follow organization / Combined" radio dialog (YTArchiver.py:5919).
         The UI should then re-call with combined=True or False.
         """
-        name = folder_or_name if isinstance(folder_or_name, str) else (
-            folder_or_name.get("name") or folder_or_name.get("folder", ""))
+        name = self._coerce_channel_name(folder_or_name)
         ch = subs_backend.get_channel({"name": name})
         if not ch:
             return {"ok": False, "error": "Channel not found"}
@@ -502,8 +513,7 @@ class ChannelMixin:
         can offer a "Continue redownload" button in the edit panel.
         Matches YTArchiver.py:5473 _has_pending_redownload."""
         try:
-            name = folder_or_name if isinstance(folder_or_name, str) else (
-                folder_or_name.get("name") or folder_or_name.get("folder", ""))
+            name = self._coerce_channel_name(folder_or_name)
             if not name:
                 return {"ok": False, "error": "channel name required"}
             ch = subs_backend.get_channel({"name": name})
@@ -545,15 +555,15 @@ class ChannelMixin:
            start them.
         3. Remove from `queues.sync` so the UI popover drops the
            row and the task count decrements.
-        4. Delete `_redownload_progress.json` from the channel folder
-           so the Subs-table chartreuse dot + right-click "Continue
-           Redownload" option both disappear on next render.
+        4. Delete `_redownload_progress.json` and any legacy broken-count
+           sidecar from the channel folder so the Subs-table chartreuse
+           dot + right-click "Continue Redownload" option both disappear
+           on next render.
 
         Returns `{ok, was_running, was_queued, progress_removed}`.
         """
         try:
-            name = folder_or_name if isinstance(folder_or_name, str) else (
-                folder_or_name.get("name") or folder_or_name.get("folder", ""))
+            name = self._coerce_channel_name(folder_or_name)
             if not name:
                 return {"ok": False, "error": "channel name required"}
             ch = subs_backend.get_channel({"name": name})
@@ -610,10 +620,13 @@ class ChannelMixin:
             # 4. Delete the progress file so the pending state clears.
             try:
                 if folder:
-                    pp = os.path.join(folder, "_redownload_progress.json")
-                    if os.path.isfile(pp):
-                        os.remove(pp)
-                        progress_removed = True
+                    for pp in (
+                            os.path.join(folder, "_redownload_progress.json"),
+                            os.path.join(folder,
+                                         "_redownload_broken_counts.json")):
+                        if os.path.isfile(pp):
+                            os.remove(pp)
+                            progress_removed = True
             except OSError:
                 pass
 
@@ -660,18 +673,16 @@ class ChannelMixin:
         try:
             import subprocess as _sp
             import uuid as _uuid
-            name = folder_or_name if isinstance(folder_or_name, str) else (
-                folder_or_name.get("name") or folder_or_name.get("folder", ""))
+            name = self._coerce_channel_name(folder_or_name)
             if not name:
                 return {"ok": False, "error": "channel name required"}
             target = str(target_res or "720").strip().lower()
+            if target not in ALLOWED_REDOWNLOAD_RESOLUTIONS:
+                return {"ok": False, "error": f"Unsupported resolution: {target}"}
             if target == "best":
                 return {"ok": True, "mismatch": 0, "total": 0,
                         "note": "Best mode can't be scanned ahead of time."}
-            try:
-                target_h = int(target)
-            except ValueError:
-                return {"ok": False, "error": f"bad target: {target}"}
+            target_h = int(target)
             ch = subs_backend.get_channel({"name": name})
             if not ch:
                 return {"ok": False, "error": "Channel not found"}
@@ -776,14 +787,13 @@ class ChannelMixin:
         Mirrors OLD's per-year / per-month tree-view right-click
         (YTArchiver.py:26498 _browse_redownload_folder).
         """
-        name = folder_or_name if isinstance(folder_or_name, str) else (
-            folder_or_name.get("name") or folder_or_name.get("folder", ""))
+        name = self._coerce_channel_name(folder_or_name)
         if not name:
             return {"ok": False, "error": "channel name required"}
         new_res = str(new_resolution or "").strip().lower()
         if not new_res:
             return {"ok": False, "error": "new_resolution required"}
-        if new_res not in ("best", "2160", "1440", "1080", "720", "480", "360", "240", "144"):
+        if new_res not in ALLOWED_REDOWNLOAD_RESOLUTIONS:
             return {"ok": False, "error": f"Unsupported resolution: {new_res}"}
         ch = subs_backend.get_channel({"name": name})
         if not ch:
@@ -972,8 +982,13 @@ class ChannelMixin:
                 try: threading.Timer(0.5, self._on_queue_changed).start()
                 except Exception as e: _log.debug("swallowed: %s", e)
 
-            self._sync_thread = threading.Thread(target=_worker, daemon=True)
-            self._sync_thread.start()
+            if not self._start_sync_thread_locked(_worker):
+                # A regular sync or another redownload worker started
+                # after our first idle check. Keep the pending item queued
+                # and let the live worker / completion drain pick it up.
+                self._on_queue_changed()
+                return {"ok": True, "queued": True,
+                        "resolution": new_res}
             self._on_queue_changed()
             return {"ok": True, "started": True, "resolution": new_res}
 

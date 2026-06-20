@@ -37,6 +37,7 @@ import urllib.request
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .log import get_logger
 from .ytarchiver_config import APP_DATA_DIR
@@ -112,6 +113,8 @@ def _download(url: str, dest: Path, progress: Progress | None,
     """Stream `url` to `dest` (atomic via .part), reporting % when the
     server gives a Content-Length. Raises on failure."""
     tmp = dest.with_suffix(dest.suffix + ".part")
+    if urlparse(url).scheme.lower() not in ("http", "https"):
+        raise ValueError(f"Unsupported download URL scheme: {url}")
     _emit(progress, phase, f"Downloading {label}…", 0)
     req = urllib.request.Request(url, headers={"User-Agent": "YTArchiver-Setup"})
     with urllib.request.urlopen(req, timeout=60) as resp:
@@ -386,12 +389,15 @@ def _run_streaming(cmd: list[str], progress: Progress | None, phase: str,
             if not line:
                 continue
             tail.append(line)
-            del tail[:-12]  # keep last ~12 lines
+            del tail[:-40]  # keep enough context for pip failure diagnostics
             # Surface meaningful pip lines without spamming every byte.
             low = line.lower()
             if any(k in low for k in ("downloading", "installing", "collecting",
                                       "building", "successfully", "error", "warning")):
-                _emit(progress, phase, f"{label}: {line[:120]}")
+                status = ("error" if "error" in low else
+                          "warning" if "warning" in low else "running")
+                _emit(progress, phase, f"{label}: {line[:120]}",
+                      status=status)
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
@@ -479,8 +485,14 @@ def install_whisper_stack(progress: Progress | None = None) -> dict:
           else "No NVIDIA GPU detected - installing CPU build.", None)
 
     # 1) upgrade pip (best-effort)
-    _run_streaming([python, "-m", "pip", "install", "--upgrade", "pip"],
-                   progress, "whisper", "Upgrading pip", timeout=300)
+    rc_pip, tail_pip = _run_streaming(
+        [python, "-m", "pip", "install", "--upgrade", "pip"],
+        progress, "whisper", "Upgrading pip", timeout=300)
+    if rc_pip != 0:
+        _log.warning("pip upgrade failed during whisper setup: %s", tail_pip)
+        _emit(progress, "whisper",
+              "pip upgrade failed; continuing with existing pip",
+              status="warning")
 
     # 2) torch (CUDA or CPU)
     if gpu["ok"]:

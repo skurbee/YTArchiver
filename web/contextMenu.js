@@ -35,26 +35,34 @@
     }
     const menu = document.createElement("div");
     menu.className = "ctx-menu";
+    menu.setAttribute("role", "menu");
+    menu.tabIndex = -1;
     menu.style.left = x + "px";
     menu.style.top = y + "px";
     for (const it of items) {
       if (it.sep) {
         const sep = document.createElement("div");
         sep.className = "ctx-menu-sep";
+        sep.setAttribute("role", "separator");
         menu.appendChild(sep);
         continue;
       }
       const row = document.createElement("div");
       row.className = "ctx-menu-item" + (it.cls ? " " + it.cls : "");
+      row.setAttribute("role", "menuitem");
+      row.tabIndex = -1;
       row.textContent = it.label;
       if (it.title) row.title = it.title;   // hover tooltip (e.g. why disabled)
       if (it.submenu) {
         row.classList.add("ctx-submenu-wrap");
         const sub = document.createElement("div");
         sub.className = "ctx-submenu";
+        sub.setAttribute("role", "menu");
         for (const sit of it.submenu) {
           const srow = document.createElement("div");
           srow.className = "ctx-menu-item";
+          srow.setAttribute("role", "menuitem");
+          srow.tabIndex = -1;
           srow.textContent = sit.label;
           srow.addEventListener("click", (e) => {
             e.stopPropagation();
@@ -81,6 +89,8 @@
     if (r.bottom > window.innerHeight) {
       menu.style.top = (window.innerHeight - r.height - 4) + "px";
     }
+    const first = menu.querySelector(".ctx-menu-item");
+    if (first) setTimeout(() => first.focus(), 0);
     setTimeout(() => {
       document.addEventListener("click", closeContextMenu, { once: true });
       document.addEventListener("keydown", onCtxKey);
@@ -100,6 +110,32 @@
     if (e.key === "Escape") {
       e.stopPropagation();
       closeContextMenu();
+      return;
+    }
+    if (e.key === "Tab") {
+      closeContextMenu();
+      return;
+    }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      const root = document.getElementById("ctx-menu-root");
+      const items = [...(root?.querySelectorAll(".ctx-menu-item") || [])];
+      if (!items.length) return;
+      e.preventDefault();
+      const cur = document.activeElement;
+      const idx = items.indexOf(cur);
+      const dir = e.key === "ArrowDown" ? 1 : -1;
+      const next = idx === -1
+        ? 0
+        : (idx + dir + items.length) % items.length;
+      items[next].focus();
+      return;
+    }
+    if (e.key === "Enter" || e.key === " ") {
+      const row = document.activeElement;
+      if (row?.classList?.contains("ctx-menu-item")) {
+        e.preventDefault();
+        row.click();
+      }
     }
   }
 

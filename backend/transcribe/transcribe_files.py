@@ -101,7 +101,7 @@ def _seg_to_jsonl_line(video_id: str, title: str, seg: dict) -> str:
 
 
 def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
-                       segments: list[dict]) -> None:
+                       segments: list[dict]) -> bool:
     """Append long-form JSONL entries for one video. Matches YTArchiver.py:8508.
 
     Each line:
@@ -165,6 +165,7 @@ def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
         # cross-volume on Windows).
         try: _hide_file_win(jsonl_path)
         except Exception: pass
+        return True
     except Exception as _jse:
         # surface to module-level log so .txt/.jsonl desync
         # is diagnosable. Was a print() — routes via
@@ -175,6 +176,7 @@ def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
         except Exception:
             print(f"[transcribe] _write_jsonl_entry failed for "
                   f"{os.path.basename(jsonl_path)}: {_jse}")
+        return False
 
 
 def _write_transcript_entry(txt_path, *args, **kwargs):
@@ -241,14 +243,68 @@ def _write_transcript_entry_unlocked(txt_path: str, title: str,
 # line in the aggregated Transcript.txt. Captures title (group 1), date
 # (group 2), duration (group 3), source tag (group 4). Matches OLD
 # YTArchiver.py:28997 `_HEADER_RE`.
-# Title uses `.+?` (non-greedy) so YT titles containing `)` (e.g.
-# "How I made $1M (in one year)") are not truncated at the first paren.
-# The trailing `,\s*\(` anchor guarantees correct termination at the
-# date field. Date/dur/src groups stay restrictive because they're
-# emitted by our own writers and won't contain `)`.
+# Title uses `.*` greedily so YT titles containing the field-looking
+# delimiter `), (` are not truncated at the first apparent boundary.
+# Date/dur/src groups stay restrictive because they're emitted by our
+# own writers and won't contain `)`.
 _HEADER_RE = re.compile(
-    r'^===\((.+?)\),\s*(\([^)]*\)),\s*(\([^)]*\)),\s*(\([^)]*\))===',
+    r'^===\((.*)\),\s*(\([^)]*\)),\s*(\([^)]*\)),\s*(\([^)]*\))===',
     re.MULTILINE)
+_BODY_WS_RE = re.compile(r"\s+")
+
+
+def _body_key(text: str) -> str:
+    return _BODY_WS_RE.sub(" ", (text or "").strip())
+
+
+def _jsonl_text_candidates_from_bytes(data: bytes | None, title: str,
+                                      video_id: str) -> set[str]:
+    """Return old transcript-body candidates for one video from JSONL."""
+    if not data:
+        return set()
+    vid_norm = (video_id or "").strip()
+    title_key = _norm_title(title)
+    grouped: dict[str, list[str]] = {}
+    for raw in data.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+            continue
+        seg_vid = (obj.get("video_id") or "").strip()
+        seg_title = (obj.get("title") or "").strip()
+        title_hit = bool(seg_title) and _norm_title(seg_title) == title_key
+        id_hit = bool(vid_norm) and seg_vid == vid_norm
+        if not (id_hit or (title_hit and (not seg_vid or not vid_norm))):
+            continue
+        key = seg_vid or seg_title or title
+        grouped.setdefault(key, []).append(obj.get("text") or "")
+    candidates: set[str] = set()
+    for parts in grouped.values():
+        joined = " ".join(p.strip() for p in parts if p.strip()).strip()
+        if joined:
+            candidates.add(joined)
+    return candidates
+
+
+def parse_transcript_header(line: str) -> tuple[str, str, str, str] | None:
+    """Parse a Transcript.txt header into unwrapped fields.
+
+    The title field is user-controlled and can contain the literal
+    delimiter text `), (`. Parse from the right-hand metadata fields so
+    sibling repair/punctuation code shares one boundary rule.
+    """
+    m = _HEADER_RE.match((line or "").strip())
+    if not m:
+        return None
+    return (
+        m.group(1).strip(),
+        m.group(2).strip("()"),
+        m.group(3).strip("()"),
+        m.group(4).strip("()"),
+    )
 
 
 def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
@@ -393,7 +449,8 @@ def _replace_txt_entry(txt_path, *args, **kwargs):
 
 def _replace_txt_entry_unlocked(txt_path: str, title: str, new_text: str,
                        source_tag: str,
-                       extra_titles_to_remove=None) -> bool:
+                       extra_titles_to_remove=None,
+                       old_text_candidates=None) -> bool:
     """Surgically swap this video's `===(…)===\\n<body>\\n\\n\\n` block in
     the aggregated Transcript.txt. `_replace_txt_entry`.
 
@@ -427,27 +484,54 @@ def _replace_txt_entry_unlocked(txt_path: str, title: str, new_text: str,
     purge.add(_norm_title(title))
     purge.discard("")
 
+    matches = list(_HEADER_RE.finditer(content))
+    old_body_keys = {
+        _body_key(t) for t in (old_text_candidates or ()) if _body_key(t)
+    }
+    title_matches: list[tuple[int, int, re.Match[str]]] = []
+    body_matches: list[tuple[int, int, re.Match[str]]] = []
+    for i, m in enumerate(matches):
+        entry_key = _norm_title(m.group(1))
+        if entry_key not in purge:
+            continue
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+        title_matches.append((m.start(), end, m))
+        if old_body_keys:
+            body_start = content.find("\n", m.end(), end)
+            body = content[(body_start + 1 if body_start >= 0 else m.end()):end]
+            if _body_key(body) in old_body_keys:
+                body_matches.append((m.start(), end, m))
+
+    if old_body_keys:
+        removals = body_matches
+        if not removals and len(title_matches) == 1:
+            # Legacy/edited TXT body may not match JSONL exactly, but a single
+            # matching header is still unambiguous.
+            removals = title_matches
+        elif not removals and title_matches:
+            raise ValueError(
+                f"Refusing ambiguous same-title TXT replacement for {title!r}")
+    else:
+        if len(title_matches) > 1:
+            raise ValueError(
+                f"Refusing ambiguous same-title TXT replacement for {title!r}")
+        removals = title_matches
+
     # Remove each matching entry (header line through the next header
     # or EOF). Iterate from the end so earlier match positions stay
-    # valid as we slice. Capture date+duration from the FIRST removed
+    # valid as we slice. Capture date+duration from the first removed
     # entry so the new block inherits the provenance.
-    matches = list(_HEADER_RE.finditer(content))
     new_content = content
     date_fmt = "(Unknown date)"
     dur_fmt = "(Unknown length)"
     captured = False
-    for i in range(len(matches) - 1, -1, -1):
-        m = matches[i]
-        entry_key = _norm_title(m.group(1))
-        if entry_key not in purge:
-            continue
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(new_content)
+    for start, end, m in sorted(removals, key=lambda x: x[0], reverse=True):
         if not captured:
             # Matches group indices of _HEADER_RE: (title, date, dur, src)
             date_fmt = m.group(2)
             dur_fmt = m.group(3)
             captured = True
-        new_content = new_content[:m.start()] + new_content[end:]
+        new_content = new_content[:start] + new_content[end:]
 
     src_fmt = source_tag if source_tag.startswith("(") else f"({source_tag})"
     new_entry = f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}===\n{new_text}\n\n\n"

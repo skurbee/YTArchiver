@@ -8,7 +8,90 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
+
+from backend.services import file_ops
+
 from ._shared import *  # noqa: F401,F403
+
+
+_METADATA_DRAWER_CACHE_LOCK = threading.Lock()
+_METADATA_DRAWER_CACHE: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+_METADATA_DRAWER_CACHE_MAX = 128
+_TRANSCRIPT_SOURCE_SCAN_BYTES = 5 * 1024 * 1024
+
+
+def _iter_transcript_header_lines(path: str):
+    """Yield header lines from a bounded tail scan of a Transcript.txt file."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        if size > _TRANSCRIPT_SOURCE_SCAN_BYTES:
+            fh.seek(max(0, size - _TRANSCRIPT_SOURCE_SCAN_BYTES))
+            if fh.tell() > 0:
+                fh.readline()
+        for line in fh:
+            if line.startswith("==="):
+                yield line
+
+
+def _metadata_file_signature(path: str) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
+
+
+def _metadata_drawer_cache_get(video_id: str, channel: str) -> dict | None:
+    key = (video_id, channel or "")
+    with _METADATA_DRAWER_CACHE_LOCK:
+        cached = _METADATA_DRAWER_CACHE.get(key)
+        if not cached:
+            return None
+        source = str(cached.get("source") or "")
+        sig = _metadata_file_signature(source)
+        if sig is not None and sig == cached.get("sig"):
+            _METADATA_DRAWER_CACHE.move_to_end(key)
+            return {
+                "ok": True,
+                "meta": cached.get("meta") or {},
+                "source": source,
+            }
+        _METADATA_DRAWER_CACHE.pop(key, None)
+    return None
+
+
+def _metadata_drawer_cache_put(video_id: str, channel: str,
+                               source: str, meta: dict) -> None:
+    sig = _metadata_file_signature(source)
+    if sig is None:
+        return
+    key = (video_id, channel or "")
+    with _METADATA_DRAWER_CACHE_LOCK:
+        _METADATA_DRAWER_CACHE[key] = {
+            "source": source,
+            "sig": sig,
+            "meta": meta,
+        }
+        _METADATA_DRAWER_CACHE.move_to_end(key)
+        while len(_METADATA_DRAWER_CACHE) > _METADATA_DRAWER_CACHE_MAX:
+            _METADATA_DRAWER_CACHE.popitem(last=False)
+
+
+def _guard_browse_launch_path(filepath: str, *, require_file: bool) -> dict:
+    fp = os.path.normpath(filepath or "")
+    if not fp:
+        return {"ok": False, "error": "No path provided"}
+    exists = os.path.isfile(fp) if require_file else os.path.exists(fp)
+    if not exists:
+        return {"ok": False, "error": f"Not found: {fp}"}
+    guard = file_ops.assert_within_managed_roots(fp)
+    if not guard.get("ok"):
+        return guard
+    return {"ok": True, "path": fp}
 
 
 class BrowseMixin:
@@ -275,36 +358,34 @@ class BrowseMixin:
                 fp = os.path.join(d, fn)
                 _last_tag = ""
                 try:
-                    with open(fp, "r", encoding="utf-8", errors="replace") as fh:
-                        # Scan ALL header lines, keep the last matching one.
-                        for line in fh:
-                            if not line.startswith("==="):
-                                continue
-                            body = line.strip().rstrip("=").lstrip("=").strip()
-                            m = _hdr_re.match(body)
-                            if m:
-                                head_title = m.group(1).strip()
-                                tag = m.group(4).strip()
-                                if _classify_norm(head_title) == norm_title:
-                                    _last_tag = tag
-                                continue
-                            # Fallback: pre-regex split-by-comma path
-                            # for any legacy/odd header that doesn't
-                            # match the canonical 4-field shape.
-                            parts = [p.strip() for p in body.split(",")]
-                            if not parts:
-                                continue
-                            head_title = parts[0].strip()
-                            if head_title.startswith("("):
-                                head_title = head_title[1:]
-                            if head_title.endswith(")"):
-                                head_title = head_title[:-1]
-                            if _classify_norm(head_title) != norm_title:
-                                continue
-                            if len(parts) >= 2:
-                                tail = parts[-1].strip()
-                                if tail.startswith("(") and tail.endswith(")"):
-                                    _last_tag = tail[1:-1].strip()
+                    # Scan a bounded tail of large aggregate transcripts and
+                    # keep the last matching header so newest writes win.
+                    for line in _iter_transcript_header_lines(fp):
+                        body = line.strip().rstrip("=").lstrip("=").strip()
+                        m = _hdr_re.match(body)
+                        if m:
+                            head_title = m.group(1).strip()
+                            tag = m.group(4).strip()
+                            if _classify_norm(head_title) == norm_title:
+                                _last_tag = tag
+                            continue
+                        # Fallback: pre-regex split-by-comma path
+                        # for any legacy/odd header that doesn't
+                        # match the canonical 4-field shape.
+                        parts = [p.strip() for p in body.split(",")]
+                        if not parts:
+                            continue
+                        head_title = parts[0].strip()
+                        if head_title.startswith("("):
+                            head_title = head_title[1:]
+                        if head_title.endswith(")"):
+                            head_title = head_title[:-1]
+                        if _classify_norm(head_title) != norm_title:
+                            continue
+                        if len(parts) >= 2:
+                            tail = parts[-1].strip()
+                            if tail.startswith("(") and tail.endswith(")"):
+                                _last_tag = tail[1:-1].strip()
                 except OSError:
                     continue
                 if _last_tag:
@@ -342,6 +423,8 @@ class BrowseMixin:
         Returns { ok, title, channel, segments:[{s,e,t,is_hit}], before_more, after_more }
         where `is_hit` marks the segment that was originally matched + any
         other segments in the same video that match the query.
+        before/after are clamped to 0..500 to keep malformed callers from
+        asking the bridge to marshal huge context windows.
 
         Matches YTArchiver.py:29598 viewer pane data flow — grab N segments
         before + hit + N segments after, let the user pull in more with
@@ -349,8 +432,8 @@ class BrowseMixin:
         """
         try:
             seg_id = int((payload or {}).get("segment_id") or 0)
-            before = int((payload or {}).get("before") or 30)
-            after = int((payload or {}).get("after") or 30)
+            before = max(0, min(int((payload or {}).get("before") or 30), 500))
+            after = max(0, min(int((payload or {}).get("after") or 30), 500))
             query = (payload or {}).get("query") or ""
             return index_backend.get_segment_context(seg_id, before, after, query)
         except Exception as e:
@@ -378,6 +461,9 @@ class BrowseMixin:
                     video_id = m.group(1)
             if not video_id:
                 return {"ok": False, "error": "No video_id"}
+            cached = _metadata_drawer_cache_get(video_id, channel)
+            if cached:
+                return cached
 
             # Find the aggregated metadata JSONL — look in the video's own
             # folder first, then walk up to 3 levels (year / year-month).
@@ -390,10 +476,14 @@ class BrowseMixin:
                     try:
                         for fn in os.listdir(cur):
                             if fn.startswith(".") and fn.endswith("Metadata.jsonl"):
-                                entries = _read_metadata_jsonl(os.path.join(cur, fn))
+                                source = os.path.join(cur, fn)
+                                entries = _read_metadata_jsonl(source)
                                 if video_id in entries:
-                                    return {"ok": True, "meta": entries[video_id],
-                                            "source": os.path.join(cur, fn)}
+                                    meta = entries[video_id]
+                                    _metadata_drawer_cache_put(
+                                        video_id, channel, source, meta)
+                                    return {"ok": True, "meta": meta,
+                                            "source": source}
                     except OSError:
                         pass
                     parent = os.path.dirname(cur)
@@ -425,10 +515,14 @@ class BrowseMixin:
                             dns[:] = []  # don't recurse further
                         for fn in fns:
                             if fn.startswith(".") and fn.endswith("Metadata.jsonl"):
-                                entries = _read_metadata_jsonl(os.path.join(dp, fn))
+                                source = os.path.join(dp, fn)
+                                entries = _read_metadata_jsonl(source)
                                 if video_id in entries:
-                                    return {"ok": True, "meta": entries[video_id],
-                                            "source": os.path.join(dp, fn)}
+                                    meta = entries[video_id]
+                                    _metadata_drawer_cache_put(
+                                        video_id, channel, source, meta)
+                                    return {"ok": True, "meta": meta,
+                                            "source": source}
             return {"ok": False, "error": "Metadata not found"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -610,9 +704,10 @@ class BrowseMixin:
         """Return a file:/// URL the webview can load into a <video> element."""
         try:
             from backend.index import _file_url
-            fp = os.path.normpath(filepath or "")
-            if not fp or not os.path.isfile(fp):
-                return {"ok": False, "error": "File not found"}
+            guard = _guard_browse_launch_path(filepath, require_file=True)
+            if not guard.get("ok"):
+                return guard
+            fp = guard["path"]
             return {"ok": True, "url": _file_url(fp)}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -634,6 +729,9 @@ class BrowseMixin:
                 for ext in (".mp4", ".mkv", ".webm", ".m4a", ".mov"):
                     cand = base + ext
                     if os.path.isfile(cand):
+                        guard = file_ops.assert_within_managed_roots(cand)
+                        if not guard.get("ok"):
+                            return guard
                         # Derive channel from path so the Watch view
                         # has the context it needs for downstream
                         # browse_get_video_metadata + thumbnails
@@ -666,6 +764,9 @@ class BrowseMixin:
                             (video_id,),
                         ).fetchone()
                     if row and row[0] and os.path.isfile(row[0]):
+                        guard = file_ops.assert_within_managed_roots(row[0])
+                        if not guard.get("ok"):
+                            return guard
                         return {
                             "ok": True,
                             "filepath": row[0],
@@ -682,9 +783,10 @@ class BrowseMixin:
     def browse_open_video(self, filepath):
         """Launch the video in the system default player (VLC if associated)."""
         try:
-            fp = os.path.normpath(filepath)
-            if not os.path.isfile(fp):
-                return {"ok": False, "error": f"File not found: {fp}"}
+            guard = _guard_browse_launch_path(filepath, require_file=True)
+            if not guard.get("ok"):
+                return guard
+            fp = guard["path"]
             if os.name == "nt":
                 os.startfile(fp)
             elif sys.platform == "darwin":
@@ -701,9 +803,10 @@ class BrowseMixin:
     def browse_show_in_explorer(self, filepath):
         """Reveal the file in Explorer/Finder."""
         try:
-            fp = os.path.normpath(filepath)
-            if not os.path.exists(fp):
-                return {"ok": False, "error": f"Not found: {fp}"}
+            guard = _guard_browse_launch_path(filepath, require_file=False)
+            if not guard.get("ok"):
+                return guard
+            fp = guard["path"]
             if os.name == "nt":
                 import subprocess
                 # On Windows, `explorer /select,<path>` must keep the

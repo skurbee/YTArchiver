@@ -38,6 +38,7 @@ _log = get_logger(__name__)
 # and drifted (.flv/.wmv in reorg but not here), so the Subs table reported
 # fewer videos than Browse showed (audit: VIDEO_EXTS divergence).
 from .fs_search import MEDIA_EXTS_TUPLE as _CHANNEL_VIDEO_EXTS
+from .fs_search import is_partial_artifact
 
 # Partial file suffixes — never count these as real videos
 _PARTIAL_SUFFIXES = (".part", ".tmp", ".temp", ".download", ".ytdl")
@@ -53,6 +54,8 @@ def _is_partial(fn: str) -> bool:
     "Intel just did an AMD.f140-7" — this was reported Also covers
     our own `_TEMP_COMPRESS` suffix from aborted compress jobs.
     """
+    if is_partial_artifact(fn):
+        return True
     fn_l = fn.lower()
     if fn_l.endswith(_PARTIAL_SUFFIXES):
         return True
@@ -153,7 +156,12 @@ def update_disk_cache_for_channel(channel: dict[str, Any]) -> dict[str, Any]:
                         (_nm,)).fetchone()
                 if _row and _row[0]:
                     n_vids, total_bytes = int(_row[0]), int(_row[1])
-    except Exception:
+    except Exception as e:
+        _log.warning(
+            "archive disk-cache DB fast path failed for %r; falling back "
+            "to filesystem walk: %s",
+            channel.get("name") or channel.get("folder") or channel.get("url"),
+            e)
         n_vids = total_bytes = None
     if n_vids is None:
         from pathlib import Path as _P
@@ -327,10 +335,8 @@ def _channel_folder_name(ch: dict[str, Any]) -> str:
     folder_override exists when the on-disk folder was renamed after the
     channel display name changed (e.g. "Valve News Network" → "Tyler McVicker").
     """
-    return (ch.get("folder_override")
-            or ch.get("folder")
-            or ch.get("name")
-            or "").strip()
+    from . import sync as _sync
+    return _sync.channel_folder_name(ch)
 
 
 def scan_channel_folder(base_dir: Path, channel: dict[str, Any]) -> tuple[int, int]:
@@ -351,7 +357,7 @@ def scan_channel_folder(base_dir: Path, channel: dict[str, Any]) -> tuple[int, i
         for fn in fns:
             if not fn.lower().endswith(_CHANNEL_VIDEO_EXTS):
                 continue
-            if _is_partial(fn):
+            if is_partial_artifact(fn, dp):
                 continue
             fp = os.path.join(dp, fn)
             try:
@@ -364,12 +370,7 @@ def scan_channel_folder(base_dir: Path, channel: dict[str, Any]) -> tuple[int, i
                 # rescan will pick it up (self-healing). Without the
                 # retry, the per-channel vid count was permanently 1 low
                 # until the user triggered another scan.
-                import time as _t
-                _t.sleep(0.05)
-                try:
-                    size = os.path.getsize(fp)
-                except OSError:
-                    continue
+                continue
             # Skip 0-byte phantom files (failed downloads that left an
             # empty placeholder). Counting them would inflate the
             # per-channel video count vs what the grid actually renders.
@@ -422,7 +423,10 @@ def scan_channel_folder(base_dir: Path, channel: dict[str, Any]) -> tuple[int, i
                 if _n_dup:
                     n_vids = max(0, n_vids - _n_dup)
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        _log.warning(
+            "archive duplicate-count DB query failed for %r: %s",
+            channel.get("name") or channel.get("folder") or channel.get("url"),
+            e)
     return (n_vids, total)
 
 

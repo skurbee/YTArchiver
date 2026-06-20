@@ -6,6 +6,35 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v78.7 — 2026-06-19
+
+### Fixed
+- **Large-channel Browse loading is faster and less blocking.** Channel browse data now does less redundant
+  disk/index work during large-channel opens, reducing the long stalls seen when opening very large channels.
+- **Simple-mode logs are cleaner.** Thumbnail sweep misses are no longer surfaced as raw backend warning
+  jargon during normal sync output.
+- **Compression is safer.** If the original video's duration cannot be verified, compression now refuses to
+  replace the archive copy and keeps a `.compressed` output for manual review.
+- **Delete cleanup reports partial failures.** If a video file is deleted but index cleanup fails, the bridge
+  now returns a clear partial-failure result instead of a misleading full success.
+- **Sidecar deletion is more conservative.** Video delete cleanup no longer removes arbitrary same-stem
+  `.txt` files or visible user image/caption files.
+- **Folder reorganization can be cancelled.** Reorg now tracks its own running/cancel state and sync start
+  refuses to begin while a reorg is active.
+- **Single-video archive binding is safer.** The fallback that binds a finished one-off download to a file now
+  requires the candidate filename to be corroborated by video id or title.
+
+### Added / Improved
+- **Recent/Subs context menus are keyboard accessible.** Selected rows can open their context menu via the
+  Context Menu key or Shift+F10, and the shared menu supports focus, arrow navigation, Enter/Space, Escape,
+  and ARIA menu roles.
+- **Repair and maintenance passes are less wasteful.** Caption repair reuses one temp directory per pass and
+  scans large JSONL files in chunks; orphan caption cleanup now has safer guards.
+- **Config-write hardening has started.** Several autorun, sync, comments-refresh, and Recent cleanup writes
+  now use the shared config transaction path to reduce lost-update races.
+- **Tray icon resilience improved.** The system tray icon now refreshes itself if Windows drops the icon during
+  a long-running session.
+
 ## v78.6 — 2026-06-13
 
 ### Fixed

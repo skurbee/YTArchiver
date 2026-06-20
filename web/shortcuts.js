@@ -69,7 +69,7 @@
         const searchInput = document.getElementById("search-query");
         const browseTab = document.querySelector('.tab[data-tab="browse"]');
         const viewSearch = document.getElementById("view-search");
-        if (viewSearch && viewSearch.style.display === "none") {
+        if (viewSearch && viewSearch.hidden) {
           browseTab?.click();
           document.querySelector('[data-browse-sub="search"]')?.click();
           setTimeout(() => {

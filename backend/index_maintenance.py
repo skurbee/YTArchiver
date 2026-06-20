@@ -34,6 +34,23 @@ from .log import get_logger
 _log = get_logger(__name__)
 
 
+def _jsonl_needs_ingest(conn: sqlite3.Connection, jsonl_path: str) -> bool:
+    """True when a sidecar exists and indexed_files has no matching mtime."""
+    jp = os.path.normpath(jsonl_path)
+    if not os.path.isfile(jp):
+        return False
+    try:
+        mtime = os.path.getmtime(jp)
+        row = conn.execute(
+            "SELECT mtime FROM indexed_files WHERE path=? LIMIT 1",
+            (jp,)).fetchone()
+        if row is None:
+            return True
+        return float(row[0] or 0) != mtime
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return True
+
+
 def sweep_new_videos(output_dir: str, channels: list,
                      progress_cb=None,
                      gpu_busy_fn=None) -> dict:
@@ -97,8 +114,8 @@ def sweep_new_videos(output_dir: str, channels: list,
     # multi-MB set in memory for the entire sweep duration. Per-channel
     # scoping bounds memory to one channel's filepaths at a time, and
     # uses the idx_vid_channel index so each query is fast.
-    indexed_jsonls = {r[0].lower() for r in sweep_conn.execute("SELECT path FROM indexed_files").fetchall()
-                      if r[0]}
+    # indexed_files is checked per sidecar via its PRIMARY KEY instead
+    # of loading the entire table into a sweep-long set.
 
     # Per-channel folder fingerprint — lets us skip channels whose
     # folder tree hasn't been touched since the last successful sweep.
@@ -270,15 +287,11 @@ def sweep_new_videos(output_dir: str, channels: list,
                                 _log.debug("sweep id-backfill failed (%s): %s",
                                            fp, _bfe)
                         # Already registered; check if a .jsonl
-                        # sidecar is present and not yet ingested.
-                        # `indexed_jsonls` check first (pure set
-                        # lookup) so we only hit the disk with
-                        # isfile() when we actually care.
+                        # sidecar is present and either missing from
+                        # indexed_files or newer than the indexed mtime.
                         base = _os.path.splitext(fp)[0]
                         jp = base + ".jsonl"
-                        jp_lower = _os.path.normpath(jp).lower()
-                        if (jp_lower not in indexed_jsonls
-                                and _os.path.isfile(jp)):
+                        if _jsonl_needs_ingest(sweep_conn, jp):
                             title = _strip_id.sub("", _os.path.basename(base)) or _os.path.basename(base)
                             # Pass sweep_conn so this call doesn't compete
                             # for _idx._db_lock — see _idx._open_independent docstring.
@@ -315,6 +328,7 @@ def sweep_new_videos(output_dir: str, channels: list,
         # walk). Let `update_disk_cache_for_channel` own the initial
         # populate; next sweep will walk this channel again, which is
         # cheap compared to the bug.
+        post_walk_fp = _folder_fingerprint(folder)
         if ch_url:
             existing_row = _fp_cache.get(ch_url)
             # tightened to `and` — update_disk_cache_for_channel
@@ -324,7 +338,7 @@ def sweep_new_videos(output_dir: str, channels: list,
             if isinstance(existing_row, dict) and (
                     "num_vids" in existing_row
                     and "size_bytes" in existing_row):
-                existing_row["sweep_fingerprint"] = current_fp
+                existing_row["sweep_fingerprint"] = post_walk_fp or current_fp
 
     # Persist the updated fingerprints by MERGING into a FRESH load —
     # never by saving our start-of-sweep snapshot. The sweep walks for
@@ -369,11 +383,9 @@ def prune_missing_videos() -> dict[str, int]:
       1. `missing` — filepath no longer exists on disk. Dead
                       `(1)` duplicates, deleted files, etc.
       2. `zero_byte` — file exists but is 0 bytes. Phantom
-                       placeholders from failed downloads (
-                       a user's channel "Intel just did an AMD" 0-byte
-                       file that my title-matcher then mis-assigned
-                       the real video's id to, producing duplicate
-                       grid rows with shared thumbnails).
+                       placeholders from failed downloads can be
+                       mis-assigned to another video's id, producing
+                       duplicate grid rows with shared thumbnails.
       3. `duplicate_id` — multiple rows share the same video_id.
                           Keep the row with the largest `size_bytes`
                           (presumed real file), drop the rest.
@@ -391,10 +403,33 @@ def prune_missing_videos() -> dict[str, int]:
     n_missing = n_zero = n_dup = n_fake_id = 0
     affected_channels: set = set()
     try:
+        # Category 1 + 2: collect missing / zero-byte files without
+        # holding the writer lock. On large Z: archives these stats can
+        # take minutes; keeping _db_lock free lets sync/register/transcribe
+        # writers continue to make progress while the disk walk runs.
+        reader = _idx._reader_open() or conn
+        reader_lock = (_idx._reader_lock if reader is not conn
+                       else _idx._db_lock)
+        with reader_lock:
+            rows = reader.execute("SELECT filepath FROM videos").fetchall()
+        to_delete_fps = []
+        for r in rows:
+            fp = (r[0] or "").strip()
+            if not fp:
+                continue
+            if not _os.path.isfile(fp):
+                to_delete_fps.append((fp, "missing"))
+                continue
+            try:
+                if _os.path.getsize(fp) == 0:
+                    to_delete_fps.append((fp, "zero_byte"))
+            except OSError:
+                to_delete_fps.append((fp, "missing"))
+
         with _idx._db_lock:
             # Category 0: null out all-alphabetic video_ids. These are
-            # filename-suffix parse errors (a user's channel files ending in
-            # `[a-user-channel]` that matched `[A-Za-z0-9_-]{11}` but
+            # filename-suffix parse errors (channel files ending in a
+            # bracketed non-YouTube token that matched `[A-Za-z0-9_-]{11}` but
             # aren't real YT ids). The row stays — it's a real file
             # on disk — but its video_id field gets cleared so the
             # next metadata recheck will title-resolve it properly
@@ -433,22 +468,6 @@ def prune_missing_videos() -> dict[str, int]:
                     n_fake_id += 1
                     if _ch:
                         affected_channels.add(_ch)
-            # Category 1 + 2: missing files and 0-byte files.
-            rows = conn.execute(
-                "SELECT filepath FROM videos").fetchall()
-            to_delete_fps = []
-            for r in rows:
-                fp = (r[0] or "").strip()
-                if not fp:
-                    continue
-                if not _os.path.isfile(fp):
-                    to_delete_fps.append((fp, "missing"))
-                    continue
-                try:
-                    if _os.path.getsize(fp) == 0:
-                        to_delete_fps.append((fp, "zero_byte"))
-                except OSError:
-                    to_delete_fps.append((fp, "missing"))
 
             for fp, cat in to_delete_fps:
                 vid_row = conn.execute(
@@ -551,9 +570,10 @@ def prune_missing_videos() -> dict[str, int]:
             try:
                 _idx.invalidate_channel_videos(_ch)
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                _log.warning("Browse cache invalidation failed after prune "
+                             "for %r: %s", _ch, e)
     except Exception as e:
-        print(f"[index] prune_missing_videos failed: {e}")
+        _log.warning("prune_missing_videos failed: %s", e)
     return {"videos_removed": videos_removed,
             "segments_removed": segs_removed,
             "missing": n_missing, "zero_byte": n_zero,

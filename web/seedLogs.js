@@ -141,11 +141,17 @@
           await bridgeCall("startup_ready");
         });
       } else {
+        window._reportBootIssue?.(
+          "seedLogs",
+          "pywebview bridge not detected; startup data could not load.",
+          { level: "error" },
+        );
         // pywebview never came up — log and bail. Phase 0's sample.json
         // browser fallback was removed; the app is desktop-only now.
         console.warn("[seed] pywebview bridge not detected — UI will stay empty");
       }
     } catch (e) {
+      window._reportBootIssue?.("seedLogs", e, { level: "error" });
       console.error("seedLogs failed:", e);
     }
   }

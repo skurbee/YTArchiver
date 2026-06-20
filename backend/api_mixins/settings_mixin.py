@@ -295,6 +295,7 @@ class SettingsMixin:
                 # exe is locked by a running sync, so the self-update
                 # fails but the banner still claimed it worked).
                 if proc.returncode == 0:
+                    SettingsMixin._ytdlp_version_cache.pop(yt, None)
                     self._log_stream.emit([["[Update] ", "update_head"],
                                             ["yt-dlp update complete.\n", "update_sep"]])
                 else:
@@ -335,10 +336,11 @@ class SettingsMixin:
         except OSError as _pe:
             return {"ok": False,
                     "error": f"Folder isn't writable: {_pe}"}
-        cfg = load_config()
-        cfg["output_dir"] = path
         from backend.ytarchiver_config import save_config as _sc
-        ok = _sc(cfg)
+        with SettingsMixin._settings_save_lock:
+            cfg = load_config()
+            cfg["output_dir"] = path
+            ok = _sc(cfg)
         if ok:
             self._reload_config()
             return {"ok": True, "path": path}

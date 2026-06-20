@@ -38,13 +38,24 @@ class DiagnosticsMixin:
             rows.append({"name": "pywebview", "ok": True, "detail": ""})
         except ImportError:
             rows.append({"name": "pywebview", "ok": False, "detail": "pip install pywebview"})
-        # Executables
-        import shutil as _sh
-        for exe, hint in (("yt-dlp", "pip install yt-dlp (or drop yt-dlp.exe next to this app)"),
-                          ("ffmpeg", "Install ffmpeg + put on PATH"),
-                          ("ffprobe", "Comes with ffmpeg")):
-            path = _sh.which(exe)
-            rows.append({"name": exe, "ok": bool(path), "detail": path or hint})
+        # Executables. Use the same managed-bin-aware probe that the
+        # onboarding installer uses so app-installed binaries do not
+        # trigger false "missing from PATH" warnings.
+        try:
+            from backend import deps_installer as _deps_installer
+            _dep_probe = _deps_installer.probe(check_whisper_import=False)
+        except Exception:
+            _dep_probe = {}
+        for exe, key, hint in (
+                ("yt-dlp", "ytdlp",
+                 "Install yt-dlp from Settings -> Dependencies"),
+                ("ffmpeg", "ffmpeg",
+                 "Install ffmpeg from Settings -> Dependencies"),
+                ("ffprobe", "ffprobe", "Comes with ffmpeg")):
+            info = (_dep_probe.get(key) or {}) if _dep_probe else {}
+            path = info.get("path") or ""
+            rows.append({"name": exe, "ok": bool(path),
+                         "detail": path or hint})
         # Python 3.11 (for whisper)
         try:
             mgr = getattr(self, "_transcribe", None)
@@ -74,9 +85,9 @@ class DiagnosticsMixin:
                 names = " + ".join(missing_critical)
                 self._log_stream.emit([
                     ["[Deps] ", "sync_bracket"],
-                    [f"⚠ {names} not found on PATH — ",
+                    [f"⚠ {names} not found — ",
                      "red"],
-                    ["downloads will fail until you install + add to PATH.\n",
+                    ["downloads will fail until installed.\n",
                      "dim"],
                 ])
                 self._log_stream.flush()
@@ -89,8 +100,8 @@ class DiagnosticsMixin:
                             if self._window is None:
                                 return
                             msg = (f"Missing: {names}. "
-                                   "Install + add to PATH for downloads "
-                                   "to work.")
+                                   "Install from Settings -> Dependencies "
+                                   "for downloads to work.")
                             self.services.event_bus.show_toast(
                                 msg, "error", ttl_ms=12000)
                         except Exception:

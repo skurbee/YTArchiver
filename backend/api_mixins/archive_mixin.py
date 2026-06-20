@@ -19,6 +19,41 @@ from ._shared import *  # noqa: F401,F403
 _archive_init_lock = threading.Lock()
 
 
+def _probe_output_folder_writable(base: str) -> None:
+    import tempfile as _tempfile
+    os.makedirs(base, exist_ok=True)
+    with _tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=base,
+            prefix=".__ytarchiver_write_probe_",
+            suffix=".tmp", delete=True) as f:
+        f.write("ok")
+
+
+def _recent_scan_bind_is_corroborated(path: str, video_id: str,
+                                      title: str) -> bool:
+    """Guard single-video recent-scan fallback against wrong-file binding."""
+    if not path:
+        return False
+    import re as _re
+    stem = os.path.splitext(os.path.basename(path))[0]
+    stem_no_date = _re.sub(r"\s*\(\d{2}\.\d{2}\.\d{2}\)\s*$", "", stem)
+    low_name = os.path.basename(path).lower()
+    vid = (video_id or "").strip().lower()
+    if vid and vid in low_name:
+        return True
+    title_sane = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_",
+                         title or "").strip()
+    if not title_sane:
+        return False
+    prefix = title_sane[:50].rstrip().lower()
+    if len(prefix) < 12:
+        return False
+    stem_low = stem_no_date.lower()
+    title_low = title_sane.lower()
+    return stem_low.startswith(prefix) or (
+        len(stem_low) >= 12 and title_low.startswith(stem_low))
+
+
 class ArchiveMixin:
 
     # ─── Already-archived pre-check (Download-tab warning) ──────────────
@@ -155,12 +190,7 @@ class ArchiveMixin:
         # launching yt-dlp. Creates the dir if it doesn't exist;
         # bails with a clear error if the dir cannot be written.
         try:
-            os.makedirs(base, exist_ok=True)
-            _probe = os.path.join(base, ".__ytarchiver_write_probe.tmp")
-            with open(_probe, "w", encoding="utf-8") as _f:
-                _f.write("ok")
-            try: os.remove(_probe)
-            except OSError: pass
+            _probe_output_folder_writable(base)
         except OSError as _fe:
             try:
                 self._archive_single_inflight.discard(url)
@@ -499,11 +529,19 @@ class ArchiveMixin:
                         if (not final_path or not os.path.isfile(final_path)) and _vid:
                             try:
                                 _rp = sync_backend._scan_recent_video(base)
-                                if _rp and os.path.isfile(_rp):
+                                if (_rp and os.path.isfile(_rp)
+                                        and _recent_scan_bind_is_corroborated(
+                                            _rp, _vid, _title)):
                                     final_path = _rp
                                     _log.info(
                                         "single-video bind via recent-scan: "
                                         "vid=%s -> %s", _vid, _rp)
+                                elif _rp:
+                                    _log.warning(
+                                        "single-video recent-scan candidate "
+                                        "not corroborated; refusing bind: "
+                                        "vid=%s title=%r candidate=%s",
+                                        _vid, _title, _rp)
                             except Exception as _se:
                                 _log.debug("recent-scan bind failed: %s", _se)
                         if _vid and (not final_path

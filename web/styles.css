@@ -79,6 +79,20 @@
   box-sizing: border-box;
 }
 
+:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 2px;
+}
+
+.icon-btn:focus-visible,
+.icon-btn-slim:focus-visible,
+.btn:focus-visible,
+.tab:focus-visible,
+.submode-btn:focus-visible,
+.settings-subnav-btn:focus-visible {
+  box-shadow: 0 0 0 3px rgba(160, 170, 187, 0.28);
+}
+
 html, body {
   margin: 0;
   padding: 0;
@@ -158,6 +172,43 @@ body {
   font-weight: 600;
   border-bottom: 1px solid var(--c-raised);
   top: 1px;
+}
+
+.boot-issue-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex: 0 0 auto;
+  padding: 7px 12px;
+  border-bottom: 1px solid #5b3a17;
+  background: #241a10;
+  color: var(--c-warn-fg);
+}
+.boot-issue-banner[hidden] {
+  display: none;
+}
+.boot-issue-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.boot-issue-main strong {
+  color: #ffd58a;
+  font-size: 12px;
+  white-space: nowrap;
+}
+#boot-issue-summary {
+  color: var(--c-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.boot-issue-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
 }
 .tab.active::after {
   content: "";
@@ -266,14 +317,7 @@ body {
   display: flex;
   flex-direction: column;
 }
-/* Bridge inline `style="display:none"` (set by the show/hide JS in
-   app.js) against this view's `display: flex` above. Without this
-   attribute-selector rule, the inline display would be overridden
-   by the class rule. Patch 17 tried to migrate to the `hidden`
-   attribute and was reverted v68.1 — the show paths use
-   `el.style.display = ""` which doesn't clear the `hidden` attr. */
-.settings-view[style*="display:none"],
-.settings-view[style*="display: none"] {
+.settings-view[hidden] {
   display: none !important;
 }
 .settings-actions {
@@ -300,3 +344,11 @@ body {
    Each is loaded as a separate <link> in index.html, in this order
    (after styles.css), so the cascade still works. */
 
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}

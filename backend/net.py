@@ -29,6 +29,8 @@ _PROBE_HOSTS = [
 
 net_down = threading.Event() # Set when network is confirmed offline
 _monitor_thread: threading.Thread | None = None
+_monitor_stop = threading.Event()
+_monitor_lock = threading.Lock()
 _poll_interval_sec = 30.0
 _probe_timeout_sec = 5.0
 
@@ -98,20 +100,42 @@ def start_monitor():
     background poll fires ~30s later.
     """
     global _monitor_thread
-    if _monitor_thread and _monitor_thread.is_alive():
-        return
+    with _monitor_lock:
+        if _monitor_thread and _monitor_thread.is_alive():
+            return
+        _monitor_stop.clear()
     try:
         if not probe_once():
             net_down.set()
     except Exception as e:
         _log.debug("swallowed: %s", e)
-    _monitor_thread = threading.Thread(target=_run_monitor, daemon=True)
-    _monitor_thread.start()
+    with _monitor_lock:
+        if _monitor_stop.is_set():
+            return
+        _monitor_thread = threading.Thread(target=_run_monitor, daemon=True)
+        _monitor_thread.start()
+
+
+def stop_monitor(timeout: float = 2.0) -> bool:
+    """Request the background poller to stop and wait briefly for it."""
+    global _monitor_thread
+    with _monitor_lock:
+        thread = _monitor_thread
+        _monitor_stop.set()
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        try:
+            thread.join(timeout=max(0.0, float(timeout)))
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+    with _monitor_lock:
+        if _monitor_thread is thread and (thread is None or not thread.is_alive()):
+            _monitor_thread = None
+    return thread is None or not thread.is_alive()
 
 
 def _run_monitor():
     consecutive_ok = 0
-    while True:
+    while not _monitor_stop.is_set():
         ok = probe_once()
         if ok:
             consecutive_ok += 1
@@ -120,7 +144,8 @@ def _run_monitor():
         else:
             consecutive_ok = 0
             net_down.set()
-        time.sleep(_poll_interval_sec)
+        if _monitor_stop.wait(_poll_interval_sec):
+            return
 
 
 def block_if_down(stream=None, check_cancel=None) -> bool:

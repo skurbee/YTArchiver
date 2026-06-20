@@ -79,11 +79,10 @@
     // can revert the field instead of saving garbage.
     let _diskLastGood = "24";
 
-    // RAM estimate: each cached video row is ~1 KB of Python objects
-    // (title + filepath strings + small numbers + dict overhead). We
-    // rough-estimate by (channels) * (limit) * 1 KB and show it live
-    // under the Preload limit field so the user can see the trade-off.
-    const BYTES_PER_ROW = 1024;
+    // RAM estimate is intentionally a range: real rows vary with title,
+    // path depth, thumbnails, and Python object overhead.
+    const BYTES_PER_ROW_LOW = 2048;
+    const BYTES_PER_ROW_HIGH = 6144;
     function _fmtMB(bytes) {
       if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
       return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -104,12 +103,13 @@
         // request: "On warning: longer load time on launch.
         // Off warning: longer load time on first browse tab load."
         if (allEl?.checked) {
-          const est = nVids * BYTES_PER_ROW;
+          const estLow = nVids * BYTES_PER_ROW_LOW;
+          const estHigh = nVids * BYTES_PER_ROW_HIGH;
           hintB.innerHTML =
             `<span style="color:var(--c-log-sum);">\u26A0</span> ` +
             `All ${nVids.toLocaleString()} videos loaded at launch \u2014 ` +
             `startup takes longer (several seconds to a couple minutes on large archives). ` +
-            `~${_fmtMB(est)} RAM.`;
+            `Rough RAM: ~${_fmtMB(estLow)}-${_fmtMB(estHigh)}.`;
         } else {
           hintB.innerHTML =
             `<span style="color:var(--c-log-sum);">\u26A0</span> ` +
@@ -258,6 +258,15 @@
     // they queue N*K yt-dlp jobs.
     const metaQueueAll = document.getElementById("btn-metadata-queue-all");
     const metaRefresh = document.getElementById("btn-metadata-refresh-all");
+    const metadataQueuedText = (res, prefix = "Queued") => {
+      const queued = Number.isFinite(Number(res?.queued)) ? Number(res.queued) : 0;
+      const total = Number.isFinite(Number(res?.channels)) ? Number(res.channels) : queued;
+      const count = total !== queued
+        ? `${queued} of ${total} channel(s)`
+        : `${queued} channel(s)`;
+      const paused = res?.paused === true ? " Queue is paused - resume to start." : "";
+      return `${prefix} ${count}.${paused}`;
+    };
     // Disable-during-await guard for both Queue and Refresh buttons.
     // Without this, an impatient double-click stacked two askConfirm
     // modals — the user could click through both, queuing the same
@@ -274,7 +283,7 @@
           { confirm: "Queue all" });
         if (!ok) return;
         const res = await bridgeCall("metadata_queue_all", false);
-        if (res?.ok) window._showToast?.(`Queued ${res.channels} channel(s).`, "ok");
+        if (res?.ok) window._showToast?.(metadataQueuedText(res), res?.paused === true ? "warn" : "ok");
         else window._showToast?.(res?.error || "Queue failed.", "error");
       } finally {
         metaQueueAll.disabled = false;
@@ -293,7 +302,7 @@
           { confirm: "Refresh" });
         if (!ok) return;
         const res = await bridgeCall("metadata_queue_all", true);
-        if (res?.ok) window._showToast?.(`Queued refresh for ${res.channels} channel(s).`, "ok");
+        if (res?.ok) window._showToast?.(metadataQueuedText(res, "Queued refresh for"), res?.paused === true ? "warn" : "ok");
         else window._showToast?.(res?.error || "Refresh failed.", "error");
       } finally {
         metaRefresh.disabled = false;
@@ -330,7 +339,8 @@
           catch (e) { return { ok: false, error: String(e) }; }
           if (p && !p.pending) return p;
         }
-        return { ok: false, error: "Timed out." };
+        try { await bridgeCall("realign_cancel", token); } catch {}
+        return { ok: false, error: "Timed out; cancellation requested." };
       };
 
       btn.addEventListener("click", async () => {
@@ -487,10 +497,19 @@
         // modal — this is an infrequent admin op, the prompt is
         // minimum UI.
         let channels = [];
+        let channelLoadError = "";
         try {
           const data = await bridgeCall("get_subs_channels");
           if (Array.isArray(data) && data.length === 2) channels = data[0] || [];
-        } catch (_e) { /* fall through */ }
+        } catch (e) {
+          channelLoadError = String(e);
+          console.warn("get_subs_channels failed:", e);
+        }
+        if (channelLoadError) {
+          window._showToast?.(
+            `Could not load channels: ${channelLoadError}`, "error");
+          return;
+        }
         if (!channels.length) {
           window._showToast?.("No channels found.", "warn");
           return;
@@ -690,20 +709,15 @@
                 </div>
               </div>`;
           }).join("");
-          // Open dialog and inject HTML before awaiting (same pattern as U-11).
-          const dialogPromise = askQuestion({
+          await askQuestion({
             title: `Imported ${res.added} channels (${skipped} skipped)`,
-            message: "",
+            message: "Skipped channels by reason.",
+            bodyHtml:
+              `<div style="margin-bottom:8px;color:#888;font-size:11px;">` +
+              `Skipped channels by reason:</div>` + reasonHtml,
             confirm: "OK",
             noCancel: true,
           });
-          try {
-            const body = document.querySelector(".askq-backdrop:last-child .askq-body");
-            if (body) body.innerHTML =
-              `<div style="margin-bottom:8px;color:#888;font-size:11px;">` +
-              `Skipped channels by reason:</div>` + reasonHtml;
-          } catch {}
-          await dialogPromise;
         } else {
           window._showToast?.(`Added ${res.added} channels (${skipped} skipped).`, "ok");
         }
@@ -762,6 +776,12 @@
           <td style="color:#888;">${_esc(it.modified)}</td>
         </tr>`
       ).join("");
+      const ftsWarn = prev.fts_skipped
+        ? `<div style="margin:8px 0 0;padding:6px;border:1px solid #6b4a1d;
+                     border-radius:4px;color:#e0b568;background:rgba(180,120,40,0.10);">
+             ${_esc(prev.fts_skipped)}
+           </div>`
+        : "";
       const previewHtml =
         `<div style="max-height:280px;overflow:auto;
                      border:1px solid #2a2d33;border-radius:4px;
@@ -780,23 +800,15 @@
          <div style="margin-top:8px;font-size:11px;color:#888;">
            Total: ${prev.items.length} file(s) \u2014 ${_esc(prev.total_label)}.
            Your current config will be snapshotted before overwrite.
-         </div>`;
-      // Open the dialog (askQuestion creates the backdrop synchronously
-      // and returns a promise that resolves on Confirm / Cancel / Esc).
-      // We inject the rich preview HTML BEFORE awaiting \u2014 otherwise the
-      // user would see an empty modal until they clicked something.
-      const previewPromise = askQuestion({
+         </div>${ftsWarn}`;
+      const confirmRestore = await askQuestion({
         title: "Restore this backup?",
-        message: "",  // body filled in below
+        message: "Review the backup contents before restoring.",
+        bodyHtml: previewHtml,
         confirm: "Restore",
         cancel: "Cancel",
         danger: true,
       });
-      try {
-        const body = document.querySelector(".askq-backdrop:last-child .askq-body");
-        if (body) body.innerHTML = previewHtml;
-      } catch {}
-      const confirmRestore = await previewPromise;
       if (!confirmRestore) return;
       const res = await bridgeCall("import_full_backup", prev.zip_path);
       _handleImportResult(res);

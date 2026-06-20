@@ -87,6 +87,7 @@
     })();
 
     const urlLooksLikeVideo = (s) => _YT_RE.test((s || "").trim());
+    window._urlLooksLikeVideo = urlLooksLikeVideo;
     const urlLooksLikeChannel = (s) => {
       const t = (s || "").trim();
       if (!t) return false;

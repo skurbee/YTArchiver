@@ -56,10 +56,15 @@
           <div class="bookmark-head">
             <span class="bookmark-title"></span>
             <span class="bookmark-meta"></span>
-            <button class="icon-btn-slim" data-remove="${b.id}" title="Delete bookmark">\u00d7</button>
           </div>
           ${isWholeVideo ? "" : '<div class="bookmark-text"></div>'}
         `;
+        const removeBtn = document.createElement("button");
+        removeBtn.className = "icon-btn-slim";
+        removeBtn.dataset.remove = String(b.id);
+        removeBtn.title = "Delete bookmark";
+        removeBtn.textContent = "\u00d7";
+        row.querySelector(".bookmark-head")?.appendChild(removeBtn);
         row.querySelector(".bookmark-title").textContent = b.title || "(untitled)";
         row.querySelector(".bookmark-meta").textContent = isWholeVideo
           ? (b.channel || "")

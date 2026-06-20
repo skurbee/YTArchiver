@@ -62,7 +62,9 @@
       const titleAttr = el.getAttribute("title");
       if (titleAttr) {
         el.setAttribute("data-tooltip", titleAttr);
-        el.removeAttribute("title");
+        if (!el.hasAttribute("aria-label") && !el.hasAttribute("aria-describedby")) {
+          el.setAttribute("aria-label", titleAttr);
+        }
       }
       const text = el.getAttribute("data-tooltip") || "";
       if (!text) return;
@@ -94,12 +96,43 @@
         }
       }, 400);
     });
+    document.addEventListener("focusin", (e) => {
+      const el = e.target.closest("[title], [data-tooltip]");
+      if (!el || el === currentEl) return;
+      const titleAttr = el.getAttribute("title");
+      if (titleAttr) {
+        el.setAttribute("data-tooltip", titleAttr);
+        if (!el.hasAttribute("aria-label") && !el.hasAttribute("aria-describedby")) {
+          el.setAttribute("aria-label", titleAttr);
+        }
+      }
+      const text = el.getAttribute("data-tooltip") || "";
+      if (!text) return;
+      hide();
+      currentEl = el;
+      timer = setTimeout(() => {
+        if (!document.contains(el)) return;
+        const rect = el.getBoundingClientRect();
+        bubble = makeBubble(text, rect.left + rect.width / 2, rect.bottom + 6);
+        const br = bubble.getBoundingClientRect();
+        let left = (rect.left + rect.width / 2) - (br.width / 2);
+        if (left + br.width > window.innerWidth - 10) {
+          left = window.innerWidth - br.width - 10;
+        }
+        if (left < 10) left = 10;
+        bubble.style.left = left + "px";
+        if (br.bottom > window.innerHeight - 10) {
+          bubble.style.top = (rect.top - br.height - 6) + "px";
+        }
+      }, 400);
+    });
     document.addEventListener("mouseout", (e) => {
       if (!currentEl) return;
       const to = e.relatedTarget;
       if (to && currentEl.contains(to)) return; // still inside
       hide();
     });
+    document.addEventListener("focusout", hide);
     // Also hide when the user starts clicking / typing
     document.addEventListener("mousedown", hide);
     document.addEventListener("keydown", hide);
@@ -122,8 +155,11 @@
       const sel = window.getSelection?.();
       if (sel && sel.toString().length > 0) return;
       try {
-        if (document.activeElement && document.activeElement !== document.body) {
-          document.activeElement.blur();
+        const active = document.activeElement;
+        if (active && active !== document.body && active.matches(
+          "input, textarea, select, [contenteditable='true'], .bookmark-note"
+        )) {
+          active.blur();
         }
       } catch {}
     });

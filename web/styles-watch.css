@@ -215,16 +215,8 @@
 .watch-video-el[data-cap-bg="none"]::cue {
   background: transparent;
 }
-/* 3-words mode: previous + next words are wrapped in <c.dim> spans so
-   the current word stays at full opacity and the neighbors fade. ::cue
-   only honors a narrow style set — opacity is on that list.
-   NOTE: the overlay is now a pinned DOM overlay (`.cap-ovl` below); these
-   ::cue rules are retained but inert (the caption TextTrack is never
-   shown). See watchView.js _ensureCapOverlay. */
-.watch-video-el::cue(.dim) {
-  opacity: 0.55;
-}
-
+/* Native ::cue dim styling was removed; the DOM `.cap-ovl-*` overlay below
+   handles three-word fading in visible captions. */
 /* ═══ Pinned on-video overlay (DOM, replaces native ::cue overlay) ═══
    The <video> is wrapped in `.watch-video-stage` (position:relative) so
    the absolute overlay anchors to the video box, and so fullscreen can
@@ -604,4 +596,3 @@
   padding: 40px 20px;
   text-align: center;
 }
-

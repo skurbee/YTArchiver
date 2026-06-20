@@ -35,7 +35,7 @@ import shutil
 import subprocess
 import sys
 import threading
-import time
+from functools import lru_cache
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -47,6 +47,28 @@ from .subprocess_util import (
 )
 
 _log = get_logger(__name__)
+
+
+class StreamingRunResult:
+    """Backward-compatible result for YtDlpRunner.run_streaming."""
+
+    __slots__ = ("returncode", "stderr_tail", "cancelled")
+
+    def __init__(self, returncode: int, stderr_tail: list[str],
+                 cancelled: bool = False):
+        self.returncode = returncode
+        self.stderr_tail = stderr_tail
+        self.cancelled = cancelled
+
+    def __iter__(self):
+        yield self.returncode
+        yield self.stderr_tail
+
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, idx):
+        return (self.returncode, self.stderr_tail)[idx]
 
 
 # ── ProcessRegistry ───────────────────────────────────────────────────
@@ -72,6 +94,14 @@ class ProcessRegistry:
         if proc is None:
             return proc
         with self._lock:
+            still = []
+            for existing in self._procs:
+                try:
+                    if existing.poll() is None:
+                        still.append(existing)
+                except Exception:
+                    still.append(existing)
+            self._procs = still
             self._procs.append(proc)
         return proc
 
@@ -111,33 +141,38 @@ class ProcessRegistry:
     def kill_all(self, timeout: float = 5.0) -> int:
         """Terminate every tracked process. Returns count terminated.
 
-        Sends terminate, waits up to `timeout` total, then kills any
-        survivors. Used in main.py's shutdown path.
+        Sends terminate to each still-running process, waits up to
+        `timeout` for that process, then kills it if it is still alive.
+        Used in main.py's shutdown path.
         """
         with self._lock:
             procs = list(self._procs)
             self._procs.clear()
         if not procs:
             return 0
-        deadline = time.time() + max(0.0, timeout)
+        per_proc_timeout = max(0.0, timeout)
+        terminated = 0
         for p in procs:
             try:
-                if p.poll() is None:
-                    p.terminate()
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-        for p in procs:
-            try:
-                remaining = max(0.05, deadline - time.time())
-                p.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
+                if p.poll() is not None:
+                    continue
+                terminated += 1
+                p.terminate()
                 try:
-                    p.kill()
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    p.wait(timeout=per_proc_timeout)
+                except subprocess.TimeoutExpired:
+                    if p.poll() is None:
+                        try:
+                            p.kill()
+                        except Exception as e:
+                            _log.debug("swallowed: %s", e)
+                    try:
+                        p.wait(timeout=0.25)
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-        return len(procs)
+        return terminated
 
 
 # Module-level singleton — the rest of the codebase imports this.
@@ -165,7 +200,8 @@ def _exe_dir_candidates() -> list[Path]:
     return out
 
 
-def find_yt_dlp() -> str | None:
+@lru_cache(maxsize=1)
+def _find_yt_dlp_cached() -> str | None:
     """Locate yt-dlp.exe. Identical behavior to sync.find_yt_dlp but
     available without importing sync (which pulls in heavy deps).
     Result is NOT cached here — each caller pays one shutil.which.
@@ -185,7 +221,8 @@ def find_yt_dlp() -> str | None:
     return None
 
 
-def find_ffprobe() -> str | None:
+@lru_cache(maxsize=1)
+def _find_ffprobe_cached() -> str | None:
     """Locate ffprobe — PATH first, then sibling-of-app dir."""
     p = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
     if p:
@@ -202,6 +239,22 @@ def find_ffprobe() -> str | None:
 
 
 # ── YtDlpRunner ──────────────────────────────────────────────────────
+
+def find_yt_dlp() -> str | None:
+    """Locate yt-dlp.exe, cached process-wide."""
+    return _find_yt_dlp_cached()
+
+
+def find_ffprobe() -> str | None:
+    """Locate ffprobe, cached process-wide."""
+    return _find_ffprobe_cached()
+
+
+def reset_process_binary_caches() -> None:
+    """Clear module-level process binary lookup caches."""
+    _find_yt_dlp_cached.cache_clear()
+    _find_ffprobe_cached.cache_clear()
+
 
 # Type alias for the cookie-provider callback. Returns a list of yt-dlp
 # args (e.g. ["--cookies-from-browser", "firefox"]) or empty list. The
@@ -250,6 +303,7 @@ class YtDlpRunner:
         """Forget the cached executable path (e.g. after install update)."""
         with self._binary_lock:
             self._binary_cached = None
+        reset_process_binary_caches()
 
     def build_argv(self, *extra: str,
                    include_cookies: bool = True,
@@ -336,7 +390,7 @@ class YtDlpRunner:
                       *, on_stdout_line: Callable[[str], None] | None = None,
                       cancel_event: threading.Event | None = None,
                       extra_env: dict | None = None
-                      ) -> tuple[int, list[str]]:
+                      ) -> StreamingRunResult:
         """Run yt-dlp and stream stdout line by line via `on_stdout_line`.
 
         Used for long-running passes (channel sync) where the caller
@@ -346,11 +400,13 @@ class YtDlpRunner:
         Stderr is also drained on a background thread (last 200 lines
         captured for the return tuple's diagnostic list).
 
-        Returns (returncode, stderr_tail).
+        Returns a StreamingRunResult. It still unpacks as
+        (returncode, stderr_tail), and exposes `.cancelled` so callers can
+        distinguish user cancellation from a launch/process failure.
         """
         argv = list(argv)
         if not argv:
-            return -1, ["yt-dlp not found"]
+            return StreamingRunResult(-1, ["yt-dlp not found"])
         try:
             proc = subprocess.Popen(
                 argv,
@@ -363,12 +419,13 @@ class YtDlpRunner:
                 startupinfo=make_startupinfo(),
                 creationflags=subprocess_creationflags(),
                 env=utf8_env(extra_env or None),
-            )
+        )
         except OSError as e:
-            return -1, [f"launch failed: {e}"]
+            return StreamingRunResult(-1, [f"launch failed: {e}"])
         self._registry.register(proc)
         from collections import deque
         stderr_tail: deque = deque(maxlen=200)
+        cancelled = False
 
         def _drain_stderr():
             try:
@@ -388,6 +445,7 @@ class YtDlpRunner:
             if proc.stdout is not None:
                 for line in iter(proc.stdout.readline, ""):
                     if cancel_event is not None and cancel_event.is_set():
+                        cancelled = True
                         try:
                             proc.terminate()
                         except Exception:
@@ -403,6 +461,13 @@ class YtDlpRunner:
             # leaving a process that ignored SIGTERM running until app
             # shutdown's kill_all reaped it.
             try:
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    if proc.poll() is None:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 try:
@@ -427,7 +492,8 @@ class YtDlpRunner:
                 t.join(timeout=2.0)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-        return proc.returncode if proc.returncode is not None else -1, list(stderr_tail)
+        rc = proc.returncode if proc.returncode is not None else -1
+        return StreamingRunResult(rc, list(stderr_tail), cancelled=cancelled)
 
 
 # ── FfmpegRunner ─────────────────────────────────────────────────────

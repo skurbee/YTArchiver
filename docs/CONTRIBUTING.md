@@ -45,7 +45,10 @@ YTArchiver/
 │   │   ├── sync_helpers.py   # file/format helpers
 │   │   ├── log_rows.py       # activity-log row emission
 │   │   ├── quickcheck.py     # fast "are there new uploads?" probe
-│   │   ├── ytdlp_proc.py     # yt-dlp subprocess plumbing
+│   │   ├── options.py       # normalized sync options
+│   │   ├── ytdlp_proc.py     # yt-dlp lookup/cookies/formats
+│   │   ├── ytdlp_events.py   # yt-dlp output parsing
+│   │   ├── ytdlp_session.py  # process launch/watchdog/finish
 │   │   ├── recent_track.py   # Recent-tab download tracking
 │   │   ├── active_state.py   # in-flight sync-channel tracking
 │   │   └── display_push.py   # sync-progress JSON for companion display
@@ -67,6 +70,7 @@ YTArchiver/
 │   │   ├── normalize.py        # title canonicalization
 │   │   ├── scan.py             # per-channel video scan
 │   │   └── thumbnails_ops.py   # thumbnail housekeeping
+│   ├── services/           # AppServices + event bus + file ops
 │   ├── metadata_io.py      # JSONL I/O helpers (extracted Patch 5)
 │   ├── pause_helpers.py    # Shared pause/cancel guards
 │   ├── index.py            # SQLite index entry — schema + register + reads
@@ -195,11 +199,11 @@ always carry the ten: `v37.9 + 0.1 = v38.0` (never `v37.10`).
 
 ## Known gaps
 
-- No automated tests. End-to-end testing is manual — run
-  `python main.py` and exercise the flow you touched. The repo used
-  to ship a small `tests/` smoke suite for import + re-export
-  checking during the package-decomposition pass; it was removed
-  once the splits stabilized.
+- A backend smoke suite lives at `tests/test_backend_smoke.py`. Run it with
+  `py -3.13 scripts/smoke.py` before patches that touch imports, re-exports,
+  sync helpers, generated HTML, frontend JS, or bridge-facing backend behavior.
+- End-to-end UI testing is still manual — run `python main.py` and exercise
+  the flow you touched.
 - `web/app.js` modularization is complete (10,218 → ~150 lines across
   ~50 focused modules). Remaining work is small-cleanup passes only.
 

@@ -34,6 +34,48 @@ from .scan import _scan_channel_videos
 _log = get_logger(__name__)
 
 
+def _scan_metadata_and_thumbnail_ids(folder: Path, name: str, stream=None
+                                     ) -> tuple[set[str], int, set[str], int]:
+    """Return metadata ids/count and thumbnail ids/count from one tree walk."""
+    have_meta: set[str] = set()
+    have_thumb: set[str] = set()
+    jsonl_count = 0
+    thumb_file_count = 0
+    _expected_prefix = f".{name} "
+    _expected_exact = f".{name} Metadata.jsonl"
+    _thumb_id_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
+    for dp, _dns, fns in os.walk(str(folder)):
+        if os.path.basename(dp).lower() == ".thumbnails":
+            for fn in fns:
+                low = fn.lower()
+                if not low.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                    continue
+                thumb_file_count += 1
+                m = _thumb_id_re.search(fn)
+                if m:
+                    have_thumb.add(m.group(1))
+            continue
+        for fn in fns:
+            if not fn.endswith("Metadata.jsonl"):
+                continue
+            if fn != _expected_exact and not fn.startswith(_expected_prefix):
+                continue
+            jsonl_count += 1
+            try:
+                have_meta.update(
+                    _read_metadata_jsonl(os.path.join(dp, fn)).keys())
+            except Exception as _re:
+                if stream is not None:
+                    try:
+                        stream.emit_dim(
+                            f" (jsonl read failed: {fn} â€” {_re})")
+                    except Exception:
+                        pass
+                _log.warning("metadata jsonl read failed during recheck: "
+                             "%s: %s", os.path.join(dp, fn), _re)
+    return have_meta, jsonl_count, have_thumb, thumb_file_count
+
+
 def fetch_channel_metadata(channel: dict[str, Any],
                            stream: LogStreamer,
                            cancel_event: threading.Event | None = None,
@@ -181,7 +223,8 @@ def fetch_channel_metadata(channel: dict[str, Any],
                         if _fp:
                             _failed_id_files.add(os.path.normpath(_fp).lower())
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        _log.warning("metadata recheck failed to load prior DB failure "
+                     "state for %r: %s", ch_name, e)
     # Files we couldn't resolve to a video_id. Skip ones we already
     # gave up on in a previous run.
     unmatched_files = [v[4] for v in on_disk if not v[0]
@@ -197,11 +240,13 @@ def fetch_channel_metadata(channel: dict[str, Any],
     # Without this, targets selection would skip "covered" videos that
     # are actually missing metadata for THIS channel (audit:
     # refresh_fetch.py C16).
-    have_meta: set = set()
-    jsonl_count = 0
+    have_meta, jsonl_count, have_thumb, thumb_file_count = (
+        _scan_metadata_and_thumbnail_ids(folder, name, stream))
+    have_meta = set(have_meta)
+    jsonl_count = int(jsonl_count)
     _expected_prefix = f".{name} "          # ".{ch_name} ..."
     _expected_exact  = f".{name} Metadata.jsonl"
-    for dp, _dns, fns in os.walk(str(folder)):
+    for dp, _dns, fns in ():
         for fn in fns:
             if not fn.endswith("Metadata.jsonl"):
                 continue
@@ -233,10 +278,10 @@ def fetch_channel_metadata(channel: dict[str, Any],
     # `<safe_title> [<video_id>].<ext>` inside `.Thumbnails/`
     # subfolders (one per year/month split). We extract the
     # bracketed video_id from each filename.
-    have_thumb: set = set()
-    thumb_file_count = 0
+    have_thumb = set(have_thumb)
+    thumb_file_count = int(thumb_file_count)
     _thumb_id_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
-    for dp, _dns, fns in os.walk(str(folder)):
+    for dp, _dns, fns in ():
         # Only look in .Thumbnails/ folders — avoids picking up a
         # bracketed id from an unrelated file elsewhere in the tree.
         if os.path.basename(dp).lower() != ".thumbnails":
@@ -449,7 +494,8 @@ def fetch_channel_metadata(channel: dict[str, Any],
                                 "duplicate-detect commit rolled back: %s",
                                 _ce)
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                _log.warning("metadata duplicate-detect DB update failed "
+                             "for %r: %s", name, e)
             if n_duplicates_flagged:
                 stream.emit([
                     [" \u26A0 ", "meta_bracket"],
@@ -510,7 +556,8 @@ def fetch_channel_metadata(channel: dict[str, Any],
                                     (_now, _fp))
                         conn.commit()
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                _log.warning("metadata id-resolve failure stamp failed "
+                             "for %r: %s", name, e)
             stream.emit([
                 [" \u2014 ", "meta_bracket"],
                 [f"{len(still_unmatched):,} file(s) couldn't be matched "

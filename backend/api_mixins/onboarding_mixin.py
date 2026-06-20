@@ -102,8 +102,13 @@ class OnboardingMixin:
             cfg = load_config()
             cfg["onboarded"] = True
             ok = save_config(cfg)
+            if not ok:
+                return {
+                    "ok": False,
+                    "error": "config save failed (disk full / locked?)",
+                }
             self._reload_config()
-            return {"ok": bool(ok)}
+            return {"ok": True}
         except Exception as e:
             _log.warning("onboarding_finish failed: %s", e)
             return {"ok": False, "error": str(e)}

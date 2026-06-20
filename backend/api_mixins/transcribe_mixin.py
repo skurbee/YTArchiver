@@ -10,12 +10,26 @@ from __future__ import annotations
 
 from ._shared import *  # noqa: F401,F403
 
+_TRANSCRIBE_FOLDER_MAX_CANDIDATES = 500
+
 
 class TranscribeMixin:
 
     # ─── Transcribe ─────────────────────────────────────────────────────
 
-    def transcribe_enqueue(self, path, title=""):
+    _WHISPER_MODELS = {"tiny", "small", "medium", "large-v3"}
+
+    def _apply_runtime_whisper_model(self, model):
+        model = (model or "").strip()
+        if not model:
+            return {"ok": True}
+        if model not in self._WHISPER_MODELS:
+            return {"ok": False, "error": "Unsupported model"}
+        if not self._transcribe.swap_model(model):
+            return {"ok": False, "error": "Model swap failed"}
+        return {"ok": True}
+
+    def transcribe_enqueue(self, path, title="", model=""):
         """Queue a video for transcription."""
         # Derive the channel from the index DB so the transcribe worker can
         # resolve the correct conjoined Transcript.txt path. The manual
@@ -41,6 +55,9 @@ class TranscribeMixin:
                             break
         except Exception as e:
             _log.debug("swallowed: %s", e)
+        model_result = self._apply_runtime_whisper_model(model)
+        if not model_result.get("ok"):
+            return model_result
         try:
             ok = self._transcribe.enqueue(path, title, channel=_channel)
         except Exception as _e:
@@ -59,7 +76,7 @@ class TranscribeMixin:
         return {"ok": ok}
 
 
-    def transcribe_folder(self):
+    def transcribe_folder(self, model=""):
         """Prompt for a folder, recursively queue every untranscribed video.
 
         Mirrors YTArchiver.py:16505 _run_manual_transcription_folder. Skips
@@ -75,6 +92,9 @@ class TranscribeMixin:
         """
         if self._window is None:
             return {"ok": False, "error": "No window"}
+        model_result = self._apply_runtime_whisper_model(model)
+        if not model_result.get("ok"):
+            return model_result
 
         def _run():
             try:
@@ -108,11 +128,16 @@ class TranscribeMixin:
                 _have_agg = True
             except Exception:
                 _have_agg = False
+            _channel_cache: dict[str, str] = {}
 
             def _channel_for(video):
+                _dir = os.path.normcase(os.path.normpath(os.path.dirname(video)))
+                if _dir in _channel_cache:
+                    return _channel_cache[_dir]
                 try:
                     _rconn = _idx._reader_open()
                     if _rconn is None:
+                        _channel_cache[_dir] = ""
                         return ""
                     for _fp in (str(video), os.path.normpath(str(video))):
                         with _idx._reader_lock:
@@ -121,9 +146,11 @@ class TranscribeMixin:
                                 "WHERE filepath = ? LIMIT 1",
                                 (_fp,)).fetchone()
                         if _row and _row[0]:
+                            _channel_cache[_dir] = _row[0]
                             return _row[0]
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
+                _channel_cache[_dir] = ""
                 return ""
 
             def _already_done(video, title, channel):
@@ -154,18 +181,36 @@ class TranscribeMixin:
                     _log.debug("swallowed: %s", e)
                     return False
 
-            for dp, _dns, fns in os.walk(folder):
+            candidates: list[tuple[str, str]] = []
+            too_many = False
+            for dp, dns, fns in os.walk(folder):
                 for fn in fns:
                     if not fn.lower().endswith((".mp4", ".mkv", ".webm", ".m4a", ".mov")):
                         continue
                     video = os.path.join(dp, fn)
                     title = os.path.splitext(fn)[0]
-                    _ch = _channel_for(video)
-                    if _already_done(video, title, _ch):
-                        skipped += 1
-                        continue
-                    self._transcribe.enqueue(video, title, channel=_ch)
-                    queued += 1
+                    candidates.append((video, title))
+                    if len(candidates) > _TRANSCRIBE_FOLDER_MAX_CANDIDATES:
+                        too_many = True
+                        dns[:] = []
+                        break
+                if too_many:
+                    break
+            if too_many:
+                self._log_stream.emit_error(
+                    "[GPU] Transcribe folder aborted: found more than "
+                    f"{_TRANSCRIBE_FOLDER_MAX_CANDIDATES} media files in "
+                    f"{os.path.basename(folder) or folder}. Choose a narrower folder.")
+                self._log_stream.flush()
+                return
+
+            for video, title in candidates:
+                _ch = _channel_for(video)
+                if _already_done(video, title, _ch):
+                    skipped += 1
+                    continue
+                self._transcribe.enqueue(video, title, channel=_ch)
+                queued += 1
             try:
                 self._on_queue_changed()
             except Exception as e:
@@ -382,9 +427,8 @@ class TranscribeMixin:
         if not new_model or new_model not in ("tiny", "small", "medium", "large-v3"):
             return {"ok": False, "error": "Unsupported model"}
         ok = self._transcribe.swap_model(new_model)
+        persisted = False
         if ok and persist:
-            if self._config is not None:
-                self._config["whisper_model"] = new_model
             # Acquire the same settings_save lock so a parallel
             # settings_save can't load_config, see the OLD whisper
             # model, mutate, and clobber our write (audit:
@@ -396,18 +440,22 @@ class TranscribeMixin:
                 _lock = None
             try:
                 from backend.ytarchiver_config import save_config as _sc
+                saved = False
                 if _lock is not None:
                     with _lock:
                         cfg = load_config()
                         cfg["whisper_model"] = new_model
-                        _sc(cfg)
+                        saved = bool(_sc(cfg))
                 else:
                     cfg = load_config()
                     cfg["whisper_model"] = new_model
-                    _sc(cfg)
+                    saved = bool(_sc(cfg))
+                if saved:
+                    self._reload_config()
+                    persisted = True
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-        return {"ok": ok, "model": new_model, "persisted": bool(ok and persist)}
+        return {"ok": ok, "model": new_model, "persisted": persisted}
 
 
     def transcribe_current_model(self):

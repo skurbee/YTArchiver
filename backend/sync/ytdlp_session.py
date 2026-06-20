@@ -17,6 +17,8 @@ _log = get_logger(__name__)
 
 @dataclass(slots=True)
 class LaunchResult:
+    """Outcome of a yt-dlp launch attempt before stdout parsing begins."""
+
     proc: subprocess.Popen | None = None
     cancelled: bool = False
     failed: bool = False
@@ -24,9 +26,17 @@ class LaunchResult:
 
 @dataclass(slots=True)
 class DownloadWatchdog:
+    """State shared with the watchdog thread that can kill stalled yt-dlp."""
+
     stop_event: threading.Event
     last_output: list[float]
     stalled: dict[str, bool]
+    thread: threading.Thread
+
+    def stop(self, timeout: float | None = None) -> None:
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=timeout)
 
 
 def popen_ytdlp_process(cmd: list[str], *, startupinfo: Any = None
@@ -88,11 +98,13 @@ def start_download_watchdog(
                     pass
                 return
 
-    threading.Thread(target=_run, name="dl-watchdog", daemon=True).start()
+    thread = threading.Thread(target=_run, name="dl-watchdog", daemon=True)
+    thread.start()
     return DownloadWatchdog(
         stop_event=stop_event,
         last_output=last_output,
         stalled=stalled,
+        thread=thread,
     )
 
 

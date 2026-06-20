@@ -17,6 +17,18 @@ class SyncMixin:
         return bool(self._sync_thread and self._sync_thread.is_alive())
 
 
+    def _start_sync_thread_locked(self, target):
+        """Assign and start _sync_thread only if no sync worker is alive."""
+        if not hasattr(self, "_sync_start_lock"):
+            self._sync_start_lock = threading.Lock()
+        with self._sync_start_lock:
+            if self.sync_is_running():
+                return False
+            self._sync_thread = threading.Thread(target=target, daemon=True)
+            self._sync_thread.start()
+            return True
+
+
     def _maybe_autostart_sync(self):
         """Auto-fire the sync worker after a queue-enqueue UI action.
 
@@ -74,6 +86,9 @@ class SyncMixin:
         try:
             if self.sync_is_running():
                 return {"ok": False, "error": "Sync already running"}
+            if getattr(self, "_reorg_running", False):
+                return {"ok": False,
+                        "error": "Folder reorganization is running. Wait for it to finish before syncing."}
             if not sync_backend.find_yt_dlp():
                 return {"ok": False, "error": "yt-dlp not found. Install yt-dlp or place yt-dlp.exe next to the app."}
             return self._sync_start_all_inner(add_downloads_from_config)
@@ -785,7 +800,16 @@ class SyncMixin:
                 # (same rationale as sync_start_all's fix).
                 try: threading.Timer(0.5, self._on_queue_changed).start()
                 except Exception as e: _log.debug("swallowed: %s", e)
-        self._sync_thread = threading.Thread(target=_run, daemon=True)
-        self._sync_thread.start()
+        if not self._start_sync_thread_locked(_run):
+            # Another start path won the race after our optimistic
+            # is-running check. Queue this channel on the live worker
+            # instead of overwriting _sync_thread with a second thread.
+            try:
+                added = bool(self._queues.sync_enqueue(ch))
+            except Exception as e:
+                return {"ok": False, "error": f"Could not queue: {e}"}
+            try: self._on_queue_changed()
+            except Exception as e: _log.debug("swallowed: %s", e)
+            return {"ok": True, "queued": added, "name": ch_name}
         self._on_queue_changed()
         return {"ok": True, "started": True}

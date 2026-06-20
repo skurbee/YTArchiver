@@ -48,44 +48,34 @@ class WindowMixin:
                 from backend.ytarchiver_config import save_config as _sc
                 cfg = self._config or load_config()
                 cfg["close_behavior"] = choice
-                _sc(cfg)
-                self._reload_config()
+                if _sc(cfg):
+                    self._reload_config()
+                else:
+                    try:
+                        self._log_stream.emit_dim(
+                            " (close behavior preference not saved)")
+                    except Exception:
+                        pass
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                try:
+                    self._log_stream.emit_dim(
+                        f" (close behavior preference not saved: {e})")
+                except Exception:
+                    pass
+                _log.warning("close behavior preference save failed: %s", e)
 
-        # NUCLEAR OPTION (2026-05-13): repeated soft fixes haven't
-        # held. The user wants Quit to actually quit, period. This
-        # path now does the minimum possible amount of work before
-        # invoking Win32 TerminateProcess on ourselves — which is
-        # the strongest possible "kill this process" call short of
-        # pulling power. TerminateProcess does NOT need the target
-        # thread to cooperate; it can be invoked from any thread
-        # and the OS kills the process unconditionally.
-        # The price: in-flight downloads / writes may leave temp
-        # files behind. But the user is clicking Quit. They expect
-        # the app to exit. Cleanup hygiene is secondary to that.
-        # Subsequent launches will rotate temp folders via the
-        # startup cleanup_temps sweep anyway.
-        import ctypes as _ctypes
-
-        # Fire TWO independent kill paths. If one is somehow blocked
-        # by GIL contention or scheduler weirdness, the other should
-        # still fire.
+        # Quit runs on a background thread so the JS bridge can return,
+        # then performs the full shutdown cleanup before destroying the
+        # webview. main.py performs the final process exit after
+        # webview.start() returns.
 
         def _kill_via_thread():
             import time as _t
             _t.sleep(0.10)  # let the API response return to JS
-            # WATCHDOG: Quit must ALWAYS quit. If the cleanup below
-            # hangs (Z: spinning up, stuck subprocess join), this
-            # timer pulls the plug unconditionally. 8s outlasts
-            # _shutdown_cleanup's own bounded waits with margin.
+            # Last-resort fallback only. Normal cleanup gets a long grace
+            # period so queue/index/log writes are not cut off mid-flush.
             def _watchdog():
-                _t.sleep(8.0)
-                try:
-                    _ctypes.windll.kernel32.TerminateProcess(
-                        _ctypes.c_void_p(-1), 0)
-                except Exception:
-                    pass
+                _t.sleep(30.0)
                 import os as _os2
                 _os2._exit(0)
             try:
@@ -125,19 +115,18 @@ class WindowMixin:
                     save_t.join(timeout=2.0)
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
-            # Kill the process. TerminateProcess with current
-            # process handle (-1 == GetCurrentProcess()) is
-            # equivalent to TerminateProcess(GetCurrentProcess(), 0)
-            # but doesn't need an extra call.
+            # After cleanup, close the webview and let main.py's
+            # webview.start() teardown perform the final process exit.
             try:
-                _ctypes.windll.kernel32.TerminateProcess(
-                    _ctypes.c_void_p(-1), 0)
+                state = getattr(self, "_close_state", None)
+                if isinstance(state, dict):
+                    state["flag"] = True
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-            # Belt-and-suspenders if TerminateProcess somehow
-            # didn't kill us.
             try:
-                _ctypes.windll.kernel32.ExitProcess(0)
+                if self._window:
+                    self._window.destroy()
+                    return
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             import os as _os
@@ -185,19 +174,7 @@ class WindowMixin:
         landed (audit: window_mixin H9 — same fix already in
         backup_mixin.py).
         """
-        if not paths:
-            return None
-        if isinstance(paths, str):
-            return paths or None
-        try:
-            if len(paths) == 0:
-                return None
-            first = paths[0]
-            if isinstance(first, str) and first:
-                return first
-        except (TypeError, IndexError):
-            return None
-        return None
+        return normalize_dialog_paths(paths)
 
     def pick_folder(self, title="Choose a folder", initial=None):
         """Open a native folder picker (pywebview's FOLDER_DIALOG)."""
@@ -364,17 +341,9 @@ class WindowMixin:
                 _wv.SAVE_DIALOG,
                 save_filename=suggested_name,
             )
-            if not paths:
+            path = normalize_dialog_paths(paths)
+            if not path:
                 return {"ok": False, "cancelled": True}
-            if isinstance(paths, str):
-                path = paths
-            else:
-                try:
-                    if not len(paths):
-                        return {"ok": False, "cancelled": True}
-                    path = paths[0]
-                except (TypeError, IndexError):
-                    return {"ok": False, "cancelled": True}
             # Atomic tmp+replace so a mid-write disk-full doesn't
             # truncate a pre-existing file the user picked to
             # overwrite (audit: window_mixin.py:244-261).

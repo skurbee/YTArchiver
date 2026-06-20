@@ -10,9 +10,10 @@ The "Refresh views" button on Settings → Metadata drives this.
 from __future__ import annotations
 
 import os
+import random
 import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from ..log import get_logger
@@ -37,6 +38,10 @@ from .fetcher import (
 from .scan import _scan_channel_videos
 
 _log = get_logger(__name__)
+
+
+def _utc_fetched_at_now() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 def bulk_refresh_views_likes(channel: dict[str, Any],
@@ -133,6 +138,17 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 _log.debug("swallowed: %s", e)
     _hb_thread = threading.Thread(target=_heartbeat, daemon=True)
     _hb_thread.start()
+    class _HeartbeatGuard:
+        def __init__(self, alive):
+            self._alive = alive
+
+        def stop(self):
+            self._alive[0] = False
+
+        def __del__(self):
+            self.stop()
+
+    _hb_guard = _HeartbeatGuard(_hb_alive)
     # Cap the heartbeat at a hard deadline (30 min) and watch the
     # current thread's liveness so it can't leak forever if the
     # function body raises before reaching the normal `_hb_alive[0]
@@ -161,7 +177,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     _hb_catalog_count[0] = max(_hb_catalog_count[0], len(bulk))
     _hb_phase[0] = "matching local files"
     if not bulk:
-        _hb_alive[0] = False  # stop heartbeat
+        _hb_guard.stop()
         # Replace the in-place "Refreshing X..." line with this warning
         # so the user sees the failure cleanly instead of two side-by-
         # side lines (the warning + the orphaned Refreshing... line).
@@ -288,7 +304,8 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                         except Exception: pass
                         _log.error("title-resolve commit failed: %s", _ce)
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            _log.warning("views refresh title-resolution DB update failed "
+                         "for %r: %s", name, e)
         # User-friendly wording: dropped "(no [id] in filename)"
         # technicality — users shouldn't have to know about the
         # internal DB state to understand what happened.
@@ -414,7 +431,8 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
             stream.emit_error(
                 f"removed-from-YT detection failed for {name}: {_rm_e}")
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            _log.warning("views refresh removed-video DB stamp failed "
+                         "for %r: %s", name, e)
 
     on_disk_ids = {v[0] for v in on_disk if v[0]}
     # Count duplicate video_ids (same id on disk in two folders — usually
@@ -527,7 +545,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         if _comment_new is not None:
             old["comment_count"] = _comment_new
         if _changed or _no_flat_data:
-            old["fetched_at"] = datetime.now().isoformat()
+            old["fetched_at"] = _utc_fetched_at_now()
             old["_dirty"] = True
 
         # VERBOSE-ONLY per-video diff trace. Compact one-liner showing
@@ -588,7 +606,13 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         # could read, both miss the other's changes, then both write
         # (audit: refresh_views.py C15).
         with _lock_for(jp):
-            full = _read_metadata_jsonl(jp)
+            try:
+                full = _read_metadata_jsonl(jp, strict=True)
+            except Exception as e:
+                stream.emit_dim(
+                    f" (metadata read failed for {os.path.basename(jp)}; "
+                    f"skipping rewrite: {e})")
+                continue
             full.update(entries)
             try:
                 _write_metadata_jsonl(jp, full)
@@ -655,9 +679,13 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         _last_tick_ts = time.time()
         _processed = 0
         _total = len(changed_ids)
-        for vid in changed_ids:
+        for _j, vid in enumerate(changed_ids, 1):
             if cancel_event is not None and cancel_event.is_set():
                 break
+            if _j > 1:
+                time.sleep(random.uniform(0.3, 0.8))
+                if cancel_event is not None and cancel_event.is_set():
+                    break
             # Pause-wait between videos. The user might have clicked
             # Pause minutes ago — they're waiting on this exact loop
             # to land here. Emit a Paused log line + signal active.
@@ -731,11 +759,12 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         # stamp rather than fall through to an unserialized write that
         # could clobber a concurrent writer.
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        _log.warning("views refresh timestamp stamp failed for %r: %s",
+                     name, e)
 
     # Stop the heartbeat thread BEFORE the clear_line + summary so
     # the in-place line doesn't get re-painted on top of the summary.
-    _hb_alive[0] = False
+    _hb_guard.stop()
     took = time.time() - t0
     # Drop all the per-channel transitional lines tagged with
     # `views_refresh_progress` ("Refreshing X...", "N video(s) have

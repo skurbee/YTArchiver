@@ -36,6 +36,9 @@
   let _whisperChecking = false; // auto import-verify in flight
   let _deps = null;           // last probe snapshot
   let _force = false;         // true when re-opened from Settings (dismissable)
+  const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
+  let _coreWatchdog = null;
+  let _whisperWatchdog = null;
 
   const STEP_NEXT_LABEL = { 1: "Get started", 2: "Continue", 3: "Continue", 4: "Finish" };
 
@@ -67,8 +70,12 @@
     if (el) el.innerHTML = rows.join("");
     // Update the Install button label/state.
     const btn = $("onb-install-core");
+    const allOk = d.ytdlp?.ok && d.ffmpeg?.ok && d.ffprobe?.ok;
+    if (allOk && _coreBusy) {
+      _coreBusy = false;
+      _clearInstallWatchdog("core");
+    }
     if (btn && !_coreBusy) {
-      const allOk = d.ytdlp?.ok && d.ffmpeg?.ok && d.ffprobe?.ok;
       btn.textContent = allOk ? "Reinstall" : "Install";
       btn.disabled = false;
     }
@@ -95,6 +102,10 @@
     const el = $("onb-whisper-rows");
     if (el) el.innerHTML = rows.join("");
     const btn = $("onb-install-whisper");
+    if (wOk && _whisperBusy) {
+      _whisperBusy = false;
+      _clearInstallWatchdog("whisper");
+    }
     if (btn && !_whisperBusy) {
       btn.textContent = wOk ? "Reinstall" : "Install";
       btn.disabled = false;
@@ -147,6 +158,7 @@
       if (r && r.ok && r.deps) _deps = Object.assign({}, _deps || {}, r.deps);
     } catch (e) {
       console.error("[onboarding] auto-verify whisper", e);
+      window._showToast?.(`Could not verify transcription setup: ${e}`, "warn");
     } finally {
       _whisperChecking = false;
       renderWhisperRows(_deps);
@@ -232,7 +244,13 @@
       }
       if (d.status === "done") {
         if (fill) { fill.classList.remove("onb-fill-indef"); fill.style.width = "100%"; }
-        if (isWhisper) { _whisperBusy = false; } else { _coreBusy = false; }
+        if (isWhisper) {
+          _whisperBusy = false;
+          _clearInstallWatchdog("whisper");
+        } else {
+          _coreBusy = false;
+          _clearInstallWatchdog("core");
+        }
         if (d.state && d.state.ytdlp) renderDeps(d.state);
         // Leave the final message visible briefly, then collapse the bar.
         if (msg) msg.textContent = d.ok ? "Done." : ("Failed: " + (d.error || d.msg || "unknown"));
@@ -240,28 +258,71 @@
       }
     } catch (e) {
       console.error("[onboarding] progress error", e);
+      window._showToast?.(`Setup progress update failed: ${e}`, "warn");
     }
   }
 
   // ── install actions ───────────────────────────────────────────────────
+  function _clearInstallWatchdog(kind) {
+    if (kind === "whisper") {
+      if (_whisperWatchdog) clearTimeout(_whisperWatchdog);
+      _whisperWatchdog = null;
+    } else {
+      if (_coreWatchdog) clearTimeout(_coreWatchdog);
+      _coreWatchdog = null;
+    }
+  }
+
+  function _startInstallWatchdog(kind) {
+    _clearInstallWatchdog(kind);
+    const isWhisper = kind === "whisper";
+    const timer = setTimeout(() => {
+      if (isWhisper) _whisperBusy = false;
+      else _coreBusy = false;
+      const btn = $(isWhisper ? "onb-install-whisper" : "onb-install-core");
+      const msg = $(isWhisper ? "onb-whisper-msg" : "onb-core-msg");
+      const fill = $(isWhisper ? "onb-whisper-fill" : "onb-core-fill");
+      if (btn) { btn.disabled = false; btn.textContent = "Retry"; }
+      if (msg) {
+        msg.textContent = "Install timed out - click to retry.";
+        msg.classList.add("onb-msg-error");
+      }
+      if (fill) fill.classList.remove("onb-fill-indef");
+      if (isWhisper) _whisperWatchdog = null;
+      else _coreWatchdog = null;
+    }, INSTALL_TIMEOUT_MS);
+    if (isWhisper) _whisperWatchdog = timer;
+    else _coreWatchdog = timer;
+  }
+
   async function installCore() {
     if (!nativeBridgeUp() || _coreBusy) return;
     _coreBusy = true;
+    _startInstallWatchdog("core");
     const btn = $("onb-install-core");
     if (btn) { btn.disabled = true; btn.textContent = "Installing…"; }
     const wrap = $("onb-core-progress"); if (wrap) wrap.hidden = false;
     try { await bridgeCall("onboarding_install_core"); }
-    catch (e) { _onboardingProgress({ phase: "core", status: "error", msg: String(e) }); _coreBusy = false; }
+    catch (e) {
+      _clearInstallWatchdog("core");
+      _onboardingProgress({ phase: "core", status: "error", msg: String(e) });
+      _coreBusy = false;
+    }
   }
 
   async function installWhisper() {
     if (!nativeBridgeUp() || _whisperBusy) return;
     _whisperBusy = true;
+    _startInstallWatchdog("whisper");
     const btn = $("onb-install-whisper");
     if (btn) { btn.disabled = true; btn.textContent = "Installing…"; }
     const wrap = $("onb-whisper-progress"); if (wrap) wrap.hidden = false;
     try { await bridgeCall("onboarding_install_whisper"); }
-    catch (e) { _onboardingProgress({ phase: "whisper", status: "error", msg: String(e) }); _whisperBusy = false; }
+    catch (e) {
+      _clearInstallWatchdog("whisper");
+      _onboardingProgress({ phase: "whisper", status: "error", msg: String(e) });
+      _whisperBusy = false;
+    }
   }
 
   async function recheck() {
@@ -269,7 +330,10 @@
     try {
       const r = await bridgeCall("onboarding_probe", true);
       if (r && r.ok && r.deps) renderDeps(r.deps);
-    } catch (e) { console.error("[onboarding] recheck", e); }
+    } catch (e) {
+      console.error("[onboarding] recheck", e);
+      window._showToast?.(`Setup re-check failed: ${e}`, "warn");
+    }
   }
 
   async function pickFolder() {
@@ -305,7 +369,10 @@
 
   async function finish() {
     try { if (nativeBridgeUp()) await bridgeCall("onboarding_finish"); }
-    catch (e) { console.error("[onboarding] finish", e); }
+    catch (e) {
+      console.error("[onboarding] finish", e);
+      window._showToast?.(`Could not save setup completion: ${e}`, "warn");
+    }
     const ov = $("onboarding-overlay");
     if (ov) ov.hidden = true;
     document.removeEventListener("keydown", _escBlock, true);
@@ -372,7 +439,10 @@
           renderDeps(st.deps || {});
         }
       }
-    } catch (e) { console.error("[onboarding] state load", e); }
+    } catch (e) {
+      console.error("[onboarding] state load", e);
+      window._showToast?.(`Could not load setup state: ${e}`, "warn");
+    }
     ov.hidden = false;
     document.addEventListener("keydown", _escBlock, true);
     gotoStep(1);

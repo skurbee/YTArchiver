@@ -95,21 +95,34 @@ def _update_db_text(conn: sqlite3.Connection, video_id: str,
     updated = 0
     affected_ids = []
     for seg in segments:
+        s_val = float(seg.get("start") or 0)
+        e_val = float(seg.get("end") or 0)
         # Capture rowids we'll touch so we can re-sync FTS afterward.
+        # Match repair_captions' tolerance window instead of exact
+        # float equality so tiny parse/rewrite drift cannot desync DB
+        # text from the JSONL sidecar.
         try:
             row = conn.execute(
                 "SELECT id, text FROM segments "
-                "WHERE video_id=? AND start_time=? AND end_time=?",
-                (video_id, seg["start"], seg["end"])).fetchone()
+                "WHERE video_id=? "
+                "AND ABS(start_time - ?) < 0.01 "
+                "AND ABS(end_time - ?) < 0.01",
+                (video_id, s_val, e_val)).fetchone()
         except sqlite3.Error:
             row = None
         cur = conn.execute(
             "UPDATE segments SET text=? "
-            "WHERE video_id=? AND start_time=? AND end_time=?",
-            (seg["text"], video_id, seg["start"], seg["end"]))
+            "WHERE video_id=? "
+            "AND ABS(start_time - ?) < 0.01 "
+            "AND ABS(end_time - ?) < 0.01",
+            (seg["text"], video_id, s_val, e_val))
         if cur.rowcount and row:
             # (rowid, old_text) — used to clear stale FTS tokens.
             affected_ids.append((row[0], row[1]))
+        elif not cur.rowcount:
+            _log.warning(
+                "punct_restore: no DB row matched %s %.3f-%.3f",
+                video_id, s_val, e_val)
         updated += cur.rowcount
     # FTS re-sync: issue 'delete' with the OLD text to clear stale
     # tokens, then re-insert with the NEW text. Done in batches to
@@ -131,14 +144,12 @@ def _update_db_text(conn: sqlite3.Connection, video_id: str,
                     "INSERT INTO segments_fts(rowid, text) VALUES(?, ?)",
                     new_id_text)
         except sqlite3.Error as e:
-            # Best-effort — log and continue. A subsequent
-            # rebuild_fts_index will fix any drift.
             try:
-                from .log import get_logger
-                get_logger(__name__).debug(
-                    "FTS re-sync after _update_db_text failed: %s", e)
-            except Exception:
+                conn.rollback()
+            except sqlite3.Error:
                 pass
+            raise RuntimeError(
+                f"FTS re-sync failed after punctuation update: {e}") from e
     conn.commit()
     return updated
 

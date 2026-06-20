@@ -55,10 +55,15 @@
     };
     const saveFooter = document.getElementById("settings-actions-footer");
     if (!buttons.length) return;
+    document.querySelector(".settings-sidebar")?.setAttribute("role", "tablist");
     const show = (key) => {
       buttons.forEach(b => b.classList.toggle("active", b.dataset.settingsView === key));
+      buttons.forEach(b => {
+        const active = b.dataset.settingsView === key;
+        b.setAttribute("aria-selected", active ? "true" : "false");
+      });
       for (const k of Object.keys(views)) {
-        if (views[k]) views[k].style.display = (k === key) ? "" : "none";
+        if (views[k]) views[k].hidden = (k !== key);
       }
       // Hide Save on Index + Metadata (both have their own actions
       // and no form fields). Show on everything else.
@@ -80,8 +85,20 @@
       }
     };
     buttons.forEach(b => {
+      b.setAttribute("role", "tab");
+      b.tabIndex = 0;
+      if (b.dataset.settingsView) {
+        b.setAttribute("aria-controls", "settings-view-" + b.dataset.settingsView);
+      }
+      b.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          b.click();
+        }
+      });
       b.addEventListener("click", () => show(b.dataset.settingsView || "general"));
     });
+    show(document.querySelector(".settings-subnav-btn.active")?.dataset.settingsView || "general");
   }
 
   // Settings > Index sub-tab: Archive Roots list + Auto-update-every-N +
@@ -96,6 +113,14 @@
     if (!rootsList && !autoCB) return;
 
     let _selectedRoot = null;
+
+    const saveSettingsChecked = async (payload, label) => {
+      const res = await bridgeCall("settings_save", payload);
+      if (!res?.ok) {
+        throw new Error(res?.error || `${label || "Settings"} save failed.`);
+      }
+      return res;
+    };
 
     const _confirmDeleteAllTranscriptions = async (folder) => {
       if (!nativeBridgeUp()) {
@@ -147,7 +172,10 @@
         const s = nativeBridgeUp() ? await bridgeCall("settings_load") : null;
         outDir = (s?.output_dir || "").trim();
         extras = Array.isArray(s?.tp_archive_roots) ? s.tp_archive_roots : [];
-      } catch (_e) {}
+      } catch (e) {
+        console.warn("settings_load archive roots failed:", e);
+        window._showToast?.(`Could not load archive roots: ${e}`, "error");
+      }
       const entries = [];
       if (outDir) entries.push({ path: outDir, auto: true });
       for (const r of extras) if (r) entries.push({ path: r, auto: false });
@@ -192,7 +220,8 @@
         const extras = Array.isArray(s?.tp_archive_roots) ? s.tp_archive_roots : [];
         if (extras.includes(res.path)) return;
         extras.push(res.path);
-        await bridgeCall("settings_save", { tp_archive_roots: extras });
+        await saveSettingsChecked(
+          { tp_archive_roots: extras }, "Archive roots");
         await renderRoots();
       } catch (e) {
         window._showToast?.("Add root failed: " + e, "error");
@@ -215,7 +244,8 @@
           return;
         }
         const extras = (s?.tp_archive_roots || []).filter(r => r !== _selectedRoot);
-        await bridgeCall("settings_save", { tp_archive_roots: extras });
+        await saveSettingsChecked(
+          { tp_archive_roots: extras }, "Archive roots");
         _selectedRoot = null;
         await renderRoots();
       } catch (e) {
@@ -231,11 +261,14 @@
       if (n > 9999) n = 9999;
       if (autoThr) autoThr.value = String(n);
       try {
-        await bridgeCall("settings_save", {
+        await saveSettingsChecked({
           auto_index_enabled: enabled,
           auto_index_threshold: n,
-        });
-      } catch (_e) {}
+        }, "Auto-index");
+      } catch (e) {
+        console.warn("auto-index settings save failed:", e);
+        window._showToast?.(`Auto-index save failed: ${e}`, "error");
+      }
     };
     const loadSavedAuto = async () => {
       try {
@@ -244,7 +277,9 @@
           if (autoCB) autoCB.checked = !!s.auto_index_enabled;
           if (autoThr) autoThr.value = String(s.auto_index_threshold || 10);
         }
-      } catch (_e) {}
+      } catch (e) {
+        console.warn("auto-index settings load failed:", e);
+      }
     };
     loadSavedAuto();
     autoCB?.addEventListener("change", persistAuto);

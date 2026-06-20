@@ -229,8 +229,18 @@ _LIVE_MARKERS = (
     "waiting for stream",
 )
 
+_LIVE_LINE_PREFIXES = (
+    "error:",
+    "warning:",
+    "[info]",
+    "[youtube]",
+    "[youtube:",
+)
+
 
 def line_looks_live(line: str) -> bool:
     """Cheap heuristic: does this yt-dlp stdout line indicate a live/scheduled stream?"""
-    low = (line or "").lower()
-    return any(m in low for m in _LIVE_MARKERS)
+    low = (line or "").strip().lower()
+    if not any(m in low for m in _LIVE_MARKERS):
+        return False
+    return any(low.startswith(prefix) for prefix in _LIVE_LINE_PREFIXES)

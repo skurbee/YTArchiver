@@ -81,6 +81,27 @@ from backend.ytarchiver_config import (  # noqa: F401
 
 _log = _get_logger("main")  # share the same logger name as main.py
 
+ALLOWED_REDOWNLOAD_RESOLUTIONS = (
+    "best", "2160", "1440", "1080", "720", "480", "360", "240", "144"
+)
+
+
+def normalize_dialog_paths(paths):
+    """Return the first selected pywebview dialog path, or None on cancel."""
+    if not paths:
+        return None
+    if isinstance(paths, str):
+        return paths or None
+    try:
+        if len(paths) == 0:
+            return None
+        first = paths[0]
+        if isinstance(first, str) and first:
+            return first
+    except (TypeError, IndexError):
+        return None
+    return None
+
 
 # Star-import friendly: explicit re-export list including underscore
 # names that `from ._shared import *` would otherwise skip.
@@ -99,6 +120,8 @@ __all__ = [
     "subs_backend", "archive_scan", "sync_backend", "metadata_backend",
     "index_backend", "compress_backend", "reorg_backend", "winstate",
     "autorun_backend", "net_backend",
+    # shared helpers
+    "normalize_dialog_paths", "ALLOWED_REDOWNLOAD_RESOLUTIONS",
     # classes
     "TrayController", "LogStreamer", "TranscribeManager", "QueueState",
     # logger

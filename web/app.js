@@ -55,8 +55,75 @@
     // Each line is wrapped in try/catch so one broken module doesn't
     // brick the rest of the UI.
     const _safe = (name, fn) => {
-      try { fn(); } catch (e) { console.error(name + ":", e); }
+      try {
+        fn();
+      } catch (e) {
+        if (typeof window._reportBootIssue === "function") {
+          window._reportBootIssue(name, e, { level: "error" });
+        } else {
+          console.error(name + ":", e);
+        }
+      }
     };
+    const _expectedBootFns = [
+      "initTabs",
+      "initGlobalDefocus",
+      "initCustomTooltips",
+      "initSplitter",
+      "initLogMode",
+      "initRefreshSizesClick",
+      "initBrowseSubmodes",
+      "initBrowseSubmodeContent",
+      "initBrowseContextMenus",
+      "initSearchView",
+      "initGraphView",
+      "initBookmarksExport",
+      "initEditChannelPanel",
+      "initSubsContextMenu",
+      "initSubsFilter",
+      "initSyncButton",
+      "initColumnSort",
+      "initQueuePendingButton",
+      "initRecentContextMenu",
+      "initRecentFilter",
+      "initSettingsTab",
+      "initSettingsSubTabs",
+      "initSettingsArchiveRoots",
+      "initIndexControls",
+      "initMetadataTab",
+      "initScanArchive",
+      "initAutorun",
+      "initAutorunHistoryDialog",
+      "initManualTranscribe",
+      "initAboutDialog",
+      "initDiagnosticsDialog",
+      "initDriftScanDialog",
+      "initCompressDryRunDialog",
+      "initRepairCaptionsDialog",
+      "initPunctRestoreDialog",
+      "initQueueModals",
+      "initWatchActions",
+      "initLogContextMenu",
+      "initUrlField",
+      "initDragDropUrl",
+      "initClearLog",
+      "initQueueBlink",
+      "initQueueAutoCheckboxes",
+      "initDeferredLivestreams",
+      "initKeyboardShortcuts",
+      "initLastSyncTicker",
+      "persistSplitterOnResize",
+      "persistColumnWidths",
+      "seedLogs",
+    ];
+    for (const fnName of _expectedBootFns) {
+      if (typeof window[fnName] !== "function") {
+        window._reportBootIssue?.(
+          fnName,
+          `${fnName} is not loaded; related UI controls may not work.`,
+        );
+      }
+    }
 
     // Foundation
     _safe("initTabs",            () => window.initTabs?.());
@@ -129,6 +196,13 @@
     // Run the missing-folder reconcile after seed so the Subs table is
     // already populated when any Remove/Relocate actions happen.
     setTimeout(() => {
+      if (typeof window._reconcileMissingFolders !== "function") {
+        window._reportBootIssue?.(
+          "_reconcileMissingFolders",
+          "Missing-folder reconcile did not load; subscription folder warnings may be stale.",
+        );
+        return;
+      }
       _safe("_reconcileMissingFolders",
             () => window._reconcileMissingFolders?.());
     }, 1500);

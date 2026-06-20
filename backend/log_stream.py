@@ -103,6 +103,8 @@ class LogStreamer:
 
     BATCH_INTERVAL_SEC = 0.06
     MAX_BATCH_SIZE = 200
+    MAX_SEGMENT_TEXT_CHARS = 8192
+    _TRUNC_SUFFIX = "... [truncated]"
 
     def __init__(self, window=None):
         self._window = window
@@ -163,10 +165,34 @@ class LogStreamer:
 
     # ── main log ──
 
+    def _clamp_segments(self, segments: SegmentList) -> SegmentList:
+        out = []
+        for seg in segments:
+            if not isinstance(seg, (list, tuple)) or not seg:
+                out.append(seg)
+                continue
+            text = str(seg[0] or "")
+            if len(text) > self.MAX_SEGMENT_TEXT_CHARS:
+                had_newline = text.endswith("\n")
+                keep = max(
+                    0,
+                    self.MAX_SEGMENT_TEXT_CHARS
+                    - len(self._TRUNC_SUFFIX)
+                    - (1 if had_newline else 0),
+                )
+                text = text[:keep] + self._TRUNC_SUFFIX
+                if had_newline:
+                    text += "\n"
+            clipped = list(seg)
+            clipped[0] = text
+            out.append(clipped)
+        return out
+
     def emit(self, segments: SegmentList):
         """Append one line of segments to the main log."""
         if not segments:
             return
+        segments = self._clamp_segments(segments)
         # Simple-mode filter — drop pure-verbose lines
         if self.simple_mode and _line_is_verbose_only(segments):
             return

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import mimetypes
 import os
+import secrets
 import socket
 import threading
 import urllib.parse
@@ -44,6 +45,7 @@ _lock = threading.Lock()
 # was only "..-in-segments + isabs + exists", which let any
 # absolute path on disk be read through http://127.0.0.1:PORT/file/.
 _allowed_roots: list[str] = []
+_request_token: str = ""
 
 
 def _normalize_root(p: str) -> str:
@@ -118,6 +120,21 @@ def _is_under_allowed_root(path: str) -> bool:
     return False
 
 
+def _authorized_request(handler: BaseHTTPRequestHandler,
+                        parsed: urllib.parse.SplitResult) -> bool:
+    expected = _request_token
+    if not expected:
+        return False
+    supplied = handler.headers.get("X-YTArchiver-Token", "")
+    if not supplied:
+        try:
+            supplied = urllib.parse.parse_qs(
+                parsed.query, keep_blank_values=True).get("t", [""])[0]
+        except Exception:
+            supplied = ""
+    return secrets.compare_digest(str(supplied), expected)
+
+
 class _FileRequestHandler(BaseHTTPRequestHandler):
     # Advertise HTTP/1.1 so `Accept-Ranges: bytes` + 206 Partial Content
     # responses are recognized by WebView2 / Chromium video elements.
@@ -141,12 +158,12 @@ class _FileRequestHandler(BaseHTTPRequestHandler):
             try: self.wfile.write(b"ok")
             except (OSError, ConnectionError): pass
             return None
-        if not self.path.startswith("/file/"):
+        parsed = urllib.parse.urlsplit(self.path)
+        if not parsed.path.startswith("/file/"):
             self.send_error(404); return None
-        raw = self.path[len("/file/"):]
-        q = raw.find("?")
-        if q >= 0:
-            raw = raw[:q]
+        if not _authorized_request(self, parsed):
+            self.send_error(403); return None
+        raw = parsed.path[len("/file/"):]
         try:
             path = urllib.parse.unquote(raw)
         except Exception:
@@ -260,7 +277,7 @@ def _pick_free_port() -> int:
 
 def start_server() -> int:
     """Start the local file server (once). Returns the port number."""
-    global _server_port, _server_thread, _httpd
+    global _server_port, _server_thread, _httpd, _request_token
     with _lock:
         if _server_port and _server_thread and _server_thread.is_alive():
             return _server_port
@@ -284,6 +301,7 @@ def start_server() -> int:
             target=_httpd.serve_forever, name="YTA-FileServer", daemon=True)
         _server_thread.start()
         _server_port = port
+        _request_token = secrets.token_urlsafe(32)
         return port
 
 
@@ -299,12 +317,13 @@ def stop_server() -> None:
     Run the close on a 1s-timeout background thread so even
     server_close() can't deadlock the caller.
     """
-    global _server_port, _server_thread, _httpd
+    global _server_port, _server_thread, _httpd, _request_token
     with _lock:
         httpd = _httpd
         _httpd = None
         _server_port = 0
         _server_thread = None
+        _request_token = ""
     if httpd is None:
         return
     def _close():
@@ -325,7 +344,7 @@ def url_for(path: str) -> str:
 
     Caller is responsible for starting the server first via `start_server()`.
     """
-    if not _server_port or not path:
+    if not _server_port or not path or not _request_token:
         return ""
     # quote the whole abs path so spaces/brackets/apostrophes are encoded.
     # safe="" means EVERYTHING gets percent-encoded except alphanumerics —
@@ -333,4 +352,5 @@ def url_for(path: str) -> str:
     # `quote` call's default safe chars.
     norm = os.path.abspath(path).replace("\\", "/")
     encoded = urllib.parse.quote(norm, safe="")
-    return f"http://127.0.0.1:{_server_port}/file/{encoded}"
+    token = urllib.parse.quote(_request_token, safe="")
+    return f"http://127.0.0.1:{_server_port}/file/{encoded}?t={token}"

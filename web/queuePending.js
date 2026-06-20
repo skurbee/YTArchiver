@@ -85,7 +85,10 @@
     if (!qpBtn) return;
 
     qpBtn.addEventListener("click", async () => {
-      if (!nativeBridgeUp()) return;
+      if (!nativeBridgeUp()) {
+        window._showToast?.("App still starting - try again in a moment.", "warn");
+        return;
+      }
       const res = await bridgeCall("subs_queue_pending");
       if (res?.ok) {
         const parts = [];
@@ -94,6 +97,8 @@
         window._showToast?.(parts.length
           ? `Queued ${parts.join(", ")}.`
           : "No pending channels.", parts.length ? "ok" : "warn");
+      } else {
+        window._showToast?.(res?.error || "Queue pending failed.", "error");
       }
       // Re-fetch channel rows so the badge reflects backend counter
       // resets. Without this, chan_transcribe_pending can zero a
@@ -105,15 +110,20 @@
 
     qpBtn.addEventListener("contextmenu", async (e) => {
       e.preventDefault();
+      if (!nativeBridgeUp()) {
+        window._showToast?.("App still starting - try again in a moment.", "warn");
+        return;
+      }
       const ok = await window.askConfirm?.(
         "Queue all channels",
         "Add ALL channels to the transcribe queue? This may take a long time for large libraries.",
         { confirm: "Queue all" });
       if (!ok) return;
-      if (!nativeBridgeUp()) return;
       const res = await bridgeCall("subs_queue_all");
       if (res?.ok) {
         window._showToast?.(`Queued ${res.queued} channels.`, "ok");
+      } else {
+        window._showToast?.(res?.error || "Queue all failed.", "error");
       }
     });
 

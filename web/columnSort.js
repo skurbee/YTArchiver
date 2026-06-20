@@ -360,7 +360,16 @@
       const folder = selected.dataset.channelName
         || (selected.querySelector(".col-folder")?.textContent || "").trim();
       if (!folder) return;
-      if (e.key === "Enter" || e.key === "F2") {
+      if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+        e.preventDefault();
+        const r = selected.getBoundingClientRect();
+        selected.dispatchEvent(new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          clientX: Math.min(window.innerWidth - 8, r.left + 24),
+          clientY: Math.min(window.innerHeight - 8, r.top + Math.min(28, r.height || 28)),
+        }));
+      } else if (e.key === "Enter" || e.key === "F2") {
         e.preventDefault();
         window._editChannelFromContext?.(folder);
       } else if (e.key === "Delete") {

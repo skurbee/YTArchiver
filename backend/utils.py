@@ -198,7 +198,11 @@ def norm_ascii(text: str) -> str:
     nfc = unicodedata.normalize("NFC", text)
     nfkd = unicodedata.normalize("NFKD", nfc)
     ascii_only = nfkd.encode("ascii", "ignore").decode("ascii")
-    return _NORM_ASCII_RE.sub(" ", ascii_only).strip().lower()
+    ascii_key = _NORM_ASCII_RE.sub(" ", ascii_only).strip().lower()
+    if ascii_key:
+        return ascii_key
+    fallback = unicodedata.normalize("NFKC", nfc)
+    return re.sub(r"[^\w\s]+", " ", fallback).strip().lower()
 
 
 # ── Disk pre-flight checks (YTArchiver.py:2314 / 2332) ─────────────────
@@ -238,8 +242,9 @@ def check_disk_space(path: str, required_bytes: int) -> bool:
     try:
         free = shutil.disk_usage(path).free
         return free >= int(required_bytes)
-    except (OSError, ValueError):
-        return True # fail open — don't block on probe errors
+    except (OSError, ValueError) as exc:
+        _log.warning("disk space probe failed for %r: %s", path, exc)
+        return False
 
 
 # ── Subprocess cleanup (YTArchiver.py:2243 / 9214 / 9262) ──────────────
@@ -484,9 +489,9 @@ def unhide_file_win(path) -> None:
 # The old hand-copied tuple omitted .flv/.wmv, so the hide sweeps set
 # the HIDDEN attribute on real video files — and nothing ever unhides
 # media, so they vanished from Explorer permanently.
-from .fs_search import MEDIA_EXTS_TUPLE as _FS_MEDIA_EXTS
+from .fs_search import VIDEO_EXTS_EXTENDED as _FS_VIDEO_EXTS
 
-_VISIBLE_MEDIA_EXTS = tuple(_FS_MEDIA_EXTS)
+_VISIBLE_MEDIA_EXTS = tuple(sorted(_FS_VIDEO_EXTS))
 
 
 def _archive_file_should_be_visible(name: str) -> bool:
@@ -497,7 +502,7 @@ def _archive_file_should_be_visible(name: str) -> bool:
     low = name.lower()
     if low.endswith(_VISIBLE_MEDIA_EXTS):
         return True
-    if low.endswith("transcript.txt"):
+    if low.endswith(" transcript.txt"):
         return True
     return False
 
@@ -540,6 +545,19 @@ def _set_hidden_if_needed(path, entry=None) -> bool:
     except Exception as e:
         _log.debug("swallowed: %s", e)
         return False
+
+
+def _file_has_hidden_attribute(path: str) -> bool:
+    """True when Windows marks the file hidden; False elsewhere/fail-closed."""
+    if os.name != "nt":
+        return False
+    FILE_ATTRIBUTE_HIDDEN = 0x02
+    INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+    try:
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    except Exception:
+        return False
+    return attrs != INVALID_FILE_ATTRIBUTES and bool(attrs & FILE_ATTRIBUTE_HIDDEN)
 
 
 def hide_stray_sidecars(folder, recursive=True, cancel_event=None) -> int:
@@ -684,10 +702,10 @@ def sampled_files_equal(path_a: str, path_b: str, sample: int = 1 << 20) -> bool
 def delete_video_sidecars(filepath: str) -> None:
     """Best-effort cleanup of sidecar files next to a video.
 
-    Removes `.txt`, `.jsonl`, `.info.json`, `.description`,
-    `.live_chat.json`, `.srt`, common image thumbnails, and language-
-    coded caption variants (.*.vtt, .*.srt, .*.ttml). Used by
-    recent_delete_file and video_delete_file.
+    Removes `.jsonl`, `.info.json`, `.description`, `.live_chat.json`,
+    `.srt`, hidden image thumbnails, and language-coded caption variants
+    (.*.vtt, .*.srt, .*.ttml). Used by recent_delete_file and
+    video_delete_file.
 
     Errors per sidecar are swallowed — the primary contract is "the
     main file is gone"; a leaked sidecar is non-fatal.
@@ -699,13 +717,23 @@ def delete_video_sidecars(filepath: str) -> None:
     if not filepath:
         return
     base = os.path.splitext(filepath)[0]
-    _basic_exts = (".txt", ".jsonl", ".info.json", ".description",
-                   ".live_chat.json", ".srt",
-                   ".jpg", ".jpeg", ".webp", ".png")
+    # Do not delete arbitrary same-stem `.txt`: it can be a visible
+    # Transcript.txt or a user note. Image siblings are also only safe to
+    # remove when the app has already hidden them as sidecars.
+    _basic_exts = (".jsonl", ".info.json", ".description",
+                   ".live_chat.json", ".srt")
+    _hidden_image_exts = (".jpg", ".jpeg", ".webp", ".png")
     for ext in _basic_exts:
         sc = base + ext
         try:
             if os.path.isfile(sc):
+                os.remove(sc)
+        except OSError:
+            pass
+    for ext in _hidden_image_exts:
+        sc = base + ext
+        try:
+            if os.path.isfile(sc) and _file_has_hidden_attribute(sc):
                 os.remove(sc)
         except OSError:
             pass

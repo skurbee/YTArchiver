@@ -97,6 +97,7 @@ from .punct_manager import PunctuationManager  # noqa: F401
 # expect these names in this module's namespace.
 from .transcribe_files import (
     _HEADER_RE,  # noqa: F401
+    _jsonl_text_candidates_from_bytes,
     _replace_jsonl_entry,
     _replace_txt_entry,
     _write_jsonl_entry,
@@ -122,6 +123,17 @@ def _pending_journal_path() -> Path:
     return APP_DATA_DIR / "ytarchiver_pending_transcribe.json"
 
 
+def _rough_duration_from_size(path: str) -> float:
+    """Estimate duration from size using the existing ~50 MB/hour heuristic."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return 0.0
+    if size <= 0:
+        return 0.0
+    return max(1.0, (float(size) / (50 * 1024 * 1024)) * 3600.0)
+
+
 class TranscribeManager:
     """Manages the whisper subprocess + a GPU queue."""
 
@@ -141,6 +153,8 @@ class TranscribeManager:
         self._line_queue: queue.Queue | None = None
         self._starting = False
         self._reader_thread: threading.Thread | None = None
+        self._stderr_drain_thread: threading.Thread | None = None
+        self._stderr_buffer = None
         self._python311 = find_python311()
         # Patch 19 fix (v68.2): this file moved from backend/transcribe.py
         # to backend/transcribe/legacy.py. The worker script is bundled
@@ -196,6 +210,85 @@ class TranscribeManager:
         # in the queue without firing. Checked each worker iteration so
         # toggling the Auto checkbox mid-pass takes effect between jobs.
         self._cfg_loader = None # set via attach_queues
+
+    def _whisper_stderr_tail(self, max_lines: int = 8,
+                             max_chars: int = 1200) -> str:
+        try:
+            lines = [str(ln).strip() for ln in list(self._stderr_buffer or [])
+                     if str(ln).strip()]
+        except Exception:
+            return ""
+        if not lines:
+            return ""
+        tail = "\n".join(lines[-max_lines:])
+        return tail[-max_chars:]
+
+    def _emit_whisper_stderr_tail(self,
+                                  label: str = "Whisper stderr") -> None:
+        tail = self._whisper_stderr_tail()
+        if tail:
+            self._stream.emit_dim(f" ({label}: {tail})")
+
+    def _emit_whisper_traceback(self, msg: dict[str, Any]) -> None:
+        trace = str(msg.get("traceback") or "").strip()
+        if trace:
+            self._stream.emit_dim(f" (Whisper traceback: {trace[-1200:]})")
+
+    def _send_cancel_command(self) -> bool:
+        with self._proc_lock:
+            proc = self._proc
+            if (proc is None or proc.poll() is not None
+                    or proc.stdin is None or proc.stdin.closed):
+                return False
+            try:
+                proc.stdin.write(json.dumps({"command": "cancel"}) + "\n")
+                proc.stdin.flush()
+                return True
+            except Exception as e:
+                _log.debug("whisper cancel command failed: %s", e)
+                return False
+
+    def _wait_for_cancel_ack(self, timeout: float = 5.0) -> bool:
+        q = self._line_queue
+        if q is None:
+            return False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                line = q.get(timeout=min(0.25, max(0.01, deadline - time.time())))
+            except queue.Empty:
+                continue
+            if line is None:
+                return False
+            try:
+                msg = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+            status = msg.get("status")
+            if status in {"cancelled", "ok", "error"}:
+                return True
+        return False
+
+    def _graceful_cancel_current(self, timeout: float = 5.0) -> bool:
+        if not self._send_cancel_command():
+            return False
+        return self._wait_for_cancel_ack(timeout=timeout)
+
+    def _snapshot_worker_io(self):
+        with self._proc_lock:
+            return self._proc, self._line_queue
+
+    def _wait_for_starting_subprocess(self, timeout: float = 600.0) -> bool:
+        """Wait for a concurrent start_subprocess call to finish."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._proc_lock:
+                if not self._starting:
+                    return bool(
+                        self._proc is not None
+                        and self._proc.poll() is None)
+            time.sleep(0.1)
+        return False
 
     def attach_queues(self, queues, cfg_loader=None) -> None:
         """Connect this manager to the shared QueueState.
@@ -280,13 +373,18 @@ class TranscribeManager:
 
     def start_subprocess(self, model: str | None = None) -> bool:
         """Start the persistent whisper worker. Returns True when ready."""
+        wait_for_start = False
         with self._proc_lock:
             if self._proc is not None and self._proc.poll() is None:
                 return True
             if self._starting:
-                return False
-            self._starting = True
-            self._proc = None
+                wait_for_start = True
+            else:
+                self._starting = True
+                self._proc = None
+
+        if wait_for_start:
+            return self._wait_for_starting_subprocess()
 
         try:
             if not self._python311:
@@ -361,12 +459,14 @@ class TranscribeManager:
             t.join(timeout=600) # 10 min for model download + load
             if t.is_alive():
                 self._stream.emit_error("Transcription took too long to start.")
+                self._emit_whisper_stderr_tail()
                 self._stop_subprocess()
                 return False
 
             line = ready_result[0]
             if not line:
                 self._stream.emit_error("Transcription tool didn't respond. Try again.")
+                self._emit_whisper_stderr_tail()
                 self._stop_subprocess()
                 return False
             try:
@@ -380,6 +480,7 @@ class TranscribeManager:
                     ["   — ", ["dim"]],
                     [f"raw payload: {line[:200]}\n", ["dim"]],
                 ])
+                self._emit_whisper_stderr_tail()
                 self._stop_subprocess()
                 return False
             if info.get("status") != "ready":
@@ -388,6 +489,8 @@ class TranscribeManager:
                     ["   — ", ["dim"]],
                     [f"status: {info}\n", ["dim"]],
                 ])
+                self._emit_whisper_traceback(info)
+                self._emit_whisper_stderr_tail()
                 self._stop_subprocess()
                 return False
 
@@ -481,6 +584,13 @@ class TranscribeManager:
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             self._reader_thread = None
+            try:
+                _st = self._stderr_drain_thread
+                if _st is not None and _st.is_alive():
+                    _st.join(timeout=2.0)
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+            self._stderr_drain_thread = None
             self._proc = None
             self._line_queue = None
 
@@ -523,7 +633,22 @@ class TranscribeManager:
             self._stream.emit_error(f"Transcribe: file not found: {path}")
             return False
         _job_title = title or os.path.basename(path)
+        _path_key = os.path.normcase(os.path.normpath(os.path.abspath(path)))
         with self._jobs_lock:
+            def _same_transcribe_path(job: dict[str, Any] | None) -> bool:
+                if not job or (job.get("kind") or "transcribe") != "transcribe":
+                    return False
+                job_path = job.get("path") or ""
+                if not job_path:
+                    return False
+                return (
+                    os.path.normcase(os.path.normpath(os.path.abspath(job_path)))
+                    == _path_key
+                )
+
+            if any(_same_transcribe_path(j) for j in self._jobs) \
+                    or _same_transcribe_path(self._current_job):
+                return False
             self._jobs.append({
                 "path": path,
                 "title": _job_title,
@@ -610,6 +735,19 @@ class TranscribeManager:
         path = str(path)
         if not os.path.isfile(path):
             self._stream.emit_error(f"Compress: file not found: {path}")
+            return False
+        path = os.path.normpath(path)
+        try:
+            from ..utils import is_within_managed_roots
+            if not is_within_managed_roots(path):
+                self._stream.emit_error(
+                    "Compress: refusing to queue file outside the archive.")
+                return False
+        except Exception as e:
+            _log.warning("compress containment check failed for %s: %s",
+                         path, e)
+            self._stream.emit_error(
+                "Compress: could not verify archive containment.")
             return False
         _job_title = title or os.path.splitext(os.path.basename(path))[0]
         with self._jobs_lock:
@@ -856,21 +994,17 @@ class TranscribeManager:
         self._cancel_all.set()
         with self._jobs_lock:
             self._jobs.clear()
-        if self._current_job:
-            self._current_job["cancel"].set()
-        # Kill the whisper subprocess like skip_current does. Leaving
-        # it alive mid-chunk let its late {"status":"ok"} response sit
-        # in _line_queue; the NEXT transcribe job reused the live
-        # process and accepted that stale result as its own — the OLD
-        # video's text was written into the NEW video's transcript
-        # (and FTS) and the new video marked transcribed. Stopping the
-        # process drops the line queue so no stale response can cross
-        # job boundaries, and releases the chunk WAV handle so temp
-        # cleanup stops leaking ~230MB files on cancelled chunks.
-        try:
-            self._stop_subprocess(force=True)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+            job = self._current_job
+            if job and "cancel" in job:
+                job["cancel"].set()
+            # Keep the job lock through the subprocess stop so the
+            # worker cannot clear _current_job, pop the next job, and
+            # start a new subprocess between our cancel signal and kill.
+            if job:
+                try:
+                    self._stop_subprocess(force=True)
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
         # also clear the shared GPU popover queue so the UI
         # doesn't keep showing phantom "pending" rows for tasks that
         # have been cancelled. The worker's finally-path would normally
@@ -902,10 +1036,8 @@ class TranscribeManager:
         the queue is empty and no job is running, is_active() returns False
         immediately and the final notify paints the button to idle.
         """
-        if self._current_job is not None:
-            return True
         with self._jobs_lock:
-            return len(self._jobs) > 0
+            return self._current_job is not None or len(self._jobs) > 0
 
     def skip_current(self):
         """Cancel the currently-running job but keep the queue + worker alive.
@@ -913,23 +1045,22 @@ class TranscribeManager:
         Fires the per-job cancel event so _transcribe_one returns promptly;
         worker loop then picks up the next job. No-op if nothing running.
 
-        also force-restart the whisper subprocess so the GPU
-        actually frees up for the next job. Previously the cancel event
-        was set but whisper kept chugging on the current file until
-        completion (just discarding the result) — GPU stayed pinned for
-        the rest of the original video's duration. Killing the subprocess
-        makes "skip" actually skip. Next job picks up a fresh process.
+        Also sends the worker's cooperative cancel command so the GPU
+        work stops without killing the warm Whisper subprocess. The
+        read loop falls back to a force-kill if the worker does not
+        acknowledge cancellation promptly.
         """
-        job = self._current_job
-        if job and "cancel" in job:
-            try:
-                job["cancel"].set()
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-            try:
-                self._stop_subprocess(force=True)
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
+        with self._jobs_lock:
+            job = self._current_job
+            if job and "cancel" in job:
+                try:
+                    job["cancel"].set()
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+                try:
+                    self._send_cancel_command()
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
 
     def _ensure_worker(self):
         if self._worker_thread is None or not self._worker_thread.is_alive():
@@ -1005,7 +1136,7 @@ class TranscribeManager:
                 if not self._jobs:
                     break
                 job = self._jobs.pop(0)
-            self._current_job = job
+                self._current_job = job
             # Journal the in-flight job state IMMEDIATELY so a crash
             # between here and the finally-end _persist_pending call
             # doesn't lose the in-flight job (audit: transcribe/
@@ -1099,7 +1230,9 @@ class TranscribeManager:
                 ]])
                 crashed = True
             finally:
-                if crashed:
+                if job.get("_requeued_no_tally"):
+                    job.pop("_requeued_no_tally", None)
+                elif crashed:
                     stats["err"] += 1
                 else:
                     stats["done"] += 1
@@ -1121,7 +1254,9 @@ class TranscribeManager:
                             _cfg.remove_pending_tx_id(_vid)
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
-                self._current_job = None
+                with self._jobs_lock:
+                    if self._current_job is job:
+                        self._current_job = None
                 # audit D-10 / if the previous job had been
                 # forced into CPU mode via OOM fallback, reset the env
                 # back to CUDA regardless of whether the fallback job
@@ -1408,7 +1543,8 @@ class TranscribeManager:
                 ["transcribe_using", job_tag],
             ]])
 
-        if self._proc is None or self._proc.poll() is not None:
+        proc, _line_q = self._snapshot_worker_io()
+        if proc is None or proc.poll() is not None:
             if not self.start_subprocess():
                 # Subprocess failed to start — emit an error so the
                 # user knows why the transcription silently died
@@ -1442,6 +1578,7 @@ class TranscribeManager:
         # (audit: transcribe/core.py H70).
         _duration_is_real = duration > 0.0
         if duration <= 0.0:
+            duration = _rough_duration_from_size(path)
             try:
                 _sz = os.path.getsize(path)
                 # 120 MB threshold ~= 2 hour 1080p — conservative; we'd
@@ -1510,9 +1647,12 @@ class TranscribeManager:
             "duration": 0,
             "duration_fallback": float(duration) if duration else 0.0,
         }) + "\n"
+        proc, q = self._snapshot_worker_io()
+        if proc is None or q is None:
+            return
         try:
-            self._proc.stdin.write(req)
-            self._proc.stdin.flush()
+            proc.stdin.write(req)
+            proc.stdin.flush()
         except Exception as e:
             # Suppress the error toast when cancel was already
             # requested — BrokenPipeError on cancel is normal cleanup,
@@ -1540,14 +1680,24 @@ class TranscribeManager:
                 self._stream.emit([
                     [" \u26d4 Transcription cancelled.\n", _tag_list]
                 ])
-                self._stop_subprocess()
+                if self._cancel_all.is_set():
+                    self._stop_subprocess(force=True)
+                elif not self._graceful_cancel_current():
+                    self._stop_subprocess(force=True)
                 return
             try:
-                line = self._line_queue.get(timeout=0.5)
+                _proc_snapshot, q = self._snapshot_worker_io()
+                if q is None:
+                    if job["cancel"].is_set() or self._cancel_all.is_set():
+                        return
+                    self._stream.emit_error("Transcription stopped unexpectedly. Try again.")
+                    return
+                line = q.get(timeout=0.5)
             except queue.Empty:
                 continue
             if line is None:
                 self._stream.emit_error("Transcription stopped unexpectedly. Try again.")
+                self._emit_whisper_stderr_tail()
                 return
             try:
                 msg = json.loads(line.strip())
@@ -1562,6 +1712,8 @@ class TranscribeManager:
                 continue
             if status == "starting":
                 continue
+            if status == "cancelled":
+                return
             if status == "ok":
                 result = msg
                 break
@@ -1595,10 +1747,12 @@ class TranscribeManager:
                         # to 0 prematurely while the retry is still
                         # running.
                         job["_pending_decremented"] = True
+                        job["_requeued_no_tally"] = True
                         with self._jobs_lock:
                             self._jobs.insert(0, job)
                     return
                 self._stream.emit_error(f"Transcription error: {err}")
+                self._emit_whisper_traceback(msg)
                 return
 
         # Write output files + ingest into FTS index
@@ -1633,6 +1787,7 @@ class TranscribeManager:
                             result["text"] = punct_text
                             # Also run punctuation per-segment so the .jsonl
                             # matches what search / transcript view shows
+                            _punct_segments_complete = True
                             for seg in result.get("segments", []):
                                 # Cancel-respect inside the per-segment
                                 # punct loop. Without this, a Skip /
@@ -1644,8 +1799,10 @@ class TranscribeManager:
                                 # CPU after the user clicked Cancel.
                                 _job_cancel = job.get("cancel")
                                 if _job_cancel is not None and _job_cancel.is_set():
+                                    _punct_segments_complete = False
                                     break
                                 if self._cancel_all.is_set():
+                                    _punct_segments_complete = False
                                     break
                                 t = seg.get("t", "")
                                 if t and len(t.split()) >= 3:
@@ -1654,7 +1811,7 @@ class TranscribeManager:
                                         seg["t"] = pt
                                     if getattr(self._punct, "last_was_timeout", False):
                                         result["_punct_timeout"] = True
-                            result["_punct_success"] = True
+                            result["_punct_success"] = _punct_segments_complete
                 except Exception as _pe:
                     self._stream.emit_dim(f" (punctuation pass skipped: {_pe})")
             self._write_outputs(path, result, title=title, channel=channel,
@@ -1842,8 +1999,11 @@ class TranscribeManager:
                         f"to avoid silent gaps in the merged transcript.")
                     return
                 except Exception as e:
-                    self._stream.emit_error(f"Section {ci+1}/{n_chunks} split failed: {e}")
-                    continue
+                    self._stream.emit_error(
+                        f"Section {ci+1}/{n_chunks} split failed: {e} "
+                        f"— aborting chunked transcribe to avoid silent gaps "
+                        f"in the merged transcript.")
+                    return
 
                 # Hand the chunk to Whisper via the persistent subprocess.
                 section_prefix = f" Section {ci+1}/{n_chunks},"
@@ -1855,6 +2015,8 @@ class TranscribeManager:
                 except Exception as e: _log.debug("swallowed: %s", e)
 
                 if not result:
+                    if cancel.is_set():
+                        return
                     self._stream.emit([
                         [f" Section {ci+1}/{n_chunks} \u2014 no speech\n", "simpleline"],
                     ])
@@ -2016,9 +2178,13 @@ class TranscribeManager:
         own progress bar. also honors pause INSIDE
         the read loop so a 2-hour chunk can be paused mid-run.
         """
-        if self._proc is None or self._proc.poll() is not None:
+        proc, _line_q = self._snapshot_worker_io()
+        if proc is None or proc.poll() is not None:
             if not self.start_subprocess():
                 return None
+            proc, _line_q = self._snapshot_worker_io()
+        if proc is None:
+            return None
         try:
             # Pass ffprobe duration as fallback so the worker can still
             # render progress on chunks where info.duration is 0
@@ -2028,8 +2194,8 @@ class TranscribeManager:
                 "path": path, "duration": 0,
                 "duration_fallback": float(_chunk_dur),
             }) + "\n"
-            self._proc.stdin.write(req)
-            self._proc.stdin.flush()
+            proc.stdin.write(req)
+            proc.stdin.flush()
         except Exception as e:
             self._stream.emit_error(f"Write to whisper failed: {e}")
             return None
@@ -2038,6 +2204,10 @@ class TranscribeManager:
         _prefix_str = (_log_prefix or "").strip()
         while True:
             if job["cancel"].is_set() or self._cancel_all.is_set():
+                if self._cancel_all.is_set():
+                    self._stop_subprocess(force=True)
+                elif not self._graceful_cancel_current():
+                    self._stop_subprocess(force=True)
                 return None
             # pause also polled inside the read loop so a
             # long chunk mid-transcription can actually pause, not
@@ -2057,13 +2227,24 @@ class TranscribeManager:
                     try: self._queues.set_gpu_paused_active(False)
                     except Exception as e: _log.debug("swallowed: %s", e)
             if job["cancel"].is_set() or self._cancel_all.is_set():
+                if self._cancel_all.is_set():
+                    self._stop_subprocess(force=True)
+                elif not self._graceful_cancel_current():
+                    self._stop_subprocess(force=True)
                 return None
             try:
-                line = self._line_queue.get(timeout=0.5)
+                _proc_snapshot, q = self._snapshot_worker_io()
+                if q is None:
+                    if job["cancel"].is_set() or self._cancel_all.is_set():
+                        return None
+                    self._stream.emit_error("Transcription stopped unexpectedly. Try again.")
+                    return None
+                line = q.get(timeout=0.5)
             except queue.Empty:
                 continue
             if line is None:
                 self._stream.emit_error("Transcription stopped unexpectedly. Try again.")
+                self._emit_whisper_stderr_tail()
                 return None
             try:
                 msg = json.loads(line.strip())
@@ -2090,12 +2271,15 @@ class TranscribeManager:
                 continue
             if status == "starting":
                 continue
+            if status == "cancelled":
+                return None
             if status == "ok":
                 return msg
             if status == "error":
                 self._stream.emit_error(
                     f"Whisper error{(' (' + _log_prefix.strip() + ')') if _log_prefix else ''}: "
                     f"{msg.get('text', 'unknown')}")
+                self._emit_whisper_traceback(msg)
                 return None
 
     def _write_outputs(self, video_path: str, result: dict[str, Any],
@@ -2300,8 +2484,11 @@ class TranscribeManager:
                     f" — .txt left unchanged to avoid split-state.")
                 return
             try:
+                _old_txt_candidates = _jsonl_text_candidates_from_bytes(
+                    _jsonl_backup, title, vid_id)
                 _replace_txt_entry(txt_path, title, text, source_tag,
-                                   extra_titles_to_remove=extra_titles)
+                                   extra_titles_to_remove=extra_titles,
+                                   old_text_candidates=_old_txt_candidates)
             except Exception as _te:
                 self._stream.emit_error(
                     f"Could not update {os.path.basename(txt_path)}: {_te}"
@@ -2356,7 +2543,11 @@ class TranscribeManager:
                                            duration, source_tag, text):
                 self._stream.emit_error(f"Could not write transcript to {txt_path}")
                 return
-            _write_jsonl_entry(jsonl_path, vid_id, title, segs)
+            if not _write_jsonl_entry(jsonl_path, vid_id, title, segs):
+                self._stream.emit_error(
+                    f"Could not write transcript JSONL to {jsonl_path} "
+                    f"— not marking {os.path.basename(video_path)} transcribed")
+                return
 
         # Ingest into FTS index — `ingest_jsonl` does a DELETE WHERE
         # jsonl_path=? first, so re-ingesting after a retranscribe

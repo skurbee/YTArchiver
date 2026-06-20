@@ -15,6 +15,7 @@ import os
 import subprocess
 import time
 import urllib.request
+from urllib.parse import urlparse
 from typing import Any
 
 from .sync import _find_cookie_source, find_yt_dlp
@@ -71,8 +72,16 @@ def _http_get(url: str, dest: str, timeout: int = 30) -> bool:
     """
     tmp = dest + ".tmp"
     try:
+        if urlparse(url).scheme.lower() not in ("http", "https"):
+            return False
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            try:
+                content_len = resp.headers.get("Content-Length")
+                if content_len and int(content_len) > _HTTP_MAX_BYTES:
+                    return False
+            except (TypeError, ValueError):
+                pass
             data = resp.read(_HTTP_MAX_BYTES + 1)
         if not data or len(data) > _HTTP_MAX_BYTES:
             return False
@@ -163,19 +172,27 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
             break
 
     yt_dlp = find_yt_dlp() or "yt-dlp"
-    cmd = [
+    base_cmd = [
         yt_dlp, "--skip-download", "--no-warnings",
         "--dump-single-json", "--flat-playlist", "--playlist-items", "0",
     ]
-    cmd += _find_cookie_source() or []
-    cmd.append(base_url)
 
-    try:
-        proc = subprocess.run(
+    def _run_probe(cookie_args: list[str]) -> subprocess.CompletedProcess:
+        cmd = [*base_cmd, *cookie_args, base_url]
+        return subprocess.run(
             cmd, capture_output=True, text=True, timeout=60,
             encoding="utf-8", errors="replace",
             creationflags=(0x08000000 if os.name == "nt" else 0),
         )
+
+    try:
+        proc = _run_probe([])
+        if proc.returncode != 0 or not (proc.stdout or "").strip():
+            # Channel art is cosmetic. Do not attach YouTube cookies unless
+            # the public metadata probe failed.
+            cookie_args = _find_cookie_source() or []
+            if cookie_args:
+                proc = _run_probe(cookie_args)
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "yt-dlp timed out"}
     except FileNotFoundError:
@@ -208,22 +225,6 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
     # <img src>. Previously only the successful key was present, causing
     # broken-image icons in the Browse grid when only one of avatar/
     # banner fetched successfully.
-    # always stamp the .last_attempt sentinel, regardless
-    # of whether either art download succeeded. The skip-logic above
-    # uses its mtime to throttle retries; without this, channels
-    # whose art genuinely doesn't exist get re-probed on every call.
-    try:
-        _sentinel = os.path.join(art_dir, ".last_attempt")
-        with open(_sentinel, "w", encoding="utf-8") as _sf:
-            _sf.write("ok\n")
-        # A leading-dot name isn't hidden on Windows — stamp the hidden
-        # attribute so this marker doesn't clutter the .ChannelArt folder.
-        try:
-            hide_file_win(_sentinel)
-        except Exception:
-            pass
-    except OSError:
-        pass
     got = {"ok": True, "avatar_path": None, "banner_path": None,
            "partial": False, "failed_assets": []}
     avatar_attempted = bool(avatar and avatar.get("url"))
@@ -239,6 +240,16 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
     if got["avatar_path"] is None and got["banner_path"] is None:
         return {"ok": False, "error": "avatar + banner downloads failed",
                 "failed_assets": got["failed_assets"]}
+    try:
+        _sentinel = os.path.join(art_dir, ".last_attempt")
+        with open(_sentinel, "w", encoding="utf-8") as _sf:
+            _sf.write("ok\n")
+        try:
+            hide_file_win(_sentinel)
+        except Exception:
+            pass
+    except OSError:
+        pass
     # Bug [23]: surface partial-success so the caller can warn the user
     # that ONE of the two downloads failed (Browse grid was silently
     # showing broken-image icons because ok=True hid the partial state).

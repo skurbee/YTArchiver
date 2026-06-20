@@ -24,6 +24,8 @@
 
   // ─── Manual Transcribe dialog ────────────────────────────────────────
   function initManualTranscribe() {
+    if (window._manualTxInited) return;
+    window._manualTxInited = true;
     const backdrop = document.getElementById("manual-tx-backdrop");
     const pathEl = document.getElementById("manual-tx-path");
     const modelEl = document.getElementById("manual-tx-model");
@@ -33,16 +35,13 @@
     const confirmBtn = document.getElementById("manual-tx-confirm");
     if (!backdrop) return;
 
-    const show = () => { backdrop.style.display = "flex"; };
-    const hide = () => { backdrop.style.display = "none"; if (pathEl) pathEl.value = ""; };
+    const show = () => { backdrop.hidden = false; };
+    const hide = () => { backdrop.hidden = true; if (pathEl) pathEl.value = ""; };
 
     openBtn?.addEventListener("click", show);
     cancelBtn?.addEventListener("click", hide);
     backdrop.addEventListener("click", (e) => { if (e.target === backdrop) hide(); });
-    // BUG FIX 2026-05-15 (audit): consistent Esc-to-close across modals.
-    document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && backdrop.style.display !== "none") hide();
-    });
+    window.YT?.modals?.registerEscapeClose?.(backdrop, hide);
 
     // "Transcribe folder..." — recursively queue every untranscribed video
     // under a picked folder. Native folder picker handles the prompt.
@@ -54,7 +53,7 @@
       // Manual → ask Whisper model (60s countdown auto-picks Settings default).
       const model = await (window._askWhisperModel?.("this folder"));
       if (model === null) return;
-      const res = await bridgeCall("transcribe_folder");
+      const res = await bridgeCall("transcribe_folder", model);
       if (res?.ok) {
         window._showToast?.("Walking folder \u2014 watch the log for queue counts.", "ok");
       } else if (!res?.cancelled) {
@@ -93,7 +92,7 @@
       // Manual → ask Whisper model (60s countdown auto-picks Settings default).
       const model = await (window._askWhisperModel?.(`"${title}"`));
       if (model === null) return;
-      const res = await bridgeCall("transcribe_enqueue", path, title);
+      const res = await bridgeCall("transcribe_enqueue", path, title, model);
       if (res?.ok) {
         window._showToast?.("Queued for transcription.", "ok");
         hide();

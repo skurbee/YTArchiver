@@ -58,6 +58,32 @@ from .scan import _scan_channel_videos
 _log = get_logger(__name__)
 
 
+def _active_channel_keys(channels: list[dict[str, Any]] | None) -> set[str]:
+    return {
+        (ch.get("name") or ch.get("folder") or "").lower()
+        for ch in (channels or [])
+        if (ch.get("name") or ch.get("folder") or "").strip()
+    }
+
+
+def _output_dir_where() -> tuple[str, list[str]]:
+    out_dir = (load_config() or {}).get("output_dir") or ""
+    if not out_dir:
+        return "", []
+    norm = os.path.normpath(out_dir).rstrip("\\/")
+    prefixes = [norm + os.sep]
+    alt = norm.replace("\\", "/")
+    if alt != norm:
+        prefixes.append(alt.rstrip("/") + "/")
+    clauses = " OR ".join(["filepath LIKE ? ESCAPE '\\'"] * len(prefixes))
+    args = [_like_esc(p) + "%" for p in prefixes]
+    return (
+        "WHERE filepath IS NOT NULL AND filepath != '' AND "
+        f"({clauses})",
+        args,
+    )
+
+
 def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
                               cancel_event=None) -> dict[str, int]:
     """Issue #147/#158: scan a channel folder for .mp4 files that lack a
@@ -117,7 +143,8 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
                     if not _candidate.isalpha():
                         _all_thumb_vids.add(_candidate)
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        _log.warning("thumbnail sweep failed while walking thumbnails "
+                     "for %r: %s", name, e)
     by_bucket: dict[tuple[int | None, int | None],
                     list[tuple[str, str]]] = {}
     for vid_id, _title, _y, _m, path in _scan_channel_videos(folder):
@@ -148,9 +175,9 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
                 still_missing += 1
                 continue
             try:
-                _download_thumbnail(url, thumb_dir, title, vid_id,
-                                     stream=stream)
-                if _thumbnail_exists_for(thumb_dir, vid_id):
+                downloaded = _download_thumbnail(url, thumb_dir, title, vid_id,
+                                                 stream=stream)
+                if downloaded and _thumbnail_exists_for(thumb_dir, vid_id):
                     fetched += 1
                     _all_thumb_vids.add(vid_id)
                     # Mark the DB flag so Settings > Metadata's
@@ -182,10 +209,24 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
                                     except Exception: pass
                                     _log.debug("has_thumbnail rollback: %s", _ue)
                     except Exception as e:
-                        _log.debug("swallowed: %s", e)
+                        _log.warning("thumbnail sweep failed to persist "
+                                     "has_thumbnail for %r/%s: %s",
+                                     name, vid_id, e)
                 else:
                     still_missing += 1
+                    _log.debug(
+                        "Thumbnail preview unavailable for %r video %s; "
+                        "continuing without it.",
+                        name, vid_id)
             except Exception:
+                _log.warning(
+                    "Could not save a thumbnail preview for %r video %s; "
+                    "the video was archived, but the preview image is missing.",
+                    name, vid_id)
+                _log.debug(
+                    "thumbnail sweep download failed: channel=%r "
+                    "video_id=%s url=%s",
+                    name, vid_id, url, exc_info=True)
                 still_missing += 1
     return {"checked": checked, "fetched": fetched,
             "missing": still_missing}
@@ -245,15 +286,18 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
                     for _ch in channels:
                         _fn = _cfn(_ch)
                         if _fn:
+                            _p = os.path.normpath(os.path.join(out_dir, _fn))
                             _allowed_prefixes.append(
-                                os.path.normpath(os.path.join(out_dir, _fn)))
+                                os.path.normcase(_p.rstrip(os.sep)) + os.sep)
                     for fp, vid in conn.execute(
                             "SELECT filepath, video_id FROM videos "
                             "WHERE video_id IS NOT NULL AND video_id<>''"):
                         if not (fp and vid):
                             continue
                         _np = os.path.normpath(fp)
-                        if not any(_np.startswith(_p) for _p in _allowed_prefixes):
+                        _np_prefix = os.path.normcase(_np) + os.sep
+                        if not any(_np_prefix.startswith(_p)
+                                   for _p in _allowed_prefixes):
                             continue
                         # Wrap isfile in try/except so a single path-
                         # too-long row doesn't abort the whole realign
@@ -299,7 +343,7 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
                 f"starting across {_total_ch} channel(s)…", "simpleline_pink")
             stream.flush()
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            _log.warning("thumbnail status walk failed for %r: %s", name, e)
 
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -418,7 +462,8 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
                     "simpleline_pink")
             stream.flush()
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            _log.warning("video scan for thumbnail status failed for %r: %s",
+                         name, e)
 
     return {
         "ok": True,
@@ -457,6 +502,7 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
     cache = {} if force else _load_thumb_cache()
     out: dict[str, dict[str, Any]] = {}
     needs_walk: list[tuple[dict[str, Any], Path, str, float]] = []
+    active_keys = _active_channel_keys(channels)
 
     # FAST PATH (2026-05-14): when `force=False`, query the DB column
     # `has_thumbnail` instead of walking disk. The column is populated
@@ -473,12 +519,16 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
                     # Per-channel: total, sum(has_thumbnail), count NULL.
                     # NULL count > 0 → channel needs a backfill walk.
                     db_stats = {}
+                    where_sql, where_args = _output_dir_where()
                     for r in conn.execute(
                             "SELECT channel, COUNT(*) AS total, "
                             "  SUM(CASE WHEN has_thumbnail=1 THEN 1 ELSE 0 END) AS with_thumb, "
                             "  SUM(CASE WHEN has_thumbnail IS NULL THEN 1 ELSE 0 END) AS unknown "
-                            "FROM videos GROUP BY channel"):
+                            f"FROM videos {where_sql} GROUP BY channel",
+                            where_args):
                         nm = (r[0] or "").lower()
+                        if active_keys and nm not in active_keys:
+                            continue
                         db_stats[nm] = {
                             "total": int(r[1] or 0),
                             "with_thumb": int(r[2] or 0),
@@ -505,7 +555,8 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
                             "missing": max(0, s["total"] - s["with_thumb"]),
                         }
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            _log.warning("thumbnail status DB backfill failed for %r: %s",
+                         name, e)
 
     # Pass 1: figure out which channels can use the cache.
     # Patch fix (v68.3): also distrust cache entries with total>0 but
@@ -667,6 +718,7 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
     out: dict[str, dict[str, Any]] = {}
     if not channels:
         return out
+    active_keys = _active_channel_keys(channels)
     # TTL cache shortcut: if the same data was computed recently AND
     # the caller didn't ask for a force-refresh, return the cached
     # rows. Avoids hitting the DB on every Metadata-page open.
@@ -679,7 +731,10 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
                 if cached_rows and age < _VIDEO_ID_CACHE_TTL_SEC:
                     # Return a shallow copy so callers can't mutate
                     # cached state from outside the lock.
-                    return dict(cached_rows)
+                    return {
+                        k: v for k, v in cached_rows.items()
+                        if not active_keys or k in active_keys
+                    }
         except Exception as e:
             _log.debug("swallowed: %s", e)
     try:
@@ -699,6 +754,7 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
         # matching happens in Python below — typically no-op since
         # channel names rarely vary in case across rows.
         with _idx._reader_lock:
+            where_sql, where_args = _output_dir_where()
             try:
                 _has_tried_col = True
                 _has_removed_col = True
@@ -712,7 +768,8 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
                     "           THEN 1 ELSE 0 END) AS tried, "
                     "  SUM(CASE WHEN removed_from_yt_ts IS NOT NULL "
                     "           THEN 1 ELSE 0 END) AS removed "
-                    "FROM videos GROUP BY channel"
+                    f"FROM videos {where_sql} GROUP BY channel",
+                    where_args,
                 ).fetchall()
             except Exception:
                 # Older DB without removed_from_yt_ts column.
@@ -727,7 +784,8 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
                         "  SUM(CASE WHEN (video_id IS NULL OR video_id = '') "
                         "           AND id_backfill_tried_ts IS NOT NULL "
                         "           THEN 1 ELSE 0 END) AS tried "
-                        "FROM videos GROUP BY channel"
+                        f"FROM videos {where_sql} GROUP BY channel",
+                        where_args,
                     ).fetchall()
                 except Exception:
                     _has_tried_col = False
@@ -736,7 +794,8 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
                         "  COUNT(*) AS total, "
                         "  SUM(CASE WHEN video_id IS NOT NULL AND video_id != '' "
                         "           THEN 1 ELSE 0 END) AS with_id "
-                        "FROM videos GROUP BY channel"
+                        f"FROM videos {where_sql} GROUP BY channel",
+                        where_args,
                     ).fetchall()
         # Merge case-variant channels in Python (e.g. "MyChan" + "mychan"
         # → one entry under "mychan"). Sums the counts so duplicates from
@@ -744,6 +803,8 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
         for r in rows:
             ch_raw = r[0] or ""
             ch_low = ch_raw.lower()
+            if active_keys and ch_low not in active_keys:
+                continue
             total = int(r[1] or 0)
             with_id = int(r[2] or 0)
             tried = int(r[3] or 0) if _has_tried_col and len(r) > 3 else 0

@@ -22,6 +22,7 @@ and reused by transcribe's auto-caption fast path here.
 """
 from __future__ import annotations
 
+import bisect
 import glob
 import os
 import re
@@ -210,6 +211,19 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
         return None
 
     # Prefer auto-generated VTT — it has <c> tags with per-word timestamps.
+    def _caption_pref(path: str) -> tuple[int, str]:
+        name = os.path.basename(path).lower()
+        if name.endswith(".en.vtt"):
+            rank = 0
+        elif name.endswith(".en-us.vtt"):
+            rank = 1
+        elif name.endswith(".en-gb.vtt"):
+            rank = 2
+        else:
+            rank = 3
+        return (rank, name)
+
+    vtts = sorted(vtts, key=_caption_pref)
     pick = vtts[0]
     if len(vtts) > 1:
         for vf in vtts:
@@ -271,7 +285,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     if not vtt:
         vtt = _fetch_captions_via_ytdlp(video_path, stream, _fetched_temp)
         if vtt:
-            candidates.append(vtt) # let the downstream cleanup delete it
+            candidates.append(vtt)
 
     if not vtt:
         return False
@@ -415,12 +429,25 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
         except Exception as _pe:
             stream.emit_dim(f" (punctuation skipped: {_pe})")
 
-    _write_transcript_entry(txt_path, title, upload_date, duration,
-                            src_tag, full_text)
-    _write_jsonl_entry(jsonl_path, vid_id, title, segs)
+    if not _write_transcript_entry(txt_path, title, upload_date, duration,
+                                   src_tag, full_text):
+        try:
+            stream.emit_error(f"Could not write transcript to {txt_path}")
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        return False
+    if not _write_jsonl_entry(jsonl_path, vid_id, title, segs):
+        try:
+            stream.emit_error(
+                f"Could not write transcript JSONL to {jsonl_path} "
+                f"— not marking {os.path.basename(video_path)} transcribed")
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        return False
 
-    # Clean up the .vtt sidecar — OLD deletes these immediately after parsing.
-    for _p in candidates:
+    # Clean up only .vtt sidecars fetched by this function. Pre-existing
+    # user-supplied caption sidecars must survive a successful parse.
+    for _p in list(_fetched_temp):
         if os.path.isfile(_p):
             try: os.remove(_p)
             except OSError: pass
@@ -497,6 +524,42 @@ def _ts_to_sec(ts: str) -> float:
     if len(parts) == 2:
         return int(parts[0]) * 60 + float(parts[1])
     return 0.0
+
+
+def _attach_words_to_segments(segments: list, all_words: list) -> list:
+    out = []
+    if all_words:
+        word_starts = [w["s"] for w in all_words]
+        for seg in segments:
+            seg_words = []
+            # Strict partitioning: each word belongs to the segment whose
+            # [start, end) range contains its timestamp. bisect finds the
+            # first word at/after the segment start directly, avoiding the
+            # old bounded back-scan that could stop too early.
+            widx = bisect.bisect_left(word_starts, seg["start"])
+            scan = widx
+            while scan < len(all_words) and all_words[scan]["s"] < seg["end"]:
+                seg_words.append(all_words[scan])
+                scan += 1
+            if not seg_words:
+                seg_words = _generate_distributed_words(
+                    seg["text"], seg["start"], seg["end"])
+            out.append({
+                "s": round(seg["start"], 2),
+                "e": round(seg["end"], 2),
+                "t": seg["text"],
+                "w": seg_words,
+            })
+    else:
+        for seg in segments:
+            out.append({
+                "s": round(seg["start"], 2),
+                "e": round(seg["end"], 2),
+                "t": seg["text"],
+                "w": _generate_distributed_words(
+                    seg["text"], seg["start"], seg["end"]),
+            })
+    return out
 
 
 def _parse_vtt(path: str) -> list:
@@ -716,25 +779,20 @@ def _parse_vtt(path: str) -> list:
             ce = round(min(seg["end"], seg["start"] + (ci + 1) * cdur), 2)
             capped.append({"start": cs, "end": ce, "text": ct})
     segments = capped
+    return _attach_words_to_segments(segments, all_words)
 
     # ── Step 3: Attach per-word timestamps back onto the merged segments ──
     out = []
     if all_words:
-        widx = 0
+        word_starts = [w["s"] for w in all_words]
         for seg in segments:
             seg_words = []
-            back_limit = 200
             # Strict partitioning: each word belongs to the segment whose
             # [start, end) range contains its timestamp. Previously used a
             # ±0.5s buffer which pulled the next segment's first 1-3 words
             # into the prior segment, producing visible "heading to heading
             # to" duplications at segment boundaries.
-            while back_limit > 0 and widx > 0 and widx < len(all_words) \
-                    and all_words[widx]["s"] >= seg["start"]:
-                widx -= 1
-                back_limit -= 1
-            while widx < len(all_words) and all_words[widx]["s"] < seg["start"]:
-                widx += 1
+            widx = bisect.bisect_left(word_starts, seg["start"])
             scan = widx
             while scan < len(all_words) and all_words[scan]["s"] < seg["end"]:
                 seg_words.append(all_words[scan])
@@ -748,7 +806,6 @@ def _parse_vtt(path: str) -> list:
                 "t": seg["text"],
                 "w": seg_words,
             })
-            widx = scan
     else:
         for seg in segments:
             out.append({

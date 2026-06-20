@@ -28,11 +28,26 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
+from collections import OrderedDict
 from typing import Any
 
 from .log import get_logger
 
 _log = get_logger(__name__)
+_TOP_WORDS_CACHE_MAX = 24
+_TOP_WORDS_CACHE_REVISION = 0
+_TOP_WORDS_CACHE: OrderedDict[
+    tuple[int, str, int, int], list[dict[str, Any]]
+] = OrderedDict()
+_TOP_WORDS_CACHE_LOCK = threading.Lock()
+
+
+def invalidate_top_words_cache() -> None:
+    global _TOP_WORDS_CACHE_REVISION
+    with _TOP_WORDS_CACHE_LOCK:
+        _TOP_WORDS_CACHE_REVISION += 1
+        _TOP_WORDS_CACHE.clear()
 
 
 def _index():
@@ -74,7 +89,8 @@ def bucket_totals(bucket: str = "month",
         try:
             with _index()._reader_lock:
                 rows = conn.execute(sql, args).fetchall()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            _log.warning("bucket_totals week query failed: %s", exc)
             return {}
         import datetime as _dt_w
         totals: dict[str, int] = {}
@@ -104,7 +120,8 @@ def bucket_totals(bucket: str = "month",
     try:
         with _index()._reader_lock:
             rows = conn.execute(sql, args).fetchall()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        _log.warning("bucket_totals query failed: %s", exc)
         return {}
     return {str(r[0]): int(r[1] or 0) for r in rows if r[0] is not None}
 
@@ -143,6 +160,21 @@ def top_words(channel: str | None = None, top_n: int = 120,
     Returns a list of {word, count} sorted descending by count. Used by
     the Graph sub-mode's Word Cloud chart type.
     """
+    try:
+        top_n_i = max(1, int(top_n))
+    except (TypeError, ValueError):
+        top_n_i = 120
+    try:
+        min_len_i = max(1, int(min_len))
+    except (TypeError, ValueError):
+        min_len_i = 3
+    with _TOP_WORDS_CACHE_LOCK:
+        cache_key = (_TOP_WORDS_CACHE_REVISION, channel or "", top_n_i,
+                     min_len_i)
+        cached = _TOP_WORDS_CACHE.get(cache_key)
+        if cached is not None:
+            _TOP_WORDS_CACHE.move_to_end(cache_key)
+            return [dict(row) for row in cached]
     # Use an INDEPENDENT connection (not the shared reader) so this 500k-row
     # scan + Python word-aggregation doesn't hold _reader_lock and freeze every
     # other reader (Browse / Search / Watch) for the whole duration of a
@@ -157,9 +189,10 @@ def top_words(channel: str | None = None, top_n: int = 120,
         sql += " WHERE channel=?"
         args.append(channel)
     # Cap at a large but finite number so a huge archive doesn't OOM us.
-    sql += " LIMIT 500000"
+    # ORDER BY id makes capped samples stable across runs.
+    sql += " ORDER BY id LIMIT 500000"
     import re as _re
-    word_re = _re.compile(rf"[a-zA-Z][a-zA-Z']{{{min_len - 1},}}")
+    word_re = _re.compile(rf"[a-zA-Z][a-zA-Z']{{{min_len_i - 1},}}")
     counts: dict[str, int] = {}
     try:
         cur = conn.execute(sql, args)
@@ -171,15 +204,22 @@ def top_words(channel: str | None = None, top_n: int = 120,
                 if w in _STOP_WORDS:
                     continue
                 counts[w] = counts.get(w, 0) + 1
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        _log.warning("top_words query failed: %s", exc)
         return []
     finally:
         try: conn.close()
         except Exception:
             pass
     # Top-N
-    items = sorted(counts.items(), key=lambda x: -x[1])[:int(top_n)]
-    return [{"word": w, "count": c} for w, c in items]
+    items = sorted(counts.items(), key=lambda x: -x[1])[:top_n_i]
+    result = [{"word": w, "count": c} for w, c in items]
+    with _TOP_WORDS_CACHE_LOCK:
+        _TOP_WORDS_CACHE[cache_key] = [dict(row) for row in result]
+        _TOP_WORDS_CACHE.move_to_end(cache_key)
+        while len(_TOP_WORDS_CACHE) > _TOP_WORDS_CACHE_MAX:
+            _TOP_WORDS_CACHE.popitem(last=False)
+    return result
 
 
 def backfill_upload_ts(limit: int = 0) -> dict[str, int]:
@@ -204,6 +244,21 @@ def backfill_upload_ts(limit: int = 0) -> dict[str, int]:
         return {"filled": 0, "skipped": 0}
     filled = 0
     skipped = 0
+    batch: list[tuple[float, int]] = []
+    batch_size = 500
+
+    def _flush_batch() -> None:
+        nonlocal filled, batch
+        if not batch:
+            return
+        with _index()._db_lock:
+            writer.executemany(
+                "UPDATE videos SET upload_ts=? WHERE rowid=?",
+                batch)
+            writer.commit()
+        filled += len(batch)
+        batch = []
+
     try:
         with _index()._reader_lock:
             sql = "SELECT rowid, filepath FROM videos WHERE upload_ts IS NULL"
@@ -214,24 +269,40 @@ def backfill_upload_ts(limit: int = 0) -> dict[str, int]:
             try:
                 if fp and os.path.isfile(fp):
                     mtime = os.path.getmtime(fp)
-                    with _index()._db_lock:
-                        writer.execute(
-                            "UPDATE videos SET upload_ts=? WHERE rowid=?",
-                            (mtime, rowid))
-                    filled += 1
+                    batch.append((mtime, rowid))
+                    if len(batch) >= batch_size:
+                        _flush_batch()
                 else:
                     skipped += 1
             except OSError:
                 skipped += 1
-        with _index()._db_lock:
-            writer.commit()
-    except sqlite3.Error:
-        pass
+        _flush_batch()
+    except sqlite3.Error as exc:
+        try:
+            with _index()._db_lock:
+                writer.rollback()
+        except sqlite3.Error:
+            pass
+        _log.warning("backfill_upload_ts failed after %d filled/%d skipped: %s",
+                     filled, skipped, exc)
     return {"filled": filled, "skipped": skipped}
 
 
+def _week_backfill_pending(conn) -> int:
+    try:
+        with _index()._reader_lock:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM videos WHERE upload_ts IS NULL"
+            ).fetchone()
+        return int(row[0] or 0) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
 def graph_word_frequency(word: str, channel: str | None = None,
-                         bucket: str = "month") -> dict[str, Any]:
+                         bucket: str = "month",
+                         _backfill_pending: int | None = None
+                         ) -> dict[str, Any]:
     """Count occurrences of `word` per time bucket.
 
     bucket ∈ {"year", "month", "week"}. Returns {labels, values}.
@@ -337,15 +408,8 @@ def graph_word_frequency(word: str, channel: str | None = None,
     # user think their channel has no recent activity.
     backfill_pending = 0
     if bucket == "week":
-        try:
-            with _index()._reader_lock:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM videos WHERE upload_ts IS NULL"
-                ).fetchone()
-            if row:
-                backfill_pending = int(row[0] or 0)
-        except sqlite3.Error:
-            pass
+        backfill_pending = (_backfill_pending if _backfill_pending is not None
+                            else _week_backfill_pending(conn))
     return {"labels": labels, "values": values,
             "backfill_pending": backfill_pending}
 
@@ -362,8 +426,18 @@ def graph_multi(words: list[str], channel: str | None = None,
         return {"labels": [], "series": []}
     per_word = {}
     label_set = set()
+    backfill_pending = None
+    if bucket == "week":
+        conn = _index()._reader_open()
+        if conn is not None:
+            backfill_pending = _week_backfill_pending(conn)
     for w in words:
-        r = graph_word_frequency(w, channel=channel, bucket=bucket)
+        if bucket == "week":
+            r = graph_word_frequency(
+                w, channel=channel, bucket=bucket,
+                _backfill_pending=backfill_pending)
+        else:
+            r = graph_word_frequency(w, channel=channel, bucket=bucket)
         mapping = dict(zip(r.get("labels", []), r.get("values", []), strict=False))
         per_word[w] = mapping
         label_set.update(mapping.keys())
@@ -385,8 +459,18 @@ def graph_channel_overlay(word: str, channels: list[str],
         return {"labels": [], "series": []}
     per_ch = {}
     label_set = set()
+    backfill_pending = None
+    if bucket == "week":
+        conn = _index()._reader_open()
+        if conn is not None:
+            backfill_pending = _week_backfill_pending(conn)
     for ch in channels:
-        r = graph_word_frequency(word, channel=ch, bucket=bucket)
+        if bucket == "week":
+            r = graph_word_frequency(
+                word, channel=ch, bucket=bucket,
+                _backfill_pending=backfill_pending)
+        else:
+            r = graph_word_frequency(word, channel=ch, bucket=bucket)
         mapping = dict(zip(r.get("labels", []), r.get("values", []), strict=False))
         per_ch[ch] = mapping
         label_set.update(mapping.keys())
@@ -405,8 +489,18 @@ def graph_word_frequency_multi(words: list[str], channel: str | None = None,
         return out
     per = []
     all_labels = set()
+    backfill_pending = None
+    if bucket == "week":
+        conn = _index()._reader_open()
+        if conn is not None:
+            backfill_pending = _week_backfill_pending(conn)
     for w in words:
-        r = graph_word_frequency(w, channel=channel, bucket=bucket)
+        if bucket == "week":
+            r = graph_word_frequency(
+                w, channel=channel, bucket=bucket,
+                _backfill_pending=backfill_pending)
+        else:
+            r = graph_word_frequency(w, channel=channel, bucket=bucket)
         per.append({"word": w, "data": dict(zip(r["labels"], r["values"], strict=False))})
         all_labels.update(r["labels"])
     labels = sorted(all_labels)

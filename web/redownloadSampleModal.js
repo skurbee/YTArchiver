@@ -37,6 +37,7 @@
     if (tickHandle) { clearInterval(tickHandle); tickHandle = null; }
   }
   function startTick() {
+    stopTick();
     remaining = 300;
     const paint = () => {
       const m = Math.floor(remaining / 60);
@@ -70,6 +71,15 @@
     if (p) p.hidden = !show;
   }
 
+  function wireHoverPause(m) {
+    if (!m || m._redwnlHoverWired) return;
+    m._redwnlHoverWired = true;
+    m.addEventListener("mouseenter", () => { stopTick(); });
+    m.addEventListener("mouseleave", () => {
+      if (!tickHandle && !m.hidden) startTick();
+    });
+  }
+
   window.addEventListener("yt-control", (ev) => {
     const d = ev && ev.detail;
     if (!d || d.kind !== "redownload_sample") return;
@@ -86,17 +96,9 @@
       stats().classList.toggle("larger", dir === "larger");
     }
     showPicker(false);
+    wireHoverPause(m);
     m.hidden = false;
     startTick();
-    // Pause the auto-continue countdown while the user is actively
-    // interacting (hover); resume when pointer leaves. Protects a user
-    // reading the stats from being rug-pulled by the 5-minute timer.
-    const _pauseOnHover = () => { stopTick(); };
-    const _resumeOnLeave = () => {
-      if (!tickHandle && !m.hidden) startTick();
-    };
-    m.addEventListener("mouseenter", _pauseOnHover);
-    m.addEventListener("mouseleave", _resumeOnLeave);
   });
 
   document.addEventListener("DOMContentLoaded", () => {

@@ -29,12 +29,21 @@ class RecentMixin:
         largest. `query` filters by title/channel substring. Returns
         {rows, has_more, offset}."""
         try:
+            _limit = max(1, min(int(limit or 60), 1000))
+        except (TypeError, ValueError):
+            _limit = 60
+        try:
+            _offset = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            _offset = 0
+        try:
             return index_backend.list_all_videos(
                 sort=str(sort or "recent"),
-                limit=int(limit or 60), offset=int(offset or 0),
+                limit=_limit, offset=_offset,
                 query=str(query or ""))
         except Exception as e:
-            return {"rows": [], "has_more": False, "offset": offset, "error": str(e)}
+            return {"rows": [], "has_more": False, "offset": _offset,
+                    "error": str(e)}
 
 
     def clear_recent_downloads(self):
@@ -89,6 +98,79 @@ class RecentMixin:
 
 
     # ─── Recent tab actions ────────────────────────────────────────────
+
+    def _recent_identity(self, title_or_payload, channel=None):
+        if isinstance(title_or_payload, dict):
+            p = title_or_payload
+            return {
+                "title": str(p.get("title") or "").strip(),
+                "channel": str(p.get("channel") or "").strip(),
+                "filepath": str(p.get("filepath") or "").strip(),
+                "video_id": str(p.get("video_id")
+                                or p.get("videoId") or "").strip(),
+            }
+        return {
+            "title": str(title_or_payload or "").strip(),
+            "channel": str(channel or "").strip(),
+            "filepath": "",
+            "video_id": "",
+        }
+
+    @staticmethod
+    def _norm_recent_path(path: str) -> str:
+        try:
+            return os.path.normcase(os.path.normpath(path or ""))
+        except Exception:
+            return path or ""
+
+    def _recent_find_entry(self, ident: dict):
+        cfg = load_config()
+        rows = cfg.get("recent_downloads", []) or []
+        target_fp = self._norm_recent_path(ident.get("filepath", ""))
+        target_vid = ident.get("video_id", "")
+        if target_fp:
+            for r in rows:
+                if self._norm_recent_path(r.get("filepath", "")) == target_fp:
+                    return r, cfg
+        if target_vid:
+            for r in rows:
+                if (r.get("video_id") or "").strip() == target_vid:
+                    return r, cfg
+        title = ident.get("title", "")
+        channel = ident.get("channel", "")
+        if title or channel:
+            matches = [
+                r for r in rows
+                if r.get("title") == title and r.get("channel") == channel
+            ]
+            if len(matches) == 1:
+                return matches[0], cfg
+            if len(matches) > 1:
+                return {"_ambiguous": True, "matches": len(matches)}, cfg
+        return None, cfg
+
+    def _recent_lookup_path_from_identity(self, title_or_payload,
+                                          channel=None):
+        ident = self._recent_identity(title_or_payload, channel)
+        if ident.get("filepath"):
+            fp = ident["filepath"]
+            if os.path.isfile(fp):
+                return fp
+        entry, _cfg = self._recent_find_entry(ident)
+        if isinstance(entry, dict) and entry.get("_ambiguous"):
+            return None
+        if entry:
+            fp = entry.get("filepath", "") or ""
+            if fp and os.path.isfile(fp):
+                return fp
+        return self._recent_lookup_path(ident.get("title", ""),
+                                        ident.get("channel", ""))
+
+    def _recent_is_ambiguous_legacy(self, ident: dict) -> bool:
+        if ident.get("filepath") or ident.get("video_id"):
+            return False
+        entry, _cfg = self._recent_find_entry(ident)
+        return isinstance(entry, dict) and entry.get("_ambiguous")
 
     def _recent_lookup_path(self, title, channel):
         """Find the on-disk filepath for a Recent row by title + channel.
@@ -163,45 +245,50 @@ class RecentMixin:
         return None
 
 
-    def recent_play(self, title, channel):
-        fp = self._recent_lookup_path(title, channel)
+    def recent_play(self, title, channel=None):
+        fp = self._recent_lookup_path_from_identity(title, channel)
         if not fp:
             return {"ok": False, "error": "File not found"}
         return self.browse_open_video(fp)
 
 
-    def recent_requeue(self, title, channel):
+    def recent_requeue(self, title, channel=None):
         """Re-download the YouTube URL stored for this Recent entry.
         Mirrors OLD YTArchiver.py Recent right-click "Re-queue download".
 
         Returns {ok, queued} or {ok:False, error}.
         """
         try:
-            cfg = self._config or load_config()
-            for r in cfg.get("recent_downloads", []):
-                if r.get("title") == title and r.get("channel") == channel:
-                    url = (r.get("video_url") or "").strip()
-                    if not url:
-                        vid = (r.get("video_id") or "").strip()
-                        if vid:
-                            url = f"https://www.youtube.com/watch?v={vid}"
-                    if not url:
-                        return {"ok": False,
-                                "error": "No URL saved for this recent entry."}
-                    # Delegate to single-video download. Uses the user's
-                    # saved video_out_dir + resolution defaults.
-                    return self.archive_single_video(url, options={})
+            ident = self._recent_identity(title, channel)
+            r, _cfg = self._recent_find_entry(ident)
+            if isinstance(r, dict) and r.get("_ambiguous"):
+                return {"ok": False,
+                        "error": "Recent entry is ambiguous; select a row with filepath/video_id."}
+            if r:
+                url = (r.get("video_url") or "").strip()
+                if not url:
+                    vid = (r.get("video_id")
+                           or ident.get("video_id") or "").strip()
+                    if vid:
+                        url = f"https://www.youtube.com/watch?v={vid}"
+                if not url:
+                    return {"ok": False,
+                            "error": "No URL saved for this recent entry."}
+                # Delegate to single-video download. Uses the user's
+                # saved video_out_dir + resolution defaults.
+                return self.archive_single_video(url, options={})
             return {"ok": False, "error": "Recent entry not found."}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
 
-    def recent_resolve(self, title, channel):
+    def recent_resolve(self, title, channel=None):
         """Return {ok, filepath, video_id} for a Recent row, using the same
         three-step lookup as recent_play (config → DB → fuzzy walk). Used by
         the right-click "Play video" action to hand off to the Browse Watch
         view instead of spawning VLC."""
-        fp = self._recent_lookup_path(title, channel)
+        ident = self._recent_identity(title, channel)
+        fp = self._recent_lookup_path_from_identity(ident)
         if not fp:
             return {"ok": False, "error": "File not found"}
         # Best-effort video_id lookup — check config.recent_downloads first,
@@ -210,7 +297,17 @@ class RecentMixin:
         try:
             cfg = self._config or load_config()
             for r in cfg.get("recent_downloads", []):
-                if r.get("title") == title and r.get("channel") == channel:
+                if (ident.get("filepath")
+                        and self._norm_recent_path(r.get("filepath", ""))
+                        != self._norm_recent_path(ident["filepath"])):
+                    continue
+                if (ident.get("video_id")
+                        and (r.get("video_id") or "").strip()
+                        != ident["video_id"]):
+                    continue
+                if (ident.get("filepath") or ident.get("video_id")
+                        or (r.get("title") == ident.get("title")
+                            and r.get("channel") == ident.get("channel"))):
                     vid = (r.get("video_id") or "").strip()
                     if not vid:
                         # parse from video_url if present
@@ -232,7 +329,8 @@ class RecentMixin:
                         row = rconn.execute(
                             "SELECT video_id FROM videos WHERE title=? AND channel=? "
                             "ORDER BY added_ts DESC LIMIT 1",
-                            (title, channel)).fetchone()
+                            (ident.get("title", ""),
+                             ident.get("channel", ""))).fetchone()
                     if row and row[0]:
                         vid = row[0]
             except Exception as e:
@@ -240,14 +338,14 @@ class RecentMixin:
         return {"ok": True, "filepath": fp, "video_id": vid}
 
 
-    def recent_show_in_explorer(self, title, channel):
-        fp = self._recent_lookup_path(title, channel)
+    def recent_show_in_explorer(self, title, channel=None):
+        fp = self._recent_lookup_path_from_identity(title, channel)
         if not fp:
             return {"ok": False, "error": "File not found"}
         return self.browse_show_in_explorer(fp)
 
 
-    def recent_open_youtube(self, title, channel):
+    def recent_open_youtube(self, title, channel=None):
         """Open the YouTube page for this recent video (if we have video_id)."""
         import re as _re
         import webbrowser
@@ -258,19 +356,25 @@ class RecentMixin:
         # was sitting right there in config (audit: recent_mixin.py:
         # 213-223).
         try:
-            cfg = load_config()
-            for r in (cfg.get("recent_downloads") or []):
-                if r.get("title") == title and r.get("channel") == channel:
-                    vid = (r.get("video_id") or "").strip()
-                    if vid:
-                        webbrowser.open(f"https://www.youtube.com/watch?v={vid}")
-                        return {"ok": True}
-                    break
+            ident = self._recent_identity(title, channel)
+            vid = ident.get("video_id", "")
+            if vid and _re.fullmatch(r"[A-Za-z0-9_-]{11}", vid):
+                webbrowser.open(f"https://www.youtube.com/watch?v={vid}")
+                return {"ok": True}
+            r, _cfg = self._recent_find_entry(ident)
+            if isinstance(r, dict) and r.get("_ambiguous"):
+                return {"ok": False,
+                        "error": "Recent entry is ambiguous; select a row with video_id."}
+            if r:
+                vid = (r.get("video_id") or "").strip()
+                if vid and _re.fullmatch(r"[A-Za-z0-9_-]{11}", vid):
+                    webbrowser.open(f"https://www.youtube.com/watch?v={vid}")
+                    return {"ok": True}
         except Exception as _e:
             _log.debug("swallowed: %s", _e)
         # Filename-suffix fallback for older entries that pre-date the
         # video_id field.
-        fp = self._recent_lookup_path(title, channel)
+        fp = self._recent_lookup_path_from_identity(title, channel)
         if fp:
             m = _re.search(r"\[([A-Za-z0-9_-]{11})\]", os.path.basename(fp))
             if m:
@@ -279,9 +383,13 @@ class RecentMixin:
         return {"ok": False, "error": "No video ID available"}
 
 
-    def recent_delete_file(self, title, channel):
+    def recent_delete_file(self, title, channel=None):
         """Delete the file from disk + remove from recent_downloads list."""
-        fp = self._recent_lookup_path(title, channel)
+        ident = self._recent_identity(title, channel)
+        if self._recent_is_ambiguous_legacy(ident):
+            return {"ok": False,
+                    "error": "Recent entry is ambiguous; select a row with filepath/video_id."}
+        fp = self._recent_lookup_path_from_identity(ident)
         if not fp:
             return {"ok": False, "error": "File not found"}
         # Defense-in-depth: refuse to os.remove a path resolving OUTSIDE the
@@ -306,6 +414,7 @@ class RecentMixin:
         # Without this, Browse + Search kept returning "file not
         # found" hits for the deleted file (audit: recent_mixin.py:
         # 226-246).
+        index_warning = ""
         try:
             from backend import index as _idx
             # FTS-safe, video_id-keyed segment removal (works in the
@@ -322,13 +431,34 @@ class RecentMixin:
                         (fp,))
                     _conn.commit()
         except Exception as _e:
-            _log.debug("swallowed: %s", _e)
+            index_warning = (
+                "File deleted but index cleanup failed; run Rescan "
+                f"to remove stale Browse/Search entries. ({_e})"
+            )
+            _log.debug("recent_delete_file index cleanup failed: %s", _e)
         # Remove from recent_downloads (if writable)
         if config_is_writable():
-            cfg = load_config()
-            cfg["recent_downloads"] = [r for r in cfg.get("recent_downloads", [])
-                                        if not (r.get("title") == title and r.get("channel") == channel)]
-            from backend.ytarchiver_config import save_config as _sc
-            if not _sc(cfg):
+            try:
+                target_fp = self._norm_recent_path(ident.get("filepath") or fp)
+                target_vid = ident.get("video_id", "")
+                from backend.ytarchiver_config import config_transaction as _ctx
+                with _ctx() as cfg:
+                    cfg["recent_downloads"] = [
+                        r for r in cfg.get("recent_downloads", [])
+                        if not (
+                            (target_fp and self._norm_recent_path(
+                                r.get("filepath", "")) == target_fp)
+                            or (target_vid and (r.get("video_id") or "").strip()
+                                == target_vid)
+                            or (not target_fp and not target_vid
+                                and r.get("title") == ident.get("title")
+                                and r.get("channel") == ident.get("channel"))
+                        )
+                    ]
+            except Exception:
                 return {"ok": False, "error": "File deleted but config write failed; recent_downloads may show stale entry"}
+        if index_warning:
+            return {"ok": False, "file_deleted": True,
+                    "cleanup_failed": True, "error": index_warning,
+                    "warning": index_warning}
         return {"ok": True}

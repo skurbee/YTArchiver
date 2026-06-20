@@ -66,7 +66,23 @@
   // ── Tab switching ────────────────────────────────────────────────
   function initTabs() {
     const tabs = document.querySelectorAll(".tab");
+    document.querySelector(".tab-row")?.setAttribute("role", "tablist");
+    const syncTabA11y = () => {
+      tabs.forEach(x => {
+        const active = x.classList.contains("active");
+        x.setAttribute("aria-selected", active ? "true" : "false");
+      });
+    };
     tabs.forEach(t => {
+      t.setAttribute("role", "tab");
+      t.tabIndex = 0;
+      if (t.dataset.tab) t.setAttribute("aria-controls", "panel-" + t.dataset.tab);
+      t.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          t.click();
+        }
+      });
       t.addEventListener("click", () => {
         // Switching AWAY from Browse with a Watch-view <video> playing:
         // pause it but don't unload. `display:none` doesn't stop HTML5
@@ -80,6 +96,7 @@
         }
         tabs.forEach(x => x.classList.remove("active"));
         t.classList.add("active");
+        syncTabA11y();
         document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
         const panel = document.getElementById("panel-" + target);
         if (panel) panel.classList.add("active");
@@ -122,6 +139,7 @@
         } catch (_e) { /* non-fatal */ }
       });
     });
+    syncTabA11y();
   }
   window.initTabs = initTabs;
 

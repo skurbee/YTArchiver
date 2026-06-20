@@ -63,6 +63,33 @@
       return;
     }
 
+    function _sameWatchVideo(a, b) {
+      if (!a || !b) return false;
+      if (a.video_id && b.video_id) return a.video_id === b.video_id;
+      const norm = (s) => String(s || "").replace(/\\/g, "/").toLowerCase();
+      if (a.filepath && b.filepath) return norm(a.filepath) === norm(b.filepath);
+      return (a.title || "") === (b.title || "")
+        && (a.channel || "") === (b.channel || "");
+    }
+
+    function _watchActionVideo() {
+      const rendered = window._watchCurrentVideo || null;
+      const pending = _browseState.currentVideo || null;
+      const openToken = window._watchOpenToken;
+      const renderedToken = window._watchRenderedToken;
+      if (rendered && pending && !_sameWatchVideo(rendered, pending)) {
+        window._showToast?.("Video is still loading - try again in a moment.", "warn");
+        return null;
+      }
+      if (rendered && Number.isFinite(openToken)
+          && Number.isFinite(renderedToken)
+          && renderedToken !== openToken) {
+        window._showToast?.("Video is still loading - try again in a moment.", "warn");
+        return null;
+      }
+      return rendered || pending;
+    }
+
     // Playback speed
     const speedSel = document.getElementById("watch-speed");
     const vEl = document.getElementById("watch-video");
@@ -100,8 +127,8 @@
 
     // Video-scoped keyboard shortcuts (only active when the watch view is visible)
     document.addEventListener("keydown", (e) => {
-      const watchVisible = document.getElementById("view-watch")
-        && document.getElementById("view-watch").style.display !== "none";
+      const watchView = document.getElementById("view-watch");
+      const watchVisible = !!(watchView && !watchView.hidden);
       if (!watchVisible || !vEl) return;
       // Include TEXTAREA so typing in a bookmark-note textarea doesn't
       // trigger Space/Arrow/B/M video shortcuts.
@@ -140,18 +167,19 @@
     });
 
     document.getElementById("btn-open-external")?.addEventListener("click", () => {
-      const v = _browseState.currentVideo;
+      const v = _watchActionVideo();
       if (!v?.filepath) { window._showToast?.("No file loaded.", "warn"); return; }
       _bridgeCall("browse_open_video", v.filepath);
     });
 
     // Redownload current video — resolution picker, then video_redownload.
     document.getElementById("btn-watch-redownload")?.addEventListener("click", async () => {
-      const v = _browseState.currentVideo;
+      let v = _watchActionVideo();
       if (!v?.video_id && !v?.filepath) {
         window._showToast?.("No video loaded.", "warn");
         return;
       }
+      const actionToken = window._watchOpenToken;
       const pick = await (window.askChoice ? window.askChoice({
         title: "Redownload at…",
         message: `Replace the local file for "${v.title || v.video_id}" ` +
@@ -168,6 +196,14 @@
         ],
       }) : null);
       if (!pick) return;
+      if (Number.isFinite(actionToken)
+          && Number.isFinite(window._watchOpenToken)
+          && actionToken !== window._watchOpenToken) {
+        window._showToast?.("Video changed before redownload was queued.", "warn");
+        return;
+      }
+      v = _watchActionVideo();
+      if (!v) return;
       const _VALID_RES = new Set(
         ["audio", "144", "240", "360", "480", "720",
          "1080", "1440", "2160", "best"]);
@@ -181,7 +217,7 @@
 
     // Per-video metadata refresh: synchronous yt-dlp fetch for THIS video.
     document.getElementById("btn-watch-refresh-meta")?.addEventListener("click", async () => {
-      const v = _browseState.currentVideo || window._watchCurrentVideo;
+      const v = _watchActionVideo();
       if (!v?.filepath && !v?.video_id) {
         window._showToast?.("No video loaded.", "warn");
         return;
@@ -456,7 +492,7 @@
     };
 
     document.getElementById("btn-watch-retranscribe")?.addEventListener("click", async () => {
-      const v = _browseState.currentVideo;
+      let v = _watchActionVideo();
       if (!v?.filepath) {
         window._showToast?.("No file loaded.", "warn");
         return;
@@ -471,6 +507,7 @@
           "Re-transcribe already queued for this video.", "warn");
         return;
       }
+      const actionToken = window._watchOpenToken;
       // Wrap the await chain so a thrown rejection (rare but possible
       // when pywebview's bridge times out) surfaces as a visible toast
       // instead of being swallowed as an unhandled promise.
@@ -482,6 +519,14 @@
         return;
       }
       if (!model) return; // user cancelled
+      if (Number.isFinite(actionToken)
+          && Number.isFinite(window._watchOpenToken)
+          && actionToken !== window._watchOpenToken) {
+        window._showToast?.("Video changed before re-transcribe was queued.", "warn");
+        return;
+      }
+      v = _watchActionVideo();
+      if (!v?.filepath) return;
       // Mark inflight BEFORE the bridge call so a whisper_pct event
       // racing between the bridge return and the post-await success
       // branch finds the entry and updates it. Roll back on failure
@@ -553,7 +598,7 @@
 
     document.getElementById("btn-bookmark-now")?.addEventListener("click", async () => {
       const _vEl = document.getElementById("watch-video");
-      const v = _browseState.currentVideo;
+      let v = _watchActionVideo();
       if (!v) {
         window._showToast?.("No video loaded.", "warn");
         return;
@@ -562,8 +607,17 @@
         window._showToast?.("Native mode required.", "warn");
         return;
       }
+      const actionToken = window._watchOpenToken;
       const kind = await (window._askBookmarkKind?.());
       if (!kind) return;
+      if (Number.isFinite(actionToken)
+          && Number.isFinite(window._watchOpenToken)
+          && actionToken !== window._watchOpenToken) {
+        window._showToast?.("Video changed before bookmark was saved.", "warn");
+        return;
+      }
+      v = _watchActionVideo();
+      if (!v) return;
       let t = -1;            // -1 sentinel = whole-video bookmark
       let text = "";
       if (kind === "yes") {

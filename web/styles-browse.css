@@ -113,6 +113,31 @@
   align-items: center;
   gap: 6px;
 }
+.browse-sort-wrap[hidden],
+.browse-find-wrap[hidden],
+.back-btn[hidden],
+.browse-view[hidden],
+#browse-group-month-wrap[hidden] {
+  display: none !important;
+}
+.browse-group-label {
+  margin-left: 6px;
+}
+.browse-group-check {
+  margin-right: 3px;
+  vertical-align: -1px;
+}
+.watch-overlay-label,
+.search-hint-spaced,
+.browse-toolbar-spaced {
+  margin-left: 10px;
+}
+.vo-check-spaced {
+  margin-left: 16px;
+}
+.videos-load-sentinel {
+  height: 1px;
+}
 .browse-find-wrap {
   position: relative;
   /* Allow shrinking below the 220px ideal so the toolbar doesn't
@@ -638,33 +663,6 @@
   background: var(--c-log-bg);
 }
 
-/* Index */
-.index-panel { display: flex; flex-direction: column; gap: 14px; height: 100%; }
-.index-cards {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  gap: 10px;
-}
-.stat-card {
-  background: var(--c-surface);
-  border: 1px solid var(--c-border);
-  border-radius: 4px;
-  padding: 10px 14px;
-}
-.stat-label { color: var(--c-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-.stat-value { color: var(--c-text); font-size: 22px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; }
-.index-detail { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; gap: 6px; }
-.index-table-wrap {
-  flex: 1 1 auto;
-  overflow-y: auto;
-  border: 1px solid var(--c-border);
-  border-radius: 2px;
-  background: var(--c-log-bg);
-}
-/* audit F-45: use the palette token (see :root --c-log-row-odd). */
-.index-table tbody tr:nth-child(odd) td { background: var(--c-log-row-odd); }
-.index-table tbody tr:nth-child(even) td { background: var(--c-log-bg); }
-
 .browse-tree-pane {
   flex: 0 0 240px;
   display: flex;
@@ -808,6 +806,7 @@
   display: flex;
   flex-direction: column;
   gap: 12px;
+  height: 100%;
   padding: 14px 14px 8px;
 }
 .index-section {

@@ -17,6 +17,8 @@ PersistDurationMigration = Callable[[str, bool, bool], None]
 
 @dataclass(slots=True)
 class ChannelSyncOptions:
+    """Normalized per-channel sync settings consumed by sync_channel."""
+
     name: str
     url: str
     resolution: str

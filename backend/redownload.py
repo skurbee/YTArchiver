@@ -48,21 +48,60 @@ def _progress_path(folder: str) -> str:
     return os.path.join(folder, "_redownload_progress.json")
 
 
-def _load_progress(folder: str, ch_url: str, new_res: str) -> set[str]:
+def _legacy_broken_counts_path(folder: str) -> str:
+    return os.path.join(folder, "_redownload_broken_counts.json")
+
+
+def _coerce_broken_counts(data: Any) -> dict[str, int]:
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): int(v) for k, v in data.items()
+            if isinstance(v, (int, float))}
+
+
+def _load_legacy_broken_counts(folder: str) -> dict[str, int]:
     try:
-        pf = _progress_path(folder)
+        pf = _legacy_broken_counts_path(folder)
         if not os.path.isfile(pf):
-            return set()
+            return {}
         with open(pf, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if data.get("resolution") == new_res and data.get("ch_url") == ch_url:
-            return set(data.get("done_ids", []))
+            data = json.load(f) or {}
+        return _coerce_broken_counts(data)
     except Exception as e:
         _log.debug("swallowed: %s", e)
-    return set()
+    return {}
 
 
-def _save_progress(folder: str, ch_url: str, new_res: str, done: set[str]) -> bool:
+def _load_progress_state(
+        folder: str, ch_url: str, new_res: str
+) -> tuple[set[str], dict[str, int]]:
+    done: set[str] = set()
+    broken_counts: dict[str, int] = {}
+    try:
+        pf = _progress_path(folder)
+        if os.path.isfile(pf):
+            with open(pf, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            if (data.get("resolution") == new_res
+                    and data.get("ch_url") == ch_url):
+                done = set(data.get("done_ids", []))
+                broken_counts = _coerce_broken_counts(
+                    data.get("broken_counts"))
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
+    # Migration path for pre-T301 runs. We keep reading the legacy sidecar,
+    # but new writes fold the counts into _redownload_progress.json.
+    broken_counts.update(_load_legacy_broken_counts(folder))
+    return done, broken_counts
+
+
+def _load_progress(folder: str, ch_url: str, new_res: str) -> set[str]:
+    done, _broken_counts = _load_progress_state(folder, ch_url, new_res)
+    return done
+
+
+def _save_progress(folder: str, ch_url: str, new_res: str, done: set[str],
+                   broken_counts: dict[str, int] | None = None) -> bool:
     """Persist the redownload progress dict atomically. Returns True on
     success, False on failure (caller can surface a warning when False
     so the user knows resume might re-do already-completed videos —
@@ -71,9 +110,12 @@ def _save_progress(folder: str, ch_url: str, new_res: str, done: set[str]) -> bo
         os.makedirs(folder, exist_ok=True)
         pf = _progress_path(folder)
         tmp = pf + ".tmp"
+        payload = {"ch_url": ch_url, "resolution": new_res,
+                   "done_ids": list(done)}
+        if broken_counts is not None:
+            payload["broken_counts"] = dict(broken_counts)
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"ch_url": ch_url, "resolution": new_res,
-                       "done_ids": list(done)}, f)
+            json.dump(payload, f)
         os.replace(tmp, pf)
         return True
     except Exception as e:
@@ -83,43 +125,9 @@ def _save_progress(folder: str, ch_url: str, new_res: str, done: set[str]) -> bo
 
 def _clear_progress(folder: str) -> None:
     try:
-        pf = _progress_path(folder)
-        if os.path.isfile(pf):
-            os.remove(pf)
-    except Exception as e:
-        _log.debug("swallowed: %s", e)
-
-
-def _broken_counts_path(folder: str) -> str:
-    return os.path.join(folder, "_redownload_broken_counts.json")
-
-
-def _load_broken_counts(folder: str) -> dict[str, int]:
-    """Per-video broken-download counter. Used to quarantine
-    permanently-broken videos after 3 consecutive broken downloads
-    (audit: redownload.py:1011-1015)."""
-    try:
-        pf = _broken_counts_path(folder)
-        if not os.path.isfile(pf):
-            return {}
-        with open(pf, "r", encoding="utf-8") as f:
-            data = json.load(f) or {}
-        if isinstance(data, dict):
-            return {str(k): int(v) for k, v in data.items()
-                    if isinstance(v, (int, float))}
-    except Exception as e:
-        _log.debug("swallowed: %s", e)
-    return {}
-
-
-def _save_broken_counts(folder: str, counts: dict[str, int]) -> None:
-    try:
-        os.makedirs(folder, exist_ok=True)
-        pf = _broken_counts_path(folder)
-        tmp = pf + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(counts, f)
-        os.replace(tmp, pf)
+        for pf in (_progress_path(folder), _legacy_broken_counts_path(folder)):
+            if os.path.isfile(pf):
+                os.remove(pf)
     except Exception as e:
         _log.debug("swallowed: %s", e)
 
@@ -553,7 +561,7 @@ def _height_from_metadata_jsonl(filepath: str) -> int | None:
 
     The .Metadata.jsonl is written by sync/backfill and carries every
     YT-side field, including `height` (when bulk_refresh_views_likes has
-    visited the video) or — older entries — `formats[0].height`.
+    visited the video) or — older entries — the max video-format height.
 
     Returns None if no jsonl is present or no height field is found.
     Caller falls back to ffprobe on None.
@@ -603,12 +611,23 @@ def _height_from_metadata_jsonl(filepath: str) -> int | None:
                             h = obj.get("height")
                             if isinstance(h, (int, float)) and h > 0:
                                 return int(h)
-                            # Older entries may have height inside formats[0]
+                            # Older entries may have height only inside the
+                            # formats list. Pick the max real video stream
+                            # height; formats[0] is often audio-only or the
+                            # lowest quality.
                             fmts = obj.get("formats") or []
                             if fmts and isinstance(fmts, list):
-                                fh = fmts[0].get("height") if isinstance(fmts[0], dict) else None
-                                if isinstance(fh, (int, float)) and fh > 0:
-                                    return int(fh)
+                                heights = [
+                                    int(f.get("height") or 0)
+                                    for f in fmts
+                                    if isinstance(f, dict)
+                                    and f.get("vcodec") not in (None, "none")
+                                    and isinstance(f.get("height"),
+                                                   (int, float))
+                                    and f.get("height") > 0
+                                ]
+                                if heights:
+                                    return max(heights)
                             return None
                 except Exception:
                     continue
@@ -960,7 +979,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                    if (m.get("video_id") or "") == only_video_id]
 
     # 4. Resume support
-    done = _load_progress(folder, ch_url, new_res)
+    done, broken_counts = _load_progress_state(folder, ch_url, new_res)
     if done:
         stream.emit([["  \u2014", "simpleline_redwnl"],
                      [f" Resuming \u2014 {len(done)} already redownloaded.\n",
@@ -1125,7 +1144,8 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             # invariant.
             _emit_active(file_num, _live_total)
             done.add(vid)
-            _save_progress(folder, ch_url, cur_res[0], done)
+            broken_counts.pop(vid, None)
+            _save_progress(folder, ch_url, cur_res[0], done, broken_counts)
             n_skipped += 1
             continue
         # Emit / update the sticky active line for this video.
@@ -1192,8 +1212,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                 # consecutive broken downloads, add to `done` so the
                 # next pass skips it (audit: redownload.py:1011-1015).
                 try:
-                    _broken_counts = _load_broken_counts(folder)
-                    _bc = int(_broken_counts.get(vid, 0)) + 1
+                    _bc = int(broken_counts.get(vid, 0)) + 1
                     if _bc >= 3:
                         stream.emit([
                             ["  \u2014 ", "simpleline_redwnl"],
@@ -1205,11 +1224,14 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                         # Quarantine: mark as done so this pass + future
                         # resumes skip the video.
                         done.add(vid)
-                        _save_progress(folder, ch_url, cur_res[0], done)
-                        _broken_counts.pop(vid, None)
+                        broken_counts.pop(vid, None)
                     else:
-                        _broken_counts[vid] = _bc
-                    _save_broken_counts(folder, _broken_counts)
+                        broken_counts[vid] = _bc
+                    if not _save_progress(folder, ch_url, cur_res[0], done,
+                                          broken_counts):
+                        stream.emit_dim(
+                            "  \u2014 warning: progress file save failed; "
+                            "broken-download retry state may be stale.")
                 except Exception as _qe:
                     _log.debug("swallowed: %s", _qe)
                 _emit_active(file_num, _live_total)
@@ -1245,7 +1267,9 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                     # Re-push the active status line to the DOM bottom.
                     _emit_active(file_num, _live_total)
                     done.add(vid)
-                    _save_progress(folder, ch_url, cur_res[0], done)
+                    broken_counts.pop(vid, None)
+                    _save_progress(folder, ch_url, cur_res[0], done,
+                                   broken_counts)
                     n_skipped += 1
                     continue
             # Resolution guard — never replace an original with a WORSE
@@ -1348,7 +1372,9 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                     raise _last_err if _last_err else OSError(
                         "os.replace failed after 3 attempts")
             done.add(vid)
-            if not _save_progress(folder, ch_url, cur_res[0], done):
+            broken_counts.pop(vid, None)
+            if not _save_progress(folder, ch_url, cur_res[0], done,
+                                  broken_counts):
                 stream.emit_dim(
                     "  — warning: progress file save failed; resume "
                     "may retry this video on next run.")

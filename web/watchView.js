@@ -58,7 +58,7 @@
       // them all on one completion would mis-paint sibling buttons.
       try { window._retranscribeWatchClear?.(video_id || ""); } catch {}
       const wv = document.getElementById("view-watch");
-      if (!wv || wv.style.display === "none") return;
+      if (!wv || wv.hidden) return;
       const cur = window._watchCurrentVideo || null;
       if (!cur) return;
       // Normalize filepaths — Python sends os.path.normpath() output which
@@ -119,7 +119,12 @@
       window.renderWatchView(cur, transcript, sourceInfo,
                              { skipVideoReload: true });
       window._showToast?.("Re-transcription complete — transcript updated.", "ok");
-    } catch (e) { /* ignore */ }
+    } catch (e) {
+      console.warn("_onRetranscribeComplete failed:", e);
+      window._showToast?.(
+        "Re-transcription finished but the view couldn't refresh; reopen the video.",
+        "warn");
+    }
   };
 
   /** Render the Watch view: loads the real video file into <video> and
@@ -165,6 +170,7 @@
     // a retranscribe, it pushes an event; the handler checks this ref
     // to decide whether the completed job matches what's on screen.
     window._watchCurrentVideo = video;
+    window._watchRenderedToken = window._watchOpenToken;
 
     // Repaint the Re-transcribe button to reflect whether THIS video
     // has an in-flight retranscribe. Without this, navigating from
@@ -187,7 +193,7 @@
       tr.innerHTML = _noSpeech
         ? '<div style="color: var(--c-dim); font-style: italic;">No speech detected — this video has no spoken audio to transcribe.</div>'
         : '<div style="color: var(--c-dim); font-style: italic;">No transcript available.</div>';
-      _unbindKaraoke(vEl);
+      _unbindKaraoke();
       // Hide the on-video overlay so a stale phrase doesn't linger over
       // the still-playing video after a failed retranscribe.
       try { vEl._capOverlay && vEl._capOverlay.classList.remove("show"); } catch { /* ignore */ }
@@ -538,7 +544,7 @@
       if (mn > 59 || s > 59) {
         el.appendChild(document.createTextNode(m[0]));
       } else {
-        const secs = h * 3600 + mn * 60 + s;
+        const secs = Math.max(0, h * 3600 + mn * 60 + s);
         const span = document.createElement("span");
         span.className = "desc-ts";
         span.dataset.t = String(secs);
@@ -565,8 +571,8 @@
             } else {
               const _onMeta = () => {
                 vEl.removeEventListener("loadedmetadata", _onMeta);
-                const _d = Number.isFinite(vEl.duration) ? vEl.duration : secs;
-                vEl.currentTime = Math.min(secs, _d);
+                if (!Number.isFinite(vEl.duration)) return;
+                vEl.currentTime = Math.min(secs, vEl.duration);
                 vEl.play().catch(() => {});
               };
               vEl.addEventListener("loadedmetadata", _onMeta);
@@ -633,7 +639,7 @@
         '<div class="watch-placeholder-text" style="font-size:13px;color:var(--c-text);">'
         + '<span class="spinner-inline"></span>Loading…</div>';
       // Hide the <video> element so its previous src doesn't flash.
-      vEl.style.display = "none";
+      vEl.hidden = true;
     }
     let url = null;
     let errorDetail = "";
@@ -699,7 +705,7 @@
         return;
       }
       vEl.src = url;
-      vEl.style.display = "";
+      vEl.hidden = false;
       if (ph) {
         ph.style.display = "none";
         // Reset placeholder DOM back to its default empty-state
@@ -723,7 +729,7 @@
       // "Select a video to play" which was misleading when a video IS
       // selected but the file is gone. Now it explains.
       vEl.src = "";
-      vEl.style.display = "none";
+      vEl.hidden = true;
       if (ph) {
         ph.style.display = "";
         if (errorDetail && errorDetail !== "unknown error") {
@@ -772,10 +778,23 @@
   }
 
   function _seekTo(vEl, seconds) {
-    if (!vEl || !vEl.duration) return;
-    try {
-      vEl.currentTime = Math.max(0, Number(seconds) || 0);
+    if (!vEl) return;
+    const target = Math.max(0, Number(seconds) || 0);
+    const doSeek = () => {
+      const d = Number.isFinite(vEl.duration) ? vEl.duration : target;
+      vEl.currentTime = Math.min(target, d);
       vEl.play().catch(() => {});
+    };
+    try {
+      if (Number.isFinite(vEl.duration)) {
+        doSeek();
+      } else {
+        const onMeta = () => {
+          vEl.removeEventListener("loadedmetadata", onMeta);
+          try { doSeek(); } catch {}
+        };
+        vEl.addEventListener("loadedmetadata", onMeta);
+      }
     } catch { /* noop */ }
   }
 
@@ -812,22 +831,20 @@
   // marker tracks Whisper's millisecond-precision timestamps cleanly
   // even at fast forward.
 
-  let _karaokeHandler = null;   // legacy: kept around for compat
   let _karaokeRafId = null;
-  function _unbindKaraoke(vEl) {
+  let _karaokeGen = 0;
+  function _unbindKaraoke() {
+    _karaokeGen += 1;
     if (_karaokeRafId !== null) {
       try { cancelAnimationFrame(_karaokeRafId); } catch {}
       _karaokeRafId = null;
     }
-    if (vEl && _karaokeHandler) {
-      vEl.removeEventListener("timeupdate", _karaokeHandler);
-    }
-    _karaokeHandler = null;
   }
 
   function _bindKaraoke(vEl, trWrap, segEls, allWordEls, wordIndex) {
-    _unbindKaraoke(vEl);
+    _unbindKaraoke();
     if (!vEl || !segEls.length) return;
+    const myGen = ++_karaokeGen;
     let lastSegIdx = -1;
     let lastWordEl = null;
     // Repaint the pinned overlay immediately (e.g. when the user flips
@@ -835,6 +852,7 @@
     vEl._capForceRefresh = () => _updateCapOverlay(vEl, lastWordEl, allWordEls, wordIndex);
 
     const _tick = () => {
+      if (myGen !== _karaokeGen) return;
       const t = vEl.currentTime;
       if (t == null) return;
       // Binary-search segments for the one containing t
@@ -886,8 +904,8 @@
       // otherwise runs at 60fps wastefully while user is on
       // another tab / view (audit: watchView.js H155).
       const _watchView = document.getElementById("view-watch");
-      const _hidden = _watchView && _watchView.style.display === "none";
-      if (vEl.isConnected && !_hidden) {
+      const _hidden = _watchView && _watchView.hidden;
+      if (myGen === _karaokeGen && vEl.isConnected && !_hidden) {
         _karaokeRafId = requestAnimationFrame(_tick);
       }
     };

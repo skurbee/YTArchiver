@@ -97,7 +97,7 @@
         </div>
 
         <!-- Performance &mdash; startup tuning -->
-        <div class="settings-view" id="settings-view-performance" style="display:none;">
+        <div class="settings-view" id="settings-view-performance" hidden>
           <label class="subs-section-label">Performance</label>
           <div class="edit-grid">
             <!-- Disk-scan staleness: re-walk the archive to refresh sizes
@@ -106,10 +106,10 @@
                  Higher = faster boots but outside-the-app drift takes
                  longer to reconcile. -->
             <label class="edit-gl">Disk scan</label>
-            <div class="edit-gv-inline" style="gap:6px;">
+            <div class="edit-gv-inline edit-gap-6">
               <span class="edit-dim">rescan archive if cache older than</span>
-              <input type="text" class="ctl-input edit-num" id="settings-disk-staleness"
-                     value="24" style="width:56px;" />
+              <input type="text" class="ctl-input edit-num settings-disk-staleness-input"
+                     id="settings-disk-staleness" value="24" />
               <span class="edit-dim">hours &nbsp;&middot;&nbsp; 0 = always rescan</span>
             </div>
 
@@ -117,11 +117,11 @@
                  memory at boot so Browse clicks are instant. -->
             <label class="edit-gl">Browse preload</label>
             <div class="edit-gv-stack">
-              <label class="edit-gv-inline" style="gap:6px;cursor:pointer;">
+              <label class="edit-gv-inline settings-preload-toggle">
                 <input type="checkbox" id="settings-preload-all" />
                 <span>Preload every video at launch</span>
               </label>
-              <div class="edit-gv-inline" id="settings-preload-hint-wrap" style="gap:6px;margin-top:2px;">
+              <div class="edit-gv-inline settings-preload-hint-row" id="settings-preload-hint-wrap">
                 <span class="edit-dim" id="settings-preload-all-hint"></span>
               </div>
             </div>
@@ -129,7 +129,7 @@
         </div>
 
         <!-- Appearance &mdash; UI preferences -->
-        <div class="settings-view" id="settings-view-appearance" style="display:none;">
+        <div class="settings-view" id="settings-view-appearance" hidden>
           <label class="subs-section-label">Appearance</label>
           <div class="edit-grid">
             <!-- Subs tab Avg column visibility toggle. The Avg column
@@ -137,7 +137,7 @@
                  find noisy; hide it without losing the underlying data. -->
             <label class="edit-gl">Subs table</label>
             <div class="edit-gv-stack">
-              <label class="edit-gv-inline" style="gap:6px;cursor:pointer;">
+              <label class="edit-gv-inline settings-preload-toggle">
                 <input type="checkbox" id="settings-show-avg-size" />
                 <span>Show Avg filesize in subs tab</span>
               </label>
@@ -159,18 +159,20 @@
         </div>
 
         <!-- Tools &mdash; yt-dlp, import/export, bulk metadata -->
-        <div class="settings-view" id="settings-view-tools" style="display:none;">
+        <div class="settings-view" id="settings-view-tools" hidden>
           <label class="subs-section-label">Tools</label>
           <div class="edit-grid">
+            <div class="edit-gh settings-tool-group">Dependencies</div>
             <label class="edit-gl">yt-dlp</label>
-            <div class="edit-gv-inline" style="gap:8px;">
+            <div class="edit-gv-inline edit-gap-8">
               <span class="edit-dim" id="settings-ytdlp-version">checking&hellip;</span>
               <button class="btn btn-ghost btn-thin" id="btn-ytdlp-update"
                       title="Run yt-dlp -U to update to the latest release">Update</button>
             </div>
 
+            <div class="edit-gh settings-tool-group">Backup and migration</div>
             <label class="edit-gl">Channels</label>
-            <div class="edit-gv-inline" style="gap:6px;">
+            <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-export-channels"
                       title="Save your channel list to a JSON file">Export&hellip;</button>
               <button class="btn btn-ghost btn-thin" id="btn-import-channels"
@@ -178,7 +180,7 @@
             </div>
 
             <label class="edit-gl">Full backup</label>
-            <div class="edit-gv-inline" style="gap:6px;">
+            <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-export-backup"
                       title="Save config + queue state + all journals to a zip">Export&hellip;</button>
               <button class="btn btn-ghost btn-thin" id="btn-import-backup"
@@ -196,8 +198,9 @@
                  users asked for it grouped with the other archive-
                  wide Tools actions. Button id stays `btn-scan-archive`
                  so `initScanArchive()` in app.js finds it unchanged. -->
+            <div class="edit-gh settings-tool-group">Archive integrity</div>
             <label class="edit-gl">Archive</label>
-            <div class="edit-gv-inline" style="gap:6px;">
+            <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-scan-archive"
                       title="Re-scan archive folders for new files added outside the app">Rescan archive&hellip;</button>
             </div>
@@ -210,7 +213,7 @@
                  Explorer's "show hidden files" is off. Non-destructive —
                  only flips the hidden bit; never moves or deletes. -->
             <label class="edit-gl">Hidden sidecars</label>
-            <div class="edit-gv-inline" style="gap:6px;">
+            <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-hide-sidecars"
                       title="Scan the whole archive and hide any stray sidecar files (.info.json, leftover thumbnails, .jsonl, etc.) so each folder shows only the videos + the Transcript.txt. Only sets the Windows hidden attribute — nothing is moved or deleted.">Scan &amp; repair&hellip;</button>
             </div>
@@ -219,8 +222,9 @@
                  HTML + JS but had no UI buttons to trigger them. Both
                  handlers (app.js:6436 / 6471) use getElementById which
                  silently no-ops when the elements are absent. -->
+            <div class="edit-gh settings-tool-group">App info and setup</div>
             <label class="edit-gl">Info &amp; Self-check</label>
-            <div class="edit-gv-inline" style="gap:6px;">
+            <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-about"
                       title="App version and config info">About&hellip;</button>
               <button class="btn btn-ghost btn-thin" id="btn-diagnostics"
@@ -230,7 +234,7 @@
             <!-- Re-open the first-run setup wizard (archive folder picker +
                  dependency installer for yt-dlp / ffmpeg / Whisper). -->
             <label class="edit-gl">Setup</label>
-            <div class="edit-gv-inline" style="gap:6px;">
+            <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-run-setup"
                       title="Re-run first-time setup: archive folder + install yt-dlp / ffmpeg / Whisper">Run setup again&hellip;</button>
             </div>
@@ -240,7 +244,7 @@
                  much disk would be saved at each quality tier &mdash; no
                  actual compression runs. -->
             <label class="edit-gl">Compress</label>
-            <div class="edit-gv-inline" style="gap:6px;">
+            <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-compress-dry-run"
                       title="Project disk savings at each quality tier without compressing anything">Dry-run savings&hellip;</button>
             </div>
@@ -251,7 +255,7 @@
                  them next to their mp4. Reports a dry-run preview
                  first; user confirms before any files move. -->
             <label class="edit-gl">Thumbnails</label>
-            <div class="edit-gv-inline" style="gap:6px;">
+            <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-thumb-realign"
                       title="Move thumbnails that drifted into the wrong year folder back next to their video file. Shows a dry-run preview before doing anything.">Realign misplaced&hellip;</button>
             </div>
@@ -262,8 +266,9 @@
                  from .jsonl data, queues Whisper retranscribe for
                  entries that only exist in .txt, and cleans up FTS5
                  phantom rows (C-9). -->
+            <div class="edit-gh settings-tool-group">Transcript repair</div>
             <label class="edit-gl">Transcript drift</label>
-            <div class="edit-gv-inline" style="gap:6px;">
+            <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-drift-scan"
                       title="Scan a channel's .txt / .jsonl / FTS for drift and offer a repair">Scan &amp; fix&hellip;</button>
             </div>
@@ -275,7 +280,7 @@
                  are auto-skipped. Slow (hits YT per video) — progress
                  streams to the main log. -->
             <label class="edit-gl">YT auto-captions</label>
-            <div class="edit-gv-inline" style="gap:6px;">
+            <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-repair-yt-captions"
                       title="Re-parse YT auto-captions for videos archived before v64.7 to fix dropped words and segment-boundary duplications">Repair&hellip;</button>
             </div>
@@ -286,7 +291,7 @@
                  runs each through PunctuationManager, writes back to
                  DB + JSONL. No YT calls. -->
             <label class="edit-gl">Transcript punctuation</label>
-            <div class="edit-gv-inline" style="gap:6px;">
+            <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-punct-restore"
                       title="Add sentence punctuation + capitalization to per-segment text for legacy YT-captioned videos. Local CPU/GPU only, no YT calls.">Restore&hellip;</button>
             </div>
@@ -297,8 +302,9 @@
                  a fresh bootstrap. Useful if the user deleted a
                  channel folder manually, or wants to re-walk the
                  whole catalog after a filter change. -->
+            <div class="edit-gh settings-tool-group">Advanced state repair</div>
             <label class="edit-gl">Channel sync state</label>
-            <div class="edit-gv-inline" style="gap:6px;">
+            <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-reset-sync-state"
                       title="Reset a channel's bootstrap/sync state so the next sync walks from scratch">Reset channel&hellip;</button>
             </div>
@@ -310,7 +316,7 @@
                  Local only; progress streams to the main log; stoppable and
                  resumable (re-run picks up the rest). -->
             <label class="edit-gl">Video lengths</label>
-            <div class="edit-gv-inline" style="gap:6px;">
+            <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-fix-video-lengths"
                       title="Read each video's true length with ffprobe (local, no YouTube) to fill in missing lengths shown in Browse &gt; Videos. Progress streams to the log; you can Stop and re-run to resume.">Check / fix&hellip;</button>
             </div>
@@ -322,7 +328,7 @@
              Rows show when each channel's views/likes and comments
              were last refreshed; sort defaults to "oldest first" so
              stale channels float to the top and are easy to spot. -->
-        <div class="settings-view" id="settings-view-metadata" style="display:none;">
+        <div class="settings-view" id="settings-view-metadata" hidden>
           <label class="subs-section-label">Metadata</label>
           <div class="metadata-panel">
             <div class="metadata-hint">
@@ -422,7 +428,7 @@
         </div>
 
         <!-- Index management -->
-        <div class="settings-view" id="settings-view-index" style="display:none;">
+        <div class="settings-view" id="settings-view-index" hidden>
           <label class="subs-section-label">Index</label>
           <div class="settings-index-grid">
 
@@ -463,7 +469,7 @@
                 Right-click a root &rarr; Delete All Transcriptions.
               </div>
               <div class="index-roots-list" id="settings-roots-list" tabindex="0"></div>
-              <div class="index-section-buttons" style="margin-top:6px;">
+              <div class="index-section-buttons">
                 <button class="btn btn-ghost btn-thin" id="btn-settings-add-root">Add Folder&hellip;</button>
                 <button class="btn btn-ghost btn-thin" id="btn-settings-remove-root">Remove Selected</button>
               </div>
@@ -472,7 +478,7 @@
             <!-- Auto-update on every N downloads -->
             <div class="index-section">
               <div class="index-section-label">Auto-update</div>
-              <label class="index-auto-label" style="display:inline-flex;align-items:center;gap:6px;">
+              <label class="index-auto-label">
                 <input type="checkbox" id="settings-auto-index-enabled" />
                 <span>Re-index automatically every</span>
               </label>
@@ -500,7 +506,8 @@
              each write. Hidden on the Index/Metadata views (their own
              controls auto-save through settingsInfra). -->
         <div class="settings-actions" id="settings-actions-footer">
-          <span class="settings-autosave-note" id="settings-autosave-note">Changes are saved automatically</span>
+          <span class="settings-autosave-note" id="settings-autosave-note"
+                role="status" aria-live="polite" aria-atomic="true">Changes are saved automatically</span>
         </div>
       </div>
     </div>

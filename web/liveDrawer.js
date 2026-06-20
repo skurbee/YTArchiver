@@ -132,8 +132,23 @@
       if (!ok) return;
       if (!nativeBridgeUp()) return;
       const r = await bridgeCall("livestreams_list");
+      let cleared = 0;
+      let failed = 0;
       for (const it of (r?.items || [])) {
-        await bridgeCall("livestreams_drop", it.video_id);
+        try {
+          const dropped = await bridgeCall("livestreams_drop", it.video_id);
+          if (dropped?.ok) cleared += 1;
+          else failed += 1;
+        } catch (e) {
+          failed += 1;
+          console.warn("[deferred] clear failed", it?.video_id, e);
+        }
+      }
+      const total = cleared + failed;
+      if (failed) {
+        window._showToast?.(`Cleared ${cleared} of ${total}; ${failed} failed.`, "warn");
+      } else {
+        window._showToast?.(`Cleared ${cleared} deferred livestream${cleared === 1 ? "" : "s"}.`, "ok");
       }
       refreshDeferredLivestreams();
     });

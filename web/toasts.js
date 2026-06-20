@@ -100,6 +100,9 @@
     const ttl = opts.ttlMs ?? (opts.kind === "error" ? 8000 : 2500);
     const el = document.createElement("div");
     el.className = "toast " + (opts.kind || "");
+    el.setAttribute("role", opts.kind === "error" ? "alert" : "status");
+    el.setAttribute("aria-live", opts.kind === "error" ? "assertive" : "polite");
+    el.setAttribute("aria-atomic", "true");
     const msgEl = document.createElement("span");
     msgEl.textContent = opts.msg || "";
     el.appendChild(msgEl);

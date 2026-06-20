@@ -25,7 +25,7 @@ from typing import Any
 
 from ..log import get_logger
 from ..log_stream import LogStreamer
-from ..ytarchiver_config import ARCHIVE_FILE, load_config
+from ..ytarchiver_config import ARCHIVE_FILE, config_transaction, load_config
 
 # sync_channel + the module-level cookie-alert flag live in core.py.
 # The flag is reset at pass start; mutate it via the imported module
@@ -987,6 +987,18 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                                name_tag="simpleline", summary_tag="dim")
                 _last_live["name"] = ""
                 continue
+            if _qc.get("quickcheck_skipped"):
+                _sync_row_emit(stream, i, total, ch_name,
+                               summary="quick check cooling down; full sync",
+                               name_tag="simpleline", summary_tag="dim")
+            elif _qc.get("timed_out"):
+                _sync_row_emit(stream, i, total, ch_name,
+                               summary="quick check timed out; full sync",
+                               name_tag="simpleline", summary_tag="dim")
+            elif _qc.get("empty_probe"):
+                _sync_row_emit(stream, i, total, ch_name,
+                               summary="quick check returned empty; full sync",
+                               name_tag="simpleline", summary_tag="dim")
         # Wrap sync_channel in try/finally so the sync-active flag is
         # ALWAYS cleared on this channel — even when sync_channel takes
         # one of its many early-return paths (no URL, yt-dlp missing,
@@ -1125,10 +1137,9 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     _cancelled_for_ts = (cancel_event is not None and cancel_event.is_set())
     if _label == "Sync pass" and not _cancelled_for_ts:
         try:
-            _cfg_end = load_config()
-            _cfg_end["last_sync"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-            from ..ytarchiver_config import save_config as _save_cfg
-            _save_cfg(_cfg_end)
+            with config_transaction() as _cfg_end:
+                _cfg_end["last_sync"] = datetime.now().strftime(
+                    "%Y-%m-%d %H:%M")
         except Exception as _ce:
             _log.debug("end-of-pass last_sync write failed: %s", _ce)
     # Clean up: clear the running-slot and pass-progress decoration.

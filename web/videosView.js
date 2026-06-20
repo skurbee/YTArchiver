@@ -46,9 +46,15 @@
   const $ = (id) => document.getElementById(id);
   const grid = () => $("recent-grid");
 
+  function _uploadTsMs(value) {
+    const n = Number(value || 0);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n < 1000000000000 ? n * 1000 : n;
+  }
+
   function isActive() {
     const v = $("view-recent");
-    return !!(v && v.style.display !== "none" && v.offsetParent !== null);
+    return !!(v && !v.hidden && v.offsetParent !== null);
   }
 
   function _cardFor(r) {
@@ -56,7 +62,7 @@
       title: r.title || "", channel: r.channel || "",
       filepath: r.filepath || "", video_id: r.video_id || "",
       duration: r.duration || "", uploaded: r.uploaded || "",
-      upload_ts: r.upload_ts || null, size_bytes: r.size_bytes || 0,
+      upload_ts: _uploadTsMs(r.upload_ts), size_bytes: r.size_bytes || 0,
       views: r.views || "", view_count: r.view_count,
       thumbnail_url: r.thumbnail_url || "",
       tx_status: r.tx_status || "", removed_from_yt: !!r.removed_from_yt,

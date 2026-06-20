@@ -31,9 +31,9 @@
          whisper model is set in Settings, mid-queue swap is overkill
          for the popover. Element kept commented for future reference
          in case the per-job swap feature is resurrected.
-         <div class="gpu-popover-modelswap" style="padding:4px 10px;display:flex;align-items:center;gap:6px;">
-           <label for="gpu-model-swap" class="edit-dim" style="font-size:11px;">Next-job model:</label>
-           <select class="ctl-select" id="gpu-model-swap" style="flex:1;">
+         <div class="gpu-popover-modelswap">
+           <label for="gpu-model-swap" class="edit-dim gpu-popover-model-label">Next-job model:</label>
+           <select class="ctl-select gpu-popover-model-select" id="gpu-model-swap">
              <option value="tiny">tiny (fastest)</option>
              <option value="small" selected>small</option>
              <option value="medium">medium</option>
@@ -59,4 +59,3 @@
               title="Manual Transcription">&#128193;</button>
     </div>
   </div>
-

@@ -417,29 +417,36 @@
     }
     cloud.style.display = "";
     cloud.innerHTML = "";
-    if (!words.length) {
+    const cleanWords = Array.isArray(words)
+      ? words.map(w => ({
+          word: String(w?.word || "").trim(),
+          count: Math.max(1, Number(w?.count) || 1),
+        })).filter(w => w.word)
+      : [];
+    if (!cleanWords.length) {
       cloud.innerHTML = '<div class="browse-empty">No words.</div>';
       return;
     }
     // Scale font sizes between 12px and 52px based on rank.
-    const max = words[0].count || 1;
-    const min = words[words.length - 1].count || 1;
+    const counts = cleanWords.map(w => w.count);
+    const max = Math.max(...counts);
+    const min = Math.min(...counts);
     // Degenerate-data hint: when every word ties at the same count
     // the cloud renders as one uniform size with no rank cue. Make
     // the user aware that frequency ordering is arbitrary (audit:
     // graphTab.js H220).
-    if (max === min && words.length > 1) {
+    if (max === min && cleanWords.length > 1) {
       const hint = document.createElement("div");
       hint.className = "browse-hint";
       hint.style.cssText = "padding:8px 12px;color:var(--c-dim);font-size:12px;";
-      hint.textContent = `All ${words.length} words tied at ${max} `
+      hint.textContent = `All ${cleanWords.length} words tied at ${max} `
         + `occurrences — frequency ordering is arbitrary.`;
       cloud.appendChild(hint);
     }
     const palette = ["#6cb4ee", "#e87aac", "#3dd68c", "#c7e64f",
                      "#c084fc", "#ff8c42", "#38d9e0", "#dde1e8"];
-    for (let i = 0; i < words.length; i++) {
-      const w = words[i];
+    for (let i = 0; i < cleanWords.length; i++) {
+      const w = cleanWords[i];
       const ratio = max === min ? 0.5 :
         (Math.log(w.count) - Math.log(min)) / (Math.log(max) - Math.log(min));
       const size = 12 + Math.round(ratio * 40);
@@ -477,17 +484,31 @@
     let rows = [];
     if (_graphLastData.cloud) {
       rows.push(["word", "count"]);
-      for (const w of _graphLastData.cloud) rows.push([w.word, w.count]);
+      const cloudRows = Array.isArray(_graphLastData.cloud)
+        ? _graphLastData.cloud : [];
+      for (const w of cloudRows) {
+        const word = String(w?.word || "").trim();
+        if (!word) continue;
+        rows.push([word, Math.max(1, Number(w?.count) || 1)]);
+      }
     } else if (Array.isArray(_graphLastData.series) && _graphLastData.series.length) {
-      rows.push(["bucket", ..._graphLastData.series.map(s => s.word)]);
-      for (let i = 0; i < _graphLastData.labels.length; i++) {
-        rows.push([_graphLastData.labels[i],
-                   ..._graphLastData.series.map(s => s.values[i] ?? "")]);
+      const labels = Array.isArray(_graphLastData.labels)
+        ? _graphLastData.labels : [];
+      const series = _graphLastData.series.filter(s => Array.isArray(s.values));
+      rows.push(["bucket", ...series.map(s => s.word || "")]);
+      const rowCount = Math.min(labels.length, ...series.map(s => s.values.length));
+      for (let i = 0; i < rowCount; i++) {
+        rows.push([labels[i], ...series.map(s => s.values[i] ?? "")]);
       }
     } else {
       rows.push(["bucket", _graphLastData.word || "count"]);
-      for (let i = 0; i < _graphLastData.labels.length; i++) {
-        rows.push([_graphLastData.labels[i], _graphLastData.values[i] ?? ""]);
+      const labels = Array.isArray(_graphLastData.labels)
+        ? _graphLastData.labels : [];
+      const values = Array.isArray(_graphLastData.values)
+        ? _graphLastData.values : [];
+      const rowCount = Math.min(labels.length, values.length);
+      for (let i = 0; i < rowCount; i++) {
+        rows.push([labels[i], values[i] ?? ""]);
       }
     }
     const csv = rows.map(r => r.map(c => {

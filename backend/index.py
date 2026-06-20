@@ -22,6 +22,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from datetime import UTC
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,16 @@ _db_lock = threading.RLock()
 _tx_retry_set: set = set()
 _tx_retry_lock = threading.Lock()
 _tx_retry_thread: threading.Thread | None = None
+
+
+def _invalidate_top_words_cache() -> None:
+    try:
+        from . import index_graph as _graph
+        _graph.invalidate_top_words_cache()
+    except Exception as e:
+        _log.debug("top_words cache invalidation failed: %s", e)
+
+
 def _enqueue_tx_retry(fp: str) -> None:
     global _tx_retry_thread
     with _tx_retry_lock:
@@ -388,8 +399,11 @@ def _open() -> sqlite3.Connection | None:
             ):
                 try:
                     _conn.execute(stmt)
-                except sqlite3.OperationalError:
-                    pass
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc).lower():
+                        _log.warning("schema ALTER failed: %s; stmt=%s",
+                                     exc, stmt)
+                        raise
             # Indexes
             for stmt in (
                 "CREATE INDEX IF NOT EXISTS idx_seg_channel ON segments(channel)",
@@ -433,8 +447,10 @@ def _open() -> sqlite3.Connection | None:
             ):
                 try:
                     _conn.execute(stmt)
-                except sqlite3.OperationalError:
-                    pass
+                except sqlite3.OperationalError as exc:
+                    _log.warning("schema index creation failed: %s; stmt=%s",
+                                 exc, stmt)
+                    raise
             # run pending migrations (none currently — framework
             # only) and bump user_version once we're at the target. Wrapped
             # in try/except so a future migration bug can't brick startup.
@@ -445,15 +461,23 @@ def _open() -> sqlite3.Connection | None:
                 if _current_v != _SCHEMA_VERSION:
                     _conn.execute(f"PRAGMA user_version = {int(_SCHEMA_VERSION)}")
             except Exception as e:
-                _log.debug("schema migration step failed: %s", e)
+                _log.error("schema migration step failed; user_version "
+                           "left at %s: %s", _current_v, e)
+                raise
             _conn.commit()
+            try:
+                _qc = _conn.execute("PRAGMA quick_check").fetchone()
+                if _qc and str(_qc[0]).lower() != "ok":
+                    _log.warning("SQLite quick_check reported: %s", _qc[0])
+            except sqlite3.Error as exc:
+                _log.warning("SQLite quick_check failed: %s", exc)
             # Mark schema-ready so future _reader_open() calls can
             # skip the _db_lock-acquiring _open() call entirely.
             global _schema_inited
             _schema_inited = True
             return _conn
         except sqlite3.Error as e:
-            print(f"[index] Could not open DB: {e}")
+            _log.error("Could not open DB %s: %s", TRANSCRIPTION_DB, e)
             return None
 
 
@@ -523,7 +547,8 @@ def _parse_year_month_from_path(filepath: str) -> tuple[int | None, int | None]:
 # falling back to a normalized-title match. The id is always inside the JSON,
 # so it's recoverable regardless of what the sidecar file is named.
 _VIDID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-_sidecar_id_cache: dict[str, tuple[float, dict]] = {}
+_SIDECAR_ID_CACHE_MAX = 1000
+_sidecar_id_cache: OrderedDict[str, tuple[float, dict]] = OrderedDict()
 _sidecar_id_cache_lock = threading.Lock()
 
 
@@ -584,11 +609,13 @@ def _resolve_id_from_sidecars(filepath: str) -> str:
             if cached is None or cached[0] != mt:
                 m = _build_sidecar_id_map(d)
                 _sidecar_id_cache[d] = (mt, m)
+                _sidecar_id_cache.move_to_end(d)
                 # Cap the cache so a full-archive backfill doesn't grow it
-                # without bound.
-                if len(_sidecar_id_cache) > 400:
-                    _sidecar_id_cache.pop(next(iter(_sidecar_id_cache)))
+                # without bound. LRU keeps hot dirs alive during wide scans.
+                while len(_sidecar_id_cache) > _SIDECAR_ID_CACHE_MAX:
+                    _sidecar_id_cache.popitem(last=False)
             else:
+                _sidecar_id_cache.move_to_end(d)
                 m = cached[1]
         base = os.path.basename(filepath).lower()
         if base in m["by_name"]:
@@ -786,8 +813,9 @@ def register_video(filepath: str, channel: str, title: str | None = None,
             except sqlite3.OperationalError as _oe:
                 _msg = str(_oe).lower()
                 if ("locked" in _msg or "busy" in _msg) and _attempt < _attempts - 1:
-                    print(f"[index] register_video DB busy, retry "
-                          f"{_attempt + 1}/{_attempts}: {_oe}")
+                    _log.warning(
+                        "register_video DB busy, retry %d/%d: %s",
+                        _attempt + 1, _attempts, _oe)
                     time.sleep(0.5 * (_attempt + 1))
                     continue
                 raise
@@ -808,10 +836,11 @@ def register_video(filepath: str, channel: str, title: str | None = None,
                 _display_title = title or os.path.basename(_base)
                 ingest_jsonl(fp, _jp, _display_title, channel)
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            _log.warning("register_video sidecar ingest failed for %s: %s",
+                         fp, e)
         return True
     except sqlite3.Error as e:
-        print(f"[index] register_video failed: {e}")
+        _log.error("register_video failed for %s: %s", filepath, e)
         return False
 
 
@@ -854,7 +883,9 @@ def mark_video_transcribed(filepath: str,
             try: invalidate_channel_videos(row[0])
             except Exception as e: _log.debug("swallowed: %s", e)
         return True
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        _log.warning("update_video_path failed from %r to %r: %s",
+                     old_path, new_path, exc)
         return False
 
 
@@ -944,8 +975,11 @@ def delete_segments_for_video(filepath: str) -> int:
                 (_legacy_jsonl,))
             removed += cur.rowcount
             conn.commit()
+        if removed:
+            _invalidate_top_words_cache()
     except sqlite3.Error as e:
-        _log.debug("swallowed: %s", e)
+        _log.warning("delete_segments_for_video failed for %s: %s",
+                     filepath, e)
     return removed
 
 
@@ -1072,7 +1106,8 @@ def update_video_path(old_path: str, new_path: str) -> bool:
 
 def ingest_jsonl(video_filepath: str, jsonl_path: str,
                  title: str, channel: str,
-                 _conn_override: sqlite3.Connection | None = None) -> int:
+                 _conn_override: sqlite3.Connection | None = None,
+                 force: bool = False) -> int:
     """Load a .jsonl transcript into segments + FTS. Returns segment count.
 
     `_conn_override`: see register_video — caller may supply their own
@@ -1086,6 +1121,10 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
     fp = os.path.normpath(video_filepath)
     jp = os.path.normpath(jsonl_path)
     if not os.path.isfile(jp):
+        return 0
+    try:
+        jsonl_mtime = os.path.getmtime(jp)
+    except OSError:
         return 0
 
     vid_id = None
@@ -1109,25 +1148,6 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
         vid_id = _matches[-1]
     year, month = _parse_year_month_from_path(fp)
 
-    import json
-    segments = []
-    try:
-        with open(jp, "r", encoding="utf-8") as f:
-            for ln in f:
-                ln = ln.strip()
-                if not ln:
-                    continue
-                try:
-                    obj = json.loads(ln)
-                except json.JSONDecodeError:
-                    continue
-                segments.append(obj)
-    except OSError:
-        return 0
-
-    if not segments:
-        return 0
-
     try:
         # When the caller provided their own connection, skip _db_lock
         # (see register_video for the reasoning). BUT the DELETE+INSERT
@@ -1141,6 +1161,44 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
         _ctx = _nullctx() if use_override else _db_lock
         _path_lock = _ingest_lock_for(jp)
         with _path_lock, _ctx:
+            if not force:
+                _idx_row = conn.execute(
+                    "SELECT mtime, segment_count FROM indexed_files "
+                    "WHERE path=?", (jp,)).fetchone()
+                if _idx_row is not None:
+                    try:
+                        _idx_mtime = float(_idx_row[0] or 0)
+                        _idx_count = int(_idx_row[1] or 0)
+                    except (TypeError, ValueError):
+                        _idx_mtime = -1
+                        _idx_count = -1
+                    _actual_count = conn.execute(
+                        "SELECT COUNT(*) FROM segments WHERE jsonl_path=?",
+                        (jp,)).fetchone()[0]
+                    if (_idx_mtime == jsonl_mtime
+                            and _idx_count == int(_actual_count or 0)):
+                        conn.execute(
+                            "UPDATE videos SET tx_status='transcribed' "
+                            "WHERE filepath=? COLLATE NOCASE", (fp,))
+                        conn.commit()
+                        return _idx_count
+            segments = []
+            try:
+                with open(jp, "r", encoding="utf-8") as f:
+                    for ln in f:
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        try:
+                            obj = json.loads(ln)
+                        except json.JSONDecodeError:
+                            continue
+                        segments.append(obj)
+            except OSError:
+                return 0
+
+            if not segments:
+                return 0
             # FTS5 external-content tables don't auto-sync
             # when rows are deleted from the content table. Without
             # the explicit FTS delete-from-content idiom, re-ingesting
@@ -1206,7 +1264,7 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
             conn.execute(
                 "INSERT OR REPLACE INTO indexed_files(path, mtime, segment_count) "
                 "VALUES (?, ?, ?)",
-                (jp, os.path.getmtime(jp), len(rows)),
+                (jp, jsonl_mtime, len(rows)),
             )
             # flip tx_status='transcribed' on successful
             # ingest so channel_transcription_stats reflects reality
@@ -1220,6 +1278,8 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
                 "WHERE filepath=? COLLATE NOCASE", (fp,))
             _tx_rowcount = _tx_cur.rowcount or 0
             conn.commit()
+            if rows:
+                _invalidate_top_words_cache()
             # If the UPDATE matched 0 rows, the videos row may still be
             # mid-INSERT on another connection (race during a boot
             # sweep that overlaps with sync's per-download path). Retry
@@ -1238,7 +1298,7 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
         # still inflated the reported "ingested" total before this fix.
         return len(rows)
     except sqlite3.Error as e:
-        print(f"[index] ingest_jsonl failed: {e}")
+        _log.error("ingest_jsonl failed for %s: %s", jsonl_path, e)
         return 0
 
 
@@ -1252,7 +1312,11 @@ def list_recent_videos(limit: int = 200, channel: str | None = None
     never waits on sync's `register_video` write lock. WAL handles the
     cross-connection visibility.
     """
-    conn = _reader_open() or _open()
+    conn = _reader_open()
+    lock = _reader_lock
+    if conn is None:
+        conn = _open()
+        lock = _db_lock
     if conn is None:
         return []
     q = ("SELECT title, channel, filepath, video_id, size_bytes, year, month, "
@@ -1263,7 +1327,7 @@ def list_recent_videos(limit: int = 200, channel: str | None = None
         args.append(channel)
     q += "ORDER BY added_ts DESC LIMIT ?"
     args.append(limit)
-    with _reader_lock:
+    with lock:
         cur = conn.execute(q, args)
         out = []
         for row in cur.fetchall():
@@ -1285,7 +1349,12 @@ def list_recent_videos(limit: int = 200, channel: str | None = None
 # Keyed by (channel_name, sort, limit, include_thumbs). Invalidated by
 # `invalidate_channel_videos(channel)` whenever a video is added / deleted
 # / re-transcribed for that channel.
-_browse_videos_cache: dict[tuple[str, str, int, bool], list[dict[str, Any]]] = {}
+_BROWSE_VIDEOS_CACHE_MAX = 30
+_ALL_VIDEOS_CACHE_MAX = 20
+_THUMB_INDEX_CACHE_MAX = 60
+_browse_videos_cache: OrderedDict[
+    tuple[str, str, int, bool], list[dict[str, Any]]
+] = OrderedDict()
 _browse_cache_lock = threading.Lock()
 
 # Global "Videos" (all-videos) view cache. list_all_videos runs its own
@@ -1298,7 +1367,9 @@ _browse_cache_lock = threading.Lock()
 # survives OS file-cache eviction. Cleared wholesale by
 # invalidate_channel_videos (any video add/delete/re-transcribe in any
 # channel can change the global list). Shares _browse_cache_lock.
-_all_videos_cache: dict[tuple[str, int, int, bool], dict[str, Any]] = {}
+_all_videos_cache: OrderedDict[
+    tuple[str, int, int, bool, str], dict[str, Any]
+] = OrderedDict()
 
 # Per-channel thumbnail index cache. Keyed by channel-root path, value
 # is {"mtime": float, "thumbs": {vid_id: thumb_path}}. The audit
@@ -1306,8 +1377,31 @@ _all_videos_cache: dict[tuple[str, int, int, bool], dict[str, Any]] = {}
 # this cache, a stale entry is detected via the channel-root mtime
 # (Windows bumps a dir's mtime when entries change) and a re-walk only
 # happens when the directory was actually touched.
-_thumb_index_cache: dict[str, dict[str, Any]] = {}
+_thumb_index_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _thumb_index_cache_lock = threading.Lock()
+
+
+def _lru_put(cache: OrderedDict, key: Any, value: Any, max_entries: int) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_entries:
+        cache.popitem(last=False)
+
+
+def _browse_videos_cache_put(
+        key: tuple[str, str, int, bool],
+        rows: list[dict[str, Any]]) -> None:
+    _lru_put(_browse_videos_cache, key, rows, _BROWSE_VIDEOS_CACHE_MAX)
+
+
+def _all_videos_cache_put(
+        key: tuple[str, int, int, bool, str],
+        page: dict[str, Any]) -> None:
+    _lru_put(_all_videos_cache, key, page, _ALL_VIDEOS_CACHE_MAX)
+
+
+def _thumb_index_cache_put(key: str, entry: dict[str, Any]) -> None:
+    _lru_put(_thumb_index_cache, key, entry, _THUMB_INDEX_CACHE_MAX)
 
 
 def invalidate_channel_videos(channel: str | None = None) -> None:
@@ -1341,7 +1435,7 @@ def preload_channel_videos(channel: str,
     rows = list_videos_for_channel(channel, sort=sort, limit=limit,
                                     include_thumbs=True)
     with _browse_cache_lock:
-        _browse_videos_cache[(channel, sort, limit, True)] = rows
+        _browse_videos_cache_put((channel, sort, limit, True), rows)
     return len(rows)
 
 
@@ -1424,6 +1518,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     with _browse_cache_lock:
         hit = _browse_videos_cache.get(cache_key)
         if hit is not None:
+            _browse_videos_cache.move_to_end(cache_key)
             # Return a shallow copy so callers can mutate without poisoning
             # the cache for the next reader.
             return list(hit)
@@ -1433,11 +1528,20 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         # this, "preload every video" setting didn't deliver
         # the promised instant-click behavior because preload keyed
         # on 100_000 while the frontend requested 50_000.
-        for (c_ch, c_sort, c_lim, c_thumbs), rows in _browse_videos_cache.items():
+        fallback_key = None
+        fallback_rows = None
+        for key, rows in _browse_videos_cache.items():
+            c_ch, c_sort, c_lim, c_thumbs = key
             if (c_ch == channel and c_sort == sort
                     and c_thumbs == bool(include_thumbs)
                     and c_lim >= limit):
-                return list(rows[:limit]) if len(rows) > limit else list(rows)
+                fallback_key = key
+                fallback_rows = rows
+                break
+        if fallback_key is not None and fallback_rows is not None:
+            _browse_videos_cache.move_to_end(fallback_key)
+            return (list(fallback_rows[:limit])
+                    if len(fallback_rows) > limit else list(fallback_rows))
     # use the long-lived read-only connection
     # (`_reader_conn`, opened on first use below) so this Browse
     # query never contends on `_db_lock` with sync's register_video
@@ -1446,8 +1550,8 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     if conn is None:
         return []
     order = {
-        "newest": "COALESCE(year, 0) DESC, COALESCE(month, 0) DESC, COALESCE(added_ts, 0) DESC",
-        "oldest": "COALESCE(year, 99999) ASC, COALESCE(month, 99) ASC, COALESCE(added_ts, 0) ASC",
+        "newest": "(upload_ts IS NULL) ASC, upload_ts DESC, COALESCE(added_ts, 0) DESC",
+        "oldest": "(upload_ts IS NULL) ASC, upload_ts ASC, COALESCE(added_ts, 0) ASC",
         "largest": "COALESCE(size_bytes, 0) DESC",
         "title": "title COLLATE NOCASE ASC",
         # most_viewed MUST order in SQL: without this key the query ran
@@ -1466,7 +1570,8 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         try:
             cur = conn.execute(
                 f"SELECT title, channel, filepath, video_id, size_bytes, year, month, "
-                f"tx_status, added_ts, removed_from_yt_ts FROM videos "
+                f"tx_status, added_ts, removed_from_yt_ts, upload_ts, "
+                f"view_count, like_count FROM videos "
                 f"WHERE channel=? COLLATE NOCASE AND is_duplicate_of IS NULL "
                 f"ORDER BY {order} LIMIT ?",
                 (channel, limit),
@@ -1476,6 +1581,9 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
                 "size_bytes": r[4] or 0, "year": r[5], "month": r[6],
                 "tx_status": r[7], "added_ts": r[8],
                 "removed_from_yt": bool(r[9]),
+                "upload_ts": r[10],
+                "view_count": r[11],
+                "like_count": r[12],
             } for r in cur.fetchall()]
         except Exception:
             cur = conn.execute(
@@ -1580,8 +1688,9 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     # thumbnail and clicking them would 404. Cheaper to hide them
     # entirely. Cost: ~one os.path.exists() per row, cached by the
     # browse cache anyway.
-    out = [r for r in out
-           if r.get("filepath") and os.path.exists(r["filepath"])]
+    # Keep this index-only; per-row file probes make huge channels slow
+    # to open on network-backed archives.
+    out = [r for r in out if r.get("filepath")]
 
     # Channel-wide thumbnail index. `find_thumbnail` walks UP the path
     # at most 3 levels — it does NOT cross over to sibling year folders.
@@ -1615,7 +1724,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         _root_votes: dict[str, int] = {}
         for _row in out:
             _fp = _row.get("filepath") or ""
-            if not _fp or not os.path.isfile(_fp):
+            if not _fp:
                 continue
             _parent = os.path.dirname(_fp)
             _gp = os.path.dirname(_parent)
@@ -1627,7 +1736,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
                 _cand = os.path.dirname(_gp)
             else:
                 _cand = _parent
-            if _cand and os.path.isdir(_cand):
+            if _cand:
                 _root_votes[_cand] = _root_votes.get(_cand, 0) + 1
         if _root_votes:
             _ch_root = max(_root_votes.items(), key=lambda kv: kv[1])[0]
@@ -1645,6 +1754,8 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
             _ch_root_key = os.path.normpath(_ch_root)
             with _thumb_index_cache_lock:
                 _cached = _thumb_index_cache.get(_ch_root_key)
+                if _cached is not None:
+                    _thumb_index_cache.move_to_end(_ch_root_key)
             if (_cached is not None
                     and _ch_mtime > 0
                     and _cached.get("mtime") == _ch_mtime):
@@ -1667,10 +1778,10 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
                     pass
                 if _ch_mtime > 0:
                     with _thumb_index_cache_lock:
-                        _thumb_index_cache[_ch_root_key] = {
-                            "mtime": _ch_mtime,
-                            "thumbs": dict(_thumb_by_vid),
-                        }
+                        _thumb_index_cache_put(
+                            _ch_root_key,
+                            {"mtime": _ch_mtime,
+                             "thumbs": dict(_thumb_by_vid)})
 
     # Helper: parse yt-dlp's YYYYMMDD upload_date string into a Unix
     # epoch. Returns 0 on anything unparseable. The aggregated metadata
@@ -1702,14 +1813,19 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         # reorg / bulk-copy operations stomped all the mtimes to the
         # same date. Metadata upload_date is invariant across those.
         meta = None
-        if fp and vid_id:
+        needs_meta = (
+            not row.get("upload_ts")
+            or row.get("view_count") is None
+            or row.get("like_count") is None
+        )
+        if needs_meta and fp and vid_id:
             meta = _fetch_meta(os.path.dirname(fp)).get(vid_id)
         # Fallback — many DB rows (older channels, bulk-imported from
         # folder scans, pre-ID-column upgrades) have a NULL video_id.
         # Title-match against the JSONL's `title` field so those rows
         # still get their view_count populated for the Most Viewed
         # sort. Loose normalization (lower + whitespace collapse).
-        if meta is None and fp:
+        if needs_meta and meta is None and fp:
             _t_row = row.get("title", "")
             if _t_row:
                 meta = _fetch_meta_by_title(os.path.dirname(fp), _t_row)
@@ -1717,20 +1833,30 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
             ep = _yyyymmdd_to_epoch(meta.get("upload_date", ""))
             if ep > 0:
                 row["upload_ts"] = ep
-        if "upload_ts" not in row:
-            try:
-                if fp and os.path.isfile(fp):
-                    row["upload_ts"] = os.path.getmtime(fp)
-                    # Bug [103]: flag the fallback so the UI can render
-                    # the date with a "~estimated" hint. Without this,
-                    # a video whose mtime got reset (re-org, copy across
-                    # volumes) shows the wrong date as if it were real.
-                    row["upload_ts_source"] = "mtime_fallback"
-            except OSError:
-                pass
+        # Avoid per-row mtime probes here; the DB's added_ts is the
+        # cheap last-resort fallback when upload_ts was not materialized.
+        if "upload_ts" not in row or not row.get("upload_ts"):
+            row["upload_ts"] = row.get("added_ts") or 0
+            row["upload_ts_source"] = "index_fallback"
 
         # View count: fetch from aggregated metadata when available
-        if meta:
+        if row.get("view_count") is not None:
+            try:
+                row["view_count"] = int(row.get("view_count") or 0)
+            except (TypeError, ValueError):
+                row["view_count"] = 0
+            try:
+                row["like_count"] = int(row.get("like_count") or 0)
+            except (TypeError, ValueError):
+                row["like_count"] = 0
+            v = row["view_count"]
+            if v >= 1_000_000:
+                row["views"] = f"{v/1_000_000:.1f}M"
+            elif v >= 1_000:
+                row["views"] = f"{v/1_000:.1f}K"
+            elif v > 0:
+                row["views"] = str(v)
+        elif meta:
             # a corrupted JSONL entry with view_count="N/A"
             # would raise ValueError out of this cast and abort the
             # entire Browse grid render for the channel. Guard with
@@ -1777,7 +1903,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     # Store in the browse cache so the NEXT click on this channel is
     # instant (no DB + metadata JSONL + thumbnail-walk cost again).
     with _browse_cache_lock:
-        _browse_videos_cache[cache_key] = list(out)
+        _browse_videos_cache_put(cache_key, list(out))
     return out
 
 
@@ -1837,7 +1963,7 @@ def new_videos_in_last_n_days(days: int = 7) -> dict[str, Any]:
         out["channel_list"] = [r[0] for r in rows if r[0]]
         out["channels"] = len(out["channel_list"])
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        _log.warning("new_videos_in_last_n_days failed: %s", e)
     return out
 
 
@@ -1891,7 +2017,8 @@ def channel_transcription_stats(channel: str) -> dict[str, int]:
             out["failed"] = int(row[3] or 0)
             out["no_speech"] = int(row[4] or 0)
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        _log.warning("channel_transcription_stats failed for %r: %s",
+                     channel, e)
     return out
 
 
@@ -2009,6 +2136,8 @@ def _build_channel_thumb_index(ch_root: str) -> dict[str, str]:
     key = os.path.normpath(ch_root)
     with _thumb_index_cache_lock:
         cached = _thumb_index_cache.get(key)
+        if cached is not None:
+            _thumb_index_cache.move_to_end(key)
     if cached is not None and ch_mtime > 0 and cached.get("mtime") == ch_mtime:
         return dict(cached.get("thumbs") or {})
     thumbs: dict[str, str] = {}
@@ -2027,7 +2156,8 @@ def _build_channel_thumb_index(ch_root: str) -> dict[str, str]:
         pass
     if ch_mtime > 0:
         with _thumb_index_cache_lock:
-            _thumb_index_cache[key] = {"mtime": ch_mtime, "thumbs": dict(thumbs)}
+            _thumb_index_cache_put(
+                key, {"mtime": ch_mtime, "thumbs": dict(thumbs)})
     return thumbs
 
 
@@ -2289,6 +2419,8 @@ def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
     _ck = ((sort or "recent").lower(), lim, off, bool(include_thumbs), _q.lower())
     with _browse_cache_lock:
         _hit = _all_videos_cache.get(_ck)
+        if _hit is not None:
+            _all_videos_cache.move_to_end(_ck)
     if _hit is not None:
         return {"rows": [dict(r) for r in _hit["rows"]],
                 "has_more": _hit["has_more"], "offset": _hit["offset"]}
@@ -2358,8 +2490,10 @@ def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
         out.append(d)
     # Store a copy in the result cache so the next open is instant.
     with _browse_cache_lock:
-        _all_videos_cache[_ck] = {"rows": [dict(r) for r in out],
-                                  "has_more": has_more, "offset": off}
+        _all_videos_cache_put(
+            _ck,
+            {"rows": [dict(r) for r in out],
+             "has_more": has_more, "offset": off})
     return {"rows": out, "has_more": has_more, "offset": off}
 
 
@@ -2408,11 +2542,15 @@ def video_tx_status(video_id: str | None = None,
     been transcribed yet (both have zero segments)."""
     if not video_id and not title:
         return ""
-    conn = _reader_open() or _open()
+    conn = _reader_open()
+    lock = _reader_lock
+    if conn is None:
+        conn = _open()
+        lock = _db_lock
     if conn is None:
         return ""
     try:
-        with _reader_lock:
+        with lock:
             if video_id:
                 row = conn.execute(
                     "SELECT tx_status FROM videos WHERE video_id=? LIMIT 1",
@@ -2443,7 +2581,11 @@ def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
     the writer's ongoing transaction; falls back to _open() only if
     the reader connection somehow failed to initialize.
     """
-    conn = _reader_open() or _open()
+    conn = _reader_open()
+    lock = _reader_lock
+    if conn is None:
+        conn = _open()
+        lock = _db_lock
     if conn is None:
         return []
     # When only video_id is supplied (the Watch-view click path —
@@ -2472,7 +2614,7 @@ def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
     # safe for concurrent execute on a single connection — without
     # the lock this would raise "Recursive use of cursors not allowed"
     # or return wrong segment results.
-    with _reader_lock:
+    with lock:
         _jp_from_canon = False
         # When the video_id resolves to no segments, fall back to matching
         # by title (the way get_segment_context / video_tx_status already do).
@@ -2619,15 +2761,33 @@ def get_segment_context(segment_id: int, before: int = 30,
             # one the user clicked.
             other_hits: set = set()
             if query and query.strip():
+                from .index_search import _normalize_fts_query, _sanitize_fts_query
+                match_query = _normalize_fts_query(query)
                 try:
                     cur2 = conn.execute(
                         "SELECT s.id FROM segments_fts "
                         "JOIN segments s ON s.id = segments_fts.rowid "
                         f"WHERE {('s.video_id=?' if vid_id else 's.jsonl_path=? AND s.title=? AND s.channel=?')} "
                         "AND segments_fts MATCH ?",
-                        (*scope_args, query))
+                        (*scope_args, match_query))
                     other_hits = {r[0] for r in cur2.fetchall()}
-                except sqlite3.Error:
+                except sqlite3.OperationalError:
+                    cleaned = _sanitize_fts_query(query)
+                    if cleaned and cleaned != match_query:
+                        try:
+                            cur2 = conn.execute(
+                                "SELECT s.id FROM segments_fts "
+                                "JOIN segments s ON s.id = segments_fts.rowid "
+                                f"WHERE {('s.video_id=?' if vid_id else 's.jsonl_path=? AND s.title=? AND s.channel=?')} "
+                                "AND segments_fts MATCH ?",
+                                (*scope_args, cleaned))
+                            other_hits = {r[0] for r in cur2.fetchall()}
+                        except sqlite3.Error as exc:
+                            _log.warning("context highlight query failed: %s",
+                                         exc)
+                            other_hits = set()
+                except sqlite3.Error as exc:
+                    _log.warning("context highlight query failed: %s", exc)
                     other_hits = set()
             # Assemble in chronological order
             segments: list[dict[str, Any]] = []
@@ -2677,17 +2837,30 @@ from .index_search import (  # noqa: F401
 # ── Stats ───────────────────────────────────────────────────────────────
 
 def summary() -> dict[str, Any]:
-    # Read-only stats — use the reader connection so a long-running
-    # sweep / ingest doesn't block these basic counts.
-    conn = _reader_open()
+    # Read-only stats on an independent connection so full-table counts do
+    # not hold the shared reader lock used by Browse/Search/Watch.
+    conn = _open_independent()
     if conn is None:
         return {"segments": 0, "videos": 0, "channels": 0, "bookmarks": 0}
-    with _reader_lock:
+    try:
         seg = conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
         vid = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
-        ch = conn.execute("SELECT COUNT(DISTINCT channel) FROM videos").fetchone()[0]
+        ch = conn.execute(
+            "SELECT COUNT(*) FROM ("
+            "SELECT 1 FROM videos WHERE channel IS NOT NULL GROUP BY channel"
+            ")"
+        ).fetchone()[0]
         bm = conn.execute("SELECT COUNT(*) FROM bookmarks").fetchone()[0]
-    return {"segments": seg, "videos": vid, "channels": ch, "bookmarks": bm}
+        return {"segments": seg, "videos": vid, "channels": ch,
+                "bookmarks": bm}
+    except sqlite3.Error as e:
+        _log.warning("index summary failed: %s", e)
+        return {"segments": 0, "videos": 0, "channels": 0, "bookmarks": 0}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 

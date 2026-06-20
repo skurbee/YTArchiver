@@ -10,6 +10,44 @@ from __future__ import annotations
 
 from ._shared import *  # noqa: F401,F403
 
+_SUBS_PROBE_TIMEOUT_SEC = 15
+
+
+def _direct_child_realpath(base: str, target: str) -> bool:
+    """True when target resolves as a direct child of base."""
+    try:
+        rb = os.path.normcase(os.path.realpath(base)).rstrip("/\\")
+        rt = os.path.normcase(os.path.realpath(target)).rstrip("/\\")
+        parent = os.path.dirname(rt)
+        return bool(rb and rt and parent == rb)
+    except Exception:
+        return False
+
+
+def _normalize_probe_channel_url(url: str) -> tuple[str, str]:
+    """Return (normalized_url, error) for yt-dlp channel probes."""
+    raw = (url or "").strip()
+    if not raw:
+        return "", "Empty URL"
+    try:
+        from backend.subs import normalize_channel_url
+        normalized = normalize_channel_url(raw).strip()
+        if not normalized.startswith(("http://", "https://")):
+            return "", "Enter a YouTube channel URL or @handle"
+        from urllib.parse import urlparse
+        parsed = urlparse(normalized)
+        host = (parsed.netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host not in ("youtube.com", "youtu.be"):
+            return "", "Enter a YouTube channel URL or @handle"
+        path = (parsed.path or "").lower()
+        if "/watch" in path or "/playlist" in path:
+            return "", "Enter a channel URL, not a video or playlist URL"
+        return normalized, ""
+    except Exception as e:
+        return "", str(e)
+
 
 class SubsMixin:
 
@@ -88,9 +126,9 @@ class SubsMixin:
         done via the persisted `_pending_preview` slot, polled via
         `subs_preview_folder_poll`.
         """
-        url = (url or "").strip()
-        if not url:
-            return {"ok": False, "error": "No URL"}
+        url, url_error = _normalize_probe_channel_url(url)
+        if url_error:
+            return {"ok": False, "error": url_error}
         yt = sync_backend.find_yt_dlp()
         if not yt:
             return {"ok": False, "error": "yt-dlp not found"}
@@ -133,7 +171,8 @@ class SubsMixin:
                     *sync_backend._find_cookie_source(),
                     "--playlist-end", "1", url,
                 ]
-                r = _sp.run(cmd, capture_output=True, text=True, timeout=25,
+                r = _sp.run(cmd, capture_output=True, text=True,
+                            timeout=_SUBS_PROBE_TIMEOUT_SEC,
                             startupinfo=sync_backend._startupinfo,
                             creationflags=(0x08000000 if os.name == "nt" else 0))
                 out = (r.stdout or "").strip().splitlines()
@@ -470,30 +509,30 @@ class SubsMixin:
 
     def subs_test_url(self, url):
         """Probe a channel URL via yt-dlp, return the canonical name + video count."""
-        url = (url or "").strip()
-        if not url:
-            return {"ok": False, "error": "Empty URL"}
+        normalized, url_error = _normalize_probe_channel_url(url)
+        if url_error:
+            return {"ok": False, "error": url_error}
         yt = sync_backend.find_yt_dlp()
         if not yt:
             return {"ok": False, "error": "yt-dlp not found"}
         import subprocess as _sp
 
-        from backend.subs import normalize_channel_url
         try:
-            normalized = normalize_channel_url(url)
             cookies = sync_backend._find_cookie_source()
             # Get channel name (from first video)
             r1 = _sp.run([yt, "--flat-playlist", "--playlist-end", "1",
                          "--print", "channel", "--no-warnings", "--quiet",
                          *cookies, normalized],
-                        capture_output=True, text=True, timeout=15,
+                        capture_output=True, text=True,
+                        timeout=_SUBS_PROBE_TIMEOUT_SEC,
                         startupinfo=sync_backend._startupinfo)
             name = (r1.stdout or "").strip().split("\n")[0] or ""
             # Get total count (best-effort)
             r2 = _sp.run([yt, "--flat-playlist", "--print", "%(playlist_count)s",
                          "--playlist-end", "1", "--no-warnings", "--quiet",
                          *cookies, normalized],
-                        capture_output=True, text=True, timeout=15,
+                        capture_output=True, text=True,
+                        timeout=_SUBS_PROBE_TIMEOUT_SEC,
                         startupinfo=sync_backend._startupinfo)
             count_raw = (r2.stdout or "").strip().split("\n")[0]
             total = int(count_raw) if count_raw.isdigit() else None
@@ -830,8 +869,9 @@ class SubsMixin:
         target = os.path.normpath(os.path.join(base, new_folder_name))
         if not os.path.isdir(target):
             return {"ok": False, "error": f"Folder not found: {target}"}
-        # Guard: must live inside output_dir (prevent folder_override escapes)
-        if os.path.dirname(target) != os.path.normpath(base):
+        # Guard: must resolve directly inside output_dir. normpath/dirname
+        # alone accepts symlinks, junctions, case aliases, and 8.3 paths.
+        if not _direct_child_realpath(base, target):
             return {"ok": False,
                     "error": "Target folder must live directly under output_dir"}
         try:
@@ -873,7 +913,7 @@ class SubsMixin:
                 return {"ok": False, "cancelled": True}
             picked = paths if isinstance(paths, str) else paths[0]
             picked = os.path.normpath(picked)
-            if os.path.dirname(picked) != os.path.normpath(base):
+            if not _direct_child_realpath(base, picked):
                 return {"ok": False,
                         "error": f"Pick a subfolder of:\n {base}"}
             return {"ok": True,

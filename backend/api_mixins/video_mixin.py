@@ -72,7 +72,10 @@ class VideoMixin:
         except Exception as _e:
             # Don't fail the whole call — the file is gone, that's the
             # primary contract. Surface the DB issue as a soft warning.
-            return {"ok": True, "warning": f"File deleted but index cleanup failed: {_e}"}
+            warning = f"File deleted but index cleanup failed: {_e}"
+            return {"ok": False, "file_deleted": True,
+                    "cleanup_failed": True, "error": warning,
+                    "warning": warning}
         # Also remove from recent_downloads if it was there.
         if config_is_writable():
             try:

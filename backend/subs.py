@@ -27,6 +27,7 @@ Schema matches YTArchiver.py's CHANNEL_DEFAULTS (line 173):
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -72,7 +73,9 @@ def normalize_channel_url(url: str) -> str:
         if url.startswith("/"):
             return "https://www.youtube.com" + url
         # assume bare handle without @
-        return f"https://www.youtube.com/@{url}"
+        if re.fullmatch(r"[A-Za-z0-9_-]{2,30}", url):
+            return f"https://www.youtube.com/@{url}"
+        return url
     return url
 
 
@@ -138,7 +141,8 @@ def validate_channel_url(url: str) -> tuple[bool, str]:
     # never hosts channels. Accepting it let users paste a video URL,
     # pass validation, then sync tried to walk "a channel" built from
     # one video's URL → garbage results silently.
-    if "youtube.com" not in parsed.netloc:
+    host = (parsed.hostname or "").lower()
+    if host not in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
         return False, "URL must be a youtube.com channel link (not youtu.be)."
     path = parsed.path.strip("/")
     if not path:
@@ -243,6 +247,8 @@ def _payload_to_channel(payload: dict[str, Any]) -> dict[str, Any]:
 # ── Public API ─────────────────────────────────────────────────────────
 
 class SubsError(Exception):
+    """Raised for user-correctable subscription add/update failures."""
+
     pass
 
 
@@ -296,29 +302,39 @@ def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> str | None:
                 try: PROCESS_REGISTRY.unregister(proc)
                 except Exception: pass
             return out or ""
-        # Pass 1: flat-playlist with channel+uploader fields
-        cmd = [
-            yt, "--flat-playlist", "--playlist-end", "1",
-            "--print", "%(channel,uploader,playlist_title)s",
-            "--no-warnings", "--quiet",
-            *_sync._find_cookie_source(),
-            normalize_channel_url(url),
-        ]
-        raw_out = _run_registered(cmd, timeout_sec).strip()
-        name = raw_out.split("\n")[0].strip() if raw_out else ""
-        # yt-dlp sentinel for "not available" is the literal string "NA"
-        if name in ("", "NA"):
+        def _probe_name(cookie_args: list[str]) -> str:
+            # Pass 1: flat-playlist with channel+uploader fields.
+            cmd = [
+                yt, "--flat-playlist", "--playlist-end", "1",
+                "--print", "%(channel,uploader,playlist_title)s",
+                "--no-warnings", "--quiet",
+                *cookie_args,
+                normalize_channel_url(url),
+            ]
+            raw_out = _run_registered(cmd, timeout_sec).strip()
+            name = raw_out.split("\n")[0].strip() if raw_out else ""
+            # yt-dlp sentinel for "not available" is the literal string "NA".
+            if name not in ("", "NA"):
+                return name
             # Pass 2: resolve one video fully (no --flat-playlist) so
             # yt-dlp returns the real metadata including channel name.
             cmd2 = [
                 yt, "--playlist-end", "1", "--skip-download",
                 "--print", "%(channel,uploader,playlist_title)s",
                 "--no-warnings", "--quiet",
-                *_sync._find_cookie_source(),
+                *cookie_args,
                 normalize_channel_url(url),
             ]
             raw_out = _run_registered(cmd2, timeout_sec + 15).strip()
-            name = raw_out.split("\n")[0].strip() if raw_out else ""
+            return raw_out.split("\n")[0].strip() if raw_out else ""
+
+        name = _probe_name([])
+        if name in ("", "NA"):
+            # Cosmetic channel-name probes should not exercise the user's
+            # YouTube cookies unless the public probe failed.
+            cookie_args = _sync._find_cookie_source() or []
+            if cookie_args:
+                name = _probe_name(cookie_args)
         if name == "NA":
             name = ""
         # yt-dlp sometimes returns the channel's "Videos" tab title instead
@@ -504,6 +520,8 @@ def update_channel(identity: dict[str, str], payload: dict[str, Any]) -> dict[st
     from . import sync as _sync
     old_name = (existing.get("name") or existing.get("folder") or "").strip()
     new_name = (updated.get("name") or updated.get("folder") or "").strip()
+    old_folder = _sync.channel_folder_name(existing)
+    new_folder = _sync.channel_folder_name(updated)
     if old_name and new_name and old_name != new_name:
         # preflight — refuse if the new name collides with
         # ANY other existing channel. Without this, two channels could
@@ -518,10 +536,11 @@ def update_channel(identity: dict[str, str], payload: dict[str, Any]) -> dict[st
                 raise SubsError(
                     f"A channel named {new_name!r} already exists. "
                     f"Choose a different name.")
+    if old_folder and new_folder and old_folder != new_folder:
         base = (cfg.get("output_dir") or "").strip()
         if base:
-            old_path = _os.path.join(base, _sync.sanitize_folder(old_name))
-            new_path = _os.path.join(base, _sync.sanitize_folder(new_name))
+            old_path = _os.path.join(base, old_folder)
+            new_path = _os.path.join(base, new_folder)
             if _os.path.isdir(old_path) and not _os.path.exists(new_path):
                 # Reject cross-volume renames up front. os.rename is
                 # documented atomic only when source + dest live on the
@@ -644,6 +663,19 @@ def remove_channel(identity: dict[str, str],
     # Now drop the subs-list entry and persist config.
     channels.pop(idx)
     saved = save_config(cfg)
+    if saved:
+        ch_url = (ch.get("url") or "").strip()
+        if ch_url:
+            try:
+                from . import archive_scan
+                archive_scan.invalidate_channel(ch_url)
+            except Exception:
+                pass
+            try:
+                from . import channel_cache
+                channel_cache.clear(ch_url)
+            except Exception:
+                pass
     result["ok"] = bool(saved)
     return result
 

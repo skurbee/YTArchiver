@@ -27,6 +27,27 @@ from .. import utils as _utils
 # `video.f140-16.m4a`, `video.f140-drc.m4a`. Used by `_scan_recent_video`
 # to skip these when picking the most-recent merged output.
 _F_SUFFIX_RE = re.compile(r"\.f\d+(?:-[A-Za-z0-9]+)?\.[A-Za-z0-9]+$")
+_CAPTION_LANG_SUFFIX_RE = re.compile(
+    r"\.(?:[a-z]{2,3}(?:-[A-Za-z0-9]+)?|[a-z]{2,3}-orig)$",
+    re.IGNORECASE,
+)
+
+
+def _caption_media_base(caption_filename: str) -> str:
+    stem = os.path.splitext(caption_filename)[0]
+    return _CAPTION_LANG_SUFFIX_RE.sub("", stem)
+
+
+def _caption_sweep_can_delete(folder: str, caption_filename: str) -> bool:
+    if os.name == "nt":
+        path = os.path.join(folder, caption_filename)
+        if not _utils._file_has_hidden_attribute(path):
+            return False
+    media_base = _caption_media_base(caption_filename)
+    for ext in _utils._VISIBLE_MEDIA_EXTS:
+        if os.path.isfile(os.path.join(folder, media_base + ext)):
+            return True
+    return False
 
 
 def _hide_sidecar_win(video_path: str) -> None:
@@ -80,7 +101,11 @@ def _sweep_orphan_vtts(channel_folder: str, cancel_event=None) -> int:
         if base == ".Thumbnails" or base == ".ChannelArt":
             continue
         for fn in fns:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             if fn.lower().endswith(exts):
+                if not _caption_sweep_can_delete(dp, fn):
+                    continue
                 try:
                     os.remove(os.path.join(dp, fn))
                     removed += 1

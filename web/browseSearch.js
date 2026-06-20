@@ -18,7 +18,7 @@
  * Depends on:
  *   - window._browseState (app.js)
  *   - window._formatTs (util.js)
- *   - window.YT.util.escapeHtml (util.js, falls back to identity)
+ *   - window.YT.util.escapeHtml (util.js, falls back to local escaper)
  *   - window.YT.bridge.bridgeCall / isUp (bridge.js)
  */
 (function () {
@@ -26,7 +26,10 @@
 
   const _browseState = window._browseState || {};
   const _formatTs = (sec) => (window._formatTs ? window._formatTs(sec) : String(sec));
-  const escapeHtml = window.YT?.util?.escapeHtml || ((s) => String(s ?? ""));
+  const escapeHtml = window.YT?.util?.escapeHtml || ((s) => String(s ?? "")
+    .replace(/[&<>"']/g, (ch) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+    }[ch])));
   function bridgeCall(method, ...args) {
     const fn = window.YT?.bridge?.bridgeCall;
     if (fn) return fn(method, ...args);

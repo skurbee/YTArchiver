@@ -82,6 +82,8 @@ def _apply_dark_menu_theme() -> bool:
 
 
 class TrayController:
+    """Owns the Windows tray icon, menu callbacks, badge, and spinner thread."""
+
     def __init__(self,
                  on_show: Callable[[], None] | None = None,
                  on_hide: Callable[[], None] | None = None,
@@ -100,8 +102,12 @@ class TrayController:
         self._autorun_set_label = None # callable(label) -> None
         self._tooltip = tooltip
         self._icon = None
+        self._icon_lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._started = False
+        self._keepalive_thread: threading.Thread | None = None
+        self._keepalive_stop = threading.Event()
+        self._keepalive_interval = 300.0
         # Spin animation state
         self._base_img = None
         self._Image = None
@@ -249,7 +255,58 @@ class TrayController:
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
         self._started = True
+        self._start_keepalive()
         return True
+
+    def _start_keepalive(self):
+        self._keepalive_stop.clear()
+        if self._keepalive_thread and self._keepalive_thread.is_alive():
+            return
+
+        def _loop():
+            while not self._keepalive_stop.wait(self._keepalive_interval):
+                self._refresh_shell_registration()
+
+        self._keepalive_thread = threading.Thread(
+            target=_loop, name="ytarchiver-tray-keepalive", daemon=True)
+        self._keepalive_thread.start()
+
+    def _static_icon_image(self):
+        if self._base_img is None:
+            return None
+        if self._badge_count:
+            return self._compose_badge(self._base_img.copy())
+        return self._base_img
+
+    def _refresh_shell_registration(self):
+        """Best-effort repair for Windows notification-area icon loss.
+
+        Explorer occasionally drops a long-lived tray icon or keeps a blank
+        clickable slot. Reapplying the image fixes the blank-slot case; calling
+        pystray's Win32 _show path re-sends NIM_ADD and restores a missing
+        shell registration after Explorer/taskbar churn.
+        """
+        icon = self._icon
+        if not self._started or icon is None:
+            return
+        with self._icon_lock:
+            try:
+                icon.title = self._tooltip
+            except Exception as e:
+                _log.debug("tray keepalive title failed: %s", e)
+            if self._spin_thread is None:
+                img = self._static_icon_image()
+                if img is not None:
+                    try:
+                        icon.icon = img
+                    except Exception as e:
+                        _log.debug("tray keepalive icon failed: %s", e)
+            try:
+                show = getattr(icon, "_show", None)
+                if callable(show):
+                    show()
+            except Exception as e:
+                _log.debug("tray keepalive re-register failed: %s", e)
 
     # ── Spin animation (matches YTArchiver's tray busy indicator) ──
 
@@ -258,12 +315,16 @@ class TrayController:
         `color` = "blue" (sync) or "red" (gpu)."""
         if not self._started or not self._icon:
             return
-        self._spin_color = (80, 160, 240, 255) if color == "blue" else (230, 80, 80, 255)
+        new_color = (80, 160, 240, 255) if color == "blue" else (230, 80, 80, 255)
         # OLD uses 0.18s/frame for blue (sync), 0.12s/frame for red (GPU) — red
         # spins faster to signal GPU work is active. Mirrors YTArchiver.py:3481.
-        self._spin_interval = 0.12 if color == "red" else 0.18
+        new_interval = 0.12 if color == "red" else 0.18
         if self._spin_thread is not None:
-            return # already spinning
+            if self._spin_color == new_color and self._spin_interval == new_interval:
+                return  # already spinning with the requested style
+            self.stop_spin()
+        self._spin_color = new_color
+        self._spin_interval = new_interval
         self._spin_stop.clear()
         self._spin_epoch += 1
         _epoch = self._spin_epoch
@@ -289,8 +350,8 @@ class TrayController:
         # Restore base icon (possibly with badge if a count is set)
         if self._icon and self._base_img:
             try:
-                self._icon.icon = self._compose_badge(self._base_img.copy()) \
-                    if self._badge_count else self._base_img
+                with self._icon_lock:
+                    self._icon.icon = self._static_icon_image()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
 
@@ -307,8 +368,8 @@ class TrayController:
         # If not spinning, re-render the base icon with the new badge
         if self._spin_thread is None and self._icon and self._base_img:
             try:
-                self._icon.icon = (self._compose_badge(self._base_img.copy())
-                                   if self._badge_count else self._base_img)
+                with self._icon_lock:
+                    self._icon.icon = self._static_icon_image()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
 
@@ -382,13 +443,25 @@ class TrayController:
                 if self._badge_count:
                     img = self._compose_badge(img)
                 if self._icon:
-                    self._icon.icon = img
+                    with self._icon_lock:
+                        self._icon.icon = img
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             frame += 1
             self._spin_stop.wait(self._spin_interval)
 
     def stop(self):
+        self._keepalive_stop.set()
+        try:
+            if self._keepalive_thread is not None:
+                self._keepalive_thread.join(timeout=0.5)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        self._keepalive_thread = None
+        try:
+            self.stop_spin()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         if self._icon:
             try:
                 self._icon.stop()
@@ -400,6 +473,7 @@ class TrayController:
         self._tooltip = text
         if self._icon:
             try:
-                self._icon.title = text
+                with self._icon_lock:
+                    self._icon.title = text
             except Exception as e:
                 _log.debug("swallowed: %s", e)

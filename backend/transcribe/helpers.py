@@ -332,6 +332,20 @@ def _ffprobe_duration(filepath: str) -> float | None:
         return None
 # ── Python 3.11 discovery (same pattern as YTArchiver.py:8653) ─────────
 
+def _is_python311_exe(path: str) -> bool:
+    """Return True only when path runs as CPython 3.11."""
+    try:
+        r = subprocess.run(
+            [path, "-c",
+             "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=(0x08000000 if os.name == "nt" else 0),
+        )
+        return r.returncode == 0 and (r.stdout or "").strip() == "3.11"
+    except Exception:
+        return False
+
+
 def find_python311() -> str | None:
     """Locate a Python 3.11 executable to run the Whisper worker.
 
@@ -341,7 +355,7 @@ def find_python311() -> str | None:
     pywebview shell runs on Python 3.13 and shells out to a separate
     Python 3.11 process for transcription work.
 
-    Search order (first hit wins):
+    Search order (first validated 3.11 hit wins):
       1. `%LOCALAPPDATA%\\Programs\\Python\\Python311*\\python.exe`
          (the per-user install path the official Python installer uses
          by default — this is where most installs land)
@@ -369,20 +383,22 @@ def find_python311() -> str | None:
         p = os.path.join(base, "python.exe")
         if os.path.isfile(p):
             candidates.append(p)
-    # Prefer paths that mention Python311 specifically — old code
-    # returned candidates[0] which on some installs was the
-    # Python310 base dir. faster-whisper imports then failed under
-    # an opaque "Transcription tool didn't respond" message (audit:
-    # transcribe/helpers.py:330-336).
-    if candidates:
-        _py311 = [p for p in candidates if "Python311" in p]
-        if _py311:
-            return _py311[0]
-        return candidates[0]
+    # Validate every discovered candidate; path names alone are not enough.
     for name in ("python3.11", "python"):
         found = _shutil.which(name)
         if found:
-            return found
+            candidates.append(found)
     # Final fallback — common location
     fallback = os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python311\python.exe")
-    return fallback if os.path.isfile(fallback) else None
+    if os.path.isfile(fallback):
+        candidates.append(fallback)
+
+    seen: set[str] = set()
+    for cand in candidates:
+        key = os.path.normcase(os.path.abspath(cand))
+        if key in seen:
+            continue
+        seen.add(key)
+        if _is_python311_exe(cand):
+            return cand
+    return None

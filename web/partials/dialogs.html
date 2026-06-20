@@ -4,8 +4,8 @@
 
 
   <!-- About dialog -->
-  <div class="askq-backdrop" id="about-backdrop" style="display:none;">
-    <div class="askq-dialog" style="min-width:420px;">
+  <div class="askq-backdrop" id="about-backdrop" hidden>
+    <div class="askq-dialog askq-dialog-about">
       <div class="askq-header">About YTArchiver</div>
       <div class="askq-body" id="about-body">Loading&hellip;</div>
       <div class="askq-buttons">
@@ -18,16 +18,16 @@
        disk savings per-channel + grand totals at each quality tier for
        a user-chosen output resolution. Read-only; does not trigger any
        compression. -->
-  <div class="askq-backdrop" id="compress-dry-backdrop" style="display:none;">
-    <div class="askq-dialog" style="min-width:620px;max-width:900px;width:80vw;">
+  <div class="askq-backdrop" id="compress-dry-backdrop" hidden>
+    <div class="askq-dialog askq-dialog-wide">
       <div class="askq-header">
         <span>Compress savings &mdash; dry run</span>
-        <span class="status-text" id="compress-dry-summary" style="margin-left:auto;"></span>
+        <span class="status-text dialog-summary-spacer" id="compress-dry-summary"></span>
       </div>
-      <div class="askq-body" style="padding:10px 16px;">
-        <div class="edit-gv-inline" style="gap:6px;margin-bottom:10px;">
-          <label class="edit-gl" style="flex:0 0 auto;">Output resolution:</label>
-          <select class="ctl-select" id="compress-dry-res" style="width:auto;">
+      <div class="askq-body askq-body-compact-pad">
+        <div class="edit-gv-inline askq-form-row">
+          <label class="edit-gl askq-label-static">Output resolution:</label>
+          <select class="ctl-select askq-select-auto" id="compress-dry-res">
             <option value="480">480p</option>
             <option value="720" selected>720p</option>
             <option value="1080">1080p</option>
@@ -38,8 +38,8 @@
                "do something" affordance is visually obvious (UI audit). -->
           <button class="btn btn-primary btn-thin" id="compress-dry-recalc">Recompute</button>
         </div>
-        <div id="compress-dry-body" style="max-height:55vh;overflow-y:auto;font-size:12px;">
-          <div class="browse-empty" style="padding:16px;">Computing&hellip;</div>
+        <div id="compress-dry-body" class="askq-scroll-body">
+          <div class="browse-empty askq-empty-padded">Computing&hellip;</div>
         </div>
       </div>
       <div class="askq-buttons">
@@ -49,21 +49,21 @@
   </div>
 
   <!-- Transcript drift scan/fix modal (feature H-2) -->
-  <div class="askq-backdrop" id="drift-backdrop" style="display:none;">
-    <div class="askq-dialog" style="min-width:620px;max-width:900px;width:80vw;">
+  <div class="askq-backdrop" id="drift-backdrop" hidden>
+    <div class="askq-dialog askq-dialog-wide">
       <div class="askq-header">
         <span>Transcript drift &mdash; scan &amp; fix</span>
-        <span class="status-text" id="drift-summary" style="margin-left:auto;"></span>
+        <span class="status-text dialog-summary-spacer" id="drift-summary"></span>
       </div>
-      <div class="askq-body" style="padding:10px 16px;">
-        <div class="edit-gv-inline" style="gap:6px;margin-bottom:10px;">
-          <label class="edit-gl" style="flex:0 0 auto;">Channel:</label>
-          <select class="ctl-select" id="drift-channel" style="flex:1;max-width:400px;"></select>
+      <div class="askq-body askq-body-compact-pad">
+        <div class="edit-gv-inline askq-form-row">
+          <label class="edit-gl askq-label-static">Channel:</label>
+          <select class="ctl-select askq-select-flex-wide" id="drift-channel"></select>
           <!-- Primary action for this modal — green so the "go" is obvious. -->
           <button class="btn btn-primary btn-thin" id="drift-scan-btn">Scan</button>
         </div>
-        <div id="drift-body" style="max-height:55vh;overflow-y:auto;font-size:12px;">
-          <div class="browse-empty" style="padding:16px;">Pick a channel and click Scan.</div>
+        <div id="drift-body" class="askq-scroll-body">
+          <div class="browse-empty askq-empty-padded">Pick a channel and click Scan.</div>
         </div>
       </div>
       <div class="askq-buttons">
@@ -81,25 +81,24 @@
        VTTs for archived videos and rewrites the per-word array in the
        JSONL + DB. Long-running — kicks off a background thread; progress
        streams to the main log so the user can close the modal. -->
-  <div class="askq-backdrop" id="repair-yt-backdrop" style="display:none;">
-    <div class="askq-dialog" style="min-width:420px;max-width:520px;width:60vw;">
+  <div class="askq-backdrop" id="repair-yt-backdrop" hidden>
+    <div class="askq-dialog askq-dialog-narrow">
       <div class="askq-header">
         <span>Repair YT auto-captions</span>
       </div>
-      <div class="askq-body" style="padding:12px 14px;">
-        <div style="font-size:12px;line-height:1.4;margin-bottom:10px;color:var(--c-dim,#94a3b8);"
+      <div class="askq-body askq-body-small-pad">
+        <div class="askq-help-text"
              title="Re-parses YouTube auto-captions for already-archived videos to fix the pre-v64.7 parser bugs (dropped rolled-in words; segment-boundary duplications). Hits YouTube once per video, queues as a Sync Task, pausable/cancellable/resumable. Whisper-transcribed videos are auto-skipped, as are YT+PUNCTUATION videos where the new VTT comes back lowercase (would downgrade punctuation).">
           Re-parses YT captions to fix the pre-v64.7 word-drop and
           segment-boundary duplication bugs. Queues as a Sync Task.
-          <span style="text-decoration: underline dotted; cursor: help;">Details</span>
+          <span class="askq-help-details">Details</span>
         </div>
-        <div class="edit-grid" style="grid-template-columns: auto 1fr; gap:8px 12px;">
+        <div class="edit-grid askq-compact-grid">
           <label class="edit-gl">Scope</label>
-          <select class="ctl-select" id="repair-yt-channel"
-                  style="max-width:360px;"></select>
+          <select class="ctl-select askq-select-max" id="repair-yt-channel"></select>
 
           <label class="edit-gl">Dry-run</label>
-          <label style="font-size:12px;">
+          <label class="askq-small-label">
             <input type="checkbox" id="repair-yt-dryrun" />
             Fetch + parse only, don't write
           </label>
@@ -116,25 +115,24 @@
   <!-- Restore transcript punctuation dialog. Walks per-segment text
        for YT-captioned videos, runs each through the punctuation model,
        writes the punctuated form back to DB + JSONL. -->
-  <div class="askq-backdrop" id="punct-restore-backdrop" style="display:none;">
-    <div class="askq-dialog" style="min-width:420px;max-width:520px;width:60vw;">
+  <div class="askq-backdrop" id="punct-restore-backdrop" hidden>
+    <div class="askq-dialog askq-dialog-narrow">
       <div class="askq-header">
         <span>Restore transcript punctuation</span>
       </div>
-      <div class="askq-body" style="padding:12px 14px;">
-        <div style="font-size:12px;line-height:1.4;margin-bottom:10px;color:var(--c-dim,#94a3b8);"
+      <div class="askq-body askq-body-small-pad">
+        <div class="askq-help-text"
              title="Walks per-segment text for YT-captioned videos in scope, runs each segment through the PunctuationManager (the same punct-restoration worker the Whisper path uses), and writes the punctuated form back to segments.text + the JSONL. The per-word array used by the video overlay is left as raw lowercase so the overlay captions stay readable in short chunks. Already-punctuated videos are skipped automatically.">
           Adds sentence punctuation + capitalization to legacy
           YT-captioned transcripts. Queues as a Sync Task.
-          <span style="text-decoration: underline dotted; cursor: help;">Details</span>
+          <span class="askq-help-details">Details</span>
         </div>
-        <div class="edit-grid" style="grid-template-columns: auto 1fr; gap:8px 12px;">
+        <div class="edit-grid askq-compact-grid">
           <label class="edit-gl">Scope</label>
-          <select class="ctl-select" id="punct-restore-channel"
-                  style="max-width:360px;"></select>
+          <select class="ctl-select askq-select-max" id="punct-restore-channel"></select>
 
           <label class="edit-gl">Dry-run</label>
-          <label style="font-size:12px;">
+          <label class="askq-small-label">
             <input type="checkbox" id="punct-restore-dryrun" />
             Load model + parse, don't write
           </label>
@@ -149,16 +147,15 @@
   </div>
 
   <!-- Diagnostics dialog -->
-  <div class="askq-backdrop" id="diag-backdrop" style="display:none;">
-    <div class="askq-dialog" style="min-width:560px;max-width:720px;width:72vw;">
+  <div class="askq-backdrop" id="diag-backdrop" hidden>
+    <div class="askq-dialog askq-dialog-diagnostics">
       <div class="askq-header">
         <span>Diagnostics</span>
-        <span class="status-text" id="diag-summary" style="margin-left:auto;"></span>
+        <span class="status-text dialog-summary-spacer" id="diag-summary"></span>
       </div>
-      <div class="askq-body" id="diag-body"
-           style="padding:0;max-height:55vh;overflow-y:auto;">
+      <div class="askq-body askq-body-diagnostics" id="diag-body">
         <div class="diag-rows" id="diag-rows">
-          <div class="browse-empty" style="padding:16px;">Running self-check&hellip;</div>
+          <div class="browse-empty askq-empty-padded">Running self-check&hellip;</div>
         </div>
       </div>
       <div class="askq-buttons">
@@ -172,20 +169,20 @@
 
   <!-- Manual Transcribe dialog &mdash; supports both single-file AND folder-walk
        modes, matching YTArchiver.py:16083 _start_manual_transcription. -->
-  <div class="askq-backdrop" id="manual-tx-backdrop" style="display:none;">
-    <div class="askq-dialog" style="min-width:440px;">
+  <div class="askq-backdrop" id="manual-tx-backdrop" hidden>
+    <div class="askq-dialog askq-dialog-manual">
       <div class="askq-header">Manual Transcribe</div>
       <div class="askq-body">
-        <div class="edit-grid" style="grid-template-columns: auto 1fr; gap: 8px 14px;">
+        <div class="edit-grid askq-manual-grid">
           <label class="edit-gl">Video file</label>
-          <div class="edit-gv-inline" style="gap:4px;">
-            <input type="text" class="ctl-input" id="manual-tx-path" readonly style="flex:1;" placeholder="Click Browse&hellip;" />
+          <div class="edit-gv-inline askq-form-row-tight">
+            <input type="text" class="ctl-input askq-input-fill" id="manual-tx-path" readonly placeholder="Click Browse&hellip;" />
             <button class="btn btn-ghost btn-thin" id="manual-tx-browse">Browse&hellip;</button>
           </div>
           <label class="edit-gl">Or folder</label>
-          <div class="edit-gv-inline" style="gap:4px;">
+          <div class="edit-gv-inline askq-form-row-tight">
             <button class="btn btn-ghost btn-thin" id="btn-transcribe-folder"
-                    title="Pick a folder \u2014 every video/audio file under it will be queued">Pick folder &amp; queue all&hellip;</button>
+                    title="Pick a folder &mdash; every video/audio file under it will be queued">Pick folder &amp; queue all&hellip;</button>
             <span class="co-hint">(recurses subfolders)</span>
           </div>
           <label class="edit-gl">Model</label>
@@ -205,19 +202,18 @@
   </div>
 
   <!-- Autorun history full-view dialog -->
-  <div class="askq-backdrop" id="autorun-history-backdrop" style="display:none;">
-    <div class="askq-dialog" style="min-width:680px; max-width: 900px; width: 90vw;">
+  <div class="askq-backdrop" id="autorun-history-backdrop" hidden>
+    <div class="askq-dialog askq-dialog-history">
       <div class="askq-header">
         <span>Autorun history</span>
-        <span class="status-text" id="autorun-history-count" style="margin-left:auto;"></span>
+        <span class="status-text dialog-summary-spacer" id="autorun-history-count"></span>
       </div>
-      <div class="askq-body" style="padding: 0; max-height: 55vh; overflow-y: auto;">
-        <div class="ah-filter-row" style="padding: 8px 12px; border-bottom: 1px solid var(--c-border);">
-          <input type="text" class="ctl-input" id="autorun-history-filter"
-                 placeholder="Filter&hellip;" style="max-width:240px;" />
+      <div class="askq-body askq-body-history">
+        <div class="ah-filter-row askq-history-filter-row">
+          <input type="text" class="ctl-input askq-filter-input"
+                 id="autorun-history-filter" placeholder="Filter&hellip;" />
         </div>
-        <div class="ah-entries" id="autorun-history-entries"
-             style="font-family: var(--font-log); font-size: 12px; padding: 6px 0;"></div>
+        <div class="ah-entries askq-history-entries" id="autorun-history-entries"></div>
       </div>
       <div class="askq-buttons">
         <button class="btn btn-ghost" id="autorun-history-cancel">Close</button>

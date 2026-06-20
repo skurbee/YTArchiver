@@ -200,12 +200,16 @@
         const _folderVal = channel.folder_override || channel.folder || channel.name || "";
         document.getElementById("edit-folder").value = _folderVal;
         document.getElementById("edit-url").value = channel.url || "";
+        const _rawMode = (channel.mode || "new").toLowerCase();
+        const _normalizedMode = _rawMode === "full" ? "full"
+                              : (_rawMode === "date" || _rawMode === "fromdate") ? "date"
+                              : "new";
         window._editOriginalSnapshot = {
           folder: _folderVal, url: channel.url || "",
           resolution: String(channel.resolution || "720").replace("p",""),
           min_duration: channel.min_duration || 0,
           max_duration: channel.max_duration || 0,
-          mode: channel.mode || "new",
+          mode: _normalizedMode,
           folder_org: (channel.split_months ? "months"
                          : (channel.split_years ? "years" : "flat")),
           from_date: channel.from_date || channel.date_after || "",
@@ -216,7 +220,7 @@
         document.getElementById("edit-resolution").value = String(channel.resolution || "720").replace("p", "");
         document.getElementById("edit-min-dur").value = channel.min_duration || "";
         document.getElementById("edit-max-dur").value = channel.max_duration || "";
-        const _mode = (channel.mode || "new").toLowerCase();
+        const _mode = _rawMode;
         const _rangeVal = _mode === "full" ? "all"
                          : (_mode === "date" || _mode === "fromdate") ? "fromdate"
                          : "subscribe";

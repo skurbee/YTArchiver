@@ -33,6 +33,7 @@ _STALE_TEMP_DIRS = ("_TEMP_COMPRESS", "_BACKLOG_TEMP")
 # removes it on completion — presence of .lock means "active", skip
 # regardless of age.
 _MIN_TEMP_AGE_SEC = 30 * 60  # 30 minutes
+_RECENT_WRITE_STAT_LIMIT = 200
 
 
 def _dir_is_active(full: str) -> bool:
@@ -69,8 +70,12 @@ def _dir_is_active(full: str) -> bool:
         try:
             _RECENT_WRITE_SEC = 60
             _now = time.time()
+            _checked = 0
             for _root, _dns, _fns in os.walk(full):
                 for _fn in _fns:
+                    _checked += 1
+                    if _checked > _RECENT_WRITE_STAT_LIMIT:
+                        return False
                     try:
                         if (_now - os.path.getmtime(
                                 os.path.join(_root, _fn))) < _RECENT_WRITE_SEC:

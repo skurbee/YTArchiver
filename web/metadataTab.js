@@ -67,6 +67,15 @@
     // "loading…" (spinner) and the real percentage. Cleared on each
     // refresh + force-recheck so the indicator shows up again.
     let _thumbsLoaded = false;
+    let _loadGen = 0;
+    let _pendingRefreshTimer = null;
+    const _scheduleMetadataRefresh = () => {
+      if (_pendingRefreshTimer) clearTimeout(_pendingRefreshTimer);
+      _pendingRefreshTimer = setTimeout(() => {
+        _pendingRefreshTimer = null;
+        try { window._refreshMetadataTab?.(); } catch (e) {}
+      }, 2000);
+    };
     // Cutoff for the "Still on YT" column. bulk_refresh_views_likes only
     // started populating `removed_from_yt_ts` after 2026-05-13. Channels
     // whose `last_views_refresh_ts` predates that have no real signal —
@@ -477,6 +486,7 @@
         tbody.innerHTML = '<tr><td colspan="8" class="md-empty">Native mode required.</td></tr>';
         return;
       }
+      const _myLoadGen = ++_loadGen;
       // Live "Loading channels..." with elapsed counter so the table
       // doesn't sit silent during a slow DB query (sometimes the
       // index DB lock is held by an in-flight sweep / ingest, in
@@ -512,6 +522,10 @@
       _thumbsLoaded = false;
       try {
         const rows = await bridgeCall("get_channel_metadata_status");
+        if (_myLoadGen !== _loadGen) {
+          clearInterval(_ticker);
+          return;
+        }
         _rows = Array.isArray(rows) ? rows : [];
         // Issue #154 (fix): thumbnail_status_bulk walks every channel
         // folder on disk (~100k probes on a 100-channel archive on a
@@ -521,6 +535,7 @@
         // the column when it returns.
         if (nativeBridgeUp()) {
           bridgeCall("thumbnail_status_bulk").then((thRes) => {
+            if (_myLoadGen !== _loadGen) return;
             const thMap = thRes?.rows || {};
             for (const r of _rows) {
               const key = (r.name || r.folder || "").toLowerCase();
@@ -535,7 +550,11 @@
             // Re-render once thumb data is in. Cheap — same rows,
             // just rebuilt with the merged values.
             try { render(); } catch {}
-          }).catch(() => { _thumbsLoaded = true; try { render(); } catch {} });
+          }).catch(() => {
+            if (_myLoadGen !== _loadGen) return;
+            _thumbsLoaded = true;
+            try { render(); } catch {}
+          });
         } else {
           // No native API → no walk is going to happen. Don't sit on
           // a spinner forever; flip to loaded so the column shows "—".
@@ -654,8 +673,8 @@
         // so the dialog can show real time estimates.
         let _vc = 0;
         try {
-          const _r = _rows.find(r => r.folder === ident.folder
-                                   || r.url === ident.url);
+          const _r = _rows.find(r => ident.folder && r.folder === ident.folder)
+            || _rows.find(r => ident.url && r.url === ident.url);
           _vc = _r?.video_count || 0;
         } catch {}
         const _mode = await _promptBackfillMode(
@@ -800,7 +819,7 @@
         // without the user manually hitting Reload. Harmless if the job is
         // still running — the row just re-renders with the current backend
         // state. (Full completion for big channels still needs a Reload.)
-        setTimeout(() => { try { window._refreshMetadataTab?.(); } catch (e) {} }, 2000);
+        _scheduleMetadataRefresh();
       });
 
       document.body.appendChild(menu);
@@ -1050,6 +1069,7 @@
         // itself is left intact — we don't blank it out — but the
         // spinner takes precedence so the user sees that work is
         // in progress.)
+        const _myLoadGen = ++_loadGen;
         _thumbsLoaded = false;
         try { render(); } catch {}
         const _t0 = Date.now();
@@ -1065,6 +1085,7 @@
             bridgeCall("get_channel_metadata_status", true),
             bridgeCall("thumbnail_status_bulk", true),
           ]);
+          if (_myLoadGen !== _loadGen) return;
           _rows = Array.isArray(metaRows) ? metaRows : [];
           const thMap = thRes?.rows || {};
           for (const r of _rows) {
@@ -1082,6 +1103,7 @@
           window._showToast?.(
             `Rechecked ${ch} channel(s).`, "ok");
         } catch (e) {
+          if (_myLoadGen !== _loadGen) return;
           // Stuck spinner is worse than a dash — flip back on error.
           _thumbsLoaded = true;
           try { render(); } catch {}
@@ -1100,13 +1122,13 @@
     // If the user's initial panel is the Metadata tab (e.g. after a
     // restart where it was remembered as active), pull data now.
     const metaView = document.getElementById("settings-view-metadata");
-    if (metaView && metaView.style.display !== "none") {
+    if (metaView && !metaView.hidden) {
       // Re-check display inside the timeout — if the user clicks
       // away to another tab in the 400ms window, the fetch isn't
       // needed and would just spam the bridge (audit:
       // metadataTab.js:1077).
       setTimeout(() => {
-        if (metaView.style.display !== "none") {
+        if (!metaView.hidden) {
           window._refreshMetadataTab?.();
         }
       }, 400);

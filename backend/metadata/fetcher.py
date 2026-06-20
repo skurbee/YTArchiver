@@ -55,6 +55,7 @@ from .scan import _group_by_metadata_path, _scan_channel_videos
 # so concurrent worker threads can add/remove safely.
 _inflight_procs: set[subprocess.Popen] = set()
 _inflight_procs_lock = threading.Lock()
+_fail_count_column_ready = False
 
 
 def _kill_inflight_metadata_procs() -> int:
@@ -71,6 +72,19 @@ def _kill_inflight_metadata_procs() -> int:
         except Exception as e:
             _log.debug("swallowed: %s", e)
     return killed
+
+
+def _ensure_fail_count_column(conn) -> None:
+    global _fail_count_column_ready
+    if _fail_count_column_ready:
+        return
+    try:
+        conn.execute(
+            "ALTER TABLE videos ADD COLUMN "
+            "metadata_fetch_fail_count INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    _fail_count_column_ready = True
 
 _log = get_logger(__name__)
 
@@ -210,14 +224,8 @@ def _fetch_video_metadata(yt: str, video_id: str,
         # caveat as before — fragile against descriptions containing
         # `{` — kept for back-compat but the whole-stdout path above
         # should win in normal operation.
-        js = stdout.find("{")
-        je = stdout.rfind("}")
-        if js < 0 or je <= js:
-            return None
-        try:
-            data = json.loads(stdout[js:je + 1])
-        except Exception:
-            return None
+        # Disabled: fail closed instead of risking a wrong sliced object.
+        return None
 
     comments = []
     for c in (data.get("comments") or [])[:50]:
@@ -243,10 +251,9 @@ def _fetch_video_metadata(yt: str, video_id: str,
         # as UTC (H75). The old naive LOCAL string parsed 5-6h in the
         # past for Central Time, so 'already done this pass' never
         # matched and every resumed comment refresh restarted from
-        # video 1. (metadata_io's duplicate resolution compares these
-        # lexicographically — for UTC-negative timezones the UTC
-        # string sorts >= the old naive-local string for the same
-        # instant, so mixed old/new entries still resolve correctly.)
+        # video 1. metadata_io's duplicate resolution parses these into
+        # epoch seconds so mixed old naive-local and new offset-aware
+        # entries compare by actual time rather than string order.
         "fetched_at": datetime.now(UTC).isoformat(),
     }
 
@@ -342,7 +349,7 @@ def fetch_single_video_metadata(channel: dict[str, Any],
         # re-read fresh here under it (audit H2). RLock → the inner
         # _write_metadata_jsonl re-acquires on this thread safely.
         with _lock_for(jp):
-            existing = _read_metadata_jsonl(jp)
+            existing = _read_metadata_jsonl(jp, strict=True)
             existing[video_id] = entry
             _write_metadata_jsonl(jp, existing)
     except Exception as e:
@@ -587,6 +594,8 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                                     and not _has_thumbnail_for(_v_id))
             if _v_id in existing and not refresh and not _needs_thumb_only_pf:
                 continue
+            if _needs_thumb_only_pf:
+                continue
             _to_prefetch.append((_v_id, _v_title))
 
         _prefetched: dict[str, dict[str, Any] | None] = {}
@@ -725,7 +734,9 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
             # synchronous fetch if (a) pre-fetch was skipped due to
             # error, or (b) this vid_id wasn't in the prefetch set
             # (shouldn't happen with the same skip-logic, but defensive).
-            if vid_id in _prefetched:
+            if needs_thumb_only:
+                entry = existing.get(vid_id) or {}
+            elif vid_id in _prefetched:
                 entry = _prefetched[vid_id]
             else:
                 entry = _fetch_video_metadata(yt, vid_id, title)
@@ -776,13 +787,7 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                             try:
                                 # Ensure the column exists (lazy migration
                                 # — cheap, only happens once per process).
-                                try:
-                                    conn.execute(
-                                        "ALTER TABLE videos ADD COLUMN "
-                                        "metadata_fetch_fail_count INTEGER "
-                                        "DEFAULT 0")
-                                except Exception:
-                                    pass
+                                _ensure_fail_count_column(conn)
                                 conn.execute(
                                     "UPDATE videos SET "
                                     "metadata_fetch_fail_count = "
@@ -816,7 +821,12 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                 old["like_count"] = entry.get("like_count", old.get("like_count", 0))
                 old["comment_count"] = entry.get("comment_count", old.get("comment_count", 0))
                 old["comments"] = entry.get("comments", old.get("comments", []))
-                old["fetched_at"] = entry.get("fetched_at", "")
+                old["fetched_at"] = entry.get(
+                    "fetched_at", old.get("fetched_at", ""))
+                if entry.get("upload_date"):
+                    old["upload_date"] = entry["upload_date"]
+                if entry.get("duration"):
+                    old["duration"] = entry["duration"]
                 if entry.get("thumbnail_url"):
                     old["thumbnail_url"] = entry["thumbnail_url"]
                 refreshed += 1
@@ -872,7 +882,7 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                 # fetches above ran outside the lock; only this reload+merge+
                 # write is serialized.
                 with _lock_for(jp):
-                    _fresh = _read_metadata_jsonl(jp)
+                    _fresh = _read_metadata_jsonl(jp, strict=True)
                     for _cid in _changed_ids:
                         if _cid in existing:
                             _fresh[_cid] = existing[_cid]

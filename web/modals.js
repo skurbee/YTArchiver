@@ -38,6 +38,7 @@
       escapeValue: null,
       outsideClickValue: null,
       onMount: null,          // (root, resolve) => void
+      onCleanup: null,        // () => void
     }, opts || {});
 
     return new Promise((resolve) => {
@@ -58,6 +59,11 @@
       function resolveOuter(val) {
         if (_resolved) return;
         _resolved = true;
+        try {
+          if (typeof cfg.onCleanup === "function") cfg.onCleanup();
+        } catch (e) {
+          console.error("[modal cleanup]", e);
+        }
         backdrop.style.animation = "askq-fade 0.12s ease-out reverse";
         setTimeout(() => backdrop.remove(), 120);
         document.removeEventListener("keydown", onKey);
@@ -88,6 +94,7 @@
     const cfg = Object.assign({
       title: "Confirm",
       message: "",
+      bodyHtml: "",
       confirm: "OK",
       cancel: "Cancel",
       danger: false,
@@ -113,7 +120,9 @@
       },
       onMount: (root, resolveOuter) => {
         root.querySelector(".askq-header").textContent = cfg.title;
-        root.querySelector(".askq-body").textContent = cfg.message;
+        const body = root.querySelector(".askq-body");
+        if (cfg.bodyHtml) body.innerHTML = cfg.bodyHtml;
+        else body.textContent = cfg.message;
         root.querySelector('[data-act="confirm"]').textContent = cfg.confirm;
         const cancelBtn = root.querySelector('[data-act="cancel"]');
         if (cancelBtn) cancelBtn.textContent = cfg.cancel;
@@ -197,6 +206,12 @@
     `;
 
     let countdownTimer = null;
+    const clearCountdown = () => {
+      if (countdownTimer) {
+        clearInterval(countdownTimer);
+        countdownTimer = null;
+      }
+    };
     const primary = choices.find(c => c.primary || c.kind === "primary");
 
     return openModal({
@@ -206,18 +221,19 @@
       onKey: (e, resolveOuter) => {
         if (e.key === "Enter" && primary) {
           e.preventDefault();
-          if (countdownTimer) clearInterval(countdownTimer);
+          clearCountdown();
           resolveOuter(primary.value);
           return true;
         }
         return false;
       },
+      onCleanup: clearCountdown,
       onMount: (root, resolveOuter) => {
         root.querySelector(".askq-header").textContent = cfg.title;
         root.querySelector(".askq-body").textContent = cfg.message;
         root.querySelector('[data-act="cancel"]').textContent = cfg.cancel;
         const finish = (val) => {
-          if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+          clearCountdown();
           resolveOuter(val);
         };
         root.querySelectorAll("[data-value]").forEach(b => {
@@ -226,7 +242,11 @@
         root.querySelector('[data-act="cancel"]').addEventListener(
           "click", () => finish(null));
         if (primary) {
-          setTimeout(() => root.querySelector(`[data-value="${primary.value}"]`)?.focus(), 30);
+          setTimeout(() => {
+            const primaryButton = Array.from(root.querySelectorAll("[data-value]"))
+              .find(btn => btn.dataset.value === String(primary.value));
+            primaryButton?.focus();
+          }, 30);
         }
         // Live countdown — auto-pick primary at zero.
         if (hasCountdown && primary) {
@@ -312,6 +332,48 @@
   }
 
   // ── Expose ──────────────────────────────────────────────────────
+  const escapeCloseEntries = [];
+  let escapeCloseInstalled = false;
+
+  function isVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const st = window.getComputedStyle ? window.getComputedStyle(el) : null;
+    return st ? st.display !== "none" : el.style.display !== "none";
+  }
+
+  function topVisibleEscapeEntry() {
+    for (let i = escapeCloseEntries.length - 1; i >= 0; i--) {
+      const entry = escapeCloseEntries[i];
+      if (isVisible(entry.backdrop)) return entry;
+    }
+    return null;
+  }
+
+  function onSharedEscapeClose(e) {
+    if (e.key !== "Escape") return;
+    const askOpen = Array.from(document.querySelectorAll(".askq-backdrop"))
+      .some(isVisible);
+    if (askOpen) return;
+    const entry = topVisibleEscapeEntry();
+    if (!entry) return;
+    e.preventDefault();
+    entry.close();
+  }
+
+  function registerEscapeClose(backdrop, closeFn) {
+    if (!backdrop || typeof closeFn !== "function") return () => {};
+    const entry = { backdrop, close: closeFn };
+    escapeCloseEntries.push(entry);
+    if (!escapeCloseInstalled) {
+      document.addEventListener("keydown", onSharedEscapeClose);
+      escapeCloseInstalled = true;
+    }
+    return () => {
+      const idx = escapeCloseEntries.indexOf(entry);
+      if (idx >= 0) escapeCloseEntries.splice(idx, 1);
+    };
+  }
+
   YT.modals = {
     open: openModal,
     ask: askQuestion,
@@ -319,6 +381,7 @@
     danger: askDanger,
     choice: askChoice,
     text: askTextInput,
+    registerEscapeClose,
   };
 
   // Back-compat globals — every existing app.js / logs.js call site

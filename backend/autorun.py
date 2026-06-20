@@ -18,7 +18,11 @@ from datetime import datetime
 from typing import Any
 
 from .log import get_logger
-from .ytarchiver_config import config_is_writable, load_config, save_config
+from .ytarchiver_config import (
+    config_is_writable,
+    config_transaction,
+    load_config,
+)
 
 _log = get_logger(__name__)
 
@@ -30,6 +34,11 @@ AUTORUN_OPTIONS = {
 AUTORUN_LABELS = list(AUTORUN_OPTIONS.keys())
 
 AUTORUN_HISTORY_MAX = 10000  # was 100. UI activity-log displays everything (audit 2026-05-14)
+
+
+def _format_log_time(now: datetime | None = None) -> str:
+    now = now or datetime.now()
+    return now.strftime("%I:%M%p").lstrip("0").lower()
 
 
 class AutorunScheduler:
@@ -88,9 +97,12 @@ class AutorunScheduler:
         # reverted — previously no error shown.
         persisted = True
         if config_is_writable():
-            cfg = load_config()
-            cfg["autorun_interval"] = self._interval_mins
-            persisted = bool(save_config(cfg))
+            try:
+                with config_transaction() as cfg:
+                    cfg["autorun_interval"] = self._interval_mins
+            except Exception as e:
+                _log.warning("autorun interval save failed: %s", e)
+                persisted = False
         else:
             persisted = False
         return {"ok": True, "mins": self._interval_mins, "persisted": persisted}
@@ -107,9 +119,12 @@ class AutorunScheduler:
                 self._schedule_next_locked()
         persisted = True
         if config_is_writable():
-            cfg = load_config()
-            cfg["autorun_mode"] = "clock" if clock else "timer"
-            persisted = bool(save_config(cfg))
+            try:
+                with config_transaction() as cfg:
+                    cfg["autorun_mode"] = "clock" if clock else "timer"
+            except Exception as e:
+                _log.warning("autorun mode save failed: %s", e)
+                persisted = False
         else:
             persisted = False
         return {"ok": True, "mode": "clock" if clock else "timer",
@@ -250,7 +265,8 @@ class AutorunScheduler:
         try:
             if self._stream:
                 self._stream.emit_text(
-                    "\u2014 Autorun: interval reached, kicking Sync Subbed\u2026",
+                    f"\u2014 Autorun: interval reached at {_format_log_time()}, "
+                    "kicking Sync Subbed\u2026",
                     "simpleline_green")
             with self._lock:
                 self._waiting_for_sync_done = True
@@ -332,12 +348,15 @@ def append_history_entry(entry: str, kind: str = "Auto") -> bool:
     if not config_is_writable():
         return False
     with _HISTORY_LOCK:
-        cfg = load_config()
-        hist = cfg.setdefault("autorun_history", [])
-        hist.append(entry)
-        if len(hist) > AUTORUN_HISTORY_MAX:
-            cfg["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
-        save_config(cfg)
+        try:
+            with config_transaction() as cfg:
+                hist = cfg.setdefault("autorun_history", [])
+                hist.append(entry)
+                if len(hist) > AUTORUN_HISTORY_MAX:
+                    cfg["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
+        except Exception as e:
+            _log.warning("autorun history save failed: %s", e)
+            return False
     return True
 
 
@@ -350,15 +369,9 @@ def clear_history() -> dict[str, Any]:
     if not config_is_writable():
         return {"ok": False, "error": "write-gate off", "removed": 0}
     try:
-        cfg = load_config()
-        removed = len(cfg.get("autorun_history") or [])
-        cfg["autorun_history"] = []
-        if not save_config(cfg):
-            return {
-                "ok": False,
-                "error": "config save failed",
-                "removed": 0,
-            }
+        with config_transaction() as cfg:
+            removed = len(cfg.get("autorun_history") or [])
+            cfg["autorun_history"] = []
         return {"ok": True, "removed": removed}
     except Exception as e:
         return {"ok": False, "error": str(e), "removed": 0}

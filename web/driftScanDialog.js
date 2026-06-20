@@ -51,34 +51,19 @@
 
       const _loadChannels = async () => {
         try {
-          const resp = nativeBridgeUp() ? await bridgeCall("get_subs_channels") : undefined;
-          // get_subs_channels returns a (rows, total_label) TUPLE — which
-          // arrives in JS as [rowsArray, "label string"]. The old code
-          // treated the whole tuple as the channel list and iterated
-          // [rowsArray, label] (2 items, neither with a usable name), so
-          // EVERY dropdown entry rendered "(channel name missing)".
-          // Unwrap rows[0]. Also: the row dicts key the channel's display
-          // name under `folder` (there is no `name` key), so read that.
-          let channels = [];
-          if (Array.isArray(resp) && Array.isArray(resp[0])) channels = resp[0];
-          else if (Array.isArray(resp)) channels = resp;
-          else channels = (resp && resp.channels) || [];
+          const channels = await window.YT?.util?.loadSubsChannels?.() || [];
           chanSel.innerHTML = "";
-          const _nm = (c) => (c && (c.folder || c.name)) || "";
-          // Sort alphabetically by name for picker sanity.
-          const sorted = [...channels].sort((a, b) =>
-            _nm(a).toLowerCase().localeCompare(_nm(b).toLowerCase()));
-          for (const ch of sorted) {
-            const nm = _nm(ch);
+          for (const ch of channels) {
+            const nm = ch.displayName || ch.folder || ch.name || "";
             const opt = document.createElement("option");
             // drift_scan resolves the on-disk folder via
             // folder → folder_override → name; the Subs row only carries
             // the display name, so pass it in both slots.
-            opt.value = JSON.stringify({ name: nm, folder: nm });
+            opt.value = JSON.stringify({ name: ch.name || nm, folder: ch.folder || nm });
             opt.textContent = nm || "(channel name missing — check config)";
             chanSel.appendChild(opt);
           }
-          if (!sorted.length) {
+          if (!channels.length) {
             const opt = document.createElement("option");
             opt.value = "";
             opt.textContent = "(no channels)";
@@ -87,6 +72,7 @@
           }
         } catch (e) {
           console.warn("drift: failed to load channels", e);
+          window._showToast?.(`Could not load channels: ${e}`, "warn");
         }
       };
 
@@ -320,7 +306,7 @@
       };
 
       const _open = async () => {
-        bd.style.display = "flex";
+        bd.hidden = false;
         body.innerHTML = `<div class="browse-empty" style="padding:16px;">Loading channels…</div>`;
         if (summary) summary.textContent = "";
         fixBtn.disabled = true;
@@ -333,16 +319,14 @@
       btn.addEventListener("click", _open);
       scanBtn.addEventListener("click", _scan);
       fixBtn.addEventListener("click", _fix);
-      const _close = () => { bd.style.display = "none"; };
+      const _close = () => { bd.hidden = true; };
       closeBtn?.addEventListener("click", _close);
       bd.addEventListener("click", (e) => {
         if (e.target === bd) _close();
       });
       // BUG FIX 2026-05-15 (audit): consistent Esc-to-close behavior
       // across all custom modals.
-      document.addEventListener("keydown", (e) => {
-        if (e.key === "Escape" && bd.style.display !== "none") _close();
-      });
+      window.YT?.modals?.registerEscapeClose?.(bd, _close);
   }
 
   window.initDriftScanDialog = initDriftScanDialog;

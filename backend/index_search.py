@@ -13,13 +13,28 @@ reaches for them via `from . import index as _idx`.
 """
 from __future__ import annotations
 
+import calendar
 import sqlite3
+import threading
+import time
+from collections import OrderedDict
+from datetime import UTC, datetime
 from typing import Any
 
 from . import index as _idx
 from .log import get_logger
 
 _log = get_logger(__name__)
+_TITLE_SEARCH_CACHE_MAX = 64
+_TITLE_SEARCH_CACHE_TTL = 5.0
+_title_search_cache: OrderedDict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = (
+    OrderedDict()
+)
+_title_search_cache_lock = threading.Lock()
+
+
+def _year_start_ts(year: int) -> int:
+    return calendar.timegm(datetime(int(year), 1, 1, tzinfo=UTC).timetuple())
 
 
 def _dedupe_segment_hits(rows: list[Any]) -> list[Any]:
@@ -47,7 +62,6 @@ def _dedupe_segment_hits(rows: list[Any]) -> list[Any]:
             video_key,
             start_key,
             (r[5] or "").strip(),
-            (r[7] or "").strip(),
         )
         if key in seen:
             continue
@@ -187,6 +201,13 @@ def search_video_titles(query: str,
             placeholders = ",".join(["?"] * len(_names))
             chan_sql = f" AND channel IN ({placeholders})"
             args.extend(_names)
+    channel_key: Any
+    if isinstance(channel, str):
+        channel_key = channel.strip()
+    elif isinstance(channel, (list, tuple)):
+        channel_key = tuple(str(c).strip() for c in channel if str(c).strip())
+    else:
+        channel_key = ""
     # Year scope (inclusive). Mirror the FTS leg: prefer the video's
     # UPLOAD year (upload_ts = file mtime = YT upload date), since the
     # folder-derived `year` column is NULL for flat / non-year-organized
@@ -195,18 +216,34 @@ def search_video_titles(query: str,
     # lenient (include) only when both are unknown.
     year_sql = ""
     if year_from is not None:
-        year_sql += (" AND (CAST(strftime('%Y', upload_ts, 'unixepoch') AS INTEGER) >= ?"
+        year_from_i = int(year_from)
+        year_sql += (" AND ((upload_ts IS NOT NULL AND upload_ts >= ?)"
                      " OR (upload_ts IS NULL AND year >= ?)"
                      " OR (upload_ts IS NULL AND year IS NULL))")
-        args.append(int(year_from))
-        args.append(int(year_from))
+        args.append(_year_start_ts(year_from_i))
+        args.append(year_from_i)
     if year_to is not None:
-        year_sql += (" AND (CAST(strftime('%Y', upload_ts, 'unixepoch') AS INTEGER) <= ?"
+        year_to_i = int(year_to)
+        year_sql += (" AND ((upload_ts IS NOT NULL AND upload_ts < ?)"
                      " OR (upload_ts IS NULL AND year <= ?)"
                      " OR (upload_ts IS NULL AND year IS NULL))")
-        args.append(int(year_to))
-        args.append(int(year_to))
+        args.append(_year_start_ts(year_to_i + 1))
+        args.append(year_to_i)
     requested_limit = max(1, int(limit))
+    cache_key = (
+        tuple(p.lower() for p in parts),
+        channel_key,
+        requested_limit,
+        (sort or "newest").lower(),
+        int(year_from) if year_from is not None else None,
+        int(year_to) if year_to is not None else None,
+    )
+    now = time.monotonic()
+    with _title_search_cache_lock:
+        cached = _title_search_cache.get(cache_key)
+        if cached is not None and now - cached[0] <= _TITLE_SEARCH_CACHE_TTL:
+            _title_search_cache.move_to_end(cache_key)
+            return [dict(row) for row in cached[1]]
     args.append(requested_limit)
     # Translate sort key → SQL ORDER BY clause.
     order_sql = {
@@ -227,11 +264,10 @@ def search_video_titles(query: str,
                 f"ORDER BY {order_sql} LIMIT ?",
                 args)
             rows = cur.fetchall()
-    except sqlite3.Error as e:
-        try: print(f"[search_video_titles] error: {e}")
-        except Exception as e: _log.debug("swallowed: %s", e)
+    except sqlite3.Error as exc:
+        _log.warning("search_video_titles query failed: %s", exc)
         return []
-    return [{
+    result = [{
         "video_id": r[0] or "",
         "title": r[1] or "",
         "channel": r[2] or "",
@@ -244,6 +280,13 @@ def search_video_titles(query: str,
         "added_ts": r[5] or 0,
         "upload_ts": r[5] or 0,
     } for r in rows]
+    with _title_search_cache_lock:
+        _title_search_cache[cache_key] = (time.monotonic(),
+                                          [dict(row) for row in result])
+        _title_search_cache.move_to_end(cache_key)
+        while len(_title_search_cache) > _TITLE_SEARCH_CACHE_MAX:
+            _title_search_cache.popitem(last=False)
+    return result
 
 
 def search_fts(query: str, channel: Any | None = None, limit: int = 200,
@@ -372,13 +415,32 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
         # is FTS5's bm25 auxiliary column; unambiguous here because
         # segments_fts is the only FTS table in the query.
         suffix += " ORDER BY rank"
-    suffix += " LIMIT ?"
-    args_suffix.append(query_limit)
+    suffix += " LIMIT ? OFFSET ?"
 
-    def _run(q_text: str):
+    def _run(q_text: str, offset: int = 0):
         with _idx._reader_lock:
-            cur = conn.execute(q + suffix, [q_text] + args_suffix)
+            cur = conn.execute(
+                q + suffix,
+                [q_text] + args_suffix + [query_limit, int(offset)])
             return cur.fetchall()
+
+    def _run_until_full(q_text: str) -> list[Any]:
+        all_rows: list[Any] = []
+        offset = 0
+        # Bounded paging: enough to fill duplicate-heavy pages without
+        # letting one search walk the whole FTS table through the bridge.
+        max_offset = max(query_limit * 10, requested_limit)
+        while True:
+            page = _run(q_text, offset)
+            all_rows.extend(page)
+            if len(_dedupe_segment_hits(all_rows)) >= requested_limit:
+                break
+            if len(page) < query_limit:
+                break
+            offset += query_limit
+            if offset >= max_offset:
+                break
+        return all_rows
 
     # Proactively normalize so plain terms containing FTS5-special chars
     # (e.g. the hyphen in "well-known", a stray quote, "%") match literally
@@ -388,8 +450,9 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
     rows: list[Any] = []
     _qnorm = _normalize_fts_query(query)
     try:
-        rows = _run(_qnorm)
-    except sqlite3.Error:
+        rows = _run_until_full(_qnorm)
+    except sqlite3.Error as exc:
+        _log.warning("search_fts query failed before sanitize retry: %s", exc)
         # Roll back any aborted txn state on the shared reader
         # connection before retrying — otherwise the second _run
         # can inherit a "transaction aborted" state and fail with
@@ -402,18 +465,16 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
         cleaned = _sanitize_fts_query(query)
         if cleaned and cleaned != query:
             try:
-                rows = _run(cleaned)
-            except sqlite3.Error as e2:
+                rows = _run_until_full(cleaned)
+            except sqlite3.Error as exc:
                 # Bug [52]: returning [{"error": ...}] poisoned the
                 # iterator since callers access r["segment_id"] etc.
-                # Print the error and return an empty list so the UI
+                # Log the error and return an empty list so the UI
                 # renders "no results" cleanly instead of crashing.
-                try: print(f"[search_fts] FTS error: {e2}")
-                except Exception as e: _log.debug("swallowed: %s", e)
+                _log.warning("search_fts retry failed: %s", exc)
                 return []
         else:
-            try: print(f"[search_fts] Invalid FTS5 query: {query!r}")
-            except Exception as e: _log.debug("swallowed: %s", e)
+            _log.warning("search_fts invalid FTS5 query: %r", query)
             return []
     rows = _dedupe_segment_hits(rows)[:requested_limit]
     return [{

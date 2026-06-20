@@ -12,6 +12,10 @@
   const askDanger = window.askDanger;
   const askQuestion = window.askQuestion;
   const askChoice = window.askChoice;
+  const emptyBlinkState = {
+    sync: { running: false, paused: false, count: 0 },
+    gpu: { running: false, paused: false, count: 0 },
+  };
   function bridgeCall(method, ...args) {
     const fn = window.YT?.bridge?.bridgeCall;
     if (fn) return fn(method, ...args);
@@ -20,6 +24,49 @@
 
   function nativeBridgeUp() {
     return !!window.YT?.bridge?.isUp?.();
+  }
+
+  function blinkState() {
+    const state = window._blinkState || emptyBlinkState;
+    return {
+      sync: state.sync || emptyBlinkState.sync,
+      gpu: state.gpu || emptyBlinkState.gpu,
+    };
+  }
+
+  function queueStateSnapshot() {
+    if (typeof window._queueStateSnapshot !== "function") return {};
+    return window._queueStateSnapshot() || {};
+  }
+
+  async function checkedQueueCall(call, okMessage, okKind, failMessage) {
+    const res = await call();
+    if (!res?.ok) {
+      window._showToast?.(res?.error || failMessage || "Queue action failed.", "error");
+      return false;
+    }
+    window._showToast?.(okMessage, okKind || "ok");
+    return true;
+  }
+
+  async function checkedQueueApi(api, method, queueName, okMessage, okKind, failMessage) {
+    if (typeof api?.[method] !== "function") {
+      window._showToast?.(failMessage || "Queue action is unavailable.", "error");
+      return false;
+    }
+    return checkedQueueCall(
+      () => api[method](queueName),
+      okMessage,
+      okKind,
+      failMessage);
+  }
+
+  async function checkedQueueBridge(method, queueName, okMessage, okKind, failMessage) {
+    return checkedQueueCall(
+      () => bridgeCall(method, queueName),
+      okMessage,
+      okKind,
+      failMessage);
   }
 
   // Wraps an async click handler so a second click that lands before
@@ -132,8 +179,9 @@
       // proxy can't express (it resolves every name to a function).
       const api = window.pywebview?.api;
       if (!api) return;
-      const s = _blinkState.sync;
-      const g = _blinkState.gpu;
+      const bs = blinkState();
+      const s = bs.sync;
+      const g = bs.gpu;
       const syncActivelyPaused = s.running && s.paused;
       const gpuActivelyPaused = g.running && g.paused;
       const anyActivelyPaused = syncActivelyPaused || gpuActivelyPaused;
@@ -143,10 +191,9 @@
         syncDeadPausedWithItems || gpuDeadPausedWithItems;
       try {
         if (anyActivelyPaused) {
-          if (typeof api.queue_resume === "function") {
-            await api.queue_resume("both");
-          }
-          window._showToast?.("Resumed.", "ok");
+          await checkedQueueApi(
+            api, "queue_resume", "both",
+            "Resumed.", "ok", "Resume failed.");
         } else if (deadPausedWithItems) {
           // Clear pause flags AND start the sync thread so the queue
           // actually drains. Using sync_start_all (not queue_resume)
@@ -163,13 +210,14 @@
             } else {
               window._showToast?.(res?.error || "Resume failed.", "error");
             }
+          } else {
+            window._showToast?.("Resume failed.", "error");
           }
         } else {
-          if (typeof api.queue_pause === "function") {
-            await api.queue_pause("both");
-          }
-          window._showToast?.(
-            "Paused \u2014 current jobs finish first.", "warn");
+          await checkedQueueApi(
+            api, "queue_pause", "both",
+            "Paused \u2014 current jobs finish first.", "warn",
+            "Pause failed.");
         }
       } catch (e) { window._showToast?.("Error: " + e, "error"); }
     }));
@@ -188,7 +236,7 @@
       // proxy can't express (it resolves every name to a function).
       const api = window.pywebview?.api;
       if (!api?.queue_is_paused) { api?.sync_cancel?.(); return; }
-      const s = _blinkState.sync;
+      const s = blinkState().sync;
       const threadAlive = s.running;
       const st = await api.queue_is_paused();
       if (st?.sync) {
@@ -202,7 +250,7 @@
           // disk is silently ignored.
           let routedRedownload = false;
           try {
-            const snap = window._queueStateSnapshot?.();
+            const snap = queueStateSnapshot();
             const hasRedwnl = (snap?.sync || []).some(
               t => (t?.kind || "").toLowerCase() === "redownload");
             if (hasRedwnl && api.resume_pending_redownloads) {
@@ -228,12 +276,15 @@
               res?.ok ? "ok" : "error");
           }
         } else {
-          await api.queue_resume("sync");
-          window._showToast?.("Sync resumed.", "ok");
+          await checkedQueueApi(
+            api, "queue_resume", "sync",
+            "Sync resumed.", "ok", "Sync resume failed.");
         }
       } else {
-        await api.queue_pause("sync");
-        window._showToast?.("Sync paused \u2014 finishing current channel.", "warn");
+        await checkedQueueApi(
+          api, "queue_pause", "sync",
+          "Sync paused \u2014 finishing current channel.", "warn",
+          "Sync pause failed.");
       }
     });
     document.getElementById("btn-cancel-sync-queue")?.addEventListener("click", async () => {
@@ -243,8 +294,7 @@
       // pause). Show only Clear + Never mind. The opposite case
       // (queue is running) gets the full Pause / Clear / Stop now
       // trio.
-      const _isPaused = !!(_blinkState && _blinkState.sync
-                           && _blinkState.sync.paused);
+      const _isPaused = !!blinkState().sync.paused;
       // Visual hierarchy on the action row (running-state):
       //   Pause = primary green (safe, fully reversible)
       //   Clear = ghost gray (intermediate — empties queue but current
@@ -290,8 +340,10 @@
           `Stopped — cleared ${n} queued, killed ${k} subprocess(es).`,
           "warn");
       } else if (choice === "pause") {
-        await bridgeCall("queue_pause", "sync");
-        window._showToast?.("Sync paused \u2014 finishing current channel.", "warn");
+        await checkedQueueBridge(
+          "queue_pause", "sync",
+          "Sync paused \u2014 finishing current channel.", "warn",
+          "Sync pause failed.");
       }
       // null → Cancel → no-op (dialog closed)
     });
@@ -305,11 +357,15 @@
       if (!api?.queue_is_paused) { api?.transcribe_cancel_all?.(); return; }
       const st = await api.queue_is_paused();
       if (st?.gpu) {
-        await api.queue_resume("gpu");
-        window._showToast?.("Processing queue resumed.", "ok");
+        await checkedQueueApi(
+          api, "queue_resume", "gpu",
+          "Processing queue resumed.", "ok",
+          "Processing queue resume failed.");
       } else {
-        await api.queue_pause("gpu");
-        window._showToast?.("Processing queue paused \u2014 current job will finish.", "warn");
+        await checkedQueueApi(
+          api, "queue_pause", "gpu",
+          "Processing queue paused \u2014 current job will finish.", "warn",
+          "Processing queue pause failed.");
       }
     });
     document.getElementById("btn-cancel-gpu-queue")?.addEventListener("click", async () => {
@@ -334,8 +390,10 @@
           n > 0 ? `Processing queue cleared (${n} pending).`
                 : "Processing queue cleared.", "warn");
       } else if (choice === "pause") {
-        await bridgeCall("queue_pause", "gpu");
-        window._showToast?.("Processing queue paused \u2014 current job will finish.", "warn");
+        await checkedQueueBridge(
+          "queue_pause", "gpu",
+          "Processing queue paused \u2014 current job will finish.", "warn",
+          "Processing queue pause failed.");
       }
     });
   }

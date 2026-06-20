@@ -516,6 +516,8 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
     # Attach the completeness flag out-of-band (dict subclass) so the
     # by-id mapping shape every consumer iterates stays untouched.
     class _BulkResult(dict):
+        """Bulk stats mapping with an attached completion flag."""
+
         complete = False
     _res = _BulkResult(out)
     try:
@@ -1799,18 +1801,13 @@ def existing_info_ids(folder: Path) -> set:
     if not folder.is_dir():
         return set()
     found = set()
-    # Walk for .{ch_name} Metadata.jsonl files regardless of channel name
+    bracket_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
     for dp, _dns, fns in os.walk(str(folder)):
         for fn in fns:
             if fn.startswith(".") and fn.endswith("Metadata.jsonl"):
                 found.update(_read_metadata_jsonl(os.path.join(dp, fn)).keys())
-    # Also keep compat with any leftover per-video .info.json files
-    bracket_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
-    for dp, _dns, fns in os.walk(str(folder)):
-        for fn in fns:
-            if not fn.endswith(".info.json"):
-                continue
-            m = bracket_re.findall(fn)
-            if m:
-                found.add(m[-1])
+            elif fn.endswith(".info.json"):
+                m = bracket_re.findall(fn)
+                if m:
+                    found.add(m[-1])
     return found

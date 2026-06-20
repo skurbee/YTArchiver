@@ -28,6 +28,8 @@
     timer: null,
     pendingTimer: null,  // separate clock for pause-pending blink
     pendingClockOn: false,
+    lastStateAtMs: Date.now(),
+    stale: false,
     // `count` = items queued for this pipeline. Used by
     // _syncPauseButtonState so the global Pause button enables when
     // items are queued-but-paused-without-a-live-thread (the state after
@@ -50,11 +52,45 @@
   // "pause" straight to "resume" with no visible "queued" indication.
   // 1500ms = ~3 cycles of the 1s blink animation, enough to register.
   const _PAUSE_PENDING_MIN_MS = 1500;
+  // If the backend misses the final "all idle" push, interval timers
+  // would otherwise blink forever. Treat a quiet queue state as stale
+  // and shut the clocks down; the next queue/render payload restarts
+  // them if work is still active.
+  const _BLINK_STATE_STALE_MS = 10 * 60 * 1000;
   // Expose for logs.js's renderQueues so it can mirror queue counts
   // into _blinkState the moment a fresh payload arrives.
   window._blinkState = _blinkState;
   window._syncPauseButtonState = _syncPauseButtonState;
   window._paintBlinkState = paintBlinkState;
+
+  function _touchBlinkState() {
+    _blinkState.lastStateAtMs = Date.now();
+    _blinkState.stale = false;
+  }
+
+  function _stopBlinkTimers() {
+    if (_blinkState.timer) {
+      clearInterval(_blinkState.timer);
+      _blinkState.timer = null;
+    }
+    if (_blinkState.pendingTimer) {
+      clearInterval(_blinkState.pendingTimer);
+      _blinkState.pendingTimer = null;
+    }
+    _blinkState.clockOn = false;
+    _blinkState.pendingClockOn = false;
+  }
+
+  function _handleBlinkWatchdog() {
+    if (Date.now() - _blinkState.lastStateAtMs < _BLINK_STATE_STALE_MS) {
+      return false;
+    }
+    _blinkState.stale = true;
+    _stopBlinkTimers();
+    _syncPauseButtonState();
+    paintBlinkState();
+    return true;
+  }
 
   function initQueueBlink() {
     // Re-init guard — without this, repeated init calls double-wrap
@@ -66,6 +102,7 @@
     // Backend drives blink state via:
     // window.setQueueState({ sync: {running, paused, pausedActive}, gpu: {...} })
     window.setQueueState = (state) => {
+      _touchBlinkState();
       // Capture the moment paused goes from false → true so we can
       // hold the "pending" blink for a minimum visible window even
       // if the backend flips pausedActive=true within 50ms (which it
@@ -116,6 +153,7 @@
     const origRenderQueues = window.renderQueues;
     if (typeof origRenderQueues === "function") {
       window.renderQueues = (queues) => {
+        _touchBlinkState();
         origRenderQueues(queues);
         _blinkState.sync.count = (queues?.sync || []).length;
         _blinkState.gpu.count = (queues?.gpu || []).length;
@@ -186,6 +224,7 @@
   }
 
   function blinkTick() {
+    if (_handleBlinkWatchdog()) return;
     _blinkState.clockOn = !_blinkState.clockOn;
     paintBlinkState();
   }
@@ -196,6 +235,7 @@
   // pause-wait yet OR we're still inside the minimum visible window
   // since the pause click ).
   function _isPipelinePending(s) {
+    if (_blinkState.stale) return false;
     if (!s.paused || !s.running) return false;
     if (!s.pausedActive) return true;
     // Clamp the elapsed delta to >=0 so a backwards clock skew (NTP
@@ -229,6 +269,7 @@
   }
 
   function pendingBlinkTick() {
+    if (_handleBlinkWatchdog()) return;
     _blinkState.pendingClockOn = !_blinkState.pendingClockOn;
     // Re-check on each tick: the minimum-window timer might have
     // expired since the timer started. paintBlinkState reads the

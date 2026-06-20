@@ -19,7 +19,6 @@
 
   function enhanceSelect(sel) {
     if (!sel || sel.dataset.ytdd === "1") return; // idempotent
-    sel.dataset.ytdd = "1";
 
     const dd = document.createElement("div");
     dd.className = "yt-dd";
@@ -42,18 +41,23 @@
 
     function paintMenu() {
       menu.innerHTML = "";
-      const curVal = sel.value;
-      Array.from(sel.options).forEach((opt) => {
+      const curIdx = sel.selectedIndex;
+      Array.from(sel.options).forEach((opt, idx) => {
         const row = document.createElement("div");
         row.className = "yt-dd-option";
-        if (opt.value === curVal || (!opt.value && opt.text === curVal)) {
+        if (idx === curIdx) {
           row.classList.add("selected");
         }
         row.textContent = opt.text || opt.value;
-        row.dataset.value = opt.value !== "" ? opt.value : opt.text;
+        row.dataset.idx = String(idx);
         row.addEventListener("click", (e) => {
           e.stopPropagation();
-          sel.value = row.dataset.value;
+          const nextIdx = Number(row.dataset.idx);
+          if (Number.isInteger(nextIdx)
+              && nextIdx >= 0
+              && nextIdx < sel.options.length) {
+            sel.selectedIndex = nextIdx;
+          }
           sel.dispatchEvent(new Event("change", { bubbles: true }));
           paintTrigger();
           closeMenu();
@@ -63,9 +67,8 @@
     }
 
     function paintTrigger() {
+      const opt = sel.options[sel.selectedIndex] || null;
       const v = sel.value;
-      const opt = Array.from(sel.options).find(
-        (o) => (o.value !== "" ? o.value : o.text) === v);
       valueEl.textContent = opt ? (opt.text || opt.value) : (v || "");
     }
 
@@ -112,11 +115,21 @@
 
     paintTrigger();
     sel.parentNode.insertBefore(dd, sel);
+    sel.classList.add("yt-dd-enhanced");
+    sel.dataset.ytdd = "1";
   }
 
   function enhanceAllSettingsSelects() {
     document.querySelectorAll(
-      ".settings-view .ctl-select").forEach(enhanceSelect);
+      ".settings-view .ctl-select").forEach((sel) => {
+        try {
+          enhanceSelect(sel);
+        } catch (e) {
+          console.warn("settings dropdown enhancement failed:", e);
+          sel.classList.remove("yt-dd-enhanced");
+          delete sel.dataset.ytdd;
+        }
+      });
   }
 
   document.addEventListener("DOMContentLoaded", enhanceAllSettingsSelects);

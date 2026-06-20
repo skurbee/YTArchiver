@@ -210,9 +210,7 @@ class RedownloadMixin:
         if not pending_list:
             return {"ok": False, "error": "no pending sample-confirm"}
         c = str(choice or "continue").strip().lower()
-        if c not in ("continue", "cancel",
-                     "best", "2160", "1440", "1080", "720",
-                     "480", "360", "240", "144"):
+        if c not in ("continue", "cancel", *ALLOWED_REDOWNLOAD_RESOLUTIONS):
             return {"ok": False, "error": f"invalid choice: {c}"}
         # In normal (serial) operation there's exactly one pending. If
         # multiple ever overlap, apply the user's choice to all rather

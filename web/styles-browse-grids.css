@@ -11,7 +11,7 @@
 /* Channel grid (landing) */
 .channel-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr));
   gap: 14px;
 }
 /* Shared "loading…" placeholder rendered inside a grid container before
@@ -153,7 +153,7 @@
 /* Video grid (inside a channel) */
 .video-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 1fr));
   gap: 14px;
 }
 /* When grouping by year, the top-level grid becomes a vertical stack of

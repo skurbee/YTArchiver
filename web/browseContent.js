@@ -11,7 +11,10 @@
   const askQuestion = window.askQuestion;
   const askChoice = window.askChoice;
   const askTextInput = window.askTextInput;
-  const escapeHtml = window.YT?.util?.escapeHtml || ((s) => String(s ?? ""));
+  const escapeHtml = window.YT?.util?.escapeHtml || ((s) => String(s ?? "")
+    .replace(/[&<>"']/g, (ch) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+    }[ch])));
   function bridgeCall(method, ...args) {
     const fn = window.YT?.bridge?.bridgeCall;
     if (fn) return fn(method, ...args);
@@ -294,7 +297,7 @@
     // yyyy/mm on disk — otherwise there's nothing to group by.
     const monthWrap = document.getElementById("browse-group-month-wrap");
     if (monthWrap) {
-      monthWrap.style.display = channel.split_months ? "" : "none";
+      monthWrap.hidden = !channel.split_months;
     }
     // Uncheck month-grouping when switching to a channel that doesn't
     // support it, to avoid a stale-state re-render.
@@ -364,22 +367,8 @@
     }
 
     // Fallback for preview mode — synthesize placeholder videos
-    const count = Math.min(Math.max(12, channel.n_vids || 24), 48);
-    const vids = [];
-    for (let i = 0; i < count; i++) {
-      const minutes = (i * 37 + 3) % 58 + 2;
-      const secs = (i * 17) % 60;
-      vids.push({
-        title: `${name || "Video"}: sample episode #${i + 1}`,
-        channel: name,
-        uploaded: i < 2 ? "2 days ago" : i + " weeks ago",
-        duration: `${minutes}:${String(secs).padStart(2, "0")}`,
-        views: (((i * 1337) % 50000) + 800).toLocaleString(),
-        upload_ts: Date.now() - (i * 86400000 * 3),
-        view_count: ((i * 1337) % 50000) + 800,
-      });
-    }
-    _browseState.videos = vids;
+    _browseState.videos = [];
+    window._showToast?.("Archive bridge unavailable. Videos will load once the app is ready.", "warn");
     sortCurrentVideos(sort);
   }
 
@@ -481,9 +470,6 @@
   // All 4 callers now pass [] directly so the renderer's existing
   // "No transcript available." message displays.
 
-  /* Browse sub-mode hook-ups — all synthesize data for preview only.
-     Phase 6 replaces these with real bridge calls (FTS5, JSONL indexer,
-     bookmarks table, per-channel stats). */
   function initBrowseSubmodeContent() {
     // Search is fully wired by initSearchSubmode() (native + FTS) above.
     // Graph is wired by initGraphView() (Chart.js, native data).

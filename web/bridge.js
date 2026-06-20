@@ -23,6 +23,98 @@
 
   window.YT = window.YT || {};
   const YT = window.YT;
+  YT.bootIssues = YT.bootIssues || [];
+
+  function _bootIssueMessage(err) {
+    if (!err) return "Unknown error";
+    if (typeof err === "string") return err;
+    if (err && typeof err.message === "string" && err.message.trim()) {
+      return err.message.trim();
+    }
+    try { return JSON.stringify(err).slice(0, 240); }
+    catch { return String(err); }
+  }
+
+  function _bootIssueDetails() {
+    return YT.bootIssues.map((issue) => {
+      const lines = [`[${issue.ts}] ${issue.name}: ${issue.message}`];
+      if (issue.stack) lines.push(issue.stack);
+      return lines.join("\n");
+    }).join("\n\n");
+  }
+
+  function _ensureBootIssueBanner() {
+    let banner = document.getElementById("boot-issue-banner");
+    if (banner) return banner;
+    banner = document.createElement("div");
+    banner.id = "boot-issue-banner";
+    banner.className = "boot-issue-banner";
+    banner.hidden = true;
+    banner.innerHTML = [
+      '<div class="boot-issue-main">',
+      '  <strong>UI started with issues</strong>',
+      '  <span id="boot-issue-summary"></span>',
+      '</div>',
+      '<div class="boot-issue-actions">',
+      '  <button type="button" id="boot-issue-copy" class="btn btn-thin">Copy details</button>',
+      '  <button type="button" id="boot-issue-close" class="btn btn-thin">Dismiss</button>',
+      '</div>',
+    ].join("");
+    const anchor = document.querySelector(".tab-row");
+    if (anchor && anchor.parentNode) {
+      anchor.parentNode.insertBefore(banner, anchor.nextSibling);
+    } else {
+      document.body.insertBefore(banner, document.body.firstChild);
+    }
+    banner.querySelector("#boot-issue-copy")?.addEventListener("click", async () => {
+      const details = _bootIssueDetails();
+      try {
+        if (!navigator.clipboard?.writeText) {
+          throw new Error("Clipboard API unavailable");
+        }
+        await navigator.clipboard?.writeText(details);
+        window._showToast?.("Boot issue details copied.", "ok");
+      } catch {
+        console.warn("[boot issues]", details);
+        window._showToast?.("Boot issue details written to console.", "warn");
+      }
+    });
+    banner.querySelector("#boot-issue-close")?.addEventListener("click", () => {
+      banner.hidden = true;
+    });
+    return banner;
+  }
+
+  function _renderBootIssues() {
+    if (!YT.bootIssues.length || !document.body) return;
+    const banner = _ensureBootIssueBanner();
+    const summary = banner.querySelector("#boot-issue-summary");
+    const names = YT.bootIssues.slice(-3).map((issue) => issue.name).join(", ");
+    if (summary) {
+      summary.textContent = `${YT.bootIssues.length} boot warning(s): ${names}`;
+    }
+    banner.hidden = false;
+  }
+
+  window._reportBootIssue = function (name, err, opts) {
+    const issue = {
+      name: String(name || "boot"),
+      message: _bootIssueMessage(err),
+      stack: err && err.stack ? String(err.stack) : "",
+      level: (opts && opts.level) || "warn",
+      ts: new Date().toISOString(),
+    };
+    YT.bootIssues.push(issue);
+    console.error("[boot] " + issue.name + ":", err || issue.message);
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", _renderBootIssues, { once: true });
+    } else {
+      _renderBootIssues();
+    }
+    if (typeof window._showToast === "function") {
+      window._showToast("UI started with issues. See the banner for details.", "warn");
+    }
+  };
 
   // ── Ready promise ────────────────────────────────────────────────
   // pywebview fires a 'pywebviewready' event when window.pywebview.api
@@ -57,6 +149,11 @@
       _tries += 1;
       if (_tries >= _max) {
         console.warn("[bridge] pywebview never came up — running in browser-only mode");
+        window._reportBootIssue?.(
+          "pywebview bridge",
+          "Native bridge did not become ready; desktop data may not load.",
+          { level: "error" },
+        );
         _markReady();  // resolve to undefined so callers can fall back
         return;
       }
@@ -105,6 +202,7 @@
   // identity is preserved across accesses — `YT.api.foo === YT.api.foo`
   // now holds, which matters for removeEventListener-style call sites
   // (audit: bridge.js:97-110).
+  const API_FN_CACHE_LIMIT = 200;
   const _apiFnCache = new Map();
   const _apiProxy = new Proxy({}, {
     get(_target, prop) {
@@ -121,8 +219,16 @@
           return api[prop].apply(api, args);
         }
         _toastNativeRequired();
-        return undefined;
+        return Promise.resolve({
+          ok: false,
+          error: "Native mode required",
+          code: "NATIVE_BRIDGE_UNAVAILABLE",
+        });
       };
+      if (_apiFnCache.size >= API_FN_CACHE_LIMIT) {
+        const oldest = _apiFnCache.keys().next().value;
+        if (oldest !== undefined) _apiFnCache.delete(oldest);
+      }
       _apiFnCache.set(prop, _fn);
       return _fn;
     },
@@ -183,9 +289,8 @@
             if (node.hasAttribute && node.hasAttribute("data-needs-ready")) {
               _applyReadyTo(node, _readyState);
             }
-            if (node.querySelectorAll
-                && node.outerHTML
-                && node.outerHTML.indexOf("data-needs-ready") !== -1) {
+            if (node.querySelector
+                && node.querySelector("[data-needs-ready]")) {
               node.querySelectorAll("[data-needs-ready]").forEach(el => {
                 _applyReadyTo(el, _readyState);
               });

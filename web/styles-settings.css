@@ -104,6 +104,19 @@
   margin-top: -8px;
   border-top: none;  /* override the row-divider rule above */
 }
+.settings-view .edit-grid > .settings-tool-group {
+  color: var(--c-accent);
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  padding: 14px 22px 8px 0;
+  margin-top: 0;
+  border-top: 1px solid var(--c-border);
+}
+.settings-view .edit-grid > .settings-tool-group:first-child {
+  border-top: none;
+  padding-top: 4px;
+}
 
 /* Thin horizontal dividers between rows. The label and value cells
    sit in the same row, so applying border-top to ALL cells except
@@ -123,6 +136,20 @@
   justify-content: flex-end;
   align-items: center;
   flex-wrap: nowrap;
+}
+.settings-view .edit-gap-6 {
+  gap: 6px;
+}
+.settings-view .edit-gap-8 {
+  gap: 8px;
+}
+.settings-view .settings-preload-toggle {
+  gap: 6px;
+  cursor: pointer;
+}
+.settings-view .settings-preload-hint-row {
+  gap: 6px;
+  margin-top: 2px;
 }
 .settings-view .edit-gv-stack {
   display: flex;
@@ -166,12 +193,12 @@
   box-sizing: border-box;
   line-height: 1.4;
 }
-/* Native <select> elements in settings are HIDDEN. They remain in the
-   DOM for state/value so the existing save handlers still work, but
-   we render a custom div-based dropdown in their place because
-   Chromium in pywebview refuses to render the selected-value text
-   once any `appearance: none` or non-trivial padding is applied. */
+/* Native <select> elements stay visible as the fallback. dropdown.js hides
+   each one only after its custom widget has mounted successfully. */
 .settings-view .ctl-select {
+  display: inline-block;
+}
+.settings-view .ctl-select.yt-dd-enhanced {
   display: none !important;
 }
 
@@ -281,6 +308,9 @@
   width: 64px;
   text-align: center;
   flex: 0 0 auto;
+}
+.settings-view .settings-disk-staleness-input {
+  width: 56px;
 }
 
 /* Browse / secondary buttons inside rows */

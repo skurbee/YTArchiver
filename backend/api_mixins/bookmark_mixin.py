@@ -110,17 +110,9 @@ class BookmarkMixin:
                 _wv.SAVE_DIALOG,
                 save_filename="ytarchiver_bookmarks.csv",
             )
-            if not paths:
+            path = normalize_dialog_paths(paths)
+            if not path:
                 return {"ok": False, "cancelled": True}
-            if isinstance(paths, str):
-                path = paths
-            else:
-                try:
-                    if not len(paths):
-                        return {"ok": False, "cancelled": True}
-                    path = paths[0]
-                except (TypeError, IndexError):
-                    return {"ok": False, "cancelled": True}
             # Atomic tmp+replace so a mid-write disk-full doesn't
             # clobber a pre-existing CSV the user picked to overwrite
             # (audit: bookmark_mixin.py:58-88).

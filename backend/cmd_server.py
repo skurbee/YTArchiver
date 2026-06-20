@@ -4,7 +4,7 @@ ArchiveBrowserWithYTTest viewers talk to.
 
 Mirrors YTArchiver.py:34400-34960 _start_cmd_server + _CmdHandler. Scope:
 
-  GET /cmd/ping → liveness probe; returns app version + gpu depth
+  GET /cmd/ping → liveness probe
   GET /cmd/gpu-status → queue counts
   POST /cmd/retranscribe → queue a re-transcribe (body: {video_id | filepath, title, channel})
 
@@ -39,13 +39,12 @@ from .log import get_logger
 _log = get_logger(__name__)
 
 
-# generate a per-install auth token. Same-machine
-# trust boundary was previously implicit — any local process could POST
-# to /cmd/retranscribe. Now requests must echo X-Auth-Token (or include
-# ?token=... in the URL). Token persisted to %APPDATA%\YTArchiver\
-# cmd_token so external tools (ArchivePlayer) can read it. GET endpoints
-# (/cmd/ping, /cmd/gpu-status) remain unauthenticated since they're
-# pure read-only liveness/status. POST endpoints require the token.
+# Generate a per-install auth token. This blocks unauthenticated browser
+# origins and other users on the same machine from casually POSTing to
+# /cmd/retranscribe, but it is not a same-user malware boundary: companion
+# tools intentionally read %APPDATA%\YTArchiver\cmd_token via get_token_path().
+# GET endpoints (/cmd/ping, /cmd/gpu-status) remain unauthenticated since
+# they're pure read-only liveness/status. POST endpoints require the token.
 _TOKEN_FILE_NAME = "cmd_token"
 _AUTH_TOKEN: str = ""
 
@@ -147,6 +146,11 @@ if _env_bind != "127.0.0.1" and not _allow_lan:
 
 _HANDLERS: dict[str, dict[str, Callable]] = {"get": {}, "post": {}}
 _STATE = {"started": False, "app_version": "", "srv": None, "thread": None}
+_MAX_POST_BODY_BYTES = 64 * 1024
+
+
+class RequestBodyTooLarge(ValueError):
+    pass
 
 
 def register_handler(method: str, path: str, fn: Callable):
@@ -162,6 +166,9 @@ def _read_body(request) -> dict[str, Any]:
         length = 0
     if length <= 0:
         return {}
+    if length > _MAX_POST_BODY_BYTES:
+        raise RequestBodyTooLarge(
+            f"request body too large ({length} > {_MAX_POST_BODY_BYTES})")
     try:
         return json.loads(request.rfile.read(length).decode("utf-8"))
     except Exception:
@@ -240,7 +247,11 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
             self._json(500, {"ok": False, "error": str(e)})
 
     def do_POST(self):
-        body = _read_body(self)
+        try:
+            body = _read_body(self)
+        except RequestBodyTooLarge as e:
+            self._json(413, {"ok": False, "error": str(e)})
+            return
         # POST endpoints require the X-Auth-Token
         # header (or ?token=... query param). Generated per-install
         # token at %APPDATA%\YTArchiver\cmd_token. Without this any
@@ -298,10 +309,7 @@ def start_server(app_version: str = "",
     # ensure auth token exists before first request.
     _load_or_create_token()
     # Register built-in handlers (ping + gpu-status). Callers can add more.
-    register_handler("get", "/cmd/ping", lambda _b: {
-        "version": _STATE.get("app_version", ""),
-        "gpu_depth": 0, # overridden if main.py registers a richer handler
-    })
+    register_handler("get", "/cmd/ping", lambda _b: {"alive": True})
     try:
         srv = _http_server.ThreadingHTTPServer(
             (_CMD_BIND, _CMD_PORT), _CmdHandler)

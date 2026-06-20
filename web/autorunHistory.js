@@ -29,10 +29,10 @@
     if (!backdrop) return;
 
     const show = async () => {
-      backdrop.style.display = "flex";
+      backdrop.hidden = false;
       await refreshHistory();
     };
-    const hide = () => { backdrop.style.display = "none"; };
+    const hide = () => { backdrop.hidden = true; };
 
     async function refreshHistory() {
       if (!nativeBridgeUp()) return;
@@ -45,7 +45,17 @@
         if (!body) return;
         window._autorunHistoryRaw = entries;
         _paintAutorunHistory(entries, "");
-      } catch (e) { console.warn("autorun hist:", e); }
+      } catch (e) {
+        console.warn("autorun hist:", e);
+        const body = document.getElementById("autorun-history-entries");
+        const count = document.getElementById("autorun-history-count");
+        if (count) count.textContent = "load failed";
+        if (body) {
+          body.innerHTML = `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
+            + `Could not load autorun history: ${escapeHtml(String(e))}</div>`;
+        }
+        window._showToast?.(`Could not load autorun history: ${e}`, "warn");
+      }
     }
 
     document.getElementById("autorun-history-filter")?.addEventListener("input", (e) => {
@@ -54,9 +64,7 @@
 
     cancelBtn?.addEventListener("click", hide);
     backdrop.addEventListener("click", (e) => { if (e.target === backdrop) hide(); });
-    document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && backdrop.style.display === "flex") hide();
-    });
+    window.YT?.modals?.registerEscapeClose?.(backdrop, hide);
 
     // Autorun-history viewer kept wired up for any remaining callers
     // (tray menu, etc.) but no longer reachable from the Clear button
@@ -76,12 +84,16 @@
         const segs = ent.segments || [];
         return segs.map(s => (s && s[0]) || "").join("").trim();
       });
-      const csv = "entry\n" + lines.map(l => `"${l.replace(/"/g, '""')}"`).join("\n");
+      const csvCell = (value) => `"${String(value ?? "")
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n")
+        .replace(/"/g, '""')}"`;
+      const csv = "\ufeffentry\r\n" + lines.map(csvCell).join("\r\n");
       if (nativeBridgeUp()) {
         const r = await bridgeCall("save_text_to_file", "autorun_history.csv", csv);
         if (r?.ok) window._showToast?.("Saved.", "ok");
       } else {
-        const blob = new Blob([csv], { type: "text/csv" });
+        const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url; a.download = "autorun_history.csv"; a.click();

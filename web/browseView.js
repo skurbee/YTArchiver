@@ -33,6 +33,7 @@
   const askDanger = window.askDanger;
   const askQuestion = window.askQuestion;
   const askChoice = window.askChoice;
+  let _browseFilterTimer = null;
   function bridgeCall(method, ...args) {
     const fn = window.YT?.bridge?.bridgeCall;
     if (fn) return fn(method, ...args);
@@ -45,14 +46,31 @@
     if (initBrowseSubmodes._wired) return;
     initBrowseSubmodes._wired = true;
     const buttons = document.querySelectorAll(".submode-btn");
+    document.querySelector(".browse-sidebar")?.setAttribute("role", "tablist");
+    const syncSubmodeA11y = () => {
+      buttons.forEach(x => {
+        const active = x.classList.contains("active");
+        x.setAttribute("aria-selected", active ? "true" : "false");
+      });
+    };
     buttons.forEach(b => {
+      b.setAttribute("role", "tab");
+      b.tabIndex = 0;
+      b.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          b.click();
+        }
+      });
       b.addEventListener("click", () => {
         buttons.forEach(x => x.classList.remove("active"));
         b.classList.add("active");
+        syncSubmodeA11y();
         _browseState.submode = b.dataset.submode;
         browseNavigate();
       });
     });
+    syncSubmodeA11y();
 
     // Back button — channels → videos → watch unwind, with scroll-position
     // restoration per-view so clicking back to the channel grid lands on
@@ -126,6 +144,9 @@
     // video. Stored in `_browseState.lastWatched` when `_browseGoBack`
     // leaves Watch. If there's nothing to forward to, it's a no-op.
     window.addEventListener("mouseup", (e) => {
+      if (document.querySelector(".tab.active")?.dataset.tab !== "browse") {
+        return;
+      }
       if (e.button === 3) {
         // Back
         e.preventDefault();
@@ -147,23 +168,28 @@
 
     // Sort dropdown
     document.getElementById("browse-sort")?.addEventListener("change", (e) => {
-      sortCurrentVideos(e.target.value);
+      window.sortCurrentVideos?.(e.target.value);
     });
 
     // Group-by-year checkbox triggers a re-render with current sort
     document.getElementById("browse-group-year")?.addEventListener("change", () => {
       const sort = document.getElementById("browse-sort")?.value || "newest";
-      sortCurrentVideos(sort);
+      window.sortCurrentVideos?.(sort);
     });
     // Group-by-month does the same, for channels organized yyyy/mm.
     document.getElementById("browse-group-month")?.addEventListener("change", () => {
       const sort = document.getElementById("browse-sort")?.value || "newest";
-      sortCurrentVideos(sort);
+      window.sortCurrentVideos?.(sort);
     });
 
     // Filter input
     document.getElementById("browse-filter")?.addEventListener("input", (e) => {
-      filterCurrentView(e.target.value);
+      const value = e.target.value;
+      if (_browseFilterTimer) clearTimeout(_browseFilterTimer);
+      _browseFilterTimer = setTimeout(() => {
+        _browseFilterTimer = null;
+        filterCurrentView(value);
+      }, 200);
     });
 
     // Channel-grid sort dropdown
@@ -244,7 +270,7 @@
       try { window._stopWatchVideo(); } catch (e) { /* noop */ }
     }
     // Hide all views
-    document.querySelectorAll(".browse-view").forEach(v => v.style.display = "none");
+    document.querySelectorAll(".browse-view").forEach(v => { v.hidden = true; });
     const toolbar = document.getElementById("browse-main-toolbar");
     const backBtn = document.getElementById("browse-back-btn");
     const sortWrap = document.getElementById("browse-sort-wrap");
@@ -258,12 +284,12 @@
     // Channel-sort dropdown belongs to the Channels grid only; hide it for
     // every submode here — showView("channels") re-shows it below.
     const chanSortWrap = document.getElementById("browse-channel-sort-wrap");
-    if (chanSortWrap) chanSortWrap.style.display = "none";
+    if (chanSortWrap) chanSortWrap.hidden = true;
 
     if (mode === "channels") {
       // Restart in channel grid
       _browseState.view = "channels";
-      if (findWrap) findWrap.style.display = "";
+      if (findWrap) findWrap.hidden = false;
       showView("channels");
     } else if (mode === "recent") {
       // Recent was moved from a top-level tab into a Browse submode
@@ -273,11 +299,11 @@
       // its own filter input inside the view, so hide the top-level
       // find-wrap entirely (wrap, not just input — otherwise the
       // icon orphans).
-      document.getElementById("view-recent").style.display = "";
+      document.getElementById("view-recent").hidden = false;
       title.textContent = "Videos";
-      backBtn.style.display = "none";
-      sortWrap.style.display = "none";
-      if (findWrap) findWrap.style.display = "none";
+      backBtn.hidden = true;
+      sortWrap.hidden = true;
+      if (findWrap) findWrap.hidden = true;
       _browseState.view = "recent";
       // Load (or reload) the global Videos list for the current sort.
       if (typeof window._loadVideosView === "function") window._loadVideosView();
@@ -285,39 +311,39 @@
       // Search view has its own search input inside #view-search, so
       // hide the top-level find-wrap too (same orphan-icon bug as
       // recent if we only hid the input).
-      document.getElementById("view-search").style.display = "";
+      document.getElementById("view-search").hidden = false;
       title.textContent = "Search transcripts";
-      backBtn.style.display = "none";
-      sortWrap.style.display = "none";
-      if (findWrap) findWrap.style.display = "none";
+      backBtn.hidden = true;
+      sortWrap.hidden = true;
+      if (findWrap) findWrap.hidden = true;
       // Record origin so Watch's "← Back" returns to Search (browseGoBack
       // re-clicks the submode) instead of dumping the user on Videos.
       _browseState.view = "search";
     } else if (mode === "graph") {
-      document.getElementById("view-graph").style.display = "";
+      document.getElementById("view-graph").hidden = false;
       title.textContent = "Word frequency";
-      backBtn.style.display = "none";
-      sortWrap.style.display = "none";
-      if (findWrap) findWrap.style.display = "none";
+      backBtn.hidden = true;
+      sortWrap.hidden = true;
+      if (findWrap) findWrap.hidden = true;
       _browseState.view = "graph";
-      populateGraphChannels();
+      window.populateGraphChannels?.();
     } else if (mode === "bookmarks") {
-      document.getElementById("view-bookmarks").style.display = "";
+      document.getElementById("view-bookmarks").hidden = false;
       title.textContent = "Bookmarks";
-      backBtn.style.display = "none";
-      sortWrap.style.display = "none";
-      if (findWrap) findWrap.style.display = "none";
+      backBtn.hidden = true;
+      sortWrap.hidden = true;
+      if (findWrap) findWrap.hidden = true;
       _browseState.view = "bookmarks";
-      refreshBookmarks();
+      window.refreshBookmarks?.();
     } else if (mode === "index") {
       // Browse > Index sub-mode was removed; the Index controls now
       // live in Settings → Index. Null-check defensively in case
       // anything tries to switch to "index" mode in the future.
       const idx = document.getElementById("view-index");
-      if (idx) idx.style.display = "";
+      if (idx) idx.hidden = false;
       title.textContent = "Archive index";
-      backBtn.style.display = "none";
-      sortWrap.style.display = "none";
+      backBtn.hidden = true;
+      sortWrap.hidden = true;
     }
   }
 
@@ -433,7 +459,7 @@
       _stopWatchVideo();
     }
     _browseState.view = viewName;
-    document.querySelectorAll(".browse-view").forEach(v => v.style.display = "none");
+    document.querySelectorAll(".browse-view").forEach(v => { v.hidden = true; });
     const title = document.getElementById("browse-main-title");
     const backBtn = document.getElementById("browse-back-btn");
     const sortWrap = document.getElementById("browse-sort-wrap");
@@ -442,13 +468,13 @@
     const findWrap = filter?.closest(".browse-find-wrap");
 
     if (viewName === "channels") {
-      document.getElementById("view-channels").style.display = "";
+      document.getElementById("view-channels").hidden = false;
       title.textContent = "Channels";
-      backBtn.style.display = "none";
-      sortWrap.style.display = "none";
-      if (chanSortWrap) chanSortWrap.style.display = "";
+      backBtn.hidden = true;
+      sortWrap.hidden = true;
+      if (chanSortWrap) chanSortWrap.hidden = false;
       if (filter) { filter.placeholder = "Filter channels\u2026"; filter.value = ""; }
-      if (findWrap) findWrap.style.display = "";
+      if (findWrap) findWrap.hidden = false;
       // Re-render the grid to match the just-cleared filter. Without this,
       // a grid left filtered from a previous visit (or a stale per-channel
       // scope) persisted while the filter box read empty \u2014 so the user saw
@@ -460,23 +486,23 @@
         filterCurrentView("");
       }
     } else if (viewName === "videos") {
-      document.getElementById("view-videos").style.display = "";
+      document.getElementById("view-videos").hidden = false;
       title.textContent = _browseState.currentChannel?.folder || "Videos";
-      backBtn.style.display = "";
-      sortWrap.style.display = "";
-      if (chanSortWrap) chanSortWrap.style.display = "none";
+      backBtn.hidden = false;
+      sortWrap.hidden = false;
+      if (chanSortWrap) chanSortWrap.hidden = true;
       if (filter) { filter.placeholder = "Filter videos\u2026"; filter.value = ""; }
-      if (findWrap) findWrap.style.display = "";
+      if (findWrap) findWrap.hidden = false;
     } else if (viewName === "watch") {
-      document.getElementById("view-watch").style.display = "";
+      document.getElementById("view-watch").hidden = false;
       title.textContent = _browseState.currentVideo?.title || "Watch";
-      backBtn.style.display = "";
-      sortWrap.style.display = "none";
-      if (chanSortWrap) chanSortWrap.style.display = "none";
+      backBtn.hidden = false;
+      sortWrap.hidden = true;
+      if (chanSortWrap) chanSortWrap.hidden = true;
       // Hide the whole wrap (input + icon), not just the input —
       // otherwise a lone magnifying glass sits in the header with
       // nothing to filter.
-      if (findWrap) findWrap.style.display = "none";
+      if (findWrap) findWrap.hidden = true;
       // Paint loading state into the watch view BEFORE any async
       // transcript fetch resolves. Every code path that opens Watch
       // (video-grid click, search result click, Forward gesture,
@@ -517,7 +543,7 @@
           + '<div class="watch-placeholder-text" '
           + 'style="font-size:13px;color:var(--c-text);">'
           + '<span class="spinner-inline"></span>Loading…</div>';
-        if (vEl) vEl.style.display = "none";
+        if (vEl) vEl.hidden = true;
       }
       const tr = document.getElementById("watch-transcript");
       if (tr) {
@@ -545,7 +571,10 @@
   // escapeHtml moved to web/util.js. Local alias kept so
   // the existing call sites in this IIFE keep resolving — Patch 14
   // migrates them to YT.util.escapeHtml.
-  const escapeHtml = window.YT?.util?.escapeHtml || ((s) => String(s ?? ""));
+  const escapeHtml = window.YT?.util?.escapeHtml || ((s) => String(s ?? "")
+    .replace(/[&<>"']/g, (ch) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+    }[ch])));
 
   // Auto-sync dropdown + countdown moved to web/autoSync.js (window.initAutorun).
 

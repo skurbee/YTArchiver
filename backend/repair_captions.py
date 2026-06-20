@@ -41,6 +41,7 @@ from pathlib import Path
 from .log import get_logger
 from .sync import _find_cookie_source, _startupinfo, find_yt_dlp
 from .transcribe import _parse_vtt, _replace_jsonl_entry
+from .transcribe.transcribe_files import parse_transcript_header
 from .ytarchiver_config import TRANSCRIPTION_DB
 
 _log = get_logger(__name__)
@@ -211,11 +212,6 @@ def _clear_checkpoint(scope_url: str) -> None:
 # transcribe.py. Whisper rows look like `(WHISPER:small)` and are skipped.
 YT_CAPTION_TAGS = {"YT CAPTIONS", "YT+PUNCTUATION"}
 
-_HEADER_RE = re.compile(
-    r"^===\((.+?)\),\s*\((.+?)\),\s*\((.+?)\),\s*\((.+?)\)===\s*$"
-)
-
-
 # consolidated onto text_utils.normalize_title_loose
 # (NFKC + lower + strip ALL punct + collapse whitespace). Previous local
 # copy was the same minus NFKC normalization.
@@ -228,9 +224,10 @@ def _parse_txt_sources(txt_path: Path) -> dict:
     try:
         with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
-                m = _HEADER_RE.match(line.strip())
-                if m:
-                    out[_norm_title(m.group(1))] = m.group(4).strip()
+                parsed = parse_transcript_header(line)
+                if parsed:
+                    title, _date, _dur, src = parsed
+                    out[_norm_title(title)] = src
     except OSError:
         pass
     return out
@@ -471,6 +468,7 @@ def _repair_one_video(yt_dlp: str, jsonl_path: Path, title: str,
                       log_stream,
                       cancel_event: threading.Event | None = None,
                       db_conn: sqlite3.Connection | None = None,
+                      tmp_dir: Path | None = None,
                       ) -> tuple[bool, str, int, int]:
     """Fetch+parse+write a single video. Returns (ok, msg, n_segs, n_words).
 
@@ -480,32 +478,61 @@ def _repair_one_video(yt_dlp: str, jsonl_path: Path, title: str,
     strip the capitalization + punctuation across the whole transcript.
     Skip those videos rather than downgrade them.
     """
-    with tempfile.TemporaryDirectory(prefix="ytarc_repair_") as tmp:
-        tmp_dir = Path(tmp)
+    def _run_repair(_tmp_dir: Path) -> tuple[bool, str, int, int]:
         vtt, err = _fetch_vtt_with_backoff(
-            yt_dlp, video_id, tmp_dir, log_stream, cancel_event)
+            yt_dlp, video_id, _tmp_dir, log_stream, cancel_event)
         if not vtt:
             return False, f"fetch: {err}", 0, 0
-        new_segs = _parse_vtt(str(vtt))
-        if not new_segs:
-            return False, "parser produced no segments", 0, 0
-        total_words = sum(len(s.get("w") or []) for s in new_segs)
-        if source_tag == "YT+PUNCTUATION" and not _looks_punctuated(new_segs):
-            return False, "skipped: new VTT is lowercase (would downgrade punctuation)", 0, 0
-        if dry_run:
-            return True, "DRY-RUN", len(new_segs), total_words
         try:
-            _replace_jsonl_entry(str(jsonl_path), title, video_id, new_segs)
-        except Exception as e:
-            return False, f"JSONL replace: {e}", 0, 0
-        db_rows, db_err = _update_db_words(video_id, new_segs, conn=db_conn)
-        if db_err:
-            return True, f"DB skipped: {db_err}", len(new_segs), total_words
-        return True, f"{db_rows} DB rows", len(new_segs), total_words
+            new_segs = _parse_vtt(str(vtt))
+            if not new_segs:
+                return False, "parser produced no segments", 0, 0
+            total_words = sum(len(s.get("w") or []) for s in new_segs)
+            if source_tag == "YT+PUNCTUATION" and not _looks_punctuated(new_segs):
+                return False, "skipped: new VTT is lowercase (would downgrade punctuation)", 0, 0
+            if dry_run:
+                return True, "DRY-RUN", len(new_segs), total_words
+            try:
+                _replace_jsonl_entry(str(jsonl_path), title, video_id, new_segs)
+            except Exception as e:
+                return False, f"JSONL replace: {e}", 0, 0
+            db_rows, db_err = _update_db_words(video_id, new_segs, conn=db_conn)
+            if db_err:
+                return True, f"DB skipped: {db_err}", len(new_segs), total_words
+            return True, f"{db_rows} DB rows", len(new_segs), total_words
+        finally:
+            try:
+                Path(vtt).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    if tmp_dir is not None:
+        return _run_repair(tmp_dir)
+    with tempfile.TemporaryDirectory(prefix="ytarc_repair_") as tmp:
+        return _run_repair(Path(tmp))
 
 
 _VID_RE = re.compile(rb'"video_id"\s*:\s*"([^"]+)"')
 _TITLE_RE = re.compile(rb'"title"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _file_contains_any(path: Path, needles: tuple[bytes, ...],
+                       chunk_size: int = 1024 * 1024) -> bool:
+    """Return True if any needle appears in path without full-file read."""
+    if not needles:
+        return False
+    max_needle = max(len(n) for n in needles)
+    overlap = max(0, max_needle - 1)
+    tail = b""
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                return False
+            hay = tail + chunk
+            if any(n in hay for n in needles):
+                return True
+            tail = hay[-overlap:] if overlap else b""
 
 
 def _collect_yt_videos(jsonl_path: Path) -> list:
@@ -576,13 +603,9 @@ def _find_jsonl_for_video_id(root: Path, video_id: str
     _needle_alt = (b'"video_id":"' + video_id.encode("ascii") + b'"')
     for j in root.rglob(".*Transcript.jsonl"):
         try:
-            # Read the file in binary mode and scan for the substring
-            # first. The JSON writer is consistent within a file, so a
-            # quick byte-contains pre-filter rules out 99%+ of jsonls
-            # in microseconds.
-            with open(j, "rb") as f:
-                _data = f.read()
-            if _needle not in _data and _needle_alt not in _data:
+            # Scan in chunks so a 20MB+ channel JSONL is not materialized
+            # just to reject a non-match.
+            if not _file_contains_any(j, (_needle, _needle_alt)):
                 continue
             # Found a hit — parse line-by-line to extract the title.
             with open(j, "r", encoding="utf-8") as f:
@@ -789,6 +812,8 @@ def repair_archive(*, output_dir: str, log_stream,
     # of thousands of file-handle operations and prevented the WAL
     # pragma from taking effect on cold-start invocations.
     db_conn = None if dry_run else _open_repair_db_conn()
+    repair_tmp = tempfile.TemporaryDirectory(prefix="ytarc_repair_")
+    repair_tmp_dir = Path(repair_tmp.name)
     try:
       for i, (j, vid, t, tag) in enumerate(work, 1):
         _wait_if_paused()
@@ -799,7 +824,7 @@ def repair_archive(*, output_dir: str, log_stream,
             break
         success, msg, n_segs, n_words = _repair_one_video(
             yt_dlp, j, t, vid, tag, dry_run, log_stream, cancel_event,
-            db_conn=db_conn)
+            db_conn=db_conn, tmp_dir=repair_tmp_dir)
         # Record progress only for a GENUINE success or a deliberate
         # "skipped:" downgrade, so a restart resumes after the last truly-done
         # video. Do NOT persist hard FAILs, the "DB skipped" partial (JSONL
@@ -869,6 +894,10 @@ def repair_archive(*, output_dir: str, log_stream,
             else:
                 time.sleep(_per_fetch_sleep)
     finally:
+        try:
+            repair_tmp.cleanup()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         if db_conn is not None:
             try: db_conn.close()
             except Exception as e: _log.debug("swallowed: %s", e)

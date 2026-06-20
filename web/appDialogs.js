@@ -102,7 +102,16 @@
     `;
     document.body.appendChild(backdrop);
     const remember = backdrop.querySelector("#close-remember-choice");
+    let settled = false;
+    let onKey = null;
+    const cleanup = () => {
+      if (onKey) document.removeEventListener("keydown", onKey);
+      onKey = null;
+    };
     const choose = async (action) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       const rem = !!remember?.checked;
       backdrop.remove();
       // Cancel = pure dismiss. Window stays open, no config change
@@ -126,12 +135,12 @@
     backdrop.addEventListener("click", (e) => {
       if (e.target === backdrop) choose("cancel");
     });
-    document.addEventListener("keydown", function onKey(e) {
+    onKey = function (e) {
       if (e.key === "Escape") {
-        document.removeEventListener("keydown", onKey);
         choose("cancel");
       }
-    });
+    };
+    document.addEventListener("keydown", onKey);
     setTimeout(() => backdrop.querySelector('[data-act="quit"]')?.focus(), 30);
   };
 

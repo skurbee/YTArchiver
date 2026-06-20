@@ -102,9 +102,12 @@
       if (st.mins > 0 && st.waiting_for_sync) {
         cd.textContent = "waiting for queue\u2026";
       } else if (st.mins > 0 && st.mode === "clock" && st.next_fire_ts) {
-        // Clock-aligned mode: show the absolute fire time, e.g. "Next at 7:00pm".
-        cd.textContent = `Next at ${_fmtClock(st.next_fire_ts)}`;
+        // Clock-aligned mode: keep the absolute fire time, but include
+        // a live relative suffix so the label does not look frozen.
         const sec = Math.max(0, Math.floor(st.next_fire_ts - Date.now() / 1000));
+        cd.textContent = sec > 0
+          ? `Next at ${_fmtClock(st.next_fire_ts)} (in ${_fmtRemain(sec)})`
+          : `Next at ${_fmtClock(st.next_fire_ts)} (firing...)`;
         if (sec === 0 && !_fetchInFlight) {
           _fetchInFlight = true;
           fetchAnchor().finally(() => { _fetchInFlight = false; });

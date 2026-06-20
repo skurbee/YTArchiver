@@ -13,6 +13,19 @@ from ._shared import *  # noqa: F401,F403
 
 class ThumbnailMixin:
 
+    _realign_init_lock = threading.Lock()
+
+    def _ensure_realign_jobs(self):
+        if (hasattr(self, "_realign_jobs")
+                and hasattr(self, "_realign_jobs_lock")):
+            return
+        with self._realign_init_lock:
+            if not hasattr(self, "_realign_jobs"):
+                self._realign_jobs = {}
+            if not hasattr(self, "_realign_jobs_lock"):
+                self._realign_jobs_lock = threading.Lock()
+
+
     def thumbnail_status_bulk(self, force=False):
         """Issue #154: return {channel: {total, with_thumb, missing}}
         for every subscribed channel. Drives the thumbnail % column
@@ -74,9 +87,7 @@ class ThumbnailMixin:
         for minutes with the UI showing only a frozen 'Scanning…')."""
         try:
             import uuid as _uuid
-            if not hasattr(self, "_realign_jobs"):
-                self._realign_jobs = {}
-                self._realign_jobs_lock = threading.Lock()
+            self._ensure_realign_jobs()
             token = _uuid.uuid4().hex
             cancel_ev = threading.Event()
             now = time.time()
@@ -118,8 +129,7 @@ class ThumbnailMixin:
         running, or the final result payload (with ok/scanned/misaligned/
         moved/per_channel/cancelled) when done. The token is forgotten
         once the final payload is returned."""
-        if not hasattr(self, "_realign_jobs"):
-            return {"ok": False, "error": "unknown token"}
+        self._ensure_realign_jobs()
         with self._realign_jobs_lock:
             entry = self._realign_jobs.get(token)
             if entry is None:
@@ -134,8 +144,7 @@ class ThumbnailMixin:
         """Signal a running realign pass (by token) to stop at the next
         channel / directory boundary. Idempotent; safe on an unknown or
         already-finished token."""
-        if not hasattr(self, "_realign_jobs"):
-            return {"ok": True}
+        self._ensure_realign_jobs()
         with self._realign_jobs_lock:
             entry = self._realign_jobs.get(token)
             ev = entry.get("cancel") if isinstance(entry, dict) else None

@@ -90,17 +90,6 @@ def _bracket_segments(label: str, bracket_tag: str = "sync_bracket",
 # would find the first pass's `sync_row_1` DOM element (still in
 # scrollback) and silently replace its content — leaving the user
 # staring at a log that seemed to skip most of the channel iteration.
-
-# Module-level pass-id counter + lock. Each invocation of `sync_all()`
-# (or `sync_one_channel`) calls `_new_pass_id()` once to get a unique
-# token and stashes it on `_ROW_EMIT_PASS_ID.id`; `_sync_row_emit`
-# reads that thread-local by default and appends the token to its
-# in-place-replace marker so passes never collide.
-#
-# Without this, the autorun-triggered second pass's `sync_row_1` emit
-# would find the first pass's `sync_row_1` DOM element (still in
-# scrollback) and silently replace its content — leaving the user
-# staring at a log that seemed to skip most of the channel iteration.
 _PASS_ID_COUNTER = 0
 _PASS_ID_LOCK = threading.Lock()
 _ROW_EMIT_PASS_ID = threading.local()
@@ -400,18 +389,25 @@ def _persist_row_history(row_id: str, line: str) -> None:
                 hist[existing_idx] = line
             else:
                 hist.append(line)
-                # Trim + shift any tracked indices if we exceeded cap.
+                new_idx = len(hist) - 1
+                # Trim + shift previously tracked indices if we exceeded cap.
                 if len(hist) > _ar.AUTORUN_HISTORY_MAX:
                     trim_n = len(hist) - _ar.AUTORUN_HISTORY_MAX
                     hist = hist[-_ar.AUTORUN_HISTORY_MAX:]
                     cfg["autorun_history"] = hist
                     for _k, _v in list(_HIST_INDEX_BY_ROW_ID.items()):
+                        if _k == row_id:
+                            continue
                         if _v < trim_n:
                             _HIST_INDEX_BY_ROW_ID.pop(_k, None)
                         else:
                             _HIST_INDEX_BY_ROW_ID[_k] = _v - trim_n
+                    new_idx -= trim_n
                 if row_id:
-                    _HIST_INDEX_BY_ROW_ID[row_id] = len(hist) - 1
+                    _HIST_INDEX_BY_ROW_ID[row_id] = new_idx
+            for _k, _v in list(_HIST_INDEX_BY_ROW_ID.items()):
+                if not isinstance(_v, int) or _v < 0 or _v >= len(hist):
+                    _HIST_INDEX_BY_ROW_ID.pop(_k, None)
         _cfg.save_config(cfg)
     except Exception as e:
         _log.debug("swallowed: %s", e)
@@ -426,6 +422,7 @@ def _persist_row_history(row_id: str, line: str) -> None:
 # appending a separate [Trnscr].
 _RECENT_DWNLD_ROWS: dict[str, dict[str, Any]] = {}
 _RECENT_DWNLD_LOCK = threading.Lock()
+_RECENT_DWNLD_MAX_AGE_SEC = 1800.0
 
 
 def register_pending_dwnld_row(channel_name: str, row_id: str,
@@ -435,13 +432,17 @@ def register_pending_dwnld_row(channel_name: str, row_id: str,
     a subsequent transcribe-complete update can find the row and patch
     its transcribed cell instead of emitting a separate [Trnscr]."""
     with _RECENT_DWNLD_LOCK:
+        now = time.time()
+        for _ch, _entry in list(_RECENT_DWNLD_ROWS.items()):
+            if now - _entry.get("registered_at", 0) > _RECENT_DWNLD_MAX_AGE_SEC:
+                _RECENT_DWNLD_ROWS.pop(_ch, None)
         _RECENT_DWNLD_ROWS[channel_name] = {
             "row_id": row_id,
             "downloaded": int(downloaded or 0),
             "metadata": int(metadata or 0),
             "errors": int(errors or 0),
             "elapsed_start": float(elapsed_start or time.time()),
-            "registered_at": time.time(),
+            "registered_at": now,
         }
 
 

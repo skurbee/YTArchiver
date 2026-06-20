@@ -63,9 +63,31 @@ def _ensure_thumbnails_dir(subfolder: str) -> str:
     return thumb_dir
 
 
+def _thumbnail_url_candidates(url: str, video_id: str) -> list[str]:
+    """Return thumbnail URLs to try, from best/original to safe fallbacks."""
+    candidates: list[str] = []
+
+    def _add(candidate: str) -> None:
+        candidate = (candidate or "").strip()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    _add(url)
+    if video_id and "ytimg.com/" in (url or ""):
+        # YouTube often omits maxresdefault for a video while still
+        # serving hqdefault/mqdefault, so try those before giving up.
+        base_webp = f"https://i.ytimg.com/vi_webp/{video_id}"
+        base_jpg = f"https://i.ytimg.com/vi/{video_id}"
+        for quality in ("maxresdefault", "sddefault",
+                        "hqdefault", "mqdefault"):
+            _add(f"{base_webp}/{quality}.webp")
+            _add(f"{base_jpg}/{quality}.jpg")
+    return candidates
+
+
 def _download_thumbnail(url: str, thumb_dir: str,
                         title: str, video_id: str,
-                        stream=None) -> None:
+                        stream=None) -> bool:
     """Download a thumbnail to `{thumb_dir}/{safe_title} [{video_id}].jpg`.
     Dedupes against an existing file with the same [{video_id}] bracket.
     Matches YTArchiver.py:26784 exactly.
@@ -76,7 +98,7 @@ def _download_thumbnail(url: str, thumb_dir: str,
     the exception was silently swallowed.
     """
     if not url or not video_id:
-        return
+        return False
     # Also strip control chars (incl. NUL) and trim trailing dots /
     # spaces so the resulting filename is valid on NTFS — bare
     # `[<>:"/\\|?*]` substitution missed those classes (audit:
@@ -88,7 +110,7 @@ def _download_thumbnail(url: str, thumb_dir: str,
     fname = f"{safe_title} [{video_id}].jpg"
     fpath = os.path.join(thumb_dir, fname)
     if os.path.isfile(fpath):
-        return
+        return True
 
     # Dedup: if a thumb with this [{video_id}] already exists under a
     # different title (YT renamed the video), rename it instead of writing
@@ -122,7 +144,7 @@ def _download_thumbnail(url: str, thumb_dir: str,
                         new_path = os.path.join(thumb_dir, new_fname)
                         try:
                             os.replace(existing_path, new_path)
-                            return
+                            return True
                         except OSError:
                             pass
                     else:
@@ -146,31 +168,43 @@ def _download_thumbnail(url: str, thumb_dir: str,
     # a thumbnail. cap read at 20 MB — YouTube thumbs are
     # typically <200 KB so anything bigger is suspicious.
     try:
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0"})
-        # Pre-check Content-Length: YouTube thumbs are typically <200KB,
-        # and we cap at 20MB. A misbehaving server reporting 100MB+
-        # gets refused without burning a slow read (audit:
-        # thumbnails.py:130-141).
         _MAX_BYTES = 20 * 1024 * 1024
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        img_data = None
+        _last_error: Exception | None = None
+        for candidate_url in _thumbnail_url_candidates(url, video_id):
             try:
-                _cl = resp.headers.get("Content-Length")
-                if _cl and int(_cl) > _MAX_BYTES:
+                req = urllib.request.Request(
+                    candidate_url, headers={"User-Agent": "Mozilla/5.0"})
+                # Pre-check Content-Length: YouTube thumbs are typically <200KB,
+                # and we cap at 20MB. A misbehaving server reporting 100MB+
+                # gets refused without burning a slow read (audit:
+                # thumbnails.py:130-141).
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    try:
+                        _cl = resp.headers.get("Content-Length")
+                        if _cl and int(_cl) > _MAX_BYTES:
+                            raise ValueError(
+                                f"Content-Length {_cl} exceeds 20MB cap")
+                    except (TypeError, ValueError) as _cle:
+                        if "exceeds" in str(_cle):
+                            raise
+                    candidate_data = resp.read(_MAX_BYTES)
+                if not candidate_data or len(candidate_data) < 16:
                     raise ValueError(
-                        f"Content-Length {_cl} exceeds 20MB cap")
-            except (TypeError, ValueError) as _cle:
-                if "exceeds" in str(_cle):
-                    raise
-            img_data = resp.read(_MAX_BYTES)
-        if not img_data or len(img_data) < 16:
-            raise ValueError(f"empty/short response ({len(img_data)} bytes)")
-        # JPEG: FF D8 FF. PNG: 89 50 4E 47. WEBP: RIFF....WEBP.
-        _magic_ok = (img_data[:3] == b"\xFF\xD8\xFF"
-                     or img_data[:4] == b"\x89PNG"
-                     or (img_data[:4] == b"RIFF" and img_data[8:12] == b"WEBP"))
-        if not _magic_ok:
-            raise ValueError("not a recognized image format")
+                        f"empty/short response ({len(candidate_data)} bytes)")
+                # JPEG: FF D8 FF. PNG: 89 50 4E 47. WEBP: RIFF....WEBP.
+                _magic_ok = (candidate_data[:3] == b"\xFF\xD8\xFF"
+                             or candidate_data[:4] == b"\x89PNG"
+                             or (candidate_data[:4] == b"RIFF"
+                                 and candidate_data[8:12] == b"WEBP"))
+                if not _magic_ok:
+                    raise ValueError("not a recognized image format")
+                img_data = candidate_data
+                break
+            except Exception as _candidate_error:
+                _last_error = _candidate_error
+        if img_data is None:
+            raise _last_error or ValueError("thumbnail unavailable")
         tmp_path = fpath + ".tmp"
         try:
             with open(tmp_path, "wb") as f:
@@ -214,6 +248,7 @@ def _download_thumbnail(url: str, thumb_dir: str,
                 os.remove(_stale_old_thumb)
             except OSError:
                 pass
+        return True
     except Exception as _te:
         # Non-fatal, but no longer invisible: emit a verbose-only
         # diagnostic so the user can see WHY a Browse thumbnail is
@@ -222,15 +257,16 @@ def _download_thumbnail(url: str, thumb_dir: str,
         if stream is not None:
             try:
                 stream.emit([
-                    [" ⚠ Thumbnail fetch failed ", "dim"],
+                    ["Thumbnail preview unavailable ", "dim"],
                     [f"[{video_id}]: {_te}\n", "dim"],
                 ])
             except Exception as e:
                 _log.debug("swallowed: %s", e)
+        return False
 
 
 def _thumbnail_exists_for(thumb_dir: str, video_id: str) -> bool:
-    """True iff any thumbnail file in `thumb_dir` carries `[video_id]`."""
+    """True iff a valid thumbnail file in `thumb_dir` carries `[video_id]`."""
     if not thumb_dir or not video_id or not os.path.isdir(thumb_dir):
         return False
     bracket = f"[{video_id}]"
@@ -238,7 +274,21 @@ def _thumbnail_exists_for(thumb_dir: str, video_id: str) -> bool:
         for fn in os.listdir(thumb_dir):
             if bracket in fn and fn.lower().endswith(
                     (".jpg", ".jpeg", ".png", ".webp")):
-                return True
+                path = os.path.join(thumb_dir, fn)
+                try:
+                    if os.path.getsize(path) < 16:
+                        continue
+                    with open(path, "rb") as f:
+                        head = f.read(12)
+                    magic_ok = (
+                        head[:3] == b"\xFF\xD8\xFF"
+                        or head[:4] == b"\x89PNG"
+                        or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
+                    )
+                    if magic_ok:
+                        return True
+                except OSError:
+                    continue
     except OSError:
         pass
     return False
@@ -283,10 +333,12 @@ def _save_thumb_cache(cache: dict[str, dict[str, Any]]) -> None:
 
 
 def _channel_fingerprint(folder: Path) -> float:
-    """Max mtime across the channel folder + one level of subdirs.
-    Adding a new download bumps the immediate parent dir's mtime, so
-    a one-level walk is enough to detect new content. Mirrors the
-    fingerprint pattern used by sweep_new_videos.
+    """Max mtime across the channel folder plus shallow year/month content.
+
+    Directory mtimes catch newly added files, but not every in-place file
+    edit or replace on remote/storage-backed filesystems. Include file mtimes
+    through the usual channel/year/month layout so thumbnail status cache
+    invalidates when existing media changes.
     """
     if not folder.exists():
         return 0.0
@@ -294,25 +346,21 @@ def _channel_fingerprint(folder: Path) -> float:
         mx = folder.stat().st_mtime
     except OSError:
         return 0.0
-    try:
-        for entry in os.scandir(folder):
-            try:
-                if entry.is_dir(follow_symlinks=False):
-                    m = entry.stat(follow_symlinks=False).st_mtime
-                    if m > mx:
-                        mx = m
-                    # One more level deep (covers year/month splits).
-                    for sub in os.scandir(entry.path):
-                        try:
-                            if sub.is_dir(follow_symlinks=False):
-                                ms = sub.stat(
-                                    follow_symlinks=False).st_mtime
-                                if ms > mx:
-                                    mx = ms
-                        except OSError:
-                            pass
-            except OSError:
-                pass
-    except OSError:
-        pass
+    def _scan(path: str | os.PathLike, depth: int) -> None:
+        nonlocal mx
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        if st.st_mtime > mx:
+                            mx = st.st_mtime
+                        if depth > 0 and entry.is_dir(follow_symlinks=False):
+                            _scan(entry.path, depth - 1)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    _scan(folder, 2)
     return mx

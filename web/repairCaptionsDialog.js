@@ -36,15 +36,7 @@
 
       const _loadChannels = async () => {
         try {
-          if (!nativeBridgeUp()) return;
-          const list = await bridgeCall("get_subs_channels");
-          // get_subs_channels returns a [rows, totalLabel] tuple —
-          // unwrap rows like driftScanDialog does, or the dropdown
-          // fills with two garbage entries.
-          let channels = [];
-          if (Array.isArray(list) && Array.isArray(list[0])) channels = list[0];
-          else if (Array.isArray(list)) channels = list;
-          else channels = list?.channels || [];
+          const channels = await window.YT?.util?.loadSubsChannels?.() || [];
           chanSel.innerHTML = "";
           // "All channels" is the default — full-archive fix is the
           // most common case for a one-shot repair.
@@ -52,38 +44,34 @@
           allOpt.value = "";
           allOpt.textContent = "All channels";
           chanSel.appendChild(allOpt);
-          const sorted = [...channels].sort((a, b) =>
-            (a.name || "").toLowerCase().localeCompare(
-              (b.name || "").toLowerCase()));
-          for (const ch of sorted) {
+          for (const ch of channels) {
             const opt = document.createElement("option");
             // Scope uses the on-disk folder name (matches backend's
             // `output_dir / channel_folder` Path.join). Fall back to
             // name if folder isn't set.
             opt.value = ch.folder || ch.name || "";
-            opt.textContent = ch.name || ch.folder
+            opt.textContent = ch.displayName || ch.folder || ch.name
               || "(channel name missing)";
             chanSel.appendChild(opt);
           }
         } catch (e) {
           console.warn("repair-yt: failed to load channels", e);
+          window._showToast?.(`Could not load channels: ${e}`, "warn");
         }
       };
 
       btn.addEventListener("click", async () => {
         await _loadChannels();
         if (dryEl) dryEl.checked = false;
-        bd.style.display = "flex";
+        bd.hidden = false;
       });
 
-      const _close = () => { bd.style.display = "none"; };
+      const _close = () => { bd.hidden = true; };
       closeBtn?.addEventListener("click", _close);
       bd.addEventListener("click", (e) => {
         if (e.target === bd) _close();
       });
-      document.addEventListener("keydown", (e) => {
-        if (e.key === "Escape" && bd.style.display !== "none") _close();
-      });
+      window.YT?.modals?.registerEscapeClose?.(bd, _close);
 
       runBtn.addEventListener("click", async () => {
         if (!nativeBridgeUp()) {

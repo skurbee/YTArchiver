@@ -16,7 +16,7 @@ Public API:
     VIDEO_AND_AUDIO_EXTS     extended + audio
     walk_channel_videos(folder, *, exts=VIDEO_EXTS_EXTENDED, skip_partial=True) -> Iterator[Path]
     walk_channel_files(folder, exts) -> Iterator[Path]
-    is_partial_artifact(name) -> bool
+    is_partial_artifact(name, dir_path=None) -> bool
 """
 
 from __future__ import annotations
@@ -52,7 +52,43 @@ _PARTIAL_FRAG_RE = re.compile(
     r"\.f\d{1,4}(?:-\d+)?\.[a-z0-9]{3,4}$", re.IGNORECASE)
 
 
-def is_partial_artifact(name: str) -> bool:
+def _has_partial_fragment_evidence(name: str,
+                                   dir_path: str | os.PathLike | None) -> bool:
+    """Return True when a `.fNNN` media file has sibling evidence of a merge.
+
+    A title can legitimately end with `.f140.mp4`. Treat it as a partial
+    only when the caller gives us its directory and we can see a final merged
+    sibling, or a `.part` sidecar from an interrupted yt-dlp run. Callers that
+    only have a filename keep the historical conservative-filter behavior.
+    """
+    if dir_path is None:
+        return True
+    try:
+        names = set(os.listdir(dir_path))
+    except OSError:
+        return False
+    if name + ".part" in names:
+        return True
+    base, ext = os.path.splitext(name)
+    m = re.search(r"\.f\d{1,4}(?:-\d+)?$", base, re.IGNORECASE)
+    if not m:
+        return False
+    final_name = base[:m.start()] + ext
+    if final_name in names or final_name + ".part" in names:
+        return True
+    final_prefix = base[:m.start()] + "."
+    low_name = name.lower()
+    for other in names:
+        if other.lower() == low_name:
+            continue
+        other_ext = os.path.splitext(other)[1].lower()
+        if other_ext in MEDIA_EXTS_TUPLE and other.startswith(final_prefix):
+            return True
+    return False
+
+
+def is_partial_artifact(name: str,
+                        dir_path: str | os.PathLike | None = None) -> bool:
     """True if `name` looks like a yt-dlp / ffmpeg temp / partial file.
 
     Matches the rule already used in temp_cleanup.is_partial_file but
@@ -72,11 +108,11 @@ def is_partial_artifact(name: str) -> bool:
     if "_temp_compress" in low:
         return True
     if _PARTIAL_FRAG_RE.search(name):
-        return True
+        return _has_partial_fragment_evidence(name, dir_path)
     base, ext = os.path.splitext(name)
     if ext.lower() in (".webm", ".m4a", ".mp4") and re.search(
             r"\.f\d{1,4}(?:-\d+)?$", base):
-        return True
+        return _has_partial_fragment_evidence(name, dir_path)
     return False
 
 
@@ -114,6 +150,6 @@ def walk_channel_videos(folder: str | os.PathLike,
     """
     use_exts = frozenset(exts) if exts is not None else VIDEO_EXTS_EXTENDED
     for p in walk_channel_files(folder, use_exts):
-        if skip_partial and is_partial_artifact(p.name):
+        if skip_partial and is_partial_artifact(p.name, p.parent):
             continue
         yield p

@@ -17,6 +17,35 @@
     return undefined;
   }
 
+  async function _refreshRecentRows() {
+    const rows = await bridgeCall("get_recent_downloads");
+    if (rows && typeof window.renderRecentTable === "function") {
+      window.renderRecentTable(rows);
+    }
+  }
+
+  function _rowIdentity(row) {
+    return {
+      title: row?.dataset?.title
+        || (row?.querySelector(".col-title")?.textContent || "").trim(),
+      channel: row?.dataset?.channel
+        || (row?.querySelector(".col-channel")?.textContent || "").trim(),
+      filepath: row?.dataset?.filepath || "",
+      video_id: row?.dataset?.videoId || "",
+    };
+  }
+
+  async function _deleteRecent(identity) {
+    const res = await bridgeCall("recent_delete_file", identity);
+    if (!res?.ok) {
+      return { ok: false, error: res?.error || "Delete failed." };
+    }
+    if (res.warning) {
+      window._showToast?.(res.warning, "warn");
+    }
+    return { ok: true, warning: res.warning || "" };
+  }
+
   // ─── Recent tab context menu (matches _recent_ctx_menu at line 33174) ─
   function initRecentContextMenu() {
     const tbody = document.getElementById("recent-table-body");
@@ -77,21 +106,33 @@
     tbody.addEventListener("keydown", async (e) => {
       const selected = tbody.querySelector("tr.row-selected");
       if (!selected) return;
-      const title = (selected.querySelector(".col-title")?.textContent || "").trim();
-      const channel = (selected.querySelector(".col-channel")?.textContent || "").trim();
-      if (e.key === "Delete") {
+      const identity = _rowIdentity(selected);
+      const title = identity.title;
+      if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+        e.preventDefault();
+        const r = selected.getBoundingClientRect();
+        selected.dispatchEvent(new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          clientX: Math.min(window.innerWidth - 8, r.left + 24),
+          clientY: Math.min(window.innerHeight - 8, r.top + Math.min(28, r.height || 28)),
+        }));
+      } else if (e.key === "Delete") {
         e.preventDefault();
         const ok = await askDanger("Delete file",
           `Permanently delete "${title}" from disk?\n\nThis cannot be undone.`,
           "Delete");
         if (!ok) return;
         try {
-          await bridgeCall("recent_delete_file", title, channel);
-          const rows = await bridgeCall("get_recent_downloads");
-          if (rows && typeof window.renderRecentTable === "function") {
-            window.renderRecentTable(rows);
+          const res = await _deleteRecent(identity);
+          if (!res.ok) {
+            window._showToast?.(res.error, "error");
+            return;
           }
-        } catch {}
+          await _refreshRecentRows();
+        } catch (err) {
+          window._showToast?.(`Delete failed: ${err}`, "error");
+        }
       } else if (e.key === "Enter") {
         e.preventDefault();
         const fp = selected.dataset?.filepath || "";
@@ -125,8 +166,9 @@
       // or trailing whitespace in the rendered row don't leak into
       // the title/channel lookup. Exact-match on the backend side
       // would silently fail for rows with any prefix/suffix decor.
-      const title = (tr.querySelector(".col-title")?.textContent || "").trim();
-      const channel = (tr.querySelector(".col-channel")?.textContent || "").trim();
+      const identity = _rowIdentity(tr);
+      const title = identity.title;
+      const channel = identity.channel;
       const items = n > 1 ? [
         { label: `Delete ${n} files`, cls: "dim",
           action: async () => {
@@ -138,19 +180,31 @@
             // await each call instead of fire-and-forget, then
             // refresh the table so deleted rows disappear immediately
             // instead of lingering until tab switch.
+            let deleted = 0;
+            let failed = 0;
+            let firstError = "";
             for (const row of selected) {
-              const t = row.querySelector(".col-title")?.textContent;
-              const c = row.querySelector(".col-channel")?.textContent;
+              const rowIdentity = _rowIdentity(row);
               try {
-                await bridgeCall("recent_delete_file", t, c);
-              } catch {}
+                const res = await _deleteRecent(rowIdentity);
+                if (res.ok) deleted += 1;
+                else {
+                  failed += 1;
+                  firstError ||= res.error || "Delete failed.";
+                }
+              } catch (err) {
+                failed += 1;
+                firstError ||= String(err);
+              }
             }
             try {
-              const rows = await bridgeCall("get_recent_downloads");
-              if (rows && typeof window.renderRecentTable === "function") {
-                window.renderRecentTable(rows);
-              }
+              await _refreshRecentRows();
             } catch {}
+            if (failed) {
+              window._showToast?.(`Deleted ${deleted}, failed ${failed}: ${firstError}`, "warn");
+            } else {
+              window._showToast?.(`Deleted ${deleted} file${deleted === 1 ? "" : "s"}.`, "ok");
+            }
           }},
       ] : [
         // "Play video" opens the Browse Watch view (embedded HTML5 <video>
@@ -160,7 +214,7 @@
           // to the shared Watch-view opener used by the Browse grid.
           let fp = "", vid = "";
           try {
-            const res = await bridgeCall("recent_resolve", title, channel);
+            const res = await bridgeCall("recent_resolve", identity);
             if (res?.ok) { fp = res.filepath || ""; vid = res.video_id || ""; }
           } catch {}
           if (!fp) {
@@ -171,16 +225,16 @@
             title, channel, filepath: fp, video_id: vid,
           });
         }},
-        { label: "Play in external player", action: () => bridgeCall("recent_play", title, channel) },
-        { label: "Show in Explorer", action: () => bridgeCall("recent_show_in_explorer", title, channel) },
-        { label: "Open video on YouTube", action: () => bridgeCall("recent_open_youtube", title, channel) },
+        { label: "Play in external player", action: () => bridgeCall("recent_play", identity) },
+        { label: "Show in Explorer", action: () => bridgeCall("recent_show_in_explorer", identity) },
+        { label: "Open video on YouTube", action: () => bridgeCall("recent_open_youtube", identity) },
         { sep: true },
         // Re-queue download — fetches this video's URL from recent_downloads
         // and re-drives the single-video flow. Mirrors OLD's Recent menu
         // item (YTArchiver.py:33174 + friends).
         { label: "Re-queue download",
           action: async () => {
-            const r = await bridgeCall("recent_requeue", title, channel);
+            const r = await bridgeCall("recent_requeue", identity);
             if (r?.ok) {
               window._showToast?.("Re-queued download.", "ok");
             } else {
@@ -196,12 +250,16 @@
             // refresh Recent after delete so the row
             // disappears instantly instead of needing a tab switch.
             try {
-              await bridgeCall("recent_delete_file", title, channel);
-              const rows = await bridgeCall("get_recent_downloads");
-              if (rows && typeof window.renderRecentTable === "function") {
-                window.renderRecentTable(rows);
+              const res = await _deleteRecent(identity);
+              if (!res.ok) {
+                window._showToast?.(res.error, "error");
+                return;
               }
-            } catch {}
+              await _refreshRecentRows();
+              window._showToast?.("File deleted.", "ok");
+            } catch (err) {
+              window._showToast?.(`Delete failed: ${err}`, "error");
+            }
           }},
       ];
       showContextMenu(e.clientX, e.clientY, items);

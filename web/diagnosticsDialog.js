@@ -73,17 +73,15 @@
       }
     }
 
-    const show = () => { bd.style.display = "flex"; run(); };
-    const hide = () => { bd.style.display = "none"; };
+    const show = () => { bd.hidden = false; run(); };
+    const hide = () => { bd.hidden = true; };
     openBtn?.addEventListener("click", show);
     closeBtn?.addEventListener("click", hide);
     refreshBtn?.addEventListener("click", run);
     bd.addEventListener("click", (e) => { if (e.target === bd) hide(); });
     // BUG FIX 2026-05-15 (audit): Esc was a no-op on this dialog. Wire
     // it through to match the rest of the modal system.
-    document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && bd.style.display !== "none") hide();
-    });
+    window.YT?.modals?.registerEscapeClose?.(bd, hide);
   }
 
   window.initDiagnosticsDialog = initDiagnosticsDialog;

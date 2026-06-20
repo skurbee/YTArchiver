@@ -24,6 +24,16 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
+  function _withTimeout(promise, ms, message) {
+    let timer = null;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => {
+      if (timer !== null) clearTimeout(timer);
+    });
+  }
+
   const askConfirm = window.askConfirm;
 
   function initCompressDryRunDialog() {
@@ -120,7 +130,7 @@
       // compressDryRunDialog H242).
       let _computeInFlight = false;
       const _open = async () => {
-        bd.style.display = "flex";
+        bd.hidden = false;
         body.innerHTML = `<div class="browse-empty" style="padding:16px;">Computing…</div>`;
         if (summary) summary.textContent = "";
         _computeInFlight = true;
@@ -129,7 +139,11 @@
             _render({ ok: false, error: "Native mode required." });
             return;
           }
-          const res = await bridgeCall("compress_dry_run", resSel?.value || "720");
+          const res = await _withTimeout(
+            bridgeCall("compress_dry_run", resSel?.value || "720"),
+            5 * 60 * 1000,
+            "Timed out computing projections."
+          );
           _render(res);
         } catch (e) {
           _render({ ok: false, error: String(e) });
@@ -139,7 +153,7 @@
       };
       btn.addEventListener("click", _open);
       recalcBtn?.addEventListener("click", _open);
-      const _close = () => { bd.style.display = "none"; };
+      const _close = () => { bd.hidden = true; };
       closeBtn?.addEventListener("click", _close);
       bd.addEventListener("click", (e) => {
         if (e.target === bd && !_computeInFlight) _close();
@@ -147,12 +161,8 @@
       // BUG FIX 2026-05-15 (audit): Esc was a no-op on this dialog —
       // every other modal in the app dismisses on Esc but dry-run
       // didn't. Wire global keydown to close when the dialog is open.
-      document.addEventListener("keydown", (e) => {
-        // Honor the same in-flight guard the backdrop click uses, so
-        // Esc can't dismiss the dialog mid-compute and leave the
-        // result rendering into a hidden element (audit: L3).
-        if (e.key === "Escape" && bd.style.display !== "none"
-            && !_computeInFlight) _close();
+      window.YT?.modals?.registerEscapeClose?.(bd, () => {
+        if (!_computeInFlight) _close();
       });
   }
 

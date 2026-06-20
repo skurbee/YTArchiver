@@ -60,6 +60,11 @@
     const grid = document.getElementById("channel-grid");
     if (!grid) return;
     grid.innerHTML = "";
+    channels = Array.isArray(channels) ? channels : [];
+    if (!channels.length) {
+      grid.innerHTML = '<div class="browse-empty">No channels yet. Add one on the <b>Subs</b> tab to start archiving.</div>';
+      return;
+    }
     const frag = document.createDocumentFragment();
     for (const c of channels) {
       const name = c.folder || c.name || "";
@@ -74,6 +79,9 @@
 
       const card = document.createElement("div");
       card.className = "channel-card";
+      card.setAttribute("role", "button");
+      card.tabIndex = 0;
+      card.setAttribute("aria-label", `Open channel ${name || "Untitled"}`);
       if (!bannerSrc) {
         // Pure-gradient fallback gets the tinted bg directly.
         card.style.background = gradientFor(name);
@@ -140,6 +148,12 @@
       }
 
       card.addEventListener("click", () => onChannelClick && onChannelClick(c));
+      card.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          card.click();
+        }
+      });
       frag.appendChild(card);
     }
     grid.appendChild(frag);
@@ -228,6 +242,12 @@
   function _buildVideoCard(v, onVideoClick) {
     const card = document.createElement("div");
     card.className = "video-card";
+    card.setAttribute("role", "button");
+    card.tabIndex = 0;
+    const labelBits = [v.title || "Untitled video"];
+    if (v.channel) labelBits.push(v.channel);
+    if (v.uploaded) labelBits.push(v.uploaded);
+    card.setAttribute("aria-label", labelBits.join(", "));
     // Flag visually + via data attr so CSS can fade the card, add a
     // strikethrough on the title, and overlay a corner badge.
     if (v.removed_from_yt) {
@@ -325,6 +345,12 @@
         if (onVideoClick) onVideoClick(v);
       }, 220);
     });
+    card.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        card.click();
+      }
+    });
 
     // (Hover-enlarge preview removed in v49.7 — intrusive on a dense
     // grid; covered the adjacent cards and interrupted normal browsing
@@ -358,6 +384,7 @@
   window.renderVideoGrid = function (videos, onVideoClick, opts) {
     const grid = document.getElementById("video-grid");
     if (!grid) return;
+    _unobserveGridSentinel(grid);
     grid.innerHTML = "";
     const groupByYear = !!(opts && opts.groupByYear);
     // `groupByMonth` only makes sense nested inside `groupByYear`;
@@ -388,11 +415,7 @@
         // sentinel. Explicitly unobserve before remove so the shared
         // IntersectionObserver doesn't hold a dead-DOM reference
         // until GC (audit: browseGrids.js H162, H163).
-        const oldSentinel = grid.querySelector(".video-grid-sentinel");
-        if (oldSentinel) {
-          try { _gridIO?.unobserve?.(oldSentinel); } catch {}
-          oldSentinel.remove();
-        }
+        _unobserveGridSentinel(grid);
         grid.appendChild(frag);
         cursor = end;
         if (cursor < videos.length) {
@@ -569,6 +592,13 @@
   // Shared IntersectionObserver so big channels don't make thousands of them.
   let _gridIO = null;
   const _gridSentinelCallbacks = new WeakMap();
+  function _unobserveGridSentinel(grid) {
+    const oldSentinel = grid?.querySelector?.(".video-grid-sentinel");
+    if (!oldSentinel) return;
+    try { _gridIO?.unobserve?.(oldSentinel); } catch {}
+    try { _gridSentinelCallbacks.delete(oldSentinel); } catch {}
+    try { oldSentinel.remove(); } catch {}
+  }
   function _observeGridSentinel(sentinel, cb) {
     if (!_gridIO) {
       _gridIO = new IntersectionObserver((entries) => {

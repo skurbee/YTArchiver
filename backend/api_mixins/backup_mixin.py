@@ -11,6 +11,107 @@ from __future__ import annotations
 from ._shared import *  # noqa: F401,F403
 
 
+_BACKUP_MANIFEST_NAME = "ytarchiver_backup_manifest.json"
+
+
+def _backup_file_entries():
+    from backend.ytarchiver_config import (
+        APP_DATA_DIR,
+        CHANNEL_ID_CACHE,
+        CONFIG_FILE,
+        DISK_CACHE_FILE,
+        QUEUE_FILE,
+        SEEN_FILTER_TITLES,
+    )
+    return (
+        (CONFIG_FILE.name, CONFIG_FILE),
+        (QUEUE_FILE.name, QUEUE_FILE),
+        (DISK_CACHE_FILE.name, DISK_CACHE_FILE),
+        (SEEN_FILTER_TITLES.name, SEEN_FILTER_TITLES),
+        (CHANNEL_ID_CACHE.name, CHANNEL_ID_CACHE),
+        ("ytarchiver_livestream_defer.json",
+         APP_DATA_DIR / "ytarchiver_livestream_defer.json"),
+        ("ytarchiver_pending_transcribe.json",
+         APP_DATA_DIR / "ytarchiver_pending_transcribe.json"),
+    )
+
+
+def _allowed_backup_top_names() -> set[str]:
+    from backend.ytarchiver_config import TRANSCRIPTION_DB
+    return {name for name, _path in _backup_file_entries()} | {
+        _BACKUP_MANIFEST_NAME,
+        TRANSCRIPTION_DB.name,
+    }
+
+
+_CHANNEL_IMPORT_MAX = 10000
+_CHANNEL_IMPORT_STRING_LIMITS = {
+    "name": 200,
+    "folder": 200,
+    "url": 500,
+    "resolution": 32,
+    "mode": 32,
+    "from_date": 32,
+    "date_after": 32,
+    "compress_level": 64,
+    "compress_output_res": 32,
+    "output_dir": 500,
+}
+_CHANNEL_IMPORT_ALLOWED_KEYS = frozenset(_CHANNEL_IMPORT_STRING_LIMITS) | {
+    "min_duration",
+    "max_duration",
+    "split_years",
+    "split_months",
+    "auto_transcribe",
+    "auto_metadata",
+    "compress_enabled",
+    "compress_batch_size",
+}
+_CHANNEL_IMPORT_BOOL_KEYS = {
+    "split_years",
+    "split_months",
+    "auto_transcribe",
+    "auto_metadata",
+    "compress_enabled",
+}
+_CHANNEL_IMPORT_INT_KEYS = {
+    "min_duration",
+    "max_duration",
+    "compress_batch_size",
+}
+
+
+def _clean_import_channel(ch: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    raw_url = str(ch.get("url") or "").strip()
+    ok, err = subs_backend.validate_channel_url(raw_url)
+    if not ok:
+        return None, err
+    clean: dict[str, Any] = {
+        "url": subs_backend.normalize_channel_url(raw_url),
+    }
+    for key in _CHANNEL_IMPORT_ALLOWED_KEYS:
+        if key == "url" or key not in ch:
+            continue
+        val = ch.get(key)
+        if key in _CHANNEL_IMPORT_STRING_LIMITS:
+            clean[key] = str(val or "").strip()[
+                :_CHANNEL_IMPORT_STRING_LIMITS[key]]
+        elif key in _CHANNEL_IMPORT_BOOL_KEYS:
+            clean[key] = bool(val)
+        elif key in _CHANNEL_IMPORT_INT_KEYS:
+            try:
+                clean[key] = max(0, int(val))
+            except (TypeError, ValueError):
+                continue
+    if not (clean.get("name") or clean.get("folder")):
+        return None, "missing channel name/folder"
+    if not clean.get("name"):
+        clean["name"] = clean.get("folder", "")
+    if not clean.get("folder"):
+        clean["folder"] = clean.get("name", "")
+    return clean, ""
+
+
 class BackupMixin:
 
     # ─── Channel list export / import ──────────────────────────────────
@@ -27,20 +128,9 @@ class BackupMixin:
                 _wv.SAVE_DIALOG, save_filename="ytarchiver_channels.json",
                 file_types=("JSON (*.json)",),
             )
-            if not paths:
+            path = normalize_dialog_paths(paths)
+            if not path:
                 return {"ok": False, "cancelled": True}
-            # Some pywebview versions return () on cancel, others None,
-            # others a single str, others a tuple. Guard against
-            # empty-sequence indexing (audit: backup_mixin.py:32).
-            if isinstance(paths, str):
-                path = paths
-            else:
-                try:
-                    if not len(paths):
-                        return {"ok": False, "cancelled": True}
-                    path = paths[0]
-                except (TypeError, IndexError):
-                    return {"ok": False, "cancelled": True}
             with open(path, "w", encoding="utf-8") as f:
                 _json.dump({
                     "exported_from": "YTArchiver",
@@ -62,29 +152,25 @@ class BackupMixin:
                 _wv.OPEN_DIALOG, allow_multiple=False,
                 file_types=("JSON (*.json)", "All files (*.*)"),
             )
-            if not paths:
+            path = normalize_dialog_paths(paths)
+            if not path:
                 return {"ok": False, "cancelled": True}
-            # Some pywebview versions return () on cancel, others None,
-            # others a single str, others a tuple. Guard against
-            # empty-sequence indexing (audit: backup_mixin.py:32).
-            if isinstance(paths, str):
-                path = paths
-            else:
-                try:
-                    if not len(paths):
-                        return {"ok": False, "cancelled": True}
-                    path = paths[0]
-                except (TypeError, IndexError):
-                    return {"ok": False, "cancelled": True}
             with open(path, "r", encoding="utf-8") as f:
                 data = _json.load(f)
             imported = data.get("channels", []) if isinstance(data, dict) else data
             if not isinstance(imported, list):
                 return {"ok": False, "error": "Not a channel list"}
+            if len(imported) > _CHANNEL_IMPORT_MAX:
+                return {"ok": False,
+                        "error": (f"Channel import too large "
+                                  f"({len(imported)} > {_CHANNEL_IMPORT_MAX})")}
             if not config_is_writable():
                 return {"ok": False, "error": "Write-gate off"}
             cfg = load_config()
-            existing_urls = {c.get("url") for c in cfg.get("channels", [])}
+            existing_urls = {
+                subs_backend.normalize_channel_url(c.get("url", ""))
+                for c in cfg.get("channels", [])
+            }
             added = 0
             # track WHY each entry was skipped so the UI can
             # tell the user (previously just reported a raw count with
@@ -103,27 +189,21 @@ class BackupMixin:
                         "reason": "missing URL",
                     })
                     continue
-                if ch["url"] in existing_urls:
+                clean_ch, clean_err = _clean_import_channel(ch)
+                if not clean_ch:
                     skipped_reasons.append({
-                        "name": ch.get("name") or ch["url"],
+                        "name": ch.get("name") or ch.get("url") or "(unknown)",
+                        "reason": clean_err or "invalid channel",
+                    })
+                    continue
+                if clean_ch["url"] in existing_urls:
+                    skipped_reasons.append({
+                        "name": clean_ch.get("name") or clean_ch["url"],
                         "reason": "already subscribed",
                     })
                     continue
-                # validate URL shape before adding. Old
-                # code accepted any non-empty ch["url"] so a corrupted
-                # import file with "not-a-url" values landed channels
-                # that failed at sync time with cryptic yt-dlp errors.
-                # Checking here surfaces the problem at import time
-                # when the user can act on it.
-                _u = str(ch.get("url") or "").strip().lower()
-                if not (("youtube.com/" in _u) or ("youtu.be/" in _u)):
-                    skipped_reasons.append({
-                        "name": ch.get("name") or ch["url"],
-                        "reason": "URL doesn't look like a YouTube link",
-                    })
-                    continue
-                cfg.setdefault("channels", []).append(ch)
-                existing_urls.add(ch["url"])
+                cfg.setdefault("channels", []).append(clean_ch)
+                existing_urls.add(clean_ch["url"])
                 added += 1
             cfg["channels"].sort(key=lambda c: (c.get("name") or "").lower())
             from backend.ytarchiver_config import save_config as _sc
@@ -161,32 +241,20 @@ class BackupMixin:
 
             from backend.ytarchiver_config import (
                 APP_DATA_DIR,
-                CHANNEL_ID_CACHE,
-                CONFIG_FILE,
-                DISK_CACHE_FILE,
-                QUEUE_FILE,
-                SEEN_FILTER_TITLES,
                 TRANSCRIPTION_DB,
             )
-            candidates = [
-                CONFIG_FILE,
-                QUEUE_FILE,
-                DISK_CACHE_FILE,
-                SEEN_FILTER_TITLES,
-                CHANNEL_ID_CACHE,
-                APP_DATA_DIR / "ytarchiver_livestream_defer.json",
-                APP_DATA_DIR / "ytarchiver_pending_transcribe.json",
-            ]
             # opt-in include of the FTS DB if it fits. NOTE: the DB is
-            # NOT appended to `candidates` — it gets a safe sqlite3
+            # NOT appended to `_backup_file_entries()` — it gets a safe sqlite3
             # backup-API snapshot below instead of a raw file copy
             # (raw copy of a live WAL-mode DB misses every transaction
             # still in the -wal and can tear mid-read).
             _fts_skipped_reason = ""
+            _fts_size = 0
             _include_fts = False
             try:
                 if TRANSCRIPTION_DB.exists():
                     _fts_sz = TRANSCRIPTION_DB.stat().st_size
+                    _fts_size = int(_fts_sz)
                     if _fts_sz < 2 * 1024 * 1024 * 1024:
                         _include_fts = True
                     else:
@@ -209,9 +277,9 @@ class BackupMixin:
                 # round-trip mismatch.
                 file_types=("Backup ZIP (*.zip)", "All files (*.*)"),
             )
-            if not paths:
+            out_path = normalize_dialog_paths(paths)
+            if not out_path:
                 return {"ok": False, "cancelled": True}
-            out_path = paths if isinstance(paths, str) else paths[0]
             n = 0
             # Write to a .tmp file then os.replace into the final
             # path. A crash / power loss / disk full mid-zip
@@ -222,9 +290,9 @@ class BackupMixin:
             tmp_path = out_path + ".tmp"
             try:
                 with _zf.ZipFile(tmp_path, "w", _zf.ZIP_DEFLATED) as zf:
-                    for p in candidates:
+                    for arcname, p in _backup_file_entries():
                         if p.exists():
-                            zf.write(str(p), arcname=p.name)
+                            zf.write(str(p), arcname=arcname)
                             n += 1
                     if _include_fts:
                         # Consistent point-in-time snapshot of the live
@@ -255,6 +323,14 @@ class BackupMixin:
                         finally:
                             try: os.remove(_snap)
                             except OSError: pass
+                    zf.writestr(_BACKUP_MANIFEST_NAME, json.dumps({
+                        "app": "YTArchiver",
+                        "backup_type": "app-state",
+                        "fts_db_included": bool(_include_fts),
+                        "fts_db_size": _fts_size,
+                        "fts_skipped_reason": _fts_skipped_reason,
+                    }, indent=2, sort_keys=True))
+                    n += 1
                     backup_dir = APP_DATA_DIR / "backups"
                     if backup_dir.is_dir():
                         snaps = sorted(backup_dir.glob("config_*.json"),
@@ -299,13 +375,20 @@ class BackupMixin:
                 allow_multiple=False,
                 file_types=("Backup ZIP (*.zip)", "All files (*.*)"),
             )
-            if not paths:
+            zip_path = normalize_dialog_paths(paths)
+            if not zip_path:
                 return {"ok": False, "cancelled": True}
-            zip_path = paths if isinstance(paths, str) else paths[0]
             try:
                 with _zf.ZipFile(zip_path, "r") as zf:
                     items = []
                     total_bytes = 0
+                    manifest = {}
+                    try:
+                        if _BACKUP_MANIFEST_NAME in zf.namelist():
+                            manifest = json.loads(
+                                zf.read(_BACKUP_MANIFEST_NAME).decode("utf-8"))
+                    except Exception:
+                        manifest = {}
                     for info in zf.infolist():
                         if info.is_dir():
                             continue
@@ -342,6 +425,8 @@ class BackupMixin:
                 "ok": True,
                 "zip_path": zip_path,
                 "items": items,
+                "manifest": manifest,
+                "fts_skipped": manifest.get("fts_skipped_reason", ""),
                 "total_bytes": total_bytes,
                 "total_label": self._fmt_bytes_short(total_bytes),
                 "snapshot_target": str(APP_DATA_DIR / "backups" /
@@ -393,9 +478,9 @@ class BackupMixin:
                     allow_multiple=False,
                     file_types=("Backup ZIP (*.zip)", "All files (*.*)"),
                 )
-                if not paths:
+                zip_path = normalize_dialog_paths(paths)
+                if not zip_path:
                     return {"ok": False, "cancelled": True}
-                zip_path = paths if isinstance(paths, str) else paths[0]
 
             # First pass: list contents (read-only; safe even if gated off).
             try:
@@ -409,16 +494,7 @@ class BackupMixin:
             # Whitelist — only restore files we recognise from export.
             # also allow the FTS index DB so backups that
             # include it can restore cleanly.
-            allowed_top = {
-                "ytarchiver_config.json",
-                "ytarchiver_queue.json",
-                "ytarchiver_disk_cache.json",
-                "ytarchiver_seen_filters.txt",
-                "ytarchiver_channel_id_cache.json",
-                "ytarchiver_livestream_defer.json",
-                "ytarchiver_pending_transcribe.json",
-                "transcription_index.db",
-            }
+            allowed_top = _allowed_backup_top_names()
 
             if not config_is_writable():
                 return {

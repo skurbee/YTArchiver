@@ -11,6 +11,10 @@ import json
 from collections.abc import Callable
 from typing import Any
 
+from ..log import get_logger
+
+_log = get_logger(__name__)
+
 
 class BridgeEventBus:
     """Best-effort event emitter for the pywebview window."""
@@ -23,11 +27,19 @@ class BridgeEventBus:
         return json.dumps(value, ensure_ascii=False).replace("</", "<\\/")
 
     def evaluate(self, script: str) -> bool:
-        window = self._window_getter()
+        try:
+            window = self._window_getter()
+        except Exception as e:
+            _log.debug("window getter failed for bridge event: %s", e)
+            return False
         if window is None:
             return False
-        window.evaluate_js(script)
-        return True
+        try:
+            window.evaluate_js(script)
+            return True
+        except Exception as e:
+            _log.debug("evaluate_js failed for bridge event: %s", e)
+            return False
 
     def call(self, function_name: str, *args: Any) -> bool:
         argv = ", ".join(self.js_value(arg) for arg in args)

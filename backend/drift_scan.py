@@ -199,16 +199,14 @@ def _channel_folder(channel: dict[str, Any], output_dir: str) -> str | None:
     resolution used elsewhere (folder_override → name → sanitized)."""
     if not output_dir:
         return None
-    name = (channel.get("folder")
-            or channel.get("folder_override")
-            or channel.get("name")
-            or "").strip()
+    from . import sync as _sync
+    name = _sync.channel_folder_name(channel)
     if not name:
         return None
     return os.path.join(output_dir, name)
 
 
-def _count_fts_phantoms() -> int:
+def _count_fts_phantoms() -> int | None:
     """Global phantom count: FTS5 rowids with no matching segments row.
 
     Returns 0 if the DB is missing or the query fails. This is a global
@@ -220,7 +218,8 @@ def _count_fts_phantoms() -> int:
         from . import index as _idx
         conn = _idx._reader_open()
         if conn is None:
-            return 0
+            _log.warning("FTS phantom count unavailable: index reader not open")
+            return None
         # Reader path — COUNT comparison can run in parallel with any
         # writer (sweep, ingest). Drift Scan is a diagnostic, so making
         # it block was extra painful.
@@ -238,8 +237,9 @@ def _count_fts_phantoms() -> int:
                 "WHERE s.id IS NULL"
             ).fetchone()
         return int(row[0]) if row else 0
-    except Exception:
-        return 0
+    except Exception as e:
+        _log.warning("FTS phantom count failed; index may be locked/corrupt: %s", e)
+        return None
 
 
 def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
@@ -354,6 +354,8 @@ def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
         "txt_without_jsonl": txt_without_jsonl,
         "jsonl_without_txt": jsonl_without_txt,
         "fts_phantoms": fts_phantoms,
+        "fts_phantoms_error": (
+            "unavailable" if fts_phantoms is None else ""),
         "totals": {"txt_titles": txt_titles_distinct,
                    "jsonl_titles": jsonl_titles_distinct},
     }
@@ -426,7 +428,19 @@ def _rebuild_txt_from_jsonl_entries(jsonl_path: str,
              "duration_s": approx_seconds}}
     Titles not found in the file are omitted. Other titles in the file
     are ignored."""
-    want = dict.fromkeys(titles_to_recover or [], True)
+    want: dict[str, str] = {}
+    for raw_title in titles_to_recover or []:
+        requested = (raw_title or "").strip()
+        if not requested:
+            continue
+        candidates = [requested]
+        stripped_id = _ID_BRACKET_RE.sub("", requested).strip()
+        if stripped_id and stripped_id != requested:
+            candidates.append(stripped_id)
+        for cand in candidates:
+            key = _norm_title(cand)
+            if key and key not in want:
+                want[key] = requested
     buckets: dict[str, dict[str, Any]] = {}
     try:
         with open(jsonl_path, "r", encoding="utf-8") as fh:
@@ -439,13 +453,19 @@ def _rebuild_txt_from_jsonl_entries(jsonl_path: str,
                 except Exception:
                     continue
                 t = (obj.get("title") or "").strip()
-                if not t or t not in want:
+                if not t:
+                    continue
+                match_title = want.get(_norm_title(t))
+                if not match_title:
+                    stripped_t = _ID_BRACKET_RE.sub("", t).strip()
+                    match_title = want.get(_norm_title(stripped_t))
+                if not match_title:
                     continue
                 seg_text = (obj.get("text") or "").strip()
                 seg_end = float(obj.get("end") or obj.get("e") or 0)
                 vid = (obj.get("video_id") or "").strip()
-                b = buckets.setdefault(t, {"parts": [], "end": 0.0,
-                                           "video_id": vid})
+                b = buckets.setdefault(match_title, {"parts": [], "end": 0.0,
+                                                     "video_id": vid})
                 if seg_text:
                     b["parts"].append(seg_text)
                 if seg_end > b["end"]:
@@ -469,6 +489,82 @@ def _fmt_duration_hms(secs: float) -> str:
     h = total // 3600
     m = (total % 3600) // 60
     return f"{h}:{m:02d}"
+
+
+def _date_from_epoch(ts: Any) -> str:
+    try:
+        val = float(ts or 0)
+    except (TypeError, ValueError):
+        return ""
+    if val <= 0:
+        return ""
+    try:
+        return time.strftime("%m.%d.%Y", time.localtime(val))
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def _file_mtime_date(path: str) -> str:
+    try:
+        return _date_from_epoch(os.path.getmtime(path))
+    except OSError:
+        return ""
+
+
+def _recovered_upload_date(channel_name: str, title: str,
+                           video_id: str = "") -> str:
+    """Best-effort real upload date for a JSONL-to-TXT recovery.
+
+    Prefer videos.upload_ts, then the archived video's file mtime. The
+    aggregate JSONL mtime is deliberately not consulted here because it
+    changes whenever any video in the channel is appended.
+    """
+    if not channel_name:
+        return ""
+    title_key = _norm_title(title)
+    plain_key = _norm_title(_ID_BRACKET_RE.sub("", title or "").strip())
+    try:
+        from . import index as _idx
+        conn = _idx._reader_open()
+        if conn is None:
+            return ""
+        with _idx._reader_lock:
+            if video_id:
+                row = conn.execute(
+                    "SELECT upload_ts, filepath FROM videos "
+                    "WHERE channel=? COLLATE NOCASE "
+                    "AND video_id=? "
+                    "AND is_duplicate_of IS NULL "
+                    "ORDER BY (upload_ts IS NULL) ASC, id ASC LIMIT 1",
+                    (channel_name, video_id)).fetchone()
+                if row:
+                    date = _date_from_epoch(row[0])
+                    if date:
+                        return date
+                    date = _file_mtime_date(row[1] or "")
+                    if date:
+                        return date
+            rows = conn.execute(
+                "SELECT title, upload_ts, filepath FROM videos "
+                "WHERE channel=? COLLATE NOCASE "
+                "AND filepath IS NOT NULL AND filepath != '' "
+                "AND is_duplicate_of IS NULL",
+                (channel_name,)).fetchall()
+        for db_title, upload_ts, fp in rows:
+            db_key = _norm_title(db_title or "")
+            db_plain = _norm_title(_ID_BRACKET_RE.sub("", db_title or "").strip())
+            if db_key not in {title_key, plain_key} and db_plain not in {
+                    title_key, plain_key}:
+                continue
+            date = _date_from_epoch(upload_ts)
+            if date:
+                return date
+            date = _file_mtime_date(fp or "")
+            if date:
+                return date
+    except Exception as e:
+        _log.debug("recovered upload date lookup failed: %s", e)
+    return ""
 
 
 def apply_channel(channel: dict[str, Any], output_dir: str,
@@ -540,15 +636,14 @@ def apply_channel(channel: dict[str, Any], output_dir: str,
         if base.endswith(".jsonl"):
             base = base[:-6] + ".txt"
         txt_path = os.path.join(os.path.dirname(jsonl_path), base)
-        # Use the .jsonl file's mtime as best-effort date approximation.
-        try:
-            mt = os.path.getmtime(jsonl_path)
-            ts_struct = time.localtime(mt)
-            date_str = time.strftime("%m.%d.%Y", ts_struct)
-        except Exception:
-            date_str = "00.00.0000"
         for title, data in rebuilt.items():
             src_tag = "RECOVERED-FROM-JSONL"
+            date_str = (
+                _recovered_upload_date(
+                    channel.get("name", ""), title, data.get("video_id", ""))
+                or _file_mtime_date(jsonl_path)
+                or ""
+            )
             dur_str = _fmt_duration_hms(float(data.get("duration_s") or 0))
             # Header time column historically held H:MM duration; we
             # reuse the same field for consistency with other entries.
@@ -583,7 +678,7 @@ def apply_channel(channel: dict[str, Any], output_dir: str,
                 details["retranscribe_skipped_titles"].append(title)
 
     # ─── Fix C: FTS phantoms → rebuild ─────────────────────────────────
-    if scan_result.get("fts_phantoms", 0) > 0 and rebuild_fts_fn is not None:
+    if (scan_result.get("fts_phantoms") or 0) > 0 and rebuild_fts_fn is not None:
         try:
             rebuild_fts_fn()
             actions["fts_rebuilt"] = True
@@ -639,7 +734,8 @@ def _lookup_video_filepaths(channel_name: str,
                 if pkey in db_map:
                     out[pkey] = db_map[pkey]
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        _log.warning("video filepath lookup failed for %r: %s",
+                     channel_name, e)
     return out
 
 

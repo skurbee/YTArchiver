@@ -19,33 +19,33 @@ small boot orchestrator that calls each module's `init*` function.
 | `partials/popovers.html`, `dialogs.html`, `modals.html` | Floating overlays. |
 
 The assembler is `backend/html_assembler.py`; it runs at `main.py`
-startup and only rewrites `index.html` when a partial is newer.
+startup and only rewrites `index.html` when generated content changes.
 
 ### CSS (loaded in cascade order)
 
-| File | Purpose | Size |
-|------|---------|------|
-| `styles.css`                | `:root` design-token vars + base, header, tab row, tab panels. **Must load first.** | ~290 |
-| `styles-settings.css`       | Settings page | ~790 |
-| `styles-download-controls.css` | Download tab toolbar | ~500 |
-| `styles-logs.css`           | Activity log + main log + tag classes | ~430 |
-| `styles-tabs-data.css`      | Subs + Recent tables, queue popovers | ~780 |
-| `styles-browse.css`         | Browse tab framing + sub-modes + Index panel | ~1,090 |
-| `styles-browse-grids.css`   | Channel + Video grids | ~390 |
-| `styles-watch.css`          | Watch view + captions + metadata drawer | ~450 |
-| `styles-dialogs.css`        | Dark dialogs + toasts + redownload modal | ~460 |
+| File | Purpose |
+|------|---------|
+| `styles.css`                | `:root` design-token vars + base, header, tab row, tab panels. **Must load first.** |
+| `styles-settings.css`       | Settings page |
+| `styles-download-controls.css` | Download tab toolbar |
+| `styles-logs.css`           | Activity log + main log + tag classes |
+| `styles-tabs-data.css`      | Subs + Recent tables, queue popovers |
+| `styles-browse.css`         | Browse tab framing + sub-modes + Index panel |
+| `styles-browse-grids.css`   | Channel + Video grids |
+| `styles-watch.css`          | Watch view + captions + metadata drawer |
+| `styles-dialogs.css`        | Dark dialogs + toasts + redownload modal |
 
 ### JS — boot + rendering core
 
-| File | Purpose | Size |
-|------|---------|------|
-| `app.js`         | Tiny boot orchestrator — calls every module's `init*`. Owns the MutationObserver-cleanup pool. | ~150 |
-| `logs.js`        | Log infrastructure (`_logBatch`, scroll state, in-place row replace, mini-log mirror). | ~900 |
-| `watchView.js`   | Watch view + karaoke transcript + WebVTT captions + metadata drawer. | ~890 |
-| `browseGrids.js` | Channel grid + Video grid + `_buildVideoCard` (shared with Recent). | ~520 |
-| `tables.js`      | Subs channel table + Recent list/grid. | ~330 |
-| `queueRender.js` | Sync / GPU task popover row renderer (drag-reorder, right-click). | ~410 |
-| `metadataTab.js` | Settings → Metadata refresh-status table. | ~1,080 |
+| File | Purpose |
+|------|---------|
+| `app.js`         | Tiny boot orchestrator — calls every module's `init*`. Owns the MutationObserver-cleanup pool. |
+| `logs.js`        | Log infrastructure (`_logBatch`, scroll state, in-place row replace, mini-log mirror). |
+| `watchView.js`   | Watch view + karaoke transcript + WebVTT captions + metadata drawer. |
+| `browseGrids.js` | Channel grid + Video grid + `_buildVideoCard` (shared with Recent). |
+| `tables.js`      | Subs channel table + Recent list/grid. |
+| `queueRender.js` | Sync / GPU task popover row renderer (drag-reorder, right-click). |
+| `metadataTab.js` | Settings → Metadata refresh-status table. |
 
 ### JS — foundation (load first)
 

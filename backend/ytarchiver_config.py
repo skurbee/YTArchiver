@@ -118,6 +118,25 @@ _config_tx_lock = threading.RLock()
 # backup_config_on_start still fires the first one at launch.
 _save_counter = 0
 _BACKUP_EVERY_N_SAVES = 20
+_CFG_CACHE: dict[str, Any] = {"sig": None, "data": None}
+
+
+def _config_file_sig() -> tuple[str, int, int] | None:
+    try:
+        st = CONFIG_FILE.stat()
+        return (str(CONFIG_FILE), int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        return None
+
+
+def _cache_config(sig: tuple[str, int, int] | None,
+                  cfg: dict[str, Any] | None) -> None:
+    if sig is None or cfg is None:
+        _CFG_CACHE["sig"] = None
+        _CFG_CACHE["data"] = None
+        return
+    _CFG_CACHE["sig"] = sig
+    _CFG_CACHE["data"] = copy.deepcopy(cfg)
 
 
 def _long_path(p: str) -> str:
@@ -216,8 +235,8 @@ def append_pending_tx_id(channel_name: str, video_id: str) -> None:
 
     uses config_transaction for atomic RMW.
 
-    Silent on any error: the counter is user-visible but not
-    load-bearing, so we never raise into the sync pipeline."""
+    Logs persistence errors but never raises into the sync pipeline; the
+    counter is user-visible but not load-bearing."""
     if not channel_name or not video_id:
         return
     try:
@@ -238,7 +257,8 @@ def append_pending_tx_id(channel_name: str, video_id: str) -> None:
                 ch["transcription_complete"] = False
                 break
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        _log.warning("append_pending_tx_id save failed for %r/%r: %s",
+                     channel_name, video_id, e)
 
 
 def remove_pending_tx_id(video_id: str) -> bool:
@@ -249,7 +269,7 @@ def remove_pending_tx_id(video_id: str) -> bool:
     uses config_transaction for atomic RMW.
 
     Returns True if any list actually changed (useful for telemetry).
-    Silent on error; never raises.
+    Logs persistence errors but never raises.
     """
     if not video_id:
         return False
@@ -269,7 +289,9 @@ def remove_pending_tx_id(video_id: str) -> bool:
                         ch["transcription_complete"] = True
                     changed = True
         return changed
-    except Exception:
+    except Exception as e:
+        _log.warning("remove_pending_tx_id save failed for %r: %s",
+                     video_id, e)
         return False
 
 
@@ -279,10 +301,14 @@ def load_config() -> dict[str, Any]:
     Recovery path: if the primary file is corrupt, try the most recent
     dated snapshot in `backups/` before giving up and returning defaults.
     """
-    if not CONFIG_FILE.exists():
+    sig = _config_file_sig()
+    if sig is None:
         return copy.deepcopy(DEFAULT_CONFIG)
     try:
         with _config_lock:
+            if (_CFG_CACHE["sig"] == sig
+                    and isinstance(_CFG_CACHE["data"], dict)):
+                return copy.deepcopy(_CFG_CACHE["data"])
             with CONFIG_FILE.open("r", encoding="utf-8") as f:
                 data = json.load(f)
         merged = copy.deepcopy(DEFAULT_CONFIG)
@@ -318,7 +344,9 @@ def load_config() -> dict[str, Any]:
                         "migration save failed; will retry next launch")
             except Exception as _me:
                 _log.error("migration save exception: %s", _me)
-        return merged
+        with _config_lock:
+            _cache_config(sig, merged)
+        return copy.deepcopy(merged)
     except (json.JSONDecodeError, OSError) as e:
         _log.warning("failed to load %s: %s", CONFIG_FILE, e)
         # Attempt recovery from the most recent dated snapshot
@@ -495,6 +523,7 @@ def save_config(cfg: dict[str, Any]) -> bool:
         _log.warning("write blocked")
         return False
     try:
+        should_backup = False
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
         # audit SM-8 + UI audit 2026-05-14: trim autorun_history on
         # save so the config file can't grow unbounded across years.
@@ -574,11 +603,14 @@ def save_config(cfg: dict[str, Any]) -> bool:
                         os.close(_dfd)
                 except OSError as e:
                     _log.debug("swallowed: %s", e)
+            _cache_config(_config_file_sig(), cfg_for_write)
+            _save_counter += 1
+            if _save_counter >= _BACKUP_EVERY_N_SAVES:
+                _save_counter = 0
+                should_backup = True
         # periodic snapshot. Runs outside the lock because
         # backup_config_on_start does its own I/O. Non-fatal on failure.
-        _save_counter += 1
-        if _save_counter >= _BACKUP_EVERY_N_SAVES:
-            _save_counter = 0
+        if should_backup:
             try:
                 backup_config_on_start(keep=20)
             except Exception as e:
@@ -590,6 +622,36 @@ def save_config(cfg: dict[str, Any]) -> bool:
 
 
 # ── Helpers the UI actually needs ───────────────────────────────────────
+
+def _last_sync_epoch(value: Any) -> float | None:
+    """Best-effort parser for legacy channel last_sync values."""
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    try:
+        import datetime as _dt
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return _dt.datetime.strptime(raw, fmt).timestamp()
+            except ValueError:
+                pass
+        for fmt in ("%I:%M%p, %b %d", "%I:%M %p, %b %d"):
+            try:
+                now = _dt.datetime.now()
+                parsed = _dt.datetime.strptime(
+                    f"{raw} {now.year}", f"{fmt} %Y")
+            except ValueError:
+                continue
+            dt = parsed.replace(year=now.year)
+            if dt.timestamp() - time.time() > 86400:
+                dt = dt.replace(year=now.year - 1)
+            return dt.timestamp()
+    except Exception:
+        return None
+    return None
+
 
 def channels_for_subs_ui(cfg: dict[str, Any]):
     """
@@ -629,27 +691,18 @@ def channels_for_subs_ui(cfg: dict[str, Any]):
         if 0 < max_d < 60 and max_mins == 0:
             max_mins = -1
         # Last-sync shown as relative ("10hr ago") to match YTArchiver.py:5307.
-        # parser now tolerates both the legacy naive-string
-        # format AND an epoch-float value. Epoch is DST-safe and compares
-        # directly to time.time(); new code writing last_sync can emit
-        # either. Naive strings get best-effort parsing but are marked
-        # approximate (read as local-TZ without adjustment, so two days
-        # per year the delta will be off by ±1h — tolerable for a UI
-        # relative-time display).
+        # Epoch values are preferred; known legacy strings are parsed through
+        # local-time timestamps. Unknown strings render as "unknown" instead
+        # of leaking a truncated raw timestamp fragment into the UI.
         ls_raw_val = ch.get("last_sync")
         ls_str = "Never"
-        _diff_secs: float | None = None
-        if isinstance(ls_raw_val, (int, float)) and ls_raw_val > 0:
-            _diff_secs = max(0.0, time.time() - float(ls_raw_val))
-        elif isinstance(ls_raw_val, str) and ls_raw_val.strip():
-            ls_raw = ls_raw_val.strip()
-            try:
-                import datetime as _dt
-                dt = _dt.datetime.strptime(ls_raw, "%Y-%m-%d %H:%M")
-                _diff_secs = max(0.0,
-                                 (_dt.datetime.now() - dt).total_seconds())
-            except Exception:
-                ls_str = ls_raw[:12]
+        _last_epoch = _last_sync_epoch(ls_raw_val)
+        _diff_secs: float | None = (
+            max(0.0, time.time() - _last_epoch)
+            if _last_epoch is not None else None)
+        if (_diff_secs is None and isinstance(ls_raw_val, str)
+                and ls_raw_val.strip()):
+            ls_str = "unknown"
         if _diff_secs is not None:
             diff_mins = int(_diff_secs // 60)
             if diff_mins < 1:
@@ -831,12 +884,14 @@ def recent_for_ui(cfg: dict[str, Any]):
             return os.path.isfile(fp)
         except Exception:
             return True
-    _existing_recent = [r for r in _all_recent if _file_exists_for(r)]
-    _sorted_recent = sorted(
-        _existing_recent,
+    _recent_candidates = sorted(
+        _all_recent,
         key=lambda r: (r.get("download_ts") or 0),
         reverse=True,
-    )[:200]
+    )[:300]
+    _sorted_recent = [
+        r for r in _recent_candidates if _file_exists_for(r)
+    ][:200]
     # Set of tracked-subscription channel identifiers (name + folder),
     # case-folded. Used to flag each row as `tracked` so the Recent grid
     # menu can hide the channel-only actions (Refresh metadata, Redownload)

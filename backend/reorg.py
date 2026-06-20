@@ -15,6 +15,7 @@ Three modes:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import threading
 import time
@@ -31,6 +32,10 @@ from .fs_search import MEDIA_EXTS_TUPLE as _VIDEO_EXTS  # unified media set
 
 _SIDECAR_EXTS = (".txt", ".jsonl", ".info.json", ".jpg", ".jpeg", ".png", ".webp",
                  ".vtt", ".srt", ".description")
+_CAPTION_LANG_RE = re.compile(
+    r"^(?:[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*|orig)$",
+    re.IGNORECASE,
+)
 
 
 # Must match YTArchiver.py:7483 MONTH_NAMES exactly — OLD's sync writes
@@ -82,14 +87,10 @@ def _sidecars_for(video: Path) -> list[Path]:
     stem = video.stem
     folder = video.parent
     out: list[Path] = []
-    # language-suffixed caption files have a two-dot
-    # extension (e.g. `X.en.vtt`, `X.es.vtt`). Path.stem on those
-    # returns `X.en`, so the exact-stem-equality check misses
-    # them. Maintain a small whitelist of known language codes so
-    # compound suffixes attach to the video they belong to.
-    _LANG_CODES = ("en", "es", "fr", "de", "ja", "ko", "pt", "it",
-                   "ru", "zh", "zh-Hans", "zh-Hant", "ar", "hi",
-                   "tr", "nl", "sv", "pl", "id", "vi", "th")
+    # Language-suffixed caption files have a two-dot extension
+    # (`X.en.vtt`, `X.es-419.srt`, `X.en-orig.vtt`). Path.stem on
+    # those returns `X.en`, so the exact-stem-equality check misses
+    # them. Match by structure instead of a fixed language whitelist.
     for p in folder.iterdir():
         if not p.is_file():
             continue
@@ -112,7 +113,7 @@ def _sidecars_for(video: Path) -> list[Path]:
             _outer_stem = p.stem  # e.g. "X.en"
             if "." in _outer_stem:
                 _base, _lang = _outer_stem.rsplit(".", 1)
-                if _base == stem and _lang in _LANG_CODES:
+                if _base == stem and _CAPTION_LANG_RE.match(_lang):
                     out.append(p)
     return out
 
@@ -523,8 +524,13 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
                     ts_new = d.timestamp()
                     os.utime(video, (ts_new, ts_new))
                     redated += 1
-                except OSError:
-                    pass
+                except OSError as e:
+                    stream.emit_text(
+                        f" ⚠ couldn't stamp upload-date mtime on "
+                        f"{video.name}; future mtime-based reorg may "
+                        f"misplace it ({e}).\n",
+                        "red",
+                    )
         if d is None:
             try:
                 ts = video.stat().st_mtime if use_mtime else time.time()
@@ -589,10 +595,21 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
                     for _sc in _sidecars_for(_moved_path):
                         try:
                             os.utime(_sc, (ts_stamp, ts_stamp))
-                        except OSError:
-                            pass
-                except (OSError, ValueError):
-                    pass
+                        except OSError as e:
+                            stream.emit_dim(
+                                f" (couldn't stamp sidecar mtime on "
+                                f"{_sc.name}: {e})")
+                except OSError as e:
+                    stream.emit_text(
+                        f" ⚠ couldn't stamp upload-date mtime on "
+                        f"{video.name}; future mtime-based reorg may "
+                        f"misplace it ({e}).\n",
+                        "red",
+                    )
+                except ValueError as e:
+                    stream.emit_dim(
+                        f" (couldn't compute upload-date mtime for "
+                        f"{video.name}: {e})")
                 # Re-point the index at the moved file so Watch playback +
                 # the Browse grid keep finding it. Without this, reorg
                 # physically moves the .mp4 but videos.filepath still points
@@ -601,9 +618,16 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
                 # keyed by video_id, not path).
                 try:
                     from . import index as _idx
-                    _idx.update_video_path(str(video), str(target / video.name))
+                    _repointed = _idx.update_video_path(
+                        str(video), str(target / video.name))
+                    if not _repointed:
+                        msg = ("moved on disk but catalog re-point matched "
+                               f"0 rows: {video.name}")
+                        _log.warning(msg)
+                        stream.emit_dim(f" ({msg}; rescan may be needed)")
                 except Exception as _ie:
-                    _log.debug("swallowed: %s", _ie)
+                    _log.warning("catalog re-point failed for %s: %s",
+                                 video, _ie)
             # Every 10 instead of 25 — on a ≤24-video reorg the old
             # threshold never fired, making the pass look stalled.
             if moved % 10 == 0:

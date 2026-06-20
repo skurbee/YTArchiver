@@ -11,6 +11,7 @@ drives this.
 from __future__ import annotations
 
 import os
+import random
 import threading
 import time
 from datetime import UTC, datetime
@@ -201,6 +202,10 @@ def refresh_channel_comments(channel: dict[str, Any],
     for i, (vid, fp, title_hint, old_comments) in enumerate(targets, 1):
         if cancel_event is not None and cancel_event.is_set():
             break
+        if i > 1:
+            time.sleep(random.uniform(0.3, 0.8))
+            if cancel_event is not None and cancel_event.is_set():
+                break
         if pause_event is not None and pause_event.is_set():
             _clear_active()
             _enter_pause_wait(stream,
@@ -239,16 +244,17 @@ def refresh_channel_comments(channel: dict[str, Any],
     # Stamp separate last-comments-refresh timestamp on the channel.
     try:
         from .. import ytarchiver_config as _cfg
-        cfg = _cfg.load_config()
-        ch_url_norm = (channel.get("url") or "").rstrip("/")
-        now_ts = time.time()
-        for ch in cfg.get("channels", []):
-            if (ch.get("url") or "").rstrip("/") == ch_url_norm:
-                ch["last_comments_refresh_ts"] = now_ts
-                break
-        _cfg.save_config(cfg)
+
+        with _cfg.config_transaction() as cfg:
+            ch_url_norm = (channel.get("url") or "").rstrip("/")
+            now_ts = time.time()
+            for ch in cfg.get("channels", []):
+                if (ch.get("url") or "").rstrip("/") == ch_url_norm:
+                    ch["last_comments_refresh_ts"] = now_ts
+                    break
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        _log.warning("comments refresh timestamp stamp failed for %r: %s",
+                     name, e)
 
     took = time.time() - t0
     # Per-channel summary is rendered by the sync loop's `_sync_row_emit`

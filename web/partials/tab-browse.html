@@ -27,7 +27,7 @@
 
         <!-- Toolbar (contents change with view) -->
         <div class="browse-main-toolbar" id="browse-main-toolbar">
-          <button class="back-btn" id="browse-back-btn" style="display:none;">&#8592; Back</button>
+          <button class="back-btn" id="browse-back-btn" hidden>&#8592; Back</button>
           <span class="browse-main-title" id="browse-main-title">Channels</span>
           <div class="spacer"></div>
           <!-- Channel-grid sort. Visible by default because Channels is the
@@ -42,15 +42,15 @@
               <option value="size">Largest</option>
             </select>
           </div>
-          <div class="browse-sort-wrap" id="browse-sort-wrap" style="display:none;">
+          <div class="browse-sort-wrap" id="browse-sort-wrap" hidden>
             <label class="ctl-label ctl-label-thin">Sort:</label>
             <select class="ctl-select" id="browse-sort">
               <option value="newest">Newest</option>
               <option value="oldest">Oldest</option>
               <option value="most_viewed">Most Viewed</option>
             </select>
-            <label class="ctl-label ctl-label-thin" style="margin-left:6px;" title="Group videos under year headers">
-              <input type="checkbox" id="browse-group-year" style="vertical-align:-1px;margin-right:3px;" />Group by year
+            <label class="ctl-label ctl-label-thin browse-group-label" title="Group videos under year headers">
+              <input type="checkbox" id="browse-group-year" class="browse-group-check" />Group by year
             </label>
             <!-- Visible only when the channel folder has year/month
                  structure on disk (`<year>/<MM Month>/...`). Wires
@@ -60,8 +60,8 @@
                  loadVideosFor() based on whether split_months is set
                  in the channel config. -->
             <label class="ctl-label ctl-label-thin" id="browse-group-month-wrap"
-                   style="margin-left:6px; display:none;" title="Sub-group videos by month under each year">
-              <input type="checkbox" id="browse-group-month" style="vertical-align:-1px;margin-right:3px;" />Group by month
+                   hidden title="Sub-group videos by month under each year">
+              <input type="checkbox" id="browse-group-month" class="browse-group-check" />Group by month
             </label>
           </div>
           <div class="browse-find-wrap">
@@ -92,12 +92,12 @@
         </div>
 
         <!-- View: video grid -->
-        <div class="browse-view" id="view-videos" style="display:none;">
+        <div class="browse-view" id="view-videos" hidden>
           <div class="video-grid" id="video-grid"></div>
         </div>
 
         <!-- View: watch -->
-        <div class="browse-view" id="view-watch" style="display:none;">
+        <div class="browse-view" id="view-watch" hidden>
           <div class="watch-layout">
             <div class="watch-video-wrap">
               <!-- Stage wraps the <video> + the pinned caption overlay +
@@ -112,8 +112,7 @@
               <div class="watch-video-stage" id="watch-video-stage">
                 <video class="watch-video-el" id="watch-video" controls preload="metadata"
                        playsinline controlslist="nofullscreen nodownload noplaybackrate noremoteplayback"
-                       disablepictureinpicture
-                       style="display:none;"></video>
+                       disablepictureinpicture hidden></video>
                 <div class="cap-ovl" id="watch-cap-ovl" aria-hidden="true">
                   <span class="cap-ovl-cell cap-ovl-prev"></span>
                   <span class="cap-ovl-cell cap-ovl-cur"></span>
@@ -164,7 +163,7 @@
                   <option value="1.5">1.5×</option>
                   <option value="2">2×</option>
                 </select>
-                <label class="ctl-label ctl-label-thin" style="margin-left:10px;"
+                <label class="ctl-label ctl-label-thin watch-overlay-label"
                        title="Show the current transcript word overlaid on the video.&#10;Works in windowed and fullscreen.">Overlay:</label>
                 <select class="ctl-select" id="watch-cap-size"
                         title="Overlay text size — Off hides the overlay">
@@ -255,7 +254,7 @@
         </div>
 
         <!-- View: Search (FTS5 transcript search) -->
-        <div class="browse-view" id="view-search" style="display:none;">
+        <div class="browse-view" id="view-search" hidden>
           <div class="search-panel">
             <!-- Un-indexed warning banner &mdash; matches YTArchiver.py:24756
                  _update_index_warning. Shown when videos on disk haven't
@@ -322,14 +321,12 @@
                       title='Wrap in quotes for exact phrase match (e.g. "the quick brown fox")'>"exact phrase"</button>
               <button class="search-op-btn" data-op="*"
                       title="Append * for prefix match (e.g. bake* matches baker, bakery, baking)">word*</button>
-              <span class="search-hint-label" style="margin-left:10px;">Year:</span>
-              <input type="text" class="ctl-input" id="search-year-from" placeholder="from"
-                     class="search-year-input"
+              <span class="search-hint-label search-hint-spaced">Year:</span>
+              <input type="text" class="ctl-input search-year-input" id="search-year-from" placeholder="from"
                      title="Limit to segments from this year onward" />
-              <input type="text" class="ctl-input" id="search-year-to" placeholder="to"
-                     class="search-year-input"
+              <input type="text" class="ctl-input search-year-input" id="search-year-to" placeholder="to"
                      title="Limit to segments through this year" />
-              <span class="search-hint-label" style="margin-left:10px;">Sort:</span>
+              <span class="search-hint-label search-hint-spaced">Sort:</span>
               <select class="ctl-select" id="search-sort"
                       title="How to order the result list">
                 <option value="relevance" selected>Relevance</option>
@@ -370,7 +367,7 @@
         </div>
 
         <!-- View: Graph (word frequency chart) -->
-        <div class="browse-view" id="view-graph" style="display:none;">
+        <div class="browse-view" id="view-graph" hidden>
           <div class="graph-panel">
             <!-- Same un-indexed warning banner as Search &mdash; graph draws from
                  the same FTS index so stale ingest affects both equally. -->
@@ -403,13 +400,13 @@
               <label class="ctl-label">Chart:</label>
               <div class="graph-chart-type-group" role="group">
                 <button class="chart-type-btn active" data-type="line"
-                        title="Line chart \u2014 best for showing trends over time">Line</button>
+                        title="Line chart &mdash; best for showing trends over time">Line</button>
                 <button class="chart-type-btn" data-type="bar"
-                        title="Bar chart \u2014 best for comparing discrete buckets">Bar</button>
+                        title="Bar chart &mdash; best for comparing discrete buckets">Bar</button>
                 <button class="chart-type-btn" data-type="wordcloud"
-                        title="Word cloud \u2014 shows the N most-spoken words across the selected scope">Word cloud</button>
+                        title="Word cloud &mdash; shows the N most-spoken words across the selected scope">Word cloud</button>
               </div>
-              <label class="vo-check" style="margin-left:16px;">
+              <label class="vo-check vo-check-spaced">
                 <input type="checkbox" id="graph-normalize"
                        title="Divide each bucket's count by the total segments in that bucket (x1000) so channels of different sizes are comparable." />
                 <span>Normalize (per 1000 segments)</span>
@@ -427,7 +424,7 @@
         </div>
 
         <!-- View: Bookmarks (saved moments) -->
-        <div class="browse-view" id="view-bookmarks" style="display:none;">
+        <div class="browse-view" id="view-bookmarks" hidden>
           <div class="bookmarks-panel">
             <div class="bookmarks-toolbar">
               <span class="subs-section-label">Bookmarked moments</span>
@@ -449,7 +446,7 @@
         <!-- Videos view: every video in the archive, sorted + lazy-loaded.
              Driven by web/videosView.js via api.list_all_videos. The id
              stays `view-recent` so existing show/hide wiring keeps working. -->
-        <div class="browse-view" id="view-recent" style="display:none;">
+        <div class="browse-view" id="view-recent" hidden>
           <div class="recent-area">
             <div class="recent-header">
               <span class="recent-label">All videos in the archive</span>
@@ -462,7 +459,7 @@
                        placeholder="Filter by title or channel&hellip;"
                        title="Filter every video in the archive by title or channel name" />
               </div>
-              <label class="ctl-label ctl-label-thin" style="margin-left:10px;">Sort:</label>
+              <label class="ctl-label ctl-label-thin browse-toolbar-spaced">Sort:</label>
               <select class="ctl-select" id="videos-sort"
                       title="Sort every video in the archive">
                 <option value="recent">Recently downloaded</option>
@@ -482,7 +479,7 @@
                   <span class="grid-loading-label">Loading videos&hellip;</span>
                 </div>
               </div>
-              <div id="videos-load-sentinel" style="height:1px;"></div>
+              <div id="videos-load-sentinel" class="videos-load-sentinel"></div>
               <div id="videos-load-more" class="grid-loading" hidden>
                 <div class="grid-spinner"></div>
                 <span class="grid-loading-label">Loading more&hellip;</span>

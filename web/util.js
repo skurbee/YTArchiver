@@ -56,7 +56,42 @@
     try { fn(target); } catch (e) { console.error("[once " + key + "]", e); }
   }
 
-  YT.util = { escapeHtml, escapeAttr, _formatTs, onceIdempotent };
+  function normalizeSubsChannels(resp) {
+    let rows = [];
+    if (Array.isArray(resp) && Array.isArray(resp[0])) rows = resp[0];
+    else if (Array.isArray(resp)) rows = resp;
+    else if (resp && Array.isArray(resp.channels)) rows = resp.channels;
+    return rows
+      .map((ch) => {
+        const folder = String(ch?.folder || ch?.folder_override || ch?.name || "").trim();
+        const name = String(ch?.name || folder).trim();
+        const displayName = folder || name;
+        return Object.assign({}, ch || {}, {
+          name,
+          folder: folder || name,
+          displayName,
+        });
+      })
+      .filter((ch) => ch.displayName)
+      .sort((a, b) => a.displayName.toLowerCase()
+        .localeCompare(b.displayName.toLowerCase()));
+  }
+
+  async function loadSubsChannels() {
+    const bridge = window.YT?.bridge;
+    if (!bridge?.isUp?.() || !bridge?.bridgeCall) return [];
+    const resp = await bridge.bridgeCall("get_subs_channels");
+    return normalizeSubsChannels(resp);
+  }
+
+  YT.util = {
+    escapeHtml,
+    escapeAttr,
+    _formatTs,
+    onceIdempotent,
+    normalizeSubsChannels,
+    loadSubsChannels,
+  };
 
   // Back-compat shims — logs.js + app.js modules still reach for these.
   // Deleting these globals is staged for Patch 14/15 when those files

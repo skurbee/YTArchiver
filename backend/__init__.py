@@ -1,118 +1,75 @@
 """
-backend/ — Python package containing every server-side module YTArchiver
-uses at runtime. The pywebview shell (main.py) imports from here through
-the `from backend.<module> import ...` form; the presence of this
-`__init__.py` is what tells Python that `backend/` is a package and not
-just a folder of loose scripts.
+Backend package for YTArchiver.
 
-Module map (alphabetical):
+The pywebview shell in ``main.py`` imports backend modules through
+``from backend.<module> import ...``. This file is intentionally code-light;
+its job is to keep a quick, accurate map of the current package shape.
+For the exhaustive file-by-file index, see ``docs/PROJECT_MAP.md``.
 
-  archive_scan.py      One-time + on-demand scans of the channel-folder
-                       tree on disk. Produces the per-channel video
-                       counts and total-size stats the Subs and Browse
-                       tabs render.
-  autorun.py           Schedules the recurring background sync passes
-                       and writes their results to the activity log.
-  channel_art.py       Fetches and caches channel avatar + banner
-                       images for the Subs / Browse UIs.
-  channel_cache.py     Per-channel cache of every video_id ever seen
-                       on that channel — feeds the "is this new?"
-                       check during a sync so we don't re-walk the
-                       whole channel from yt-dlp every time.
-  cmd_server.py        Tiny localhost HTTP endpoint other tools can
-                       hit to read app state (version, current job,
-                       etc.) without going through the GUI.
-  compress.py          ffmpeg pipeline for AV1 / HEVC re-encodes that
-                       shrink older downloads in-place. Driven by the
-                       per-channel "compress" toggle.
-  disk_watch.py        Filesystem watcher that notices when the Z:
-                       drive disconnects, files are added/removed
-                       manually, etc. Keeps the in-memory archive
-                       scan in sync with reality.
-  drift_scan.py        Periodic integrity check: every channel's
-                       on-disk file list vs. the index DB, flagging
-                       missing files / orphans.
-  index.py             SQLite-backed video index. Every downloaded
-                       video is registered here with its title,
-                       upload date, duration, channel, file path,
-                       transcription state, and metadata-fetch state.
-                       This is the database the Browse / Search /
-                       Recent tabs query.
-  livestreams.py       Detection + deferral logic for YT livestream
-                       and premiere URLs that aren't downloadable yet.
-                       Maintains the "Deferred Livestreams" drawer.
-  local_fileserver.py  Localhost static file server that serves the
-                       archive's .mp4 / .vtt / .txt files to the
-                       pywebview page (so the embedded player can use
-                       HTTP URLs instead of file://).
-  log_stream.py        The append-only log pipe between Python and
-                       the JS UI. Backend writes segments, the
-                       LogStreamer batches them every ~60ms and
-                       evaluates `window._logBatch(payload)` in JS.
-  metadata.py          yt-dlp metadata refresh (views / likes /
-                       comments / description) for already-downloaded
-                       videos. Writes the colored .txt sidecar that
-                       Browse shows in the details panel.
-  net.py               Network-down probe: parallel TCP-handshake
-                       checks against a small set of hosts so the
-                       pipeline can pause when the network goes
-                       away and resume when it comes back. NOT a
-                       general-purpose HTTP helper.
-  punct_worker.py      Subprocess that runs the punctuation /
-                       capitalization model over a transcript's raw
-                       Whisper output. Stays in its own process so
-                       loading the model doesn't bloat the main app.
-  queues.py            The Sync / GPU queue state machines that the
-                       UI's Sync Tasks / GPU Tasks popups display.
-                       Persists to disk so queues survive a restart.
-  redownload.py        Re-fetches an existing video at a higher
-                       resolution / better format. Used by the
-                       "Redownload" button on a video row.
-  reorg.py             Year/Month folder re-shuffler — moves videos
-                       into the right `YYYY/MM Month/` subfolder
-                       once their upload_date is known.
-  seen_filters.py      Persistent set of "skip these titles" filter
-                       hits, so a duration / regex skip on one sync
-                       doesn't re-trigger on every later sync.
-  subs.py              Channel-subscription CRUD: add / remove /
-                       rename / re-folder a tracked channel. Also
-                       URL normalization so the same channel doesn't
-                       get added twice with different URL spellings.
-  sync.py              THE central download path — subprocess wrapper
-                       around yt-dlp. Walks each channel, downloads
-                       new videos, parses progress + DLTRACK lines,
-                       feeds the activity log and the inline
-                       metadata / transcribe queues.
-  temp_cleanup.py      On-startup sweep that deletes .part / .ytdl /
-                       intermediate-format leftovers from crashed
-                       or cancelled past downloads.
-  transcribe.py        Whisper transcription manager. Routes to the
-                       fast auto-captions path when YT already has
-                       captions, otherwise queues a Whisper job for
-                       the Python-3.11 worker (whisper_worker.py).
-                       Writes the per-video .txt and the merged
-                       channel-wide `Transcript.txt`.
-  tray.py              Windows system-tray icon + context menu.
-                       Mirrors the current sync state into the
-                       tooltip so users can see status without
-                       opening the window.
-  utils.py             Cross-module helpers: subprocess env, line
-                       decoding (UTF-8 with cp1252 fallback),
-                       MONTH_FOLDERS lookup table, etc.
-  whisper_worker.py    The Python-3.11 subprocess that actually runs
-                       faster-whisper. Kept separate so the main
-                       app can stay on Python 3.13 while Whisper's
-                       CUDA / CTranslate2 deps stay on 3.11.
-  window_state.py      Saves / restores the pywebview window size,
-                       position, and which tab was active across
-                       app restarts.
-  ytarchiver_config.py Reads / writes %APPDATA%\\YTArchiver\\
-                       ytarchiver_config.json (channels, output_dir,
-                       auto-sync settings, recent downloads, etc.).
-                       The single source of truth for user settings.
+Core packages:
 
-The `log_stream` and `index` modules are the two everything else
-ultimately leans on — most user-visible behavior is a backend module
-either logging something via LogStreamer or reading/writing the
-SQLite index.
+  api_mixins/         JS-callable methods mixed into ``main.Api``.
+                      The README in that package documents the shared
+                      ``self.<attr>`` contracts and the AppServices migration.
+  metadata/          Metadata refresh package: title matching, yt-dlp fetches,
+                      bulk view/comment refresh, scan helpers, normalization,
+                      thumbnails, and compatibility re-exports.
+  services/          Dependency-injection layer for thinning ``main.Api``:
+                      ``AppServices``, ``BridgeEventBus``, and file operation
+                      helpers.
+  sync/              yt-dlp orchestration package. ``core.py`` owns
+                      ``sync_channel`` and the download loop; sibling modules
+                      handle batch orchestration, options, progress/log rows,
+                      quick checks, subprocess sessions, and active state.
+  transcribe/        Whisper transcription package: manager/worker loop,
+                      caption fast-path, transcript writers, punctuation
+                      manager, and path/title helpers.
+
+Top-level modules:
+
+  archive_scan.py       Disk scans for channel counts, sizes, and recency.
+  autorun.py            Recurring background sync scheduler and history.
+  channel_art.py        Channel avatar/banner fetch and cache.
+  channel_cache.py      Per-channel seen-video-id cache for fast sync probes.
+  cmd_server.py         Localhost HTTP bridge for companion tools.
+  compress.py           ffmpeg AV1/HEVC compression pipeline.
+  deps_installer.py     Optional dependency installation helpers.
+  disk_watch.py         Archive-drive writable/reachable monitor.
+  drift_scan.py         File/index/transcript integrity checks.
+  fs_search.py          Canonical video extension set and file walkers.
+  html_assembler.py     Builds ``web/index.html`` from template partials.
+  index.py              SQLite entry module: schema, registration, reads,
+                        and re-exports from specialized index modules.
+  index_bookmarks.py    Bookmark CRUD.
+  index_graph.py        Word-frequency and graph queries.
+  index_maintenance.py  Archive sweep, prune, and FTS rebuild operations.
+  index_search.py       FTS5 and title-search query helpers.
+  livestreams.py        Deferred livestream/premiere tracking.
+  local_fileserver.py   Local file-serving layer for embedded playback.
+  log.py                Logging adapter.
+  log_stream.py         Batched Python-to-JS log transport.
+  metadata_io.py        JSONL metadata/transcript sidecar I/O helpers.
+  net.py                Network health probe.
+  pause_helpers.py      Shared pause/cancel guards.
+  process_runner.py     Process registry and yt-dlp runner helpers.
+  punct_restore.py      Restore punctuation in existing transcripts.
+  punct_worker.py       Punctuation subprocess entry point.
+  queues.py             Persistent sync/GPU queue state.
+  redownload.py         Resolution upgrade pipeline.
+  reorg.py              Year/month folder reorganization.
+  repair_captions.py    YouTube caption repair helpers.
+  seen_filters.py       Persistent filter-hit dedupe.
+  subprocess_util.py    Windows subprocess startup helpers.
+  subs.py               Subscription CRUD and URL normalization.
+  temp_cleanup.py       Startup cleanup of partial/intermediate files.
+  text_utils.py         Title/text normalization helpers.
+  thumbnails.py         Thumbnail download/cache helpers.
+  transcribe_paths.py   Transcript path and naming helpers.
+  tray.py               Windows system-tray controller.
+  utils.py              Legacy shared helpers.
+  version.py            ``APP_VERSION`` and ``APP_VERSION_DATE``.
+  view_format.py        UI-facing formatting helpers.
+  whisper_worker.py     Whisper subprocess entry point.
+  window_state.py       Save/restore pywebview window state.
+  ytarchiver_config.py  Config file loading, saving, and view models.
 """

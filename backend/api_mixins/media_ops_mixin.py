@@ -250,6 +250,15 @@ class MediaOpsMixin:
 
     # ─── Transcript drift scan (feature H-2) ──────────────────────────
 
+    def reorg_cancel(self):
+        """Stop an in-progress folder reorganization at its next checkpoint."""
+        ev = getattr(self, "_reorg_cancel", None)
+        if ev is not None:
+            ev.set()
+        return {"ok": True,
+                "running": bool(getattr(self, "_reorg_running", False))}
+
+
     def drift_scan_channel(self, identity):
         """Scan one channel's transcript files for drift between the
         aggregated .txt, hidden .jsonl, and FTS index.
@@ -734,6 +743,25 @@ class MediaOpsMixin:
             return {"ok": False, "error": "output_dir not set"}
         from backend.sync import channel_folder_name
         folder = os.path.join(base, channel_folder_name(ch))
+        if not hasattr(self, "_sync_start_lock"):
+            self._sync_start_lock = threading.Lock()
+        _start_lock_acquired = self._sync_start_lock.acquire(blocking=False)
+        if not _start_lock_acquired:
+            return {"ok": False,
+                    "error": "Sync or reorganization is already starting"}
+        if getattr(self, "_reorg_running", False):
+            try:
+                self._sync_start_lock.release()
+            except Exception:
+                pass
+            return {"ok": True, "already_running": True}
+
+        def _release_start_lock():
+            try:
+                self._sync_start_lock.release()
+            except Exception:
+                pass
+
         # Refuse reorg when sync, redownload, or compress is currently
         # writing to this channel's folder. Without this guard, reorg
         # could move files out from under an in-flight yt-dlp download
@@ -744,12 +772,14 @@ class MediaOpsMixin:
             try:
                 _cur = self._queues.current_sync
                 if _cur and _cur.get("url") == ch_url:
+                    _release_start_lock()
                     return {"ok": False,
                             "error": f"Sync is currently downloading "
                                      f"{ch_name} — wait for it to finish "
                                      f"before reorganizing."}
                 _cur_g = self._queues.current_gpu
                 if _cur_g and _cur_g.get("channel") == ch_name:
+                    _release_start_lock()
                     return {"ok": False,
                             "error": f"GPU work (transcribe/encode) is "
                                      f"running against {ch_name} — wait "
@@ -772,6 +802,8 @@ class MediaOpsMixin:
         # it aborted at video #1 ("Reorg cancelled") or stopped partway
         # through recheck_dates, leaving the folder half-done.
         _reorg_cancel = threading.Event()
+        self._reorg_cancel = _reorg_cancel
+        self._reorg_running = True
         def _run():
             try:
                 reorg_backend.reorg_channel(folder,
@@ -781,6 +813,22 @@ class MediaOpsMixin:
                                             cancel_event=_reorg_cancel,
                                             recheck_dates=bool(recheck_dates))
             finally:
-                self._log_stream.flush()
-        threading.Thread(target=_run, daemon=True).start()
+                try:
+                    self._log_stream.flush()
+                finally:
+                    try:
+                        with self._sync_start_lock:
+                            if getattr(self, "_reorg_cancel", None) is _reorg_cancel:
+                                self._reorg_cancel = None
+                            self._reorg_running = False
+                    except Exception:
+                        self._reorg_running = False
+        try:
+            threading.Thread(target=_run, daemon=True).start()
+        except Exception as e:
+            self._reorg_cancel = None
+            self._reorg_running = False
+            _release_start_lock()
+            return {"ok": False, "error": str(e)}
+        _release_start_lock()
         return {"ok": True, "started": True}

@@ -30,6 +30,19 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
+  async function copyText(text, label = "Copied.") {
+    if (!navigator.clipboard?.writeText) {
+      window._showToast?.("Clipboard unavailable.", "error");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      window._showToast?.(label, "ok");
+    } catch (_err) {
+      window._showToast?.("Copy failed.", "error");
+    }
+  }
+
   function initLogContextMenu() {
     const handlers = [
       { el: document.getElementById("main-log"), label: "Main log" },
@@ -56,14 +69,14 @@
         const items = [];
         if (sel) {
           items.push({ label: "Copy selection",
-            action: () => navigator.clipboard?.writeText(sel) });
+            action: () => copyText(sel) });
         }
         if (lineEl) {
           items.push({ label: "Copy this line",
-            action: () => navigator.clipboard?.writeText(lineEl.innerText) });
+            action: () => copyText(lineEl.innerText) });
         }
         items.push({ label: `Copy all (${label})`,
-          action: () => navigator.clipboard?.writeText(el.innerText) });
+          action: () => copyText(el.innerText) });
         items.push({ sep: true });
         items.push({ label: "Save to file…",
           action: async () => {
@@ -74,11 +87,16 @@
               else window._showToast?.(res?.error || "Save failed.", "error");
             } else {
               // Fallback: blob download (works in browser preview)
-              const blob = new Blob([text], { type: "text/plain" });
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement("a");
-              a.href = url; a.download = "ytarchiver_log.txt"; a.click();
-              setTimeout(() => URL.revokeObjectURL(url), 1000);
+              try {
+                const blob = new Blob([text], { type: "text/plain" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url; a.download = "ytarchiver_log.txt"; a.click();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+                window._showToast?.("Log download started.", "ok");
+              } catch (_err) {
+                window._showToast?.("Save failed.", "error");
+              }
             }
           }});
         items.push({ sep: true });
@@ -88,7 +106,12 @@
               `Clear the ${label.toLowerCase()}?\n\nThis only clears the visible log — no files on disk are affected.`,
               { confirm: "Clear", danger: true });
             if (!ok) return;
-            el.innerHTML = "";
+            if (el.id && typeof window.clearLog === "function") {
+              window.clearLog(el.id);
+            } else {
+              el.innerHTML = "";
+            }
+            window._showToast?.(`${label} cleared.`, "ok");
             if (label === "Activity log") {
               try { window._syncActivityLogVisibility?.(); } catch {}
             }

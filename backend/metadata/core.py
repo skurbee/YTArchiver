@@ -77,11 +77,11 @@ _log = get_logger(__name__)
 
 # ── OLD-compat helpers ──────────────────────────────────────────────────
 # the JSONL I/O + path/hide helpers below were moved
-# to backend/metadata_io.py. They're re-imported into this module's
+# to backend/metadata/io.py. They're re-imported into this module's
 # namespace so existing call sites (e.g.
 # `from backend.metadata import _read_metadata_jsonl`) keep working
-# unchanged. The actual implementation now lives ONCE in metadata_io.
-from ..metadata_io import (
+# unchanged. The actual implementation now lives ONCE in metadata.io.
+from .io import (
     _folder_for_channel,
     _read_metadata_jsonl,
 )

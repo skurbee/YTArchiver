@@ -181,8 +181,8 @@ background thread or the UI freezes. See [`../backend/api_mixins/README.md`](../
 | 2 | Helper consolidation (`text_utils`, `subprocess_util`, `fs_search`) |
 | 3 | `ProcessRegistry` + `YtDlpRunner` (centralized subprocess lifecycle) |
 | 4 | `config_transaction()` + error-handling discipline |
-| 5 | `metadata.py` decomposition (`metadata_io.py` extracted) |
-| 6 | `transcribe.py` decomposition (`transcribe_paths.py` extracted) |
+| 5 | `metadata.py` decomposition (`metadata/io.py` extracted) |
+| 6 | `transcribe.py` decomposition (`transcribe/paths.py` extracted) |
 | 7 | `ytarchiver_config.py` decomposition (`view_format.py` extracted) |
 | 8 | `api_mixins/` contract documentation (`api_mixins/README.md`) |
 | 9 | Frontend documentation (`web/README.md`) |

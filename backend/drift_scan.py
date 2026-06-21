@@ -110,25 +110,27 @@ def _scan_txt_titles(folder_path: str) -> dict[str, list[dict[str, Any]]]:
             fp = os.path.join(dirpath, f)
             try:
                 with open(fp, "r", encoding="utf-8") as fh:
-                    content = fh.read()
+                    for line in fh:
+                        m = _HEADER_RE.match(line.rstrip("\r\n"))
+                        if not m:
+                            continue
+                        raw = (m.group(1) or "").strip()
+                        if not raw:
+                            continue
+                        vid_id = ""
+                        im = _ID_BRACKET_RE.search(raw)
+                        if im:
+                            vid_id = im.group(1)
+                        raw_plain = _ID_BRACKET_RE.sub("", raw).strip() or raw
+                        rec = {"raw": raw, "video_id": vid_id, "txt_path": fp,
+                               "date": (m.group(2) or "").strip("()"),
+                               "dur": (m.group(3) or "").strip("()"),
+                               "src_tag": (m.group(4) or "").strip("()")}
+                        # Append-not-setdefault so duplicate titles are kept.
+                        out.setdefault(_norm_title(raw), []).append(rec)
+                        out.setdefault(_norm_title(raw_plain), []).append(rec)
             except Exception:
                 continue
-            for m in _HEADER_RE.finditer(content):
-                raw = (m.group(1) or "").strip()
-                if not raw:
-                    continue
-                vid_id = ""
-                im = _ID_BRACKET_RE.search(raw)
-                if im:
-                    vid_id = im.group(1)
-                raw_plain = _ID_BRACKET_RE.sub("", raw).strip() or raw
-                rec = {"raw": raw, "video_id": vid_id, "txt_path": fp,
-                       "date": (m.group(2) or "").strip("()"),
-                       "dur": (m.group(3) or "").strip("()"),
-                       "src_tag": (m.group(4) or "").strip("()")}
-                # Append-not-setdefault so duplicate titles are kept.
-                out.setdefault(_norm_title(raw), []).append(rec)
-                out.setdefault(_norm_title(raw_plain), []).append(rec)
     return out
 
 
@@ -267,17 +269,27 @@ def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
     jsonl_map = _scan_jsonl_titles(folder)
 
     # Pre-compute video_id sets from each side so the cross-check
-    # inside the loop is O(1) instead of O(N) per entry. With list-
-    # valued maps, .values() yields lists-of-records; flatten.
-    def _flatten(m: dict[str, list[dict[str, Any]]]):
-        out_ = []
-        for v in m.values():
-            out_.extend(v)
-        return out_
-    _txt_all = _flatten(txt_map)
-    _jsonl_all = _flatten(jsonl_map)
-    _jsonl_vids = {r.get("video_id") for r in _jsonl_all if r.get("video_id")}
-    _txt_vids = {r.get("video_id") for r in _txt_all if r.get("video_id")}
+    # inside the loop is O(1) instead of O(N) per entry. Iterate unique
+    # records directly instead of materializing extra flattened lists;
+    # large channels can have many raw/plain alias keys pointing at the
+    # same record objects.
+    def _iter_unique_records(m: dict[str, list[dict[str, Any]]],
+                             path_key: str):
+        seen: set[tuple[str, str]] = set()
+        for records in m.values():
+            for rec in records:
+                dedup_key = (rec.get(path_key, ""), rec.get("raw", ""))
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                yield rec
+
+    _jsonl_vids = {r.get("video_id")
+                   for r in _iter_unique_records(jsonl_map, "jsonl_path")
+                   if r.get("video_id")}
+    _txt_vids = {r.get("video_id")
+                 for r in _iter_unique_records(txt_map, "txt_path")
+                 if r.get("video_id")}
 
     seen_txt_paths: set = set()
     seen_jsonl_paths: set = set()
@@ -285,10 +297,10 @@ def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
     txt_without_jsonl: list[dict[str, Any]] = []
     jsonl_without_txt: list[dict[str, Any]] = []
 
-    # Iterate the flattened lists so duplicate-title entries are all
+    # Iterate the unique records so duplicate-title entries are all
     # checked individually for drift (rather than the previous
     # setdefault-first-wins behavior that hid drift for re-uploads).
-    for rec in _txt_all:
+    for rec in _iter_unique_records(txt_map, "txt_path"):
         dedup_key = (rec["txt_path"], rec["raw"])
         if dedup_key in seen_txt_paths:
             continue
@@ -309,7 +321,7 @@ def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
             "date": rec.get("date", ""),
         })
 
-    for rec in _jsonl_all:
+    for rec in _iter_unique_records(jsonl_map, "jsonl_path"):
         dedup_key = (rec["jsonl_path"], rec["raw"])
         if dedup_key in seen_jsonl_paths:
             continue
@@ -342,9 +354,11 @@ def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
         except Exception:
             return p
     txt_titles_distinct = len({(_np(r["txt_path"]), r["raw"])
-                                for r in _txt_all})
+                                for r in _iter_unique_records(
+                                    txt_map, "txt_path")})
     jsonl_titles_distinct = len({(_np(r["jsonl_path"]), r["raw"])
-                                  for r in _jsonl_all})
+                                  for r in _iter_unique_records(
+                                      jsonl_map, "jsonl_path")})
 
     return {
         "ok": True,

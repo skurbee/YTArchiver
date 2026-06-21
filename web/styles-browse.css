@@ -620,6 +620,11 @@
   overflow: auto;
   font-family: var(--font-ui);
 }
+.graph-wordcloud-hint {
+  padding: 8px 12px;
+  color: var(--c-dim);
+  font-size: 12px;
+}
 .wc-word {
   display: inline-block;
   font-weight: 600;
@@ -652,6 +657,32 @@
 .graph-empty {
   position: absolute;
   color: var(--c-dim); font-style: italic; font-size: 13px;
+}
+.watch-play-icon-hidden {
+  visibility: hidden;
+}
+.watch-placeholder-text {
+  font-size: 13px;
+  color: var(--c-text);
+}
+.watch-transcript-note {
+  color: var(--c-dim);
+  font-style: italic;
+}
+.watch-transcript-loading {
+  padding: 12px;
+}
+.watch-video-error-title {
+  font-size: 13px;
+  color: var(--c-log-red);
+  margin-bottom: 4px;
+}
+.watch-video-error-detail {
+  font-size: 11px;
+  color: var(--c-dim);
+}
+.watch-video-error-hint {
+  margin-top: 6px;
 }
 
 /* Bookmarks */
@@ -864,13 +895,18 @@
   background: var(--c-log-bg);
   border: 1px solid var(--c-border);
   border-radius: 2px;
-  color: #ccc;
+  color: var(--c-text-strong);
   font-family: var(--font-log);
   font-size: 12px;
   line-height: 16px;
   min-height: 90px;
   white-space: pre;
   overflow: hidden;
+}
+.index-stats-note {
+  color: var(--c-dim);
+  font-size: 11px;
+  margin-top: 4px;
 }
 .index-actions-row {
   display: flex;
@@ -908,7 +944,7 @@
   overflow: hidden;
 }
 .index-log-frame .main-log {
-  color: #bbb;
+  color: var(--c-text-muted);
 }
 .status-text.dim { color: var(--c-dim); }
 
@@ -928,13 +964,13 @@
 .custom-tooltip {
   position: fixed;
   z-index: 10000;
-  background: #333;
-  color: #ddd;
+  background: var(--c-tooltip-bg);
+  color: var(--c-tooltip-fg);
   font-family: var(--font-ui);
   font-size: 11px;
   line-height: 1.4;
   padding: 6px 10px;
-  border: 1px solid #555;
+  border: 1px solid var(--c-tooltip-border);
   border-radius: 3px;
   box-shadow: 0 4px 10px rgba(0, 0, 0, 0.5);
   max-width: 280px;

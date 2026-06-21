@@ -676,7 +676,7 @@
   overflow-y: auto;
   max-height: 260px;
   padding: 4px 0;
-  background: #1b1f25;
+  background: var(--c-menu-bg);
   color: var(--c-text);
 }
 .queue-popover-body .queue-task-row {
@@ -687,7 +687,7 @@
   padding: 4px 10px;
   font-family: var(--font-log);
   font-size: 12px;
-  color: #e8edf5;
+  color: var(--c-text-strong);
   cursor: grab;
   border-left: 2px solid transparent;
 }
@@ -713,7 +713,7 @@
   border-left-color: var(--c-log-sum);
 }
 .queue-task-index {
-  color: #98a2b3;
+  color: var(--c-dim);
   font-size: 11px;
   text-align: right;
 }
@@ -726,7 +726,7 @@
 .queue-task-state.paused { color: var(--c-log-sum); }
 .queue-task-state.queued { color: var(--c-dim); }
 .queue-task-name {
-  color: #e8edf5;
+  color: var(--c-text-strong);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -779,7 +779,7 @@
 .queue-task-close:hover { color: var(--c-log-red); }
 .queue-empty {
   padding: 18px 14px;
-  color: #aab4c3;
+  color: var(--c-text-muted);
   font-style: italic;
   text-align: center;
   font-size: 12px;
@@ -808,10 +808,10 @@
 .queue-btn svg { width: 11px; height: 11px; }
 .queue-btn:hover { background: var(--c-primary); }
 .queue-btn-cancel {
-  background: #5a1818;
-  border-color: #7a2020;
+  background: var(--c-modal-danger);
+  border-color: var(--c-modal-danger-border);
 }
-.queue-btn-cancel:hover { background: #6b1e1e; }
+.queue-btn-cancel:hover { background: var(--c-modal-danger-hover); }
 .queue-btn-thin {
   font-size: 11px;
   padding: 3px 8px;

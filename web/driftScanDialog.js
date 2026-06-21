@@ -98,7 +98,7 @@
         _lastScan = data;
         fixBtn.disabled = true;
         if (!data?.ok) {
-          body.innerHTML = `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
+          body.innerHTML = `<div class="browse-empty askq-empty-padded askq-empty-danger">`
             + `${escapeHtml(data?.error || "Scan failed.")}</div>`;
           if (summary) summary.textContent = "";
           return;
@@ -106,7 +106,7 @@
         if (data.pending) {
           // Belt-and-braces: a pending token must NEVER render as a
           // successful empty result.
-          body.innerHTML = `<div class="browse-empty" style="padding:16px;">Still scanning…</div>`;
+          body.innerHTML = `<div class="browse-empty askq-empty-padded">Still scanning…</div>`;
           if (summary) summary.textContent = "";
           return;
         }
@@ -124,32 +124,30 @@
 
         let html = "";
         // Summary bar — green if no drift, red/orange if any found.
-        const okColor = totalDrift === 0 ? "#7acf8a" : "#e8a34e";
-        html += `<div style="padding:8px 10px;border-left:3px solid ${okColor};`
-          + `background:rgba(255,255,255,0.03);margin-bottom:12px;">`;
+        html += `<div class="drift-summary-box${totalDrift === 0 ? " is-clean" : ""}">`;
         if (totalDrift === 0) {
-          html += `<strong style="color:${okColor};">No drift found.</strong> `
+          html += `<strong class="drift-summary-title">No drift found.</strong> `
             + `All .txt / .jsonl / FTS entries are consistent.`;
         } else {
-          html += `<strong style="color:${okColor};">Drift detected:</strong> `
+          html += `<strong class="drift-summary-title">Drift detected:</strong> `
             + `${txtOrphans.length} .txt-only · ${jsonlOrphans.length} .jsonl-only`
             + (phantoms > 0 ? ` · ${phantoms.toLocaleString()} FTS phantoms (global)` : "");
         }
         html += `</div>`;
 
         // Category A: TXT without JSONL
-        html += `<div style="margin-bottom:12px;">`;
-        html += `<div style="font-weight:bold;margin-bottom:4px;">`
+        html += `<div class="drift-section">`;
+        html += `<div class="drift-section-title">`
           + `A. In .txt but missing from .jsonl (${txtOrphans.length})</div>`;
-        html += `<div class="edit-dim" style="font-size:11px;margin-bottom:6px;">`
+        html += `<div class="edit-dim drift-section-note">`
           + `Fix: queue Whisper retranscribe to rebuild both sides. `
           + `Entries whose video file can't be located in the index are skipped.</div>`;
         if (!txtOrphans.length) {
-          html += `<div class="edit-dim" style="padding:4px 8px;">—</div>`;
+          html += `<div class="edit-dim drift-empty-row">—</div>`;
         } else {
-          html += `<ul style="margin:0;padding-left:18px;">`;
+          html += `<ul class="drift-list">`;
           for (const o of txtOrphans.slice(0, 50)) {
-            html += `<li style="margin:2px 0;"><span style="color:#d8d8d8;">`
+            html += `<li class="drift-list-item"><span class="drift-list-title">`
               + `${escapeHtml(o.title)}</span>`;
             if (o.src_tag) html += ` <span class="edit-dim">(${escapeHtml(o.src_tag)})</span>`;
             html += `</li>`;
@@ -162,18 +160,18 @@
         html += `</div>`;
 
         // Category B: JSONL without TXT
-        html += `<div style="margin-bottom:12px;">`;
-        html += `<div style="font-weight:bold;margin-bottom:4px;">`
+        html += `<div class="drift-section">`;
+        html += `<div class="drift-section-title">`
           + `B. In .jsonl but missing from .txt (${jsonlOrphans.length})</div>`;
-        html += `<div class="edit-dim" style="font-size:11px;margin-bottom:6px;">`
+        html += `<div class="edit-dim drift-section-note">`
           + `Fix: reconstruct .txt entry from .jsonl segments. Date from `
           + `.jsonl mtime; source tag = "RECOVERED-FROM-JSONL".</div>`;
         if (!jsonlOrphans.length) {
-          html += `<div class="edit-dim" style="padding:4px 8px;">—</div>`;
+          html += `<div class="edit-dim drift-empty-row">—</div>`;
         } else {
-          html += `<ul style="margin:0;padding-left:18px;">`;
+          html += `<ul class="drift-list">`;
           for (const o of jsonlOrphans.slice(0, 50)) {
-            html += `<li style="margin:2px 0;"><span style="color:#d8d8d8;">`
+            html += `<li class="drift-list-item"><span class="drift-list-title">`
               + `${escapeHtml(o.title)}</span></li>`;
           }
           if (jsonlOrphans.length > 50) {
@@ -184,10 +182,10 @@
         html += `</div>`;
 
         // Category C: FTS phantoms (global)
-        html += `<div style="margin-bottom:4px;">`;
-        html += `<div style="font-weight:bold;margin-bottom:4px;">`
+        html += `<div class="drift-section-tight">`;
+        html += `<div class="drift-section-title">`
           + `C. FTS5 phantom rows (${phantoms.toLocaleString()})</div>`;
-        html += `<div class="edit-dim" style="font-size:11px;margin-bottom:6px;">`
+        html += `<div class="edit-dim drift-section-note">`
           + `Fix: rebuild FTS5 index (idempotent; clears orphan rowids `
           + `from re-ingested transcripts — audit bug C-9). Counted globally; `
           + `fix is global.</div>`;
@@ -211,7 +209,7 @@
         let identity;
         try { identity = JSON.parse(raw); }
         catch { identity = { name: raw }; }
-        body.innerHTML = `<div class="browse-empty" style="padding:16px;">Scanning…</div>`;
+        body.innerHTML = `<div class="browse-empty askq-empty-padded">Scanning…</div>`;
         if (summary) summary.textContent = "";
         fixBtn.disabled = true;
         if (scanBtn) scanBtn.disabled = true;
@@ -223,7 +221,7 @@
           }
           let res = await bridgeCall("drift_scan_channel", identity);
           if (res?.pending && res?.token) {
-            body.innerHTML = `<div class="browse-empty" style="padding:16px;">Scanning…</div>`;
+            body.innerHTML = `<div class="browse-empty askq-empty-padded">Scanning…</div>`;
             res = await _pollUntilDone(
               res, (t) => bridgeCall("drift_scan_channel_poll", t), 10 * 60 * 1000);
           }
@@ -266,10 +264,10 @@
           if (!ok) return;
         }
         fixBtn.disabled = true;
-        body.innerHTML = `<div class="browse-empty" style="padding:16px;">Applying fixes…</div>`;
+        body.innerHTML = `<div class="browse-empty askq-empty-padded">Applying fixes…</div>`;
         try {
           if (!nativeBridgeUp()) {
-            body.innerHTML = `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
+            body.innerHTML = `<div class="browse-empty askq-empty-padded askq-empty-danger">`
               + `Native mode required.</div>`;
             return;
           }
@@ -279,7 +277,7 @@
               res, (t) => bridgeCall("drift_apply_channel_poll", t), 10 * 60 * 1000);
           }
           if (!res?.ok) {
-            body.innerHTML = `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
+            body.innerHTML = `<div class="browse-empty askq-empty-padded askq-empty-danger">`
               + `${escapeHtml(res?.error || "Fix failed.")}</div>`;
             return;
           }
@@ -290,29 +288,28 @@
           if (a.retranscribe_skipped) parts.push(`${a.retranscribe_skipped} skipped (video file missing)`);
           if (a.fts_rebuilt) parts.push("FTS rebuilt");
           if (!parts.length) parts.push("no actions taken");
-          body.innerHTML = `<div style="padding:12px;border-left:3px solid #7acf8a;`
-            + `background:rgba(122,207,138,0.08);">`
-            + `<strong style="color:#7acf8a;">Done.</strong> `
+          body.innerHTML = `<div class="drift-done-box">`
+            + `<strong class="drift-done-title">Done.</strong> `
             + `${parts.map(escapeHtml).join(" · ")}.`
             + `</div>`
-            + `<div class="edit-dim" style="padding:8px 4px 0;font-size:11px;">`
+            + `<div class="edit-dim drift-done-note">`
             + `Click Scan again to refresh the report.`
             + `</div>`;
           window._showToast?.(`Drift fix applied: ${parts.join(" · ")}.`, "ok");
         } catch (e) {
-          body.innerHTML = `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
+          body.innerHTML = `<div class="browse-empty askq-empty-padded askq-empty-danger">`
             + `${escapeHtml(String(e))}</div>`;
         }
       };
 
       const _open = async () => {
         bd.hidden = false;
-        body.innerHTML = `<div class="browse-empty" style="padding:16px;">Loading channels…</div>`;
+        body.innerHTML = `<div class="browse-empty askq-empty-padded">Loading channels…</div>`;
         if (summary) summary.textContent = "";
         fixBtn.disabled = true;
         _lastScan = null;
         await _loadChannels();
-        body.innerHTML = `<div class="browse-empty" style="padding:16px;">`
+        body.innerHTML = `<div class="browse-empty askq-empty-padded">`
           + `Pick a channel and click Scan.</div>`;
       };
 

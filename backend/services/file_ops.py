@@ -7,7 +7,9 @@ config writability, and sidecar cleanup rules stay consistent.
 from __future__ import annotations
 
 import os
+import json
 import shutil
+from datetime import datetime
 from typing import Any
 
 from backend.utils import (
@@ -32,6 +34,48 @@ def assert_within_managed_roots(path: str) -> dict[str, Any]:
             error="Refusing to operate on a file outside the archive.",
         )
     return _result(True, path=os.path.normpath(path))
+
+
+def _managed_root_for(path: str) -> str:
+    """Return the configured managed root containing path, or empty string."""
+    try:
+        from backend.ytarchiver_config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        return ""
+    roots: list[str] = []
+    output_dir = (cfg.get("output_dir") or "").strip()
+    if output_dir:
+        roots.append(output_dir)
+    roots.extend(str(r) for r in (cfg.get("tp_archive_roots") or []) if r)
+    try:
+        target = os.path.normcase(os.path.realpath(path))
+    except (ValueError, OSError):
+        return ""
+    matches: list[tuple[int, str]] = []
+    for root in roots:
+        try:
+            real_root = os.path.normcase(os.path.realpath(root))
+            if os.path.commonpath([target, real_root]) == real_root:
+                matches.append((len(real_root), os.path.realpath(root)))
+        except (ValueError, OSError):
+            continue
+    if not matches:
+        return ""
+    return max(matches)[1]
+
+
+def _trash_path_for(folder_path: str, archive_root: str) -> str:
+    trash_root = os.path.join(archive_root, ".YTArchiver Trash")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = os.path.basename(os.path.normpath(folder_path)) or "channel"
+    base = base.replace(os.sep, "_").replace("/", "_").replace("\\", "_")
+    candidate = os.path.join(trash_root, f"{stamp}-{base}")
+    suffix = 1
+    while os.path.exists(candidate):
+        suffix += 1
+        candidate = os.path.join(trash_root, f"{stamp}-{base}-{suffix}")
+    return candidate
 
 
 def safe_remove_file(path: str, *, require_config_writable: bool = True,
@@ -71,7 +115,7 @@ def safe_rmtree_channel_folder(
     require_config_writable: bool = True,
     reason: str = "",
 ) -> dict[str, Any]:
-    """Recursively remove one managed channel folder."""
+    """Move one managed channel folder to the app trash/quarantine."""
     guard = assert_within_managed_roots(folder_path)
     if not guard.get("ok"):
         return guard
@@ -85,7 +129,7 @@ def safe_rmtree_channel_folder(
     if os.path.islink(folder_path):
         return _result(
             False,
-            error="Refusing to recursively delete a symlink.",
+            error="Refusing to move a symlinked channel folder.",
             folder_path=os.path.normpath(folder_path),
         )
     if not os.path.isdir(folder_path):
@@ -96,24 +140,42 @@ def safe_rmtree_channel_folder(
             reason=reason,
         )
 
-    failed_paths: list[tuple[str, str]] = []
-
-    def _onerr(_fn: Any, path: str, exc_info: Any) -> None:
-        try:
-            failed_paths.append((path, str(exc_info[1])))
-        except Exception:
-            failed_paths.append((str(path), "?"))
-
-    shutil.rmtree(folder_path, onerror=_onerr)
+    archive_root = _managed_root_for(folder_path)
+    if not archive_root:
+        return _result(
+            False,
+            error="Could not resolve archive root for channel folder.",
+            folder_path=os.path.normpath(folder_path),
+        )
+    try:
+        trash_path = _trash_path_for(folder_path, archive_root)
+        os.makedirs(os.path.dirname(trash_path), exist_ok=True)
+        shutil.move(folder_path, trash_path)
+        manifest = {
+            "original_path": os.path.normpath(folder_path),
+            "trashed_path": os.path.normpath(trash_path),
+            "trashed_at": datetime.now().isoformat(timespec="seconds"),
+            "reason": reason,
+        }
+        with open(
+            os.path.join(trash_path, ".ytarchiver-trash.json"),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        return _result(
+            False,
+            error=str(exc),
+            deleted_folder=False,
+            folder_path=os.path.normpath(folder_path),
+            reason=reason,
+        )
     result = _result(
         True,
-        deleted_folder=not failed_paths,
+        deleted_folder=not os.path.exists(folder_path),
         folder_path=os.path.normpath(folder_path),
+        trashed_folder_path=os.path.normpath(trash_path),
         reason=reason,
     )
-    if failed_paths:
-        result["delete_error"] = (
-            f"{len(failed_paths)} item(s) could not be removed "
-            f"(first: {failed_paths[0][0]})")
-        result["delete_partial_failures"] = failed_paths
     return result

@@ -19,6 +19,107 @@
   window.YT = window.YT || {};
   const YT = window.YT;
   const escapeHtml = (YT.util && YT.util.escapeHtml) || (s => String(s ?? ""));
+  const FOCUSABLE_SEL = [
+    "a[href]",
+    "button:not([disabled])",
+    "input:not([disabled])",
+    "select:not([disabled])",
+    "textarea:not([disabled])",
+    "[tabindex]:not([tabindex='-1'])",
+  ].join(",");
+
+  function visibleFocusables(root) {
+    return Array.from(root.querySelectorAll(FOCUSABLE_SEL)).filter((el) => {
+      if (!el || el.hidden) return false;
+      const rects = el.getClientRects?.();
+      return !rects || rects.length > 0;
+    });
+  }
+
+  function prepareDialogSemantics(backdrop, dialogSelector) {
+    const selector = dialogSelector || ".askq-dialog";
+    const dialog = backdrop.matches?.(selector)
+      ? backdrop
+      : backdrop.querySelector(selector);
+    if (!dialog) return null;
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    const title = dialog.querySelector(".askq-header, .yt-modal-title");
+    if (title) {
+      if (!title.id) {
+        title.id = `modal-title-${Math.random().toString(36).slice(2)}`;
+      }
+      dialog.setAttribute("aria-labelledby", title.id);
+    }
+    if (!dialog.hasAttribute("tabindex")) dialog.setAttribute("tabindex", "-1");
+    return dialog;
+  }
+
+  function activateFocusTrap(backdrop, opts = {}) {
+    if (!backdrop) return () => {};
+    const previousFocus = document.activeElement;
+    const dialog = prepareDialogSemantics(backdrop, opts.dialogSelector)
+      || backdrop;
+    const focusInitial = () => {
+      const explicit = opts.initialFocus
+        ? backdrop.querySelector(opts.initialFocus)
+        : null;
+      const target = explicit || visibleFocusables(dialog)[0] || dialog;
+      try { target.focus(); } catch {}
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape" && typeof opts.onEscape === "function") {
+        e.preventDefault();
+        opts.onEscape();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const nodes = visibleFocusables(dialog);
+      if (!nodes.length) {
+        e.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = nodes[0];
+      const last = nodes[nodes.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+    setTimeout(focusInitial, 30);
+    return () => {
+      document.removeEventListener("keydown", onKey, true);
+      if (opts.restoreFocus === false) return;
+      if (previousFocus && previousFocus.isConnected) {
+        try { previousFocus.focus(); } catch {}
+      }
+    };
+  }
+
+  function bindStaticModal(modal, opts = {}) {
+    if (!modal) return () => {};
+    let releaseTrap = null;
+    const sync = () => {
+      if (!modal.hidden && isVisible(modal)) {
+        if (!releaseTrap) releaseTrap = activateFocusTrap(modal, opts);
+      } else if (releaseTrap) {
+        releaseTrap();
+        releaseTrap = null;
+      }
+    };
+    const observer = new MutationObserver(sync);
+    observer.observe(modal, { attributes: true, attributeFilter: ["hidden"] });
+    sync();
+    return () => {
+      observer.disconnect();
+      if (releaseTrap) releaseTrap();
+    };
+  }
 
   // ── Generic open() ──────────────────────────────────────────────
   // Returns a Promise that resolves with whatever resolveWith() is
@@ -54,6 +155,7 @@
       }
 
       document.body.appendChild(backdrop);
+      const releaseFocusTrap = activateFocusTrap(backdrop);
 
       let _resolved = false;
       function resolveOuter(val) {
@@ -67,6 +169,7 @@
         backdrop.style.animation = "askq-fade 0.12s ease-out reverse";
         setTimeout(() => backdrop.remove(), 120);
         document.removeEventListener("keydown", onKey);
+        releaseFocusTrap();
         resolve(val);
       }
 
@@ -186,7 +289,7 @@
       <div class="askq-dialog">
         <div class="askq-header"></div>
         <div class="askq-body"></div>
-        ${hasCountdown ? '<div class="askq-countdown" style="margin:8px 0 12px;font-size:12px;color:var(--c-dim);"></div>' : ""}
+        ${hasCountdown ? '<div class="askq-countdown"></div>' : ""}
         <div class="askq-buttons askq-buttons-actions askq-buttons-inline">
           ${buttonsHtml}${cancelBtn}
         </div>
@@ -195,7 +298,7 @@
       <div class="askq-dialog">
         <div class="askq-header"></div>
         <div class="askq-body"></div>
-        ${hasCountdown ? '<div class="askq-countdown" style="margin:8px 0 12px;font-size:12px;color:var(--c-dim);"></div>' : ""}
+        ${hasCountdown ? '<div class="askq-countdown"></div>' : ""}
         <div class="askq-buttons askq-buttons-actions">
           ${buttonsHtml}
         </div>
@@ -381,8 +484,18 @@
     danger: askDanger,
     choice: askChoice,
     text: askTextInput,
+    activateFocusTrap,
+    bindStaticModal,
     registerEscapeClose,
   };
+
+  document.addEventListener("DOMContentLoaded", () => {
+    bindStaticModal(document.getElementById("welcome-modal"), {
+      dialogSelector: ".yt-modal",
+      initialFocus: "#welcome-browse",
+      restoreFocus: false,
+    });
+  });
 
   // Back-compat globals — every existing app.js / logs.js call site
   // uses these. Patches 14-15 migrate to YT.modals.*.

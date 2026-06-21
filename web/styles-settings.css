@@ -556,7 +556,7 @@
   border-left: 3px solid transparent;
 }
 .metadata-table tbody tr.md-row-clickable:hover {
-  background: rgba(160, 170, 187, 0.10);
+  background: var(--c-hover);
 }
 /* Channels with missing video IDs get a subtle yellow left rail so
    they stay scannable now that the warn-colored "⋯" button is gone. */
@@ -593,7 +593,7 @@
      styles-settings L146). */
   z-index: 9500;
   min-width: 200px;
-  background: #1c1f23;
+  background: var(--c-menu-bg);
   border: 1px solid rgba(255, 255, 255, 0.10);
   border-radius: 4px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.35);
@@ -621,12 +621,12 @@
 }
 .md-cm-item:hover,
 .md-cm-item:focus {
-  background: rgba(120, 165, 220, 0.18);
+  background: var(--c-menu-hover);
   color: #fff;
   outline: 0;
 }
 .md-cm-warn { color: var(--c-warn-fg); }
-.md-cm-warn:hover, .md-cm-warn:focus { color: #f0c46d; }
+.md-cm-warn:hover, .md-cm-warn:focus { color: var(--c-log-sum); }
 /* Submenu wrapper — parent holds the head row + a hidden flyout. The
    flyout appears to the right when the head is hovered or focused
    inside. CSS-only show/hide, no JS state. */
@@ -643,7 +643,7 @@
   left: 100%;
   top: -5px;
   min-width: 150px;
-  background: #1c1f23;
+  background: var(--c-menu-bg);
   border: 1px solid rgba(255, 255, 255, 0.10);
   border-radius: 4px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.35);
@@ -655,7 +655,7 @@
   display: block;
 }
 .md-cm-sub-wrap:hover > .md-cm-has-sub {
-  background: rgba(120, 165, 220, 0.18);
+  background: var(--c-menu-hover);
   color: #fff;
 }
 
@@ -850,6 +850,64 @@
   margin-bottom: 0;
   color: var(--c-text);
   opacity: 0.82;
+}
+.settings-warn-icon {
+  color: var(--c-log-sum);
+}
+.import-skip-intro,
+.import-skip-count,
+.import-skip-more,
+.backup-preview-muted,
+.backup-preview-total {
+  color: var(--c-dim);
+}
+.import-skip-intro,
+.backup-preview-total {
+  margin-bottom: 8px;
+  font-size: 11px;
+}
+.import-skip-group {
+  margin-bottom: 8px;
+}
+.import-skip-title {
+  font-weight: 600;
+  color: var(--c-text-muted);
+}
+.import-skip-count {
+  font-weight: 400;
+}
+.import-skip-names {
+  font-size: 11px;
+  color: var(--c-accent);
+  padding-left: 10px;
+}
+.backup-preview-frame {
+  max-height: 280px;
+  overflow: auto;
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  padding: 6px;
+  margin-top: 8px;
+}
+.backup-preview-table {
+  width: 100%;
+  font-size: 11px;
+  border-collapse: collapse;
+}
+.backup-preview-table thead tr {
+  text-align: left;
+  color: var(--c-dim);
+}
+.backup-preview-num {
+  text-align: right;
+}
+.backup-preview-warning {
+  margin: 8px 0 0;
+  padding: 6px;
+  border: 1px solid rgba(225, 178, 90, 0.4);
+  border-radius: 4px;
+  color: var(--c-warn-fg);
+  background: rgba(225, 178, 90, 0.08);
 }
 /* Compat: older blocks still reference .settings-tab-inner. */
 .settings-tab-inner {

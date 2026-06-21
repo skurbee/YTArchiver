@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Any
 
 from ..log import get_logger
-from ..transcribe_paths import (
+from .paths import (
     _get_jsonl_sidecar,
     _get_transcript_filename,
 )
@@ -258,30 +258,28 @@ def _bump_transcription_pending(channel_name: str, delta: int) -> None:
         from .. import ytarchiver_config as _cfg
         if not _cfg.config_is_writable():
             return
-        cfg = _cfg.load_config()
         changed = False
-        for ch in cfg.get("channels", []):
-            name = ch.get("name") or ""
-            folder = ch.get("folder") or ch.get("folder_override") or ""
-            if name == channel_name or folder == channel_name:
-                cur = int(ch.get("transcription_pending", 0) or 0)
-                new = max(0, cur + int(delta))
-                if new != cur:
-                    ch["transcription_pending"] = new
-                    changed = True
-                if new == 0 and delta < 0:
-                    # Only flip `complete` when we just finished a job, not
-                    # when we re-initialize to 0.
-                    ch["transcription_complete"] = True
-                    changed = True
-                elif delta > 0 and ch.get("transcription_complete"):
-                    # Queued a new job on a previously-complete channel →
-                    # re-mark as incomplete until the new job finishes.
-                    ch["transcription_complete"] = False
-                    changed = True
-                break
-        if changed:
-            _cfg.save_config(cfg)
+        with _cfg.config_transaction() as cfg:
+            for ch in cfg.get("channels", []):
+                name = ch.get("name") or ""
+                folder = ch.get("folder") or ch.get("folder_override") or ""
+                if name == channel_name or folder == channel_name:
+                    cur = int(ch.get("transcription_pending", 0) or 0)
+                    new = max(0, cur + int(delta))
+                    if new != cur:
+                        ch["transcription_pending"] = new
+                        changed = True
+                    if new == 0 and delta < 0:
+                        # Only flip complete when we just finished a job.
+                        ch["transcription_complete"] = True
+                        changed = True
+                    elif delta > 0 and ch.get("transcription_complete"):
+                        # Re-mark as incomplete until the new job finishes.
+                        ch["transcription_complete"] = False
+                        changed = True
+                    break
+            if not changed:
+                raise _cfg.ConfigUnchanged()
     except Exception as e:
         _log.debug("swallowed: %s", e)
 

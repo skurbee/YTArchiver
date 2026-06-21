@@ -5,6 +5,7 @@ Originally a single `backend/metadata.py` (~4,200 lines). Split into:
 
     metadata/core.py            — primary entry points
     metadata/scan.py            — iter_channel_jsonls + scan helpers
+    metadata/io.py              — JSONL I/O and path helpers
     metadata/normalize.py       — title-normalization shims
     metadata/fetcher.py         — per-video metadata fetches
     metadata/refresh.py         — bulk_refresh_views_likes pipeline
@@ -21,4 +22,12 @@ from .core import *  # noqa: F401,F403
 # Explicit underscore-name re-exports — external callers reach in.
 from .core import (  # noqa: F401
     _read_metadata_jsonl,
+)
+from .io import (  # noqa: F401
+    _folder_for_channel,
+    _get_metadata_jsonl_path,
+    _hide_file_win,
+    _read_metadata_jsonl,
+    _unhide_file_win,
+    _write_metadata_jsonl,
 )

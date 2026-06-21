@@ -49,6 +49,90 @@
     return `linear-gradient(135deg, hsl(${hue}, 55%, 28%) 0%, hsl(${hue2}, 60%, 18%) 100%)`;
   }
 
+  function _buildChannelCard(c, index) {
+    const name = c.folder || c.name || "";
+    const vids = c.n_vids || c.video_count || "\u2014";
+    const size = c.size || "";
+    const first = (name[0] || "?").toUpperCase();
+
+    const bannerUrl = c.banner_url || "";
+    const avatarUrl = c.avatar_url || "";
+    // Banner priority: explicit banner > avatar zoomed-to-fill > gradient.
+    const bannerSrc = bannerUrl || avatarUrl || "";
+
+    const card = document.createElement("div");
+    card.className = "channel-card";
+    card.dataset.channelIndex = String(index);
+    card.setAttribute("role", "button");
+    card.tabIndex = 0;
+    card.setAttribute("aria-label", `Open channel ${name || "Untitled"}`);
+    if (!bannerSrc) {
+      // Pure-gradient fallback gets the tinted bg directly.
+      card.style.background = gradientFor(name);
+    }
+    if (typeof c.transcription_pending === "number") {
+      card.dataset.pendingTx = String(c.transcription_pending);
+    }
+    if (typeof c.metadata_pending === "number") {
+      card.dataset.pendingMeta = String(c.metadata_pending);
+    }
+
+    // Banner + avatar URLs come from per-channel metadata (potentially
+    // user-influenced via custom configs); interpolating them into
+    // innerHTML would XSS via " onerror=... or " /><script>. Build the
+    // <img> elements via createElement + .src so the URL is treated as
+    // a URL, not as HTML to parse.
+    const letterHtml = (!bannerSrc && !avatarUrl)
+      ? `<div class="channel-letter">${escapeHtml(first)}</div>`
+      : "";
+
+    card.innerHTML = `
+      ${letterHtml}
+      <div class="channel-card-overlay">
+        <div class="channel-card-name"></div>
+        <div class="channel-card-meta"></div>
+      </div>
+    `;
+
+    if (bannerSrc) {
+      const bgEl = document.createElement("img");
+      bgEl.className = "channel-card-bg";
+      bgEl.src = bannerSrc;
+      bgEl.loading = "lazy";
+      bgEl.decoding = "async";
+      bgEl.alt = "";
+      card.insertBefore(bgEl, card.firstChild);
+    }
+    if (avatarUrl) {
+      const avEl = document.createElement("img");
+      avEl.className = "channel-avatar";
+      avEl.src = avatarUrl;
+      avEl.loading = "lazy";
+      avEl.decoding = "async";
+      avEl.alt = "";
+      card.appendChild(avEl);
+    }
+    card.querySelector(".channel-card-name").textContent = name;
+    card.querySelector(".channel-card-meta").textContent =
+      `${vids}${vids && vids !== "\u2014" ? " videos" : ""}${size ? " \u00b7 " + size : ""}`;
+
+    // Swap to gradient if the banner image fails to load.
+    const bgEl = card.querySelector(".channel-card-bg");
+    if (bgEl) {
+      bgEl.addEventListener("error", () => {
+        bgEl.remove();
+        card.style.background = gradientFor(name);
+        if (!avatarUrl && !card.querySelector(".channel-letter")) {
+          const d = document.createElement("div");
+          d.className = "channel-letter";
+          d.textContent = first;
+          card.insertBefore(d, card.firstChild);
+        }
+      }, { once: true });
+    }
+    return card;
+  }
+
   /** Render the Channels grid (Browse tab landing view).
    *
    * YouTube-style: banner fills the card, circular PFP overlaps
@@ -59,110 +143,64 @@
   window.renderChannelGrid = function (channels, onChannelClick) {
     const grid = document.getElementById("channel-grid");
     if (!grid) return;
+    _unobserveGridSentinel(grid);
     grid.innerHTML = "";
     channels = Array.isArray(channels) ? channels : [];
+    grid._channelItems = channels;
+    grid._onChannelClick = onChannelClick;
+    if (!grid._channelDelegated) {
+      grid._channelDelegated = true;
+      grid.addEventListener("click", (e) => {
+        const card = e.target.closest(".channel-card");
+        if (!card || !grid.contains(card)) return;
+        const idx = Number(card.dataset.channelIndex);
+        const ch = Number.isFinite(idx) ? grid._channelItems?.[idx] : null;
+        if (ch && grid._onChannelClick) grid._onChannelClick(ch);
+      });
+      grid.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        const card = e.target.closest(".channel-card");
+        if (!card || !grid.contains(card)) return;
+        e.preventDefault();
+        card.click();
+      });
+    }
     if (!channels.length) {
       grid.innerHTML = '<div class="browse-empty">No channels yet. Add one on the <b>Subs</b> tab to start archiving.</div>';
       return;
     }
-    const frag = document.createDocumentFragment();
-    for (const c of channels) {
-      const name = c.folder || c.name || "";
-      const vids = c.n_vids || c.video_count || "—";
-      const size = c.size || "";
-      const first = (name[0] || "?").toUpperCase();
 
-      const bannerUrl = c.banner_url || "";
-      const avatarUrl = c.avatar_url || "";
-      // Banner priority: explicit banner > avatar zoomed-to-fill > gradient.
-      const bannerSrc = bannerUrl || avatarUrl || "";
-
-      const card = document.createElement("div");
-      card.className = "channel-card";
-      card.setAttribute("role", "button");
-      card.tabIndex = 0;
-      card.setAttribute("aria-label", `Open channel ${name || "Untitled"}`);
-      if (!bannerSrc) {
-        // Pure-gradient fallback gets the tinted bg directly.
-        card.style.background = gradientFor(name);
+    const CHANNEL_BATCH = 60;
+    const CHANNEL_LAZY_THRESHOLD = 120;
+    const useLazy = channels.length > CHANNEL_LAZY_THRESHOLD;
+    let cursor = 0;
+    const appendBatch = () => {
+      const oldSentinel = Array.from(grid.children)
+        .find(el => el.classList?.contains("video-grid-sentinel"));
+      _clearGridSentinel(oldSentinel);
+      const end = useLazy ? Math.min(cursor + CHANNEL_BATCH, channels.length)
+                          : channels.length;
+      const frag = document.createDocumentFragment();
+      for (let i = cursor; i < end; i++) {
+        frag.appendChild(_buildChannelCard(channels[i], i));
       }
-      if (typeof c.transcription_pending === "number") {
-        card.dataset.pendingTx = String(c.transcription_pending);
+      grid.appendChild(frag);
+      cursor = end;
+      if (useLazy && cursor < channels.length) {
+        const sentinel = document.createElement("div");
+        sentinel.className = "video-grid-sentinel";
+        sentinel.textContent = `... ${channels.length - cursor} more, scroll to load`;
+        grid.appendChild(sentinel);
+        _observeGridSentinel(sentinel, appendBatch);
       }
-      if (typeof c.metadata_pending === "number") {
-        card.dataset.pendingMeta = String(c.metadata_pending);
-      }
-
-      // Banner + avatar URLs come from per-channel metadata (potentially
-      // user-influenced via custom configs); interpolating them into
-      // innerHTML would XSS via " onerror=... or " /><script>. Build the
-      // <img> elements via createElement + .src so the URL is treated as
-      // a URL, not as HTML to parse.
-      const letterHtml = (!bannerSrc && !avatarUrl)
-        ? `<div class="channel-letter">${escapeHtml(first)}</div>`
-        : "";
-
-      card.innerHTML = `
-        ${letterHtml}
-        <div class="channel-card-overlay">
-          <div class="channel-card-name"></div>
-          <div class="channel-card-meta"></div>
-        </div>
-      `;
-
-      if (bannerSrc) {
-        const bgEl = document.createElement("img");
-        bgEl.className = "channel-card-bg";
-        bgEl.src = bannerSrc;
-        bgEl.loading = "lazy";
-        bgEl.decoding = "async";
-        bgEl.alt = "";
-        card.insertBefore(bgEl, card.firstChild);
-      }
-      if (avatarUrl) {
-        const avEl = document.createElement("img");
-        avEl.className = "channel-avatar";
-        avEl.src = avatarUrl;
-        avEl.loading = "lazy";
-        avEl.decoding = "async";
-        avEl.alt = "";
-        card.appendChild(avEl);
-      }
-      card.querySelector(".channel-card-name").textContent = name;
-      card.querySelector(".channel-card-meta").textContent =
-        `${vids}${vids && vids !== "—" ? " videos" : ""}${size ? " · " + size : ""}`;
-
-      // Swap to gradient if the banner image fails to load.
-      const bgEl = card.querySelector(".channel-card-bg");
-      if (bgEl) {
-        bgEl.addEventListener("error", () => {
-          bgEl.remove();
-          card.style.background = gradientFor(name);
-          if (!avatarUrl && !card.querySelector(".channel-letter")) {
-            const d = document.createElement("div");
-            d.className = "channel-letter";
-            d.textContent = first;
-            card.insertBefore(d, card.firstChild);
-          }
-        }, { once: true });
-      }
-
-      card.addEventListener("click", () => onChannelClick && onChannelClick(c));
-      card.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          card.click();
-        }
-      });
-      frag.appendChild(card);
-    }
-    grid.appendChild(frag);
+    };
+    appendBatch();
 
     // Prefetch banner + avatar images in the background, throttled to a
     // few parallel fetches at a time. By the time the user scrolls past
     // the first viewport, the later cards' images are already in the
-    // browser cache and decoded — no more pop-in. Runs on idle time so
-    // it never blocks main-thread scrolling.
+    // browser cache and decoded. Runs on idle time so it never blocks
+    // main-thread scrolling.
     _prefetchChannelArt(channels);
   };
 
@@ -381,6 +419,48 @@
     return m ? Number(m[0]) : null;
   }
 
+  function _clearGridSentinel(sentinel) {
+    if (!sentinel) return;
+    try { _gridIO?.unobserve?.(sentinel); } catch {}
+    try { _gridSentinelCallbacks.delete(sentinel); } catch {}
+    try { sentinel.remove(); } catch {}
+  }
+
+  function _renderVideoBatch(container, videos, onVideoClick, batchSize,
+                             loadImmediately) {
+    if (!videos.length) return;
+    let cursor = 0;
+    const appendBatch = () => {
+      const oldSentinel = Array.from(container.children)
+        .find(el => el.classList?.contains("video-grid-sentinel"));
+      _clearGridSentinel(oldSentinel);
+
+      const end = Math.min(cursor + batchSize, videos.length);
+      const frag = document.createDocumentFragment();
+      for (let i = cursor; i < end; i++) {
+        frag.appendChild(_buildVideoCard(videos[i], onVideoClick));
+      }
+      container.appendChild(frag);
+      cursor = end;
+      if (cursor < videos.length) {
+        const sentinel = document.createElement("div");
+        sentinel.className = "video-grid-sentinel";
+        sentinel.textContent = `... ${videos.length - cursor} more, scroll to load`;
+        container.appendChild(sentinel);
+        _observeGridSentinel(sentinel, appendBatch);
+      }
+    };
+
+    if (loadImmediately) appendBatch();
+    else {
+      const sentinel = document.createElement("div");
+      sentinel.className = "video-grid-sentinel";
+      sentinel.textContent = `... ${videos.length} videos, scroll to load`;
+      container.appendChild(sentinel);
+      _observeGridSentinel(sentinel, appendBatch);
+    }
+  }
+
   window.renderVideoGrid = function (videos, onVideoClick, opts) {
     const grid = document.getElementById("video-grid");
     if (!grid) return;
@@ -454,6 +534,7 @@
     // own internal grid of cards. CSS handles the visual gaps.
     grid.classList.add("video-grid-grouped");
     const frag = document.createDocumentFragment();
+    let firstGroup = true;
     for (const y of order) {
       const vids = buckets.get(y);
       const section = document.createElement("section");
@@ -489,6 +570,7 @@
           mBuckets.get(m).push(v);
         }
         if (mUnknown.length) { mBuckets.set("?", mUnknown); mOrder.push("?"); }
+        let firstMonth = firstGroup;
         for (const m of mOrder) {
           const mVids = mBuckets.get(m);
           const mSec = document.createElement("section");
@@ -509,7 +591,8 @@
           mSec.appendChild(mHead);
           const mInner = document.createElement("div");
           mInner.className = "video-grid-year-inner";
-          for (const v of mVids) mInner.appendChild(_buildVideoCard(v, onVideoClick));
+          _renderVideoBatch(mInner, mVids, onVideoClick, BATCH, firstMonth);
+          firstMonth = false;
           mSec.appendChild(mInner);
           mHead.addEventListener("click", () => {
             const collapsed = mSec.classList.toggle("collapsed");
@@ -518,9 +601,10 @@
           inner.appendChild(mSec);
         }
       } else {
-        for (const v of vids) inner.appendChild(_buildVideoCard(v, onVideoClick));
+        _renderVideoBatch(inner, vids, onVideoClick, BATCH, firstGroup);
       }
       section.appendChild(inner);
+      firstGroup = false;
 
       head.addEventListener("click", () => {
         const collapsed = section.classList.toggle("collapsed");
@@ -593,11 +677,11 @@
   let _gridIO = null;
   const _gridSentinelCallbacks = new WeakMap();
   function _unobserveGridSentinel(grid) {
-    const oldSentinel = grid?.querySelector?.(".video-grid-sentinel");
-    if (!oldSentinel) return;
-    try { _gridIO?.unobserve?.(oldSentinel); } catch {}
-    try { _gridSentinelCallbacks.delete(oldSentinel); } catch {}
-    try { oldSentinel.remove(); } catch {}
+    const oldSentinels = Array.from(
+      grid?.querySelectorAll?.(".video-grid-sentinel") || []);
+    for (const oldSentinel of oldSentinels) {
+      _clearGridSentinel(oldSentinel);
+    }
   }
   function _observeGridSentinel(sentinel, cb) {
     if (!_gridIO) {

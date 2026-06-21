@@ -110,7 +110,8 @@ class InfoMixin:
         used when there's no config at all (preview / demo mode).
         """
         if self._config is not None:
-            return autorun_history_entries_for_ui(self._config)
+            from backend.autorun import history_entries_for_ui
+            return history_entries_for_ui(self._config)
         return []
 
 

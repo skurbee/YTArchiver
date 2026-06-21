@@ -18,7 +18,8 @@ from typing import Any
 
 from ..log import get_logger
 from ..log_stream import LogStreamer
-from ..metadata_io import (
+from ..ytarchiver_config import ConfigUnchanged
+from .io import (
     _folder_for_channel,
     _lock_for,
     _read_metadata_jsonl,
@@ -730,34 +731,19 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     # N minutes ago" for the whole channel.
     try:
         from .. import ytarchiver_config as _cfg
-        # Hold the sync-side config write lock so a concurrent
-        # settings_save / channel update doesn't read same cfg and
-        # lose this timestamp update on race (audit: refresh_views.
-        # py:582-589). _config_write_lock lives in sync/core.py.
-        try:
-            from ..sync.core import _config_write_lock as _cwl
-        except Exception as _ilex:
-            # Fail loud rather than silently dropping serialization —
-            # a concurrent settings_save could land between our load
-            # and save and lose the timestamp update (audit: H85, H94).
-            _log.error("refresh_views can't import _config_write_lock: %s "
-                       "(skipping timestamp stamp to avoid lost-update)", _ilex)
-            _cwl = None
-        def _do_stamp():
-            cfg = _cfg.load_config()
+        with _cfg.config_transaction() as cfg:
             ch_url_norm = ch_url.rstrip("/")
             now_ts = time.time()
+            matched = False
             for ch in cfg.get("channels", []):
                 if (ch.get("url") or "").rstrip("/") == ch_url_norm:
                     ch["last_views_refresh_ts"] = now_ts
+                    matched = True
                     break
-            _cfg.save_config(cfg)
-        if _cwl is not None:
-            with _cwl:
-                _do_stamp()
-        # If _cwl is None (import failed), we intentionally SKIP the
-        # stamp rather than fall through to an unserialized write that
-        # could clobber a concurrent writer.
+            if not matched:
+                raise _cfg.ConfigUnchanged()
+    except ConfigUnchanged:
+        pass
     except Exception as e:
         _log.warning("views refresh timestamp stamp failed for %r: %s",
                      name, e)

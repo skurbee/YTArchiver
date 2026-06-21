@@ -18,6 +18,7 @@ from backend import (
     cmd_server,
     compress,
     deps_installer,
+    disk_watch,
     drift_scan,
     index,
     index_bookmarks,
@@ -27,9 +28,9 @@ from backend import (
     log_stream,
     local_fileserver,
     livestreams,
-    metadata_io,
     net,
     process_runner,
+    punct_alignment,
     punct_restore,
     queues,
     redownload,
@@ -58,6 +59,8 @@ from backend.api_mixins import transcribe_mixin
 from backend.api_mixins.browse_mixin import BrowseMixin
 from backend.api_mixins.media_ops_mixin import MediaOpsMixin
 from backend.api_mixins.onboarding_mixin import OnboardingMixin
+from backend.api_mixins.redownload_mixin import RedownloadMixin
+from backend.metadata import io as metadata_io
 from backend.api_mixins.recent_mixin import RecentMixin
 from backend.api_mixins.sync_mixin import SyncMixin
 from backend.api_mixins.thumbnail_mixin import ThumbnailMixin
@@ -567,7 +570,8 @@ class FileOpsTests(unittest.TestCase):
             unhide.assert_called_once_with(str(transcript))
             self.assertFalse(transcript.exists())
 
-    def test_safe_rmtree_channel_folder_deletes_inside_archive_root(self) -> None:
+    def test_safe_rmtree_channel_folder_quarantines_inside_archive_root(
+            self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "Archive"
             folder = root / "Channel"
@@ -584,6 +588,15 @@ class FileOpsTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertTrue(result["deleted_folder"])
             self.assertFalse(folder.exists())
+            trash_path = Path(result["trashed_folder_path"])
+            self.assertTrue(trash_path.is_dir())
+            self.assertEqual(trash_path.parent.name, ".YTArchiver Trash")
+            self.assertTrue((trash_path / "video.mp4").exists())
+            manifest = json.loads(
+                (trash_path / ".ytarchiver-trash.json").read_text(
+                    encoding="utf-8"))
+            self.assertEqual(manifest["original_path"],
+                             os.path.normpath(str(folder)))
 
     def test_safe_rmtree_channel_folder_rejects_outside_archive_root(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1269,6 +1282,13 @@ class ThumbnailMixinTests(unittest.TestCase):
 
 
 class SubsTests(unittest.TestCase):
+    class _InlineThread:
+        def __init__(self, target, *args, **kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
     def test_relocate_channel_rejects_realpath_escape(self) -> None:
         class Api(subs_mixin.SubsMixin):
             def _reload_config(self):
@@ -1350,6 +1370,61 @@ class SubsTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         disk.assert_called_once_with("https://www.youtube.com/@example")
         id_cache.assert_called_once_with("https://www.youtube.com/@example")
+
+    def test_subs_queue_all_worker_uses_fresh_config(self) -> None:
+        class Api(subs_mixin.SubsMixin):
+            pass
+
+        api = Api()
+        api._config = {"channels": [{"name": "Stale"}]}
+        api._log_stream = mock.Mock()
+        api._window = None
+        api.chan_transcribe_all = mock.Mock(return_value={
+            "ok": True, "queued": 1})
+
+        with mock.patch.object(subs_mixin, "load_config",
+                               return_value={
+                                   "channels": [{"name": "Fresh"}],
+                               }), \
+                mock.patch.object(subs_mixin.threading, "Thread",
+                                  self._InlineThread):
+            result = api.subs_queue_all()
+
+        self.assertEqual(result, {"ok": True, "started": True})
+        api.chan_transcribe_all.assert_called_once_with("Fresh")
+
+    def test_subs_queue_pending_worker_uses_fresh_config(self) -> None:
+        class Api(subs_mixin.SubsMixin):
+            pass
+
+        api = Api()
+        api._config = {"channels": [{"name": "Stale"}]}
+        api._log_stream = mock.Mock()
+        api._window = None
+        api._on_queue_changed = mock.Mock()
+        api.sync_is_running = mock.Mock(return_value=False)
+        api.chan_transcribe_pending = mock.Mock(return_value={
+            "ok": True, "queued": 1})
+
+        cfg0 = {"output_dir": "Z:/Archive", "channels": []}
+        fresh = {
+            "output_dir": "Z:/Archive",
+            "autorun_sync": False,
+            "channels": [{
+                "name": "Fresh",
+                "url": "https://youtube.com/@fresh",
+                "pending_tx_ids": ["abc123_def4"],
+            }],
+        }
+        with mock.patch.object(subs_mixin, "load_config",
+                               side_effect=[cfg0, fresh, fresh]), \
+                mock.patch.object(subs_mixin.threading, "Thread",
+                                  self._InlineThread):
+            result = api.subs_queue_pending()
+
+        self.assertEqual(result, {"ok": True, "started": True})
+        api.chan_transcribe_pending.assert_called_once_with("Fresh")
+        api._on_queue_changed.assert_called_once()
 
 
 class MetadataMixinTests(unittest.TestCase):
@@ -1781,29 +1856,58 @@ class AutorunTests(unittest.TestCase):
         self.assertFalse(result["persisted"])
         self.assertEqual(result["mode"], "clock")
 
-    def test_append_history_uses_config_transaction(self) -> None:
-        cfg = {"autorun_history": [{"old": True}]}
+    def test_append_history_writes_jsonl_and_seeds_old_config(self) -> None:
+        cfg = {"autorun_history": ["old"]}
+        with tempfile.TemporaryDirectory() as td:
+            history_file = Path(td) / "autorun_history.jsonl"
 
-        with mock.patch.object(autorun_backend, "config_is_writable",
-                               return_value=True), \
-                mock.patch.object(autorun_backend, "config_transaction",
-                                  return_value=self._tx(cfg)):
-            ok = autorun_backend.append_history_entry("new")
+            with mock.patch.object(autorun_backend, "AUTORUN_HISTORY_FILE",
+                                   history_file), \
+                    mock.patch.object(autorun_backend, "config_is_writable",
+                                      return_value=True), \
+                    mock.patch.object(autorun_backend, "load_config",
+                                      return_value=cfg):
+                ok = autorun_backend.append_history_entry("new")
+                entries = autorun_backend._read_history_file(history_file)
 
         self.assertTrue(ok)
-        self.assertEqual(cfg["autorun_history"], [{"old": True}, "new"])
+        self.assertEqual(entries, ["old", "new"])
 
-    def test_clear_history_uses_config_transaction(self) -> None:
+    def test_history_entries_for_ui_prefers_jsonl_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            history_file = Path(td) / "autorun_history.jsonl"
+            history_file.write_text(
+                json.dumps("[ Auto] 7:00pm, Jun 20 — New — 1 downloaded")
+                + "\n",
+                encoding="utf-8")
+
+            with mock.patch.object(autorun_backend, "AUTORUN_HISTORY_FILE",
+                                   history_file):
+                rows = autorun_backend.history_entries_for_ui({
+                    "autorun_history": [
+                        "[ Auto] 6:00pm, Jun 20 — Old — 1 downloaded"
+                    ]
+                })
+
+        self.assertEqual(rows[0]["cells"]["channel"], "New")
+
+    def test_clear_history_removes_jsonl_and_old_config_history(self) -> None:
         cfg = {"autorun_history": [{"old": True}]}
+        with tempfile.TemporaryDirectory() as td:
+            history_file = Path(td) / "autorun_history.jsonl"
+            history_file.write_text(json.dumps("new") + "\n", encoding="utf-8")
 
-        with mock.patch.object(autorun_backend, "config_is_writable",
-                               return_value=True), \
-                mock.patch.object(autorun_backend, "config_transaction",
-                                  return_value=self._tx(cfg)):
-            result = autorun_backend.clear_history()
+            with mock.patch.object(autorun_backend, "AUTORUN_HISTORY_FILE",
+                                   history_file), \
+                    mock.patch.object(autorun_backend, "config_is_writable",
+                                      return_value=True), \
+                    mock.patch.object(autorun_backend, "config_transaction",
+                                      return_value=self._tx(cfg)):
+                result = autorun_backend.clear_history()
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["removed"], 1)
+        self.assertEqual(result["removed"], 2)
+        self.assertFalse(history_file.exists())
         self.assertEqual(cfg["autorun_history"], [])
 
 
@@ -1952,6 +2056,19 @@ class TranscribeMixinTests(unittest.TestCase):
 
 
 class PunctuationManagerTests(unittest.TestCase):
+    def test_joined_text_and_word_ends_uses_exact_joined_string(self) -> None:
+        words = ["same", "same", "cafe\u0301", "emoji\U0001f642"]
+
+        text, offsets = punct_alignment.joined_text_and_word_ends(words)
+
+        self.assertEqual(text, "same same cafe\u0301 emoji\U0001f642")
+        self.assertEqual([text[:end] for end in offsets], [
+            "same",
+            "same same",
+            "same same cafe\u0301",
+            "same same cafe\u0301 emoji\U0001f642",
+        ])
+
     def test_punctuate_guards_missing_proc_after_start(self) -> None:
         stream = mock.Mock()
         mgr = PunctuationManager(stream)
@@ -2237,6 +2354,42 @@ class TranscribeManagerQueueTests(unittest.TestCase):
         self.assertIn("Traceback...ValueError",
                       stream.emit_dim.call_args.args[0])
 
+    def test_bump_transcription_pending_uses_config_transaction(self) -> None:
+        cfg = {
+            "channels": [{
+                "name": "Channel",
+                "folder": "Channel Folder",
+                "transcription_pending": 1,
+                "transcription_complete": True,
+            }]
+        }
+
+        class Tx:
+            def __enter__(self):
+                return cfg
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with mock.patch("backend.ytarchiver_config.config_is_writable",
+                        return_value=True), \
+                mock.patch("backend.ytarchiver_config.config_transaction",
+                           return_value=Tx()) as tx:
+            transcribe_helpers._bump_transcription_pending("Channel", 1)
+
+        tx.assert_called_once()
+        self.assertEqual(cfg["channels"][0]["transcription_pending"], 2)
+        self.assertFalse(cfg["channels"][0]["transcription_complete"])
+
+        with mock.patch("backend.ytarchiver_config.config_is_writable",
+                        return_value=True), \
+                mock.patch("backend.ytarchiver_config.config_transaction",
+                           return_value=Tx()):
+            transcribe_helpers._bump_transcription_pending("Channel Folder", -2)
+
+        self.assertEqual(cfg["channels"][0]["transcription_pending"], 0)
+        self.assertTrue(cfg["channels"][0]["transcription_complete"])
+
 
 class Python311DiscoveryTests(unittest.TestCase):
     def test_find_python311_rejects_310_and_accepts_validated_311(self) -> None:
@@ -2458,6 +2611,23 @@ class RedownloadTests(unittest.TestCase):
         self.assertEqual(broken, {"broken_video": 2})
         self.assertFalse(legacy_exists)
 
+    def test_progress_load_keeps_done_ids_after_resolution_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            redownload._save_progress(
+                str(root),
+                "https://youtube.com/@example",
+                "720",
+                {"done_video"},
+                {"broken_video": 3},
+            )
+
+            done, broken = redownload._load_progress_state(
+                str(root), "https://youtube.com/@example", "1080")
+
+        self.assertEqual(done, {"done_video"})
+        self.assertEqual(broken, {"broken_video": 3})
+
     def test_progress_state_migrates_and_clears_legacy_broken_counts(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -2482,6 +2652,34 @@ class RedownloadTests(unittest.TestCase):
         self.assertEqual(broken, {"legacy_video": 2})
         self.assertFalse(progress_exists)
         self.assertFalse(legacy_exists)
+
+
+class RedownloadMixinTests(unittest.TestCase):
+    def test_resume_pending_redownloads_preserves_url_and_scope(self) -> None:
+        class Api(RedownloadMixin):
+            def __init__(self):
+                self._queues = mock.Mock()
+                self._queues.sync = [{
+                    "kind": "redownload",
+                    "name": "Display Name",
+                    "url": "https://youtube.com/@correct",
+                    "redownload_res": "1080",
+                    "scope": {"year": "2024", "month": 5},
+                }]
+                self.chan_redownload = mock.Mock(return_value={"ok": True})
+
+        api = Api()
+
+        result = api.resume_pending_redownloads()
+
+        self.assertEqual(result, {"ok": True, "resumed": 1, "skipped": 0})
+        api._queues.sync_remove.assert_called_once_with(
+            "https://youtube.com/@correct")
+        api.chan_redownload.assert_called_once_with(
+            {"url": "https://youtube.com/@correct"},
+            "1080",
+            scope={"year": "2024", "month": 5},
+        )
 
 
 class MediaOpsMixinTests(unittest.TestCase):
@@ -2538,6 +2736,29 @@ class MediaOpsMixinTests(unittest.TestCase):
 class SyncCoreTests(unittest.TestCase):
     def tearDown(self) -> None:
         sync_core._LAST_429_BACKOFF_TS = 0.0
+
+    def test_sync_channel_preflight_does_not_create_channel_folder_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            stream = mock.Mock()
+            channel = {
+                "name": "New Channel",
+                "url": "https://www.youtube.com/@newchannel",
+            }
+
+            with mock.patch.object(sync_core, "find_yt_dlp",
+                                   return_value="yt-dlp"), \
+                    mock.patch.object(sync_core, "load_config",
+                                      return_value={"output_dir": str(root)}), \
+                    mock.patch.object(utils, "check_directory_writable",
+                                      return_value=False), \
+                    mock.patch.object(utils, "check_disk_space",
+                                      return_value=True):
+                result = sync_core.sync_channel(channel, stream)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["reason"], "write blocked")
+            self.assertFalse((root / "New Channel").exists())
 
     def test_429_backoff_uses_locked_process_wide_cooldown(self) -> None:
         stream = mock.Mock()
@@ -2602,8 +2823,31 @@ class CompressTests(unittest.TestCase):
             self.assertEqual(result["kept_path"], str(kept))
             self.assertEqual(video.read_bytes(), original)
             self.assertEqual(kept.read_bytes(), b"small")
+            self.assertFalse((Path(td) / "sample_TEMP_COMPRESS_"
+                              f"{os.getpid()}_abc123.mp4.lock").exists())
             stream.emit_error.assert_called_once()
             self.assertIn("original was not replaced",
+                          stream.emit_error.call_args.args[0])
+
+    def test_compress_refuses_to_run_without_temp_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            video = Path(td) / "sample.mp4"
+            video.write_bytes(b"x" * 100)
+            stream = mock.Mock()
+
+            with mock.patch.object(compress, "find_ffmpeg",
+                                   return_value="ffmpeg"), \
+                    mock.patch("secrets.token_hex", return_value="abc123"), \
+                    mock.patch("builtins.open",
+                               side_effect=OSError("lock denied")), \
+                    mock.patch.object(compress.subprocess, "Popen") as popen:
+                result = compress.compress_video(str(video), stream)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["reason"], "lock_failed")
+            popen.assert_not_called()
+            stream.emit_error.assert_called_once()
+            self.assertIn("Could not protect the compression temp file",
                           stream.emit_error.call_args.args[0])
 
 
@@ -3273,6 +3517,19 @@ class QueueStateTests(unittest.TestCase):
                 q1.mark_orphan()
                 q2.mark_orphan()
 
+    def test_sync_snapshot_is_lock_protected_copy(self) -> None:
+        q = queues.QueueState()
+        try:
+            q.sync = [{"name": "One", "url": "u1"}]
+
+            snap = q.sync_snapshot()
+            snap[0]["name"] = "Changed"
+            snap.append({"name": "Two", "url": "u2"})
+
+            self.assertEqual(q.sync, [{"name": "One", "url": "u1"}])
+        finally:
+            q.mark_orphan()
+
     def test_corrupt_queue_file_is_sidelined(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             queue_file = Path(td) / "queue.json"
@@ -3285,6 +3542,263 @@ class QueueStateTests(unittest.TestCase):
                     self.assertTrue(Path(str(queue_file) + ".bak").exists())
             finally:
                 q.mark_orphan()
+
+    def test_queue_save_failure_warns_once(self) -> None:
+        q = queues.QueueState()
+        try:
+            with mock.patch("builtins.open",
+                            side_effect=OSError("disk offline")), \
+                    mock.patch.object(queues._log, "warning") as warn:
+                self.assertFalse(q._write_save_payload({"sync": []}))
+                self.assertFalse(q._write_save_payload({"sync": []}))
+
+            warn.assert_called_once()
+            self.assertIn("Queue state could not be saved",
+                          warn.call_args.args[0])
+        finally:
+            q.mark_orphan()
+
+    def test_save_debounced_reuses_single_saver_thread(self) -> None:
+        q = queues.QueueState()
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+            def is_alive(self):
+                return self.started
+
+        made = []
+
+        def fake_thread(*args, **kwargs):
+            t = FakeThread(*args, **kwargs)
+            made.append(t)
+            return t
+
+        try:
+            with mock.patch.object(queues.threading, "Thread",
+                                   side_effect=fake_thread), \
+                    mock.patch.object(queues.threading, "Timer") as timer:
+                q.save_debounced()
+                first_deadline = q._save_deadline
+                q.save_debounced()
+                q.save_debounced()
+
+            self.assertEqual(len(made), 1)
+            self.assertGreaterEqual(q._save_deadline, first_deadline)
+            timer.assert_not_called()
+        finally:
+            q.mark_orphan()
+
+    def test_notify_reuses_single_dispatcher_thread(self) -> None:
+        q = queues.QueueState()
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+            def is_alive(self):
+                return self.started
+
+        made = []
+
+        def fake_thread(*args, **kwargs):
+            t = FakeThread(*args, **kwargs)
+            made.append(t)
+            return t
+
+        try:
+            q.add_listener(lambda: None)
+            with mock.patch.object(queues.threading, "Thread",
+                                   side_effect=fake_thread):
+                q._notify()
+                q._notify()
+                q._notify()
+
+            self.assertEqual(len(made), 1)
+            self.assertEqual(made[0].kwargs.get("name"), "queues-notify")
+            target = made[0].kwargs.get("target")
+            self.assertIs(target.__self__, q)
+            self.assertIs(target.__func__, queues.QueueState._notify_loop)
+            self.assertTrue(q._notify_dirty)
+        finally:
+            q.mark_orphan()
+
+    def test_current_item_save_false_schedules_retry(self) -> None:
+        q = queues.QueueState()
+        try:
+            with mock.patch.object(queues, "config_is_writable",
+                                   return_value=True), \
+                    mock.patch.object(q, "_write_resuming_payload",
+                                      return_value=False), \
+                    mock.patch.object(q, "_write_save_payload") as full_save, \
+                    mock.patch.object(q, "save_debounced") as retry:
+                q.set_current_sync({"name": "C", "url": "u"})
+                q.set_current_gpu({"title": "V", "path": "v.mp4"})
+
+            self.assertEqual(retry.call_count, 2)
+            full_save.assert_not_called()
+        finally:
+            q.mark_orphan()
+
+    def test_current_item_sidecar_overrides_main_resuming(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            queue_file = Path(td) / "queue.json"
+            q1 = queues.QueueState()
+            q2 = queues.QueueState()
+            try:
+                with mock.patch.object(queues, "QUEUE_FILE", queue_file), \
+                        mock.patch.object(queues, "config_is_writable",
+                                          return_value=True), \
+                        mock.patch.object(queues.QueueState, "save_debounced",
+                                          return_value=None):
+                    q1.current_sync = {"name": "Stale", "url": "old"}
+                    self.assertTrue(q1.save_now())
+
+                    q1.set_current_sync({"name": "Current", "url": "new"})
+                    sidecar = q1._resuming_file()
+                    self.assertTrue(sidecar.exists())
+                    self.assertTrue(q2.load())
+
+                self.assertEqual(q2.get_loaded_resuming()["sync"]["name"],
+                                 "Current")
+            finally:
+                q1.mark_orphan()
+                q2.mark_orphan()
+
+    def test_empty_current_item_sidecar_clears_main_resuming(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            queue_file = Path(td) / "queue.json"
+            q1 = queues.QueueState()
+            q2 = queues.QueueState()
+            try:
+                with mock.patch.object(queues, "QUEUE_FILE", queue_file), \
+                        mock.patch.object(queues, "config_is_writable",
+                                          return_value=True), \
+                        mock.patch.object(queues.QueueState, "save_debounced",
+                                          return_value=None):
+                    q1.current_sync = {"name": "Stale", "url": "old"}
+                    self.assertTrue(q1.save_now())
+
+                    q1.set_current_sync(None)
+                    sidecar = q1._resuming_file()
+                    self.assertTrue(sidecar.exists())
+                    self.assertTrue(q2.load())
+
+                self.assertEqual(q2.get_loaded_resuming(), {})
+            finally:
+                q1.mark_orphan()
+                q2.mark_orphan()
+
+    def test_gpu_payload_includes_kind_title_and_channel(self) -> None:
+        q = queues.QueueState()
+        try:
+            q.current_gpu = {
+                "kind": "compress",
+                "title": "Video Title",
+                "channel": "Channel Name",
+                "path": "video.mp4",
+            }
+            row = q.to_ui_payload()["gpu"][0]
+
+            self.assertEqual(row["kind"], "compress")
+            self.assertEqual(row["title"], "Video Title")
+            self.assertEqual(row["channel"], "Channel Name")
+            self.assertTrue(row["name"].startswith("Compressing "))
+        finally:
+            q.mark_orphan()
+
+    def test_sync_remove_at_uses_identity_when_index_stale(self) -> None:
+        q = queues.QueueState()
+        try:
+            q.sync = [
+                {"name": "One", "url": "https://example.test/one"},
+                {"name": "Two", "url": "https://example.test/two"},
+            ]
+
+            self.assertTrue(q.sync_remove_at(
+                0, expected_url="https://example.test/two"))
+
+            self.assertEqual(q.sync,
+                             [{"name": "One",
+                               "url": "https://example.test/one"}])
+            self.assertFalse(q.sync_remove_at(
+                0, expected_url="https://example.test/missing"))
+            self.assertEqual(len(q.sync), 1)
+        finally:
+            q.mark_orphan()
+
+    def test_gpu_remove_at_uses_identity_when_index_stale(self) -> None:
+        q = queues.QueueState()
+        try:
+            q.gpu = [
+                {"path": "one.mp4", "bulk_id": "b1"},
+                {"path": "two.mp4", "bulk_id": "b2"},
+            ]
+
+            self.assertTrue(q.gpu_remove_at(0, expected_path="two.mp4"))
+
+            self.assertEqual(q.gpu, [{"path": "one.mp4", "bulk_id": "b1"}])
+            self.assertFalse(q.gpu_remove_at(0, expected_path="missing.mp4"))
+            self.assertEqual(len(q.gpu), 1)
+        finally:
+            q.mark_orphan()
+
+
+class DiskWatchTests(unittest.TestCase):
+    def test_retry_tick_recovery_resumes_once_when_raced(self) -> None:
+        stream = mock.Mock()
+        on_resume = mock.Mock()
+        monitor = disk_watch.DiskErrorMonitor(
+            stream, mock.Mock(), on_resume, lambda: "Z:\\Archive")
+        monitor._active = True
+        monitor._path = "Z:\\Archive"
+        barrier = threading.Barrier(2)
+
+        def check(_path):
+            barrier.wait(timeout=2)
+            return True
+
+        with mock.patch.object(disk_watch, "_check_directory_writable",
+                               side_effect=check):
+            t1 = threading.Thread(target=monitor._retry_tick)
+            t2 = threading.Thread(target=monitor._retry_tick)
+            t1.start()
+            t2.start()
+            t1.join(timeout=3)
+            t2.join(timeout=3)
+
+        self.assertFalse(t1.is_alive())
+        self.assertFalse(t2.is_alive())
+        on_resume.assert_called_once()
+
+
+class SyncMixinQueueTests(unittest.TestCase):
+    def test_gpu_defer_removes_existing_duplicate_before_enqueue(self) -> None:
+        api = sync_mixin.SyncMixin()
+        queues_mock = mock.Mock()
+        queues_mock.current_gpu = {"title": "Video", "path": "video.mp4"}
+        api._queues = queues_mock
+        api._log_stream = mock.Mock()
+        api.gpu_skip_current = mock.Mock(return_value={"ok": True})
+
+        result = api.gpu_defer_current()
+
+        self.assertEqual(result, {"ok": True})
+        queues_mock.gpu_remove.assert_called_once_with("video.mp4")
+        queues_mock.gpu_enqueue.assert_called_once_with(
+            {"title": "Video", "path": "video.mp4"})
+        api.gpu_skip_current.assert_called_once()
 
 
 class IndexGraphShapeTests(unittest.TestCase):
@@ -3612,6 +4126,33 @@ class IndexIngestTests(unittest.TestCase):
             self.assertIn(os.path.dirname(a), keys)
             self.assertIn(os.path.dirname(c), keys)
             self.assertNotIn(os.path.dirname(b), keys)
+
+    def test_register_video_resolves_direct_sidecar_through_cached_map(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "transcription_index.db"
+            video_dir = Path(td) / "Channel"
+            video_dir.mkdir()
+            video_path = video_dir / "Direct Sidecar.mp4"
+            video_path.write_bytes(b"video")
+            (video_dir / "Direct Sidecar.info.json").write_text(
+                json.dumps({"id": "abc123_def4"}),
+                encoding="utf-8")
+
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                self._reset_index_module()
+                try:
+                    self.assertTrue(index.register_video(
+                        str(video_path), "Channel", "Direct Sidecar"))
+                    conn = index._open()
+                    self.assertIsNotNone(conn)
+                    assert conn is not None
+                    row = conn.execute(
+                        "SELECT video_id FROM videos WHERE filepath=?",
+                        (os.path.normpath(str(video_path)),),
+                    ).fetchone()
+                    self.assertEqual(row[0], "abc123_def4")
+                finally:
+                    self._reset_index_module()
 
     def test_summary_uses_independent_connection(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -4149,6 +4690,35 @@ class RepairCaptionsTests(unittest.TestCase):
 
 
 class DriftScanTests(unittest.TestCase):
+    def test_scan_txt_titles_streams_headers_without_reading_whole_file(self) -> None:
+        class LineOnlyFile:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def __iter__(self):
+                return iter([
+                    "===(Video Title [abc123_def4]), (01.02.2024), "
+                    "(0:03), (WHISPER)===\n",
+                    "large transcript body that should not matter\n",
+                ])
+
+            def read(self, *_args, **_kwargs):
+                raise AssertionError("drift scan should not read whole files")
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "Channel Transcript.txt"
+            path.write_text("", encoding="utf-8")
+
+            with mock.patch("builtins.open", return_value=LineOnlyFile()):
+                titles = drift_scan._scan_txt_titles(td)
+
+        recs = titles[drift_scan._norm_title("Video Title [abc123_def4]")]
+        self.assertEqual(recs[0]["raw"], "Video Title [abc123_def4]")
+        self.assertEqual(recs[0]["video_id"], "abc123_def4")
+
     def test_channel_folder_uses_canonical_folder_override(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

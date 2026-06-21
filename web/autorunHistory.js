@@ -4,13 +4,6 @@
 (function () {
   "use strict";
 
-  const _browseState = window._browseState || {};
-  const showContextMenu = window.showContextMenu || (() => {});
-  const askConfirm = window.askConfirm;
-  const askDanger = window.askDanger;
-  const askQuestion = window.askQuestion;
-  const askChoice = window.askChoice;
-  const askTextInput = window.askTextInput;
   const escapeHtml = window.YT?.util?.escapeHtml || ((s) => String(s ?? ""));
   function bridgeCall(method, ...args) {
     const fn = window.YT?.bridge?.bridgeCall;
@@ -51,7 +44,7 @@
         const count = document.getElementById("autorun-history-count");
         if (count) count.textContent = "load failed";
         if (body) {
-          body.innerHTML = `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
+          body.innerHTML = `<div class="browse-empty askq-empty-padded askq-empty-danger">`
             + `Could not load autorun history: ${escapeHtml(String(e))}</div>`;
         }
         window._showToast?.(`Could not load autorun history: ${e}`, "warn");
@@ -116,15 +109,14 @@
       matches.push({ text, ent });
     }
     if (!matches.length) {
-      body.innerHTML = '<div style="padding: 16px; color: var(--c-dim); font-style: italic; text-align:center;">No matching entries.</div>';
+      body.innerHTML = '<div class="askq-empty-padded askq-empty-muted">No matching entries.</div>';
       return;
     }
     const frag = document.createDocumentFragment();
     for (const { text } of matches) {
       const row = document.createElement("div");
-      row.className = "ah-row";
+      row.className = "ah-row autorun-history-row";
       row.textContent = text;
-      row.style.cssText = "padding: 3px 12px; white-space: pre; color: var(--c-log-txt); border-bottom: 1px solid rgba(255,255,255,0.02);";
       frag.appendChild(row);
     }
     body.appendChild(frag);

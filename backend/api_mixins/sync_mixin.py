@@ -667,6 +667,15 @@ class SyncMixin:
             cur = self._queues.current_gpu
             if cur:
                 deferred = dict(cur)
+                try:
+                    key = ((deferred.get("id") or deferred.get("path")
+                            or deferred.get("task_id") or "").strip())
+                    if key:
+                        self._queues.gpu_remove(key)
+                    elif deferred.get("bulk_id"):
+                        self._queues.gpu_remove_bulk(str(deferred.get("bulk_id") or ""))
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
                 self._queues.gpu_enqueue(deferred)
                 self._log_stream.emit([
                     ["[GPU] ", "trans_bracket"],

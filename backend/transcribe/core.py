@@ -65,9 +65,9 @@ _log = get_logger(__name__)
 
 
 # path + format + hide helpers moved to
-# transcribe_paths.py. Re-imported here so internal calls and external
+# transcribe/paths.py. Re-imported here so internal calls and external
 # `from backend.transcribe import _foo` callers keep working.
-from ..transcribe_paths import (  # noqa: F401
+from .paths import (  # noqa: F401
     _get_jsonl_sidecar,
     _get_transcript_filename,
 )
@@ -2507,7 +2507,7 @@ class TranscribeManager:
                         # dead code for every hidden transcript .jsonl.
                         import tempfile as _tf
 
-                        from ..transcribe_paths import _hide_file_win as _rb_hide
+                        from .paths import _hide_file_win as _rb_hide
                         _fd, _rb_tmp = _tf.mkstemp(
                             suffix=".jsonl.tmp",
                             dir=os.path.dirname(jsonl_path) or ".")

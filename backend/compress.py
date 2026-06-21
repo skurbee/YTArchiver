@@ -240,469 +240,454 @@ def compress_video(input_path: str, stream: LogStreamer,
     import secrets as _secrets
     _uniq = f"_TEMP_COMPRESS_{os.getpid()}_{_secrets.token_hex(3)}"
     temp_path = base + _uniq + ext
-    # write a .lock sidecar next to the temp file so a
-    # concurrent startup_cleanup_temps pass (e.g. second-instance launch)
-    # doesn't nuke this in-flight encode. _LockGuard removes it via
-    # __del__ when the function returns (CPython refcount semantics —
-    # same pattern as sync.py's _ExecGuard). Inert if directory isn't
-    # writable.
+    # Write a .lock sidecar next to the temp file so a concurrent
+    # startup_cleanup_temps pass (e.g. second-instance launch) doesn't
+    # delete this in-flight encode.
     lock_path = temp_path + ".lock"
     try:
         with open(lock_path, "w", encoding="utf-8") as _lk:
             _lk.write(str(int(time.time())))
     except OSError as _le:
-        # Lock-write failure silently disabled the "active encode"
-        # protection — startup_cleanup_temps was free to nuke this
-        # in-flight encode after 30 min if the dir mtime hadn't been
-        # touched recently (audit: temp_cleanup.py:38-53). Warn so
-        # the user sees this encode is unprotected.
-        try:
-            stream.emit_dim(
-                f" (warning: couldn't create .lock for compress temp; "
-                f"long encodes may be vulnerable to cleanup: {_le})")
-        except Exception:
-            pass
-        lock_path = ""
-
-    class _LockGuard:
-        __slots__ = ("_path",)
-        def __init__(self, p: str): self._path = p
-        def __del__(self):
-            try:
-                if self._path:
-                    os.remove(self._path)
-            except OSError:
-                pass
-    _lock_guard = _LockGuard(lock_path)  # noqa: F841 — held for cleanup
-
-    # per-file in-place marker so the "Encoding ...", every
-    # progress-bar update, and the final ✓ done line all REPLACE one
-    # another at the same scroll position. Without this the progress
-    # bar persisted next to the per-video block while the done line
-    # landed minutes later at log bottom, under unrelated channels.
-    # Hash the basename so any non-ascii / spaces / quotes are safe in
-    # the tag string (must match \w+ rules in logs.js _inplaceKind).
-    import hashlib as _hashlib
-    _marker_tag = "compress_done_" + _hashlib.md5(
-        os.path.basename(input_path).encode("utf-8", "replace")
-    ).hexdigest()[:12]
-
-    # Determine bitrates
-    mb_per_hr = get_bitrate(quality, output_res)
-    target_total_kbps = (mb_per_hr * 1024 * 8) / 3600
-    audio_kbps = 128
-    video_kbps = max(int(target_total_kbps - audio_kbps), 50)
-
-    # Probe duration
-    dur = get_video_duration(input_path, ffmpeg)
-
-    orig_size = os.path.getsize(input_path)
-    # Probe the source codec too so the user can see why we're
-    # re-encoding (e.g. h264 \u2192 av1) and notice if we're wasting time
-    # re-encoding an already-av1 file. Verbose-only.
-    try:
-        src_codec = get_video_codec(input_path, ffmpeg)
-    except Exception:
-        src_codec = ""
-
-    # Build ffmpeg command (matches YTArchiver.py:9488)
-    cmd = [ffmpeg, "-y", "-i", input_path]
-    if output_res and str(output_res).isdigit():
-        cmd += ["-vf", f"scale=-2:{output_res}"]
-    cmd += [
-        "-c:v", "av1_nvenc",
-        "-rc", "vbr",
-        "-cq", "32",
-        "-b:v", f"{video_kbps}k",
-        "-maxrate", f"{int(video_kbps * 1.5)}k",
-        "-preset", "p6",
-        "-multipass", "2",
-        "-c:a", "aac", "-b:a", f"{audio_kbps}k",
-        "-movflags", "+faststart",
-        "-metadata", "comment=ytarchiver_compressed=1",
-        temp_path,
-    ]
-
-    name = os.path.basename(input_path)
-    display = name if len(name) <= 60 else name[:57] + "..."
-    # Em-dash prefix (compress-color) + white body, matching classic
-    # simpleline_compress painter output (brackets/em-dashes colored,
-    # body text default).
-    stream.emit([
-        ["  \u2014 ", ["simpleline_compress", _marker_tag]],
-        ["Encoding ", ["simpleline", _marker_tag]],
-        [f'"{display}"', ["encode_title", _marker_tag]],
-        [f" \u2014 {quality} / {output_res}p\n", ["dim", _marker_tag]],
-    ])
-
-    # VERBOSE-ONLY diagnostics. All `dim`-tagged so Simple mode drops
-    # the whole line via `_line_is_verbose_only`. Design intent:
-    # verbose mode should be densely informative — surface every
-    # input/decision/command so users
-    # debugging a bad encode can see exactly what ffmpeg was told.
-    _dur_str = (f"{int(dur//60):02d}:{int(dur%60):02d}"
-                if dur > 0 else "unknown")
-    _src_codec_str = src_codec or "unknown"
-    _full_path = input_path
-    stream.emit([
-        ["    \u2014 ", ["dim"]],
-        [f"source: {_full_path}\n", ["dim"]],
-    ])
-    stream.emit([
-        ["    \u2014 ", ["dim"]],
-        [f"probed: {_dur_str} duration, "
-         f"{orig_size:,} bytes ({orig_size/1024/1024:.1f} MB), "
-         f"codec={_src_codec_str}\n", ["dim"]],
-    ])
-    stream.emit([
-        ["    \u2014 ", ["dim"]],
-        [f"target: {mb_per_hr} MB/hr "
-         f"({target_total_kbps:.0f} kbps total = "
-         f"{video_kbps} kbps video + {audio_kbps} kbps audio)\n",
-         ["dim"]],
-    ])
-    stream.emit([
-        ["    \u2014 ", ["dim"]],
-        [f"encoder: av1_nvenc \u00b7 preset p6 \u00b7 multipass 2 \u00b7 "
-         f"rc vbr \u00b7 cq 32 \u00b7 maxrate {int(video_kbps * 1.5)}k\n",
-         ["dim"]],
-    ])
-    # Full ffmpeg command \u2014 single line, easy to copy-paste into a
-    # terminal for manual reproduction. Truncate at 600 chars in case
-    # the input path is absurdly long.
-    _cmd_str = " ".join(repr(c) if " " in c or '"' in c else c for c in cmd)
-    if len(_cmd_str) > 600:
-        _cmd_str = _cmd_str[:600] + "\u2026"
-    stream.emit([
-        ["    \u2014 ", ["dim"]],
-        [f"ffmpeg cmd: {_cmd_str}\n", ["dim"]],
-    ])
-
-    t0 = time.time()
-    try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            startupinfo=_startupinfo, encoding="utf-8", errors="replace", bufsize=1,
-        )
-        # register ffmpeg with PROCESS_REGISTRY so
-        # shutdown's kill_all() reaps it even if the encode is mid-flight.
-        try:
-            from .process_runner import PROCESS_REGISTRY
-            PROCESS_REGISTRY.register(proc)
-        except Exception:
-            pass
-    except OSError as e:
-        stream.emit_error(f"Couldn't start video compression: {e}")
-        return {"ok": False, "error": str(e)}
-
-    # Drain stderr on a side thread + read lines from a queue with a
-    # timeout. The previous `for line in proc.stderr:` blocked on
-    # readline forever when ffmpeg stopped producing output (NVENC
-    # driver wedge, paused pipeline, etc.) \u2014 cancel_event would not be
-    # checked again until a new line arrived. With a polling queue.get,
-    # cancel is reacted to within 250ms regardless of ffmpeg output.
-    import queue as _queue
-    _stderr_q: _queue.Queue = _queue.Queue()
-    _SENTINEL = object()
-
-    def _drain_stderr():
-        try:
-            for _l in proc.stderr:
-                _stderr_q.put(_l)
-        except Exception as _de:
-            _log.debug("stderr drain failed: %s", _de)
-        finally:
-            _stderr_q.put(_SENTINEL)
-
-    _stderr_thread = threading.Thread(
-        target=_drain_stderr, daemon=True,
-        name=f"compress-stderr-drain-{os.getpid()}")
-    _stderr_thread.start()
-
-    last_pct = -1
-    first_progress_emitted = False
-    while True:
-        if cancel_event is not None and cancel_event.is_set():
-            try:
-                proc.terminate()
-                proc.wait(timeout=3)
-            except Exception:
-                proc.kill()
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-            stream.emit_text(" \u26d4 Encode cancelled.", "red")
-            return {"ok": False, "reason": "cancelled"}
-        try:
-            line = _stderr_q.get(timeout=0.25)
-        except _queue.Empty:
-            # Check process is still alive \u2014 if ffmpeg died without
-            # writing more stderr, the drain thread will push SENTINEL
-            # soon. Loop continues so cancel_event still gets polled.
-            if proc.poll() is not None and _stderr_q.empty():
-                break
-            continue
-        if line is _SENTINEL:
-            break
-
-        m = _FFMPEG_TIME_RE.search(line)
-        if m and dur > 0:
-            sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
-            pct = min(99, int(sec / dur * 100))
-            # Bug [26]: emit at the FIRST progress sample regardless of
-            # whether it lands on a 5% boundary. A fast encode that goes
-            # straight from 0% to 6% to 12% would otherwise never trigger
-            # an emit (none of those % 5 == 0), leaving the UI stuck at
-            # the initial state until the encode completes.
-            should_emit = (pct != last_pct
-                           and (pct % 5 == 0 or not first_progress_emitted))
-            if should_emit:
-                last_pct = pct
-                first_progress_emitted = True
-                stream.emit([
-                    [" ", [_marker_tag]],
-                    ["\u2588" * (pct // 5), ["encode_progress", _marker_tag]],
-                    ["\u2591" * (20 - pct // 5), ["dim", _marker_tag]],
-                    [f" {pct}%", ["encode_pct", _marker_tag]],
-                    ["\n", [_marker_tag]],
-                ])
-                if progress_cb:
-                    try: progress_cb(pct)
-                    # previously silently eaten; surface so
-                    # a broken UI hook shows up in logs instead of
-                    # mysteriously going silent mid-encode.
-                    except Exception as _cb_e:
-                        stream.emit_dim(f" (progress_cb failed: {_cb_e})")
-
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        # Full terminate→wait→kill→wait so a hung ffmpeg (NVENC driver
-        # wedge) doesn't leave proc.returncode=None — which would let
-        # the "smaller than orig" safety below misinterpret a truncated
-        # stub as a successful encode.
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-                proc.wait(timeout=2)
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-    # unregister from PROCESS_REGISTRY now that the
-    # encode has exited.
-    try:
-        from .process_runner import PROCESS_REGISTRY
-        PROCESS_REGISTRY.unregister(proc)
-    except Exception:
-        pass
-
-    # check ffmpeg returncode BEFORE accepting the output.
-    # A mid-encode crash (NVENC driver reset, OOM, etc.) leaves a short
-    # temp file that was smaller than the original — with no returncode
-    # check, the "smaller than orig" safety below would PROMOTE the
-    # truncated stub over the pristine source. Not recoverable.
-    if proc.returncode is not None and proc.returncode != 0:
         stream.emit_error(
-            f"ffmpeg exited with code {proc.returncode}; leaving original intact.")
-        try: os.remove(temp_path)
-        except OSError: pass
-        return {"ok": False, "error": f"ffmpeg rc={proc.returncode}",
-                "reason": "ffmpeg_error"}
+            f"Could not protect the compression temp file with a .lock: {_le}")
+        return {"ok": False, "error": str(_le), "reason": "lock_failed"}
 
-    if not os.path.isfile(temp_path):
-        stream.emit_error("Video compression didn't produce an output file.")
-        return {"ok": False, "error": "no output"}
-    new_size = os.path.getsize(temp_path)
+    try:
+        # per-file in-place marker so the "Encoding ...", every
+        # progress-bar update, and the final ✓ done line all REPLACE one
+        # another at the same scroll position. Without this the progress
+        # bar persisted next to the per-video block while the done line
+        # landed minutes later at log bottom, under unrelated channels.
+        # Hash the basename so any non-ascii / spaces / quotes are safe in
+        # the tag string (must match \w+ rules in logs.js _inplaceKind).
+        import hashlib as _hashlib
+        _marker_tag = "compress_done_" + _hashlib.md5(
+            os.path.basename(input_path).encode("utf-8", "replace")
+        ).hexdigest()[:12]
 
-    # Verbose-only: announce that the subprocess returned ok and we're
-    # entering the safety-check phase. Helps the user follow the flow.
-    stream.emit([
-        ["    — ", ["dim"]],
-        [f"ffmpeg returncode=0, output written: "
-         f"{new_size:,} bytes ({new_size/1024/1024:.1f} MB)\n",
-         ["dim"]],
-    ])
+        # Determine bitrates
+        mb_per_hr = get_bitrate(quality, output_res)
+        target_total_kbps = (mb_per_hr * 1024 * 8) / 3600
+        audio_kbps = 128
+        video_kbps = max(int(target_total_kbps - audio_kbps), 50)
 
-    # ffprobe the temp file's duration and require it within
-    # ~2% of the original. A partial/truncated encode that SOMEHOW
-    # passes the returncode check (Windows hard-kill, ffmpeg oddity)
-    # could still be a 2-minute stub of a 60-minute video. Without this
-    # guard the "smaller than orig" check below promotes it, silently
-    # destroying the tail.
-    if dur <= 0:
-        kept_path = _preserve_compressed_output(input_path, temp_path)
-        stream.emit_error(
-            "Could not verify the original video's duration, so the "
-            "original was not replaced. The compressed output was kept "
-            f"for review: {kept_path}")
-        return {"ok": False, "error": "source_duration_unknown",
-                "reason": "source_duration_unknown",
-                "kept_path": kept_path}
+        # Probe duration
+        dur = get_video_duration(input_path, ffmpeg)
 
-    if dur > 0:
-        new_dur = get_video_duration(temp_path, ffmpeg)
+        orig_size = os.path.getsize(input_path)
+        # Probe the source codec too so the user can see why we're
+        # re-encoding (e.g. h264 \u2192 av1) and notice if we're wasting time
+        # re-encoding an already-av1 file. Verbose-only.
+        try:
+            src_codec = get_video_codec(input_path, ffmpeg)
+        except Exception:
+            src_codec = ""
+
+        # Build ffmpeg command (matches YTArchiver.py:9488)
+        cmd = [ffmpeg, "-y", "-i", input_path]
+        if output_res and str(output_res).isdigit():
+            cmd += ["-vf", f"scale=-2:{output_res}"]
+        cmd += [
+            "-c:v", "av1_nvenc",
+            "-rc", "vbr",
+            "-cq", "32",
+            "-b:v", f"{video_kbps}k",
+            "-maxrate", f"{int(video_kbps * 1.5)}k",
+            "-preset", "p6",
+            "-multipass", "2",
+            "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+            "-movflags", "+faststart",
+            "-metadata", "comment=ytarchiver_compressed=1",
+            temp_path,
+        ]
+
+        name = os.path.basename(input_path)
+        display = name if len(name) <= 60 else name[:57] + "..."
+        # Em-dash prefix (compress-color) + white body, matching classic
+        # simpleline_compress painter output (brackets/em-dashes colored,
+        # body text default).
         stream.emit([
-            ["    — ", ["dim"]],
-            [f"duration check: orig {dur:.1f}s vs new {new_dur:.1f}s "
-             f"(tolerance ±{max(3.0, dur * 0.02):.1f}s)\n",
+            ["  \u2014 ", ["simpleline_compress", _marker_tag]],
+            ["Encoding ", ["simpleline", _marker_tag]],
+            [f'"{display}"', ["encode_title", _marker_tag]],
+            [f" \u2014 {quality} / {output_res}p\n", ["dim", _marker_tag]],
+        ])
+
+        # VERBOSE-ONLY diagnostics. All `dim`-tagged so Simple mode drops
+        # the whole line via `_line_is_verbose_only`. Design intent:
+        # verbose mode should be densely informative — surface every
+        # input/decision/command so users
+        # debugging a bad encode can see exactly what ffmpeg was told.
+        _dur_str = (f"{int(dur//60):02d}:{int(dur%60):02d}"
+                    if dur > 0 else "unknown")
+        _src_codec_str = src_codec or "unknown"
+        _full_path = input_path
+        stream.emit([
+            ["    \u2014 ", ["dim"]],
+            [f"source: {_full_path}\n", ["dim"]],
+        ])
+        stream.emit([
+            ["    \u2014 ", ["dim"]],
+            [f"probed: {_dur_str} duration, "
+             f"{orig_size:,} bytes ({orig_size/1024/1024:.1f} MB), "
+             f"codec={_src_codec_str}\n", ["dim"]],
+        ])
+        stream.emit([
+            ["    \u2014 ", ["dim"]],
+            [f"target: {mb_per_hr} MB/hr "
+             f"({target_total_kbps:.0f} kbps total = "
+             f"{video_kbps} kbps video + {audio_kbps} kbps audio)\n",
              ["dim"]],
         ])
-        # 2% tolerance, minimum 3 seconds absolute slack for very short clips.
-        max_loss = max(3.0, dur * 0.02)
-        if new_dur <= 0 or (dur - new_dur) > max_loss:
+        stream.emit([
+            ["    \u2014 ", ["dim"]],
+            [f"encoder: av1_nvenc \u00b7 preset p6 \u00b7 multipass 2 \u00b7 "
+             f"rc vbr \u00b7 cq 32 \u00b7 maxrate {int(video_kbps * 1.5)}k\n",
+             ["dim"]],
+        ])
+        # Full ffmpeg command \u2014 single line, easy to copy-paste into a
+        # terminal for manual reproduction. Truncate at 600 chars in case
+        # the input path is absurdly long.
+        _cmd_str = " ".join(repr(c) if " " in c or '"' in c else c for c in cmd)
+        if len(_cmd_str) > 600:
+            _cmd_str = _cmd_str[:600] + "\u2026"
+        stream.emit([
+            ["    \u2014 ", ["dim"]],
+            [f"ffmpeg cmd: {_cmd_str}\n", ["dim"]],
+        ])
+
+        t0 = time.time()
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                startupinfo=_startupinfo, encoding="utf-8", errors="replace", bufsize=1,
+            )
+            # register ffmpeg with PROCESS_REGISTRY so
+            # shutdown's kill_all() reaps it even if the encode is mid-flight.
+            try:
+                from .process_runner import PROCESS_REGISTRY
+                PROCESS_REGISTRY.register(proc)
+            except Exception:
+                pass
+        except OSError as e:
+            stream.emit_error(f"Couldn't start video compression: {e}")
+            return {"ok": False, "error": str(e)}
+
+        # Drain stderr on a side thread + read lines from a queue with a
+        # timeout. The previous `for line in proc.stderr:` blocked on
+        # readline forever when ffmpeg stopped producing output (NVENC
+        # driver wedge, paused pipeline, etc.) \u2014 cancel_event would not be
+        # checked again until a new line arrived. With a polling queue.get,
+        # cancel is reacted to within 250ms regardless of ffmpeg output.
+        import queue as _queue
+        _stderr_q: _queue.Queue = _queue.Queue()
+        _SENTINEL = object()
+
+        def _drain_stderr():
+            try:
+                for _l in proc.stderr:
+                    _stderr_q.put(_l)
+            except Exception as _de:
+                _log.debug("stderr drain failed: %s", _de)
+            finally:
+                _stderr_q.put(_SENTINEL)
+
+        _stderr_thread = threading.Thread(
+            target=_drain_stderr, daemon=True,
+            name=f"compress-stderr-drain-{os.getpid()}")
+        _stderr_thread.start()
+
+        last_pct = -1
+        first_progress_emitted = False
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                except Exception:
+                    proc.kill()
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+                stream.emit_text(" \u26d4 Encode cancelled.", "red")
+                return {"ok": False, "reason": "cancelled"}
+            try:
+                line = _stderr_q.get(timeout=0.25)
+            except _queue.Empty:
+                # Check process is still alive \u2014 if ffmpeg died without
+                # writing more stderr, the drain thread will push SENTINEL
+                # soon. Loop continues so cancel_event still gets polled.
+                if proc.poll() is not None and _stderr_q.empty():
+                    break
+                continue
+            if line is _SENTINEL:
+                break
+
+            m = _FFMPEG_TIME_RE.search(line)
+            if m and dur > 0:
+                sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+                pct = min(99, int(sec / dur * 100))
+                # Bug [26]: emit at the FIRST progress sample regardless of
+                # whether it lands on a 5% boundary. A fast encode that goes
+                # straight from 0% to 6% to 12% would otherwise never trigger
+                # an emit (none of those % 5 == 0), leaving the UI stuck at
+                # the initial state until the encode completes.
+                should_emit = (pct != last_pct
+                               and (pct % 5 == 0 or not first_progress_emitted))
+                if should_emit:
+                    last_pct = pct
+                    first_progress_emitted = True
+                    stream.emit([
+                        [" ", [_marker_tag]],
+                        ["\u2588" * (pct // 5), ["encode_progress", _marker_tag]],
+                        ["\u2591" * (20 - pct // 5), ["dim", _marker_tag]],
+                        [f" {pct}%", ["encode_pct", _marker_tag]],
+                        ["\n", [_marker_tag]],
+                    ])
+                    if progress_cb:
+                        try: progress_cb(pct)
+                        # previously silently eaten; surface so
+                        # a broken UI hook shows up in logs instead of
+                        # mysteriously going silent mid-encode.
+                        except Exception as _cb_e:
+                            stream.emit_dim(f" (progress_cb failed: {_cb_e})")
+
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # Full terminate→wait→kill→wait so a hung ffmpeg (NVENC driver
+            # wedge) doesn't leave proc.returncode=None — which would let
+            # the "smaller than orig" safety below misinterpret a truncated
+            # stub as a successful encode.
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+        # unregister from PROCESS_REGISTRY now that the
+        # encode has exited.
+        try:
+            from .process_runner import PROCESS_REGISTRY
+            PROCESS_REGISTRY.unregister(proc)
+        except Exception:
+            pass
+
+        # check ffmpeg returncode BEFORE accepting the output.
+        # A mid-encode crash (NVENC driver reset, OOM, etc.) leaves a short
+        # temp file that was smaller than the original — with no returncode
+        # check, the "smaller than orig" safety below would PROMOTE the
+        # truncated stub over the pristine source. Not recoverable.
+        if proc.returncode is not None and proc.returncode != 0:
             stream.emit_error(
-                f"Compressed duration mismatch "
-                f"(orig {dur:.0f}s, new {new_dur:.0f}s) — leaving original intact.")
+                f"ffmpeg exited with code {proc.returncode}; leaving original intact.")
             try: os.remove(temp_path)
             except OSError: pass
-            return {"ok": False, "error": "duration_mismatch",
-                    "reason": "duration_mismatch",
-                    "orig_dur": dur, "new_dur": new_dur}
+            return {"ok": False, "error": f"ffmpeg rc={proc.returncode}",
+                    "reason": "ffmpeg_error"}
 
-    # verify the output codec is actually AV1. If NVENC
-    # silently falls back to HEVC/H.264 (driver crash, session
-    # collision, unsupported input colorspace), ffmpeg can return
-    # rc=0 + correct duration but wrong codec. Promoting a non-AV1
-    # "compressed" file wastes future re-compress runs and may
-    # produce a larger-than-expected archive.
-    new_codec = get_video_codec(temp_path, ffmpeg)
-    stream.emit([
-        ["    — ", ["dim"]],
-        [f"codec check: output codec = {new_codec or 'unknown'} "
-         f"(expected av1)\n", ["dim"]],
-    ])
-    if new_codec != "av1":
-        actual_codec = new_codec or "unknown"
-        reason = "codec_unverified" if not new_codec else "codec_mismatch"
-        stream.emit_error(
-            f"Compressed output is {actual_codec}, not av1 "
-            f"(NVENC silent fallback?) — leaving original intact.")
-        try: os.remove(temp_path)
-        except OSError: pass
-        return {"ok": False, "error": reason,
-                "reason": reason,
-                "expected": "av1", "actual": actual_codec}
+        if not os.path.isfile(temp_path):
+            stream.emit_error("Video compression didn't produce an output file.")
+            return {"ok": False, "error": "no output"}
+        new_size = os.path.getsize(temp_path)
 
-    # Safety: if output is larger than input, skip the replace
-    if new_size >= orig_size:
+        # Verbose-only: announce that the subprocess returned ok and we're
+        # entering the safety-check phase. Helps the user follow the flow.
         stream.emit([
-            [" ", None],
-            ["\u26a0 ", "red"],
-            [f"Output larger than original ({orig_size:,} \u2192 {new_size:,}), skipping replace.\n",
-             "simpleline"],
+            ["    — ", ["dim"]],
+            [f"ffmpeg returncode=0, output written: "
+             f"{new_size:,} bytes ({new_size/1024/1024:.1f} MB)\n",
+             ["dim"]],
         ])
-        try:
-            os.remove(temp_path)
-        except OSError:
-            pass
-        return {"ok": False, "reason": "grew",
-                "orig_bytes": orig_size, "new_bytes": new_size}
 
-    took = time.time() - t0
-    saved_pct = 100.0 * (1 - new_size / orig_size)
-
-    if replace_original:
-        # retry the replace a couple of times on transient
-        # Windows file locks (VLC preview, antivirus, Explorer preview-
-        # pane, Thumbnail cache). AV1 encodes cost minutes of GPU time;
-        # throwing away the output because another process held the
-        # target for 2 seconds is bad economics.
-        _replace_err: Exception | None = None
-        # Patch C: add randomized jitter to the retry sleep so multiple
-        # processes (VLC preview, antivirus, Explorer thumbnail cache)
-        # don't collide on every retry by ticking on the same wall-
-        # clock interval. Jitter range is small (0..1s) so total retry
-        # window is still bounded.
-        import random as _random
-        # Capture the original's timestamps BEFORE the replace — file
-        # mtime is the YouTube upload date everywhere in this app
-        # (reorg's year/month sorting, redownload's date matcher), and
-        # os.replace would otherwise leave the encode-finish time on
-        # every compressed video.
-        try:
-            _orig_st = os.stat(input_path)
-        except OSError:
-            _orig_st = None
-        for _try in range(3):
-            try:
-                os.replace(temp_path, input_path)
-                _replace_err = None
-                break
-            except OSError as e:
-                _replace_err = e
-                if _try < 2:
-                    time.sleep(2.0 + _random.uniform(0, 1.0))
-        if _replace_err is not None:
+        # ffprobe the temp file's duration and require it within
+        # ~2% of the original. A partial/truncated encode that SOMEHOW
+        # passes the returncode check (Windows hard-kill, ffmpeg oddity)
+        # could still be a 2-minute stub of a 60-minute video. Without this
+        # guard the "smaller than orig" check below promotes it, silently
+        # destroying the tail.
+        if dur <= 0:
+            kept_path = _preserve_compressed_output(input_path, temp_path)
             stream.emit_error(
-                f"Could not replace original after 3 attempts: {_replace_err}")
-            # on replace-failure (file locked by VLC preview /
-            # antivirus / cross-drive), the temp file used to sit in
-            # _TEMP_COMPRESS/ forever — `temp_cleanup.py` treats non-
-            # empty temp dirs as "in use" and skips them. Clean up now
-            # so we don't leak GB of AV1 encodes on repeated failures.
+                "Could not verify the original video's duration, so the "
+                "original was not replaced. The compressed output was kept "
+                f"for review: {kept_path}")
+            return {"ok": False, "error": "source_duration_unknown",
+                    "reason": "source_duration_unknown",
+                    "kept_path": kept_path}
+
+        if dur > 0:
+            new_dur = get_video_duration(temp_path, ffmpeg)
+            stream.emit([
+                ["    — ", ["dim"]],
+                [f"duration check: orig {dur:.1f}s vs new {new_dur:.1f}s "
+                 f"(tolerance ±{max(3.0, dur * 0.02):.1f}s)\n",
+                 ["dim"]],
+            ])
+            # 2% tolerance, minimum 3 seconds absolute slack for very short clips.
+            max_loss = max(3.0, dur * 0.02)
+            if new_dur <= 0 or (dur - new_dur) > max_loss:
+                stream.emit_error(
+                    f"Compressed duration mismatch "
+                    f"(orig {dur:.0f}s, new {new_dur:.0f}s) — leaving original intact.")
+                try: os.remove(temp_path)
+                except OSError: pass
+                return {"ok": False, "error": "duration_mismatch",
+                        "reason": "duration_mismatch",
+                        "orig_dur": dur, "new_dur": new_dur}
+
+        # verify the output codec is actually AV1. If NVENC
+        # silently falls back to HEVC/H.264 (driver crash, session
+        # collision, unsupported input colorspace), ffmpeg can return
+        # rc=0 + correct duration but wrong codec. Promoting a non-AV1
+        # "compressed" file wastes future re-compress runs and may
+        # produce a larger-than-expected archive.
+        new_codec = get_video_codec(temp_path, ffmpeg)
+        stream.emit([
+            ["    — ", ["dim"]],
+            [f"codec check: output codec = {new_codec or 'unknown'} "
+             f"(expected av1)\n", ["dim"]],
+        ])
+        if new_codec != "av1":
+            actual_codec = new_codec or "unknown"
+            reason = "codec_unverified" if not new_codec else "codec_mismatch"
+            stream.emit_error(
+                f"Compressed output is {actual_codec}, not av1 "
+                f"(NVENC silent fallback?) — leaving original intact.")
+            try: os.remove(temp_path)
+            except OSError: pass
+            return {"ok": False, "error": reason,
+                    "reason": reason,
+                    "expected": "av1", "actual": actual_codec}
+
+        # Safety: if output is larger than input, skip the replace
+        if new_size >= orig_size:
+            stream.emit([
+                [" ", None],
+                ["\u26a0 ", "red"],
+                [f"Output larger than original ({orig_size:,} \u2192 {new_size:,}), skipping replace.\n",
+                 "simpleline"],
+            ])
             try:
                 os.remove(temp_path)
             except OSError:
                 pass
-            return {"ok": False, "error": str(_replace_err)}
+            return {"ok": False, "reason": "grew",
+                    "orig_bytes": orig_size, "new_bytes": new_size}
 
-        # Post-replace verification — the original is now GONE (os.replace
-        # already overwrote it atomically at the directory-entry level).
-        # On a StableBit DrivePool boundary or other rare backend write
-        # failure, the rename can succeed while the underlying inode is
-        # corrupt or zero-length. Re-stat input_path immediately and bail
-        # LOUDLY if size doesn't match what we just wrote — the user
-        # can't restore the original automatically, but they need to
-        # know NOW (so they can recover from a backup) rather than
-        # discovering it weeks later in the archive.
-        try:
-            _stat_size = os.path.getsize(input_path)
-        except OSError as _se:
-            stream.emit_error(
-                f"CRITICAL: replaced file unreadable after os.replace — "
-                f"{input_path}: {_se}. Original is gone; restore from backup.")
-            return {"ok": False, "error": f"post-replace stat failed: {_se}",
-                    "data_loss": True}
-        if _stat_size != new_size:
-            stream.emit_error(
-                f"CRITICAL: post-replace size mismatch on {input_path} — "
-                f"wrote {new_size:,} bytes, on-disk reports {_stat_size:,}. "
-                f"Original is gone; restore from backup.")
-            return {"ok": False,
-                    "error": f"post-replace size mismatch: wrote={new_size} "
-                             f"on_disk={_stat_size}",
-                    "data_loss": True}
+        took = time.time() - t0
+        saved_pct = 100.0 * (1 - new_size / orig_size)
 
-        # Restore the original's upload-date mtime onto the encode —
-        # best-effort, but say so loudly if it fails (date integrity
-        # drives reorg and redownload matching).
-        if _orig_st is not None:
+        if replace_original:
+            # retry the replace a couple of times on transient
+            # Windows file locks (VLC preview, antivirus, Explorer preview-
+            # pane, Thumbnail cache). AV1 encodes cost minutes of GPU time;
+            # throwing away the output because another process held the
+            # target for 2 seconds is bad economics.
+            _replace_err: Exception | None = None
+            # Patch C: add randomized jitter to the retry sleep so multiple
+            # processes (VLC preview, antivirus, Explorer thumbnail cache)
+            # don't collide on every retry by ticking on the same wall-
+            # clock interval. Jitter range is small (0..1s) so total retry
+            # window is still bounded.
+            import random as _random
+            # Capture the original's timestamps BEFORE the replace — file
+            # mtime is the YouTube upload date everywhere in this app
+            # (reorg's year/month sorting, redownload's date matcher), and
+            # os.replace would otherwise leave the encode-finish time on
+            # every compressed video.
             try:
-                os.utime(input_path, (_orig_st.st_atime, _orig_st.st_mtime))
-            except OSError as _ue:
+                _orig_st = os.stat(input_path)
+            except OSError:
+                _orig_st = None
+            for _try in range(3):
+                try:
+                    os.replace(temp_path, input_path)
+                    _replace_err = None
+                    break
+                except OSError as e:
+                    _replace_err = e
+                    if _try < 2:
+                        time.sleep(2.0 + _random.uniform(0, 1.0))
+            if _replace_err is not None:
                 stream.emit_error(
-                    f"Could not restore upload-date mtime on "
-                    f"{input_path}: {_ue}")
+                    f"Could not replace original after 3 attempts: {_replace_err}")
+                # on replace-failure (file locked by VLC preview /
+                # antivirus / cross-drive), the temp file used to sit in
+                # _TEMP_COMPRESS/ forever — `temp_cleanup.py` treats non-
+                # empty temp dirs as "in use" and skips them. Clean up now
+                # so we don't leak GB of AV1 encodes on repeated failures.
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+                return {"ok": False, "error": str(_replace_err)}
 
-    # Per-file done line. Same _marker_tag as the progress bars so it
-    # REPLACES the bar in place (issue #146) instead of appending at
-    # log bottom after unrelated channels have scrolled past.
-    stream.emit([
-        [" \u2014 \u2713 ", ["simpleline_green", _marker_tag]],
-        ["Compressed ", ["simpleline", _marker_tag]],
-        [f"\u2014 {orig_size/1024/1024:.0f}MB \u2192 {new_size/1024/1024:.0f}MB ",
-         ["dim", _marker_tag]],
-        [f"(\u2212{saved_pct:.0f}%)", ["simpleline_compress", _marker_tag]],
-        [f" in {took:.0f}s\n", ["dim", _marker_tag]],
-    ])
-    return {"ok": True, "orig_bytes": orig_size, "new_bytes": new_size,
-            "saved_pct": saved_pct, "took": took}
+            # Post-replace verification — the original is now GONE (os.replace
+            # already overwrote it atomically at the directory-entry level).
+            # On a StableBit DrivePool boundary or other rare backend write
+            # failure, the rename can succeed while the underlying inode is
+            # corrupt or zero-length. Re-stat input_path immediately and bail
+            # LOUDLY if size doesn't match what we just wrote — the user
+            # can't restore the original automatically, but they need to
+            # know NOW (so they can recover from a backup) rather than
+            # discovering it weeks later in the archive.
+            try:
+                _stat_size = os.path.getsize(input_path)
+            except OSError as _se:
+                stream.emit_error(
+                    f"CRITICAL: replaced file unreadable after os.replace — "
+                    f"{input_path}: {_se}. Original is gone; restore from backup.")
+                return {"ok": False, "error": f"post-replace stat failed: {_se}",
+                        "data_loss": True}
+            if _stat_size != new_size:
+                stream.emit_error(
+                    f"CRITICAL: post-replace size mismatch on {input_path} — "
+                    f"wrote {new_size:,} bytes, on-disk reports {_stat_size:,}. "
+                    f"Original is gone; restore from backup.")
+                return {"ok": False,
+                        "error": f"post-replace size mismatch: wrote={new_size} "
+                                 f"on_disk={_stat_size}",
+                        "data_loss": True}
+
+            # Restore the original's upload-date mtime onto the encode —
+            # best-effort, but say so loudly if it fails (date integrity
+            # drives reorg and redownload matching).
+            if _orig_st is not None:
+                try:
+                    os.utime(input_path, (_orig_st.st_atime, _orig_st.st_mtime))
+                except OSError as _ue:
+                    stream.emit_error(
+                        f"Could not restore upload-date mtime on "
+                        f"{input_path}: {_ue}")
+
+        # Per-file done line. Same _marker_tag as the progress bars so it
+        # REPLACES the bar in place (issue #146) instead of appending at
+        # log bottom after unrelated channels have scrolled past.
+        stream.emit([
+            [" \u2014 \u2713 ", ["simpleline_green", _marker_tag]],
+            ["Compressed ", ["simpleline", _marker_tag]],
+            [f"\u2014 {orig_size/1024/1024:.0f}MB \u2192 {new_size/1024/1024:.0f}MB ",
+             ["dim", _marker_tag]],
+            [f"(\u2212{saved_pct:.0f}%)", ["simpleline_compress", _marker_tag]],
+            [f" in {took:.0f}s\n", ["dim", _marker_tag]],
+        ])
+        return {"ok": True, "orig_bytes": orig_size, "new_bytes": new_size,
+                "saved_pct": saved_pct, "took": took}
 
 
-# ── Batch compress + redo-on-larger fallback ───────────────────────────
+    finally:
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
+
+
+# Batch compress + redo-on-larger fallback
 
 _QUALITY_LADDER = ["Generous", "Average", "Below Average"]
 

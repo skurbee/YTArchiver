@@ -32,6 +32,35 @@
   --c-bad-fg: #d87a7a;
   --c-sync-hover: #1a6b4c;
   --c-sync-border: #1d7a56;
+  --c-sync-badge: #2e7d46;
+  --c-pause-bg: #234866;
+  --c-pause-border: #3c6690;
+  --c-pause-hover: #2f5b80;
+  --c-pause-hover-border: #4c7cab;
+  --c-pause-pending-bg: #1a5a6b;
+  --c-pause-pending-border: #267585;
+  --c-queue-active-bg: #3a5a3a;
+  --c-queue-active-border: #4a6a4a;
+  --c-queue-gpu-bg: #6b1a1a;
+  --c-queue-gpu-border: #8a2a2a;
+  --c-badge-danger: #c62828;
+  --c-menu-bg: #1c1f23;
+  --c-menu-hover: rgba(120, 165, 220, 0.18);
+  --c-text-strong: #e8edf5;
+  --c-text-muted: #aab4c3;
+  --c-tooltip-bg: #333;
+  --c-tooltip-fg: #ddd;
+  --c-tooltip-border: #555;
+  --c-modal-btn: #26292d;
+  --c-modal-btn-border: #33363a;
+  --c-modal-btn-hover: #30343a;
+  --c-modal-primary: #2e5a3c;
+  --c-modal-primary-border: #3b7049;
+  --c-modal-primary-hover: #37684a;
+  --c-modal-danger: #5a2e2e;
+  --c-modal-danger-border: #703b3b;
+  --c-modal-danger-hover: #6a3838;
+  --c-modal-warn-fg: #e0c048;
 
   /* Log */
   --c-log-bg: #0a0b0d;

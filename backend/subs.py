@@ -608,11 +608,11 @@ def remove_channel(identity: dict[str, str],
                    delete_files: bool = False) -> dict[str, Any]:
     """Remove a channel from the subs list.
 
-    If `delete_files=True`, also recursively delete the channel's on-disk
-    folder (videos, transcripts, metadata, thumbnails, .ChannelArt — the
-    whole folder). Returns {ok, deleted_folder, delete_error?}. The delete
-    is best-effort; if it partially fails the subscription is still removed
-    so the user isn't stuck with a broken record.
+    If `delete_files=True`, also move the channel's on-disk folder (videos,
+    transcripts, metadata, thumbnails, .ChannelArt — the whole folder) to the
+    app trash. Returns {ok, deleted_folder, delete_error?}. The quarantine is
+    best-effort; if it fails the subscription is still removed so the user
+    isn't stuck with a broken record.
     """
     cfg = load_config()
     channels = cfg.setdefault("channels", [])
@@ -621,11 +621,11 @@ def remove_channel(identity: dict[str, str],
         raise SubsError(f"Channel not found: {identity}")
     ch = dict(channels[idx])
 
-    # delete files FIRST, then update the config. Old
-    # order (pop + save_config before delete) meant a crash mid-delete
+    # Move files FIRST, then update the config. Old
+    # order (pop + save_config before delete) meant a crash mid-operation
     # left the config updated but the folder orphaned — the user
     # couldn't retry delete-files via the UI because the channel was
-    # already gone from the subs list. Now the folder delete runs
+    # already gone from the subs list. Now the folder move runs
     # first; the subs-list removal only happens after the delete
     # resolves (or was never requested).
     result: dict[str, Any] = {"ok": False, "deleted_folder": False}
@@ -636,7 +636,7 @@ def remove_channel(identity: dict[str, str],
                 from .sync import channel_folder_name as _cfn
                 folder_name = _cfn(ch)
                 folder_path = os.path.join(base, folder_name)
-                # Path-containment guard — refuse to rmtree anything
+                # Path-containment guard — refuse to move anything
                 # that doesn't live INSIDE output_dir. A malformed
                 # channel name with .. traversal characters could
                 # otherwise yield a path outside the archive root.
@@ -652,7 +652,7 @@ def remove_channel(identity: dict[str, str],
                 })
                 if not delete_result.get("ok"):
                     raise ValueError(delete_result.get("error")
-                                     or "folder delete failed")
+                                     or "folder quarantine failed")
             except Exception as e:
                 # Delete failed — surface the error but STILL drop the
                 # subs-list entry. The alternative (keeping it in the

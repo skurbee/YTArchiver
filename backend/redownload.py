@@ -82,8 +82,11 @@ def _load_progress_state(
         if os.path.isfile(pf):
             with open(pf, "r", encoding="utf-8") as f:
                 data = json.load(f) or {}
-            if (data.get("resolution") == new_res
-                    and data.get("ch_url") == ch_url):
+            # Completed video IDs are resolution-independent; each file is
+            # re-validated against the active target before being skipped.
+            # Keep storing resolution for diagnostics, but do not discard a
+            # large resume set after an in-run sample prompt switches target.
+            if data.get("ch_url") == ch_url:
                 done = set(data.get("done_ids", []))
                 broken_counts = _coerce_broken_counts(
                     data.get("broken_counts"))

@@ -55,11 +55,12 @@ YTArchiver/
 │   ├── transcribe/         # Whisper transcription package
 │   │   ├── core.py             # TranscribeManager + worker loop
 │   │   ├── helpers.py          # path/title/duration helpers
+│   │   ├── paths.py            # Path/format helpers (extracted Patch 6)
 │   │   ├── punct_manager.py    # punctuation subprocess wrapper
 │   │   ├── transcribe_vtt.py   # YT auto-captions fast-path
 │   │   └── transcribe_files.py # .jsonl + .txt sidecar writers
-│   ├── transcribe_paths.py # Path/format helpers (extracted Patch 6)
 │   ├── metadata/           # Metadata package
+│   │   ├── io.py               # JSONL I/O helpers (extracted Patch 5)
 │   │   ├── core.py             # title-match strategies + bulk pipeline
 │   │   ├── fetcher.py          # per-video metadata fetch
 │   │   ├── refresh.py          # re-export shim
@@ -71,7 +72,6 @@ YTArchiver/
 │   │   ├── scan.py             # per-channel video scan
 │   │   └── thumbnails_ops.py   # thumbnail housekeeping
 │   ├── services/           # AppServices + event bus + file ops
-│   ├── metadata_io.py      # JSONL I/O helpers (extracted Patch 5)
 │   ├── pause_helpers.py    # Shared pause/cancel guards
 │   ├── index.py            # SQLite index entry — schema + register + reads
 │   ├── index_search.py     # FTS5 + LIKE search (extracted Patch 17)

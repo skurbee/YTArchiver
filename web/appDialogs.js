@@ -81,15 +81,15 @@
         }
       });
     } catch (_e) { /* non-fatal */ }
-    const backdrop = document.createElement("div");
-    backdrop.className = "askq-backdrop";
-    backdrop.id = "close-confirm-modal";
-    backdrop.innerHTML = `
+    const modal = window.YT?.modals?.open;
+    if (!modal) return;
+    let remember = null;
+    modal({
+      bodyHtml: `
       <div class="askq-dialog">
         <div class="askq-header">Close YTArchiver?</div>
         <div class="askq-body">Quit completely, or close to the system tray and keep syncing in the background?</div>
-        <label style="display:flex;align-items:center;gap:6px;margin:8px 0 12px;
-                      font-size:12px;color:var(--c-dim);user-select:none;">
+        <label class="askq-check-row">
           <input type="checkbox" id="close-remember-choice" />
           Remember my choice
         </label>
@@ -99,21 +99,22 @@
           <button class="btn btn-danger" data-act="quit">Quit</button>
         </div>
       </div>
-    `;
-    document.body.appendChild(backdrop);
-    const remember = backdrop.querySelector("#close-remember-choice");
-    let settled = false;
-    let onKey = null;
-    const cleanup = () => {
-      if (onKey) document.removeEventListener("keydown", onKey);
-      onKey = null;
-    };
-    const choose = async (action) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
+      `,
+      escapeValue: "cancel",
+      outsideClickValue: "cancel",
+      onMount: (root, resolveOuter) => {
+        root.id = "close-confirm-modal";
+        remember = root.querySelector("#close-remember-choice");
+        root.querySelector('[data-act="cancel"]')?.addEventListener(
+          "click", () => resolveOuter("cancel"));
+        root.querySelector('[data-act="tray"]')?.addEventListener(
+          "click", () => resolveOuter("tray"));
+        root.querySelector('[data-act="quit"]')?.addEventListener(
+          "click", () => resolveOuter("quit"));
+        setTimeout(() => root.querySelector('[data-act="quit"]')?.focus(), 30);
+      },
+    }).then(async (action) => {
       const rem = !!remember?.checked;
-      backdrop.remove();
       // Cancel = pure dismiss. Window stays open, no config change
       // (we deliberately ignore the Remember box here — saving "Cancel"
       // as the default close behavior makes no sense). The backend
@@ -122,62 +123,28 @@
       // left the X button dead for the rest of the session after any
       // Cancel/Esc/backdrop dismissal.
       if (action === "cancel") {
-        try { if (nativeBridgeUp()) bridgeCall("confirm_close", "cancel", false); } catch {}
+        try { if (nativeBridgeUp()) await bridgeCall("confirm_close", "cancel", false); } catch {}
         return;
       }
       try {
         if (nativeBridgeUp()) await bridgeCall("confirm_close", action, rem);
       } catch {}
-    };
-    backdrop.querySelector('[data-act="cancel"]').addEventListener("click", () => choose("cancel"));
-    backdrop.querySelector('[data-act="tray"]').addEventListener("click", () => choose("tray"));
-    backdrop.querySelector('[data-act="quit"]').addEventListener("click", () => choose("quit"));
-    backdrop.addEventListener("click", (e) => {
-      if (e.target === backdrop) choose("cancel");
     });
-    onKey = function (e) {
-      if (e.key === "Escape") {
-        choose("cancel");
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    setTimeout(() => backdrop.querySelector('[data-act="quit"]')?.focus(), 30);
   };
 
   // Bookmark Yes/No timestamp dialog. Replaces the old note-prompt flow.
   // Resolves to "yes" (bookmark with timestamp), "no" (bookmark whole
   // video), or null (cancel).
   window._askBookmarkKind = function () {
-    return new Promise((resolve) => {
-      const backdrop = document.createElement("div");
-      backdrop.className = "askq-backdrop";
-      backdrop.innerHTML = `
-        <div class="askq-dialog">
-          <div class="askq-header">Add bookmark</div>
-          <div class="askq-body">Bookmark this exact moment, or the
-            entire video?</div>
-          <div class="askq-buttons askq-buttons-actions">
-            <button class="btn btn-ghost" data-act="no">Whole video</button>
-            <button class="btn btn-primary" data-act="yes">At timestamp</button>
-          </div>
-          <div class="askq-buttons askq-buttons-cancel">
-            <button class="btn btn-danger" data-act="cancel">Cancel</button>
-          </div>
-        </div>
-      `;
-      document.body.appendChild(backdrop);
-      const close = (val) => { backdrop.remove(); resolve(val); };
-      backdrop.querySelector('[data-act="yes"]').addEventListener("click", () => close("yes"));
-      backdrop.querySelector('[data-act="no"]').addEventListener("click", () => close("no"));
-      backdrop.querySelector('[data-act="cancel"]').addEventListener("click", () => close(null));
-      backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(null); });
-      document.addEventListener("keydown", function onKey(e) {
-        if (e.key === "Escape") {
-          document.removeEventListener("keydown", onKey);
-          close(null);
-        }
-      });
-      setTimeout(() => backdrop.querySelector('[data-act="yes"]')?.focus(), 30);
+    return window.YT?.modals?.choice({
+      title: "Add bookmark",
+      message: "Bookmark this exact moment, or the entire video?",
+      buttons: [
+        { label: "Whole video", value: "no", kind: "ghost" },
+        { label: "At timestamp", value: "yes", kind: "primary" },
+      ],
+      cancel: "Cancel",
+      cancelKind: "danger",
     });
   };
 })();

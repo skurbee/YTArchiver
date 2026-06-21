@@ -48,7 +48,7 @@ Top-level modules:
   local_fileserver.py   Local file-serving layer for embedded playback.
   log.py                Logging adapter.
   log_stream.py         Batched Python-to-JS log transport.
-  metadata_io.py        JSONL metadata/transcript sidecar I/O helpers.
+  metadata/io.py        JSONL metadata/transcript sidecar I/O helpers.
   net.py                Network health probe.
   pause_helpers.py      Shared pause/cancel guards.
   process_runner.py     Process registry and yt-dlp runner helpers.
@@ -64,7 +64,7 @@ Top-level modules:
   temp_cleanup.py       Startup cleanup of partial/intermediate files.
   text_utils.py         Title/text normalization helpers.
   thumbnails.py         Thumbnail download/cache helpers.
-  transcribe_paths.py   Transcript path and naming helpers.
+  transcribe/paths.py   Transcript path and naming helpers.
   tray.py               Windows system-tray controller.
   utils.py              Legacy shared helpers.
   version.py            ``APP_VERSION`` and ``APP_VERSION_DATE``.

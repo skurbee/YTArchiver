@@ -417,6 +417,10 @@ def load_config() -> dict[str, Any]:
 import contextlib as _ctxlib  # noqa: E402 (intentional late import)
 
 
+class ConfigUnchanged(Exception):
+    """Signal that a config transaction intentionally made no changes."""
+
+
 @_ctxlib.contextmanager
 def config_transaction():
     """Atomic load-modify-save with a single lock acquisition.

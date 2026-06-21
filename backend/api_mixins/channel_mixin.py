@@ -877,7 +877,8 @@ class ChannelMixin:
                         "scope_label": scope_label,
                         "scope": scope,
                         "rd_task": dict(ch, kind="redownload",
-                                         redownload_res=new_res),
+                                         redownload_res=new_res,
+                                         scope=scope),
                     })
                 try: self._on_queue_changed()
                 except Exception as e: _log.debug("swallowed: %s", e)
@@ -900,6 +901,7 @@ class ChannelMixin:
         _rd_task = dict(ch)
         _rd_task["kind"] = "redownload"
         _rd_task["redownload_res"] = new_res
+        _rd_task["scope"] = scope
         _pending_item = {
             "ch": dict(ch),
             "folder": folder,

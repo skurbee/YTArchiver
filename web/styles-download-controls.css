@@ -294,12 +294,15 @@
      disabled → inherits default .btn:disabled (opacity 0.4)
    data-pause-state is set by paintBlinkState() in app.js. */
 .btn-pause {
-  background: #234866;
-  border-color: #3c6690;
+  background: var(--c-pause-bg);
+  border-color: var(--c-pause-border);
   color: var(--c-text);
   transition: background 0.12s, border-color 0.12s;
 }
-.btn-pause:hover { background: #2f5b80; border-color: #4c7cab; }
+.btn-pause:hover {
+  background: var(--c-pause-hover);
+  border-color: var(--c-pause-hover-border);
+}
 /* Resume state uses the same green as the Sync Subbed button
    (var(--c-sync) = #145c40) so the two primary-action greens
    on the top bar stay visually consistent. Previously used
@@ -310,7 +313,7 @@
 }
 .btn-pause[data-pause-state="paused"]:hover {
   background: var(--c-sync-hover);
-  border-color: #216e52;
+  border-color: var(--c-sync-border);
 }
 /* Pause-pending: user clicked Pause but the worker is still mid-
    operation (e.g. the long re-fetch loop in a metadata refresh).
@@ -329,8 +332,8 @@
     border-color: var(--c-sync-hover);
   }
   50% {
-    background: #234866;
-    border-color: #3c6690;
+    background: var(--c-pause-bg);
+    border-color: var(--c-pause-border);
   }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -338,8 +341,8 @@
   .popover-footer-btn.pause-pending {
     animation: none;
     /* Solid teal-ish so the state still differs from "paused" without motion. */
-    background: #1a5a6b;
-    border-color: #267585;
+    background: var(--c-pause-pending-bg);
+    border-color: var(--c-pause-pending-border);
   }
 }
 /* audit E-27: keep pointer-events enabled on disabled buttons so
@@ -389,10 +392,10 @@
 .icon-btn-gpu:hover { background: var(--c-primary); }
 
 /* Blink states — driven by window.setQueueState() from backend */
-.icon-btn-sync[data-blink-state="on"] { background: #3a5a3a; border-color: #4a6a4a; }
-.icon-btn-sync[data-blink-state="paused"] { background: #3a5a3a; border-color: #4a6a4a; }
-.icon-btn-gpu[data-blink-state="on"] { background: #6b1a1a; border-color: #8a2a2a; }
-.icon-btn-gpu[data-blink-state="paused"] { background: #6b1a1a; border-color: #8a2a2a; }
+.icon-btn-sync[data-blink-state="on"] { background: var(--c-queue-active-bg); border-color: var(--c-queue-active-border); }
+.icon-btn-sync[data-blink-state="paused"] { background: var(--c-queue-active-bg); border-color: var(--c-queue-active-border); }
+.icon-btn-gpu[data-blink-state="on"] { background: var(--c-queue-gpu-bg); border-color: var(--c-queue-gpu-border); }
+.icon-btn-gpu[data-blink-state="paused"] { background: var(--c-queue-gpu-bg); border-color: var(--c-queue-gpu-border); }
 .icon-badge {
   position: absolute;
   top: -5px;
@@ -400,8 +403,8 @@
   min-width: 14px;
   height: 14px;
   border-radius: 7px;
-  background: #c62828;
-  color: #ffffff;
+  background: var(--c-badge-danger);
+  color: #fff;
   font-size: 9px;
   font-weight: 700;
   line-height: 14px;
@@ -409,7 +412,7 @@
   text-align: center;
   box-shadow: 0 0 0 2px var(--c-bg);
 }
-.icon-btn-sync .icon-badge { background: #2e7d46; }
+.icon-btn-sync .icon-badge { background: var(--c-sync-badge); }
 
 .status-text {
   color: var(--c-dim);
@@ -536,4 +539,3 @@
   border-radius: 50%;
   background: var(--c-text);
 }
-

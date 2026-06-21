@@ -191,8 +191,8 @@
       // on `video`. 'no_speech' → say so plainly instead of the generic line.
       const _noSpeech = !!(video && video.tx_status === "no_speech");
       tr.innerHTML = _noSpeech
-        ? '<div style="color: var(--c-dim); font-style: italic;">No speech detected — this video has no spoken audio to transcribe.</div>'
-        : '<div style="color: var(--c-dim); font-style: italic;">No transcript available.</div>';
+        ? '<div class="watch-transcript-note">No speech detected — this video has no spoken audio to transcribe.</div>'
+        : '<div class="watch-transcript-note">No transcript available.</div>';
       _unbindKaraoke();
       // Hide the on-video overlay so a stale phrase doesn't linger over
       // the still-playing video after a failed retranscribe.
@@ -635,8 +635,8 @@
     if (ph && fp) {
       ph.style.display = "";
       ph.innerHTML =
-        '<div class="watch-play-icon" style="visibility:hidden;">▶</div>' +
-        '<div class="watch-placeholder-text" style="font-size:13px;color:var(--c-text);">'
+        '<div class="watch-play-icon watch-play-icon-hidden">▶</div>' +
+        '<div class="watch-placeholder-text">'
         + '<span class="spinner-inline"></span>Loading…</div>';
       // Hide the <video> element so its previous src doesn't flash.
       vEl.hidden = true;
@@ -741,12 +741,12 @@
           const _esc = window._escapeHtml || (s => String(s ?? ""));
           const leaf = fp ? _esc(fp.split(/[\\/]/).pop()) : "";
           label.innerHTML =
-            `<div style="font-size:13px;color:var(--c-log-red);margin-bottom:4px;">` +
+            `<div class="watch-video-error-title">` +
             `⚠ ${_esc(errorDetail)}</div>` +
             (leaf
-              ? `<div style="font-size:11px;color:var(--c-dim);">${leaf}</div>`
+              ? `<div class="watch-video-error-detail">${leaf}</div>`
               : "") +
-            `<div style="font-size:11px;color:var(--c-dim);margin-top:6px;">` +
+            `<div class="watch-video-error-detail watch-video-error-hint">` +
             `The index entry may be stale — try Rescan archive.</div>`;
         }
       }

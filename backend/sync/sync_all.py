@@ -101,9 +101,10 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     _resume_mode = False
     if queues is not None:
         try:
+            _sync_snapshot = queues.sync_snapshot()
             existing_dl = any(
                 (c.get("kind") or "download").lower() == "download"
-                for c in queues.sync
+                for c in _sync_snapshot
             )
             if existing_dl:
                 _resume_mode = True
@@ -146,7 +147,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     # pass starting (N channels)" would over-report.
     try:
         _queue_snapshot = [
-            c for c in (queues.sync if queues is not None else [])
+            c for c in (queues.sync_snapshot() if queues is not None else [])
             if (c.get("kind") or "download").lower() != "redownload"
         ]
         _starting_total = len(_queue_snapshot) if queues is not None else len(channels)
@@ -346,18 +347,17 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     # per iteration, so pausing+resuming made [3/7] drift to [3/4] as
     # remaining items drained — confusing.)
     _processed = 0
-    # Snapshot the queue size under queues._lock so the count we
-    # display in [N/total] matches what sync_pop will actually
-    # deliver. Without the lock, an enqueue happening between
+    # Snapshot the queue size through QueueState.sync_snapshot() so the
+    # count we display in [N/total] matches what sync_pop will actually
+    # deliver. Without a locked snapshot, an enqueue happening between
     # the count + the first pop made the denominator drift by
     # the number of newly-added items (audit: sync_all.py:294).
     try:
         if queues is not None:
-            with queues._lock:
-                _initial_total = sum(
-                    1 for c in queues.sync
-                    if (c.get("kind") or "download").lower() != "redownload"
-                )
+            _initial_total = sum(
+                1 for c in queues.sync_snapshot()
+                if (c.get("kind") or "download").lower() != "redownload"
+            )
         else:
             _initial_total = 0
     except Exception:
@@ -420,7 +420,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         # display something sensible.
         try:
             _remaining = sum(
-                1 for c in queues.sync
+                1 for c in queues.sync_snapshot()
                 if (c.get("kind") or "download").lower() != "redownload"
             ) if queues is not None else 0
         except Exception:

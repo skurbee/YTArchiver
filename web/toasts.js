@@ -115,7 +115,6 @@
       const btn = document.createElement("button");
       btn.className = "toast-action";
       btn.textContent = opts.action.label || "Undo";
-      btn.style.cssText = "margin-left:10px;background:transparent;border:none;color:var(--c-log-blue);cursor:pointer;text-decoration:underline;font-size:inherit;";
       el.appendChild(btn);
       _wireActionBtn = (dismissFn) => {
         btn.addEventListener("click", () => {

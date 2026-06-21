@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from ..log import get_logger
-from ..metadata_io import (
+from .io import (
     _folder_for_channel,
     _get_metadata_jsonl_path,
     _read_metadata_jsonl,

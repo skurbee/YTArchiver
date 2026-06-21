@@ -187,13 +187,16 @@ class DiskErrorMonitor:
             self._retry_tick()
 
     def _retry_tick(self) -> None:
-        if not self._active:
-            return
-        path = self._path or self._get_output_dir() or ""
+        with self._lock:
+            if not self._active:
+                return
+            path = self._path or self._get_output_dir() or ""
         writable = _check_directory_writable(path)
         if writable:
             border = "\u2588" * 65
             with self._lock:
+                if not self._active:
+                    return
                 self._active = False
             self._stream.emit([
                 ["\n" + border + "\n", "simpleline_green"],

@@ -67,8 +67,14 @@
     el.textContent = n > 99 ? "99+" : String(n);
   }
 
+  function clearDragTargets() {
+    document.querySelectorAll(".drag-target-above, .drag-target-below")
+      .forEach(el => el.classList.remove("drag-target-above", "drag-target-below"));
+  }
+
   // In-memory queue state so drag-to-rearrange can update order.
   const _queueState = { sync: [], gpu: [] };
+  let _dragSrcKind = "";
   // Exposed so context menus elsewhere (Subs tab) can check whether a
   // channel is currently queued / running and label menu items dynamically.
   // Mirrors OLD's dynamic-label mutation (YTArchiver.py:5596 _chan_ctx_menu).
@@ -85,27 +91,71 @@
     }
     return false;
   };
+
+  function _queueChannelKey(value) {
+    return String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
+  }
+
+  function _queueTaskMatchesChannel(task, channelName) {
+    const target = _queueChannelKey(channelName);
+    if (!target) return false;
+    return [
+      task?.channel_name,
+      task?.channel,
+      task?.folder,
+      task?.uploader,
+      task?.title,
+      task?.name,
+    ].some(value => _queueChannelKey(value) === target);
+  }
+
+  function _sameText(a, b) {
+    const left = String(a || "").trim();
+    const right = String(b || "").trim();
+    return !!left && !!right && left === right;
+  }
+
+  function _queueTaskSameIdentity(task, identity, queueKind) {
+    if (!task || !identity) return false;
+    if (queueKind === "sync") {
+      const taskChannel = _queueChannelKey(
+        task.channel_name || task.channel || task.folder || task.name);
+      const identityChannel = _queueChannelKey(
+        identity.channel_name || identity.channel || identity.folder
+        || identity.name);
+      return _sameText(task.url, identity.url)
+        || (!!taskChannel && taskChannel === identityChannel);
+    }
+    return _sameText(task.path, identity.path)
+      || _sameText(task.bulk_id, identity.bulk_id)
+      || _sameText(task.id, identity.id);
+  }
+
+  function _backendQueueIndexForPopover(queueKind, popoverIdx) {
+    let queueIdx = 0;
+    for (let j = 0; j < popoverIdx; j++) {
+      if ((_queueState[queueKind][j] || {}).status !== "running") {
+        queueIdx++;
+      }
+    }
+    return queueIdx;
+  }
+
   // Convenience: does `channelName` have a sync queued? (running or queued)
   window._queueHasSyncForChannel = (channelName) => {
-    const n = (channelName || "").toLowerCase();
-    if (!n) return null;
-    const match = (t) => {
-      const s = String(t?.name || t?.url || "").toLowerCase();
-      return s.includes(n) ? t.status || "queued" : null;
-    };
     for (const t of _queueState.sync) {
-      const s = match(t);
-      if (s) return s; // "running" | "queued"
+      if (_queueTaskMatchesChannel(t, channelName)) {
+        return t.status || "queued"; // "running" | "queued"
+      }
     }
     return null;
   };
   // Convenience: does a GPU task (transcribe/encode/compress) reference this channel?
   window._queueHasGpuForChannel = (channelName) => {
-    const n = (channelName || "").toLowerCase();
-    if (!n) return null;
     for (const t of _queueState.gpu) {
-      const s = String(t?.name || t?.title || "").toLowerCase();
-      if (s.includes(n)) return t.status || "queued";
+      if (_queueTaskMatchesChannel(t, channelName)) {
+        return t.status || "queued";
+      }
     }
     return null;
   };
@@ -163,6 +213,16 @@
       const closeBtnHtml = statusCls === "running"
         ? ""
         : '<button class="queue-task-close" title="Remove">&times;</button>';
+      const rowIdentity = {
+        url: t.url || "",
+        path: t.path || "",
+        bulk_id: t.bulk_id || "",
+        id: t.id || "",
+        channel_name: t.channel_name || "",
+        channel: t.channel || "",
+        folder: t.folder || "",
+        name: t.name || t.title || "",
+      };
 
       row.innerHTML = `
         <span class="queue-task-index">${i + 1}.</span>
@@ -174,20 +234,13 @@
 
       row.querySelector(".queue-task-close")?.addEventListener("click", (e) => {
         e.stopPropagation();
-        const popoverIdx = Number(row.dataset.idx);
+        const popoverIdx = _queueState[queueKind].findIndex((item) => (
+          (item?.status || "queued") !== "running"
+          && _queueTaskSameIdentity(item, rowIdentity, queueKind)
+        ));
+        if (popoverIdx < 0) return;
         const removed = _queueState[queueKind][popoverIdx];
-        // The X is a per-ROW action. Translate popover index ->
-        // backend queue index (the popover prepends current_sync /
-        // current_gpu as the running row, so any 'running' rows
-        // before our position need to be subtracted off — that
-        // position doesn't exist in the backend's queues list).
-        let runningBefore = 0;
-        for (let j = 0; j < popoverIdx; j++) {
-          if ((_queueState[queueKind][j] || {}).status === "running") {
-            runningBefore++;
-          }
-        }
-        const queueIdx = popoverIdx - runningBefore;
+        const queueIdx = _backendQueueIndexForPopover(queueKind, popoverIdx);
         _queueState[queueKind].splice(popoverIdx, 1);
         paintTaskList(body, _queueState[queueKind], emptyText, queueKind);
         // Original code passed only a URL / path, which deleted EVERY
@@ -329,6 +382,7 @@
       //      from main.py snaps the rows back to old order.
       row.addEventListener("dragstart", (e) => {
         row.classList.add("drag-src");
+        _dragSrcKind = queueKind;
         e.dataTransfer.effectAllowed = "move";
         e.dataTransfer.setData("text/plain",
           JSON.stringify({
@@ -346,15 +400,17 @@
       });
       row.addEventListener("dragend", () => {
         row.classList.remove("drag-src");
-        body.querySelectorAll(".drag-target-above, .drag-target-below")
-            .forEach(el => el.classList.remove("drag-target-above", "drag-target-below"));
+        _dragSrcKind = "";
+        clearDragTargets();
       });
       row.addEventListener("dragover", (e) => {
-        // Cross-queue drops can't be detected here (dragover doesn't expose the
-        // payload), so we show the drop indicator and reject the actual
-        // cross-queue drop at drop-time below. (Removed dead detection code
-        // that assigned `null` and did nothing — audit r2.)
+        if (_dragSrcKind && _dragSrcKind !== queueKind) {
+          e.dataTransfer.dropEffect = "none";
+          row.classList.remove("drag-target-above", "drag-target-below");
+          return;
+        }
         e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
         const rect = row.getBoundingClientRect();
         const halfway = rect.top + rect.height / 2;
         row.classList.toggle("drag-target-above", e.clientY < halfway);
@@ -391,6 +447,7 @@
           if (_m >= 0) srcIdx = _m;
         }
         if (srcKind !== queueKind) {
+          row.classList.remove("drag-target-above", "drag-target-below");
           // Cross-queue drop: no-op. Show a brief toast so the user
           // knows the drag was registered but rejected on purpose.
           window._showToast?.(

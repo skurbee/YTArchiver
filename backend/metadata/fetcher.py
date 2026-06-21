@@ -35,7 +35,7 @@ from typing import Any
 
 from ..log import get_logger
 from ..log_stream import LogStreamer
-from ..metadata_io import (
+from .io import (
     _folder_for_channel,
     _get_metadata_jsonl_path,
     _lock_for,
@@ -251,7 +251,7 @@ def _fetch_video_metadata(yt: str, video_id: str,
         # as UTC (H75). The old naive LOCAL string parsed 5-6h in the
         # past for Central Time, so 'already done this pass' never
         # matched and every resumed comment refresh restarted from
-        # video 1. metadata_io's duplicate resolution parses these into
+        # video 1. metadata.io's duplicate resolution parses these into
         # epoch seconds so mixed old naive-local and new offset-aware
         # entries compare by actual time rather than string order.
         "fetched_at": datetime.now(UTC).isoformat(),

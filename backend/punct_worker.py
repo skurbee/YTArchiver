@@ -22,6 +22,8 @@ import os
 import re
 import sys
 
+from backend.punct_alignment import joined_text_and_word_ends
+
 _out = sys.stdout
 sys.stdout = io.StringIO()
 sys.stderr = io.StringIO()
@@ -128,29 +130,25 @@ for line in sys.stdin:
             batches.pop()
 
         # ── Step 3: tag each word with its predicted punctuation ───────
-        # The model returns "entity" labels positioned by CHARACTER
-        # offsets inside the joined chunk text. We walk both at once:
-        #   char_index    — running byte offset into the chunk text as
-        #                   we step through words (incrementing by
-        #                   `len(word) + 1` for the trailing space)
-        #   result_index  — pointer into the model's entity list
-        # When the model's entity ends at or before char_index, that
-        # entity's label belongs to the word we just consumed. "0" is
-        # the model's "no punctuation here" label.
+        # The model returns "entity" labels positioned by character offsets
+        # inside the exact joined chunk text. Compute word end offsets from
+        # that same string so unusual Unicode tokens cannot drift out of sync.
+        # result_index points into the model entity list. When an entity ends
+        # at or before the word end offset, that label belongs to the word we
+        # just consumed. Label "0" means no punctuation.
         tagged = []
         for batch in batches:
             # Drop the last `overlap` words of every non-final batch —
             # they get re-tagged in the next batch with full right
             # context.
             ov = 0 if batch is batches[-1] else overlap
-            text_chunk = " ".join(batch)
+            text_chunk, word_ends = joined_text_and_word_ends(batch)
             result = pipe(text_chunk)
-            char_index = 0
             result_index = 0
-            for word in batch[:len(batch) - ov]:
-                char_index += len(word) + 1  # +1 for the joining space
+            for word, word_end in zip(batch[:len(batch) - ov], word_ends):
                 label = "0"
-                while result_index < len(result) and char_index > result[result_index]["end"]:
+                while (result_index < len(result)
+                       and word_end >= result[result_index]["end"]):
                     label = result[result_index]["entity"]
                     result_index += 1
                 tagged.append((word, label))

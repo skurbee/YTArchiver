@@ -124,7 +124,7 @@
             if (_dbArrived) return;
             statsEl.innerHTML = _renderLines(c, _fallback);
             const note = document.createElement("div");
-            note.style.cssText = "color:var(--c-dim);font-size:11px;margin-top:4px;";
+            note.className = "index-stats-note";
             note.textContent = "(segment / hours / DB-size stats still computing — reopen Index later to refresh)";
             statsEl.appendChild(note);
           }, 30000);

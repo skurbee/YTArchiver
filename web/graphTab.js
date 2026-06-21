@@ -437,8 +437,7 @@
     // graphTab.js H220).
     if (max === min && cleanWords.length > 1) {
       const hint = document.createElement("div");
-      hint.className = "browse-hint";
-      hint.style.cssText = "padding:8px 12px;color:var(--c-dim);font-size:12px;";
+      hint.className = "browse-hint graph-wordcloud-hint";
       hint.textContent = `All ${cleanWords.length} words tied at ${max} `
         + `occurrences — frequency ordering is arbitrary.`;
       cloud.appendChild(hint);

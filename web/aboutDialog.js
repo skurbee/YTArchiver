@@ -6,13 +6,6 @@
 (function () {
   "use strict";
 
-  const _browseState = window._browseState || {};
-  const showContextMenu = window.showContextMenu || (() => {});
-  const askConfirm = window.askConfirm;
-  const askDanger = window.askDanger;
-  const askQuestion = window.askQuestion;
-  const askChoice = window.askChoice;
-  const askTextInput = window.askTextInput;
   // escapeHtml lives in util.js under window.YT.util (with a window._escapeHtml
   // back-compat shim). This IIFE never imported it, so the bare `escapeHtml`
   // calls below threw "escapeHtml is not defined" and the About dialog showed
@@ -53,17 +46,17 @@
         // without inter-element whitespace. Result: rows sit at the
         // natural 1.5 line-height instead of ~2.5.
         body.innerHTML = (
-          `<div style="line-height:1.45;white-space:normal;">`
+          `<div class="about-content">`
             + `<div><strong>${escapeHtml(info.app_name)}</strong> `
-            + `<span style="color:var(--c-dim)">${escapeHtml(info.app_version)}</span></div>`
-            + `<div style="margin-top:10px;color:var(--c-dim);font-size:11.5px;">`
+            + `<span class="about-version">${escapeHtml(info.app_version)}</span></div>`
+            + `<div class="about-meta">`
               + `<div>Channels subscribed: ${info.channels ?? "\u2014"}</div>`
               + `<div>yt-dlp: ${escapeHtml(info.ytdlp_version || "\u2014")}</div>`
               + `<div>Python: ${escapeHtml(info.python_version || "\u2014")}</div>`
-              + `<div style="margin-top:8px;">Config: `
-                + `<code style="font-size:11px;">${escapeHtml(info.config_path)}</code></div>`
+              + `<div class="about-meta-row-spaced">Config: `
+                + `<code class="about-code">${escapeHtml(info.config_path)}</code></div>`
               + `<div>Archive root: `
-                + `<code style="font-size:11px;">${escapeHtml(info.output_dir || "\u2014")}</code></div>`
+                + `<code class="about-code">${escapeHtml(info.output_dir || "\u2014")}</code></div>`
             + `</div>`
           + `</div>`);
       } catch (e) { body.textContent = "Error loading: " + e; }

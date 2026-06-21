@@ -285,14 +285,15 @@ class SubsMixin:
         succession, then undoing once, left the second one unrecoverable.
 
         If `delete_files=True`, the channel's on-disk folder (videos +
-        transcripts + metadata + thumbnails) is recursively deleted. Undo
-        only restores the subscription, not the files.
+        transcripts + metadata + thumbnails) is moved to the app trash.
+        Undo only restores the subscription, not the files.
         """
         try:
             # Snapshot before removal for undo
             ch_snap = subs_backend.get_channel(identity or {})
             # refuse delete_files=True while sync is actively
-            # processing this channel — shutil.rmtree racing yt-dlp's
+            # processing this channel — moving/removing the folder while
+            # yt-dlp is writing into it
             # active writes can crash sync, partially-delete files, or
             # leave orphan temp dirs. Sub is not removed either since
             # that side effect would also surprise a live sync.
@@ -300,10 +301,10 @@ class SubsMixin:
                 _target_url = (ch_snap.get("url") or "").strip()
                 # Hold the sync-mutation lock for BOTH the check and
                 # the subs_backend.remove_channel() call below (which
-                # is what actually calls rmtree). Without the lock,
+                # is what actually moves the folder). Without the lock,
                 # a sync worker could start touching this channel
-                # between the active-sync check and the rmtree —
-                # racing yt-dlp's writes against rmtree's directory
+                # between the active-sync check and the folder move —
+                # racing yt-dlp's writes against filesystem mutation
                 # walk. The lock is reentrant so sync_start_all
                 # taking it elsewhere doesn't self-deadlock.
                 if not hasattr(self, "_sync_mutation_lock"):
@@ -312,7 +313,7 @@ class SubsMixin:
                     try:
                         # The OLD guard read self._current_sync_channel, which is
                         # never assigned anywhere — so it always saw "" and never
-                        # fired, letting rmtree race a live sync's writes. Compare
+                        # fired, letting folder mutation race a live sync's writes. Compare
                         # the delete target against the REAL active-sync state
                         # (QueueState.current_sync, set via set_current_sync()).
                         _cur = getattr(self._queues, "current_sync", None) or {}
@@ -329,7 +330,7 @@ class SubsMixin:
                             }
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
-                    # Take the rmtree branch INSIDE the lock so an
+                    # Take the folder-move branch INSIDE the lock so an
                     # incoming sync start can't slip past our check.
                     result = subs_backend.remove_channel(
                         identity or {}, delete_files=bool(delete_files))
@@ -337,7 +338,7 @@ class SubsMixin:
                 result = subs_backend.remove_channel(
                     identity or {}, delete_files=bool(delete_files))
             ok = bool(result.get("ok"))
-            # When the files were physically deleted, also purge the channel's
+            # When the files were moved out of the archive, also purge the channel's
             # rows from the index DB (videos + transcript segments). Browse /
             # Search / Videos read the index, not the disk — without this the
             # removed channel's cards linger and 404 ("File not found — index
@@ -384,6 +385,7 @@ class SubsMixin:
                 "can_undo": bool(ch_snap and ok and not delete_files),
                 "deleted_folder": bool(result.get("deleted_folder")),
                 "folder_path": result.get("folder_path"),
+                "trashed_folder_path": result.get("trashed_folder_path"),
                 "delete_error": result.get("delete_error"),
             }
         except subs_backend.SubsError as e:
@@ -641,7 +643,7 @@ class SubsMixin:
         """Delete N channels at once. `delete_files=True` also removes
         the on-disk folders. Returns {ok, started}.
 
-        The per-channel shutil.rmtree calls can take many minutes on
+        The per-channel folder moves can take time on
         TB-scale channels; the work runs on a background thread so the
         bridge call returns immediately. The result toast + Subs table
         refresh are pushed via evaluate_js when the worker finishes.
@@ -739,20 +741,24 @@ class SubsMixin:
         bridge call returns immediately. Final tally + Subs refresh
         land via evaluate_js when the worker finishes.
         """
-        cfg = self._config or load_config()
-        base = (cfg.get("output_dir") or "").strip()
+        cfg0 = load_config()
+        base = (cfg0.get("output_dir") or "").strip()
         if not base:
             return {"ok": False, "error": "output_dir not set"}
         from backend.sync import channel_folder_name as _cfn
 
         def _qp_worker():
+            cfg = load_config() or {}
+            worker_base = (cfg.get("output_dir") or "").strip() or base
+            channels = [dict(ch) for ch in (cfg.get("channels", []) or [])
+                        if isinstance(ch, dict)]
             tx_added = 0
             mt_added = 0
-            for ch in cfg.get("channels", []):
+            for ch in channels:
                 ch_name = ch.get("name") or ch.get("folder") or ""
                 if not ch_name:
                     continue
-                _ = os.path.join(base, _cfn(ch))
+                _ = os.path.join(worker_base, _cfn(ch))
                 pending_ids = ch.get("pending_tx_ids") or []
                 if isinstance(pending_ids, list) and len(pending_ids) > 0:
                     r = self.chan_transcribe_pending(ch_name)
@@ -813,10 +819,10 @@ class SubsMixin:
         bridge call returns immediately. Final tally toast lands via
         evaluate_js when the worker finishes.
         """
-        cfg = self._config or load_config()
-        channels = cfg.get("channels", []) or []
-
         def _qa_worker():
+            cfg = load_config() or {}
+            channels = [dict(ch) for ch in (cfg.get("channels", []) or [])
+                        if isinstance(ch, dict)]
             queued = 0
             for ch in channels:
                 name = ch.get("name") or ch.get("folder") or ""

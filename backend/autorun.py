@@ -11,6 +11,7 @@ AUTORUN_OPTIONS ports YTArchiver.py:22210 verbatim.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Callable
@@ -19,6 +20,8 @@ from typing import Any
 
 from .log import get_logger
 from .ytarchiver_config import (
+    APP_DATA_DIR,
+    autorun_history_entries_for_ui,
     config_is_writable,
     config_transaction,
     load_config,
@@ -34,6 +37,7 @@ AUTORUN_OPTIONS = {
 AUTORUN_LABELS = list(AUTORUN_OPTIONS.keys())
 
 AUTORUN_HISTORY_MAX = 10000  # was 100. UI activity-log displays everything (audit 2026-05-14)
+AUTORUN_HISTORY_FILE = APP_DATA_DIR / "autorun_history.jsonl"
 
 
 def _format_log_time(now: datetime | None = None) -> str:
@@ -331,6 +335,66 @@ class AutorunScheduler:
 _HISTORY_LOCK = threading.Lock()
 
 
+def _decode_history_line(line: str) -> str | None:
+    try:
+        data = json.loads(line)
+    except Exception:
+        return None
+    if isinstance(data, str):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("entry"), str):
+        return data["entry"]
+    return None
+
+
+def _append_history_line(path, entry: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _read_history_file(path=None,
+                       limit: int = AUTORUN_HISTORY_MAX) -> list[str]:
+    try:
+        path = path or AUTORUN_HISTORY_FILE
+        if not path.is_file():
+            return []
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return []
+    entries: list[str] = []
+    for line in lines[-max(1, int(limit)):]:
+        entry = _decode_history_line(line)
+        if entry:
+            entries.append(entry)
+    return entries
+
+
+def _seed_history_file_from_config_locked(path=None) -> None:
+    path = path or AUTORUN_HISTORY_FILE
+    if path.exists():
+        return
+    try:
+        old = load_config().get("autorun_history") or []
+    except Exception:
+        return
+    entries = [e for e in old[-AUTORUN_HISTORY_MAX:] if isinstance(e, str)]
+    if not entries:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def history_entries_for_ui(cfg: dict[str, Any] | None = None):
+    entries = _read_history_file()
+    if entries:
+        return autorun_history_entries_for_ui({"autorun_history": entries})
+    return autorun_history_entries_for_ui(cfg or {})
+
+
 def append_history_entry(entry: str, kind: str = "Auto") -> bool:
     """Append an autorun-history entry to config['autorun_history'].
 
@@ -349,11 +413,8 @@ def append_history_entry(entry: str, kind: str = "Auto") -> bool:
         return False
     with _HISTORY_LOCK:
         try:
-            with config_transaction() as cfg:
-                hist = cfg.setdefault("autorun_history", [])
-                hist.append(entry)
-                if len(hist) > AUTORUN_HISTORY_MAX:
-                    cfg["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
+            _seed_history_file_from_config_locked()
+            _append_history_line(AUTORUN_HISTORY_FILE, entry)
         except Exception as e:
             _log.warning("autorun history save failed: %s", e)
             return False
@@ -369,8 +430,13 @@ def clear_history() -> dict[str, Any]:
     if not config_is_writable():
         return {"ok": False, "error": "write-gate off", "removed": 0}
     try:
+        removed = len(_read_history_file())
+        try:
+            AUTORUN_HISTORY_FILE.unlink(missing_ok=True)
+        except Exception as e:
+            return {"ok": False, "error": str(e), "removed": removed}
         with config_transaction() as cfg:
-            removed = len(cfg.get("autorun_history") or [])
+            removed += len(cfg.get("autorun_history") or [])
             cfg["autorun_history"] = []
         return {"ok": True, "removed": removed}
     except Exception as e:

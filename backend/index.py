@@ -560,13 +560,14 @@ def _alnum_key(s: str) -> str:
 
 
 def _build_sidecar_id_map(dir_path: str) -> dict:
-    """Map a directory's .info.json sidecars: {by_name, by_title} -> id."""
+    """Map a directory's .info.json sidecars to ids."""
     by_name: dict[str, str] = {}
+    by_stem: dict[str, str] = {}
     by_title: dict[str, str] = {}
     try:
         names = os.listdir(dir_path)
     except OSError:
-        return {"by_name": by_name, "by_title": by_title}
+        return {"by_name": by_name, "by_stem": by_stem, "by_title": by_title}
     for fn in names:
         if not fn.endswith(".info.json"):
             continue
@@ -578,6 +579,9 @@ def _build_sidecar_id_map(dir_path: str) -> dict:
         vid = str(data.get("id") or "").strip()
         if not _VIDID_RE.fullmatch(vid):
             continue
+        sidecar_stem = fn[:-len(".info.json")].lower()
+        if sidecar_stem:
+            by_stem.setdefault(sidecar_stem, vid)
         # The exact output filename yt-dlp used (authoritative).
         rec = data.get("_filename") or data.get("filename") or ""
         if not rec:
@@ -589,7 +593,7 @@ def _build_sidecar_id_map(dir_path: str) -> dict:
         tkey = _alnum_key(str(data.get("title") or ""))
         if tkey:
             by_title.setdefault(tkey, vid)
-    return {"by_name": by_name, "by_title": by_title}
+    return {"by_name": by_name, "by_stem": by_stem, "by_title": by_title}
 
 
 def _resolve_id_from_sidecars(filepath: str) -> str:
@@ -620,7 +624,10 @@ def _resolve_id_from_sidecars(filepath: str) -> str:
         base = os.path.basename(filepath).lower()
         if base in m["by_name"]:
             return m["by_name"][base]
-        stem_key = _alnum_key(os.path.splitext(os.path.basename(filepath))[0])
+        raw_stem = os.path.splitext(os.path.basename(filepath))[0].lower()
+        if raw_stem and raw_stem in m.get("by_stem", {}):
+            return m["by_stem"][raw_stem]
+        stem_key = _alnum_key(raw_stem)
         if stem_key:
             if stem_key in m["by_title"]:
                 return m["by_title"][stem_key]
@@ -665,42 +672,22 @@ def register_video(filepath: str, channel: str, title: str | None = None,
         stem = Path(fp).stem
         # Strip " [ID]" suffix if present
         title = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", stem).strip() or stem
-    # Explicit video_id wins; else try the filename; else look in .info.json
-    # consolidated into text_utils.extract_video_id.
+    # Explicit video_id wins; else try the filename. Sidecar recovery is kept
+    # in the cached resolver below so JSON is read through one path.
     from .text_utils import extract_video_id as _extract_vid
     vid_id = _extract_vid(
         fp,
         hint=(video_id or "").strip(),
         reject_alpha_only=True,
-        info_json_fallback=True,
+        info_json_fallback=False,
     ) or None
-    # Content-based recovery: extract_video_id's sidecar step matches by
-    # exact filename stem, which misses when yt-dlp named the .mp4 and the
-    # .info.json differently (punctuation-heavy titles). This reads the id
-    # out of the .info.json *content* in the same folder — the id yt-dlp
-    # recorded is always in there, regardless of the sidecar's filename.
+    # Content-based recovery: direct sibling sidecar, recorded output filename,
+    # then title match, all from one per-directory cached sidecar scan.
     if not vid_id:
         _sc_vid = _resolve_id_from_sidecars(fp)
         if _sc_vid:
             vid_id = _sc_vid
-    if not vid_id:
-        # Final, dead-simple, CACHE-FREE guarantee: yt-dlp writes
-        # "<stem>.info.json" with the SAME stem as the video file and the
-        # real id inside it. Read that exact sibling directly — no filename/
-        # title matching, no per-directory cache — so a video is NEVER
-        # registered id-less when its own sidecar is sitting right beside it.
-        # The resolvers above can trip on punctuation / fullwidth-colon names
-        # (extract_video_id's stem logic) or a stale dir-mtime cache
-        # (_resolve_id_from_sidecars); this can't.
-        try:
-            _direct_info = os.path.splitext(fp)[0] + ".info.json"
-            if os.path.isfile(_direct_info):
-                with open(_direct_info, "r", encoding="utf-8") as _jf:
-                    _jid = str((json.load(_jf) or {}).get("id") or "").strip()
-                if re.fullmatch(r"[A-Za-z0-9_-]{11}", _jid):
-                    vid_id = _jid
-        except Exception as _je:
-            _log.debug("direct .info.json id read failed (%s): %s", fp, _je)
+    # Direct sibling sidecars are covered by _resolve_id_from_sidecars.
     vid_url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None
     year, month = _parse_year_month_from_path(fp)
     # Single os.stat() call rather than separate isfile + getsize +
@@ -2265,7 +2252,7 @@ def backfill_video_stats(progress=None) -> dict:
     archive by views/likes off an indexed column. Idempotent; safe to re-run.
     """
     try:
-        from .metadata_io import _folder_for_channel, _read_metadata_jsonl
+        from .metadata.io import _folder_for_channel, _read_metadata_jsonl
         from .ytarchiver_config import load_config
     except Exception as e:
         return {"ok": False, "error": f"import: {e}", "updated": 0}

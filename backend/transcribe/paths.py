@@ -19,14 +19,14 @@ from __future__ import annotations
 
 import os
 
-from .log import get_logger
-from .utils import (
+from ..log import get_logger
+from ..utils import (
     MONTH_FOLDERS as _MONTH_NAMES,
 )
 
 # Re-exported so transcribe/transcribe_files.py + transcribe/core.py can
 # pull it from this single facade module.
-from .utils import hide_file_win as _hide_file_win  # noqa: F401
+from ..utils import hide_file_win as _hide_file_win  # noqa: F401
 
 _log = get_logger(__name__)
 
@@ -42,7 +42,7 @@ def _get_transcript_filename(ch_name: str, folder_path: str,
     # Defensive: split_years=True with year=None is a caller bug —
     # without this guard, both the month and year branches below
     # fall through and we'd silently write to the combined-mode
-    # filename (audit: transcribe_paths.py:43-58). Surface the bug
+    # filename (audit: transcribe/paths.py:43-58). Surface the bug
     # rather than silently misroute.
     if split_years and year is None and not combined:
         raise ValueError(

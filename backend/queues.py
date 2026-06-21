@@ -25,6 +25,7 @@ import copy
 import json
 import os
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -79,8 +80,12 @@ class QueueState:
         self.sync_pass_index: int = 0
         self.sync_pass_total: int = 0
 
-        # Debounced save scheduler
-        self._save_timer: threading.Timer | None = None
+        # Debounced save scheduler. A single daemon thread waits until
+        # _save_deadline; save_debounced() only pushes the deadline out
+        # and signals it, avoiding one Timer thread per queue mutation.
+        self._save_cond = threading.Condition(self._lock)
+        self._save_thread: threading.Thread | None = None
+        self._save_deadline: float | None = None
         # Shortened from 2.0s — a task-killed (Task Manager "End Task")
         # process during the debounce window loses the last queue
         # mutation since SIGTERM doesn't fire on Windows force-kill
@@ -90,11 +95,17 @@ class QueueState:
         # window-of-loss to a quarter of what it was (audit:
         # main.py:1362).
         self._save_interval_sec = 0.5
-        # Save mutex — serializes save_now() so two near-simultaneous
-        # debounce-timer fires (the in-progress one + a freshly-scheduled
-        # one from a new save_debounced call) can't both write to the
-        # same .tmp file and race on os.replace.
+        # Save mutex serializes save_now() so immediate current-item saves
+        # and the debounced saver cannot both write to the same .tmp file
+        # and race on os.replace.
         self._save_io_lock = threading.Lock()
+        self._save_failure_warned: bool = False
+        # Hot current-item transitions use a tiny authoritative sidecar so
+        # large queues are not fully serialized on every channel/job change.
+        self._resuming_io_lock = threading.Lock()
+        self._resuming_write_seq: int = 0
+        self._resuming_last_written_seq: int = 0
+        self._resuming_failure_warned: bool = False
 
         # resuming items pulled from the persisted file
         # (in-flight when the app last shut down). Caller reads via
@@ -104,6 +115,10 @@ class QueueState:
 
         # Listeners notified on any state change (UI push)
         self._listeners: list[Callable[[], None]] = []
+        self._notify_cond = threading.Condition(self._lock)
+        self._notify_dirty = False
+        self._notify_thread: threading.Thread | None = None
+        self._notify_stopped = False
 
         # When True, _atexit_flush is a no-op. Set via mark_orphan()
         # by the caller (main.py) when it discards a QueueState
@@ -126,10 +141,18 @@ class QueueState:
             _log.debug("swallowed: %s", e)
 
     def mark_orphan(self) -> None:
-        """Caller-side signal that this QueueState should NOT participate
-        in atexit-save. Use when discarding an instance whose load()
-        raised (and replacing it with a fresh QueueState)."""
-        self._atexit_disabled = True
+        """Caller-side signal that this QueueState should stop background work.
+
+        Use when discarding an instance whose load() raised and replacing it
+        with a fresh QueueState.
+        """
+        with self._save_cond:
+            self._atexit_disabled = True
+            self._save_deadline = None
+            self._save_cond.notify_all()
+        with self._notify_cond:
+            self._notify_stopped = True
+            self._notify_cond.notify_all()
 
     # ── listener registration ───────────────────────────────────────
 
@@ -153,34 +176,40 @@ class QueueState:
             self._listeners.append(fn)
 
     def _notify(self):
-        # Fire listeners on a background thread so the mutation path
-        # (sync_enqueue, sync_pop, etc.) doesn't block on
-        # window.evaluate_js round-trips. Previously every queue
-        # mutation blocked the calling worker thread on Chromium's JS
-        # engine — a fast download burst against 50 channels
-        # serialized through evaluate_js, slowing throughput and
-        # making the UI feel unresponsive. The listeners are
-        # idempotent and run on a short-lived daemon thread; ordering
-        # is preserved because we snapshot the listener list before
-        # dispatching.
-        # LOW FIX (audit 5.23 LOW-4): snapshot under _lock to pair with
-        # the locked add_listener above. Cheap (single list copy) and
-        # closes the theoretical add-during-snapshot race.
-        with self._lock:
-            snapshot = list(self._listeners)
-        if not snapshot:
-            return
-        def _fire():
+        """Schedule one latest-state listener dispatch for queue UI updates."""
+        try:
+            with self._notify_cond:
+                if self._notify_stopped or not self._listeners:
+                    return
+                self._notify_dirty = True
+                if (self._notify_thread is None
+                        or not self._notify_thread.is_alive()):
+                    self._notify_thread = threading.Thread(
+                        target=self._notify_loop,
+                        daemon=True,
+                        name="queues-notify",
+                    )
+                    self._notify_thread.start()
+                self._notify_cond.notify_all()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+
+    def _notify_loop(self):
+        while True:
+            with self._notify_cond:
+                while not self._notify_dirty and not self._notify_stopped:
+                    self._notify_cond.wait()
+                if self._notify_stopped:
+                    self._notify_thread = None
+                    return
+                self._notify_dirty = False
+                snapshot = list(self._listeners)
+
             for fn in snapshot:
                 try:
                     fn()
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
-        try:
-            threading.Thread(target=_fire, daemon=True,
-                             name="queues-notify").start()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
 
     # ── load/save ────────────────────────────────────────────────────
 
@@ -210,6 +239,7 @@ class QueueState:
                 try: os.remove(str(QUEUE_FILE))
                 except OSError: pass
             return False
+        sidecar_exists, sidecar_resuming = self._load_resuming_sidecar()
         with self._lock:
             self.sync = list(data.get("sync", []))
             # LOW FIX (audit 5.23 LOW-3): no longer load five dead lists
@@ -254,8 +284,30 @@ class QueueState:
                             and isinstance(lst[0], dict)
                             and lst[0].get("_in_flight")):
                         self._loaded_resuming[key] = lst.pop(0)
+            if sidecar_exists:
+                self._loaded_resuming = sidecar_resuming
         self._notify()
         return True
+
+    def _resuming_file(self):
+        return QUEUE_FILE.with_name(
+            f"{QUEUE_FILE.stem}_resuming{QUEUE_FILE.suffix or '.json'}")
+
+    def _load_resuming_sidecar(self) -> tuple[bool, dict[str, Any]]:
+        sidecar = self._resuming_file()
+        if not sidecar.exists():
+            return False, {}
+        try:
+            with sidecar.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError):
+            try:
+                os.replace(str(sidecar), str(sidecar) + ".bak")
+            except OSError:
+                pass
+            return False, {}
+        resuming = data.get("resuming") if isinstance(data, dict) else None
+        return True, dict(resuming) if isinstance(resuming, dict) else {}
 
     def _build_save_payload_locked(self) -> dict[str, Any]:
         """Build the QUEUE_FILE payload from current state. CALLER MUST HOLD
@@ -292,8 +344,51 @@ class QueueState:
                 with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(payload, f, indent=2)
                 os.replace(tmp, QUEUE_FILE)
+                self._save_failure_warned = False
                 return True
-            except OSError:
+            except OSError as e:
+                if not self._save_failure_warned:
+                    _log.warning(
+                        "Queue state could not be saved; pending work may not "
+                        "resume after a crash until saving succeeds again: %s", e)
+                    self._save_failure_warned = True
+                return False
+
+    def _build_resuming_payload_locked(self) -> dict[str, Any]:
+        self._resuming_write_seq += 1
+        resuming: dict[str, Any] = {}
+        if self.current_sync is not None:
+            resuming["sync"] = copy.deepcopy(self.current_sync)
+        if self.current_gpu is not None:
+            resuming["gpu"] = copy.deepcopy(self.current_gpu)
+        return {
+            "_schema_version": 1,
+            "_seq": self._resuming_write_seq,
+            "resuming": resuming,
+        }
+
+    def _write_resuming_payload(self, payload: dict[str, Any]) -> bool:
+        sidecar = self._resuming_file()
+        with self._resuming_io_lock:
+            seq = int(payload.get("_seq") or 0)
+            if seq and seq < self._resuming_last_written_seq:
+                return True
+            try:
+                tmp = str(sidecar) + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+                os.replace(tmp, sidecar)
+                if seq:
+                    self._resuming_last_written_seq = seq
+                self._resuming_failure_warned = False
+                return True
+            except OSError as e:
+                if not self._resuming_failure_warned:
+                    _log.warning(
+                        "Current queue item could not be saved for crash "
+                        "recovery; it will retry with the next queue save: %s",
+                        e)
+                    self._resuming_failure_warned = True
                 return False
 
     def save_now(self) -> bool:
@@ -305,43 +400,42 @@ class QueueState:
         return self._write_save_payload(payload)
 
     def save_debounced(self):
-        """Schedule a save for _save_interval_sec from now (coalesces bursts).
+        """Schedule a save after _save_interval_sec, coalescing bursts.
 
-        an atexit hook is registered at construction
-        (see __init__) so that if the app is killed or crashes during
-        the 2-second debounce window, pending changes still flush to
-        disk. Without this, close-during-queue-edit silently lost the
-        latest enqueue/remove.
-
-        Each call cancels any pending timer and re-arms a fresh one, so
-        a burst of edits coalesces correctly to a single save AFTER the
-        burst quiets. Previously the early-return on existing-timer
-        meant only the FIRST edit was guaranteed to land — edits that
-        arrived within the 2s window weren't persisted until the next
-        unrelated debounce trigger or app shutdown.
+        A single reusable daemon thread waits until the latest deadline;
+        each call only pushes that deadline out and signals the condition.
         """
-        with self._lock:
-            # Don't arm a timer once atexit has flushed — it could fire
-            # save_now() during interpreter teardown, writing QUEUE_FILE AFTER
-            # the final flush (audit r2). Checked under the same lock the
-            # atexit flag is now set under.
+        with self._save_cond:
             if getattr(self, "_atexit_disabled", False):
                 return
-            if self._save_timer is not None:
-                try: self._save_timer.cancel()
-                except Exception as e: _log.debug("swallowed: %s", e)
-                self._save_timer = None
-            t = threading.Timer(self._save_interval_sec, self._do_debounced_save)
-            t.daemon = True
-            t.start()
-            self._save_timer = t
+            self._save_deadline = time.monotonic() + self._save_interval_sec
+            if self._save_thread is None or not self._save_thread.is_alive():
+                self._save_thread = threading.Thread(
+                    target=self._debounced_save_loop,
+                    daemon=True,
+                    name="queues-save",
+                )
+                self._save_thread.start()
+            self._save_cond.notify_all()
 
-    def _do_debounced_save(self):
-        with self._lock:
-            self._save_timer = None
-            if getattr(self, "_atexit_disabled", False):
-                return
-        self.save_now()
+    def _debounced_save_loop(self):
+        while True:
+            with self._save_cond:
+                while True:
+                    if getattr(self, "_atexit_disabled", False):
+                        self._save_deadline = None
+                        self._save_thread = None
+                        return
+                    deadline = self._save_deadline
+                    if deadline is None:
+                        self._save_thread = None
+                        return
+                    delay = deadline - time.monotonic()
+                    if delay <= 0:
+                        self._save_deadline = None
+                        break
+                    self._save_cond.wait(delay)
+            self.save_now()
 
     def _atexit_flush(self):
         """atexit hook — cancel any pending debounce timer and force a
@@ -354,19 +448,15 @@ class QueueState:
         """
         if getattr(self, "_atexit_disabled", False):
             return
-        # Set the disable flag + cancel the pending timer ATOMICALLY under the
-        # lock so a concurrent save_debounced (which now checks the flag under
-        # the same lock) can't arm a fresh timer after our flush (audit r2 —
-        # the flag was previously set OUTSIDE the lock, so the H121 invariant
+        # Set the disable flag + clear the pending deadline atomically
+        # under the condition lock so a concurrent save_debounced cannot
+        # schedule work after our final flush.
         # didn't actually hold).
         try:
-            with self._lock:
+            with self._save_cond:
                 self._atexit_disabled = True
-                t = self._save_timer
-                self._save_timer = None
-            if t is not None:
-                try: t.cancel()
-                except Exception as e: _log.debug("swallowed: %s", e)
+                self._save_deadline = None
+                self._save_cond.notify_all()
             self.save_now()
         except Exception as e:
             _log.debug("swallowed: %s", e)
@@ -391,6 +481,11 @@ class QueueState:
         self._notify()
         self.save_debounced()
         return True
+
+    def sync_snapshot(self) -> list[dict[str, Any]]:
+        """Return a lock-protected copy of the pending sync queue."""
+        with self._lock:
+            return copy.deepcopy(self.sync)
 
     def sync_pop(self) -> dict[str, Any] | None:
         with self._lock:
@@ -446,30 +541,39 @@ class QueueState:
 
     def sync_remove_at(self, idx: int, expected_url: str = "",
                        expected_name: str = "") -> bool:
-        """Remove the queued sync item at exactly `idx`, with an
-        identity guard so we don't accidentally delete a different
-        item if the queue shifted between paint and click.
+        """Remove a queued sync item by identity, using `idx` as a fast path.
 
         `expected_url` / `expected_name` describe what the caller
-        thought was at that slot — we refuse to delete if neither
-        matches. Both empty = skip the guard (legacy callers).
+        thought was at that slot. When either identity field is supplied,
+        the index is trusted only if the entry still matches; otherwise we
+        search the latest queue snapshot for the identity before deleting.
+        Both empty keeps the legacy exact-index behavior.
         """
         with self._lock:
-            if idx < 0 or idx >= len(self.sync):
+            has_identity = bool(expected_url or expected_name)
+            if not has_identity and (idx < 0 or idx >= len(self.sync)):
                 return False
-            item = self.sync[idx]
-            if expected_url or expected_name:
+
+            def matches(item: dict[str, Any]) -> bool:
                 cur_url = (item.get("url") or "").strip()
                 cur_name = (item.get("name")
                             or item.get("folder") or "").strip()
-                # Allow either match — frontend may pass whichever
-                # field was visible. Refuse only when BOTH disagree.
-                _url_ok = (not expected_url) or (cur_url == expected_url)
-                _name_ok = (not expected_name) or (cur_name == expected_name)
-                if not (_url_ok or _name_ok):
-                    return False
+                return ((bool(expected_url) and cur_url == expected_url)
+                        or (bool(expected_name) and cur_name == expected_name))
+
+            target_idx = idx
+            if has_identity:
+                if idx < 0 or idx >= len(self.sync) or not matches(self.sync[idx]):
+                    target_idx = next(
+                        (i for i, item in enumerate(self.sync)
+                         if matches(item)),
+                        -1,
+                    )
+                    if target_idx < 0:
+                        return False
+            item = self.sync[target_idx]
             removed_url = (item.get("url") or "").strip()
-            del self.sync[idx]
+            del self.sync[target_idx]
             # Drop the matching order entry (first one with this URL).
             if removed_url:
                 for j, o in enumerate(self.order):
@@ -606,20 +710,30 @@ class QueueState:
 
     def gpu_remove_at(self, idx: int, expected_path: str = "",
                       expected_bulk_id: str = "") -> bool:
-        """Remove the queued GPU item at exactly `idx`, with an
-        identity guard. See sync_remove_at — same idea."""
+        """Remove a queued GPU item by identity, using `idx` as a fast path."""
         with self._lock:
-            if idx < 0 or idx >= len(self.gpu):
+            has_identity = bool(expected_path or expected_bulk_id)
+            if not has_identity and (idx < 0 or idx >= len(self.gpu)):
                 return False
-            item = self.gpu[idx]
-            if expected_path or expected_bulk_id:
+
+            def matches(item: dict[str, Any]) -> bool:
                 cur_path = (item.get("path") or "").strip()
                 cur_bulk = str(item.get("bulk_id") or "").strip()
-                _path_ok = (not expected_path) or (cur_path == expected_path)
-                _bulk_ok = (not expected_bulk_id) or (cur_bulk == expected_bulk_id)
-                if not (_path_ok or _bulk_ok):
-                    return False
-            del self.gpu[idx]
+                return ((bool(expected_path) and cur_path == expected_path)
+                        or (bool(expected_bulk_id)
+                            and cur_bulk == expected_bulk_id))
+
+            target_idx = idx
+            if has_identity:
+                if idx < 0 or idx >= len(self.gpu) or not matches(self.gpu[idx]):
+                    target_idx = next(
+                        (i for i, item in enumerate(self.gpu)
+                         if matches(item)),
+                        -1,
+                    )
+                    if target_idx < 0:
+                        return False
+            del self.gpu[target_idx]
         self._notify()
         self.save_debounced()
         return True
@@ -663,12 +777,13 @@ class QueueState:
         # skips atexit and a 0.5s debounce can lose this transition (H106).
         with self._lock:
             self.current_sync = copy.deepcopy(ch) if ch else None
-            _payload = (self._build_save_payload_locked()
+            _payload = (self._build_resuming_payload_locked()
                         if config_is_writable() else None)
         self._notify()
         if _payload is not None:
             try:
-                self._write_save_payload(_payload)
+                if not self._write_resuming_payload(_payload):
+                    self.save_debounced()
             except Exception:
                 self.save_debounced()
 
@@ -689,12 +804,13 @@ class QueueState:
         # dropping it from `resuming` on a force-kill is costly.
         with self._lock:
             self.current_gpu = copy.deepcopy(item) if item else None
-            _payload = (self._build_save_payload_locked()
+            _payload = (self._build_resuming_payload_locked()
                         if config_is_writable() else None)
         self._notify()
         if _payload is not None:
             try:
-                self._write_save_payload(_payload)
+                if not self._write_resuming_payload(_payload):
+                    self.save_debounced()
             except Exception:
                 self.save_debounced()
 
@@ -762,6 +878,9 @@ class QueueState:
                 "status": "running",
                 "path": (cur_gpu.get("path") or "").strip(),
                 "bulk_id": running_bulk_id,
+                "kind": (cur_gpu.get("kind") or "transcribe"),
+                "title": (cur_gpu.get("title") or ""),
+                "channel": (cur_gpu.get("channel") or "").strip(),
             })
         # Coalesce queued items by bulk_id. First pass: count per bulk_id.
         # Second pass: emit one row per bulk (or per-item if no bulk_id).
@@ -793,6 +912,9 @@ class QueueState:
                     "status": "queued",
                     "bulk_id": bid,
                     "bulk_count": remaining,
+                    "kind": (t.get("kind") or "transcribe"),
+                    "title": ch_name,
+                    "channel": ch_name,
                 })
                 seen_bulks.add(bid)
             else:
@@ -802,6 +924,9 @@ class QueueState:
                     "status": "queued",
                     "path": (t.get("path") or "").strip(),
                     "bulk_id": str(t.get("bulk_id") or ""),
+                    "kind": (t.get("kind") or "transcribe"),
+                    "title": (t.get("title") or ""),
+                    "channel": (t.get("channel") or "").strip(),
                 })
         return {
             "sync": sync_list,

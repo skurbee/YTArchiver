@@ -33,7 +33,7 @@ import time
 from ..log import get_logger
 from ..log_stream import LogStreamer
 from ..subprocess_util import make_startupinfo as _make_startupinfo
-from ..transcribe_paths import (
+from .paths import (
     _generate_distributed_words,
 )
 from .transcribe_files import (

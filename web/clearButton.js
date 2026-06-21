@@ -6,11 +6,7 @@
 (function () {
   "use strict";
 
-  const _browseState = window._browseState || {};
-  const showContextMenu = window.showContextMenu || (() => {});
   const askConfirm = window.askConfirm;
-  const askDanger = window.askDanger;
-  const askQuestion = window.askQuestion;
   function bridgeCall(method, ...args) {
     const fn = window.YT?.bridge?.bridgeCall;
     if (fn) return fn(method, ...args);

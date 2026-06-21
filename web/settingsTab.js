@@ -106,13 +106,13 @@
           const estLow = nVids * BYTES_PER_ROW_LOW;
           const estHigh = nVids * BYTES_PER_ROW_HIGH;
           hintB.innerHTML =
-            `<span style="color:var(--c-log-sum);">\u26A0</span> ` +
+            `<span class="settings-warn-icon">\u26A0</span> ` +
             `All ${nVids.toLocaleString()} videos loaded at launch \u2014 ` +
             `startup takes longer (several seconds to a couple minutes on large archives). ` +
             `Rough RAM: ~${_fmtMB(estLow)}-${_fmtMB(estHigh)}.`;
         } else {
           hintB.innerHTML =
-            `<span style="color:var(--c-log-sum);">\u26A0</span> ` +
+            `<span class="settings-warn-icon">\u26A0</span> ` +
             `Channels load on first click of each \u2014 brief "Loading\u2026" screen the ` +
             `first time you open a channel each session, then cached for the rest of the session.`;
         }
@@ -698,13 +698,13 @@
           }
           const reasonHtml = Object.keys(byReason).map(reason => {
             const names = byReason[reason];
-            const more = names.length > 5 ? ` <span style="color:#888;">+ ${names.length - 5} more</span>` : "";
+            const more = names.length > 5 ? ` <span class="import-skip-more">+ ${names.length - 5} more</span>` : "";
             return `
-              <div style="margin-bottom:8px;">
-                <div style="font-weight:600;color:#cdd;">${_esc(reason)}
-                  <span style="color:#888;font-weight:normal;">(${names.length})</span>
+              <div class="import-skip-group">
+                <div class="import-skip-title">${_esc(reason)}
+                  <span class="import-skip-count">(${names.length})</span>
                 </div>
-                <div style="font-size:11px;color:#aaa;padding-left:10px;">
+                <div class="import-skip-names">
                   ${names.slice(0, 5).map(_esc).join("<br>")}${more}
                 </div>
               </div>`;
@@ -713,7 +713,7 @@
             title: `Imported ${res.added} channels (${skipped} skipped)`,
             message: "Skipped channels by reason.",
             bodyHtml:
-              `<div style="margin-bottom:8px;color:#888;font-size:11px;">` +
+              `<div class="import-skip-intro">` +
               `Skipped channels by reason:</div>` + reasonHtml,
             confirm: "OK",
             noCancel: true,
@@ -772,32 +772,28 @@
       const rows = (prev.items || []).map(it =>
         `<tr>
           <td>${_esc(it.name)}</td>
-          <td style="text-align:right;">${_esc(it.size_label)}</td>
-          <td style="color:#888;">${_esc(it.modified)}</td>
+          <td class="backup-preview-num">${_esc(it.size_label)}</td>
+          <td class="backup-preview-muted">${_esc(it.modified)}</td>
         </tr>`
       ).join("");
       const ftsWarn = prev.fts_skipped
-        ? `<div style="margin:8px 0 0;padding:6px;border:1px solid #6b4a1d;
-                     border-radius:4px;color:#e0b568;background:rgba(180,120,40,0.10);">
+        ? `<div class="backup-preview-warning">
              ${_esc(prev.fts_skipped)}
            </div>`
         : "";
       const previewHtml =
-        `<div style="max-height:280px;overflow:auto;
-                     border:1px solid #2a2d33;border-radius:4px;
-                     padding:6px;margin-top:8px;">
-           <table style="width:100%;font-size:11px;
-                         border-collapse:collapse;">
+        `<div class="backup-preview-frame">
+           <table class="backup-preview-table">
              <thead>
-               <tr style="text-align:left;color:#888;">
-                 <th>File</th><th style="text-align:right;">Size</th>
+               <tr>
+                 <th>File</th><th class="backup-preview-num">Size</th>
                  <th>Modified</th>
                </tr>
              </thead>
              <tbody>${rows}</tbody>
            </table>
          </div>
-         <div style="margin-top:8px;font-size:11px;color:#888;">
+         <div class="backup-preview-total">
            Total: ${prev.items.length} file(s) \u2014 ${_esc(prev.total_label)}.
            Your current config will be snapshotted before overwrite.
          </div>${ftsWarn}`;

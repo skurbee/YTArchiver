@@ -32,6 +32,7 @@
 
   let tickHandle = null;
   let remaining = 300;
+  let releaseFocusTrap = null;
 
   function stopTick() {
     if (tickHandle) { clearInterval(tickHandle); tickHandle = null; }
@@ -59,6 +60,10 @@
 
   function answer(choice) {
     stopTick();
+    if (releaseFocusTrap) {
+      releaseFocusTrap();
+      releaseFocusTrap = null;
+    }
     const m = modal();
     if (m) m.hidden = true;
     if (!nativeBridgeUp()) return;
@@ -69,6 +74,8 @@
   function showPicker(show) {
     const p = picker();
     if (p) p.hidden = !show;
+    const focusId = show ? "redwnl-sample-res-ok" : "redwnl-sample-continue";
+    setTimeout(() => document.getElementById(focusId)?.focus(), 30);
   }
 
   function wireHoverPause(m) {
@@ -98,6 +105,12 @@
     showPicker(false);
     wireHoverPause(m);
     m.hidden = false;
+    if (releaseFocusTrap) releaseFocusTrap();
+    releaseFocusTrap = window.YT?.modals?.activateFocusTrap?.(m, {
+      dialogSelector: ".yt-modal",
+      initialFocus: "#redwnl-sample-continue",
+      onEscape: () => answer("cancel"),
+    }) || null;
     startTick();
   });
 

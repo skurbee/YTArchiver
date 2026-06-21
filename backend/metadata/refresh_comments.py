@@ -19,7 +19,7 @@ from typing import Any
 
 from ..log import get_logger
 from ..log_stream import LogStreamer
-from ..metadata_io import (
+from .io import (
     _folder_for_channel,
     _read_metadata_jsonl,
 )

@@ -29,10 +29,10 @@ from ..log import get_logger
 from ..log_stream import LogStreamer
 from ..ytarchiver_config import (
     ARCHIVE_FILE,
+    ConfigUnchanged,
     config_is_writable,
     config_transaction,
     load_config,
-    save_config,
 )
 
 __all__ = [
@@ -217,9 +217,6 @@ _cookie_alert_lock = threading.Lock()
 # sync threads writing concurrently can interleave bytes mid-line, and
 # the loader silently drops malformed lines (audit: sync/core.py:1654).
 _archive_write_lock = threading.Lock()
-# Legacy compatibility for older metadata code paths; new writes should use
-# ytarchiver_config.config_transaction() directly.
-_config_write_lock = threading.Lock()
 _LAST_429_BACKOFF_TS: float = 0.0
 _backoff_lock = threading.Lock()
 
@@ -489,7 +486,6 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         return SyncResult(ok=False, reason="blank channel name",
                           downloaded=0, errors=0)
     ch_dir = base_dir / folder_name
-    ch_dir.mkdir(parents=True, exist_ok=True)
 
     # Pre-flight disk checks (mirrors YTArchiver.py:2314/2332).
     # check_directory_writable creates + deletes a probe file so we fail
@@ -497,21 +493,24 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # A minimum of 500MB free keeps room for the largest plausible single
     # video; actual videos are streamed so we don't need to pre-allocate.
     from ..utils import check_directory_writable, check_disk_space
-    if not check_directory_writable(str(ch_dir)):
+    preflight_dir = base_dir if not ch_dir.exists() else ch_dir
+    if not check_directory_writable(str(preflight_dir)):
         stream.emit([["ERROR: ", "red"],
                      [f"Cannot write to {ch_dir} \u2014 disk may be full, read-only, or disconnected.\n", "red"]])
         return SyncResult(ok=False, reason="write blocked", downloaded=0, errors=0)
     # 2-tier disk space check. Hard-fail under 100MB
     # (smaller than a typical 720p 10-minute video — downloads WILL
     # fail mid-stream and leave partial files). Soft-warn under 500MB.
-    if not check_disk_space(str(ch_dir), 100 * 1024 * 1024):
+    if not check_disk_space(str(preflight_dir), 100 * 1024 * 1024):
         stream.emit([["ERROR: ", "red"],
                      [f"Less than 100 MB free at {ch_dir} \u2014 refusing to start download.\n", "red"]])
         return SyncResult(ok=False, reason="disk_low", downloaded=0, errors=0)
-    if not check_disk_space(str(ch_dir), 500 * 1024 * 1024):
+    if not check_disk_space(str(preflight_dir), 500 * 1024 * 1024):
         stream.emit([["\u26a0 ", "red"],
                      [f"Less than 500 MB free at {ch_dir} \u2014 downloads may fail mid-stream.\n", "red"]])
         # warn but don't block — user may still want to try
+
+    ch_dir.mkdir(parents=True, exist_ok=True)
 
     fmt = build_format_string(resolution)
     # Output template matches YTArchiver.py:17257-17267 — files live under
@@ -2554,124 +2553,66 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             # invisibly defeating the --break-on-existing fast-path on every
             # subsequent sync.
             now = datetime.now()
-            cfg2 = load_config()
             _dirty = False
-            # require AT LEAST ONE video to have been walked
-            # (downloaded > 0 OR errors > 0, meaning yt-dlp actually
-            # ran end-to-end) before stamping `initialized=True`. A
-            # first sync that 0-downloads AND 0-errors almost certainly
-            # hit a filter wall (strict duration filter, empty
-            # playlist, auth failure) — stamping initialized there locks
-            # the channel into fast-path forever even though it was
-            # never actually bootstrapped.
-            # only stamp initialized when downloaded > 0.
-            # Treating errors as "walked meaningfully" was wrong —
-            # a first sync that cookies-expired or got blanket-
-            # --match-filter'd has errors > 0 but zero real walk, and
-            # marking it initialized locks the channel into fast-path
-            # forever (--break-on-existing stops the walk at the first
-            # archive hit). Real first-sync success needs an actual
-            # download.
-            _walked_meaningfully = (downloaded > 0)
-            _meta_did_fetch = _read_meta_count("fetched") > 0
-            _now_ts = time.time()
-            # update last_sync on every SUCCESSFUL pass, not
-            # just ones with new downloads. A channel with 0 new videos
-            # is still being checked — last_sync going stale-for-months
-            # made users think their channel wasn't syncing when it
-            # was. No new downloads doesn't mean no activity.
-            _matched_any = False
-            for c in cfg2.get("channels", []):
-                # compare normalized URLs so a saved
-                # `youtube.com/@ch/` and a live `www.youtube.com/@ch`
-                # still match the same row.
-                _c_url = (c.get("url", "") or "").strip().rstrip("/")
-                try:
-                    _c_norm = _subs_norm.normalize_channel_url(_c_url) or _c_url
-                except Exception:
-                    _c_norm = _c_url
-                _c_norm = (_c_norm or "").strip().rstrip("/")
-                if _c_norm != _url_norm and _c_url != url:
-                    continue
-                _matched_any = True
-                # Capture the pre-update `initialized` state so we can
-                # tell whether this pass is a bootstrap (first-ever
-                # sync of a brand-new channel, EVERY video freshly
-                # fetched → timestamps truly mean "all metadata is
-                # current") versus an incremental sync (thousands of
-                # stale entries + a handful of fresh ones → stamping
-                # "refreshed just now" would be a lie).
-                _was_bootstrap_pass = (not c.get("initialized", False)
-                                       and _walked_meaningfully)
-                c["last_sync"] = now.strftime("%Y-%m-%d %H:%M")
-                _dirty = True
-                # if the user paused or cancelled mid-pass
-                # of a FIRST-ever sync, do NOT stamp initialized/
-                # sync_complete. The previous behavior stamped both flags
-                # the moment downloaded > 0, so a "pause + clear queue"
-                # at 3/4 through a 200-video bootstrap permanently
-                # locked the channel into --break-on-existing fast-path,
-                # leaving the unfetched 1/4 unreachable on every
-                # subsequent sync ("no new videos"). Only graduate to
-                # the fast-path when a sync completes WITHOUT being
-                # interrupted.
-                _was_interrupted = bool(
-                    (cancel_event is not None and cancel_event.is_set())
-                    or (pause_event is not None and pause_event.is_set())
-                )
-                if _walked_meaningfully and not _was_interrupted:
-                    if not c.get("initialized", False):
-                        c["initialized"] = True
-                        _dirty = True
-                    if not c.get("sync_complete", False):
-                        c["sync_complete"] = True
-                        _dirty = True
-                    # Graduate to the quick-check fast path too. The
-                    # flag is read in four places (sync_all
-                    # _fast_path_eligible, quickcheck, core) but no
-                    # current code ever WROTE it — so the documented
-                    # ~11s-per-channel flat-playlist skip could never
-                    # fire for channels bootstrapped by this codebase,
-                    # only for legacy-config carryovers. Same gate as
-                    # initialized/sync_complete: an uninterrupted,
-                    # meaningful walk.
-                    if not c.get("init_complete", False):
-                        c["init_complete"] = True
-                        _dirty = True
-                elif _walked_meaningfully and _was_interrupted:
-                    # Surface the interruption so the user knows why
-                    # this channel will do a full walk again next time.
+            with config_transaction() as cfg2:
+                # require AT LEAST ONE video to have been walked before stamping
+                # initialized=True. A first sync with zero downloads likely hit a
+                # filter/auth wall and was never actually bootstrapped.
+                _walked_meaningfully = (downloaded > 0)
+                _meta_did_fetch = _read_meta_count("fetched") > 0
+                _now_ts = time.time()
+                _matched_any = False
+                for c in cfg2.get("channels", []):
+                    # compare normalized URLs so a saved youtube.com/@ch/ and a
+                    # live www.youtube.com/@ch still match the same row.
+                    _c_url = (c.get("url", "") or "").strip().rstrip("/")
                     try:
-                        stream.emit_dim(
-                            " (sync interrupted before completion — "
-                            "channel will do another full walk on the "
-                            "next sync to catch missed videos)")
-                    except Exception as e:
-                        _log.debug("swallowed: %s", e)
-                # Only stamp the channel-level refresh timestamps on a
-                # bootstrap pass. For incremental syncs (4 new videos
-                # out of 1000), 996 entries still hold older fetched_at
-                # stamps — stamping "just now" would misrepresent the
-                # freshness of the bulk of the channel's data. Design
-                # intent: the column should say "today" for a brand-
-                # new channel add, NOT for a small trickle-in on an
-                # existing channel.
-                if _meta_did_fetch and _was_bootstrap_pass:
-                    c["last_views_refresh_ts"] = _now_ts
-                    c["last_comments_refresh_ts"] = _now_ts
+                        _c_norm = _subs_norm.normalize_channel_url(_c_url) or _c_url
+                    except Exception:
+                        _c_norm = _c_url
+                    _c_norm = (_c_norm or "").strip().rstrip("/")
+                    if _c_norm != _url_norm and _c_url != url:
+                        continue
+                    _matched_any = True
+                    _was_bootstrap_pass = (not c.get("initialized", False)
+                                           and _walked_meaningfully)
+                    c["last_sync"] = now.strftime("%Y-%m-%d %H:%M")
                     _dirty = True
-                break
-            # Per-channel pass would write the GLOBAL `cfg2["last_sync"]`
-            # whenever any channel downloaded — so "Last Full Sync" on
-            # the UI advanced mid-pass (after the first channel that
-            # downloaded), not when the pass actually completed. The
-            # global timestamp now lives at the end of `sync_all`
-            # (gated on pass kind + not-cancelled) so it really reflects
-            # "pass completed at <time>". Per-channel `c["last_sync"]`
-            # above still updates so the Subs tab's per-row column
-            # advances live.
-            if _dirty:
-                save_config(cfg2)
+                    _was_interrupted = bool(
+                        (cancel_event is not None and cancel_event.is_set())
+                        or (pause_event is not None and pause_event.is_set())
+                    )
+                    if _walked_meaningfully and not _was_interrupted:
+                        if not c.get("initialized", False):
+                            c["initialized"] = True
+                            _dirty = True
+                        if not c.get("sync_complete", False):
+                            c["sync_complete"] = True
+                            _dirty = True
+                        if not c.get("init_complete", False):
+                            c["init_complete"] = True
+                            _dirty = True
+                    elif _walked_meaningfully and _was_interrupted:
+                        # Surface the interruption so the user knows why this
+                        # channel will do a full walk again next time.
+                        try:
+                            stream.emit_dim(
+                                " (sync interrupted before completion - "
+                                "channel will do another full walk on the "
+                                "next sync to catch missed videos)")
+                        except Exception as e:
+                            _log.debug("swallowed: %s", e)
+                    # Only stamp channel-level refresh timestamps on a bootstrap
+                    # pass; an incremental sync may refresh only a few entries.
+                    if _meta_did_fetch and _was_bootstrap_pass:
+                        c["last_views_refresh_ts"] = _now_ts
+                        c["last_comments_refresh_ts"] = _now_ts
+                        _dirty = True
+                    break
+                # Per-channel pass writes only the row-level last_sync. The global
+                # Last Full Sync timestamp lives at the end of sync_all.
+                if not _dirty:
+                    raise ConfigUnchanged()
             if not _matched_any:
                 # surface the mismatch as a dim warning.
                 # Before, a URL-normalization mismatch silently no-
@@ -2682,6 +2623,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     f"config update: no channel matched URL "
                     f"{url!r} (normalized {_url_norm!r}) — "
                     f"last_sync/initialized/sync_complete not written.")
+        except ConfigUnchanged:
+            pass
         except (OSError, PermissionError, ValueError, KeyError) as _ce:
             # narrow the catch. Bare `except Exception: pass`
             # was hiding config-write failures (disk full, file lock,

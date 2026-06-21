@@ -24,7 +24,7 @@ import re
 import threading as _threading
 
 from ..log import get_logger
-from ..transcribe_paths import (
+from .paths import (
     _format_duration_hms,
     _format_upload_date,
     _generate_distributed_words,

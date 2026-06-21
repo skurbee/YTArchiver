@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from ..log import get_logger
-from ..metadata_io import _get_metadata_jsonl_path, _year_month_from_path
+from .io import _get_metadata_jsonl_path, _year_month_from_path
 from ..thumbnails import _channel_fingerprint
 from ..utils import sqlite_like_escape as _like_esc
 

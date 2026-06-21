@@ -539,15 +539,14 @@
       if (ph && video && video.filepath) {
         ph.style.display = "";
         ph.innerHTML =
-          '<div class="watch-play-icon" style="visibility:hidden;">▶</div>'
-          + '<div class="watch-placeholder-text" '
-          + 'style="font-size:13px;color:var(--c-text);">'
+          '<div class="watch-play-icon watch-play-icon-hidden">▶</div>'
+          + '<div class="watch-placeholder-text">'
           + '<span class="spinner-inline"></span>Loading…</div>';
         if (vEl) vEl.hidden = true;
       }
       const tr = document.getElementById("watch-transcript");
       if (tr) {
-        tr.innerHTML = '<div style="color: var(--c-dim); font-style: italic; padding: 12px;">'
+        tr.innerHTML = '<div class="watch-transcript-note watch-transcript-loading">'
           + '<span class="spinner-inline"></span>Loading transcript…</div>';
       }
       // Drawer is open by default (v63.7) — without resetting it the

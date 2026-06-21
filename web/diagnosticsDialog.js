@@ -36,16 +36,16 @@
       // during hot reload, partial render, etc). Old code hit a
       // TypeError on rowsEl.innerHTML and the dialog never opened.
       if (!rowsEl) return;
-      rowsEl.innerHTML = '<div class="browse-empty" style="padding:16px;">Running self-check\u2026</div>';
+      rowsEl.innerHTML = '<div class="browse-empty askq-empty-padded">Running self-check\u2026</div>';
       if (summaryEl) summaryEl.textContent = "";
       if (!nativeBridgeUp()) {
-        rowsEl.innerHTML = '<div class="browse-empty" style="padding:16px;">Native mode required.</div>';
+        rowsEl.innerHTML = '<div class="browse-empty askq-empty-padded">Native mode required.</div>';
         return;
       }
       try {
         const res = await bridgeCall("diagnostics_run");
         if (!res?.ok || !Array.isArray(res.rows)) {
-          rowsEl.innerHTML = '<div class="browse-empty" style="padding:16px;">Self-check failed.</div>';
+          rowsEl.innerHTML = '<div class="browse-empty askq-empty-padded">Self-check failed.</div>';
           return;
         }
         const frag = document.createDocumentFragment();
@@ -69,7 +69,7 @@
           ? `All ${okN} checks passed`
           : `${okN} ok \u2014 ${failN} problem${failN === 1 ? "" : "s"}`;
       } catch (e) {
-        rowsEl.innerHTML = `<div class="browse-empty" style="padding:16px;">Error: ${escapeHtml(String(e))}</div>`;
+        rowsEl.innerHTML = `<div class="browse-empty askq-empty-padded">Error: ${escapeHtml(String(e))}</div>`;
       }
     }
 

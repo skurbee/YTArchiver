@@ -50,7 +50,8 @@ class RedownloadMixin:
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             try:
-                r = self.chan_redownload({"name": name}, res)
+                identity = {"url": url} if url else {"name": name}
+                r = self.chan_redownload(identity, res, scope=t.get("scope"))
                 if isinstance(r, dict) and r.get("ok"):
                     resumed += 1
                 else:

@@ -61,7 +61,7 @@
             {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])));
         if (!data?.ok) {
           body.innerHTML =
-            `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
+            `<div class="browse-empty askq-empty-padded askq-empty-danger">`
             + `${escapeHtml(data?.error || "Dry run failed.")}</div>`;
           if (summary) summary.textContent = "";
           return;
@@ -80,25 +80,25 @@
         // Build a simple table. Per-channel rows sorted by current_gb
         // desc (matches backend query); grand total pinned at top.
         let html = "";
-        html += `<table style="width:100%;border-collapse:collapse;">`;
-        html += `<thead><tr style="border-bottom:1px solid #2a3140;text-align:right;">`;
-        html += `<th style="text-align:left;padding:4px 6px;">Channel</th>`;
-        html += `<th style="padding:4px 6px;" title="Total videos on disk for this channel.">Videos</th>`;
-        html += `<th style="padding:4px 6px;" title="Sum of video durations.">Hours</th>`;
-        html += `<th style="padding:4px 6px;" title="Current bytes used on disk before compression.">Current</th>`;
-        html += `<th style="padding:4px 6px;" title="Estimated size after AV1 compression at the GENEROUS bitrate tier (largest files, best quality).">Generous</th>`;
-        html += `<th style="padding:4px 6px;" title="Estimated size at the AVERAGE bitrate tier (middle ground — recommended for most archives).">Average</th>`;
-        html += `<th style="padding:4px 6px;" title="Estimated size at the BELOW-AVERAGE bitrate tier (smallest files, most aggressive savings; some quality loss).">Below Avg</th>`;
+        html += `<table class="compress-dry-table">`;
+        html += `<thead><tr>`;
+        html += `<th class="cell-left">Channel</th>`;
+        html += `<th title="Total videos on disk for this channel.">Videos</th>`;
+        html += `<th title="Sum of video durations.">Hours</th>`;
+        html += `<th title="Current bytes used on disk before compression.">Current</th>`;
+        html += `<th title="Estimated size after AV1 compression at the GENEROUS bitrate tier (largest files, best quality).">Generous</th>`;
+        html += `<th title="Estimated size at the AVERAGE bitrate tier (middle ground — recommended for most archives).">Average</th>`;
+        html += `<th title="Estimated size at the BELOW-AVERAGE bitrate tier (smallest files, most aggressive savings; some quality loss).">Below Avg</th>`;
         html += `</tr></thead><tbody>`;
         // Grand totals first, highlighted.
-        html += `<tr style="background:rgba(96,160,255,0.08);font-weight:bold;">`;
-        html += `<td style="padding:4px 6px;">ALL CHANNELS (${escapeHtml(String(data.output_res))}p target)</td>`;
-        html += `<td style="padding:4px 6px;text-align:right;">${(t.videos || 0).toLocaleString()}</td>`;
-        html += `<td style="padding:4px 6px;text-align:right;">${(t.hours || 0).toLocaleString()}</td>`;
-        html += `<td style="padding:4px 6px;text-align:right;">${_fmt(t.current_gb)}</td>`;
-        html += `<td style="padding:4px 6px;text-align:right;">${_fmt(t.generous_gb)}${_diffPct(t.current_gb, t.generous_gb)}</td>`;
-        html += `<td style="padding:4px 6px;text-align:right;">${_fmt(t.average_gb)}${_diffPct(t.current_gb, t.average_gb)}</td>`;
-        html += `<td style="padding:4px 6px;text-align:right;">${_fmt(t.below_gb)}${_diffPct(t.current_gb, t.below_gb)}</td>`;
+        html += `<tr class="compress-total-row">`;
+        html += `<td>ALL CHANNELS (${escapeHtml(String(data.output_res))}p target)</td>`;
+        html += `<td class="cell-num">${(t.videos || 0).toLocaleString()}</td>`;
+        html += `<td class="cell-num">${(t.hours || 0).toLocaleString()}</td>`;
+        html += `<td class="cell-num">${_fmt(t.current_gb)}</td>`;
+        html += `<td class="cell-num">${_fmt(t.generous_gb)}${_diffPct(t.current_gb, t.generous_gb)}</td>`;
+        html += `<td class="cell-num">${_fmt(t.average_gb)}${_diffPct(t.current_gb, t.average_gb)}</td>`;
+        html += `<td class="cell-num">${_fmt(t.below_gb)}${_diffPct(t.current_gb, t.below_gb)}</td>`;
         html += `</tr>`;
         // null-safe numeric reads. A single malformed
         // channel row (e.g. missing videos/hours) used to TypeError
@@ -108,17 +108,17 @@
         for (const c of (data.channels || [])) {
           const _n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
           html += `<tr>`;
-          html += `<td style="padding:2px 6px;">${escapeHtml(c.name || "(unknown)")}</td>`;
-          html += `<td style="padding:2px 6px;text-align:right;">${_n(c.videos).toLocaleString()}</td>`;
-          html += `<td style="padding:2px 6px;text-align:right;">${_n(c.hours).toLocaleString()}</td>`;
-          html += `<td style="padding:2px 6px;text-align:right;">${_fmt(c.current_gb)}</td>`;
-          html += `<td style="padding:2px 6px;text-align:right;">${_fmt(c.generous_gb)}</td>`;
-          html += `<td style="padding:2px 6px;text-align:right;">${_fmt(c.average_gb)}</td>`;
-          html += `<td style="padding:2px 6px;text-align:right;">${_fmt(c.below_gb)}</td>`;
+          html += `<td>${escapeHtml(c.name || "(unknown)")}</td>`;
+          html += `<td class="cell-num">${_n(c.videos).toLocaleString()}</td>`;
+          html += `<td class="cell-num">${_n(c.hours).toLocaleString()}</td>`;
+          html += `<td class="cell-num">${_fmt(c.current_gb)}</td>`;
+          html += `<td class="cell-num">${_fmt(c.generous_gb)}</td>`;
+          html += `<td class="cell-num">${_fmt(c.average_gb)}</td>`;
+          html += `<td class="cell-num">${_fmt(c.below_gb)}</td>`;
           html += `</tr>`;
         }
         html += `</tbody></table>`;
-        html += `<div class="edit-dim" style="padding:8px 4px 0;font-size:11px;">`
+        html += `<div class="edit-dim compress-dry-note">`
               + `Projections use MB/hour bitrate presets applied to each channel's `
               + `total indexed duration. Videos without duration metadata are `
               + `skipped (so real savings can be LARGER than shown).</div>`;
@@ -131,7 +131,7 @@
       let _computeInFlight = false;
       const _open = async () => {
         bd.hidden = false;
-        body.innerHTML = `<div class="browse-empty" style="padding:16px;">Computing…</div>`;
+        body.innerHTML = `<div class="browse-empty askq-empty-padded">Computing…</div>`;
         if (summary) summary.textContent = "";
         _computeInFlight = true;
         try {

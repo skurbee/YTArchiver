@@ -1,5 +1,5 @@
 """
-Version constants — moved here by Patch 7 so both main.py and the
+Version constants - moved here by Patch 7 so both main.py and the
 api_mixins package can read the same authoritative value without a
 circular import.
 
@@ -9,5 +9,5 @@ and `backend/api_mixins/_shared.py` import these names.
 """
 from __future__ import annotations
 
-APP_VERSION      = "v78.7"
-APP_VERSION_DATE = "6.19.26 9:56pm"
+APP_VERSION      = "v78.8"
+APP_VERSION_DATE = "6.21.26 10:56AM"

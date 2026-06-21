@@ -27,17 +27,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .log import get_logger
-from .utils import (
+from ..log import get_logger
+from ..utils import (
     MONTH_FOLDERS as _MONTH_NAMES,
 )
-from .utils import (
+from ..utils import (
     hide_file_win as _hide_file_win,
 )
-from .utils import (
+from ..utils import (
     unhide_file_win as _unhide_file_win,
 )
-from .ytarchiver_config import load_config
+from ..ytarchiver_config import load_config
 
 _log = get_logger(__name__)
 
@@ -48,12 +48,12 @@ def _folder_for_channel(ch: dict[str, Any]) -> Path | None:
 
     Cached output_dir lookup — bulk metadata ops called this per-video,
     re-reading the entire config file from disk each time (audit:
-    metadata_io.py:42-55). Caching by mtime fingerprint catches the
+    metadata/io.py:42-55). Caching by mtime fingerprint catches the
     common case (config unchanged during a bulk pass) while still
     seeing edits made mid-pass.
     """
     # Late import to avoid circular dep (sync.py imports metadata.py).
-    from .sync import sanitize_folder
+    from ..sync import sanitize_folder
     base = _cached_output_dir()
     if not base:
         return None
@@ -72,7 +72,7 @@ def _cached_output_dir() -> str:
     callers (1000+ per-video lookups) only re-read the file when it
     actually changed."""
     try:
-        from .ytarchiver_config import CONFIG_FILE as _CF
+        from ..ytarchiver_config import CONFIG_FILE as _CF
         try:
             _mt = os.path.getmtime(str(_CF))
         except OSError:
@@ -183,7 +183,7 @@ def _read_metadata_jsonl(jsonl_path: str, *, strict: bool = False
     try:
         # utf-8-sig so a UTF-8 BOM at the top of an externally-edited
         # jsonl doesn't strip the first entry's first byte (audit:
-        # metadata_io.py:96).
+        # metadata/io.py:96).
         with open(jsonl_path, "r", encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
@@ -199,7 +199,7 @@ def _read_metadata_jsonl(jsonl_path: str, *, strict: bool = False
                         # this, a crash mid-rewrite that left two
                         # entries for the same video_id silently
                         # picked LAST line wins regardless of which
-                        # was newer (audit: metadata_io.py:83-120).
+                        # was newer (audit: metadata/io.py:83-120).
                         _prev = existing.get(vid)
                         if _prev is None:
                             existing[vid] = entry
@@ -255,7 +255,7 @@ def _metadata_entry_is_newer(candidate: dict[str, Any],
 # Per-jsonl-path serializer. Two threads (sync writer + bulk metadata
 # refresh) writing the same jsonl_path used to race on os.replace
 # — one writer's full entries-dict would land, the other's would
-# disappear (audit: metadata_io.py:123-144).
+# disappear (audit: metadata/io.py:123-144).
 # Uses RLock so callers can take the lock externally (to span a
 # read+merge+write critical section) and the inner _write_metadata_jsonl
 # can still re-acquire it on the same thread without deadlocking
@@ -309,7 +309,7 @@ def _write_metadata_jsonl(jsonl_path: str,
             _unhide_file_win(jsonl_path)
         tmp_path = jsonl_path + ".tmp"
         # Clean up tmp on any failure so a partial write doesn't sit
-        # next to the real file forever (audit: metadata_io H92).
+        # next to the real file forever (audit: metadata/io H92).
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 for _vid, data in entries_dict.items():

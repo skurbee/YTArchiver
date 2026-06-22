@@ -430,7 +430,8 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         self._autorun = autorun_backend.AutorunScheduler(
             sync_trigger=lambda: self.sync_start_all(),
             stream=self._log_stream,
-            sync_busy_fn=lambda: self.sync_is_running(),
+            sync_busy_fn=lambda: (self.sync_is_running()
+                                 or self.archive_single_is_running()),
         )
         self._reload_config()
         # Blank-name scan: surface any channel whose folder would resolve to

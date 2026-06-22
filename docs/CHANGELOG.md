@@ -6,6 +6,18 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v78.9 - 2026-06-22
+
+### Fixed
+- **Single-video downloads now bind to the actual saved file more reliably.** The one-off download path now trusts yt-dlp's reported output paths before falling back to title/id guessing, which prevents successful downloads from being reported as missing when yt-dlp sanitizes or trims filenames differently than YTArchiver predicted.
+- **Single-video download failures are more readable in Simple mode.** The old terse "file missing after download" message is replaced with a plain explanation that the download finished but YTArchiver could not find the saved video, with clear next steps.
+- **Autorun no longer starts Sync Subbed over an active one-off download.** Active single-video downloads now count as busy work for the autorun scheduler, so an interval fire skips/rearms instead of overlapping with the Download tab job.
+
+### Validation
+- `ArchiveMixinTests` and `AutorunTests` passed.
+- `py_compile` passed for the touched backend, app, and smoke-test files.
+- Built with Python 3.13 using the PyInstaller spec file.
+
 ## v78.7 — 2026-06-19
 
 ### Fixed

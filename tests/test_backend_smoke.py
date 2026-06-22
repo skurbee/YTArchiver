@@ -285,6 +285,29 @@ class ArchiveMixinTests(unittest.TestCase):
             "Expected Download Title with extra suffix that may be trimmed",
         ))
 
+    def test_choose_ytdlp_candidate_uses_existing_media_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            stale = root / "old.mp4"
+            final = root / "yt-dlp sanitized title.mp4"
+            stale.write_bytes(b"old")
+            final.write_bytes(b"video")
+
+            chosen = archive_mixin._choose_existing_ytdlp_candidate(
+                [str(stale), str(final)], str(root))
+
+        self.assertEqual(Path(chosen).name, final.name)
+
+    def test_archive_single_running_reports_inflight_urls(self) -> None:
+        api = archive_mixin.ArchiveMixin()
+
+        self.assertFalse(api.archive_single_is_running())
+
+        api._archive_single_lock = threading.Lock()
+        api._archive_single_inflight = {"https://example.test/video"}
+
+        self.assertTrue(api.archive_single_is_running())
+
 
 class UtilsTests(unittest.TestCase):
     def test_check_disk_space_fails_closed_on_probe_error(self) -> None:
@@ -1823,6 +1846,21 @@ class AutorunTests(unittest.TestCase):
             "\u2014 Autorun: interval reached at 7:00pm, "
             "kicking Sync Subbed\u2026",
             "simpleline_green",
+        )
+
+    def test_fire_skips_when_download_or_sync_busy(self) -> None:
+        stream = mock.Mock()
+        trigger = mock.Mock(return_value={"started": True})
+        scheduler = autorun_backend.AutorunScheduler(
+            trigger, stream=stream, sync_busy_fn=lambda: True)
+
+        scheduler._fire()
+
+        trigger.assert_not_called()
+        stream.emit_text.assert_any_call(
+            "\u2014 Autorun: a download or sync is running \u2014 skipping "
+            "this run; will run at the next scheduled time.",
+            "simpleline_dim",
         )
 
     def test_format_log_time_uses_lowercase_non_padded_12_hour_time(self) -> None:

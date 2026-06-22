@@ -54,7 +54,48 @@ def _recent_scan_bind_is_corroborated(path: str, video_id: str,
         len(stem_low) >= 12 and title_low.startswith(stem_low))
 
 
+_BINDABLE_MEDIA_EXTS = {
+    ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
+    ".mp3", ".m4a", ".opus", ".ogg", ".wav", ".flac",
+}
+
+
+def _is_under_folder(path: str, folder: str) -> bool:
+    try:
+        p = os.path.normcase(os.path.abspath(path))
+        f = os.path.normcase(os.path.abspath(folder))
+        return os.path.commonpath([p, f]) == f
+    except Exception:
+        return False
+
+
+def _clean_ytdlp_path(path: str) -> str:
+    path = (path or "").strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in ("'", '"'):
+        path = path[1:-1]
+    return path.strip()
+
+
+def _choose_existing_ytdlp_candidate(
+        candidates: list[str], folder: str) -> str:
+    """Return a trustworthy media path captured from yt-dlp output."""
+    for raw in reversed(candidates):
+        path = _clean_ytdlp_path(raw)
+        if (path and os.path.isfile(path)
+                and os.path.splitext(path)[1].lower() in _BINDABLE_MEDIA_EXTS
+                and _is_under_folder(path, folder)):
+            return path
+    return ""
+
+
 class ArchiveMixin:
+
+    def archive_single_is_running(self) -> bool:
+        try:
+            with self._archive_single_lock:
+                return bool(self._archive_single_inflight)
+        except Exception:
+            return False
 
     # ─── Already-archived pre-check (Download-tab warning) ──────────────
 
@@ -339,8 +380,15 @@ class ArchiveMixin:
             # on disk invisible to the Browse grid / Recent / Search.
             _dltrack = None
             _stderr_errors = []
+            _candidate_paths = []
             # Regexes for parsing yt-dlp progress + destination lines.
             _dest_re = _re.compile(r"^\[download\]\s+Destination:\s+(.+)$")
+            _merge_re = _re.compile(
+                r'^\[Merger\]\s+Merging formats into\s+"(.+)"$')
+            _done_re = _re.compile(
+                r"^\[download\]\s+(.+?)\s+has already been downloaded")
+            _extract_re = _re.compile(
+                r"^\[ExtractAudio\]\s+Destination:\s+(.+)$")
             _pct_re = _re.compile(r"^\[download\]\s+(\d+(?:\.\d+)?)%")
             try:
                 for line in proc.stdout:
@@ -365,12 +413,19 @@ class ArchiveMixin:
                                 f" - {_state['last_pct']}%"
                                 if _state["last_pct"] >= 0 else "")
                         continue
+                    for _rx in (_merge_re, _done_re, _extract_re):
+                        _m_path = _rx.match(_line)
+                        if _m_path:
+                            _candidate_paths.append(_m_path.group(1).strip())
+                            break
                     # Capture filename from yt-dlp's Destination line — only
                     # as a fallback when DLPRE never gave us a title.
                     _m_dest = _dest_re.match(_line)
                     if _m_dest:
+                        _dest_path = _m_dest.group(1).strip()
+                        _candidate_paths.append(_dest_path)
                         if not _state["have_title"]:
-                            _state["fname"] = os.path.basename(_m_dest.group(1).strip())
+                            _state["fname"] = os.path.basename(_dest_path)
                             _emit_dwnld()
                     else:
                         # Parse progress percentage and update inplace
@@ -478,7 +533,8 @@ class ArchiveMixin:
                         # a full-title match (not just first 50 chars)
                         # so series with similar long-title prefixes
                         # ("Video 1:...", "Video 2:...") don't collide.
-                        final_path = ""
+                        final_path = _choose_existing_ytdlp_candidate(
+                            _candidate_paths, base)
                         try:
                             import glob as _glob
                             _vid_candidates = []
@@ -655,7 +711,9 @@ class ArchiveMixin:
                     # Either yt-dlp itself failed, or it reported success but
                     # the file is missing from disk at decision time.
                     if _dl_ok and not _file_exists:
-                        _reason = "file missing after download"
+                        _reason = ("download finished, but YTArchiver could "
+                                   "not find the saved video file; run Rescan "
+                                   "or try the download again")
                     elif _stderr_errors:
                         _reason = _stderr_errors[0]
                     elif proc.returncode not in (0, None):

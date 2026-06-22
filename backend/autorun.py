@@ -251,7 +251,7 @@ class AutorunScheduler:
         if busy:
             if self._stream:
                 self._stream.emit_text(
-                    "\u2014 Autorun: a manual sync is running \u2014 skipping "
+                    "\u2014 Autorun: a download or sync is running \u2014 skipping "
                     "this run; will run at the next scheduled time.",
                     "simpleline_dim")
             with self._lock:
@@ -259,7 +259,7 @@ class AutorunScheduler:
                 if self._interval_mins > 0:
                     # Skip to the NEXT scheduled fire (next clock boundary /
                     # full interval) instead of nagging every 60s while the
-                    # user's manual sync runs.
+                    # current work runs.
                     self._schedule_next_locked()
             return
         # Path A: interval elapsed + sync idle → kick the sync. Entering

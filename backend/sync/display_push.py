@@ -21,7 +21,7 @@ import json
 import os
 import threading
 
-from ..log import get_logger
+from ..log import get_logger, swallow
 
 _log = get_logger(__name__)
 
@@ -73,7 +73,7 @@ def write_sync_progress(channel_name: str = "",
             json.dump(data, f)
         os.replace(tmp, path)
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        swallow("sync-progress write", e)
 
 
 def clear_sync_progress() -> None:
@@ -85,4 +85,4 @@ def clear_sync_progress() -> None:
         if os.path.exists(p):
             os.remove(p)
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        swallow("sync-progress cleanup", e)

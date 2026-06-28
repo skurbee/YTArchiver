@@ -12,7 +12,19 @@ from collections import OrderedDict
 
 from backend.services import file_ops
 
-from ._shared import *  # noqa: F401,F403
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from typing import Any, List
+
+from ._shared import _log, webview
+from backend.log import swallow
+from backend.ytarchiver_config import load_config
+from backend import archive_scan
+from backend import index as index_backend
 
 
 _METADATA_DRAWER_CACHE_LOCK = threading.Lock()
@@ -230,6 +242,9 @@ class BrowseMixin:
             video_id=payload.get("video_id"),
             jsonl_path=payload.get("jsonl_path"),
             title=payload.get("title"),
+            channel=payload.get("channel"),
+            filepath=payload.get("filepath"),
+            strict_identity=True,
         )
         try:
             src_info = self._classify_transcript_source(
@@ -300,7 +315,7 @@ class BrowseMixin:
                             # from the video file itself.
                             jsonl_path = row[1]
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                swallow("jsonl-path db query", e)
         # Find the candidate .txt — same folder as the jsonl_path, or walk
         # up from there. Name pattern: "<channel> [<year>] [<month>] Transcript.txt".
         search_dirs = []
@@ -582,7 +597,7 @@ class BrowseMixin:
             # but the Recent grid was rendered BEFORE that write and
             # has a stale thumbnail_url="" on the card.
             try: self._push_recent_refresh()
-            except Exception as e: _log.debug("swallowed: %s", e)
+            except Exception as e: swallow("recent-refresh push", e)
             return ret if ret.get("ok") else {"ok": True, "meta": res.get("entry")}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -829,3 +844,73 @@ class BrowseMixin:
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+
+    # ─── Manual Downloads view ─────────────────────────────────────────
+
+    _MANUAL_VIDEO_EXTS = frozenset(
+        {".mp4", ".webm", ".mkv", ".avi", ".mov", ".m4v"}
+    )
+
+    def list_manual_videos(self, sort="newest", limit=60, offset=0):
+        """List video files in cfg['video_out_dir'] for the Manual Downloads view.
+
+        Returns paginated rows with filepath, title (from filename), size_bytes,
+        and mtime. Does NOT consult the index — walks the folder directly.
+        """
+        cfg = self._config or load_config()
+        folder = (cfg.get("video_out_dir") or cfg.get("output_dir") or "").strip()
+        if not folder:
+            return {"rows": [], "has_more": False, "folder": ""}
+        if not os.path.isdir(folder):
+            return {"rows": [], "has_more": False, "folder": folder}
+        try:
+            lim = max(1, min(500, int(limit)))
+        except (TypeError, ValueError):
+            lim = 60
+        try:
+            off = max(0, int(offset))
+        except (TypeError, ValueError):
+            off = 0
+
+        rows: list[dict] = []
+        try:
+            for entry in os.scandir(folder):
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                ext = os.path.splitext(entry.name)[1].lower()
+                if ext not in self._MANUAL_VIDEO_EXTS:
+                    continue
+                try:
+                    st = entry.stat()
+                except OSError:
+                    continue
+                rows.append({
+                    "filepath": entry.path,
+                    "title": os.path.splitext(entry.name)[0],
+                    "size_bytes": st.st_size,
+                    "mtime": st.st_mtime,
+                    "channel": "",
+                    "video_id": "",
+                    "thumbnail_url": "",
+                })
+        except OSError as e:
+            _log.debug("list_manual_videos scandir failed: %s", e)
+            return {"rows": [], "has_more": False, "folder": folder,
+                    "error": str(e)}
+
+        sort = str(sort or "newest")
+        if sort == "newest":
+            rows.sort(key=lambda r: r["mtime"], reverse=True)
+        elif sort == "oldest":
+            rows.sort(key=lambda r: r["mtime"])
+        elif sort == "largest":
+            rows.sort(key=lambda r: r["size_bytes"], reverse=True)
+        elif sort == "title":
+            rows.sort(key=lambda r: r["title"].lower())
+
+        page = rows[off: off + lim + 1]
+        has_more = len(page) > lim
+        page = page[:lim]
+        return {"rows": page, "has_more": has_more, "folder": folder,
+                "total": len(rows)}

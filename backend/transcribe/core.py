@@ -134,6 +134,65 @@ def _rough_duration_from_size(path: str) -> float:
     return max(1.0, (float(size) / (50 * 1024 * 1024)) * 3600.0)
 
 
+def _punct_align_segments(punct_text: str, segments: list) -> None:
+    """Re-derive per-segment punctuated text from the already-punctuated whole text.
+
+    Avoids N subprocess round-trips by word-count-aligning the punctuated
+    output back to each segment's raw token count (T150). Falls back silently
+    on word-count mismatch (rare — happens when the model splits/merges a
+    contraction).
+    """
+    if not punct_text or not segments:
+        return
+    raw_counts = [len((seg.get("t") or "").split()) for seg in segments]
+    total_raw = sum(raw_counts)
+    punct_words = punct_text.split()
+    if total_raw != len(punct_words):
+        return
+    idx = 0
+    for seg, n in zip(segments, raw_counts):
+        if n >= 3:
+            seg["t"] = " ".join(punct_words[idx:idx + n])
+        idx += n
+
+
+def _build_transcription_done_segments(job: dict, title: str, channel: str,
+                                       detail_text: str, *,
+                                       dim_tags, em_tags, lbl_tags,
+                                       txt_tags, detail_tags) -> list:
+    """Build the shared "— ✓ Transcription [— title — channel] (detail)"
+    done-line segments used by BOTH the single-pass and chunked paths.
+
+    The two paths previously duplicated this ~20-line construction
+    near-verbatim (T167). They differ only in (a) their tag families —
+    single-pass threads a tx_done_<vid> inplace marker, chunked uses the
+    job_tag — and (b) the trailing detail text, so those are passed in.
+    The lead indent (6 spaces under a [Dwnld] row vs 1 space standalone)
+    and the standalone title/channel splice rule are identical and live
+    here. Pure + unit-testable; no I/O.
+    """
+    lead = "      " if job.get("from_download") else " "
+    segs = [
+        [lead, dim_tags],
+        ["— ✓ ", em_tags],
+        ["Transcription", lbl_tags],
+    ]
+    # When not part of a download flow (sync emits a "Downloaded — title —
+    # channel" line just above), splice the title/channel into the done
+    # line so a standalone transcribe is identifiable on its own.
+    if not job.get("from_download"):
+        seg_title = (title or "").strip()
+        seg_channel = (channel or "").strip()
+        if seg_title:
+            segs.append([" — ", dim_tags])
+            segs.append([seg_title, txt_tags])
+            if seg_channel:
+                segs.append([" — ", dim_tags])
+                segs.append([seg_channel, txt_tags])
+    segs.append([f" ({detail_text})\n", detail_tags])
+    return segs
+
+
 class TranscribeManager:
     """Manages the whisper subprocess + a GPU queue."""
 
@@ -990,6 +1049,35 @@ class TranscribeManager:
             self._jobs[:] = keep
         return removed
 
+    def reorder_pending_job(self, identifier: str, new_index: int) -> bool:
+        """Mirror a GPU popover reorder into the manager's pending jobs."""
+        ident = str(identifier or "").strip()
+        if not ident:
+            return False
+        try:
+            target_index = int(new_index)
+        except (TypeError, ValueError):
+            return False
+        with self._jobs_lock:
+            if target_index < 0 or target_index >= len(self._jobs):
+                return False
+            idx = next(
+                (
+                    i for i, job in enumerate(self._jobs)
+                    if (job.get("id") or job.get("path") or "") == ident
+                ),
+                -1,
+            )
+            if idx < 0:
+                return False
+            job = self._jobs.pop(idx)
+            self._jobs.insert(target_index, job)
+        try:
+            self._persist_pending()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        return True
+
     def cancel_all(self):
         self._cancel_all.set()
         with self._jobs_lock:
@@ -1154,7 +1242,10 @@ class TranscribeManager:
             _job_kind = job.get("kind") or "transcribe"
             if self._queues is not None:
                 try:
-                    self._queues.gpu_pop()
+                    self._queues.gpu_pop_matching(
+                        expected_path=job.get("path", ""),
+                        expected_bulk_id=job.get("bulk_id", ""),
+                    )
                     self._queues.set_current_gpu({
                         "kind": _job_kind,
                         "title": job.get("title", ""),
@@ -1785,33 +1876,12 @@ class TranscribeManager:
                             result["_punct_timeout"] = True
                         if punct_text and punct_text != raw_text:
                             result["text"] = punct_text
-                            # Also run punctuation per-segment so the .jsonl
-                            # matches what search / transcript view shows
-                            _punct_segments_complete = True
-                            for seg in result.get("segments", []):
-                                # Cancel-respect inside the per-segment
-                                # punct loop. Without this, a Skip /
-                                # Cancel during a long Whisper transcribe
-                                # with punctuation enabled has to wait
-                                # for every segment's punctuate() call
-                                # to finish (each can take seconds on
-                                # CPU fallback) — minutes of unwanted
-                                # CPU after the user clicked Cancel.
-                                _job_cancel = job.get("cancel")
-                                if _job_cancel is not None and _job_cancel.is_set():
-                                    _punct_segments_complete = False
-                                    break
-                                if self._cancel_all.is_set():
-                                    _punct_segments_complete = False
-                                    break
-                                t = seg.get("t", "")
-                                if t and len(t.split()) >= 3:
-                                    pt = self._punct.punctuate(t)
-                                    if pt:
-                                        seg["t"] = pt
-                                    if getattr(self._punct, "last_was_timeout", False):
-                                        result["_punct_timeout"] = True
-                            result["_punct_success"] = _punct_segments_complete
+                            # Align punctuated whole-text back to segments by
+                            # word offset — no per-segment subprocess calls
+                            # (T150). Pure Python, completes in microseconds.
+                            _punct_align_segments(
+                                punct_text, result.get("segments", []))
+                            result["_punct_success"] = True
                 except Exception as _pe:
                     self._stream.emit_dim(f" (punctuation pass skipped: {_pe})")
             self._write_outputs(path, result, title=title, channel=channel,
@@ -1884,28 +1954,13 @@ class TranscribeManager:
             # Watch-view retranscribe) have no parent video line in the
             # log, so keep the original 1-space indent \u2014 those rows also
             # splice the title onto the end of the done line below.
-            _lead = "      " if job.get("from_download") else " "
-            _segs = [
-                [_lead, _dim_tags],
-                ["\u2014 \u2713 ", _em_tags],
-                ["Transcription", _lbl_tags],
-            ]
-            # When this transcription wasn't part of a download flow
-            # (sync.py emits "Downloaded \u2014 <title> \u2014 <channel>" just
-            # above its done line, giving the user context), splice
-            # the title (and channel if known) into the done line so
-            # a standalone player-view / "Transcribe File" / drift
-            # retranscribe is identifiable on its own.
-            if not job.get("from_download"):
-                _seg_title = (title or "").strip()
-                _seg_channel = (channel or "").strip()
-                if _seg_title:
-                    _segs.append([" \u2014 ", _dim_tags])
-                    _segs.append([_seg_title, _txt_tags])
-                    if _seg_channel:
-                        _segs.append([" \u2014 ", _dim_tags])
-                        _segs.append([_seg_channel, _txt_tags])
-            _segs.append([f" ({_detail_str})\n", _detail_tags])
+            # Shared done-line builder (T167); single-pass threads the
+            # tx_done_<vid> marker via the *_tags families and uses the
+            # tx_detail trailing tag.
+            _segs = _build_transcription_done_segments(
+                job, title, channel, _detail_str,
+                dim_tags=_dim_tags, em_tags=_em_tags, lbl_tags=_lbl_tags,
+                txt_tags=_txt_tags, detail_tags=_detail_tags)
             self._stream.emit(_segs)
             if job.get("cb"):
                 try:
@@ -2092,16 +2147,9 @@ class TranscribeManager:
                     if punct and punct != merged["text"]:
                         merged["text"] = punct
                         merged["_punct_success"] = True
-                        # Per-segment pass so .jsonl matches .txt.
-                        for _seg in merged["segments"]:
-                            _t = _seg.get("t", "")
-                            if _t and len(_t.split()) >= 3:
-                                try:
-                                    _pt = self._punct.punctuate(_t)
-                                    if _pt:
-                                        _seg["t"] = _pt
-                                except Exception as e:
-                                    _log.debug("swallowed: %s", e)
+                        # Align punctuated whole-text back to segments by
+                        # word offset — no per-segment subprocess calls (T150).
+                        _punct_align_segments(punct, merged["segments"])
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
             self._write_outputs(path, merged, title=title, channel=channel,
@@ -2138,24 +2186,13 @@ class TranscribeManager:
             # space otherwise. Without this the chunked path produced
             # a single-space line that visually misaligned in sync logs
             # (audit: H62).
-            _lead_ch = "      " if job.get("from_download") else " "
-            _segs_c = [
-                [_lead_ch, _dim_tag],
-                ["\u2014 \u2713 ", _em_tag],
-                ["Transcription", _lbl_tag],
-            ]
-            # Same standalone-context rule as the single-pass done line
-            # above \u2014 splice title/channel when not part of a download.
-            if not job.get("from_download"):
-                _seg_title_c = (title or "").strip()
-                _seg_channel_c = (channel or "").strip()
-                if _seg_title_c:
-                    _segs_c.append([" \u2014 ", _dim_tag])
-                    _segs_c.append([_seg_title_c, _txt_tag])
-                    if _seg_channel_c:
-                        _segs_c.append([" \u2014 ", _dim_tag])
-                        _segs_c.append([_seg_channel_c, _txt_tag])
-            _segs_c.append([f" (chunked, took {_time_str_c})\n", _dim_tag])
+            # Shared done-line builder (T167); chunked uses the job_tag tag
+            # families and a dim trailing detail with the "chunked, took\u2026"
+            # text instead of the single-pass model/realtime detail.
+            _segs_c = _build_transcription_done_segments(
+                job, title, channel, f"chunked, took {_time_str_c}",
+                dim_tags=_dim_tag, em_tags=_em_tag, lbl_tags=_lbl_tag,
+                txt_tags=_txt_tag, detail_tags=_dim_tag)
             self._stream.emit(_segs_c)
             if job.get("cb"):
                 try: job["cb"](merged)

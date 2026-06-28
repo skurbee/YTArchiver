@@ -8,7 +8,20 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+import urllib.request
+from datetime import datetime
+from typing import Any, Optional
+
+from ._shared import _log
+from backend.log import swallow
+from backend.ytarchiver_config import load_config
+from backend import sync as sync_backend
 
 # Module-level init lock — the bridge attribute (_archive_single_lock)
 # is created lazily on first call, and without an outer lock two near-
@@ -86,6 +99,136 @@ def _choose_existing_ytdlp_candidate(
                 and _is_under_folder(path, folder)):
             return path
     return ""
+
+
+# ── T326: pure, unit-testable pieces extracted from archive_single_video._run
+# These were inline closures with no test seam; the filename-reconstruction
+# fallbacks in particular have a history of binding the wrong file. Pulling
+# them out lets the highest-risk logic be exercised without a live yt-dlp run.
+
+
+def parse_dltrack(line: str) -> Optional[dict]:
+    """Parse a ``DLTRACK:::...`` manifest line into its fields.
+
+    Format: ``DLTRACK:::<title>:::<uploader>:::<upload_date>:::<filesize>:::
+    <duration>:::<id>``. Anchors on the trailing 5 fixed fields and rejoins
+    the middle as the title, so a title containing a literal ``:::`` cannot
+    shift the id field. Returns ``None`` when the line has fewer than the
+    7 required parts (caller treats that as "skip indexing").
+    """
+    parts = (line or "").split(":::")
+    if len(parts) < 7:
+        return None
+    return {
+        "title": ":::".join(parts[1:-5]).strip(),
+        "uploader": parts[-5],
+        "upload_date": parts[-4],
+        "filesize": parts[-3],
+        "duration": parts[-2],
+        "video_id": (parts[-1] or "").strip(),
+    }
+
+
+def resolve_final_path(base: str, video_id: str, title: str,
+                       candidate_paths: list[str]) -> str:
+    """Reconstruct the on-disk path of a freshly single-downloaded video.
+
+    Tries, in order: a trustworthy candidate captured from yt-dlp's
+    Destination/Merger output, then a glob match on the video id in the
+    filename (newest mtime wins), then a full sanitized-title match, and
+    finally a corroborated recent-scan bind. Returns "" if nothing matched.
+    The recency tie-breaks mean a user with two copies binds the fresh one.
+    """
+    import glob as _glob
+    final_path = _choose_existing_ytdlp_candidate(candidate_paths, base)
+    try:
+        vid_candidates = []
+        if video_id:
+            for g in _glob.glob(os.path.join(base, "*")):
+                if video_id in os.path.basename(g):
+                    vid_candidates.append(g)
+        if vid_candidates:
+            vid_candidates.sort(
+                key=lambda p: os.path.getmtime(p)
+                if os.path.isfile(p) else 0,
+                reverse=True)
+            final_path = vid_candidates[0]
+        if not final_path and title:
+            # Fallback: match by full sanitized title.
+            title_sane = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title)
+            title_candidates = []
+            for g in _glob.glob(os.path.join(base, "*")):
+                stem = os.path.splitext(os.path.basename(g))[0]
+                # Match if the stem EQUALS the full sanitized title
+                # (possibly with a " (MM.DD.YY)" date suffix stripped).
+                stem_no_date = re.sub(
+                    r"\s*\(\d{2}\.\d{2}\.\d{2}\)\s*$", "", stem)
+                if stem == title_sane or stem_no_date == title_sane:
+                    title_candidates.append(g)
+            if title_candidates:
+                title_candidates.sort(
+                    key=lambda p: os.path.getmtime(p)
+                    if os.path.isfile(p) else 0,
+                    reverse=True)
+                final_path = title_candidates[0]
+    except Exception as e:
+        swallow("final-path title match", e)
+    # GUARANTEED binding fallback. The id was captured from DLTRACK but
+    # neither id-in-filename nor the sanitized-title match found the file
+    # (unicode / trim-filenames / punctuation oddities). A single-video
+    # download produces exactly one fresh file, so the newest media file
+    # just written under `base` is it — bind the id through it instead of
+    # dropping it. (_scan_recent_video uses ctime on Windows, so the
+    # --mtime upload-date stamp can't defeat the recency check.)
+    if (not final_path or not os.path.isfile(final_path)) and video_id:
+        try:
+            rp = sync_backend._scan_recent_video(base)
+            if (rp and os.path.isfile(rp)
+                    and _recent_scan_bind_is_corroborated(
+                        rp, video_id, title)):
+                final_path = rp
+                _log.info(
+                    "single-video bind via recent-scan: vid=%s -> %s",
+                    video_id, rp)
+            elif rp:
+                _log.warning(
+                    "single-video recent-scan candidate not corroborated; "
+                    "refusing bind: vid=%s title=%r candidate=%s",
+                    video_id, title, rp)
+        except Exception as se:
+            _log.debug("recent-scan bind failed: %s", se)
+    return final_path
+
+
+def classify_download_outcome(returncode, has_dltrack, killed,
+                              file_exists, registered,
+                              stderr_errors) -> tuple[str, str]:
+    """Decide the terminal state of a single-video download.
+
+    Returns ``(outcome, reason)`` where outcome is one of
+    ``"killed"`` / ``"success"`` / ``"downloaded_unindexed"`` / ``"failed"``.
+    A nonzero rc OR a missing DLTRACK OR a file that vanished from disk all
+    block a success claim; ``reason`` is only meaningful for ``"failed"``.
+    """
+    if killed:
+        return ("killed", "")
+    dl_ok = (returncode == 0) and bool(has_dltrack)
+    if dl_ok and file_exists and registered:
+        return ("success", "")
+    if dl_ok and file_exists and not registered:
+        return ("downloaded_unindexed", "")
+    # Either yt-dlp itself failed, or it reported success but the file is
+    # missing from disk at decision time.
+    if dl_ok and not file_exists:
+        reason = ("download finished, but YTArchiver could not find the "
+                  "saved video file; run Rescan or try the download again")
+    elif stderr_errors:
+        reason = stderr_errors[0]
+    elif returncode not in (0, None):
+        reason = f"yt-dlp exited with code {returncode}"
+    else:
+        reason = "no video was produced"
+    return ("failed", reason)
 
 
 class ArchiveMixin:
@@ -212,7 +355,7 @@ class ArchiveMixin:
             try:
                 self._archive_single_inflight.discard(url)
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                swallow("inflight discard on yt-dlp missing", e)
             return {"ok": False, "error": "yt-dlp not found"}
         cfg = load_config()
         opts = options if isinstance(options, dict) else {}
@@ -225,7 +368,7 @@ class ArchiveMixin:
             try:
                 self._archive_single_inflight.discard(url)
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                swallow("inflight discard on no output-dir", e)
             return {"ok": False, "error": "No output_dir configured"}
         # audit DT-3: verify target folder is writable before
         # launching yt-dlp. Creates the dir if it doesn't exist;
@@ -236,7 +379,7 @@ class ArchiveMixin:
             try:
                 self._archive_single_inflight.discard(url)
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                swallow("inflight discard on folder not writable", e)
             return {"ok": False,
                     "error": f"Output folder not writable: {base} ({_fe})"}
         # audit DT-11 / DT-5: validate custom name if "use YT title"
@@ -252,7 +395,7 @@ class ArchiveMixin:
                 try:
                     self._archive_single_inflight.discard(url)
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    swallow("inflight discard on bad custom name", e)
                 return {"ok": False,
                         "error": "Custom name is empty or all special chars. "
                                  "Enable 'Use YT title' or enter a real name."}
@@ -371,7 +514,7 @@ class ArchiveMixin:
                     with self._archive_single_lock:
                         self._archive_single_inflight.discard(url)
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    swallow("inflight discard on launch failure", e)
                 return
             # parse the DLTRACK line so single-video downloads
             # land in the videos index, the Recent tab, and the FTS
@@ -464,13 +607,13 @@ class ArchiveMixin:
                         proc.terminate()
                         proc.wait(timeout=5)
                     except Exception as e:
-                        _log.debug("swallowed: %s", e)
+                        swallow("watchdog terminate", e)
                     try:
                         if proc.poll() is None:
                             proc.kill()
                             proc.wait(timeout=2)
                     except Exception as e:
-                        _log.debug("swallowed: %s", e)
+                        swallow("watchdog kill", e)
                     # Also update the in-place [Dwnld] row with the
                     # failed state so the user sees it resolved
                     # instead of stuck at "downloading..." forever
@@ -493,113 +636,36 @@ class ArchiveMixin:
                     try:
                         self._push_url_history(url)
                     except Exception as e:
-                        _log.debug("swallowed: %s", e)
+                        swallow("url-history write", e)
                 # Post-download bookkeeping — emulate the channel-sync
                 # path's register_video + _record_recent_download hooks.
                 if _dltrack:
                     try:
-                        parts = _dltrack.split(":::")
-                        # Format: "DLTRACK" + title, uploader, upload_date,
-                        # filesize, duration, id
                         # audit DT-8: guard against yt-dlp output format
-                        # changes / missing fields. The hard-indexed
-                        # parts[1]/parts[6] would raise IndexError and
-                        # abort post-download indexing silently.
-                        if len(parts) < 7:
+                        # changes / missing fields. parse_dltrack returns
+                        # None (instead of raising IndexError) when the line
+                        # is short, anchors on the trailing 5 fixed fields so
+                        # a ':::' in the title can't shift the id, and rejoins
+                        # the middle as the title. See T326 extraction.
+                        _dt = parse_dltrack(_dltrack)
+                        if _dt is None:
+                            _nparts = len((_dltrack or "").split(":::"))
                             self._log_stream.emit_dim(
-                                f" (DLTRACK parsing: only {len(parts)} "
+                                f" (DLTRACK parsing: only {_nparts} "
                                 f"parts, expected 7 — indexing skipped)")
                             raise ValueError("dltrack parse")
-                        # Anchor on the trailing 5 fixed fields
-                        # (uploader/date/size/duration/id) and rejoin the
-                        # middle as the title, so a title containing a
-                        # literal ':::' can't shift the id field. Mirrors
-                        # the proven sync-side DLTRACK parse; the old
-                        # positional parts[6] silently grabbed the wrong
-                        # field (and thus a bad/blank id) on such titles.
-                        _uploader = parts[-5]
-                        _vid = (parts[-1] or "").strip()
-                        _title = ":::".join(parts[1:-5]).strip()
-                        # Resolve the final filepath on disk. Template
-                        # was `<title> (MM.DD.YY).ext` or `<title>.ext`
-                        # under `base`. Scan `base` for something
-                        # matching the video ID / title.
-                        # when multiple candidate files
-                        # match, prefer the NEWEST by mtime (this is
-                        # the fresh download). Old code picked the
-                        # first glob hit, which for users with two
-                        # copies pointed at the stale/duplicate file.
-                        # title-prefix fallback now requires
-                        # a full-title match (not just first 50 chars)
-                        # so series with similar long-title prefixes
+                        _uploader = _dt["uploader"]
+                        _vid = _dt["video_id"]
+                        _title = _dt["title"]
+                        # Resolve the final filepath on disk via the shared
+                        # id-glob / title-match / recent-scan fallbacks
+                        # (T326 extraction — see resolve_final_path). When
+                        # multiple candidates match, the newest by mtime wins
+                        # (the fresh download), and the title fallback requires
+                        # a full-title match so similar long-title prefixes
                         # ("Video 1:...", "Video 2:...") don't collide.
-                        final_path = _choose_existing_ytdlp_candidate(
-                            _candidate_paths, base)
-                        try:
-                            import glob as _glob
-                            _vid_candidates = []
-                            if _vid:
-                                for _g in _glob.glob(os.path.join(base, "*")):
-                                    if _vid in os.path.basename(_g):
-                                        _vid_candidates.append(_g)
-                            if _vid_candidates:
-                                _vid_candidates.sort(
-                                    key=lambda p: os.path.getmtime(p)
-                                    if os.path.isfile(p) else 0,
-                                    reverse=True)
-                                final_path = _vid_candidates[0]
-                            if not final_path and _title:
-                                # Fallback: match by full sanitized title.
-                                _title_sane = _re.sub(
-                                    r'[<>:"/\\|?*\x00-\x1f]', "_", _title)
-                                _title_candidates = []
-                                for _g in _glob.glob(os.path.join(base, "*")):
-                                    _stem = os.path.splitext(
-                                        os.path.basename(_g))[0]
-                                    # Match if the stem EQUALS the full
-                                    # sanitized title (possibly with a
-                                    # " (MM.DD.YY)" date suffix stripped).
-                                    _stem_no_date = _re.sub(
-                                        r"\s*\(\d{2}\.\d{2}\.\d{2}\)\s*$",
-                                        "", _stem)
-                                    if _stem == _title_sane or _stem_no_date == _title_sane:
-                                        _title_candidates.append(_g)
-                                if _title_candidates:
-                                    _title_candidates.sort(
-                                        key=lambda p: os.path.getmtime(p)
-                                        if os.path.isfile(p) else 0,
-                                        reverse=True)
-                                    final_path = _title_candidates[0]
-                        except Exception as e:
-                            _log.debug("swallowed: %s", e)
-                        # GUARANTEED binding fallback. The id was captured
-                        # from DLTRACK but neither id-in-filename nor the
-                        # sanitized-title match found the file (unicode /
-                        # trim-filenames / punctuation oddities). A single-
-                        # video download produces exactly one fresh file, so
-                        # the newest media file just written under `base` is
-                        # it — bind the id through it instead of dropping it.
-                        # (_scan_recent_video uses ctime on Windows, so the
-                        # --mtime upload-date stamp can't defeat the recency
-                        # check.)
-                        if (not final_path or not os.path.isfile(final_path)) and _vid:
-                            try:
-                                _rp = sync_backend._scan_recent_video(base)
-                                if (_rp and os.path.isfile(_rp)
-                                        and _recent_scan_bind_is_corroborated(
-                                            _rp, _vid, _title)):
-                                    final_path = _rp
-                                    _log.info(
-                                        "single-video bind via recent-scan: "
-                                        "vid=%s -> %s", _vid, _rp)
-                                elif _rp:
-                                    _log.warning(
-                                        "single-video recent-scan candidate "
-                                        "not corroborated; refusing bind: "
-                                        "vid=%s title=%r candidate=%s",
-                                        _vid, _title, _rp)
-                            except Exception as _se:
-                                _log.debug("recent-scan bind failed: %s", _se)
+                        final_path = resolve_final_path(
+                            base, _vid, _title, _candidate_paths)
                         if _vid and (not final_path
                                      or not os.path.isfile(final_path)):
                             # Never silently drop an authoritative id.
@@ -647,7 +713,7 @@ class ArchiveMixin:
                                         os.path.dirname(final_path),
                                         recursive=False)
                                 except Exception as _he:
-                                    _log.debug("swallowed: %s", _he)
+                                    swallow("hide sidecars after download", _he)
                             # Drop from deferred livestream journal if
                             # this was a previously-deferred premiere
                             # that's now finished (matches bug C-3).
@@ -656,7 +722,7 @@ class ArchiveMixin:
                                     from backend import livestreams as _ls
                                     _ls.drop(_vid)
                                 except Exception as e:
-                                    _log.debug("swallowed: %s", e)
+                                    swallow("deferred-livestream drop", e)
                     except Exception as _pe:
                         self._log_stream.emit_dim(
                             f" (DLTRACK post-processing failed: {_pe})")
@@ -669,14 +735,16 @@ class ArchiveMixin:
                 # re-verify the file is on disk at decision time and only
                 # declare success when it ALSO landed in the index.
                 # The watchdog branch already emitted its own failure line.
-                _dl_ok = (proc.returncode == 0) and bool(_dltrack)
                 _fp_now = _state.get("final_path") or ""
                 _file_exists = bool(_fp_now) and os.path.isfile(_fp_now)
                 _registered = bool(_state.get("registered"))
                 _recorded = bool(_state.get("recorded"))
-                if _killed:
+                _outcome, _reason = classify_download_outcome(
+                    proc.returncode, bool(_dltrack), _killed,
+                    _file_exists, _registered, _stderr_errors)
+                if _outcome == "killed":
                     pass
-                elif _dl_ok and _file_exists and _registered:
+                elif _outcome == "success":
                     _sz = _state.get("final_size") or 0
                     if _sz > 0:
                         from backend.utils import format_bytes as _fmtb
@@ -688,7 +756,7 @@ class ArchiveMixin:
                     if not _recorded:
                         self._log_stream.emit_dim(
                             " (not added to Recent — try Rescan)")
-                elif _dl_ok and _file_exists and not _registered:
+                elif _outcome == "downloaded_unindexed":
                     # Downloaded fine but the index write was dropped (most
                     # likely a locked DB during a concurrent disk scan). The
                     # file is on disk but won't appear in Browse/Watch until
@@ -706,20 +774,8 @@ class ArchiveMixin:
                                 "Downloaded but not indexed — run Rescan",
                                 "warn")
                     except Exception as e:
-                        _log.debug("swallowed: %s", e)
-                else:
-                    # Either yt-dlp itself failed, or it reported success but
-                    # the file is missing from disk at decision time.
-                    if _dl_ok and not _file_exists:
-                        _reason = ("download finished, but YTArchiver could "
-                                   "not find the saved video file; run Rescan "
-                                   "or try the download again")
-                    elif _stderr_errors:
-                        _reason = _stderr_errors[0]
-                    elif proc.returncode not in (0, None):
-                        _reason = f"yt-dlp exited with code {proc.returncode}"
-                    else:
-                        _reason = "no video was produced"
+                        swallow("downloaded-not-indexed toast", e)
+                else:  # "failed" — _reason already classified above
                     # Replace the inplace [Dwnld] line with a red failure.
                     self._log_stream.emit([
                         ["[Dwnld] ", ["red", _marker_tag]],
@@ -731,7 +787,7 @@ class ArchiveMixin:
                             self.services.event_bus.show_toast(
                                 f"Download failed: {_reason}", "error")
                     except Exception as e:
-                        _log.debug("swallowed: %s", e)
+                        swallow("download-failed toast", e)
                 self._log_stream.flush()
                 # Push a Recent-tab refresh so the new video appears
                 # immediately instead of waiting for the next tab
@@ -739,7 +795,7 @@ class ArchiveMixin:
                 try:
                     self._push_recent_refresh()
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    swallow("recent-refresh push", e)
             except Exception as _ue:
                 # Any unhandled error in the stream/parse loop must still
                 # resolve the [Dwnld] row — otherwise the thread dies in
@@ -753,7 +809,7 @@ class ArchiveMixin:
                     ])
                     self._log_stream.flush()
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    swallow("unhandled-error row emit", e)
             finally:
                 # Always release the URL guard, even on exception, so
                 # the user can retry without restarting the app.
@@ -761,7 +817,7 @@ class ArchiveMixin:
                     with self._archive_single_lock:
                         self._archive_single_inflight.discard(url)
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    swallow("inflight discard in finally", e)
 
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "started": True}

@@ -128,20 +128,27 @@
     if (!el) return false;
     return (el.scrollHeight - el.scrollTop - el.clientHeight) < 700;
   }
+  // RAF-debounced scroll handler: layout reads (scrollHeight / clientHeight)
+  // are batched into one rAF tick per scroll burst instead of firing on
+  // every individual scroll event, which caused jank on large grids.
+  let _scrollRaf = null;
   function onScroll() {
-    if (!isActive() || !_hasMore || _loading) return;
-    // The Videos grid's scroll can live on EITHER the inner frame
-    // (#recent-grid-frame) or the outer .browse-view (#view-recent) — the
-    // latter is a block-level overflow-y:auto container, so the inner
-    // frame's flex:1 is inert and #view-recent is what actually scrolls.
-    // Check both (plus the document) so load-more fires regardless of which
-    // element owns the scroll. (Bug: only #recent-grid-frame + window were
-    // checked, so on the real archive the grid stopped at the first page.)
-    if (_nearBottom($("recent-grid-frame"))
-        || _nearBottom($("view-recent"))
-        || _nearBottom(document.scrollingElement || document.documentElement)) {
-      loadPage(false);
-    }
+    if (_scrollRaf) return;
+    _scrollRaf = requestAnimationFrame(() => {
+      _scrollRaf = null;
+      if (!isActive() || !_hasMore || _loading) return;
+      // The Videos grid's scroll can live on EITHER the inner frame
+      // (#recent-grid-frame) or the outer .browse-view (#view-recent) — the
+      // latter is a block-level overflow-y:auto container, so the inner
+      // frame's flex:1 is inert and #view-recent is what actually scrolls.
+      // Check both (plus the document) so load-more fires regardless of
+      // which element owns the scroll.
+      if (_nearBottom($("recent-grid-frame"))
+          || _nearBottom($("view-recent"))
+          || _nearBottom(document.scrollingElement || document.documentElement)) {
+        loadPage(false);
+      }
+    });
   }
 
   function wireOnce() {
@@ -187,10 +194,37 @@
     const filterAtCall = _filter;
     try {
       const res = await bridgeCall("list_all_videos", sortAtCall, PAGE, 0, filterAtCall);
-      if (sortAtCall !== _sort || filterAtCall !== _filter || _loading) return;  // superseded meanwhile
+      if (sortAtCall !== _sort || filterAtCall !== _filter || _loading) return;
       const rows = (res && res.rows) || [];
-      const sig = rows.map(r => r.video_id || r.filepath || "").join("|");
-      if (sig !== _firstPageSig) loadPage(true);
+      const newSig = rows.map(r => r.video_id || r.filepath || "").join("|");
+      if (newSig === _firstPageSig) return; // nothing changed
+
+      // For "recent" sort: try a no-flash prepend — find how many NEW
+      // items are at the top (before the old first item) and insert only
+      // those, avoiding the blank-grid flash that loadPage(true) causes.
+      if (sortAtCall === "recent" && _firstPageSig) {
+        const oldFirstId = _firstPageSig.split("|")[0];
+        const splitIdx = rows.findIndex(
+          r => (r.video_id || r.filepath || "") === oldFirstId
+        );
+        if (splitIdx > 0) {
+          const g = grid();
+          if (g) {
+            const frag = document.createDocumentFragment();
+            for (let i = 0; i < splitIdx; i++) {
+              const c = _cardFor(rows[i]);
+              if (c) frag.appendChild(c);
+            }
+            g.insertBefore(frag, g.firstChild);
+            _firstPageSig = newSig;
+            return; // done — no blank flash, scroll position preserved
+          }
+        }
+      }
+
+      // Fallback: full reload (other sorts, filtered view, or old first
+      // item no longer in the new page because many videos were added).
+      loadPage(true);
     } catch (_e) { /* non-fatal — leave the current grid as-is */ }
   };
 

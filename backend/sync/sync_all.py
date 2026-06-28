@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from ..log import get_logger
+from ..log import get_logger, swallow
 from ..log_stream import LogStreamer
 from ..ytarchiver_config import ARCHIVE_FILE, config_transaction, load_config
 
@@ -79,7 +79,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         # early-return here, leaving the companion display showing
         # stale "in progress" state (audit: sync_all L25).
         try: clear_sync_progress()
-        except Exception as e: _log.debug("swallowed: %s", e)
+        except Exception as e: swallow("progress reset on early exit", e)
         return {"ok": False, "reason": "no channels", "total": 0}
 
     # ENQUEUE DECISION:
@@ -114,7 +114,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
             # else: worker was started just to drain the queue — do
             # not touch it.
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("queue snapshot / enqueue", e)
 
     # Per-pass unique id — stashed on a thread-local that
     # `_sync_row_emit` reads by default, so every call site inside the
@@ -299,9 +299,16 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         ])
         # Tell the UI the pause is now ACTUALLY in effect (vs just
         # requested). Frontend stops blinking the Resume button.
+        # Also ensure sync_paused=True is visible to the frontend so
+        # the Resume button appears when an auto-pause (e.g. cookie
+        # alert) set pause_event without going through queue_pause().
         if queues is not None:
+            try:
+                if not queues.sync_paused:
+                    queues.set_sync_paused(True)
+            except Exception as e: swallow("queue pause flag", e)
             try: queues.set_sync_paused_active(True)
-            except Exception as e: _log.debug("swallowed: %s", e)
+            except Exception as e: swallow("queue pause-active flag", e)
         from ..pause_helpers import wait_for_resume
         # queue-flag flipping + wait loop delegated to
         # pause_helpers.wait_for_resume; row-repaint stays here.
@@ -323,7 +330,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         # Always clear the active flag (resumed OR cancelled).
         if queues is not None:
             try: queues.set_sync_paused_active(False)
-            except Exception as e: _log.debug("swallowed: %s", e)
+            except Exception as e: swallow("queue pause-active clear", e)
         if cancelled:
             return
         stream.emit([
@@ -368,23 +375,60 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     # return at the bottom would otherwise raise NameError and skip the
     # whole end-of-pass cleanup.
     total = _initial_total
+
+    def _requeue_paused_task(ch: dict[str, Any], ch_name: str,
+                             i: int, total: int, *,
+                             reason: str,
+                             bracket_tag=None) -> bool:
+        """Handle a task that stopped because the sync queue was paused."""
+        nonlocal _processed
+        if (pause_event is None or not pause_event.is_set()
+                or queues is None):
+            return False
+        try:
+            queues.sync_requeue_front(ch)
+        except Exception as e:
+            swallow(f"{reason} pause requeue", e)
+        _sync_row_emit(stream, i, total, ch_name,
+                       summary="paused",
+                       name_tag="simpleline",
+                       summary_tag="simpleline",
+                       bracket_tag=bracket_tag)
+        _last_live["name"] = ""
+        _processed -= 1
+        return True
+
+    def _emit_failed_metadata_task(i: int, total: int, ch_name: str,
+                                   task_t0: float, *,
+                                   bracket_tag=None) -> None:
+        """Shared failed-row scaffold for the metadata-family tasks
+        (metadata / comments / video-id backfill). Emits a red 'failed'
+        sync row plus a failed metadata activity-log row. Callers still
+        emit their own kind-specific stream.emit_error message first
+        (T204 — collapses the verbatim-duplicated failed block)."""
+        _sync_row_emit(stream, i, total, ch_name,
+                       summary="failed",
+                       name_tag="dim", summary_tag="red",
+                       bracket_tag=bracket_tag)
+        emit_metadata_activity_row(
+            stream, ch_name,
+            primary="failed", secondary="",
+            errors=1, elapsed=time.time() - task_t0,
+            green=False)
+
     while True:
-        # Clear stale cancel+skip flags from a previous iteration's
-        # mid-channel skip request. sync_skip_current sets BOTH flags so
-        # the in-flight yt-dlp dies and the worker advances. After the
-        # cancelled channel's sync_channel returns, the flags are still
-        # set; if we don't clear them BEFORE sync_pop, the cancel-check
-        # below (line ~3353) would re-trigger on the next-popped channel
-        # and silently drop it as "skipped" — symptom seen as
-        # "Cancel task on #1 removes #2, #1 stays" (actually #1's
-        # in-flight job ended AND #2 was dropped without running).
-        # NOTE: the cancel-check inside _wait_if_paused still handles
-        # the "user paused, then clicked Cancel while paused" case —
-        # in that path the flags get set AFTER this clear runs.
-        if (cancel_event is not None and cancel_event.is_set()
-                and skip_event is not None and skip_event.is_set()):
-            cancel_event.clear()
+        # Clear a stale skip flag left over from the previous channel.
+        # sync_skip_current now only sets _sync_skip (no longer overloads
+        # _sync_cancel), so we just need to drain the skip event here so
+        # it doesn't mis-fire on the NEXT channel.
+        if skip_event is not None and skip_event.is_set():
             skip_event.clear()
+        # A mid-download pause requeues the in-flight channel at the front.
+        # Wait before popping again so the paused row stays visible in Tasks.
+        _wait_if_paused()
+        if cancel_event is not None and cancel_event.is_set():
+            stream.emit([["\n\u26d4 Pass cancelled.\n", "red"]])
+            break
         # Pop next channel off the queue. When the queue is empty, we're
         # done — this is how the loop terminates, naturally supporting
         # both fresh passes (queue was fully enqueued above) and resume
@@ -432,15 +476,8 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         # as PAUSED. Matches OLD's pause-at-top-of-channel behavior.
         _wait_if_paused()
         if cancel_event is not None and cancel_event.is_set():
-            # If this was a skip-rather-than-cancel, keep going.
-            if skip_event is not None and skip_event.is_set():
-                cancel_event.clear()
-                skip_event.clear()
-                skipped += 1
-                _sync_row_emit(stream, i, total, ch.get("name", "?"),
-                               summary="skipped",
-                               name_tag="dim", summary_tag="dim")
-                continue
+            # skip_event no longer overloads cancel_event, so this is
+            # always a genuine user cancel \u2014 break unconditionally.
             stream.emit([["\n\u26d4 Pass cancelled.\n", "red"]])
             # Requeue the just-popped (never-run) item \u2014 sync_pop
             # removed it BEFORE this cancel check, and the end-of-pass
@@ -504,7 +541,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                         "repair_yt_captions", "punct_restore"):
             if queues is not None:
                 try: queues.set_current_sync(ch)
-                except Exception as e: _log.debug("swallowed: %s", e)
+                except Exception as e: swallow("current-sync set", e)
         if _ch_kind == "metadata":
             try:
                 from .. import metadata as _meta
@@ -521,19 +558,10 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                     queues=queues)
                 # Detect pause-interrupted metadata walk — same
                 # re-enqueue-at-front treatment as downloads.
-                if (pause_event is not None and pause_event.is_set()
-                        and queues is not None):
-                    try:
-                        queues.sync_requeue_front(ch)
-                    except Exception as e:
-                        _log.debug("swallowed: %s", e)
-                    _sync_row_emit(stream, i, total, ch_name,
-                                   summary="paused",
-                                   name_tag="simpleline",
-                                   summary_tag="simpleline",
-                                   bracket_tag=_row_bracket)
-                    _last_live["name"] = ""
-                    _processed -= 1
+                if _requeue_paused_task(
+                        ch, ch_name, i, total,
+                        reason="metadata",
+                        bracket_tag=_row_bracket):
                     continue
                 _fetched = int(_res.get("fetched", 0) or 0)
                 _refreshed = int(_res.get("refreshed", 0) or 0)
@@ -616,15 +644,8 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                     green=(_errors_meta == 0))
             except Exception as _me:
                 stream.emit_error(f"Metadata failed for {ch_name}: {_me}")
-                _sync_row_emit(stream, i, total, ch_name,
-                               summary="failed",
-                               name_tag="dim", summary_tag="red",
-                               bracket_tag=_row_bracket)
-                emit_metadata_activity_row(
-                    stream, ch_name,
-                    primary="failed", secondary="",
-                    errors=1, elapsed=time.time() - _task_t0,
-                    green=False)
+                _emit_failed_metadata_task(i, total, ch_name, _task_t0,
+                                           bracket_tag=_row_bracket)
             _last_live["name"] = ""
             # Push Settings > Metadata tab refresh — last_views_refresh_ts
             # may have just been stamped on the channel config.
@@ -644,19 +665,10 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                     only_recent_days=ch.get("only_recent_days"),
                     queues=queues)
                 # Honor pause the same way the metadata branch does.
-                if (pause_event is not None and pause_event.is_set()
-                        and queues is not None):
-                    try:
-                        queues.sync_requeue_front(ch)
-                    except Exception as e:
-                        _log.debug("swallowed: %s", e)
-                    _sync_row_emit(stream, i, total, ch_name,
-                                   summary="paused",
-                                   name_tag="simpleline",
-                                   summary_tag="simpleline",
-                                   bracket_tag=_row_bracket)
-                    _last_live["name"] = ""
-                    _processed -= 1
+                if _requeue_paused_task(
+                        ch, ch_name, i, total,
+                        reason="metadata-comments",
+                        bracket_tag=_row_bracket):
                     continue
                 _fetched = int(_res.get("fetched", 0) or 0)
                 _errors_c = int(_res.get("errors", 0) or 0)
@@ -748,15 +760,8 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
             except Exception as _ce:
                 stream.emit_error(
                     f"Comments refresh failed for {ch_name}: {_ce}")
-                _sync_row_emit(stream, i, total, ch_name,
-                               summary="failed",
-                               name_tag="dim", summary_tag="red",
-                               bracket_tag=_row_bracket)
-                emit_metadata_activity_row(
-                    stream, ch_name,
-                    primary="failed", secondary="",
-                    errors=1, elapsed=time.time() - _task_t0,
-                    green=False)
+                _emit_failed_metadata_task(i, total, ch_name, _task_t0,
+                                           bracket_tag=_row_bracket)
             _last_live["name"] = ""
             # Push Metadata-tab refresh (last_comments_refresh_ts may
             # have just been stamped).
@@ -778,19 +783,10 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                     pause_event=pause_event,
                     queues=queues,
                     mode=_mode)
-                if (pause_event is not None and pause_event.is_set()
-                        and queues is not None):
-                    try:
-                        queues.sync_requeue_front(ch)
-                    except Exception as e:
-                        _log.debug("swallowed: %s", e)
-                    _sync_row_emit(stream, i, total, ch_name,
-                                   summary="paused",
-                                   name_tag="simpleline",
-                                   summary_tag="simpleline",
-                                   bracket_tag=_row_bracket)
-                    _last_live["name"] = ""
-                    _processed -= 1
+                if _requeue_paused_task(
+                        ch, ch_name, i, total,
+                        reason="backfill",
+                        bracket_tag=_row_bracket):
                     continue
                 _resolved = int(_res.get("resolved", 0) or 0)
                 _unresolved = int(_res.get("unresolved", 0) or 0)
@@ -827,15 +823,8 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
             except Exception as _be:
                 stream.emit_error(
                     f"ID backfill failed for {ch_name}: {_be}")
-                _sync_row_emit(stream, i, total, ch_name,
-                               summary="failed",
-                               name_tag="dim", summary_tag="red",
-                               bracket_tag=_row_bracket)
-                emit_metadata_activity_row(
-                    stream, ch_name,
-                    primary="failed", secondary="",
-                    errors=1, elapsed=time.time() - _task_t0,
-                    green=False)
+                _emit_failed_metadata_task(i, total, ch_name, _task_t0,
+                                           bracket_tag=_row_bracket)
             _last_live["name"] = ""
             # Push Metadata-tab refresh — the Video IDs column status
             # just changed (resolved count went up, missing went down).
@@ -867,7 +856,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                 # popover render shows the clean task name again.
                 if queues is not None:
                     try: queues.set_sync_pass_progress(0, 0)
-                    except Exception as e: _log.debug("swallowed: %s", e)
+                    except Exception as e: swallow("repair pass-progress reset", e)
                 _ok_n = int(_res.get("succeeded", 0) or 0)
                 _skip_n = int(_res.get("skipped", 0) or 0)
                 _fail_n = int(_res.get("failed", 0) or 0)
@@ -919,7 +908,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                 )
                 if queues is not None:
                     try: queues.set_sync_pass_progress(0, 0)
-                    except Exception as e: _log.debug("swallowed: %s", e)
+                    except Exception as e: swallow("punct pass-progress reset", e)
                 _ok_n = int(_res.get("succeeded", 0) or 0)
                 _skip_n = int(_res.get("skipped", 0) or 0)
                 _fail_n = int(_res.get("failed", 0) or 0)
@@ -1011,13 +1000,14 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
             res = sync_channel(ch, stream, cancel_event,
                                queues=queues, transcribe_mgr=transcribe_mgr,
                                pause_event=pause_event,
+                               kill_current=skip_event,
                                pass_idx=i, pass_total=total)
         finally:
             try:
                 from .active_state import clear_sync_active as _clear_active
                 _clear_active(ch_name)
             except Exception as _ce:
-                _log.debug("swallowed: %s", _ce)
+                swallow("clear-sync-active", _ce)
         _dl = int(res.get("downloaded", 0) or 0)
         _err = int(res.get("errors", 0) or 0)
         sum_dl += _dl
@@ -1027,17 +1017,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         # FRONT of the queue so Resume continues it instead of
         # silently skipping. yt-dlp's `--continue` + download-archive
         # picks up where it left off, so no data is lost.
-        if (pause_event is not None and pause_event.is_set()
-                and queues is not None):
-            try:
-                queues.sync_requeue_front(ch)
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-            _sync_row_emit(stream, i, total, ch_name,
-                           summary="paused",
-                           name_tag="simpleline", summary_tag="simpleline")
-            _last_live["name"] = ""
-            _processed -= 1 # undo the count — will retry this one
+        if _requeue_paused_task(ch, ch_name, i, total, reason="download"):
             # Loop will hit _wait_if_paused() on next iter and block.
             continue
         # Replace the live row with a compact summary.
@@ -1054,7 +1034,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         # advances — without it the column stays frozen at its boot-time
         # values until the user clicks away and back.
         try: fire_channel_synced_hook()
-        except Exception as e: _log.debug("swallowed: %s", e)
+        except Exception as e: swallow("channel-synced hook", e)
         # If this was a batch-limited bootstrap run, apply the next cooldown.
         # We only set cooldown when the channel hadn't finished initializing
         # and this pass hit the BATCH_LIMIT threshold.
@@ -1152,7 +1132,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     if queues is not None:
         if not _cancelled:
             try: queues.sync_clear()
-            except Exception as e: _log.debug("swallowed: %s", e)
+            except Exception as e: swallow("queue clear on pass end", e)
         # Don't drop the in-flight item from `current_sync` on cancel
         # — that's what `save_now` writes into the `resuming` dict
         # so the next app launch can pick it back up. Clearing it
@@ -1160,16 +1140,16 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         # channel from the resume entry-point (audit: sync_all H27).
         if not _cancelled:
             try: queues.set_current_sync(None)
-            except Exception as e: _log.debug("swallowed: %s", e)
+            except Exception as e: swallow("current-sync clear", e)
         try: queues.set_sync_pass_progress(0, 0)
-        except Exception as e: _log.debug("swallowed: %s", e)
+        except Exception as e: swallow("pass-progress reset", e)
     # Clear the sync-progress file so any companion display goes idle.
     try: clear_sync_progress()
-    except Exception as e: _log.debug("swallowed: %s", e)
+    except Exception as e: swallow("sync-progress cleanup", e)
     # Clear the thread-local pass_id so stray `_sync_row_emit` calls
     # after this function returns don't tag rows with a dead pass.
     try: _ROW_EMIT_PASS_ID.id = ""
-    except Exception as e: _log.debug("swallowed: %s", e)
+    except Exception as e: swallow("pass-id clear", e)
     return {"ok": True, "downloaded": sum_dl, "errors": sum_err,
             "skipped": skipped,
             "took": _fmt_duration(elapsed), "total": total}

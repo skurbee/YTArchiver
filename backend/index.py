@@ -280,6 +280,11 @@ def _open() -> sqlite3.Connection | None:
                 content=segments,
                 content_rowid=id
             )""")
+            _conn.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS videos_fts USING fts5(
+                title,
+                content=videos,
+                content_rowid=id
+            )""")
             _conn.execute("""CREATE TABLE IF NOT EXISTS indexed_files (
                 path TEXT PRIMARY KEY,
                 mtime REAL,
@@ -337,9 +342,14 @@ def _open() -> sqlite3.Connection | None:
                 _current_v = _conn.execute("PRAGMA user_version").fetchone()[0]
             except Exception:
                 _current_v = 0
-            _SCHEMA_VERSION = 1
-            # Future migrations: _MIGRATIONS[2] = lambda c: c.execute("...")
-            _MIGRATIONS: dict = {}
+            _SCHEMA_VERSION = 2
+            _MIGRATIONS: dict = {
+                # Populate videos_fts from the existing videos table so
+                # title search can use FTS5 MATCH instead of LIKE '%term%'.
+                2: lambda c: c.execute(
+                    "INSERT INTO videos_fts(videos_fts) VALUES('rebuild')"
+                ),
+            }
             for stmt in (
                 "ALTER TABLE segments ADD COLUMN words TEXT DEFAULT ''",
                 "ALTER TABLE videos ADD COLUMN search_failed_ts REAL",
@@ -733,6 +743,19 @@ def register_video(filepath: str, channel: str, title: str | None = None,
                         _dur = _d
             except (TypeError, ValueError):
                 _dur = None
+            # Capture the pre-upsert FTS state. videos_fts is an external-
+            # content FTS5 table: a NEW row has nothing to delete (issuing the
+            # FTS5 'delete' for a never-indexed rowid raises DatabaseError
+            # "malformed"), and an UPDATE must delete using the row's OLD
+            # title, not the post-upsert one. The previous code always deleted
+            # with the new title — which threw on every freshly-downloaded
+            # video and, because the surrounding except only caught
+            # OperationalError, aborted the ENTIRE registration. Result: new
+            # downloads silently never landed in the index (register returned
+            # False with no error shown).
+            _fts_old = conn.execute(
+                "SELECT id, title FROM videos WHERE filepath=? COLLATE NOCASE",
+                (fp,)).fetchone()
             conn.execute(
                 """INSERT INTO videos
                    (title, channel, year, month, filepath, video_id, video_url,
@@ -783,6 +806,31 @@ def register_video(filepath: str, channel: str, title: str | None = None,
                  size, _dur, tx_status,
                  fp, time.time(), upload_ts),
             )
+            # Keep videos_fts in sync (T257). NEW row → insert only; UPDATE →
+            # delete the OLD entry (with its OLD title) then insert the new.
+            # Catch BOTH OperationalError (pre-migration DB without the FTS
+            # table) AND DatabaseError ("malformed" from a stray delete) so an
+            # FTS hiccup can never abort the registration of the video itself.
+            try:
+                _fts_new = conn.execute(
+                    "SELECT id, title FROM videos WHERE filepath=? COLLATE NOCASE",
+                    (fp,)
+                ).fetchone()
+                if _fts_new:
+                    _fts_id, _fts_title = _fts_new
+                    if _fts_old is not None:
+                        _old_id, _old_title = _fts_old
+                        conn.execute(
+                            "INSERT INTO videos_fts(videos_fts, rowid, title)"
+                            " VALUES('delete', ?, ?)",
+                            (_old_id, _old_title or "")
+                        )
+                    conn.execute(
+                        "INSERT INTO videos_fts(rowid, title) VALUES(?, ?)",
+                        (_fts_id, _fts_title or "")
+                    )
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as _fe:
+                _log.debug("videos_fts sync skipped: %s", _fe)
             conn.commit()
 
         # Retry on a transient "database is locked"/"busy" — a concurrent
@@ -1368,6 +1416,24 @@ _thumb_index_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _thumb_index_cache_lock = threading.Lock()
 
 
+class _LowPriorityInterrupted(Exception):
+    """Raised when startup preload should yield to user-visible work."""
+
+
+def _low_priority_busy(busy_fn: Any | None) -> bool:
+    if not callable(busy_fn):
+        return False
+    try:
+        return bool(busy_fn())
+    except Exception:
+        return False
+
+
+def _raise_if_low_priority_busy(busy_fn: Any | None) -> None:
+    if _low_priority_busy(busy_fn):
+        raise _LowPriorityInterrupted()
+
+
 def _lru_put(cache: OrderedDict, key: Any, value: Any, max_entries: int) -> None:
     cache[key] = value
     cache.move_to_end(key)
@@ -1389,6 +1455,24 @@ def _all_videos_cache_put(
 
 def _thumb_index_cache_put(key: str, entry: dict[str, Any]) -> None:
     _lru_put(_thumb_index_cache, key, entry, _THUMB_INDEX_CACHE_MAX)
+
+
+def _coerce_count(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _format_compact_count(value: Any) -> str:
+    n = _coerce_count(value)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    if n > 0:
+        return str(n)
+    return ""
 
 
 def invalidate_channel_videos(channel: str | None = None) -> None:
@@ -1417,10 +1501,13 @@ def invalidate_channel_videos(channel: str | None = None) -> None:
 
 def preload_channel_videos(channel: str,
                            sort: str = "newest",
-                           limit: int = 500) -> int:
+                           limit: int = 500,
+                           low_priority_busy_fn: Any | None = None) -> int:
     """Warm `list_videos_for_channel` into the cache. Returns row count."""
+    _raise_if_low_priority_busy(low_priority_busy_fn)
     rows = list_videos_for_channel(channel, sort=sort, limit=limit,
-                                    include_thumbs=True)
+                                    include_thumbs=True,
+                                    low_priority_busy_fn=low_priority_busy_fn)
     with _browse_cache_lock:
         _browse_videos_cache_put((channel, sort, limit, True), rows)
     return len(rows)
@@ -1429,6 +1516,7 @@ def preload_channel_videos(channel: str,
 def preload_all_channels(channel_names: list[str],
                          progress_cb: Any | None = None,
                          cancel_ev: Any | None = None,
+                         low_priority_busy_fn: Any | None = None,
                          sort: str = "newest",
                          limit: int = 500) -> dict[str, int]:
     """Warm the per-channel video-list cache for every subscribed channel.
@@ -1446,24 +1534,47 @@ def preload_all_channels(channel_names: list[str],
        page) advance. On 100+ channels this adds ~3 seconds total —
        imperceptible vs the multi-minute preload duration on a real
        archive.
-    3. If sync or GPU is actively running, we yield 200 ms instead so
-       the user-visible work gets more breathing room.
+    3. If sync or GPU is actively running, startup callers can provide
+       low_priority_busy_fn; preload then waits between channels and
+       interrupts uncached thumbnail walks instead of competing with
+       download finalization.
 
     Returns {channel_name: row_count}.
     """
     import time as _t
     out: dict[str, int] = {}
     total = len(channel_names)
-    for i, ch in enumerate(channel_names):
+
+    def _wait_if_busy() -> bool:
+        while _low_priority_busy(low_priority_busy_fn):
+            if cancel_ev is not None and cancel_ev.is_set():
+                return False
+            _t.sleep(0.5)
+        return True
+
+    i = 0
+    while i < total:
+        ch = channel_names[i]
         if cancel_ev is not None and cancel_ev.is_set():
+            break
+        if not _wait_if_busy():
             break
         if progress_cb is not None:
             try: progress_cb(i + 1, total, ch)
             except Exception as e: _log.debug("swallowed: %s", e)
         try:
-            out[ch] = preload_channel_videos(ch, sort=sort, limit=limit)
+            out[ch] = preload_channel_videos(
+                ch, sort=sort, limit=limit,
+                low_priority_busy_fn=low_priority_busy_fn)
+        except _LowPriorityInterrupted:
+            # User-visible work started mid-channel. Do not cache a
+            # partial preload; wait, then retry the same channel later.
+            if not _wait_if_busy():
+                break
+            continue
         except Exception:
             out[ch] = 0
+        i += 1
         # Politeness yield. Active sync/GPU = longer yield.
         try:
             from . import sync as _sync
@@ -1477,7 +1588,8 @@ def preload_all_channels(channel_names: list[str],
     # Browse>Videos click still paid the cold ~10s per-row thumbnail walk.
     # Match videosView.js's default request exactly: sort="recent",
     # PAGE=60, offset=0, include_thumbs=True.
-    if not (cancel_ev is not None and cancel_ev.is_set()):
+    if (not (cancel_ev is not None and cancel_ev.is_set())
+            and _wait_if_busy()):
         try:
             list_all_videos("recent", 60, 0, include_thumbs=True)
         except Exception as e:
@@ -1486,7 +1598,9 @@ def preload_all_channels(channel_names: list[str],
 
 
 def list_videos_for_channel(channel: str, sort: str = "newest",
-                            limit: int = 50000, include_thumbs: bool = True
+                            limit: int = 50000, include_thumbs: bool = True,
+                            *,
+                            low_priority_busy_fn: Any | None = None
                             ) -> list[dict[str, Any]]:
     """Videos in a channel, sorted by requested key.
 
@@ -1536,6 +1650,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     conn = _reader_open()
     if conn is None:
         return []
+    _raise_if_low_priority_busy(low_priority_busy_fn)
     order = {
         "newest": "(upload_ts IS NULL) ASC, upload_ts DESC, COALESCE(added_ts, 0) DESC",
         "oldest": "(upload_ts IS NULL) ASC, upload_ts ASC, COALESCE(added_ts, 0) ASC",
@@ -1586,6 +1701,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
                 "tx_status": r[7], "added_ts": r[8],
                 "removed_from_yt": False,
             } for r in cur.fetchall()]
+    _raise_if_low_priority_busy(low_priority_busy_fn)
     # Enrich: upload_ts + view_count (from aggregated metadata) + thumbnails.
     # View count enables "Most Viewed" sort in the Browse grid without
     # making yt-dlp calls here — we rely on the data Cache built up during
@@ -1608,6 +1724,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     def _fetch_meta(folder_key):
         """Lazy-load the aggregated metadata JSONL for a given folder.
         Cache by folder so we don't re-parse the same file per row."""
+        _raise_if_low_priority_busy(low_priority_busy_fn)
         if folder_key in metadata_cache:
             return metadata_cache[folder_key]
         entries: dict[str, Any] = {}
@@ -1617,6 +1734,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
             # Walk up the folder tree looking for .{channel} ... Metadata.jsonl
             cur = folder_key
             for _ in range(4):
+                _raise_if_low_priority_busy(low_priority_busy_fn)
                 if not cur or not os.path.isdir(cur):
                     break
                 for fn in os.listdir(cur):
@@ -1645,6 +1763,8 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
                 parent = os.path.dirname(cur)
                 if parent == cur: break
                 cur = parent
+        except _LowPriorityInterrupted:
+            raise
         except Exception as e:
             _walk_failed = True
             _log.debug("swallowed: %s", e)
@@ -1690,85 +1810,15 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     # back to find_thumbnail for the no-vid / stem-only path.
     _thumb_by_vid: dict[str, str] = {}
     if include_thumbs and out:
-        _vid_re_local = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
-        # Locate the channel root from any video's filepath. mp4s
-        # live at one of:
-        #    <root>/<year>/<file>           (split_years=True)
-        #    <root>/<year>/<month>/<file>   (split_years + split_months)
-        #    <root>/<file>                  (split_years=False)
-        # If the mp4's parent dir name is a 4-digit year, go up one
-        # level; if the grandparent's name is a 4-digit year and
-        # the parent looks like a month bucket, go up two.
-        # Earlier bug: walked up the FIRST dirname found, which
-        # was just the year folder, so the channel-wide scan only
-        # saw one year's .Thumbnails/.
-        # Compute candidate channel roots across ALL rows and pick the
-        # MOST-COMMON one — first-row-wins was wrong when the first
-        # video happened to be in an orphan subfolder, misrouting the
-        # whole channel's thumbnail walk (audit: index.py H117).
-        _ch_root = None
-        _year_re = re.compile(r"^[12][0-9]{3}$")
         _root_votes: dict[str, int] = {}
         for _row in out:
-            _fp = _row.get("filepath") or ""
-            if not _fp:
-                continue
-            _parent = os.path.dirname(_fp)
-            _gp = os.path.dirname(_parent)
-            _parent_name = os.path.basename(_parent)
-            _gp_name = os.path.basename(_gp)
-            if _year_re.match(_parent_name):
-                _cand = _gp
-            elif _year_re.match(_gp_name):
-                _cand = os.path.dirname(_gp)
-            else:
-                _cand = _parent
+            _cand = _channel_root_from_filepath(_row.get("filepath") or "")
             if _cand:
                 _root_votes[_cand] = _root_votes.get(_cand, 0) + 1
         if _root_votes:
             _ch_root = max(_root_votes.items(), key=lambda kv: kv[1])[0]
-        if _ch_root and os.path.isdir(_ch_root):
-            # Per-channel thumb index cache. The walk over a large
-            # channel root (with many year/month subdirs each
-            # holding a .Thumbnails) was the slowest step on
-            # first-click Browse — seconds on Z:\ DrivePool. Skip
-            # it entirely if the channel root mtime hasn't changed
-            # since our last successful walk.
-            try:
-                _ch_mtime = os.path.getmtime(_ch_root)
-            except OSError:
-                _ch_mtime = 0.0
-            _ch_root_key = os.path.normpath(_ch_root)
-            with _thumb_index_cache_lock:
-                _cached = _thumb_index_cache.get(_ch_root_key)
-                if _cached is not None:
-                    _thumb_index_cache.move_to_end(_ch_root_key)
-            if (_cached is not None
-                    and _ch_mtime > 0
-                    and _cached.get("mtime") == _ch_mtime):
-                _thumb_by_vid = dict(_cached.get("thumbs") or {})
-            else:
-                try:
-                    for _dp, _dns, _fns in os.walk(_ch_root):
-                        if os.path.basename(_dp) != ".Thumbnails":
-                            continue
-                        for _fn in _fns:
-                            _low = _fn.lower()
-                            if not _low.endswith(
-                                    (".jpg", ".jpeg", ".webp", ".png")):
-                                continue
-                            _m = _vid_re_local.search(_fn)
-                            if _m:
-                                _thumb_by_vid[_m.group(1)] = os.path.normpath(
-                                    os.path.join(_dp, _fn))
-                except OSError:
-                    pass
-                if _ch_mtime > 0:
-                    with _thumb_index_cache_lock:
-                        _thumb_index_cache_put(
-                            _ch_root_key,
-                            {"mtime": _ch_mtime,
-                             "thumbs": dict(_thumb_by_vid)})
+            _thumb_by_vid = _build_channel_thumb_index(
+                _ch_root, low_priority_busy_fn=low_priority_busy_fn)
 
     # Helper: parse yt-dlp's YYYYMMDD upload_date string into a Unix
     # epoch. Returns 0 on anything unparseable. The aggregated metadata
@@ -1786,7 +1836,9 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         except (ValueError, OSError):
             return 0.0
 
-    for row in out:
+    for i, row in enumerate(out):
+        if i % 25 == 0:
+            _raise_if_low_priority_busy(low_priority_busy_fn)
         fp = row.get("filepath") or ""
         vid_id = (row.get("video_id") or "").strip()
 
@@ -1828,43 +1880,23 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
 
         # View count: fetch from aggregated metadata when available
         if row.get("view_count") is not None:
-            try:
-                row["view_count"] = int(row.get("view_count") or 0)
-            except (TypeError, ValueError):
-                row["view_count"] = 0
-            try:
-                row["like_count"] = int(row.get("like_count") or 0)
-            except (TypeError, ValueError):
-                row["like_count"] = 0
-            v = row["view_count"]
-            if v >= 1_000_000:
-                row["views"] = f"{v/1_000_000:.1f}M"
-            elif v >= 1_000:
-                row["views"] = f"{v/1_000:.1f}K"
-            elif v > 0:
-                row["views"] = str(v)
+            row["view_count"] = _coerce_count(row.get("view_count"))
+            row["like_count"] = _coerce_count(row.get("like_count"))
+            views_label = _format_compact_count(row["view_count"])
+            if views_label:
+                row["views"] = views_label
         elif meta:
             # a corrupted JSONL entry with view_count="N/A"
             # would raise ValueError out of this cast and abort the
             # entire Browse grid render for the channel. Guard with
             # try/except and fall back to 0 so one bad row doesn't
             # hide all the others.
-            try:
-                row["view_count"] = int(meta.get("view_count") or 0)
-            except (TypeError, ValueError):
-                row["view_count"] = 0
-            try:
-                row["like_count"] = int(meta.get("like_count") or 0)
-            except (TypeError, ValueError):
-                row["like_count"] = 0
+            row["view_count"] = _coerce_count(meta.get("view_count"))
+            row["like_count"] = _coerce_count(meta.get("like_count"))
             # Surface as display "views" too
-            v = row["view_count"]
-            if v >= 1_000_000:
-                row["views"] = f"{v/1_000_000:.1f}M"
-            elif v >= 1_000:
-                row["views"] = f"{v/1_000:.1f}K"
-            elif v > 0:
-                row["views"] = str(v)
+            views_label = _format_compact_count(row["view_count"])
+            if views_label:
+                row["views"] = views_label
         if include_thumbs:
             tp = None
             _vid = (row.get("video_id") or "").strip()
@@ -2101,7 +2133,9 @@ _THUMB_VID_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
 _YEAR_DIR_RE = re.compile(r"^[12][0-9]{3}$")
 
 
-def _build_channel_thumb_index(ch_root: str) -> dict[str, str]:
+def _build_channel_thumb_index(
+        ch_root: str,
+        low_priority_busy_fn: Any | None = None) -> dict[str, str]:
     """Walk a channel root once and return ``{video_id: thumb_path}`` for
     every ``.Thumbnails/*[<id>].(jpg|jpeg|webp|png)`` anywhere beneath it.
 
@@ -2127,9 +2161,11 @@ def _build_channel_thumb_index(ch_root: str) -> dict[str, str]:
             _thumb_index_cache.move_to_end(key)
     if cached is not None and ch_mtime > 0 and cached.get("mtime") == ch_mtime:
         return dict(cached.get("thumbs") or {})
+    _raise_if_low_priority_busy(low_priority_busy_fn)
     thumbs: dict[str, str] = {}
     try:
         for _dp, _dns, _fns in os.walk(ch_root):
+            _raise_if_low_priority_busy(low_priority_busy_fn)
             if os.path.basename(_dp) != ".Thumbnails":
                 continue
             for _fn in _fns:
@@ -2464,9 +2500,9 @@ def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
                 d["uploaded"] = _dt.fromtimestamp(upts).strftime("%Y-%m-%d")
             except (OverflowError, OSError, ValueError):
                 pass
-        if vc:
-            d["views"] = (f"{vc/1_000_000:.1f}M" if vc >= 1_000_000
-                          else f"{vc/1_000:.1f}K" if vc >= 1_000 else str(vc))
+        views_label = _format_compact_count(vc)
+        if views_label:
+            d["views"] = views_label
         if include_thumbs and fp:
             try:
                 tp = find_thumbnail_channelwide(fp, vid)
@@ -2556,7 +2592,9 @@ def video_tx_status(video_id: str | None = None,
 
 
 def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
-                 title: str | None = None) -> list[dict[str, Any]]:
+                 title: str | None = None, channel: str | None = None,
+                 filepath: str | None = None,
+                 strict_identity: bool = False) -> list[dict[str, Any]]:
     """Return ordered segments for a video.
 
     Uses `_reader_open()` (lock-free reader connection) so the user's
@@ -2603,6 +2641,24 @@ def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
     # or return wrong segment results.
     with lock:
         _jp_from_canon = False
+        _file_video_id = ""
+        if filepath:
+            try:
+                from .text_utils import extract_video_id as _extract_vid
+                _file_video_id = _extract_vid(
+                    os.path.normpath(filepath),
+                    conn=conn,
+                    reject_alpha_only=True,
+                )
+            except Exception as e:
+                _log.debug("watch filepath id resolve failed: %s", e)
+            if _file_video_id:
+                if video_id and video_id != _file_video_id:
+                    _log.warning(
+                        "watch transcript id mismatch; using filepath id: "
+                        "payload=%s filepath=%s title=%r",
+                        video_id, _file_video_id, title)
+                video_id = _file_video_id
         # When the video_id resolves to no segments, fall back to matching
         # by title (the way get_segment_context / video_tx_status already do).
         # Legacy rows store video_id="" when the filename had no 11-char YT id
@@ -2626,11 +2682,21 @@ def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
                     # No segments carry this video_id -> match by title.
                     _match_by_title = True
                     try:
-                        tcanon = conn.execute(
-                            "SELECT jsonl_path FROM segments WHERE title=? "
-                            "GROUP BY jsonl_path ORDER BY MAX(id) DESC LIMIT 1",
-                            (title,)
-                        ).fetchone()
+                        if channel:
+                            tcanon = conn.execute(
+                                "SELECT jsonl_path FROM segments "
+                                "WHERE title=? AND channel=? COLLATE NOCASE "
+                                "GROUP BY jsonl_path "
+                                "ORDER BY MAX(id) DESC LIMIT 1",
+                                (title, channel),
+                            ).fetchone()
+                        else:
+                            tcanon = conn.execute(
+                                "SELECT jsonl_path FROM segments WHERE title=? "
+                                "GROUP BY jsonl_path "
+                                "ORDER BY MAX(id) DESC LIMIT 1",
+                                (title,),
+                            ).fetchone()
                         if tcanon and tcanon[0]:
                             jsonl_path = tcanon[0]
                             _jp_from_canon = True
@@ -2644,12 +2710,18 @@ def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
             where.append("video_id=?"); args.append(video_id)
         if _match_by_title and title:
             where.append("title=?"); args.append(title)
+            if channel:
+                where.append("channel=? COLLATE NOCASE")
+                args.append(channel)
         if jsonl_path:
             where.append("jsonl_path=?")
             args.append(jsonl_path if _jp_from_canon
                         else os.path.normpath(jsonl_path))
         if title and not where:
             where.append("title=?"); args.append(title)
+            if channel:
+                where.append("channel=? COLLATE NOCASE")
+                args.append(channel)
         if not where:
             return []
         # Use AND across multiple filters: when a caller passes both video_id
@@ -2657,13 +2729,38 @@ def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
         # we want segments that match BOTH, not segments matching either.
         # OR semantics would mash together segments from any video that shares
         # a jsonl_path (combined transcripts) with a different video_id.
-        q = ("SELECT start_time, end_time, text, words FROM segments "
+        q = ("SELECT start_time, end_time, text, words, title, channel "
+             "FROM segments "
              f"WHERE {' AND '.join(where)} ORDER BY start_time")
         cur = conn.execute(q, args)
         _rows = cur.fetchall()
+        if strict_identity and _rows:
+            try:
+                from .text_utils import normalize_title as _norm_title
+                _wanted_title = _norm_title(title or "")
+            except Exception:
+                _wanted_title = (title or "").strip().lower()
+                _norm_title = lambda s: (s or "").strip().lower()
+            _wanted_channel = (channel or "").strip().casefold()
+            _sample = _rows[:20]
+            if _wanted_title and not any(
+                    _norm_title(r[4] or "") == _wanted_title for r in _sample):
+                _log.warning(
+                    "refusing transcript rows with mismatched title: "
+                    "wanted=%r got=%r video_id=%r",
+                    title, _sample[0][4] if _sample else "", video_id)
+                _rows = []
+            if _rows and _wanted_channel and not any(
+                    (r[5] or "").strip().casefold() == _wanted_channel
+                    for r in _sample):
+                _log.warning(
+                    "refusing transcript rows with mismatched channel: "
+                    "wanted=%r got=%r video_id=%r",
+                    channel, _sample[0][5] if _sample else "", video_id)
+                _rows = []
     out = []
     import json as _j
-    for s, e, t, w in _rows:
+    for s, e, t, w, _title, _channel in _rows:
         try:
             words = _j.loads(w) if w else []
         except (json.JSONDecodeError, ValueError):

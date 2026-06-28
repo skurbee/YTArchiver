@@ -34,6 +34,7 @@ from urllib.parse import urlparse
 from .log import get_logger
 from .ytarchiver_config import (
     CHANNEL_DEFAULTS_ALL,
+    config_transaction,
     load_config,
     save_config,
 )
@@ -399,27 +400,28 @@ def add_channel(payload: dict[str, Any]) -> dict[str, Any]:
         raise SubsError(
             "Channel folder name could not be determined from the URL. "
             "Provide a folder name explicitly.")
-    cfg = load_config()
-    channels = cfg.setdefault("channels", [])
-    # Check dup by URL or folder name
-    if _find_channel(channels, {"url": new_ch["url"]}) is not None:
-        raise SubsError("A channel with that URL already exists.")
-    if _find_channel(channels, {"name": new_ch["name"]}) is not None:
-        raise SubsError("A channel with that folder name already exists.")
-    channels.append(new_ch)
-    # Sort alphabetically by name (matches YTArchiver's usual ordering)
-    channels.sort(key=lambda c: (c.get("name") or "").lower())
-    if not save_config(cfg):
-        # Save failed — roll back the in-memory append so the ghost
-        # channel can't be persisted later by an unrelated save_config
-        # call. Without this, the channel sits in cfg["channels"] in the
-        # process's load_config cache; the next legitimate save (e.g.
-        # window_state, settings) would commit it to disk silently.
-        try:
-            channels.remove(new_ch)
-        except ValueError:
-            pass
-        # Gated — return the proposed channel anyway so the UI can show it
+    # T123: run the dup-check + append + save as one atomic transaction so
+    # a concurrent worker save (e.g. a sync's last_sync write) can't load a
+    # stale snapshot mid-add and clobber the new channel (or vice versa).
+    try:
+        with config_transaction() as cfg:
+            channels = cfg.setdefault("channels", [])
+            # Check dup by URL or folder name
+            if _find_channel(channels, {"url": new_ch["url"]}) is not None:
+                raise SubsError("A channel with that URL already exists.")
+            if _find_channel(channels, {"name": new_ch["name"]}) is not None:
+                raise SubsError(
+                    "A channel with that folder name already exists.")
+            channels.append(new_ch)
+            # Sort alphabetically by name (matches YTArchiver's ordering)
+            channels.sort(key=lambda c: (c.get("name") or "").lower())
+    except SubsError:
+        raise
+    except OSError:
+        # config_transaction raises OSError when the atomic save fails
+        # (disk full, AV lock, write-gate). The transaction's cfg is a
+        # private deep copy that's now discarded, so there is no ghost
+        # channel to roll back — just report the write-block to the UI.
         return {**new_ch, "_write_blocked": True}
     return new_ch
 

@@ -599,7 +599,10 @@
               // Letting the backend resolve its own canonical jsonl_path
               // (as the channel-grid/bookmark paths do) fixes it.
               const res = await bridgeCall("browse_get_transcript", {
-                video_id: r.video_id, title: video.title || "",
+                video_id: r.video_id,
+                title: video.title || "",
+                channel: video.channel || r.channel || "",
+                filepath: video.filepath || "",
               });
               const segs = Array.isArray(res)
                 ? res

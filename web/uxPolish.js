@@ -50,18 +50,17 @@
     document.addEventListener("mouseover", (e) => {
       const el = e.target.closest("[title], [data-tooltip]");
       if (!el || el === currentEl) return;
-      // ALWAYS migrate any current `title` to `data-tooltip`. Earlier
-      // versions only migrated on first hover, but elements whose
-      // tooltip text changes dynamically (blink ticks rewriting
-      // pauseBtn.title every 700ms) re-added the title without going
-      // through the migration. Result: both the native browser
-      // tooltip AND our custom bubble showed at the same time —
-      // double popup. Migrating on every mouseover is cheap (a couple
-      // attribute reads + one write) and guarantees the browser
-      // tooltip never has a chance to fire.
+      // ALWAYS migrate any current `title` to `data-tooltip` and
+      // REMOVE the title attribute. Earlier versions only migrated on
+      // first hover, but elements whose tooltip text changes dynamically
+      // re-added the title without going through the migration. Result:
+      // both the native browser tooltip AND our custom bubble showed at
+      // the same time — double popup. Removing title guarantees the
+      // browser tooltip never fires.
       const titleAttr = el.getAttribute("title");
       if (titleAttr) {
         el.setAttribute("data-tooltip", titleAttr);
+        el.removeAttribute("title");
         if (!el.hasAttribute("aria-label") && !el.hasAttribute("aria-describedby")) {
           el.setAttribute("aria-label", titleAttr);
         }
@@ -102,6 +101,7 @@
       const titleAttr = el.getAttribute("title");
       if (titleAttr) {
         el.setAttribute("data-tooltip", titleAttr);
+        el.removeAttribute("title");
         if (!el.hasAttribute("aria-label") && !el.hasAttribute("aria-describedby")) {
           el.setAttribute("aria-label", titleAttr);
         }

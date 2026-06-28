@@ -8,7 +8,18 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import json
+import os
+import re
+import shutil
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List
+
+from ._shared import _api_err, webview, normalize_dialog_paths
+from backend.ytarchiver_config import CONFIG_FILE, config_is_writable, load_config, save_config
+from backend import subs as subs_backend
 
 
 _BACKUP_MANIFEST_NAME = "ytarchiver_backup_manifest.json"
@@ -138,7 +149,7 @@ class BackupMixin:
                 }, f, indent=2)
             return {"ok": True, "path": path, "count": len(cfg.get("channels", []))}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("BACKUP_WRITE_FAILED", str(e))
 
 
     def channels_import(self):
@@ -214,7 +225,7 @@ class BackupMixin:
                     "skipped": len(skipped_reasons),
                     "skipped_reasons": skipped_reasons}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("BACKUP_READ_FAILED", str(e))
 
 
     def export_full_backup(self):
@@ -343,12 +354,22 @@ class BackupMixin:
                 try: os.remove(tmp_path)
                 except OSError: pass
                 raise
-            _resp = {"ok": True, "path": out_path, "files": n}
+            # Record backup timestamp so Settings can show staleness (T295).
+            import time as _bk_time
+            _backup_ts = _bk_time.time()
+            try:
+                _c2 = load_config()
+                _c2["last_backup_ts"] = _backup_ts
+                save_config(_c2)
+            except Exception:
+                pass
+            _resp = {"ok": True, "path": out_path, "files": n,
+                     "last_backup_ts": _backup_ts}
             if _fts_skipped_reason:
                 _resp["fts_skipped"] = _fts_skipped_reason
             return _resp
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("BACKUP_WRITE_FAILED", str(e))
 
 
     def import_full_backup_preview(self):
@@ -433,7 +454,7 @@ class BackupMixin:
                                         "config_pre_restore_*.json"),
             }
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("BACKUP_READ_FAILED", str(e))
 
     @staticmethod
     def _fmt_bytes_short(b):
@@ -606,4 +627,4 @@ class BackupMixin:
                 "needs_restart": True,
             }
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("BACKUP_READ_FAILED", str(e))

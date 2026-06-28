@@ -295,6 +295,31 @@
     });
   }
 
+  function _snapIfFollowing(el) {
+    const st = scrollState.get(el) || {};
+    if (!st.userScrolled) el.scrollTop = el.scrollHeight;
+  }
+
+  function _insertTrimWarning(el) {
+    const existing = el.querySelector(".log-line.log-trim-warn");
+    if (existing) existing.remove();
+    const warn = buildLine([[
+      " \u26A0 Log trimmed \u2014 older lines removed to keep it scrollable.",
+      "dim",
+    ]]);
+    warn.classList.add("log-trim-warn");
+    el.insertBefore(warn, el.firstChild);
+  }
+
+  function _trimMainLog(el) {
+    const cap = 8000;
+    const keep = 5000;
+    if (el.childElementCount <= cap) return;
+    const toRemove = el.childElementCount - keep;
+    for (let i = 0; i < toRemove; i++) el.removeChild(el.firstChild);
+    _insertTrimWarning(el);
+  }
+
   // ─── Public API ──────────────────────────────────────────────────────
 
   /** Build one grid-aligned activity-log row.
@@ -540,16 +565,7 @@
     // after long sessions, leaving same-color rows adjacent. Compute
     // parity from the actual prior row in the DOM each append.
     _applyActivityParity(row, row.previousElementSibling);
-    const cap = 30000, keep = 25000;
-    if (el.childElementCount > cap) {
-      let toRemove = el.childElementCount - keep;
-      // Remove an EVEN number so zebra-stripe parity never shifts on the kept
-      // rows — then we never need the O(n) re-stripe walk over ~25k rows that
-      // used to stall the main thread on ~every other trim under heavy
-      // overnight log throughput (audit r2 / logs.js C30).
-      if (toRemove % 2 === 1) toRemove++;
-      for (let i = 0; i < toRemove; i++) el.removeChild(el.firstChild);
-    }
+    _trimActivityLog(el);
     maybeSnapToBottom(el);
   };
 
@@ -677,29 +693,7 @@
     if (!el) return;
     wireUserScrollDetection(el);
     el.appendChild(buildLine(segments));
-    // Trim if we get ridiculous (tkinter caps ~8000 lines). keep=5000
-    // gives 3000 lines of growth headroom before the next trim fires,
-    // preventing the "⚠ Log trimmed" warning from chattering every
-    // few seconds during heavy sync output (at keep=6000 the next
-    // 2001 lines triggered another trim visibly often).
-    const cap = 8000;
-    const keep = 5000;
-    if (el.childElementCount > cap) {
-      const toRemove = el.childElementCount - keep;
-      for (let i = 0; i < toRemove; i++) el.removeChild(el.firstChild);
-      // Drop a one-time warning at the top of the new log window so the
-      // user knows older lines got trimmed. Matches YTArchiver.py:1222
-      // inline trim marker. Re-emits periodically if trimming continues.
-      const existing = el.querySelector(".log-line.log-trim-warn");
-      if (existing) existing.remove();
-      // dropped the trailing \n — buildLine emits a <div>
-      // per segment and the literal \n was just noise in the cell
-      // (collapsed to whitespace by the default white-space rules,
-      // but still inflated the character count of this one entry).
-      const warn = buildLine([[" \u26A0 Log trimmed \u2014 older lines removed to keep it scrollable.", "dim"]]);
-      warn.classList.add("log-trim-warn");
-      el.insertBefore(warn, el.firstChild);
-    }
+    _trimMainLog(el);
     maybeSnapToBottom(el);
     mirrorMiniLogs();
   };
@@ -914,24 +908,9 @@
             for (const _p of _pinned) el.appendChild(_p);
           }
         }
-        // Same scroll-freeze / trim behavior as appendMainLog
-        const cap = 8000, keep = 5000;
-        if (el.childElementCount > cap) {
-          const toRemove = el.childElementCount - keep;
-          for (let i = 0; i < toRemove; i++) el.removeChild(el.firstChild);
-          // Inline trim warning, same pattern as appendMainLog.
-          const existing = el.querySelector(".log-line.log-trim-warn");
-          if (existing) existing.remove();
-          // dropped the trailing \n — buildLine emits a <div>
-      // per segment and the literal \n was just noise in the cell
-      // (collapsed to whitespace by the default white-space rules,
-      // but still inflated the character count of this one entry).
-      const warn = buildLine([[" \u26A0 Log trimmed \u2014 older lines removed to keep it scrollable.", "dim"]]);
-          warn.classList.add("log-trim-warn");
-          el.insertBefore(warn, el.firstChild);
-        }
-        const st = scrollState.get(el) || {};
-        if (!st.userScrolled) el.scrollTop = el.scrollHeight;
+        // Same scroll-freeze / trim behavior as appendMainLog.
+        _trimMainLog(el);
+        _snapIfFollowing(el);
         // Mirror the last N main-log lines into every mini log (Subs / Browse
         // / Recent / Settings). One snapshot per batch — not per line —
         // so mini logs track main exactly.
@@ -1003,8 +982,7 @@
         }
         el.appendChild(frag);
         _trimActivityLog(el);
-        const st = scrollState.get(el) || {};
-        if (!st.userScrolled) el.scrollTop = el.scrollHeight;
+        _snapIfFollowing(el);
       }
     }
   };

@@ -786,11 +786,14 @@
             </div>
 
             <label class="edit-gl">Full backup</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <button class="btn btn-ghost btn-thin" id="btn-export-backup"
-                      title="Save config + queue state + all journals to a zip">Export&hellip;</button>
-              <button class="btn btn-ghost btn-thin" id="btn-import-backup"
-                      title="Restore a backup zip (snapshots current config first)">Restore&hellip;</button>
+            <div class="edit-gv-stack">
+              <div class="edit-gv-inline edit-gap-6">
+                <button class="btn btn-ghost btn-thin" id="btn-export-backup"
+                        title="Save config + queue state + all journals to a zip">Export&hellip;</button>
+                <button class="btn btn-ghost btn-thin" id="btn-import-backup"
+                        title="Restore a backup zip (snapshots current config first)">Restore&hellip;</button>
+              </div>
+              <span id="backup-age-display" style="font-size:11px;color:var(--c-dim);line-height:1.4"></span>
             </div>
 
             <!-- "Metadata (all channels)" row removed &mdash; a dedicated

@@ -8,7 +8,18 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import os
+import re
+import subprocess
+import threading
+import time
+
+from ._shared import _api_err, _log
+from backend.log import swallow
+from backend.ytarchiver_config import load_config
+from backend import subs as subs_backend
+from backend import sync as sync_backend
+from backend.queues import QueueState
 
 
 class SyncMixin:
@@ -160,7 +171,7 @@ class SyncMixin:
         # still True, the Pause button flipped to "Resume", and clicking
         # it fired `queue_resume` with no effect. Clear both.
         try: self._queues.set_sync_paused(False)
-        except Exception as e: _log.debug("swallowed: %s", e)
+        except Exception as e: _log.warning("sync start: could not clear sync_paused flag; Pause button may show stale state: %s", e)
         # Starting sync implies "resume all work" — clear the GPU pause
         # flag too so transcribe jobs dispatched from this pass actually
         # process instead of piling up behind a stale paused flag left
@@ -168,7 +179,7 @@ class SyncMixin:
         try:
             self._queues.set_gpu_paused(False)
             self._transcribe.resume()
-        except Exception as e: _log.debug("swallowed: %s", e)
+        except Exception as e: _log.warning("sync start: could not clear GPU paused flag; transcribe jobs may stall: %s", e)
         # Start tray icon spin animation so the user can see sync is live
         # even when the window is minimized. Matches YTArchiver.py:3526
         # _tray_start_spin(red=False).
@@ -213,13 +224,13 @@ class SyncMixin:
                 # `_schedule_autorun(iv)` inside the sync finally
                 # (YTArchiver.py:23380).
                 try: self._autorun.notify_sync_done()
-                except Exception as e: _log.debug("swallowed: %s", e)
+                except Exception as e: _log.warning("notify_sync_done failed; autorun countdown may not reset: %s", e)
                 # Refresh the in-memory config snapshot so consumers that
                 # read self._config (Last Full Sync label, channel
                 # listing, etc.) see the new last_sync timestamp + any
                 # initialized/sync_complete flags the sync just wrote.
                 try: self._reload_config()
-                except Exception as e: _log.debug("swallowed: %s", e)
+                except Exception as e: _log.warning("post-sync config reload failed; Last Full Sync label may be stale: %s", e)
                 # Push the new "Last Full Sync" label to the UI now,
                 # not 60 seconds later when the JS tick happens to fire.
                 try:
@@ -269,7 +280,7 @@ class SyncMixin:
                         self.chan_redownload(ch, new_res,
                                              scope=first.get("scope"))
                     except Exception as e:
-                        _log.debug("swallowed: %s", e)
+                        _log.warning("post-sync redownload drain failed for queued channel: %s", e)
                 try: threading.Timer(0.6, _maybe_drain_redwnl).start()
                 except Exception as e: _log.debug("swallowed: %s", e)
                 # Scheduled second push AFTER this thread's finally
@@ -355,8 +366,12 @@ class SyncMixin:
                 self._redwnl_cancel.set()
         except Exception as e:
             _log.debug("swallowed: %s", e)
+        # Report whether a channel was actively running so the UI can
+        # show clearer feedback ("stopping current download" vs "nothing
+        # was queued").
+        _was_running = bool(self._queues.current_sync)
         self._on_queue_changed()
-        return {"ok": True, "removed": removed}
+        return {"ok": True, "removed": removed, "running": _was_running}
 
 
     def sync_force_stop(self):
@@ -507,7 +522,7 @@ class SyncMixin:
             return {"ok": True, "queued": queued,
                     "skipped": skipped, "total_queued": total_queued}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("INTERNAL_ERROR", str(e))
 
 
     def sync_prefetch_channel(self, identity):
@@ -555,16 +570,13 @@ class SyncMixin:
     def sync_skip_current(self):
         """Skip the currently-running sync item and advance to the next.
 
-        Sets a skip flag that the sync loop polls on each channel iteration,
-        and also sets the cancel event so the in-flight yt-dlp subprocess for
-        the current channel terminates promptly. The sync worker then clears
-        the cancel event and moves on to the next channel.
+        Sets _sync_skip only. sync_all passes _sync_skip as `kill_current`
+        to sync_channel, which terminates the in-flight yt-dlp subprocess
+        when it sees the flag — no longer overloading _sync_cancel, so a
+        rapid Skip+Cancel sequence can't swallow the Cancel.
         """
         try:
             self._sync_skip.set()
-            # Kill the current yt-dlp process cleanly — the sync loop sees
-            # the skip flag and clears the cancel event before the next one.
-            self._sync_cancel.set()
             self._log_stream.emit([
                 ["[Sync] ", "sync_bracket"],
                 ["Skip current channel \u2014 moving on\n", "simpleline"],
@@ -572,7 +584,7 @@ class SyncMixin:
             self._log_stream.flush()
             return {"ok": True}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("INTERNAL_ERROR", str(e))
 
 
     def gpu_skip_current(self):
@@ -615,7 +627,7 @@ class SyncMixin:
             self._log_stream.flush()
             return {"ok": True}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("INTERNAL_ERROR", str(e))
 
 
     def sync_defer_current(self):
@@ -655,7 +667,7 @@ class SyncMixin:
             # Now skip the in-flight run so the next queued item starts.
             return self.sync_skip_current()
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("INTERNAL_ERROR", str(e))
 
 
     def gpu_defer_current(self):
@@ -684,7 +696,7 @@ class SyncMixin:
                 ])
             return self.gpu_skip_current()
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("INTERNAL_ERROR", str(e))
 
 
     def sync_one_channel(self, identity):

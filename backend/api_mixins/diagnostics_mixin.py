@@ -8,7 +8,16 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import json
+import os
+import shutil
+import subprocess
+import threading
+import urllib.request
+
+from ._shared import _log, webview
+from backend.ytarchiver_config import CONFIG_FILE, config_is_writable, load_config
+from backend.version import APP_VERSION
 
 
 class DiagnosticsMixin:

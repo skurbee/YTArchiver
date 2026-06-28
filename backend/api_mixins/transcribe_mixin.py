@@ -2,18 +2,52 @@
 TranscribeMixin — extracted from the main Api class for browsability.
 
 Methods in this mixin are mixed into the Api class via multiple
-inheritance. They reference `self.<state>` which still resolves
-to the Api instance at runtime — no body changes were made
-when moving them out of main.py.
+inheritance. They prefer AppServices when present, with legacy
+private Api attributes kept as fallback state.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import json
+import os
+import re
+import threading
+import time
+from pathlib import Path
+
+from ._shared import _api_err, _log, webview
+from backend.ytarchiver_config import load_config
 
 _TRANSCRIBE_FOLDER_MAX_CANDIDATES = 500
 
 
 class TranscribeMixin:
+    def _transcribe_services(self):
+        return getattr(self, "services", None)
+
+    def _transcribe_manager(self):
+        services = self._transcribe_services()
+        mgr = (getattr(services, "transcribe", None)
+               if services is not None else None)
+        return mgr if mgr is not None else self._transcribe
+
+    def _transcribe_log_stream(self):
+        services = self._transcribe_services()
+        stream = (getattr(services, "log_stream", None)
+                  if services is not None else None)
+        return stream if stream is not None else self._log_stream
+
+    def _transcribe_config(self):
+        services = self._transcribe_services()
+        if services is not None:
+            return services.fresh_config()
+        return load_config()
+
+    def _transcribe_save_config(self, cfg):
+        services = self._transcribe_services()
+        if services is not None:
+            return services.save_config(cfg)
+        from backend.ytarchiver_config import save_config as _save_config
+        return _save_config(cfg)
 
     # ─── Transcribe ─────────────────────────────────────────────────────
 
@@ -25,7 +59,7 @@ class TranscribeMixin:
             return {"ok": True}
         if model not in self._WHISPER_MODELS:
             return {"ok": False, "error": "Unsupported model"}
-        if not self._transcribe.swap_model(model):
+        if not self._transcribe_manager().swap_model(model):
             return {"ok": False, "error": "Model swap failed"}
         return {"ok": True}
 
@@ -59,13 +93,14 @@ class TranscribeMixin:
         if not model_result.get("ok"):
             return model_result
         try:
-            ok = self._transcribe.enqueue(path, title, channel=_channel)
+            ok = self._transcribe_manager().enqueue(
+                path, title, channel=_channel)
         except Exception as _e:
             # surface the error instead of the silent
             # {ok: False} that the old code returned. Caller can
             # toast the actual reason (file not found, no whisper
             # worker, etc.) rather than a generic failure.
-            return {"ok": False, "error": str(_e)}
+            return _api_err("TRANSCRIBE_FAILED", str(_e))
         # audit L-13/L-14: nudge the UI queue popover so freshly-
         # enqueued items show up immediately instead of waiting for
         # the next automatic poll (~500ms).
@@ -97,13 +132,15 @@ class TranscribeMixin:
             return model_result
 
         def _run():
+            log_stream = self._transcribe_log_stream()
+            transcribe_mgr = self._transcribe_manager()
             try:
                 import webview as _wv
                 paths = self._window.create_file_dialog(_wv.FOLDER_DIALOG)
             except Exception as e:
-                self._log_stream.emit_error(
+                log_stream.emit_error(
                     f"[GPU] transcribe_folder dialog failed: {e}")
-                self._log_stream.flush()
+                log_stream.flush()
                 return
             if not paths:
                 return  # user cancelled
@@ -197,11 +234,11 @@ class TranscribeMixin:
                 if too_many:
                     break
             if too_many:
-                self._log_stream.emit_error(
+                log_stream.emit_error(
                     "[GPU] Transcribe folder aborted: found more than "
                     f"{_TRANSCRIBE_FOLDER_MAX_CANDIDATES} media files in "
                     f"{os.path.basename(folder) or folder}. Choose a narrower folder.")
-                self._log_stream.flush()
+                log_stream.flush()
                 return
 
             for video, title in candidates:
@@ -209,18 +246,18 @@ class TranscribeMixin:
                 if _already_done(video, title, _ch):
                     skipped += 1
                     continue
-                self._transcribe.enqueue(video, title, channel=_ch)
+                transcribe_mgr.enqueue(video, title, channel=_ch)
                 queued += 1
             try:
                 self._on_queue_changed()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-            self._log_stream.emit([
+            log_stream.emit([
                 ["[GPU] ", "trans_bracket"],
                 [f"Transcribe folder \u2014 {os.path.basename(folder)}: ", "simpleline_blue"],
                 [f"{queued} queued, {skipped} already done\n", "simpleline"],
             ])
-            self._log_stream.flush()
+            log_stream.flush()
         threading.Thread(target=_run, daemon=True,
                          name="transcribe-folder-dialog").start()
         return {"ok": True, "started": True}
@@ -250,7 +287,7 @@ class TranscribeMixin:
         """
         if not path or not os.path.isfile(path):
             try:
-                self._log_stream.emit_text(
+                self._transcribe_log_stream().emit_text(
                     f" — Re-transcribe rejected: file not found — "
                     f"{title or path}", "red")
             except Exception:
@@ -263,7 +300,7 @@ class TranscribeMixin:
                        ".avi", ".mp3", ".wav", ".flac", ".m4v", ".wmv")
         if not path.lower().endswith(_MEDIA_EXTS):
             try:
-                self._log_stream.emit_text(
+                self._transcribe_log_stream().emit_text(
                     f" — Re-transcribe rejected: not a media file — "
                     f"{title or path}", "red")
             except Exception:
@@ -347,7 +384,7 @@ class TranscribeMixin:
                     _on_complete_extra(_result)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-        ok = self._transcribe.enqueue(
+        ok = self._transcribe_manager().enqueue(
             path,
             title or os.path.basename(os.path.splitext(path)[0]),
             channel=channel_name,
@@ -373,7 +410,7 @@ class TranscribeMixin:
             try:
                 _disp = title or os.path.basename(path)
                 _ch = f" ({channel_name})" if channel_name else ""
-                self._log_stream.emit_text(
+                self._transcribe_log_stream().emit_text(
                     f" — Queued re-transcribe: {_disp}{_ch}",
                     "simpleline_blue")
             except Exception:
@@ -382,11 +419,11 @@ class TranscribeMixin:
 
 
     def transcribe_queue_size(self):
-        return {"size": self._transcribe.queue_size()}
+        return {"size": self._transcribe_manager().queue_size()}
 
 
     def transcribe_cancel_all(self):
-        self._transcribe.cancel_all()
+        self._transcribe_manager().cancel_all()
         return {"ok": True}
 
 
@@ -399,13 +436,14 @@ class TranscribeMixin:
         _cached = getattr(self, "_worker_script_exists_cached", None)
         if _cached is None:
             try:
-                _cached = bool(self._transcribe._worker_script.exists())
+                _cached = bool(
+                    self._transcribe_manager()._worker_script.exists())
             except Exception:
                 _cached = False
             self._worker_script_exists_cached = _cached
         return {
-            "ok": self._transcribe.is_available(),
-            "python311": self._transcribe._python311,
+            "ok": self._transcribe_manager().is_available(),
+            "python311": self._transcribe_manager()._python311,
             "worker_script_exists": _cached,
         }
 
@@ -426,7 +464,7 @@ class TranscribeMixin:
         """
         if not new_model or new_model not in ("tiny", "small", "medium", "large-v3"):
             return {"ok": False, "error": "Unsupported model"}
-        ok = self._transcribe.swap_model(new_model)
+        ok = self._transcribe_manager().swap_model(new_model)
         persisted = False
         if ok and persist:
             # Acquire the same settings_save lock so a parallel
@@ -439,17 +477,16 @@ class TranscribeMixin:
             except Exception:
                 _lock = None
             try:
-                from backend.ytarchiver_config import save_config as _sc
                 saved = False
                 if _lock is not None:
                     with _lock:
-                        cfg = load_config()
+                        cfg = self._transcribe_config()
                         cfg["whisper_model"] = new_model
-                        saved = bool(_sc(cfg))
+                        saved = bool(self._transcribe_save_config(cfg))
                 else:
-                    cfg = load_config()
+                    cfg = self._transcribe_config()
                     cfg["whisper_model"] = new_model
-                    saved = bool(_sc(cfg))
+                    saved = bool(self._transcribe_save_config(cfg))
                 if saved:
                     self._reload_config()
                     persisted = True
@@ -460,4 +497,4 @@ class TranscribeMixin:
 
     def transcribe_current_model(self):
         """Return the model the transcribe manager will use for the next job."""
-        return {"model": self._transcribe.current_model()}
+        return {"model": self._transcribe_manager().current_model()}

@@ -29,7 +29,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from .log import get_logger
+from .log import get_logger, swallow
 from .ytarchiver_config import QUEUE_FILE, config_is_writable
 
 _log = get_logger(__name__)
@@ -138,7 +138,7 @@ class QueueState:
             import atexit as _atx
             _atx.register(self._atexit_flush)
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("atexit flush registration", e)
 
     def mark_orphan(self) -> None:
         """Caller-side signal that this QueueState should stop background work.
@@ -192,7 +192,7 @@ class QueueState:
                     self._notify_thread.start()
                 self._notify_cond.notify_all()
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("queue notify-thread start", e)
 
     def _notify_loop(self):
         while True:
@@ -209,7 +209,7 @@ class QueueState:
                 try:
                     fn()
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    swallow("queue change-listener callback", e)
 
     # ── load/save ────────────────────────────────────────────────────
 
@@ -459,7 +459,7 @@ class QueueState:
                 self._save_cond.notify_all()
             self.save_now()
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("atexit queue flush", e)
 
     # ── sync queue ──────────────────────────────────────────────────
 
@@ -686,6 +686,29 @@ class QueueState:
             if not self.gpu:
                 return None
             it = self.gpu.pop(0)
+        self._notify()
+        self.save_debounced()
+        return it
+
+    def gpu_pop_matching(self, expected_path: str = "",
+                         expected_bulk_id: str = "") -> dict[str, Any] | None:
+        """Pop the queued GPU row matching the job that actually started."""
+        ep = str(expected_path or "").strip()
+        eb = str(expected_bulk_id or "").strip()
+        with self._lock:
+            if not self.gpu:
+                return None
+            target_idx = -1
+            if ep or eb:
+                for i, item in enumerate(self.gpu):
+                    cur_path = (item.get("path") or "").strip()
+                    cur_bulk = str(item.get("bulk_id") or "").strip()
+                    if (ep and cur_path == ep) or (eb and cur_bulk == eb):
+                        target_idx = i
+                        break
+            if target_idx < 0:
+                target_idx = 0
+            it = self.gpu.pop(target_idx)
         self._notify()
         self.save_debounced()
         return it

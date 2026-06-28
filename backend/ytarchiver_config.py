@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .log import get_logger
+from .log import get_logger, swallow
 
 _log = get_logger(__name__)
 
@@ -93,6 +93,9 @@ DEFAULT_CONFIG = {
     # Timestamp of the last completed disk walk — compared against
     # disk_scan_staleness_hours to decide whether to skip on next boot.
     "last_disk_scan_ts": 0.0,
+    # Timestamp of the last successful full backup export (epoch float).
+    # Surfaced in Settings so the user knows how stale their backup is.
+    "last_backup_ts": 0.0,
 }
 
 _config_lock = threading.RLock()  # reentrant so nested
@@ -110,6 +113,7 @@ _config_lock = threading.RLock()  # reentrant so nested
 # `config_transaction()` context manager below wraps both operations
 # under one lock acquisition so RMW is genuinely atomic.
 _config_tx_lock = threading.RLock()
+_in_tx = threading.local()  # .active set True for the duration of a config_transaction
 
 # periodic backup trigger. Writes a dated snapshot every
 # _BACKUP_EVERY_N_SAVES save_config() calls so recovery windows are
@@ -332,18 +336,23 @@ def load_config() -> dict[str, Any]:
             _candidate = copy.deepcopy(merged)
             _migrate_pending_tx_ids(_candidate)
             _candidate["_migration_v2_pending_tx_ids"] = True
-            try:
-                if save_config(_candidate):
-                    # Only adopt the migrated state into `merged` after
-                    # the save lands on disk. Now in-memory and on-disk
-                    # agree, so subsequent saves can't silently lose
-                    # the migration flag.
-                    merged = _candidate
-                else:
-                    _log.warning(
-                        "migration save failed; will retry next launch")
-            except Exception as _me:
-                _log.error("migration save exception: %s", _me)
+            if getattr(_in_tx, 'active', False):
+                # Inside a config_transaction: adopt migrated state now;
+                # the outer transaction's exit-save will persist it.
+                merged = _candidate
+            else:
+                try:
+                    if save_config(_candidate):
+                        # Only adopt the migrated state into `merged` after
+                        # the save lands on disk. Now in-memory and on-disk
+                        # agree, so subsequent saves can't silently lose
+                        # the migration flag.
+                        merged = _candidate
+                    else:
+                        _log.warning(
+                            "migration save failed; will retry next launch")
+                except Exception as _me:
+                    _log.error("migration save exception: %s", _me)
         with _config_lock:
             _cache_config(sig, merged)
         return copy.deepcopy(merged)
@@ -383,20 +392,24 @@ def load_config() -> dict[str, Any]:
                         # defaults at the top of this function, and the
                         # first save_config from any caller would
                         # permanently commit the wiped state.
-                        try:
-                            if save_config(merged):
-                                _log.warning(
-                                    "recovered config persisted back "
-                                    "to %s", CONFIG_FILE.name)
-                            else:
+                        # Skip the extra save if we're already inside a
+                        # config_transaction — its exit-save handles it,
+                        # avoiding a double-write mid-transaction.
+                        if not getattr(_in_tx, 'active', False):
+                            try:
+                                if save_config(merged):
+                                    _log.warning(
+                                        "recovered config persisted back "
+                                        "to %s", CONFIG_FILE.name)
+                                else:
+                                    _log.error(
+                                        "recovered config could NOT be "
+                                        "persisted — restore %s manually "
+                                        "from backups/ before changing any "
+                                        "settings", CONFIG_FILE)
+                            except Exception as _pe:
                                 _log.error(
-                                    "recovered config could NOT be "
-                                    "persisted — restore %s manually "
-                                    "from backups/ before changing any "
-                                    "settings", CONFIG_FILE)
-                        except Exception as _pe:
-                            _log.error(
-                                "recovered-config save failed: %s", _pe)
+                                    "recovered-config save failed: %s", _pe)
                         return merged
                     except (json.JSONDecodeError, OSError):
                         continue
@@ -430,9 +443,10 @@ def config_transaction():
     save is skipped (best-effort: the on-disk file is unchanged).
 
     The underlying _config_tx_lock is reentrant (RLock) so nested
-    transactions don't deadlock — but the inner transaction will see
-    the outer's mutations and its save fires when IT exits, not when
-    the outer exits.
+    transactions don't deadlock. _in_tx.active is set for the duration so
+    load_config's internal migration/recovery saves are suppressed — the
+    outer transaction's exit-save handles persistence instead, preventing
+    a double-write that could snapshot an intermediate state.
 
     Holds _config_lock for the WHOLE block (load + mutate + save) too, so a
     plain save_config() from another thread is excluded for the transaction's
@@ -442,24 +456,32 @@ def config_transaction():
     save_config re-acquire _config_lock reentrantly. Keep transaction blocks
     short — they run while holding _config_lock.
     """
-    with _config_tx_lock, _config_lock:
-        cfg = load_config()
-        try:
-            yield cfg
-        except Exception:
-            # Don't persist partial mutations — re-raise to caller.
-            raise
-        else:
-            # Raise on save failure so the caller can react. Previously
-            # a failed save (disk full, antivirus lock) was swallowed
-            # — the caller's transaction succeeded silently in memory
-            # but never landed on disk, and a later load would return
-            # the stale state with no signal that the mutation was
-            # lost.
-            if not save_config(cfg):
-                raise OSError(
-                    "config_transaction: save_config returned False — "
-                    "mutation not persisted; check log for details")
+    _was_in_tx = getattr(_in_tx, 'active', False)
+    _in_tx.active = True
+    try:
+        with _config_tx_lock, _config_lock:
+            cfg = load_config()
+            try:
+                yield cfg
+            except Exception:
+                # Don't persist partial mutations — re-raise to caller.
+                raise
+            else:
+                if _was_in_tx:
+                    # Nested call: outer transaction's exit-save handles it.
+                    return
+                # Raise on save failure so the caller can react. Previously
+                # a failed save (disk full, antivirus lock) was swallowed
+                # — the caller's transaction succeeded silently in memory
+                # but never landed on disk, and a later load would return
+                # the stale state with no signal that the mutation was
+                # lost.
+                if not save_config(cfg):
+                    raise OSError(
+                        "config_transaction: save_config returned False — "
+                        "mutation not persisted; check log for details")
+    finally:
+        _in_tx.active = _was_in_tx
 
 
 def config_file_exists() -> bool:
@@ -550,7 +572,7 @@ def save_config(cfg: dict[str, Any]) -> bool:
                 cfg_for_write = dict(cfg)
                 cfg_for_write["autorun_history"] = _hist[-10000:]
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("autorun-history trim", e)
         with _config_lock:
             # Write-via-temp for atomicity (matches tkinter app's save_config)
             # Wrap both paths with _long_path so an OneDrive-redirected
@@ -606,7 +628,7 @@ def save_config(cfg: dict[str, Any]) -> bool:
                     finally:
                         os.close(_dfd)
                 except OSError as e:
-                    _log.debug("swallowed: %s", e)
+                    swallow("config fsync", e)
             _cache_config(_config_file_sig(), cfg_for_write)
             _save_counter += 1
             if _save_counter >= _BACKUP_EVERY_N_SAVES:
@@ -618,7 +640,7 @@ def save_config(cfg: dict[str, Any]) -> bool:
             try:
                 backup_config_on_start(keep=20)
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                swallow("config backup-on-save", e)
         return True
     except OSError as e:
         _log.error("failed to save: %s", e)
@@ -782,7 +804,7 @@ def channels_for_subs_ui(cfg: dict[str, Any]):
                         _pending_redwnl_res = (
                             _data.get("resolution") or "").strip()
                     except Exception as e:
-                        _log.debug("swallowed: %s", e)
+                        swallow("pending-redownload resolution read", e)
             except Exception:
                 _pending_redwnl = False
 
@@ -931,7 +953,7 @@ def recent_for_ui(cfg: dict[str, Any]):
                 if tp:
                     thumbnail_url = _thumb_url(tp)
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                swallow("thumbnail URL lookup", e)
 
         # size_bytes — raw int for the grid meta line (also used by the JS
         # `_fmtBytes` helper if it wants to re-format).

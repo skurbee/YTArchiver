@@ -8,7 +8,17 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import json
+import os
+import re
+import threading
+import time
+from typing import Any, Dict
+
+from ._shared import _api_err, _log
+from backend.ytarchiver_config import load_config
+from backend import archive_scan
+from backend import subs as subs_backend
 
 
 class MetadataMixin:
@@ -187,7 +197,7 @@ class MetadataMixin:
         try:
             self._queues.sync_enqueue(task)
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("METADATA_FAILED", str(e))
         self._on_queue_changed()
         label = "refresh" if refresh else "download"
         ch_name = ch.get("name") or ch.get("folder", "")
@@ -370,7 +380,7 @@ class MetadataMixin:
         try:
             self._queues.sync_enqueue(task)
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("METADATA_FAILED", str(e))
         self._on_queue_changed()
         started = self._maybe_autostart_sync()
         return {"ok": True, "queued": True, "started": started,
@@ -455,7 +465,7 @@ class MetadataMixin:
         try:
             self._queues.sync_enqueue(task)
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("METADATA_FAILED", str(e))
         self._on_queue_changed()
         # No "Queued ..." log line — the pass-starting banner
         # emitted by sync.py already states the action, so an
@@ -501,7 +511,7 @@ class MetadataMixin:
         try:
             self._queues.sync_enqueue(task)
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("METADATA_FAILED", str(e))
         self._on_queue_changed()
         ch_name = ch.get("name") or ch.get("folder", "")
         scope_str = (f" (last {task['only_recent_days']}d)"

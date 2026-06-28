@@ -30,6 +30,7 @@ re-runnable and never raise to the caller (they return {"ok": bool, ...}).
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -54,6 +55,37 @@ _PY311_VERSION = "3.11.9"
 _PY311_URL = f"https://www.python.org/ftp/python/{_PY311_VERSION}/python-{_PY311_VERSION}-amd64.exe"
 # torch CUDA wheel index (cu121 covers modern NVIDIA drivers); CPU uses PyPI.
 _TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu121"
+
+
+# ── integrity helpers ────────────────────────────────────────────────────
+def _fetch_text(url: str, timeout: int = 30) -> str:
+    """Fetch a small text resource (checksums, manifests). Raises on failure."""
+    req = urllib.request.Request(url, headers={"User-Agent": "YTArchiver-Setup"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(1 << 20).decode("utf-8", errors="replace")
+
+
+def _verify_sha256(path: Path, expected_hex: str) -> None:
+    """Verify *path* SHA-256 matches *expected_hex*.
+
+    Deletes the file and raises RuntimeError on mismatch so the caller can
+    return {"ok": False, "integrity_error": True} rather than executing a
+    potentially tampered artifact.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    actual = h.hexdigest().lower()
+    if actual != expected_hex.lower():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"integrity check failed for {path.name}: "
+            f"expected {expected_hex[:16]}…, got {actual[:16]}…"
+        )
 
 
 # ── small helpers ─────────────────────────────────────────────────────────
@@ -306,8 +338,30 @@ def install_ytdlp(progress: Progress | None = None, force: bool = False) -> dict
     dest = managed_bin_dir() / "yt-dlp.exe"
     try:
         _download(_YTDLP_URL, dest, progress, "ytdlp", "yt-dlp")
+        # Verify against the SHA2-256SUMS file published alongside each release.
+        _emit(progress, "ytdlp", "Verifying yt-dlp integrity…", None)
+        try:
+            sums_url = _YTDLP_URL.replace("/yt-dlp.exe", "/SHA2-256SUMS")
+            sums_text = _fetch_text(sums_url)
+            expected = None
+            for line in sums_text.splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1].lower() == "yt-dlp.exe":
+                    expected = parts[0]
+                    break
+            if expected:
+                _verify_sha256(dest, expected)  # deletes + raises on mismatch
+            else:
+                _log.warning("SHA2-256SUMS has no yt-dlp.exe entry; skipping hash check")
+        except RuntimeError:
+            raise  # integrity mismatch — propagate to outer handler
+        except Exception as e:
+            _log.warning("yt-dlp hash check unavailable (%s); continuing", e)
         _emit(progress, "ytdlp", "yt-dlp installed.", 100, "ok")
         return {"ok": True, "path": str(dest)}
+    except RuntimeError as e:
+        _emit(progress, "ytdlp", f"yt-dlp integrity check failed: {e}", status="error")
+        return {"ok": False, "error": str(e), "integrity_error": True}
     except Exception as e:
         _log.warning("yt-dlp install failed: %s", e)
         _emit(progress, "ytdlp", f"yt-dlp download failed: {e}", status="error")
@@ -325,6 +379,19 @@ def install_ffmpeg(progress: Progress | None = None, force: bool = False) -> dic
     zip_path = bin_dir / "_ffmpeg_dl.zip"
     try:
         _download(_FFMPEG_ZIP_URL, zip_path, progress, "ffmpeg", "ffmpeg")
+        # Verify against gyan.dev's published .sha256 sidecar before extraction.
+        _emit(progress, "ffmpeg", "Verifying ffmpeg integrity…", None)
+        try:
+            sha_text = _fetch_text(_FFMPEG_ZIP_URL + ".sha256")
+            token = sha_text.split()[0] if sha_text.strip() else ""
+            if len(token) == 64 and all(c in "0123456789abcdef" for c in token.lower()):
+                _verify_sha256(zip_path, token)  # deletes + raises on mismatch
+            else:
+                _log.warning("ffmpeg .sha256 has unexpected format; skipping hash check")
+        except RuntimeError:
+            raise  # integrity mismatch
+        except Exception as e:
+            _log.warning("ffmpeg hash check unavailable (%s); continuing", e)
         _emit(progress, "ffmpeg", "Extracting ffmpeg…", None)
         wanted = {"ffmpeg.exe", "ffprobe.exe"}
         found: set[str] = set()
@@ -344,6 +411,18 @@ def install_ffmpeg(progress: Progress | None = None, force: bool = False) -> dic
             raise RuntimeError(f"zip missing {missing}")
         _emit(progress, "ffmpeg", "ffmpeg + ffprobe installed.", 100, "ok")
         return {"ok": True, "path": str(bin_dir / "ffmpeg.exe")}
+    except RuntimeError as e:
+        _log.warning("ffmpeg install failed: %s", e)
+        try:
+            if zip_path.exists():
+                os.remove(zip_path)
+        except OSError:
+            pass
+        is_integrity = "integrity check failed" in str(e)
+        _emit(progress, "ffmpeg",
+              f"ffmpeg {'integrity check' if is_integrity else 'install'} failed: {e}",
+              status="error")
+        return {"ok": False, "error": str(e), **({"integrity_error": True} if is_integrity else {})}
     except Exception as e:
         _log.warning("ffmpeg install failed: %s", e)
         try:
@@ -410,6 +489,38 @@ def _run_streaming(cmd: list[str], progress: Progress | None, phase: str,
     return proc.returncode or 0, "\n".join(tail)
 
 
+def _fetch_py311_sha256(installer_url: str) -> str | None:
+    """Fetch the SHA-256 of the Python installer from its Sigstore bundle.
+
+    Python.org publishes a .sigstore JSON alongside each Windows installer.
+    Tries the Sigstore bundle v0.2/v0.3 format (messageSignature.messageDigest,
+    base64-encoded digest) and falls back to the older canonicalizedBody format.
+    Returns a lowercase 64-char hex string, or None if parsing fails.
+    """
+    try:
+        import base64 as _b64
+        import json as _json
+        sig_text = _fetch_text(installer_url + ".sigstore", timeout=15)
+        bundle = _json.loads(sig_text)
+        # Sigstore bundle v0.2+: top-level messageSignature.messageDigest.digest
+        ms = bundle.get("messageSignature") or {}
+        md = ms.get("messageDigest") or {}
+        if md.get("algorithm", "").startswith("SHA2_256") and md.get("digest"):
+            return _b64.b64decode(md["digest"]).hex().lower()
+        # Older Sigstore format: body field is base64(json) with spec.data.hash.value
+        body_b64 = bundle.get("payload") or bundle.get("body") or ""
+        if body_b64:
+            body = _json.loads(_b64.b64decode(body_b64 + "==")
+                               .decode("utf-8", errors="replace"))
+            val = ((body.get("spec") or {})
+                   .get("data", {}).get("hash", {}).get("value") or "")
+            if len(val) == 64 and all(c in "0123456789abcdef" for c in val.lower()):
+                return val.lower()
+    except Exception as e:
+        _log.debug("py311 sigstore parse failed: %s", e)
+    return None
+
+
 def install_python311(progress: Progress | None = None) -> dict:
     """Ensure a Python 3.11 interpreter exists. If one is already found,
     reuse it; otherwise download + silently install the official per-user
@@ -426,6 +537,18 @@ def install_python311(progress: Progress | None = None) -> dict:
     try:
         _download(_PY311_URL, installer, progress, "python",
                   f"Python {_PY311_VERSION}")
+        # Verify against the Sigstore bundle published alongside each release.
+        _emit(progress, "python", "Verifying Python installer integrity…", None)
+        try:
+            expected = _fetch_py311_sha256(_PY311_URL)
+            if expected:
+                _verify_sha256(installer, expected)  # deletes + raises on mismatch
+            else:
+                _log.warning("python 3.11 sha256 unavailable from sigstore; skipping hash check")
+        except RuntimeError:
+            raise  # integrity mismatch — propagate to outer handler
+        except Exception as e:
+            _log.warning("python 3.11 hash check unavailable (%s); continuing", e)
         _emit(progress, "python",
               "Installing Python 3.11 (per-user, no admin)…", None)
         si, cf = _no_window()
@@ -456,6 +579,16 @@ def install_python311(progress: Progress | None = None) -> dict:
               "interpreter not found.", status="error")
         return {"ok": False, "error": f"installer exit {r.returncode}; "
                                       "python.exe not found after install"}
+    except RuntimeError as e:
+        _log.warning("python 3.11 integrity check failed: %s", e)
+        try:
+            if installer.exists():
+                os.remove(installer)
+        except OSError:
+            pass
+        _emit(progress, "python", f"Python 3.11 integrity check failed: {e}",
+              status="error")
+        return {"ok": False, "error": str(e), "integrity_error": True}
     except Exception as e:
         _log.warning("python 3.11 install failed: %s", e)
         try:
@@ -494,13 +627,13 @@ def install_whisper_stack(progress: Progress | None = None) -> dict:
               "pip upgrade failed; continuing with existing pip",
               status="warning")
 
-    # 2) torch (CUDA or CPU)
+    # 2) torch (CUDA or CPU) — version-pinned to avoid silent ABI breaks
     if gpu["ok"]:
-        torch_cmd = [python, "-m", "pip", "install", "torch",
+        torch_cmd = [python, "-m", "pip", "install", "torch>=2.1.0,<3.0",
                      "--index-url", _TORCH_CUDA_INDEX]
         torch_label = "Installing torch (CUDA)"
     else:
-        torch_cmd = [python, "-m", "pip", "install", "torch"]
+        torch_cmd = [python, "-m", "pip", "install", "torch>=2.1.0,<3.0"]
         torch_label = "Installing torch (CPU)"
     rc, tail = _run_streaming(torch_cmd, progress, "whisper", torch_label,
                               timeout=3600)
@@ -509,9 +642,10 @@ def install_whisper_stack(progress: Progress | None = None) -> dict:
               status="error")
         return {"ok": False, "stage": "torch", "error": tail[-400:]}
 
-    # 3) faster-whisper + transformers
+    # 3) faster-whisper + transformers — pinned to avoid silent compatibility breaks
     rc, tail = _run_streaming(
-        [python, "-m", "pip", "install", "faster-whisper", "transformers"],
+        [python, "-m", "pip", "install",
+         "faster-whisper>=1.0.0,<2.0", "transformers>=4.36.0,<5.0"],
         progress, "whisper", "Installing faster-whisper + transformers",
         timeout=1800)
     if rc != 0:

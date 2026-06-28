@@ -8,7 +8,7 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import threading
 
 
 class StartupMixin:

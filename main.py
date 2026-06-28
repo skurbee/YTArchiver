@@ -873,6 +873,23 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             output_dir = (cfg.get("output_dir") or "").strip()
             sweep_result = {"registered": 0, "ingested": 0}
 
+            # Startup maintenance is low priority. It should not compete with
+            # the user's first active download or a GPU job finishing.
+            def _startup_low_priority_busy():
+                try:
+                    mgr = self._transcribe
+                    if mgr._current_job is not None:
+                        return True
+                except Exception:
+                    pass
+                try:
+                    from backend.sync.active_state import (
+                        is_any_sync_active as _any_sync_active,
+                    )
+                    return bool(_any_sync_active())
+                except Exception:
+                    return False
+
             def _run_sweep():
                 if not output_dir:
                     return
@@ -883,25 +900,12 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     dots_state["sweep"]["phase"] = "Indexing new files"
                     dots_state["sweep"]["detail"] = f"{idx}/{total} \u2014 {clean}"
                 try:
-                    # Pass a gpu_busy probe so the sweep yields whenever
-                    # a user-initiated transcribe is actively running.
-                    # Without this, sweep's per-file writes on its
-                    # independent connection still compete for SQLite's
-                    # single-writer slot — observed: retranscribe stuck
-                    # at 99% for 6-8 minutes while sweep ran during boot.
-                    # `_current_job` ONLY (not queued items) — a paused
-                    # queue with items would otherwise stall sweep
-                    # forever waiting on jobs that aren't firing.
-                    def _gpu_busy():
-                        try:
-                            mgr = self._transcribe
-                            return mgr._current_job is not None
-                        except Exception:
-                            return False
+                    # Pass the low-priority gate to sweep so it yields
+                    # between channels while sync/GPU work is active.
                     r = index_backend.sweep_new_videos(
                         output_dir, cfg.get("channels", []),
                         progress_cb=_on_sweep,
-                        gpu_busy_fn=_gpu_busy)
+                        gpu_busy_fn=_startup_low_priority_busy)
                     sweep_result["registered"] = int(r.get("registered") or 0)
                     sweep_result["ingested"] = int(r.get("ingested") or 0)
                     sweep_result["skipped_unchanged"] = int(
@@ -931,6 +935,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 try:
                     index_backend.preload_all_channels(
                         ch_names, progress_cb=_on_preload,
+                        low_priority_busy_fn=_startup_low_priority_busy,
                         limit=100_000)
                 except Exception as _pe:
                     s.emit_error(f"Preload failed: {_pe}")
@@ -1038,6 +1043,8 @@ def _configured_whisper_model_for_restore(valid_models):
 
 
 def main():
+    _start_minimized = "--start-minimized" in sys.argv
+
     # Put the app-managed bin dir (%APPDATA%/YTArchiver/bin) on PATH FIRST,
     # before any shutil.which() / dependency probe runs. This is where the
     # first-run onboarding installer drops yt-dlp.exe + ffmpeg/ffprobe, so
@@ -1063,6 +1070,44 @@ def main():
             print(f"[config] dated snapshot: {snap}")
     except Exception as e:
         _log.debug("swallowed: %s", e)
+
+    # T087: boot-failure safety net. The heavy, port-binding construction
+    # below (local fileserver, cmd-server on 127.0.0.1:9855, Api(), tray)
+    # all happens BEFORE webview.start(). If any of it raises, the process
+    # used to exit with the ports still bound, so the NEXT launch silently
+    # lost companion-tool integration (cmd_server.start_server returns False
+    # on OSError) until reboot. Register an idempotent emergency teardown
+    # that releases the ports and flushes queues. The normal shutdown path
+    # ends in os._exit(0) (which skips atexit) AND sets shutdown_ran below,
+    # so this hook only ever fires when boot blew up before reaching the
+    # window — never as a double-teardown on the happy path.
+    _boot_state = {"api": None, "shutdown_ran": False}
+
+    def _boot_emergency_cleanup():
+        if _boot_state["shutdown_ran"]:
+            return
+        _boot_state["shutdown_ran"] = True
+        try:
+            from backend import cmd_server as _cs
+            _cs.stop_server()
+        except Exception as e:
+            _log.debug("boot-cleanup cmd_server stop: %s", e)
+        try:
+            from backend import local_fileserver as _lfs
+            _stop = getattr(_lfs, "stop_server", None)
+            if callable(_stop):
+                _stop()
+        except Exception as e:
+            _log.debug("boot-cleanup fileserver stop: %s", e)
+        _api = _boot_state.get("api")
+        if _api is not None:
+            try:
+                _api._queues.save_now()
+            except Exception as e:
+                _log.debug("boot-cleanup queue save: %s", e)
+
+    import atexit as _atexit
+    _atexit.register(_boot_emergency_cleanup)
 
     # Start the localhost file server BEFORE creating the Api (so any early
     # URL generation has a port to bake in). Bound to 127.0.0.1 only.
@@ -1097,6 +1142,9 @@ def main():
         print(f"[fileserver] failed to start: {_fe}")
 
     api = Api()
+    # Hand the live Api to the boot safety net so an emergency teardown can
+    # still flush queues if a later boot step (cmd-server, tray) raises.
+    _boot_state["api"] = api
 
     # HTTP command server on 127.0.0.1:9855 — lets the ArchivePlayer companion
     # and ArchiveBrowserWithYTTest viewers trigger retranscribe / ping
@@ -1414,6 +1462,47 @@ def main():
         Mirrors YTArchiver.py:34224 on_closing. Runs when the user closes
         the window (X / Ctrl+Q / tray Quit). Order matters — save before kill.
         """
+        # Neutralize the T087 boot safety net — the full teardown is running
+        # now, so the atexit fallback must not also fire (it would be a no-op
+        # under os._exit anyway, but make the intent explicit and defensive).
+        _boot_state["shutdown_ran"] = True
+
+        def _flush_queues_now() -> None:
+            try:
+                api._queues.save_now()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+
+        def _wait_for_worker_stop(thread_obj, label: str,
+                                  timeout: float = 4.0) -> bool:
+            """Give a cancelled worker a bounded chance to journal cleanly."""
+            try:
+                if thread_obj is None or not thread_obj.is_alive():
+                    return True
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+                return True
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                _flush_queues_now()
+                try:
+                    thread_obj.join(timeout=0.2)
+                    if not thread_obj.is_alive():
+                        _flush_queues_now()
+                        return True
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+                    return True
+            try:
+                _log.warning(
+                    "shutdown: %s worker still alive after %.1fs; "
+                    "persisting resuming state before process kill",
+                    label, timeout)
+            except Exception:
+                pass
+            _flush_queues_now()
+            return False
+
         try:
             # 0. Signal cancel FIRST so the sync worker has a chance to
             # tear down cleanly before we start killing subprocesses
@@ -1426,15 +1515,12 @@ def main():
             except Exception as e: _log.debug("swallowed: %s", e)
             try: api._redwnl_cancel.set()
             except Exception as e: _log.debug("swallowed: %s", e)
-            # Brief join window so an in-flight worker iteration can
-            # see the cancel and bail.
-            try:
-                if api._sync_thread is not None and api._sync_thread.is_alive():
-                    api._sync_thread.join(timeout=0.5)
-            except Exception as e: _log.debug("swallowed: %s", e)
+            # Bounded cooperative wait so an in-flight worker can see
+            # cancel, persist its queue/resuming state, and exit before
+            # PROCESS_REGISTRY starts force-killing child processes.
+            _wait_for_worker_stop(getattr(api, "_sync_thread", None), "sync")
             # 1. Persist queue state NOW (defeat the debounce timer).
-            try: api._queues.save_now()
-            except Exception as e: _log.debug("swallowed: %s", e)
+            _flush_queues_now()
             # 2. Save window geometry one last time.
             try: winstate.save_window_state({})
             except Exception as e: _log.debug("swallowed: %s", e)
@@ -1709,6 +1795,13 @@ def main():
             from backend.index import backfill_video_stats_if_needed as _bvs
             threading.Thread(target=_bvs, daemon=True).start()
         except Exception as e: _log.debug("swallowed: %s", e)
+        # If launched with --start-minimized (e.g. from Windows boot Registry
+        # entry), hide the window immediately so the app is tray-only on boot.
+        if _start_minimized:
+            try:
+                window.hide()
+            except Exception as e:
+                _log.debug("start-minimized hide failed: %s", e)
     # Defer startup checks until pywebview has actually rendered the
     # window. Previously this thread started BEFORE webview.start(), so
     # api.check_dependencies / check_channel_folders / check_app_update

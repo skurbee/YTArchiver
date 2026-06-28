@@ -11,6 +11,7 @@
         <div class="submode-btn" data-submode="search">Search</div>
         <div class="submode-btn" data-submode="graph">Graph</div>
         <div class="submode-btn" data-submode="bookmarks">Bookmarks</div>
+        <div class="submode-btn" data-submode="manual">Manual</div>
         <div class="library-stats">
           <!-- Placeholder '&mdash;' until api.browse_stats populates
                real counts. NEVER hardcode realistic-looking numbers
@@ -481,6 +482,36 @@
               </div>
               <div id="videos-load-sentinel" class="videos-load-sentinel"></div>
               <div id="videos-load-more" class="grid-loading" hidden>
+                <div class="grid-spinner"></div>
+                <span class="grid-loading-label">Loading more&hellip;</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Manual Downloads view: video files from cfg['video_out_dir'],
+             driven by web/manualView.js via api.list_manual_videos. -->
+        <div class="browse-view" id="view-manual" hidden>
+          <div class="recent-area">
+            <div class="recent-header">
+              <span class="recent-label" id="manual-folder-label">Single-video downloads</span>
+              <div class="spacer"></div>
+              <label class="ctl-label ctl-label-thin browse-toolbar-spaced">Sort:</label>
+              <select class="ctl-select" id="manual-sort">
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="largest">Largest first</option>
+                <option value="title">Title A&ndash;Z</option>
+              </select>
+            </div>
+            <div class="recent-grid-frame" id="manual-grid-frame">
+              <div class="video-grid" id="manual-grid">
+                <div class="grid-loading">
+                  <div class="grid-spinner"></div>
+                  <span class="grid-loading-label">Loading&hellip;</span>
+                </div>
+              </div>
+              <div id="manual-load-more" class="grid-loading" hidden>
                 <div class="grid-spinner"></div>
                 <span class="grid-loading-label">Loading more&hellip;</span>
               </div>

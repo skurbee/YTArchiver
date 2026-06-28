@@ -8,7 +8,15 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import json
+import os
+import re
+import time
+
+from ._shared import _log
+from backend.log import swallow
+from backend.ytarchiver_config import config_is_writable, load_config, recent_for_ui, save_config
+from backend import index as index_backend
 
 
 class RecentMixin:
@@ -62,7 +70,7 @@ class RecentMixin:
             if not ok:
                 return {"ok": False, "error": "Config write failed."}
             try: self._reload_config()
-            except Exception as e: _log.debug("swallowed: %s", e)
+            except Exception as e: swallow("config reload after clear", e)
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -83,7 +91,7 @@ class RecentMixin:
             # Reload config fresh since _record_recent_download just wrote
             # to disk; self._config may be stale.
             try: self._reload_config()
-            except Exception as e: _log.debug("swallowed: %s", e)
+            except Exception as e: swallow("config reload on recent push", e)
             # A new download just landed (and was registered in the index),
             # so reload the Videos view if it's currently showing. The view
             # pulls from api.list_all_videos (whole archive), not the old
@@ -94,7 +102,7 @@ class RecentMixin:
         except Exception as e:
             # Best-effort — never let a UI push crash the download pipeline.
             try: self._log_stream.emit_dim(f"(recent refresh push failed: {e})")
-            except Exception as e: _log.debug("swallowed: %s", e)
+            except Exception as e: swallow("recent-push dim emit", e)
 
 
     # ─── Recent tab actions ────────────────────────────────────────────
@@ -222,7 +230,7 @@ class RecentMixin:
                     if v.get("filepath") and os.path.isfile(v["filepath"]):
                         return v["filepath"]
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("recent-path lookup", e)
         # Moved-file recovery — walk the channel folder by title / videoId
         try:
             from backend.utils import try_locate_moved_file
@@ -241,7 +249,7 @@ class RecentMixin:
                 if found and os.path.isfile(found):
                     return found
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("moved-file locate", e)
         return None
 
 
@@ -317,7 +325,7 @@ class RecentMixin:
                         if m: vid = m.group(1)
                     break
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("recent video-id lookup", e)
         if not vid:
             # Reader connection so this fallback doesn't queue behind
             # writers during startup sweep / ingest.
@@ -334,7 +342,7 @@ class RecentMixin:
                     if row and row[0]:
                         vid = row[0]
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                swallow("index video-id lookup", e)
         return {"ok": True, "filepath": fp, "video_id": vid}
 
 
@@ -371,7 +379,7 @@ class RecentMixin:
                     webbrowser.open(f"https://www.youtube.com/watch?v={vid}")
                     return {"ok": True}
         except Exception as _e:
-            _log.debug("swallowed: %s", _e)
+            swallow("open-youtube url", _e)
         # Filename-suffix fallback for older entries that pre-date the
         # video_id field.
         fp = self._recent_lookup_path_from_identity(title, channel)
@@ -384,7 +392,7 @@ class RecentMixin:
 
 
     def recent_delete_file(self, title, channel=None):
-        """Delete the file from disk + remove from recent_downloads list."""
+        """Move the file to app trash + remove from recent_downloads list."""
         ident = self._recent_identity(title, channel)
         if self._recent_is_ambiguous_legacy(ident):
             return {"ok": False,
@@ -394,15 +402,11 @@ class RecentMixin:
             return {"ok": False, "error": "File not found"}
         # Defense-in-depth: refuse to os.remove a path resolving OUTSIDE the
         # archive roots this app manages (audit: recent_mixin containment).
-        from backend.services.file_ops import (
-            safe_remove_file,
-            safe_remove_sidecars,
-        )
-        removed = safe_remove_file(
+        from backend.services.file_ops import safe_trash_video_file
+        trashed = safe_trash_video_file(
             fp, require_config_writable=True, reason="recent_delete_file")
-        if not removed.get("ok"):
-            return removed
-        safe_remove_sidecars(fp)
+        if not trashed.get("ok"):
+            return trashed
         # Refuse the destructive os.remove if config writes are blocked
         # — otherwise we delete the file but can't update the
         # recent_downloads list, leaving the user with a stale entry
@@ -412,7 +416,7 @@ class RecentMixin:
         # Mirror video_mixin.video_delete_file's index cleanup so the
         # FTS / videos rows tied to this filepath are dropped too.
         # Without this, Browse + Search kept returning "file not
-        # found" hits for the deleted file (audit: recent_mixin.py:
+        # found" hits for the trashed file (audit: recent_mixin.py:
         # 226-246).
         index_warning = ""
         try:
@@ -432,7 +436,7 @@ class RecentMixin:
                     _conn.commit()
         except Exception as _e:
             index_warning = (
-                "File deleted but index cleanup failed; run Rescan "
+                "File moved to trash but index cleanup failed; run Rescan "
                 f"to remove stale Browse/Search entries. ({_e})"
             )
             _log.debug("recent_delete_file index cleanup failed: %s", _e)
@@ -456,9 +460,16 @@ class RecentMixin:
                         )
                     ]
             except Exception:
-                return {"ok": False, "error": "File deleted but config write failed; recent_downloads may show stale entry"}
+                return {"ok": False, "file_trashed": True,
+                        "error": "File moved to trash but config write failed; recent_downloads may show stale entry",
+                        "trashed_file_path": trashed.get("trashed_file_path"),
+                        "trashed_folder_path": trashed.get("trashed_folder_path")}
         if index_warning:
-            return {"ok": False, "file_deleted": True,
+            return {"ok": False, "file_trashed": True,
                     "cleanup_failed": True, "error": index_warning,
-                    "warning": index_warning}
-        return {"ok": True}
+                    "warning": index_warning,
+                    "trashed_file_path": trashed.get("trashed_file_path"),
+                    "trashed_folder_path": trashed.get("trashed_folder_path")}
+        return {"ok": True,
+                "trashed_file_path": trashed.get("trashed_file_path"),
+                "trashed_folder_path": trashed.get("trashed_folder_path")}

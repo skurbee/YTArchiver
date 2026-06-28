@@ -20,7 +20,7 @@ import threading
 import time
 from typing import Any
 
-from ..log import get_logger
+from ..log import get_logger, swallow
 
 _log = get_logger(__name__)
 
@@ -55,7 +55,7 @@ def _probe_duration_seconds(filepath: str) -> str:
         raw = (r.stdout or "").strip()
         return str(int(float(raw))) if raw else ""
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        swallow("ffprobe duration probe", e)
         return ""
 
 
@@ -82,7 +82,7 @@ def _backfill_recent_duration(filepath: str) -> None:
         if changed:
             fire_recent_changed_hook()
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        swallow("recent duration backfill", e)
 
 
 def set_recent_changed_hook(hook: Any | None) -> None:
@@ -101,7 +101,7 @@ def fire_recent_changed_hook() -> None:
         try:
             _on_recent_changed_hook()
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("recent-changed hook", e)
 
 
 def _record_recent_download(filepath: str, channel: str, title: str,
@@ -234,7 +234,7 @@ def _record_recent_download(filepath: str, channel: str, title: str,
         # Api.__init__; safe no-op when unset (unit tests).
         if _on_recent_changed_hook is not None:
             try: _on_recent_changed_hook()
-            except Exception as e: _log.debug("swallowed: %s", e)
+            except Exception as e: swallow("recent-changed hook", e)
         if _fire_sweep:
             # Spawn the sweep OUTSIDE the lock so it can't deadlock
             # another writer waiting for the same lock.
@@ -247,7 +247,7 @@ def _record_recent_download(filepath: str, channel: str, title: str,
                     if output_dir:
                         _idx.sweep_new_videos(output_dir, cfg_s.get("channels", []))
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    swallow("bg index sweep", e)
             _thr.Thread(target=_bg_sweep, daemon=True).start()
         if _needs_duration_backfill:
             threading.Thread(
@@ -258,5 +258,5 @@ def _record_recent_download(filepath: str, channel: str, title: str,
             ).start()
         return True
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        swallow("record-recent-download", e)
         return False

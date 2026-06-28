@@ -95,7 +95,8 @@
           return;
         }
         if (returnTo === "recent" || returnTo === "search" ||
-            returnTo === "bookmarks" || returnTo === "graph") {
+            returnTo === "bookmarks" || returnTo === "graph" ||
+            returnTo === "manual") {
           // The user launched Watch from a Browse submode. Re-click
           // the submode button so the sidebar's `.active` state
           // updates at the same time the view swaps.
@@ -335,6 +336,14 @@
       if (findWrap) findWrap.hidden = true;
       _browseState.view = "bookmarks";
       window.refreshBookmarks?.();
+    } else if (mode === "manual") {
+      document.getElementById("view-manual").hidden = false;
+      title.textContent = "Manual Downloads";
+      backBtn.hidden = true;
+      sortWrap.hidden = true;
+      if (findWrap) findWrap.hidden = true;
+      _browseState.view = "manual";
+      if (typeof window._loadManualView === "function") window._loadManualView();
     } else if (mode === "index") {
       // Browse > Index sub-mode was removed; the Index controls now
       // live in Settings → Index. Null-check defensively in case

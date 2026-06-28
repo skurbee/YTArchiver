@@ -14,15 +14,37 @@ from __future__ import annotations
 
 from backend import deps_installer as _deps
 
-from ._shared import *  # noqa: F401,F403
+import re
+import threading
+
+from ._shared import _log
+from backend.ytarchiver_config import load_config, save_config
+from backend.version import APP_VERSION
 
 
 class OnboardingMixin:
+    def _onboarding_services(self):
+        return getattr(self, "services", None)
+
+    def _onboarding_config(self):
+        services = self._onboarding_services()
+        if services is not None:
+            return services.fresh_config()
+        cfg = getattr(self, "_config", None)
+        if cfg is not None:
+            return cfg
+        return load_config()
+
+    def _onboarding_save_config(self, cfg):
+        services = self._onboarding_services()
+        if services is not None:
+            return services.save_config(cfg)
+        return save_config(cfg)
 
     def onboarding_state(self):
         """Snapshot for the wizard: whether onboarding is complete, the
         current archive root, and a dependency probe."""
-        cfg = self._config or load_config()
+        cfg = self._onboarding_config()
         try:
             deps = _deps.probe(check_whisper_import=False)
         except Exception as e:
@@ -99,9 +121,9 @@ class OnboardingMixin:
         """Mark onboarding complete so the wizard won't auto-show again.
         Persisted in config (`onboarded`)."""
         try:
-            cfg = load_config()
+            cfg = self._onboarding_config()
             cfg["onboarded"] = True
-            ok = save_config(cfg)
+            ok = self._onboarding_save_config(cfg)
             if not ok:
                 return {
                     "ok": False,

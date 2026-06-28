@@ -8,7 +8,17 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import os
+import re
+import subprocess
+import sys
+import threading
+
+from ._shared import _api_err, _log
+from backend.ytarchiver_config import config_is_writable, load_config, save_config
+from backend import sync as sync_backend
+from backend.log_stream import LogStreamer
+from backend.transcribe import TranscribeManager
 
 
 class SettingsMixin:
@@ -83,8 +93,52 @@ class SettingsMixin:
         try:
             return self._autorun.set_mode(mode)
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("CONFIG_SAVE_FAILED", str(e))
 
+
+    # ─── Launch at boot (Windows Registry) ────────────────────────────
+
+    _BOOT_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    _BOOT_REG_NAME = "YTArchiver"
+
+    def launch_at_boot_get(self):
+        """Read current boot-launch state from the Windows Registry."""
+        try:
+            import winreg as _wr
+            with _wr.OpenKey(_wr.HKEY_CURRENT_USER, self._BOOT_REG_PATH) as k:
+                try:
+                    val, _ = _wr.QueryValueEx(k, self._BOOT_REG_NAME)
+                    return {"enabled": True,
+                            "minimized": "--start-minimized" in str(val)}
+                except FileNotFoundError:
+                    return {"enabled": False, "minimized": False}
+        except Exception as e:
+            _log.debug("launch_at_boot_get: %s", e)
+            return {"enabled": False, "minimized": False}
+
+    def launch_at_boot_set(self, enabled, minimized=False):
+        """Set or clear the Windows Registry boot-launch entry."""
+        try:
+            import winreg as _wr
+            if enabled:
+                exe = sys.executable
+                cmd = f'"{exe}"'
+                if minimized:
+                    cmd += " --start-minimized"
+                with _wr.OpenKey(_wr.HKEY_CURRENT_USER, self._BOOT_REG_PATH,
+                                 access=_wr.KEY_SET_VALUE) as k:
+                    _wr.SetValueEx(k, self._BOOT_REG_NAME, 0, _wr.REG_SZ, cmd)
+            else:
+                try:
+                    with _wr.OpenKey(_wr.HKEY_CURRENT_USER, self._BOOT_REG_PATH,
+                                     access=_wr.KEY_SET_VALUE) as k:
+                        _wr.DeleteValue(k, self._BOOT_REG_NAME)
+                except FileNotFoundError:
+                    pass
+            return {"ok": True}
+        except Exception as e:
+            _log.warning("launch_at_boot_set failed: %s", e)
+            return _api_err("INTERNAL_ERROR", str(e))
 
     # ─── Settings dialog: load / save all tunables ─────────────────────
 
@@ -105,6 +159,7 @@ class SettingsMixin:
             "browse_preload_limit": int(cfg.get("browse_preload_limit", 150) or 150),
             "browse_preload_all": bool(cfg.get("browse_preload_all", False)),
             "last_disk_scan_ts": float(cfg.get("last_disk_scan_ts", 0) or 0),
+            "last_backup_ts": float(cfg.get("last_backup_ts", 0) or 0),
             # Subs table column visibility toggles. Default False for
             # new users — the column is optional polish, not core info.
             "show_avg_size": bool(cfg.get("show_avg_size", False)),
@@ -267,7 +322,7 @@ class SettingsMixin:
             SettingsMixin._ytdlp_version_cache[yt] = _result
             return _result
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return _api_err("MISSING_DEPENDENCY", str(e))
 
 
     def ytdlp_update(self):

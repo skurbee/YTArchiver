@@ -40,7 +40,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from ..log import get_logger
+from ..log import get_logger, swallow
 from ..log_stream import LogStreamer
 
 _log = get_logger(__name__)
@@ -274,7 +274,7 @@ def emit_metadata_activity_row(stream: LogStreamer,
         line = f"{kind_tag} {ts_date} \u2014{ch_part} {body}"
         _persist_row_history(row_id, line)
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        swallow("log-row emit persist", e)
     return row_id
 
 def emit_consolidated_auto_row(stream: LogStreamer,
@@ -349,7 +349,7 @@ def emit_consolidated_auto_row(stream: LogStreamer,
         # re-emits with updated counts.
         _persist_row_history(row_id, line)
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        swallow("log-row update persist", e)
     return row_id
 
 
@@ -410,7 +410,7 @@ def _persist_row_history(row_id: str, line: str) -> None:
                     _HIST_INDEX_BY_ROW_ID.pop(_k, None)
         _cfg.save_config(cfg)
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        swallow("log-history config save", e)
 
 
 # Registry: channel_name -> (row_id, downloaded, metadata, errors,

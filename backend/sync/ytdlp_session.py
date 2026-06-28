@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .. import utils as _utils
-from ..log import get_logger
+from ..log import get_logger, swallow
 from ..process_runner import PROCESS_REGISTRY
 
 _log = get_logger(__name__)
@@ -54,7 +54,7 @@ def popen_ytdlp_process(cmd: list[str], *, startupinfo: Any = None
     try:
         PROCESS_REGISTRY.register(proc)
     except Exception as exc:
-        _log.debug("swallowed: %s", exc)
+        swallow("process-registry register", exc)
     return proc
 
 
@@ -80,8 +80,8 @@ def start_download_watchdog(
                     or (pause_event is not None and pause_event.is_set())):
                 try:
                     proc.kill()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    swallow("cancel kill", exc)
                 return
             if time.time() - last_output[0] > kill_sec:
                 stalled["hit"] = True
@@ -90,12 +90,12 @@ def start_download_watchdog(
                                   f"{kill_sec}s — skipping this "
                                   f"download and moving on.\n", "red"]])
                     stream.flush()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    swallow("stall-warn stream flush", exc)
                 try:
                     proc.kill()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    swallow("stall kill", exc)
                 return
 
     thread = threading.Thread(target=_run, name="dl-watchdog", daemon=True)
@@ -127,16 +127,16 @@ def finish_ytdlp_process(
                 proc.kill()
                 proc.wait(timeout=kill_timeout)
             except Exception as exc:
-                _log.debug("swallowed: %s", exc)
+                swallow("force-kill wait", exc)
     try:
         if proc.stdout is not None:
             proc.stdout.close()
     except Exception as exc:
-        _log.debug("swallowed: %s", exc)
+        swallow("stdout close", exc)
     try:
         PROCESS_REGISTRY.unregister(proc)
     except Exception as exc:
-        _log.debug("swallowed: %s", exc)
+        swallow("process-registry unregister", exc)
     return proc.returncode
 
 

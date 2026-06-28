@@ -329,9 +329,17 @@
       if (choice === "clear") {
         const res = await bridgeCall("sync_clear_queue");
         const n = res?.removed || 0;
+        const wasRunning = !!res?.running;
+        // Give clear feedback: if a download was active, tell the user
+        // it's stopping (it may take a moment for the queue display to
+        // go empty). Previously "Sync cancel requested." was confusing
+        // when the queue appeared unchanged because current_sync was
+        // still set.
+        const stopNote = wasRunning ? " Current download stopping." : "";
         window._showToast?.(
-          n > 0 ? `Sync queue cleared (${n} pending).`
-                : "Sync cancel requested.", "warn");
+          n > 0 ? `Sync queue cleared (${n} pending).${stopNote}`
+                : (wasRunning ? "Stopping current download." : "Queue is empty."),
+          "warn");
       } else if (choice === "stop") {
         const res = await bridgeCall("sync_force_stop");
         const n = res?.removed || 0;
@@ -397,6 +405,34 @@
       }
     });
   }
+
+  // Cookie-expiry modal — backend emits a `cookie_alert` yt-control when
+  // yt-dlp detects stale/missing cookies and the sync is auto-paused.
+  // Show a prominent modal so the user can't miss the sign-in requirement.
+  // This listener is wired at module load so it works even if the user
+  // navigated away from the Sync tab when the alert fires.
+  (function wireCookieAlertListener() {
+    let _pending = false;
+    window.addEventListener("yt-control", async (ev) => {
+      if (!ev.detail || ev.detail.kind !== "cookie_alert") return;
+      if (_pending) return; // dedupe: only one modal at a time
+      _pending = true;
+      try {
+        await window.askConfirm?.(
+          "⚠️ Sign in to YouTube",
+          "YTArchiver detected that your browser’s YouTube session " +
+          "has expired.\n\n" +
+          "The sync has been ⏸ paused automatically.\n\n" +
+          "Sign back in to YouTube in Firefox (or your default browser), " +
+          "then click “Resume” in the queue controls to continue " +
+          "the sync.",
+          { confirm: "Got it", danger: false }
+        );
+      } finally {
+        _pending = false;
+      }
+    });
+  })();
 
   window.initSyncButton = initSyncButton;
 })();

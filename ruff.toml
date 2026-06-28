@@ -44,16 +44,13 @@ ignore = [
 
 # Star imports are intentional in backend/{sync,transcribe,metadata}/__init__.py
 # (they're the re-export shims that surface each core.py's __all__).
+# _shared.py is the star-import source for the mixin package; it suppresses
+# its own F401/F403 so the noqa comments on each re-export line stay clean.
 [lint.per-file-ignores]
 "backend/sync/__init__.py" = ["F401", "F403"]
 "backend/transcribe/__init__.py" = ["F401", "F403"]
 "backend/metadata/__init__.py" = ["F401", "F403"]
 "backend/api_mixins/_shared.py" = ["F401", "F403"]
-# Every api_mixin does `from ._shared import *`, so F405 (use of a name that
-# *might* come from a star import) fires across all of them. The star-import
-# surface is intentional (see backend/api_mixins/README.md), so silence F403/
-# F405 there — this is what was burying the real B023/F821 findings.
-"backend/api_mixins/*.py" = ["F401", "F403", "F405"]
 
 [lint.isort]
 known-first-party = ["backend"]

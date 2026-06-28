@@ -8,7 +8,11 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import os
+from datetime import datetime
+
+from ._shared import webview, normalize_dialog_paths
+from backend import index as index_backend
 
 
 class BookmarkMixin:

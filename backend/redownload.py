@@ -659,6 +659,31 @@ def _already_at_target(filepath: str, new_res: str) -> bool:
     return h >= (target - 8)
 
 
+def _redownload_refusal_reason(orig_h: int, new_h: int, target_h: int) -> str:
+    """Return a non-empty reason to REFUSE replacing the original with the
+    fresh download, or "" to allow the replace. Pure guard over the three
+    heights (0 = unknown). This is the durability-critical downgrade guard
+    the audit (T201) flagged as untestable while buried in the 700-line
+    redownload loop: never overwrite a good original with a worse or
+    unprobeable copy. The byte-identical and cross-extension checks live in
+    the loop (they need file I/O); this one is purely the height decision.
+    """
+    if orig_h and new_h:
+        if new_h < orig_h:
+            return f"new copy is {new_h}p, original is {orig_h}p"
+    elif orig_h and not new_h:
+        return (f"can't probe the new copy's resolution "
+                f"(original is {orig_h}p)")
+    elif not orig_h and target_h:
+        if new_h and new_h < target_h - 8:
+            return (f"original's resolution unknown and new copy is only "
+                    f"{new_h}p (target {target_h}p)")
+        elif not new_h:
+            return ("can't probe either file's resolution "
+                    "(ffprobe unavailable?)")
+    return ""
+
+
 def _download_one(video_id: str, new_res: str, out_dir: str,
                   stream: LogStreamer, cancel_ev: threading.Event) -> str | None:
     """Download a single video ID at the target resolution into a temp dir
@@ -1288,21 +1313,8 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                 _tgt_h = int(cur_res[0])
             except Exception:
                 _tgt_h = 0  # "best" — only the orig-vs-new compare applies
-            _refuse = ""
-            if orig_h and _new_h:
-                if _new_h < orig_h:
-                    _refuse = (f"new copy is {_new_h}p, original is "
-                               f"{orig_h}p")
-            elif orig_h and not _new_h:
-                _refuse = (f"can't probe the new copy's resolution "
-                           f"(original is {orig_h}p)")
-            elif not orig_h and _tgt_h:
-                if _new_h and _new_h < _tgt_h - 8:
-                    _refuse = (f"original's resolution unknown and new "
-                               f"copy is only {_new_h}p (target {_tgt_h}p)")
-                elif not _new_h:
-                    _refuse = ("can't probe either file's resolution "
-                               "(ffprobe unavailable?)")
+            # Durability-critical downgrade guard (T201 extraction).
+            _refuse = _redownload_refusal_reason(orig_h, _new_h, _tgt_h)
             if _refuse:
                 try: os.remove(new_fp)
                 except OSError: pass

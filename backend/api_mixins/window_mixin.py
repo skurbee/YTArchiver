@@ -8,7 +8,16 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import ctypes
+import os
+import subprocess
+import sys
+import threading
+import time
+
+from ._shared import _log, webview, normalize_dialog_paths
+from backend.ytarchiver_config import load_config, save_config
+from backend import window_state as winstate
 
 
 class WindowMixin:

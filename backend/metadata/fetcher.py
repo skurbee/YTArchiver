@@ -33,7 +33,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
-from ..log import get_logger
+from ..log import get_logger, swallow
 from ..log_stream import LogStreamer
 from .io import (
     _folder_for_channel,
@@ -57,21 +57,6 @@ _inflight_procs: set[subprocess.Popen] = set()
 _inflight_procs_lock = threading.Lock()
 _fail_count_column_ready = False
 
-
-def _kill_inflight_metadata_procs() -> int:
-    """Terminate every in-flight _fetch_video_metadata yt-dlp Popen.
-    Called by the bulk pre-fetch cancel handler. Returns count killed."""
-    with _inflight_procs_lock:
-        procs = list(_inflight_procs)
-    killed = 0
-    for p in procs:
-        try:
-            if p.poll() is None:
-                p.kill()
-                killed += 1
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-    return killed
 
 
 def _ensure_fail_count_column(conn) -> None:
@@ -102,10 +87,18 @@ def _exit_pause_wait(stream: LogStreamer, label: str, queues) -> None:
 
 
 def _fetch_video_metadata(yt: str, video_id: str,
-                          title_hint: str = "") -> dict[str, Any] | None:
+                          title_hint: str = "",
+                          proc_registry: "set[subprocess.Popen] | None" = None,
+                          ) -> dict[str, Any] | None:
     """Fetch metadata for a single video via yt-dlp --dump-json.
     Returns the OLD-schema dict, or None on failure.
-    Matches YTArchiver.py:26719."""
+    Matches YTArchiver.py:26719.
+
+    proc_registry: if supplied, this proc's Popen is registered there instead
+    of the module-global _inflight_procs — so a bulk-cancel only kills procs
+    from its own operation, leaving DLTRACK per-video fetches untouched.
+    """
+    _reg = proc_registry if proc_registry is not None else _inflight_procs
     cmd = [
         yt,
         "--dump-json", "--no-download", "--no-warnings",
@@ -153,7 +146,7 @@ def _fetch_video_metadata(yt: str, video_id: str,
         # kill, cancel feels "stuck" for many minutes during a bulk
         # pre-fetch (max_workers=3, ~1000 videos).
         with _inflight_procs_lock:
-            _inflight_procs.add(proc)
+            _reg.add(proc)
         try:
             try:
                 stdout, _ = proc.communicate(timeout=_attempt_timeout)
@@ -179,7 +172,7 @@ def _fetch_video_metadata(yt: str, video_id: str,
                     try: proc.kill()
                     except Exception: pass
                 try: proc.communicate(timeout=5)
-                except Exception as e: _log.debug("swallowed: %s", e)
+                except Exception as e: swallow("yt-dlp communicate after timeout-kill", e)
                 if _attempt_idx == len(_attempts) - 1:
                     # All attempts exhausted — still a transient signal,
                     # not a permanent failure. audit E-11 sentinel.
@@ -188,7 +181,7 @@ def _fetch_video_metadata(yt: str, video_id: str,
                 time.sleep(2 ** _attempt_idx)  # 1s, 2s
         finally:
             with _inflight_procs_lock:
-                _inflight_procs.discard(proc)
+                _reg.discard(proc)
     if _rc is None or _rc != 0:
         return None
 
@@ -605,6 +598,10 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
             _pf_done = 0
             _pf_total = len(_to_prefetch)
             _pf_last_tick = time.time()
+            # Per-operation registry: only this bulk-fetch pass's procs are
+            # here, so cancel can't kill DLTRACK per-video fetches running
+            # concurrently for a different channel (T187).
+            _local_procs: set[subprocess.Popen] = set()
             try:
                 with _cf.ThreadPoolExecutor(
                         max_workers=3,
@@ -625,28 +622,36 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                         # to dominate the wall-clock budget.
                         time.sleep(_random.uniform(0, 0.2))
                         _fut = _pf_pool.submit(
-                            _fetch_video_metadata, yt, _pf_vid, _pf_title)
+                            _fetch_video_metadata, yt, _pf_vid, _pf_title,
+                            _local_procs)
                         _pf_futs[_fut] = _pf_vid
                     for _fut in _cf.as_completed(_pf_futs):
                         if cancel_event is not None and cancel_event.is_set():
                             for _f in _pf_futs:
                                 _f.cancel()
                             # .cancel() only stops futures that haven't
-                            # started yet; in-flight workers keep
-                            # running until their subprocess timeout
-                            # (~210s worst case). Kill the in-flight
-                            # metadata-fetch yt-dlp procs targeted via
-                            # the module-scoped registry so cancel feels
-                            # responsive — without touching sync's own
-                            # yt-dlp procs in PROCESS_REGISTRY.
+                            # started yet; in-flight workers keep running
+                            # until their subprocess timeout (~210s worst
+                            # case). Kill only this operation's in-flight
+                            # procs — _local_procs is scoped here, so we
+                            # can't accidentally kill DLTRACK fetches.
                             try:
-                                _killed = _kill_inflight_metadata_procs()
+                                with _inflight_procs_lock:
+                                    _snap = list(_local_procs)
+                                _killed = 0
+                                for _p in _snap:
+                                    try:
+                                        if _p.poll() is None:
+                                            _p.kill()
+                                            _killed += 1
+                                    except Exception as _pe:
+                                        swallow("bulk-cancel proc kill", _pe)
                                 if _killed:
                                     _log.info(
                                         "metadata cancel killed %d "
                                         "in-flight yt-dlp procs", _killed)
                             except Exception as _ke:
-                                _log.debug("swallowed: %s", _ke)
+                                swallow("bulk-cancel kill block", _ke)
                             break
                         _vid_done = _pf_futs[_fut]
                         try:
@@ -812,7 +817,7 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                                 _log.warning(
                                     "fail-count UPDATE rolled back: %s", _ue)
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    swallow("fail-count increment", e)
                 continue
             if is_refresh_hit:
                 # Merge: update counts + comments, keep other fields
@@ -868,7 +873,7 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                                 (vid_id,))
                             _c_rs.commit()
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    swallow("fail-count reset after successful fetch", e)
             if entry.get("thumbnail_url"):
                 _download_thumbnail(entry["thumbnail_url"], thumb_dir,
                                     title or entry.get("title", ""), vid_id,

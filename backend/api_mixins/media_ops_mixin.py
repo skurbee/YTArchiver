@@ -8,7 +8,18 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import json
+import os
+import re
+import threading
+import time
+
+from backend.log import swallow
+from backend.ytarchiver_config import load_config
+from backend import subs as subs_backend
+from backend import index as index_backend
+from backend import reorg as reorg_backend
+from backend.transcribe import TranscribeManager
 
 
 class MediaOpsMixin:
@@ -79,7 +90,7 @@ class MediaOpsMixin:
                             "if (window._onArchiveRescanComplete) "
                             "window._onArchiveRescanComplete();")
                     except Exception as e:
-                        _log.debug("swallowed: %s", e)
+                        swallow("rescan-complete JS callback", e)
             except Exception as e:
                 self._log_stream.emit_error(f"Rescan failed: {e}")
             finally:
@@ -155,7 +166,7 @@ class MediaOpsMixin:
                         total_hidden += n_root
                         folders_touched += 1
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    swallow("root sidecar hide", e)
                 if total_hidden > 0:
                     self._log_stream.emit_text(
                         f"— Hidden-sidecar repair complete: hid "
@@ -222,18 +233,18 @@ class MediaOpsMixin:
                             "if(window._onVideoLengthsBackfilled)"
                             f"window._onVideoLengthsBackfilled({_n});")
                     except Exception as e:
-                        _log.debug("swallowed: %s", e)
+                        swallow("lengths-backfill JS callback", e)
             except Exception as e:
                 try:
                     self._log_stream.emit_error(f"Video-length fix failed: {e}")
                 except Exception as _e2:
-                    _log.debug("swallowed: %s", _e2)
+                    swallow("lengths-backfill emit-error", _e2)
             finally:
                 self._dur_backfill_running = False
                 try:
                     self._log_stream.flush()
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    swallow("lengths-backfill stream flush", e)
 
         threading.Thread(target=_run, name="dur-backfill", daemon=True).start()
         return {"ok": True, "started": True}
@@ -785,7 +796,7 @@ class MediaOpsMixin:
                                      f"running against {ch_name} — wait "
                                      f"for it to finish before reorganizing."}
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                swallow("gpu-guard check", e)
         # "Re-apply organization" (Subs > Reorg folder) passes
         # split_years=split_months=None as a sentinel meaning "use THIS
         # channel's configured folder org" rather than a specific layout.

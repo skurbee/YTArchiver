@@ -2,16 +2,38 @@
 RedownloadMixin — extracted from the main Api class for browsability.
 
 Methods in this mixin are mixed into the Api class via multiple
-inheritance. They reference `self.<state>` which still resolves
-to the Api instance at runtime — no body changes were made
-when moving them out of main.py.
+inheritance. They prefer AppServices when present, with legacy
+private Api attributes kept as fallback state.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import threading
+
+from ._shared import _log, ALLOWED_REDOWNLOAD_RESOLUTIONS
+from backend.ytarchiver_config import load_config
+from backend import archive_scan
 
 
 class RedownloadMixin:
+    def _redownload_services(self):
+        return getattr(self, "services", None)
+
+    def _redownload_queues(self):
+        services = self._redownload_services()
+        q = getattr(services, "queues", None) if services is not None else None
+        return q if q is not None else self._queues
+
+    def _redownload_log_stream(self):
+        services = self._redownload_services()
+        stream = (getattr(services, "log_stream", None)
+                  if services is not None else None)
+        return stream if stream is not None else self._log_stream
+
+    def _redownload_config(self):
+        services = self._redownload_services()
+        if services is not None:
+            return services.fresh_config()
+        return load_config()
 
     def resume_pending_redownloads(self):
         """Issue #162: scan queues.sync for redownload-kind tasks (left
@@ -26,9 +48,10 @@ class RedownloadMixin:
         """
         resumed = 0
         skipped = 0
+        queues = self._redownload_queues()
         try:
             # Snapshot the queue so we can iterate without mutation races.
-            tasks_snapshot = list(self._queues.sync)
+            tasks_snapshot = list(queues.sync)
         except Exception:
             tasks_snapshot = []
         # Remove the redownload items from the live queue FIRST. The
@@ -46,7 +69,7 @@ class RedownloadMixin:
                 skipped += 1
                 continue
             try:
-                self._queues.sync_remove(url or name)
+                queues.sync_remove(url or name)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             try:
@@ -68,23 +91,25 @@ class RedownloadMixin:
         sequentially without re-spawning threads per item.
         """
         from backend import redownload as _rd
+        queues = self._redownload_queues()
+        log_stream = self._redownload_log_stream()
         _scope_text = f" [{scope_label}]" if scope_label else ""
         _rd_task = dict(ch)
         _rd_task["kind"] = "redownload"
         _rd_task["redownload_res"] = new_res
         try:
-            self._queues.set_current_sync(_rd_task)
+            queues.set_current_sync(_rd_task)
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            _log.warning("redownload: set_current_sync failed; running task won't show in queue display: %s", e)
         try:
-            self._log_stream.emit([
+            log_stream.emit([
                 ["[Sync] ", "sync_bracket"],
                 [f"Redownload {ch.get('name','?')}{_scope_text} \u2192 ",
                  "simpleline_green"],
                 [("Best\n" if new_res == "best" else f"{new_res}p\n"),
                  "simpleline_green"],
             ])
-            self._log_stream.flush()
+            log_stream.flush()
 
             def _confirm(avg_pct, direction, res_label, sample_n):
                 ev = threading.Event()
@@ -126,12 +151,12 @@ class RedownloadMixin:
                         "res_label": str(res_label),
                         "sample_n": int(sample_n),
                     })
-                    self._log_stream.emit([
+                    log_stream.emit([
                         [_payload, "__control__"],
                     ])
-                    self._log_stream.flush()
+                    log_stream.flush()
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    _log.warning("redownload sample-confirm dialog emit failed; worker will time out after 300s: %s", e)
                 _signaled = ev.wait(timeout=300)
                 if not _signaled:
                     # User never answered. Mark as timeout and treat
@@ -140,10 +165,10 @@ class RedownloadMixin:
                     # progressed.
                     try:
                         pending["_timed_out"] = True
-                        self._log_stream.emit_dim(
+                        log_stream.emit_dim(
                             "[Sync] Redownload sample-confirm timed out "
                             "(5 min) — cancelling rather than proceeding.")
-                        self._log_stream.flush()
+                        log_stream.flush()
                     except Exception:
                         pass
                 try:
@@ -154,18 +179,18 @@ class RedownloadMixin:
 
             _rd.redownload_channel(
                 ch.get("name", ""), ch.get("url", ""), folder, new_res,
-                stream=self._log_stream,
+                stream=log_stream,
                 cancel_ev=self._redwnl_cancel,
                 pause_ev=self._sync_pause,
                 confirm_cb=_confirm,
-                queues=self._queues,
+                queues=queues,
             )
         except Exception as e:
-            self._log_stream.emit_error(f"Redownload crashed: {e}")
+            log_stream.emit_error(f"Redownload crashed: {e}")
         finally:
-            try: self._queues.set_current_sync(None)
-            except Exception as e: _log.debug("swallowed: %s", e)
-            self._log_stream.flush()
+            try: queues.set_current_sync(None)
+            except Exception as e: _log.warning("redownload finally: set_current_sync(None) failed; stale task may appear in queue display: %s", e)
+            log_stream.flush()
             try:
                 from backend import archive_scan as _as
                 _as.invalidate_channel(ch.get("url", ""))
@@ -222,14 +247,14 @@ class RedownloadMixin:
             ev = pending.get("event")
             if ev is not None:
                 try: ev.set()
-                except Exception as e: _log.debug("swallowed: %s", e)
+                except Exception as e: _log.warning("redownload sample-confirm: ev.set() failed; worker will hang until 300s timeout: %s", e)
         return {"ok": True, "choice": c, "resolved": len(pending_list)}
 
 
     def queue_pending_check(self):
         """Count channels that likely have new videos by comparing archive
         file cursor vs disk cache. Cheap sanity estimate — not exact."""
-        cfg = load_config()
+        cfg = self._redownload_config()
         channels = cfg.get("channels", [])
         cache = archive_scan.load_disk_cache()
         # scale the "pending" threshold to the user's

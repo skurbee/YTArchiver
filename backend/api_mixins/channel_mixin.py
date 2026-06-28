@@ -8,7 +8,20 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+
+from ._shared import _log, ALLOWED_REDOWNLOAD_RESOLUTIONS
+from backend.ytarchiver_config import load_config, save_config
+from backend import archive_scan
+from backend import subs as subs_backend
+from backend import reorg as reorg_backend
+from backend.queues import QueueState
 
 
 class ChannelMixin:
@@ -23,6 +36,28 @@ class ChannelMixin:
             return str(folder_or_name.get("name")
                        or folder_or_name.get("folder") or "").strip()
         return ""
+
+    def _channel_folder_for_name(self, name, *, use_cached_config=False):
+        """Resolve (channel_dict, absolute folder path) for an already-
+        coerced channel name.
+
+        Returns a ``(ch, folder)`` tuple on success, or an
+        ``{"ok": False, "error": ...}`` dict on failure ("Channel not found"
+        / "output_dir not set"). Collapses the get_channel -> output_dir ->
+        channel_folder_name preamble that was copy-pasted across ChannelMixin
+        methods (T347). `use_cached_config` mirrors the in-place handlers that
+        read `self._config or load_config()` instead of a fresh load.
+        """
+        ch = subs_backend.get_channel({"name": name})
+        if not ch:
+            return {"ok": False, "error": "Channel not found"}
+        cfg = ((self._config or load_config())
+               if use_cached_config else load_config())
+        base = (cfg.get("output_dir") or "").strip()
+        if not base:
+            return {"ok": False, "error": "output_dir not set"}
+        from backend.sync import channel_folder_name
+        return ch, os.path.join(base, channel_folder_name(ch))
 
     def chan_open_folder(self, folder_or_name):
         # Validate arg type up front. JS callers can accidentally pass
@@ -124,7 +159,7 @@ class ChannelMixin:
             try:
                 self.transcribe_swap_model(model, persist=False)
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                _log.warning("model swap before retranscribe failed (batch will use current model): %s", e)
         queued = 0
         skipped = 0
         for row in rows:
@@ -151,15 +186,10 @@ class ChannelMixin:
         runs in a background thread so the UI doesn't block.
         """
         name = self._coerce_channel_name(folder_or_name)
-        ch = subs_backend.get_channel({"name": name})
-        if not ch:
-            return {"ok": False, "error": "Channel not found"}
-        cfg = load_config()
-        base = (cfg.get("output_dir") or "").strip()
-        if not base:
-            return {"ok": False, "error": "output_dir not set"}
-        from backend.sync import channel_folder_name as _cfn
-        folder = os.path.join(base, _cfn(ch))
+        resolved = self._channel_folder_for_name(name)  # T347
+        if isinstance(resolved, dict):
+            return resolved
+        ch, folder = resolved
 
         # Per-channel in-flight dedupe so rapid clicks don't spawn N
         # concurrent yt-dlp processes hitting the same channel URL and
@@ -277,7 +307,7 @@ class ChannelMixin:
                     if p:
                         queued_paths.add(os.path.normpath(p).lower())
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            _log.warning("could not read transcribe job queue for dedup (duplicates may be enqueued): %s", e)
 
         # Resolve each ID → filepath via the FTS index, in one shot.
         id_to_path: dict = {}
@@ -298,7 +328,7 @@ class ChannelMixin:
                     if vid and fp:
                         id_to_path[vid] = (fp, title, txs)
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            _log.warning("FTS index unavailable for Queue Pending resolve; all IDs treated as unresolved: %s", e)
 
         queued = 0
         skipped = 0
@@ -379,7 +409,7 @@ class ChannelMixin:
                     # the pruned list instead of the pre-prune state.
                     self._config = cfg2
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                _log.warning("unresolved-id prune save failed; stale IDs will persist until next launch: %s", e)
         self._log_stream.flush()
         return {"ok": True, "queued": queued, "skipped": skipped,
                 "unresolved": len(unresolved)}
@@ -400,15 +430,10 @@ class ChannelMixin:
         The UI should then re-call with combined=True or False.
         """
         name = self._coerce_channel_name(folder_or_name)
-        ch = subs_backend.get_channel({"name": name})
-        if not ch:
-            return {"ok": False, "error": "Channel not found"}
-        cfg = load_config()
-        base = (cfg.get("output_dir") or "").strip()
-        if not base:
-            return {"ok": False, "error": "output_dir not set"}
-        from backend.sync import channel_folder_name
-        folder = os.path.join(base, channel_folder_name(ch))
+        resolved = self._channel_folder_for_name(name)  # T347
+        if isinstance(resolved, dict):
+            return resolved
+        ch, folder = resolved
         split_years = bool(ch.get("split_years"))
         split_months = bool(ch.get("split_months"))
 
@@ -917,7 +942,7 @@ class ChannelMixin:
             # Mirror to the sync-queue UI so the Sync Tasks popover
             # shows queued redownloads alongside the one running.
             try: self._queues.sync_enqueue(_rd_task)
-            except Exception as e: _log.debug("swallowed: %s", e)
+            except Exception as e: _log.warning("redownload sync_enqueue failed; task won't appear in Tasks popover: %s", e)
 
             # If a worker is already draining the chain, we're done —
             # our item will get picked up when the current one
@@ -980,7 +1005,7 @@ class ChannelMixin:
                 # Chain drained — final bookkeeping.
                 self._on_queue_changed()
                 try: self._autorun.notify_sync_done()
-                except Exception as e: _log.debug("swallowed: %s", e)
+                except Exception as e: _log.warning("autorun notify_sync_done failed after redownload: %s", e)
                 try: threading.Timer(0.5, self._on_queue_changed).start()
                 except Exception as e: _log.debug("swallowed: %s", e)
 

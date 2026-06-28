@@ -31,7 +31,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from ..log import get_logger
+from ..log import get_logger, swallow
 
 _log = get_logger(__name__)
 
@@ -77,7 +77,7 @@ def _find_cookie_source() -> list[str]:
                 _cookie_source_cached = ["--cookies", str(manual)]
                 return list(_cookie_source_cached)
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("cookie-source probe", e)
 
         # Firefox only (Chromium browsers intentionally NOT probed — their
         # cookies are unreadable on Windows; see note at top of section).

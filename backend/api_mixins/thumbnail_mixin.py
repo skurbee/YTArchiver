@@ -2,18 +2,40 @@
 ThumbnailMixin — extracted from the main Api class for browsability.
 
 Methods in this mixin are mixed into the Api class via multiple
-inheritance. They reference `self.<state>` which still resolves
-to the Api instance at runtime — no body changes were made
-when moving them out of main.py.
+inheritance. They prefer AppServices when present, with legacy
+private Api attributes kept as fallback state.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import threading
+import time
+
+from ._shared import _log
+from backend.ytarchiver_config import load_config
+from backend import subs as subs_backend
 
 
 class ThumbnailMixin:
 
     _realign_init_lock = threading.Lock()
+
+    def _thumbnail_services(self):
+        return getattr(self, "services", None)
+
+    def _thumbnail_config(self):
+        services = self._thumbnail_services()
+        if services is not None:
+            return services.fresh_config()
+        cfg = getattr(self, "_config", None)
+        if cfg is not None:
+            return cfg
+        return load_config()
+
+    def _thumbnail_log_stream(self):
+        services = self._thumbnail_services()
+        stream = (getattr(services, "log_stream", None)
+                  if services is not None else None)
+        return stream if stream is not None else self._log_stream
 
     def _ensure_realign_jobs(self):
         if (hasattr(self, "_realign_jobs")
@@ -38,7 +60,7 @@ class ThumbnailMixin:
         """
         try:
             from backend.metadata import count_thumbnail_status_bulk
-            cfg = self._config or load_config()
+            cfg = self._thumbnail_config()
             channels = cfg.get("channels", []) or []
             return {"ok": True,
                     "rows": count_thumbnail_status_bulk(
@@ -58,20 +80,21 @@ class ThumbnailMixin:
         if not ch:
             return {"ok": False, "error": "Channel not found"}
         def _run():
+            log_stream = self._thumbnail_log_stream()
             try:
                 from backend import metadata as _md
-                self._log_stream.emit_text(
+                log_stream.emit_text(
                     f" - Thumbnail refetch starting for {name}...",
                     "simpleline")
-                res = _md.sweep_missing_thumbnails(ch, stream=self._log_stream)
-                self._log_stream.emit_text(
+                res = _md.sweep_missing_thumbnails(ch, stream=log_stream)
+                log_stream.emit_text(
                     f" - Thumbnail refetch for {name}: "
                     f"{res.get('fetched', 0)} fetched, "
                     f"{res.get('missing', 0)} still missing, "
                     f"{res.get('checked', 0)} checked",
                     "simpleline_green")
             except Exception as _e:
-                self._log_stream.emit_error(
+                log_stream.emit_error(
                     f"Thumbnail refetch failed for {name}: {_e}")
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "started": True}
@@ -102,13 +125,14 @@ class ThumbnailMixin:
                     "done": False, "cancel": cancel_ev, "_ts": now}
 
             def _worker():
+                log_stream = self._thumbnail_log_stream()
                 try:
                     from backend import metadata as _md
                     res = _md.realign_misplaced_thumbnails(
-                        channels=(self._config or load_config()
+                        channels=(self._thumbnail_config()
                                   or {}).get("channels", []),
                         dry_run=bool(dry_run),
-                        stream=self._log_stream,
+                        stream=log_stream,
                         cancel_event=cancel_ev)
                 except Exception as _e:
                     res = {"ok": False, "error": str(_e)}
@@ -166,51 +190,52 @@ class ThumbnailMixin:
         Returns immediately with `{ok, started, channels}` — the actual
         work runs async; the user watches the log.
         """
-        cfg = self._config or load_config()
+        cfg = self._thumbnail_config()
         channels = sorted(cfg.get("channels", []),
                           key=lambda c: (c.get("name") or "").lower())
         if not channels:
             return {"ok": False, "error": "No channels configured"}
         def _run():
+            log_stream = self._thumbnail_log_stream()
             try:
                 from backend import metadata as _md
                 total_fetched = total_missing = total_checked = 0
-                self._log_stream.emit_text(
+                log_stream.emit_text(
                     f" — Thumbnail refetch starting for "
                     f"{len(channels)} channel(s)…",
                     "simpleline_pink")
-                self._log_stream.flush()
+                log_stream.flush()
                 for i, ch in enumerate(channels, 1):
                     nm = ch.get("name") or ch.get("folder") or "?"
                     try:
-                        self._log_stream.emit_text(
+                        log_stream.emit_text(
                             f"  - [{i}/{len(channels)}] {nm}…",
                             "simpleline")
                         res = _md.sweep_missing_thumbnails(
-                            ch, stream=self._log_stream)
+                            ch, stream=log_stream)
                         total_fetched += int(res.get("fetched", 0) or 0)
                         total_missing += int(res.get("missing", 0) or 0)
                         total_checked += int(res.get("checked", 0) or 0)
                         if res.get("fetched", 0) > 0 or res.get("missing", 0) > 0:
-                            self._log_stream.emit_text(
+                            log_stream.emit_text(
                                 f"    {res.get('fetched', 0)} fetched, "
                                 f"{res.get('missing', 0)} still missing, "
                                 f"{res.get('checked', 0)} checked",
                                 "simpleline_green")
                     except Exception as _per_ch_e:
-                        self._log_stream.emit_error(
+                        log_stream.emit_error(
                             f"Thumbnail refetch failed for {nm}: "
                             f"{_per_ch_e}")
-                self._log_stream.emit_text(
+                log_stream.emit_text(
                     f" — Thumbnail refetch complete: "
                     f"{total_fetched} fetched, "
                     f"{total_missing} still missing, "
                     f"{total_checked} checked across "
                     f"{len(channels)} channel(s).",
                     "simpleline_pink")
-                self._log_stream.flush()
+                log_stream.flush()
             except Exception as _e:
-                self._log_stream.emit_error(
+                log_stream.emit_error(
                     f"Bulk thumbnail refetch failed: {_e}")
         threading.Thread(target=_run, daemon=True,
                          name="thumb-refetch-all").start()

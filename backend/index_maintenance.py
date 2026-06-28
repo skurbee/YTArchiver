@@ -81,21 +81,22 @@ def sweep_new_videos(output_dir: str, channels: list,
     if not output_dir:
         return {"registered": 0, "ingested": 0}
     import time as _t
-    # Yield-loop: defer sweep while user-initiated GPU work (retranscribe,
-    # manual transcribe) is running. Sweep's many small writes to its own
-    # connection still compete with the active job for SQLite's single-
-    # writer slot at the file level — observed: retranscribes stuck at
-    # 99% for 6-8 minutes while sweep ran. User-initiated work always
-    # wins; sweep waits its turn (capped at 10 minutes so a bug in
-    # gpu_busy_fn doesn't deadlock the boot sequence).
-    if callable(gpu_busy_fn):
+    def _wait_while_busy(max_wait: float = 600.0) -> bool:
+        """Pause low-priority sweep work while user-visible work is active."""
+        if not callable(gpu_busy_fn):
+            return False
         _waited = 0.0
         try:
-            while gpu_busy_fn() and _waited < 600.0:
+            while gpu_busy_fn() and _waited < max_wait:
                 _t.sleep(0.5)
                 _waited += 0.5
         except Exception:
-            pass
+            return False
+        return _waited > 0
+
+    # Yield-loop: defer sweep while active sync or user-initiated GPU work is
+    # running. User-visible work wins over startup maintenance.
+    _wait_while_busy()
     # Make sure the shared connection's schema-init has run at least
     # once (creates tables, sets PRAGMAs at the file level).
     _ = _idx._open()
@@ -151,6 +152,7 @@ def sweep_new_videos(output_dir: str, channels: list,
         try:
             with _os.scandir(ch_folder) as _it:
                 for entry in _it:
+                    _wait_while_busy()
                     try:
                         if entry.is_dir(follow_symlinks=False):
                             try:
@@ -160,6 +162,7 @@ def sweep_new_videos(output_dir: str, channels: list,
                                 # One extra level for year/month splits.
                                 with _os.scandir(entry.path) as _it2:
                                     for sub in _it2:
+                                        _wait_while_busy()
                                         try:
                                             if sub.is_dir(follow_symlinks=False):
                                                 sm = sub.stat(follow_symlinks=False).st_mtime
@@ -181,17 +184,9 @@ def sweep_new_videos(output_dir: str, channels: list,
         ch_name = ch.get("name") or ch.get("folder", "")
         if not ch_name:
             continue
-        # Mid-sweep yield: if a retranscribe / manual transcribe kicked
-        # off after sweep started, pause here too. Same rationale as the
-        # pre-sweep wait above. Cap at 10 minutes per channel boundary.
-        if callable(gpu_busy_fn):
-            _yielded = 0.0
-            try:
-                while gpu_busy_fn() and _yielded < 600.0:
-                    _t.sleep(0.5)
-                    _yielded += 0.5
-            except Exception:
-                pass
+        # Mid-sweep yield: if sync/GPU work kicked off after sweep started,
+        # pause here too. Same rationale as the pre-sweep wait above.
+        _wait_while_busy()
         if progress_cb is not None:
             try: progress_cb(i_ch + 1, total_ch, ch_name)
             except Exception as e: _log.debug("swallowed: %s", e)
@@ -234,13 +229,18 @@ def sweep_new_videos(output_dir: str, channels: list,
         _strip_id = _re.compile(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$")
         stack = [str(folder)]
         while stack:
+            _wait_while_busy()
             dp = stack.pop()
             try:
                 it = _os.scandir(dp)
             except OSError:
                 continue
             with it:
+                _entry_count = 0
                 for entry in it:
+                    _entry_count += 1
+                    if _entry_count % 25 == 0:
+                        _wait_while_busy()
                     try:
                         if entry.is_dir(follow_symlinks=False):
                             stack.append(entry.path)
@@ -278,6 +278,7 @@ def sweep_new_videos(output_dir: str, channels: list,
                         # permanently missing. Scoped to NULL-id rows only, so
                         # it's near-free on a healthy archive.
                         if fp_lower in noid:
+                            _wait_while_busy()
                             try:
                                 _idx.register_video(fp, ch_name,
                                                     _conn_override=sweep_conn)
@@ -295,6 +296,7 @@ def sweep_new_videos(output_dir: str, channels: list,
                             title = _strip_id.sub("", _os.path.basename(base)) or _os.path.basename(base)
                             # Pass sweep_conn so this call doesn't compete
                             # for _idx._db_lock — see _idx._open_independent docstring.
+                            _wait_while_busy()
                             if _idx.ingest_jsonl(fp, jp, title, ch_name,
                                             _conn_override=sweep_conn):
                                 ingested += 1
@@ -307,6 +309,7 @@ def sweep_new_videos(output_dir: str, channels: list,
                         continue
                     if size == 0:
                         continue
+                    _wait_while_busy()
                     _idx.register_video(fp, ch_name, _conn_override=sweep_conn)
                     registered += 1
                     # Ingest .jsonl sidecar if present.
@@ -314,6 +317,7 @@ def sweep_new_videos(output_dir: str, channels: list,
                     jp = base + ".jsonl"
                     if _os.path.isfile(jp):
                         title = _strip_id.sub("", _os.path.basename(base)) or _os.path.basename(base)
+                        _wait_while_busy()
                         if _idx.ingest_jsonl(fp, jp, title, ch_name,
                                         _conn_override=sweep_conn):
                             ingested += 1

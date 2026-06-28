@@ -26,7 +26,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from ..log import get_logger
+from ..log import get_logger, swallow
 
 _log = get_logger(__name__)
 
@@ -96,7 +96,7 @@ def fire_metadata_changed_hook() -> None:
         try:
             _on_metadata_changed_hook()
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("metadata-changed hook", e)
 
 
 # Channel-synced hook — fires each time `sync_all` finishes one channel
@@ -119,4 +119,4 @@ def fire_channel_synced_hook() -> None:
         try:
             _on_channel_synced_hook()
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("channel-synced hook", e)

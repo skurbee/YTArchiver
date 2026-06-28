@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import utils as _utils
-from ..log import get_logger
+from ..log import get_logger, swallow
 from ..log_stream import LogStreamer
 from ..ytarchiver_config import (
     ARCHIVE_FILE,
@@ -338,7 +338,7 @@ def _record_timeout_strike(vid: str, stream) -> bool:
                  "paste its URL in the Download tab to try again.\n", "red"],
             ])
         except Exception as _ee:
-            _log.debug("swallowed: %s", _ee)
+            swallow("timeout-strike gave-up emit", _ee)
     return gave_up
 
 
@@ -374,6 +374,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                  cancel_event: threading.Event | None = None,
                  queues=None, transcribe_mgr=None,
                  pause_event: threading.Event | None = None,
+                 kill_current: threading.Event | None = None,
                  pass_idx: int = 1,
                  pass_total: int = 1) -> SyncResult:
     """
@@ -457,7 +458,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                             total=max(int(pass_total or 1), int(pass_idx or 1)),
                             downloaded=0, skipped=0, errors=0)
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        swallow("sync-progress channel start", e)
 
     yt = find_yt_dlp()
     if not yt:
@@ -584,7 +585,18 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     if channel.get("auto_transcribe"):
         cmd += [
             "--write-auto-subs", "--write-subs",
-            "--sub-langs", "en.*,en",
+            # Request ONLY the real English caption tracks — NOT the `en.*`
+            # wildcard. With --write-auto-subs, `en.*` expands to every
+            # English-prefixed track yt-dlp can synthesize, including
+            # auto-TRANSLATIONS (en-de, en-fr, en-en, …). On a large channel
+            # that multiplies caption requests per video into the hundreds and
+            # trips YouTube's `HTTP 429: Too Many Requests`, which then
+            # cascades and breaks the per-video DLTRACK processing for the
+            # whole pass (videos download to disk but never register / get
+            # metadata / get transcribed). Listing the explicit English
+            # variants gets the caption we actually use for transcription
+            # without the translation explosion.
+            "--sub-langs", "en,en-orig,en-US,en-GB",
             "--sub-format", "vtt",
             "--convert-subs", "vtt",
         ]
@@ -631,7 +643,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 " (Entire-channel folder is empty — bypassing the "
                 "download archive to repopulate from scratch)")
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("empty-folder repopulate emit", e)
     else:
         cmd += ["--download-archive", str(ARCHIVE_FILE)]
     # sync_complete default flipped False → True was
@@ -711,7 +723,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         _net.block_if_down(stream=stream,
                             check_cancel=lambda: cancel_event and cancel_event.is_set())
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        swallow("net-block check", e)
 
     # Counters that must persist across the /videos + /streams passes.
     downloaded = 0
@@ -805,6 +817,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # the merge target, so we'd otherwise log 3 lines per video and
     # triple-count the `downloaded` tally. Keyed by merged .mp4 path.
     _title_announced: dict[str, bool] = {}
+    _counted_vids: set[str] = set()  # vid-keyed guard so path collisions don't suppress counts
 
     # ── Inline metadata pipeline ──────────────────────────────────────
     # Design intent: "when a sync download kicks out a metadata
@@ -944,7 +957,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             try: _meta_futures.append(_fut)
             except Exception: pass
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("metadata executor submit", e)
 
     # track returncode per pass instead of relying on
     # `proc.returncode` after the loop (which reads the LAST proc only;
@@ -961,8 +974,11 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # cannot access local variable 'proc' where it is not associated
     # with a value" when resuming a paused sync.
     proc = None
+    _disk_low_stop = False
     for _pass_idx, _target_url in enumerate(_urls_to_run):
         if cancel_event is not None and cancel_event.is_set():
+            break
+        if _disk_low_stop:
             break
         # If the user paused during the main pass (yt-dlp's stdout
         # loop broke out after emitting its "Paused — stopping
@@ -1063,7 +1079,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 try:
                     proc.terminate()
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    swallow("cancel terminate", e)
                 stream.emit([[" \u26d4 Cancelled.\n", "red"]])
                 break
 
@@ -1083,6 +1099,13 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     proc.terminate()
                 except Exception as e:
                     _log.debug("yt-dlp terminate on pause failed: %s", e)
+                break
+
+            if kill_current is not None and kill_current.is_set():
+                try:
+                    proc.terminate()
+                except Exception as e:
+                    swallow("skip-current terminate", e)
                 break
 
             s = line.rstrip()
@@ -1221,11 +1244,29 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                               "red"],
                              ["\n", "red"]])
                 stream.emit([["\u2588  ", "red"],
-                             ["reuse the session cookie. Public "
-                              "videos still download without signing in.",
+                             ["reuse the session cookie. "
+                              "\u23f8 Sync paused \u2014 click Resume to continue.",
                               "red"],
                              ["\n", "red"]])
                 stream.emit([[_bar + "\n\n", "red"]])
+                # Auto-pause so the user must re-sign in before more
+                # channels run. Setting pause_event here terminates the
+                # current yt-dlp subprocess; sync_all._wait_if_paused()
+                # blocks the loop until the user clicks Resume.
+                if pause_event is not None:
+                    try:
+                        pause_event.set()
+                    except Exception as _cpe:
+                        _log.debug("cookie alert: pause_event.set() failed: %s",
+                                   _cpe)
+                # Notify the frontend to show a prominent modal dialog so
+                # the user doesn't miss the cookie-expired warning buried
+                # in the log text.
+                import json as _json
+                stream.emit([[
+                    _json.dumps({"kind": "cookie_alert"}),
+                    "__control__",
+                ]])
 
             # DLTRACK:::Title:::Uploader:::YYYYMMDD:::bytes:::secs:::videoID
             # Emitted by yt-dlp's --print after_video:... directive ONLY
@@ -1396,10 +1437,27 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                         # (mirrors verbose emit),
                         # and upgrades the tri-state (missing / "pending" / True).
                         _prev = _title_announced.get(final_path)
+                        _already_counted = vid in _counted_vids
                         if _prev is not True:
                             _title_announced[final_path] = True
                             _hide_sidecar_win(final_path)
+                        if not _already_counted:
+                            _counted_vids.add(vid)
                             downloaded += 1
+                            # Periodic disk-space re-check every 10 downloads.
+                            if downloaded % 10 == 0:
+                                if not check_disk_space(str(ch_dir), 100 * 1024 * 1024):
+                                    stream.emit([
+                                        ["ERROR: ", "red"],
+                                        ["Stopping: less than 100 MB free — "
+                                         "further downloads would leave partial files.\n", "red"],
+                                    ])
+                                    _disk_low_stop = True
+                                    try:
+                                        proc.terminate()
+                                    except Exception as _dle:
+                                        swallow("disk-low terminate", _dle)
+                                    break
                             # Companion display would read downloaded=0
                             # for entire channel-length syncs because
                             # write_sync_progress was only called once
@@ -1415,7 +1473,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                               int(pass_idx or 1)),
                                     downloaded=1, skipped=0, errors=0)
                             except Exception as e:
-                                _log.debug("swallowed: %s", e)
+                                swallow("sync-progress dltrack", e)
                             _display = (t or re.sub(
                                 r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "",
                                 os.path.splitext(os.path.basename(final_path))[0]
@@ -1603,12 +1661,12 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                 video_id=vid,
                                 duration_secs=_dur_val)
                         except Exception as _re:
-                            # surface the failure so the user
-                            # knows a download they just saw succeed is
-                            # actually invisible in Browse/Search. Old
-                            # code silently swallowed this.
-                            stream.emit_dim(
-                                f" (index register failed for {t!r}: {_re})")
+                            errors += 1
+                            stream.emit([
+                                [" ⚠ Index failed: ", "yellow"],
+                                [f"{t!r} downloaded but won't appear in "
+                                 f"Browse/Search — {_re}\n", "yellow"],
+                            ])
                         try:
                             # Pass size + duration through so the function
                             # doesn't need to spawn ffprobe / re-stat the
@@ -1640,7 +1698,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                             from .. import livestreams as _ls
                             _ls.drop(vid)
                         except Exception as e:
-                            _log.debug("swallowed: %s", e)
+                            swallow("deferred-livestream drop", e)
                         # Issues #139/#144/#148: emit a meta_done_<vid>
                         # placeholder BEFORE the metadata fetch fires
                         # async. The done line tags the same marker so
@@ -1811,7 +1869,28 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                     stream.emit_error(
                                         f"Video compression failed to start: {_e}")
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    # This handler wraps the ENTIRE per-video DLTRACK pipeline
+                    # (bind → count → register → metadata → transcribe enqueue).
+                    # It previously swallowed at debug level, which silently hid
+                    # a regression where _hide_sidecar_win raised AttributeError
+                    # for EVERY video (a renamed util that wasn't re-exported):
+                    # videos landed on disk but nothing was counted/registered/
+                    # transcribed and NO error showed — the pass read
+                    # "0 downloaded · 0 errors". Surface it loudly so a broken
+                    # post-download step can never again masquerade as a silent
+                    # no-op: log the full traceback AND show a visible note.
+                    _bad_vid = locals().get("vid", "") or "?"
+                    _log.warning(
+                        "DLTRACK post-download processing failed for vid=%s: %s",
+                        _bad_vid, e, exc_info=True)
+                    try:
+                        stream.emit([
+                            [" ⚠ ", "yellow"],
+                            [f"{_bad_vid} downloaded but post-processing failed "
+                             f"(on disk, may not be indexed): {e}\n", "yellow"],
+                        ])
+                    except Exception:
+                        pass
                 # Reset per-video path captures so the NEXT video in the
                 # same yt-dlp pass doesn't inherit this one's paths.
                 # Mirrors YTArchiver.py:18556.
@@ -2044,7 +2123,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                         ])
                     continue
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                swallow("live-detect classify", e)
 
             # Error lines.
             # require the error/warning tokens to appear
@@ -2248,20 +2327,24 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         try:
             _watchdog.stop(timeout=4.0)
         except Exception as _wde:
-            _log.debug("swallowed: %s", _wde)
+            swallow("watchdog stop", _wde)
         if _wd_stalled.get("hit") and current_vid_id:
             _failed_this_run.add(current_vid_id)
 
         try:
             finish_ytdlp_process(proc)
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("ytdlp proc finish", e)
         # record this pass's returncode for the final
         # _ok check. None = terminated mid-flight without wait (treated
         # below as not-a-failure if any other pass succeeded).
         _pass_returncodes.append(proc.returncode)
         # End of per-URL pass (main /videos or /streams). Loop picks up the
         # next URL if there is one.
+
+    if _disk_low_stop:
+        return SyncResult(ok=False, reason="disk_low_midrun",
+                          downloaded=downloaded, errors=errors)
 
     elapsed = time.time() - t_start
     took = _fmt_duration(elapsed)
@@ -2285,7 +2368,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                             downloaded=0,
                             skipped=0, errors=errors)
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        swallow("sync-progress channel end", e)
 
     # refresh the disk cache for this channel now that the
     # download pass completed. Without this hook the Subs table's
@@ -2376,10 +2459,10 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                      "again.\n", "red"],
                 ])
             except Exception as _ee:
-                _log.debug("swallowed: %s", _ee)
+                swallow("gave-up emit", _ee)
         if _gave_up:
             try: stream.flush()
-            except Exception as _fe: _log.debug("swallowed: %s", _fe)
+            except Exception as _fe: swallow("stream flush", _fe)
         # Safety net: counts in _next_failed are already < 3 by construction.
         _next_failed = {v: c for v, c in _next_failed.items() if c < 3}
         # Only write if something actually changed (avoid config churn
@@ -2412,7 +2495,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 stream.emit_dim(
                     f" (failed-id list save skipped: {_fce})")
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        swallow("failed-id persist", e)
 
     # Clear current-sync marker
     if queues is not None:
@@ -2441,7 +2524,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     if _in_flight:
                         _fwait(_in_flight, timeout=10.0)
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    swallow("meta-executor drain-inflight", e)
             else:
                 # Happy path: DRAIN — wait for every queued per-video
                 # fetch to run. cancel_futures=True here contradicted
@@ -2453,7 +2536,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 # in the log forever.
                 _meta_exec.shutdown(wait=True, cancel_futures=False)
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("meta-executor shutdown", e)
 
     # Consolidated activity-log row — request: replace the
     # historical 3 rows with ONE [Dwnld] row per channel per sync pass
@@ -2489,7 +2572,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 if _is_idle:
                     transcribe_mgr.consume_channel_batch_stats(name)
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                swallow("transcribe batch-stats consume", e)
         _row_id = emit_consolidated_auto_row(
             stream, name,
             downloaded=int(downloaded or 0),
@@ -2522,7 +2605,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             from .. import channel_cache as _cc
             _cc.append_ids(url, downloaded_ids)
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("channel-cache append", e)
 
     # Update config last_sync + initialized/sync_complete flags. These
     # are load-bearing for the `--break-on-existing` gate above: OLD
@@ -2601,7 +2684,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                 "channel will do another full walk on the "
                                 "next sync to catch missed videos)")
                         except Exception as e:
-                            _log.debug("swallowed: %s", e)
+                            swallow("sync-interrupted emit", e)
                     # Only stamp channel-level refresh timestamps on a bootstrap
                     # pass; an incremental sync may refresh only a few entries.
                     if _meta_did_fetch and _was_bootstrap_pass:
@@ -2636,7 +2719,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             try:
                 stream.emit_dim(f" ({_config_write_err})")
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                swallow("config-write-err emit", e)
 
     # Safety net: after the sync pass completes, sweep the channel folder
     # for orphan .vtt caption files and delete them. yt-dlp can drop
@@ -2718,9 +2801,9 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     }), "__control__"],
                 ])
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                swallow("orphan-dlrow clear emit", e)
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        swallow("orphan-dlrow sweep", e)
 
     # derive _ok from ANY pass's returncode instead of
     # reading the last proc.returncode (which could be None if the loop
@@ -2760,7 +2843,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 f"yt-dlp crashed with no output (exit {_rc_hex}) — "
                 "no videos checked.")
         except Exception as _e:
-            _log.debug("swallowed: %s", _e)
+            swallow("crash-exit emit", _e)
     if _good_rcs:
         _ok = True
     elif _crashed:

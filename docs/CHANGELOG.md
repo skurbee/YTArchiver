@@ -6,6 +6,20 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v79.1 - 2026-06-28
+
+### Fixed
+- **First-time channel pauses now stay in the queue.** Pausing a new channel download during its first sync no longer makes the task look finished or disappear from the queue.
+- **Startup indexing yields to active downloads.** Browse preload and new-file indexing now back off while sync or GPU work is active, reducing first-download stalls on large archives.
+- **Browse preload avoids caching partial channel loads.** Low-priority preload work now retries cleanly after being interrupted instead of storing incomplete channel state.
+
+### Changed
+- **API mixins continue moving behind service boundaries.** Queue, transcription, onboarding, redownload, and thumbnail paths now prefer injected application services with compatibility fallbacks.
+
+### Validation
+- Focused backend smoke tests passed for sync pause behavior, low-priority Browse preload, index maintenance, AppServices mixin slices, and related compile checks.
+- Built with Python 3.13 using the PyInstaller spec file.
+
 ## v78.9 - 2026-06-22
 
 ### Fixed

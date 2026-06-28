@@ -119,6 +119,17 @@
       } catch (_e) {}
     }
 
+    function _fmtBackupAge(ts) {
+      if (!ts) return "Last backup: never";
+      const days = Math.floor((Date.now() / 1000 - ts) / 86400);
+      const label = days === 0 ? "today"
+        : days === 1 ? "yesterday"
+        : `${days} days ago`;
+      return days >= 14
+        ? `⚠ Last backup: ${label} — consider exporting soon`
+        : `Last backup: ${label}`;
+    }
+
     async function load() {
       if (!nativeBridgeUp()) return;
       try {
@@ -155,6 +166,16 @@
             amEl.value = (ast && ast.mode === "clock") ? "clock" : "timer";
           }
         } catch (e) { /* ignore */ }
+        // Launch at boot — read Registry state, not config.
+        try {
+          const bootState = await bridgeCall("launch_at_boot_get");
+          const labEl = document.getElementById("settings-launch-at-boot");
+          const lbmEl = document.getElementById("settings-boot-minimized");
+          const lbmWrap = document.getElementById("settings-boot-minimized-wrap");
+          if (labEl) labEl.checked = !!bootState?.enabled;
+          if (lbmEl) lbmEl.checked = !!bootState?.minimized;
+          if (lbmWrap) lbmWrap.hidden = !bootState?.enabled;
+        } catch (_e) { /* non-fatal */ }
         // BUG FIX (2026-05-14): the custom `.yt-dd` widget mirrors a
         // hidden <select> via its own div trigger. When JS sets
         // sel.value programmatically there's no change event, so the
@@ -178,6 +199,9 @@
           });
         }
         _updatePreloadHints();
+        // Backup age (T295)
+        const bkAgeEl = document.getElementById("backup-age-display");
+        if (bkAgeEl) bkAgeEl.textContent = _fmtBackupAge(s.last_backup_ts || 0);
         const vEl = document.getElementById("settings-ytdlp-version");
         if (vEl) vEl.textContent = "checking\u2026";
         try {
@@ -232,6 +256,29 @@
     });
     _diskEl?.addEventListener("keydown", (e) => {
       if (e.key === "Enter") { e.preventDefault(); _diskEl.blur(); }
+    });
+
+    // Launch at boot / start minimized to tray.
+    document.getElementById("settings-launch-at-boot")?.addEventListener("change", async (e) => {
+      if (!nativeBridgeUp()) return;
+      const minimized = !!document.getElementById("settings-boot-minimized")?.checked;
+      const lbmWrap = document.getElementById("settings-boot-minimized-wrap");
+      if (lbmWrap) lbmWrap.hidden = !e.target.checked;
+      try {
+        const res = await bridgeCall("launch_at_boot_set", !!e.target.checked, minimized);
+        if (res?.ok) flashSaved(true);
+        else { flashSaved(false); window._showToast?.(res?.error || "Boot setting failed.", "error"); }
+      } catch (err) { flashSaved(false); }
+    });
+    document.getElementById("settings-boot-minimized")?.addEventListener("change", async (e) => {
+      if (!nativeBridgeUp()) return;
+      const enabled = !!document.getElementById("settings-launch-at-boot")?.checked;
+      if (!enabled) return;
+      try {
+        const res = await bridgeCall("launch_at_boot_set", true, !!e.target.checked);
+        if (res?.ok) flashSaved(true);
+        else { flashSaved(false); window._showToast?.(res?.error || "Boot setting failed.", "error"); }
+      } catch (err) { flashSaved(false); }
     });
 
     // Auto-sync timing mode — applied immediately via its own scheduler
@@ -735,8 +782,13 @@
 
     bkExpBtn?.addEventListener("click", async () => {
       const res = await bridgeCall("export_full_backup");
-      if (res?.ok) window._showToast?.(`Backup saved (${res.files} files).`, "ok");
-      else if (!res?.cancelled) window._showToast?.(res?.error || "Backup failed.", "error");
+      if (res?.ok) {
+        window._showToast?.(`Backup saved (${res.files} files).`, "ok");
+        const bkAgeEl = document.getElementById("backup-age-display");
+        if (bkAgeEl) bkAgeEl.textContent = _fmtBackupAge(res.last_backup_ts || Date.now() / 1000);
+      } else if (!res?.cancelled) {
+        window._showToast?.(res?.error || "Backup failed.", "error");
+      }
     });
     bkImpBtn?.addEventListener("click", async () => {
       if (!nativeBridgeUp()) return;

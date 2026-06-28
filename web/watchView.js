@@ -76,6 +76,8 @@
       const res = await bridgeCall("browse_get_transcript", {
         video_id: cur.video_id || undefined,
         title: cur.title || "",
+        channel: cur.channel || "",
+        filepath: cur.filepath || "",
       });
       let segments = [];
       let sourceInfo = null;
@@ -127,6 +129,85 @@
     }
   };
 
+  /** Render the empty / no-speech transcript state into the panel.
+   * Handles both "not yet transcribed" and "Whisper found no speech". */
+  function _renderEmptyTranscript(tr, video, vEl) {
+    const _noSpeech = !!(video && video.tx_status === "no_speech");
+    tr.innerHTML = _noSpeech
+      ? '<div class="watch-transcript-note">No speech detected — this video has no spoken audio to transcribe.</div>'
+      : '<div class="watch-transcript-note">No transcript available.</div>';
+    _unbindKaraoke();
+    // Hide any stale overlay phrase that lingered from the previous video.
+    try { vEl._capOverlay && vEl._capOverlay.classList.remove("show"); } catch { /* ignore */ }
+  }
+
+  /** Build the scrollable transcript body from segment data.
+   * Returns { body, segEls, allWordEls, wordIndex }.
+   *
+   * Token-count reconciliation: when the punctuated-text token count
+   * matches the raw word-timestamp count, punctuated tokens drive the
+   * display while per-word timestamps stay intact for karaoke.
+   * On mismatch (cap-flush rollover, manual edits) falls back to raw words. */
+  function _buildTranscriptBody(transcript, vEl) {
+    const body = document.createElement("div");
+    body.className = "watch-transcript-body";
+    const segEls = [];
+    for (const seg of transcript) {
+      const segEl = document.createElement("span");
+      segEl.className = "seg";
+      segEl.dataset.s = seg.s ?? 0;
+      segEl.dataset.e = seg.e ?? 0;
+      const words = Array.isArray(seg.words) && seg.words.length
+        ? seg.words
+        : (seg.w && seg.w.length ? seg.w : null);
+      const segText = seg.t || seg.text || "";
+      const textTokens = segText.trim().split(/\s+/).filter(Boolean);
+      if (words && textTokens.length === words.length) {
+        for (let i = 0; i < words.length; i++) {
+          const wobj = words[i];
+          const span = document.createElement("span");
+          span.className = "word";
+          span.dataset.s = wobj.s ?? 0;
+          span.dataset.e = wobj.e ?? 0;
+          span.textContent = textTokens[i] + " ";
+          segEl.appendChild(span);
+        }
+      } else if (words) {
+        for (const wobj of words) {
+          const span = document.createElement("span");
+          span.className = "word";
+          span.dataset.s = wobj.s ?? 0;
+          span.dataset.e = wobj.e ?? 0;
+          span.textContent = (wobj.w || "") + " ";
+          segEl.appendChild(span);
+        }
+      } else {
+        const span = document.createElement("span");
+        span.className = "word";
+        span.dataset.s = String(seg.s ?? 0);
+        span.textContent = segText + " ";
+        segEl.appendChild(span);
+      }
+      // Trailing space between segments keeps words from running together.
+      segEl.appendChild(document.createTextNode(" "));
+      body.appendChild(segEl);
+      segEls.push(segEl);
+    }
+    // Delegated click listener — one closure on the body instead of N
+    // per-word closures (memory pressure on long transcripts). Walks up
+    // to nearest .word and seeks via dataset.s.
+    body.addEventListener("click", (e) => {
+      const wEl = e.target && e.target.closest && e.target.closest(".word");
+      if (!wEl) return;
+      const _s = parseFloat(wEl.dataset.s);
+      if (Number.isFinite(_s)) _seekTo(vEl, _s);
+    });
+    const allWordEls = Array.from(body.querySelectorAll(".word"));
+    const wordIndex = new Map();
+    for (let i = 0; i < allWordEls.length; i++) wordIndex.set(allWordEls[i], i);
+    return { body, segEls, allWordEls, wordIndex };
+  }
+
   /** Render the Watch view: loads the real video file into <video> and
    * builds per-word transcript spans with (s, e) timestamps for karaoke.
    *
@@ -166,9 +247,9 @@
     if (video.views) parts.push(video.views + " views");
     meta.textContent = parts.join(" · ");
 
-    // Stash for `_onRetranscribeComplete` — when the Python side finishes
-    // a retranscribe, it pushes an event; the handler checks this ref
-    // to decide whether the completed job matches what's on screen.
+    // Stash for `_onRetranscribeComplete` — when Python finishes a
+    // retranscribe, the handler checks this ref to decide whether the
+    // completed job matches what's on screen.
     window._watchCurrentVideo = video;
     window._watchRenderedToken = window._watchOpenToken;
 
@@ -185,113 +266,22 @@
 
     tr.innerHTML = "";
     if (!transcript || transcript.length === 0) {
-      // Distinguish a genuinely-silent video (Whisper ran, found no speech)
-      // from one that just hasn't been transcribed yet — both have zero
-      // segments. browse_get_transcript returns tx_status; callers stash it
-      // on `video`. 'no_speech' → say so plainly instead of the generic line.
-      const _noSpeech = !!(video && video.tx_status === "no_speech");
-      tr.innerHTML = _noSpeech
-        ? '<div class="watch-transcript-note">No speech detected — this video has no spoken audio to transcribe.</div>'
-        : '<div class="watch-transcript-note">No transcript available.</div>';
-      _unbindKaraoke();
-      // Hide the on-video overlay so a stale phrase doesn't linger over
-      // the still-playing video after a failed retranscribe.
-      try { vEl._capOverlay && vEl._capOverlay.classList.remove("show"); } catch { /* ignore */ }
+      _renderEmptyTranscript(tr, video, vEl);
       return;
     }
 
     const frag = document.createDocumentFragment();
-
-    // Source banner — Whisper / YT auto-captions / unknown. Mirrors
-    // ArchivePlayer's `_ytSourceBannerHTML`. Pass the actual transcript
-    // so the banner can verify the "(punctuation restored)" claim
-    // against real content — for legacy videos the source tag says
-    // YT+PUNCTUATION (Transcript.txt was punct-restored) but the
-    // per-segment data in the watch view was never punctuated, so the
-    // banner used to lie.
+    // Source banner — Whisper / YT auto-captions / unknown. Pass the
+    // actual transcript so the banner can verify the "(punctuation
+    // restored)" claim against real per-segment content.
     const bannerEl = _buildSourceBanner(sourceInfo, video, transcript);
     if (bannerEl) frag.appendChild(bannerEl);
 
-    // Flatten every word across every segment into one continuous flowing
-    // body. No per-segment div, no inline [timestamp] prefixes — matches
-    // ArchivePlayer. The `seg` wrappers are kept for karaoke so the whole
-    // block highlights while the active word inside it gets stronger styling.
-    const body = document.createElement("div");
-    body.className = "watch-transcript-body";
-    const segEls = [];
-    for (const seg of transcript) {
-      const segEl = document.createElement("span");
-      segEl.className = "seg";
-      segEl.dataset.s = seg.s ?? 0;
-      segEl.dataset.e = seg.e ?? 0;
-      const words = Array.isArray(seg.words) && seg.words.length
-        ? seg.words
-        : (seg.w && seg.w.length ? seg.w : null);
-      // Tokenize the segment text on whitespace. After the "Restore
-      // transcript punctuation" pass runs, seg.text/seg.t holds the
-      // punctuated paragraph form while the words array stays raw
-      // (drives the video overlay's karaoke captions, which are
-      // intentionally unpunctuated). When the token count matches the
-      // words count we
-      // render the punctuated tokens but keep the per-word timestamps —
-      // user sees readable prose with full karaoke + click-to-seek.
-      // If counts ever disagree (cap-flush rollover words, manual
-      // edits, etc.) fall back to the raw words.
-      const segText = seg.t || seg.text || "";
-      const textTokens = segText.trim().split(/\s+/).filter(Boolean);
-      // Per-word click handlers were causing memory pressure on long
-      // videos — a 10k-word transcript allocated 10k closures that
-      // GC eventually had to reap. Use event delegation instead:
-      // one click listener on the body root walks up to the nearest
-      // .word and seeks. Set up below, once per render.
-      if (words && textTokens.length === words.length) {
-        for (let i = 0; i < words.length; i++) {
-          const wobj = words[i];
-          const span = document.createElement("span");
-          span.className = "word";
-          span.dataset.s = wobj.s ?? 0;
-          span.dataset.e = wobj.e ?? 0;
-          span.textContent = textTokens[i] + " ";
-          segEl.appendChild(span);
-        }
-      } else if (words) {
-        for (const wobj of words) {
-          const span = document.createElement("span");
-          span.className = "word";
-          span.dataset.s = wobj.s ?? 0;
-          span.dataset.e = wobj.e ?? 0;
-          span.textContent = (wobj.w || "") + " ";
-          segEl.appendChild(span);
-        }
-      } else {
-        const span = document.createElement("span");
-        span.className = "word";
-        span.dataset.s = String(seg.s ?? 0);
-        span.textContent = segText + " ";
-        segEl.appendChild(span);
-      }
-      // Trailing space between segments keeps words from running together.
-      segEl.appendChild(document.createTextNode(" "));
-      body.appendChild(segEl);
-      segEls.push(segEl);
-    }
-    // Delegated click handler — one listener on body instead of N
-    // per-word listeners. Walks up to nearest .word and seeks via
-    // dataset.s. Replaces the previous closure-per-word pattern
-    // that allocated thousands of listeners for long transcripts.
-    body.addEventListener("click", (e) => {
-      const wEl = e.target && e.target.closest && e.target.closest(".word");
-      if (!wEl) return;
-      const _s = parseFloat(wEl.dataset.s);
-      if (Number.isFinite(_s)) _seekTo(vEl, _s);
-    });
+    const { body, segEls, allWordEls, wordIndex } =
+      _buildTranscriptBody(transcript, vEl);
     frag.appendChild(body);
     tr.appendChild(frag);
-    // Flat list of every .word span (document order) so the karaoke loop
-    // can pull the active word's neighbours for the pinned video overlay.
-    const allWordEls = Array.from(body.querySelectorAll(".word"));
-    const wordIndex = new Map();
-    for (let i = 0; i < allWordEls.length; i++) wordIndex.set(allWordEls[i], i);
+
     _bindKaraoke(vEl, tr, segEls, allWordEls, wordIndex);
     // The on-video overlay is a pinned DOM overlay (see _ensureCapOverlay)
     // driven by the karaoke loop above — no WebVTT cue track needed.

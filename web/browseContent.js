@@ -180,6 +180,8 @@
         const res = await bridgeCall("browse_get_transcript", {
           video_id: video.video_id || undefined,
           title: video.title || "",
+          channel: video.channel || "",
+          filepath: video.filepath || "",
         });
         // If the user navigated away (different video, different tab)
         // while we were waiting, drop the result on the floor so the
@@ -576,6 +578,8 @@
         const res = await bridgeCall("browse_get_transcript", {
           video_id: video.video_id || undefined,
           title: video.title,
+          channel: video.channel || "",
+          filepath: video.filepath || "",
         });
         if (Array.isArray(res)) transcript = res;
         else if (res && res.segments) {

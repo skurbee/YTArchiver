@@ -28,7 +28,7 @@ from datetime import timedelta as _td
 from typing import Any
 
 from .. import utils as _utils
-from ..log import get_logger
+from ..log import get_logger, swallow
 from ..process_runner import PROCESS_REGISTRY
 from ..ytarchiver_config import config_transaction, load_config
 from .ytdlp_proc import _ensure_videos_tab, _find_cookie_source, find_yt_dlp
@@ -120,7 +120,7 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
     try:
         PROCESS_REGISTRY.register(proc)
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        swallow("process-registry register", e)
     timer = None
     timeout_hit = {"hit": False}
     try:
@@ -129,7 +129,7 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
             try:
                 proc.kill()
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                swallow("timer kill", e)
 
         timer = threading.Timer(float(timeout_sec), _kill_on_timeout)
         timer.daemon = True
@@ -145,16 +145,16 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
                 # proc.wait() can hang because the OS pipe buffer is
                 # full and the child blocks on write().
                 try: proc.terminate()
-                except Exception: pass
+                except Exception as e: swallow("deadline terminate", e)
                 try:
                     import threading as _th
                     def _drain():
                         try:
                             while proc.stdout.readline():
                                 pass
-                        except Exception: pass
+                        except Exception as e: swallow("stdout drain", e)
                     _th.Thread(target=_drain, daemon=True).start()
-                except Exception: pass
+                except Exception as e: swallow("drain thread start", e)
                 break
             raw = line.strip()
             if "|||" not in raw:
@@ -171,19 +171,19 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
             try:
                 timer.cancel()
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                swallow("timer cancel", e)
         # Bound the post-kill wait so a child refusing to die can't
         # leak a Windows handle until GC (audit: sync/quickcheck.py:88).
         try: proc.wait(timeout=5)
         except Exception:
             try: proc.kill()
-            except Exception as e: _log.debug("swallowed: %s", e)
+            except Exception as e: swallow("proc kill", e)
             try: proc.wait(timeout=5)
-            except Exception as e: _log.debug("swallowed: %s", e)
+            except Exception as e: swallow("proc wait", e)
         try:
             PROCESS_REGISTRY.unregister(proc)
         except Exception as e:
-            _log.debug("swallowed: %s", e)
+            swallow("process-registry unregister", e)
     result = {"ok": True, "total": total, "lives": lives,
               "upcoming": upcoming}
     if timeout_hit.get("hit"):
@@ -337,4 +337,4 @@ def set_batch_cooldown(ch_url: str) -> None:
                         _dt.now() + _td(hours=_BATCH_COOLDOWN_HOURS)
                     ).isoformat()
     except Exception as e:
-        _log.debug("set_batch_cooldown config update failed: %s", e)
+        swallow("batch-cooldown config update", e)

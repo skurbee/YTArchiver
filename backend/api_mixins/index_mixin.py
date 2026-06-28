@@ -8,7 +8,14 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import os
+import threading
+import time
+
+from ._shared import _log
+from backend.ytarchiver_config import load_config
+from backend import archive_scan
+from backend import index as index_backend
 
 
 class IndexMixin:

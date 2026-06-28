@@ -8,18 +8,23 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import os
+import re
+import threading
+
+from ._shared import _log
+from backend.ytarchiver_config import config_is_writable, load_config, save_config
 
 
 class VideoMixin:
 
     def video_delete_file(self, filepath):
-        """Delete a video file from disk + drop its sidecars + remove
+        """Move a video file to app trash and remove
         the index DB row. Used by the Browse-grid right-click "Delete file"
         action — previously the bridge call had no matching backend method
         and the action silently failed (audit U-3).
 
-        Mirrors recent_delete_file's sidecar-cleanup logic (audit F-24
+        Mirrors recent_delete_file's sidecar-trash logic (audit F-24
         sidecar list) but operates on a path the caller already knows
         instead of looking it up via title+channel.
         """
@@ -32,17 +37,13 @@ class VideoMixin:
         # os.remove a path resolving OUTSIDE the archive roots this app
         # manages — a crafted/compromised filepath must not delete arbitrary
         # files (audit: video_mixin containment).
-        from backend.services.file_ops import (
-            safe_remove_file,
-            safe_remove_sidecars,
-        )
-        removed = safe_remove_file(
+        from backend.services.file_ops import safe_trash_video_file
+        trashed = safe_trash_video_file(
             fp, require_config_writable=True, reason="video_delete_file")
-        if not removed.get("ok"):
-            return removed
+        if not trashed.get("ok"):
+            return trashed
         # Refuse the destructive os.remove if config writes are blocked
         # — see recent_mixin H22 for the same precondition.
-        safe_remove_sidecars(fp)
         # Drop sidecars. audit F-24 list lives in utils.delete_video_sidecars.
         # Drop the index DB row (and its FTS segments) so Browse / Search
         # stop returning the now-deleted video.
@@ -72,10 +73,12 @@ class VideoMixin:
         except Exception as _e:
             # Don't fail the whole call — the file is gone, that's the
             # primary contract. Surface the DB issue as a soft warning.
-            warning = f"File deleted but index cleanup failed: {_e}"
-            return {"ok": False, "file_deleted": True,
+            warning = f"File moved to trash but index cleanup failed: {_e}"
+            return {"ok": False, "file_trashed": True,
                     "cleanup_failed": True, "error": warning,
-                    "warning": warning}
+                    "warning": warning,
+                    "trashed_file_path": trashed.get("trashed_file_path"),
+                    "trashed_folder_path": trashed.get("trashed_folder_path")}
         # Also remove from recent_downloads if it was there.
         if config_is_writable():
             try:
@@ -90,7 +93,9 @@ class VideoMixin:
                     _sc(cfg)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-        return {"ok": True}
+        return {"ok": True,
+                "trashed_file_path": trashed.get("trashed_file_path"),
+                "trashed_folder_path": trashed.get("trashed_folder_path")}
 
 
     def video_redownload(self, video_id, title, resolution):

@@ -4,76 +4,59 @@ Shared utility helpers — direct ports from YTArchiver.py.
 This module collects the small, stateless helpers the rest of the backend
 previously inlined or skipped. Each function name is kept close to the
 original's so `git blame`-style searches across both codebases still work.
+
+Concern-area sub-modules (split out for maintainability):
+  proc_utils.py — subprocess/process helpers
+  fmt_utils.py  — byte/time/duration formatting
+  fs_attrs.py   — Windows file-attribute management (hide/unhide)
+  fs_safety.py  — disk checks, archive containment, atomic I/O, sidecar cleanup
+
+All public names from those modules are re-exported here so existing
+`from .utils import X` call sites continue to work without changes.
 """
 
 from __future__ import annotations
 
-import contextlib
-import ctypes
-import glob
-import json
 import os
 import re
-import shutil
-import subprocess
-import time
 import unicodedata
-from typing import Any
 
 from .log import get_logger
 
+# Re-exports from concern-area sub-modules (backward-compat shims).  # noqa: E402
+from .fmt_utils import (  # noqa: F401
+    fmt_time_ago,
+    format_bytes,
+    format_duration_hms,
+    format_elapsed,
+    format_enc_size,
+)
+from .fs_attrs import (  # noqa: F401
+    _VISIBLE_MEDIA_EXTS,
+    _archive_file_should_be_visible,
+    _file_has_hidden_attribute,
+    hide_file_win,
+    hide_stray_sidecars,
+    unhide_file_win,
+)
+from .fs_safety import (  # noqa: F401
+    atomic_write,
+    check_directory_writable,
+    check_disk_space,
+    delete_video_sidecars,
+    is_within_managed_roots,
+    load_json_safe,
+    sampled_files_equal,
+)
+from .proc_utils import (  # noqa: F401
+    decode_subprocess_line,
+    ffprobe_is_compressed,
+    kill_process,
+    managed_popen,
+    utf8_subprocess_env,
+)
+
 _log = get_logger(__name__)
-
-
-def utf8_subprocess_env() -> dict[str, str]:
-    """Return a copy of os.environ with PYTHONIOENCODING forced to utf-8.
-
-    On Windows, Python subprocess stdout defaults to the console's code
-    page (typically cp1252), which mangles non-ASCII characters yt-dlp
-    emits in video titles (curly apostrophes, em-dashes, etc.). Reading
-    those bytes back with `encoding="utf-8", errors="replace"` produces
-    U+FFFD replacement chars like "World\u2019s" -> "World\ufffds".
-
-    Forcing PYTHONIOENCODING=utf-8 in the subprocess env tells the
-    child Python runtime (including frozen yt-dlp.exe builds) to
-    reconfigure sys.stdout to UTF-8 so our reader sees valid UTF-8.
-
-    Use via: `subprocess.Popen(..., env=utf8_subprocess_env())`.
-    """
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
-    # Best-effort belt-and-suspenders for yt-dlp: its own re-encoding
-    # layer checks this too (yt_dlp/utils/_utils.py:preferredencoding).
-    env["PYTHONUTF8"] = "1"
-    # LC_ALL = C.UTF-8 covers tools that read POSIX locale rather than
-    # PYTHONIOENCODING (e.g. some yt-dlp helpers, ffmpeg).
-    env["LC_ALL"] = "C.UTF-8"
-    env["LANG"] = "C.UTF-8"
-    return env
-
-
-def decode_subprocess_line(line_bytes: bytes) -> str:
-    """Decode a single line from yt-dlp / ffmpeg stdout.
-
-    Tries UTF-8 first (which is what yt-dlp emits when PYTHONIOENCODING
-    is set correctly). If that fails because the frozen yt-dlp.exe
-    bootstrap ignored the env var and fell back to cp1252, decode as
-    cp1252 so characters like U+2019 (\u2019, curly apostrophe) round-
-    trip cleanly instead of becoming U+FFFD replacement chars.
-
-    Belt-and-suspenders companion to `utf8_subprocess_env()` — reported replacement chars in titles even after the env var fix,
-    suggesting yt-dlp.exe isn't consistently respecting the setting.
-    """
-    if not line_bytes:
-        return ""
-    try:
-        return line_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        pass
-    # cp1252 has no "unmapped" bytes in 0x80-0x9F for \x81, \x8D, \x8F,
-    # \x90, \x9D — those raise UnicodeDecodeError without `errors`.
-    # errors="replace" replaces ONLY those rare bytes, not the whole line.
-    return line_bytes.decode("cp1252", errors="replace")
 
 
 # ── Single source of truth for year/month folder naming ───────────────
@@ -96,91 +79,6 @@ MONTH_FOLDERS = {
 }
 
 
-# ── Format helpers (YTArchiver.py:2815 / 9299 / 9308) ──────────────────
-
-def format_bytes(n: int, dash_if_zero: bool = True) -> str:
-    """Pretty-print a byte count. 0 → '\u2014' when dash_if_zero."""
-    n = int(n or 0)
-    if n <= 0 and dash_if_zero:
-        return "\u2014"
-    units = ("B", "KB", "MB", "GB", "TB", "PB")
-    i = 0
-    v = float(n)
-    while v >= 1024 and i < len(units) - 1:
-        v /= 1024.0
-        i += 1
-    if i == 0:
-        return f"{int(v)} {units[i]}"
-    return f"{v:.{1 if i >= 2 else 0}f} {units[i]}"
-
-
-def format_duration_hms(secs: float) -> str:
-    """Format seconds as `H:MM:SS` or `MM:SS` (when under 1 hour)."""
-    try:
-        s = int(float(secs or 0))
-    except (TypeError, ValueError):
-        return "0:00"
-    if s < 0:
-        s = 0
-    h, rem = divmod(s, 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return f"{h}:{m:02d}:{s:02d}"
-    return f"{m}:{s:02d}"
-
-
-def format_elapsed(secs: float) -> str:
-    """Compact elapsed-time format for in-line log strings.
-
-    Rules (always fold into Xm XXs):
-      < 60s      -> "Xs"            ("47s")
-      < 1h       -> "Xm YYs"        ("3m 21s", zero-padded seconds)
-      >= 1h      -> "Xh Ym YYs"     ("1h 5m 03s")
-
-    Use this anywhere the user-facing log would otherwise show raw
-    seconds for a duration (heartbeats, "took N", elapsed counters).
-    Never emit bare "201s" — fold via this helper instead.
-    """
-    try:
-        s = int(float(secs or 0))
-    except (TypeError, ValueError):
-        return "0s"
-    if s < 0:
-        s = 0
-    if s < 60:
-        return f"{s}s"
-    h, rem = divmod(s, 3600)
-    m, ss = divmod(rem, 60)
-    if h:
-        return f"{h}h {m}m {ss:02d}s"
-    return f"{m}m {ss:02d}s"
-
-
-def format_enc_size(mb: float) -> str:
-    """Format a megabyte count for encode progress display (e.g. '1.23 GB')."""
-    try:
-        mb = float(mb)
-    except (TypeError, ValueError):
-        return "\u2014"
-    if mb >= 1024:
-        return f"{mb / 1024:.2f} GB"
-    return f"{mb:.1f} MB"
-
-
-def fmt_time_ago(ts: float) -> str:
-    """Human-friendly 'N min ago' style for Recent tab. ts is Unix epoch."""
-    try:
-        age = max(0.0, time.time() - float(ts))
-    except (TypeError, ValueError):
-        return ""
-    if age < 60: return "just now"
-    if age < 3600: return f"{int(age / 60)} min ago"
-    if age < 86400: return f"{int(age / 3600)} h ago"
-    if age < 86400 * 30: return f"{int(age / 86400)} d ago"
-    if age < 86400 * 365: return f"{int(age / 2592000)} mo ago"
-    return f"{int(age / 31536000)} yr ago"
-
-
 # ── Unicode title normalization (YTArchiver.py:7765) ───────────────────
 
 _NORM_ASCII_RE = re.compile(r'[^A-Za-z0-9]+')
@@ -190,7 +88,7 @@ def norm_ascii(text: str) -> str:
     """Return an ASCII-only, lower-case, punctuation-stripped form for matching.
 
     Handles NFC/NFD Unicode forms so titles with combining marks (e.g.
-    caf\u00e9) still match titles written as `cafe`. Used for fuzzy title
+    café) still match titles written as `cafe`. Used for fuzzy title
     matching in the file-date fixer + recent-file recovery.
     """
     if not text:
@@ -203,107 +101,6 @@ def norm_ascii(text: str) -> str:
         return ascii_key
     fallback = unicodedata.normalize("NFKC", nfc)
     return re.sub(r"[^\w\s]+", " ", fallback).strip().lower()
-
-
-# ── Disk pre-flight checks (YTArchiver.py:2314 / 2332) ─────────────────
-
-def check_directory_writable(path: str) -> bool:
-    """Can we create + delete a probe file inside `path`? True if yes."""
-    if not path:
-        return False
-    try:
-        if not os.path.isdir(path):
-            return False
-        # clean up any stale probe files from a previous
-        # run (crashed process, antivirus-blocked unlink, etc.) before
-        # writing a new one. Without this, the archive root accumulates
-        # `.yta_probe_<PID>` litter over time.
-        try:
-            for _f in os.listdir(path):
-                if _f.startswith(".yta_probe_"):
-                    try: os.remove(os.path.join(path, _f))
-                    except OSError: pass
-        except OSError:
-            pass
-        probe = os.path.join(path, f".yta_probe_{os.getpid()}")
-        with open(probe, "w", encoding="utf-8") as f:
-            f.write("ok")
-        try: os.remove(probe)
-        except OSError: pass
-        return True
-    except OSError:
-        return False
-
-
-def check_disk_space(path: str, required_bytes: int) -> bool:
-    """True if `path`'s filesystem has at least `required_bytes` free."""
-    if not path or required_bytes <= 0:
-        return True
-    try:
-        free = shutil.disk_usage(path).free
-        return free >= int(required_bytes)
-    except (OSError, ValueError) as exc:
-        _log.warning("disk space probe failed for %r: %s", path, exc)
-        return False
-
-
-# ── Subprocess cleanup (YTArchiver.py:2243 / 9214 / 9262) ──────────────
-
-def kill_process(proc: subprocess.Popen | None, timeout: float = 2.0) -> None:
-    """Terminate then kill a child process, swallowing errors.
-
-    Sends SIGTERM, waits up to `timeout`, then SIGKILL. No-op if proc is
-    None or already exited.
-    """
-    if proc is None:
-        return
-    try:
-        if proc.poll() is not None:
-            return
-        try:
-            proc.terminate()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        try:
-            proc.wait(timeout=float(timeout))
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            proc.kill()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        try:
-            proc.wait(timeout=1.0)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-    except Exception as e:
-        _log.debug("swallowed: %s", e)
-
-
-# ── ffprobe: is the file already AV1/NVENC-compressed? ────────────────
-# (YTArchiver.py:9336 _ffprobe_is_compressed)
-
-def ffprobe_is_compressed(filepath: str) -> bool:
-    """Heuristic: True if the video was produced by this app's compress
-    pipeline. We stamp compressed files with `encoder=ytarchive_nvenc` in
-    the format metadata; ffprobe reads that tag.
-    """
-    if not filepath or not os.path.isfile(filepath):
-        return False
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error",
-             "-show_entries", "format_tags=encoder",
-             "-of", "default=noprint_wrappers=1:nokey=1",
-             filepath],
-            capture_output=True, text=True, timeout=10,
-            creationflags=(0x08000000 if os.name == "nt" else 0),
-        )
-        tag = (r.stdout or "").strip().lower()
-        return "ytarchive_nvenc" in tag or "av1_nvenc" in tag
-    except Exception:
-        return False
 
 
 # ── Channel helpers ────────────────────────────────────────────────────
@@ -398,484 +195,3 @@ def sqlite_like_escape(s: str) -> str:
             (pattern,))
     """
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
-# ── Windows file attributes ────────────────────────────────────────────
-
-def hide_file_win(path) -> None:
-    """Set the Windows HIDDEN attribute on a file or folder. No-op on
-    non-Windows.
-
-    Used for sidecar files (e.g. `.{name} Metadata.jsonl`) and folders
-    (e.g. `.Thumbnails/`, `.ChannelArt/`) that should be invisible to
-    Explorer but readable by the app.
-
-    Checks the SetFileAttributesW return value (Windows returns 0 on
-    failure). Logs a warning on failure rather than silently swallowing —
-    per the "ULTIMATE RULE" memory, sidecars MUST stay hidden; a silent
-    failure here would expose internals to the user's archive view.
-    Preserves the file's other attributes (read-only, system, archive
-    bit) by OR-ing FILE_ATTRIBUTE_HIDDEN into the current value rather
-    than passing 0x02 alone.
-    """
-    if os.name != "nt":
-        return
-    try:
-        p = str(path)
-        FILE_ATTRIBUTE_HIDDEN = 0x02
-        INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
-        cur = ctypes.windll.kernel32.GetFileAttributesW(p)
-        if cur == INVALID_FILE_ATTRIBUTES:
-            # File may not exist; nothing to do. Don't warn — callers
-            # often invoke this defensively against paths that may have
-            # already been deleted.
-            return
-        new = cur | FILE_ATTRIBUTE_HIDDEN
-        if new == cur:
-            return  # already hidden
-        ok = ctypes.windll.kernel32.SetFileAttributesW(p, new)
-        if not ok:
-            err = ctypes.windll.kernel32.GetLastError()
-            _log.warning("hide_file_win failed for %s (err=%s)", p, err)
-    except Exception as e:
-        _log.debug("swallowed: %s", e)
-
-
-def unhide_file_win(path) -> None:
-    """Clear the Windows HIDDEN attribute. No-op on non-Windows.
-
-    Companion to `hide_file_win` — used before atomic rewrites of hidden
-    sidecars so `os.replace` can target the file. Re-hide after the
-    rewrite with `hide_file_win`.
-
-    Preserves other attributes (read-only, system, archive bit) by
-    masking out only FILE_ATTRIBUTE_HIDDEN instead of overwriting all
-    attributes with FILE_ATTRIBUTE_NORMAL (0x80). The old behavior
-    clobbered the archive bit, breaking backup tools that rely on it.
-    """
-    if os.name != "nt":
-        return
-    try:
-        p = str(path)
-        FILE_ATTRIBUTE_HIDDEN = 0x02
-        FILE_ATTRIBUTE_NORMAL = 0x80
-        INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
-        cur = ctypes.windll.kernel32.GetFileAttributesW(p)
-        if cur == INVALID_FILE_ATTRIBUTES:
-            return
-        new = cur & ~FILE_ATTRIBUTE_HIDDEN
-        # Per MSDN: FILE_ATTRIBUTE_NORMAL is only valid when set ALONE;
-        # SetFileAttributesW will fail if NORMAL is combined with other
-        # attributes. Replace with NORMAL only if no other bits remain.
-        if new == 0:
-            new = FILE_ATTRIBUTE_NORMAL
-        if new == cur:
-            return  # already not hidden
-        ok = ctypes.windll.kernel32.SetFileAttributesW(p, new)
-        if not ok:
-            err = ctypes.windll.kernel32.GetLastError()
-            _log.warning("unhide_file_win failed for %s (err=%s)", p, err)
-    except Exception as e:
-        _log.debug("swallowed: %s", e)
-
-
-# ── Stray-sidecar hider (whitelist sweep) ──────────────────────────────
-
-# The ONLY files an archive folder should show with Explorer's "hidden
-# files" off: the videos themselves + the conjoined `… Transcript.txt`.
-# Everything else (.info.json, .description, stray thumbnails, .jsonl
-# sidecars, .last_attempt state, etc.) gets the Windows HIDDEN attribute.
-# Derived from the single source of truth (fs_search.MEDIA_EXTS_TUPLE).
-# The old hand-copied tuple omitted .flv/.wmv, so the hide sweeps set
-# the HIDDEN attribute on real video files — and nothing ever unhides
-# media, so they vanished from Explorer permanently.
-from .fs_search import VIDEO_EXTS_EXTENDED as _FS_VIDEO_EXTS
-
-_VISIBLE_MEDIA_EXTS = tuple(sorted(_FS_VIDEO_EXTS))
-
-
-def _archive_file_should_be_visible(name: str) -> bool:
-    """Whitelist test: True for video/media files and the conjoined
-    `… Transcript.txt`. Everything else is a sidecar that must be hidden.
-    Matches the user contract: an archive folder shows only the videos +
-    one transcript .txt when 'show hidden files' is off."""
-    low = name.lower()
-    if low.endswith(_VISIBLE_MEDIA_EXTS):
-        return True
-    if low.endswith(" transcript.txt"):
-        return True
-    return False
-
-
-def _set_hidden_if_needed(path, entry=None) -> bool:
-    """Set FILE_ATTRIBUTE_HIDDEN on `path` only if it isn't already
-    hidden, preserving other attribute bits. Returns True iff the item
-    was visible and is now hidden (so callers can count real changes).
-
-    When `entry` is an os.DirEntry, its cached `st_file_attributes`
-    (populated for free by the directory scan on Windows) is used to
-    test the hidden bit without an extra GetFileAttributesW syscall —
-    so a sweep over an already-clean archive costs ~one syscall per
-    *new* stray, not per file."""
-    if os.name != "nt":
-        return False
-    FILE_ATTRIBUTE_HIDDEN = 0x02
-    INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
-    attrs = None
-    if entry is not None:
-        try:
-            attrs = entry.stat(follow_symlinks=False).st_file_attributes
-        except (OSError, AttributeError, ValueError):
-            attrs = None
-    try:
-        p = str(path)
-        if attrs is None:
-            attrs = ctypes.windll.kernel32.GetFileAttributesW(p)
-            if attrs == INVALID_FILE_ATTRIBUTES:
-                return False
-        if attrs & FILE_ATTRIBUTE_HIDDEN:
-            return False  # already hidden
-        ok = ctypes.windll.kernel32.SetFileAttributesW(
-            p, attrs | FILE_ATTRIBUTE_HIDDEN)
-        if not ok:
-            err = ctypes.windll.kernel32.GetLastError()
-            _log.warning("hide stray failed for %s (err=%s)", p, err)
-            return False
-        return True
-    except Exception as e:
-        _log.debug("swallowed: %s", e)
-        return False
-
-
-def _file_has_hidden_attribute(path: str) -> bool:
-    """True when Windows marks the file hidden; False elsewhere/fail-closed."""
-    if os.name != "nt":
-        return False
-    FILE_ATTRIBUTE_HIDDEN = 0x02
-    INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
-    try:
-        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
-    except Exception:
-        return False
-    return attrs != INVALID_FILE_ATTRIBUTES and bool(attrs & FILE_ATTRIBUTE_HIDDEN)
-
-
-def hide_stray_sidecars(folder, recursive=True, cancel_event=None) -> int:
-    """Sweep `folder` and set the Windows HIDDEN attribute on every file
-    that is NOT a video/media file and NOT a `… Transcript.txt`, plus any
-    dot-prefixed subdirectory (`.Thumbnails`, `.ChannelArt`). This is the
-    bulletproof enforcement of the archive-folder contract — robust to
-    any sidecar naming oddity (e.g. yt-dlp's double-dot
-    `Title..info.json`) because it's a whitelist, not a name-reconstruct.
-
-    Returns the count of items NEWLY hidden (were visible, now hidden).
-    No-op on non-Windows. Idempotent and cheap on a clean archive: uses
-    os.scandir so already-hidden items cost no extra syscall. Dot-dirs
-    are hidden but not descended into (a hidden parent hides its whole
-    subtree in Explorer)."""
-    if os.name != "nt":
-        return 0
-    folder = str(folder)
-    if not folder or not os.path.isdir(folder):
-        return 0
-    newly = 0
-    stack = [folder]
-    while stack:
-        if cancel_event is not None and cancel_event.is_set():
-            break
-        d = stack.pop()
-        try:
-            it = os.scandir(d)
-        except OSError:
-            continue
-        with it:
-            for entry in it:
-                if cancel_event is not None and cancel_event.is_set():
-                    break
-                try:
-                    name = entry.name
-                    if entry.is_dir(follow_symlinks=False):
-                        if name.startswith("."):
-                            # Hide the dot-dir; don't descend — a hidden
-                            # parent already hides its whole subtree.
-                            if _set_hidden_if_needed(entry.path, entry):
-                                newly += 1
-                            continue
-                        if recursive:
-                            stack.append(entry.path)
-                        continue
-                    # Regular file.
-                    if _archive_file_should_be_visible(name):
-                        continue
-                    if _set_hidden_if_needed(entry.path, entry):
-                        newly += 1
-                except OSError:
-                    continue
-    return newly
-
-
-# ── Video sidecar cleanup ──────────────────────────────────────────────
-
-def is_within_managed_roots(path: str) -> bool:
-    """True if `path` resolves to a location under one of the archive roots
-    this app manages: the global output_dir, any per-channel output_dir, and
-    the tp_archive_roots (index-only roots). Used to gate destructive
-    os.remove calls that originate from the JS bridge (the trust boundary),
-    so a crafted/compromised filepath can't drive a delete outside the
-    archive. Fail-closed: returns False when no roots are configured or the
-    path can't be resolved. realpath is used on both sides so a symlink
-    can't tunnel out of an allowed root.
-    """
-    try:
-        from .ytarchiver_config import load_config
-        cfg = load_config() or {}
-    except Exception:
-        return False
-    roots: list[str] = []
-    _g = (cfg.get("output_dir") or "").strip()
-    if _g:
-        roots.append(_g)
-    # (Channels don't store their own output_dir — their folders nest under
-    # the global output_dir added above, so no per-channel root is needed.)
-    for _r in (cfg.get("tp_archive_roots") or []):
-        if _r:
-            roots.append(str(_r))
-    if not roots:
-        return False
-    try:
-        target = os.path.normcase(os.path.realpath(path)).rstrip("/\\")
-    except (ValueError, OSError):
-        return False
-    if not target:
-        return False
-    for _root in roots:
-        try:
-            nr = os.path.normcase(os.path.realpath(_root)).rstrip("/\\")
-        except (ValueError, OSError):
-            continue
-        if not nr:
-            continue
-        if target == nr or target.startswith((nr + os.sep, nr + "/")):
-            return True
-    return False
-
-
-def sampled_files_equal(path_a: str, path_b: str, sample: int = 1 << 20) -> bool:
-    """Best-effort 'are these the same file' check: equal size + up to three
-    1MB content windows (head, mid, tail). Used before treating one file as a
-    duplicate of another and deleting/replacing the source. CONSERVATIVE — any
-    read error or size mismatch returns False (not equal), so a caller never
-    deletes on uncertainty. Three windows (vs head+tail only) guard the rare
-    'same size, identical head+tail, different middle' collision. Single source
-    of truth shared by redownload (replace) and reorg (dedup-delete) so the
-    delete path isn't weaker than the replace path (audit: sampled_files_equal).
-    """
-    try:
-        sz = os.path.getsize(path_a)
-        if sz != os.path.getsize(path_b):
-            return False
-    except OSError:
-        return False
-    try:
-        with open(path_a, "rb") as _a, open(path_b, "rb") as _b:
-            if _a.read(sample) != _b.read(sample):
-                return False
-            if sz > sample * 3:
-                _mid = sz // 2 - sample // 2
-                _a.seek(_mid); _b.seek(_mid)
-                if _a.read(sample) != _b.read(sample):
-                    return False
-                _tail = sz - sample
-                _a.seek(_tail); _b.seek(_tail)
-                if _a.read(sample) != _b.read(sample):
-                    return False
-            elif sz > sample * 2:
-                _tail = sz - sample
-                _a.seek(_tail); _b.seek(_tail)
-                if _a.read(sample) != _b.read(sample):
-                    return False
-    except OSError:
-        return False
-    return True
-
-
-def delete_video_sidecars(filepath: str) -> None:
-    """Best-effort cleanup of sidecar files next to a video.
-
-    Removes `.jsonl`, `.info.json`, `.description`, `.live_chat.json`,
-    `.srt`, hidden image thumbnails, and language-coded caption variants
-    (.*.vtt, .*.srt, .*.ttml). Used by recent_delete_file and
-    video_delete_file.
-
-    Errors per sidecar are swallowed — the primary contract is "the
-    main file is gone"; a leaked sidecar is non-fatal.
-
-    yt-dlp emits a wider sidecar set than the original
-    narrow list captured. Keep this list in sync with what yt-dlp
-    actually writes.
-    """
-    if not filepath:
-        return
-    base = os.path.splitext(filepath)[0]
-    # Do not delete arbitrary same-stem `.txt`: it can be a visible
-    # Transcript.txt or a user note. Image siblings are also only safe to
-    # remove when the app has already hidden them as sidecars.
-    _basic_exts = (".jsonl", ".info.json", ".description",
-                   ".live_chat.json", ".srt")
-    _hidden_image_exts = (".jpg", ".jpeg", ".webp", ".png")
-    for ext in _basic_exts:
-        sc = base + ext
-        try:
-            if os.path.isfile(sc):
-                os.remove(sc)
-        except OSError:
-            pass
-    for ext in _hidden_image_exts:
-        sc = base + ext
-        try:
-            if os.path.isfile(sc) and _file_has_hidden_attribute(sc):
-                os.remove(sc)
-        except OSError:
-            pass
-    # Language-coded caption variants (en, en-orig, en-US, es, …).
-    # Glob avoids enumerating every language code yt-dlp might emit.
-    # `glob.escape` is required — titles routinely contain bracket
-    # metacharacters like "[Live]" or "[Remastered]" which would
-    # otherwise be interpreted as glob character classes, causing the
-    # pattern to silently match nothing and leak orphan caption files.
-    _base_glob = glob.escape(base)
-    for pat in (_base_glob + ".*.vtt", _base_glob + ".*.srt",
-                _base_glob + ".*.ttml"):
-        try:
-            for _hit in glob.glob(pat):
-                try: os.remove(_hit)
-                except OSError: pass
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-
-
-# ── JSON load with safe default ────────────────────────────────────────
-
-def load_json_safe(path, default: Any = None) -> Any:
-    """Load JSON from `path`. Return `default` on any failure — missing
-    file, malformed JSON, OS error.
-
-    Use for state files where "missing or corrupt = start from defaults"
-    is the desired behavior (queue.json, channel cache, drawer state).
-    Callers that need to distinguish missing-vs-corrupt should check
-    `os.path.exists(path)` themselves before calling.
-    """
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError, ValueError):
-        return default
-
-
-# ── Subprocess context manager ─────────────────────────────────────────
-
-@contextlib.contextmanager
-def managed_popen(*args, **kwargs):
-    """Popen variant that guarantees cleanup on exit.
-
-    Wraps subprocess.Popen so that if an exception escapes the `with`
-    block — or the block exits normally without the caller calling
-    `.wait()` — the subprocess is terminate/wait/kill'd via
-    `kill_process()` instead of leaking until garbage collection.
-
-    Same arguments as `subprocess.Popen`.
-
-    Usage:
-        with managed_popen(["yt-dlp", url], stdout=subprocess.PIPE,
-                           text=True) as proc:
-            for line in proc.stdout:
-                ...
-        # Even if the loop body raises, proc gets terminate/kill'd here.
-
-    Note: existing call sites that already pair `Popen` with a `try/
-    finally proc.wait()/kill()` pattern are equally safe — this helper
-    is the cleaner replacement for new code or refactors.
-    """
-    proc = subprocess.Popen(*args, **kwargs)
-    try:
-        yield proc
-    finally:
-        # Skip terminate when the proc already exited normally —
-        # kill_process eats the no-op anyway, but avoiding the
-        # spurious "trying to terminate a dead PID" path keeps logs
-        # cleaner and is the right cosmetic shape (audit:
-        # utils.py:494-520).
-        try:
-            if proc.poll() is None:
-                kill_process(proc)
-        except Exception:
-            kill_process(proc)
-
-
-# ── Atomic file replace ────────────────────────────────────────────────
-
-@contextlib.contextmanager
-def atomic_write(path, mode: str = "w", encoding: str = "utf-8"):
-    """Atomic-replace context manager.
-
-    Yields a file handle pointing to a `.tmp` sibling of `path`. On
-    successful exit, fsyncs and atomically renames over `path`. On
-    exception inside the block, removes the `.tmp` so the original is
-    untouched, then re-raises.
-
-    Usage:
-        with atomic_write("state.json") as f:
-            json.dump(data, f)
-
-    Why atomic: a crash or power loss during a plain `open(..., 'w')`
-    truncates the destination to whatever bytes happened to flush. With
-    `.tmp` + `os.replace()`, the original file remains intact until the
-    rename completes — and rename is atomic at the filesystem layer on
-    both Windows (NtSetInformationFile) and POSIX.
-    """
-    if "a" in mode:
-        raise ValueError("atomic_write does not support append mode")
-    path = os.fspath(path)
-    # Use mkstemp for a UNIQUE temp filename per writer. Old `path +
-    # ".tmp"` collided when two threads wrote the same path
-    # concurrently — second open truncated the first's in-flight tmp,
-    # then both raced on os.replace and the loser committed half-
-    # flushed content over the winner (audit: utils.py:525-577).
-    import tempfile as _tempfile
-    _dir = os.path.dirname(path) or "."
-    _stem = os.path.basename(path) + "."
-    fd, tmp = _tempfile.mkstemp(prefix=_stem, suffix=".tmp", dir=_dir)
-    try:
-        os.close(fd)
-    except OSError:
-        pass
-    open_kwargs: dict[str, Any] = {"mode": mode}
-    if "b" not in mode:
-        open_kwargs["encoding"] = encoding
-    f = open(tmp, **open_kwargs)
-    success = False
-    try:
-        yield f
-        try:
-            f.flush()
-            os.fsync(f.fileno())
-        except OSError:
-            pass
-        success = True
-    finally:
-        try:
-            f.close()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        if success:
-            try:
-                os.replace(tmp, path)
-            except Exception:
-                try: os.unlink(tmp)
-                except OSError: pass
-                raise
-        else:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass

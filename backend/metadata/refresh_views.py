@@ -1,11 +1,11 @@
 """
-metadata.refresh_views — bulk views/likes refresh.
+metadata.refresh_views â€” bulk views/likes refresh.
 
 Extracted from metadata/refresh.py (Patch 22, v72.4).
 
 Fast view-count refresh via a single flat-playlist call. Compares
 against existing JSONL, only full-fetches videos whose counts changed.
-The "Refresh views" button on Settings → Metadata drives this.
+The "Refresh views" button on Settings â†’ Metadata drives this.
 """
 from __future__ import annotations
 
@@ -45,6 +45,127 @@ def _utc_fetched_at_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _build_refresh_summary_segments(
+    *,
+    name: str,
+    full_fetched: int,
+    updated_in_place: int,
+    skipped_same: int,
+    full_errors: int,
+    no_meta_entry: int,
+    disk_count: int,
+    bulk_count: int,
+    took: float,
+) -> list[list[str]]:
+    """Build the final tagged user-facing refresh summary line."""
+    err_color = "red" if full_errors else "simpleline_pink"
+    tagged: list[list[str]] = [
+        [" \u2014 ", "meta_bracket"],
+        [f"{name}: ", "simpleline"],
+    ]
+    first = True
+    emitted_something = False
+
+    def sep() -> None:
+        nonlocal first
+        if not first:
+            tagged.append([" \u00b7 ", "simpleline"])
+
+    def add_count(value: int, label: str, color: str = "simpleline_pink",
+                  label_color: str = "simpleline") -> None:
+        nonlocal first, emitted_something
+        sep()
+        tagged.append([f"{value}", color])
+        tagged.append([label, label_color])
+        first = False
+        emitted_something = True
+
+    if full_fetched:
+        add_count(full_fetched, " with updated counts")
+    if updated_in_place:
+        add_count(updated_in_place, " counts updated in place")
+    if skipped_same:
+        add_count(skipped_same, " unchanged")
+    if full_errors:
+        add_count(full_errors, " errors", err_color, err_color)
+    if no_meta_entry and not full_fetched:
+        add_count(no_meta_entry, " need first fetch")
+    if not emitted_something:
+        if disk_count == 0:
+            tagged.append(["no videos on disk for this channel",
+                           "simpleline"])
+        elif bulk_count == 0:
+            tagged.append(["channel returned no videos", "simpleline"])
+        else:
+            tagged.append([
+                f"no matches ({disk_count} on disk vs {bulk_count} from "
+                f"YouTube \u2014 titles too divergent to match)",
+                "simpleline",
+            ])
+    tagged.append([f" (took {took:.1f}s)\n", "simpleline"])
+    return tagged
+
+
+def _classify_video_counts(stats: dict[str, Any], old: dict[str, Any],
+                           full_fetch_on_change: bool) -> dict[str, Any]:
+    """Pure per-video count-diff decision (T328 extraction).
+
+    Given the bulk flat-playlist `stats` and the existing `old` metadata
+    entry, decide whether anything moved enough to warrant work. Does NOT
+    mutate `old`. Returns the new/old count values plus:
+      - changed: a count we trust actually differs
+      - no_flat_data: flat mode returned no view_count but we have one
+        stored, so we can't tell — force a full fetch to learn the truth
+      - decision: the verbose-mode human label
+      - action: "full_fetch" | "in_place" | "skip"
+
+    This is the function with the longest historical bug trail; isolating
+    it makes the changed / no-flat-data / skip logic unit-testable without
+    the full yt-dlp + JSONL + DB I/O stack.
+    """
+    view_new = stats.get("view_count")
+    like_new = stats.get("like_count")
+    comment_new = stats.get("comment_count")
+    view_old = old.get("view_count")
+    like_old = old.get("like_count")
+    comment_old = old.get("comment_count")
+    changed = False
+    if view_new is not None and view_new != view_old:
+        changed = True
+    # like_count often missing in flat mode; only flag if it's explicitly
+    # different (not when the old had a real value and the new is None —
+    # that's a bulk-mode gap, not a real drop).
+    if (like_new is not None and like_old is not None
+            and like_new != like_old):
+        changed = True
+    if (comment_new is not None and comment_old is not None
+            and comment_new != comment_old):
+        changed = True
+    # "No flat data": flat-playlist returned None for view_count BUT we
+    # have a stored value, so we can't tell whether it changed. Route it
+    # through the per-video fetch path to get a current count.
+    no_flat_data = (view_new is None and view_old is not None)
+    if no_flat_data:
+        decision = "no flat data → full fetch"
+        action = "full_fetch"
+    elif changed and full_fetch_on_change:
+        decision = "changed → full fetch"
+        action = "full_fetch"
+    elif changed:
+        decision = "changed → in-place update"
+        action = "in_place"
+    else:
+        decision = "unchanged → skip"
+        action = "skip"
+    return {
+        "view_new": view_new, "like_new": like_new,
+        "comment_new": comment_new,
+        "view_old": view_old, "like_old": like_old,
+        "changed": changed, "no_flat_data": no_flat_data,
+        "decision": decision, "action": action,
+    }
+
+
 def bulk_refresh_views_likes(channel: dict[str, Any],
                               stream: LogStreamer,
                               cancel_event: threading.Event | None = None,
@@ -60,7 +181,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     top-comments, descriptions, etc.).
 
     `full_fetch_on_change=False` skips even that second pass and just
-    updates the count fields in-place — useful for "i only care about
+    updates the count fields in-place â€” useful for "i only care about
     the view count, don't waste any more yt-dlp calls" flows.
 
     `scope={"year": N}` honors the year-scoped refresh introduced for
@@ -74,27 +195,27 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     """
     folder = _folder_for_channel(channel)
     if folder is None:
-        stream.emit_error("Archive folder isn't configured. Set it in Settings → General.")
+        stream.emit_error("Archive folder isn't configured. Set it in Settings â†’ General.")
         return {"ok": False, "error": "no output_dir"}
     folder.mkdir(parents=True, exist_ok=True)
 
     yt = find_yt_dlp()
     if not yt:
-        stream.emit_error("Can't refresh video info — the download tool (yt-dlp) isn't installed.")
+        stream.emit_error("Can't refresh video info â€” the download tool (yt-dlp) isn't installed.")
         return {"ok": False, "error": "yt-dlp missing"}
 
     name = channel.get("name") or channel.get("folder") or "?"
     ch_url = (channel.get("url") or "").strip()
     if not ch_url:
         stream.emit_error(
-            f"Metadata: {name} has no URL — can't refresh.")
+            f"Metadata: {name} has no URL â€” can't refresh.")
         return {"ok": False, "error": "no url"}
 
     _scope_year: int | None = None
     if scope and isinstance(scope.get("year"), int):
         _scope_year = int(scope["year"])
     _banner = f" ({_scope_year} only)" if _scope_year is not None else ""
-    # Log kept user-friendly — previously said "(flat-playlist)" which
+    # Log kept user-friendly â€” previously said "(flat-playlist)" which
     # is an implementation detail (yt-dlp mode) the user doesn't need
     # to see in Simple mode.
     # Tag the per-channel transitional emits with `views_refresh_progress`
@@ -108,7 +229,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                   ["simpleline", "views_refresh_progress"]]])
 
     t0 = time.time()
-    # Heartbeat thread — re-emits the in-place "Refreshing X..." line
+    # Heartbeat thread â€” re-emits the in-place "Refreshing X..." line
     # every 3s with elapsed time + current sub-phase so the user always
     # sees motion. Without this the line sits silent while yt-dlp spins
     # up + walks the catalog (many seconds on cold-cookie firefox; can
@@ -184,7 +305,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         # side lines (the warning + the orphaned Refreshing... line).
         stream.emit([
             [" \u26A0 ", ["meta_bracket", "views_refresh_progress"]],
-            [f"Initial check unsuccessful for {name} — "
+            [f"Initial check unsuccessful for {name} â€” "
              f"trying per-video lookup...\n",
              ["simpleline", "views_refresh_progress"]],
         ])
@@ -194,8 +315,8 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         # be easily readable for someone with no technical context;
         # Verbose mode is where the noisy diagnostics belong.
         stream.emit([
-            ["   — ", ["dim", "views_refresh_progress"]],
-            [f"Bulk-stats returned no data for {name} — "
+            ["   â€” ", ["dim", "views_refresh_progress"]],
+            [f"Bulk-stats returned no data for {name} â€” "
              f"channel may be empty / private / geo-locked, or yt-dlp "
              f"hit a transient YouTube block.\n",
              ["dim", "views_refresh_progress"]],
@@ -207,14 +328,14 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     # Verbose-only: announce the bulk-stats walk landed and how many
     # videos it found. Helps the user follow the multi-phase flow.
     stream.emit([
-        ["   — ", ["dim"]],
+        ["   â€” ", ["dim"]],
         [f"bulk-stats: {len(bulk):,} videos retrieved from YouTube "
          f"catalog (took {time.time() - t0:.1f}s)\n", ["dim"]],
     ])
 
     # Enumerate on-disk videos so we only refresh ones we actually
     # have files for (mirrors fetch_channel_metadata's disk-driven
-    # philosophy — never pay yt-dlp time for playlist entries with
+    # philosophy â€” never pay yt-dlp time for playlist entries with
     # no archive file).
     on_disk = _scan_channel_videos(folder)
     if _scope_year is not None:
@@ -225,10 +346,10 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     # registrations landed in the videos-table with video_id=NULL.
     # Without a second matching strategy every file shows as "missing"
     # and the whole bulk pass reports "no matches". Fix: build a
-    # normalized-title → video_id map from the bulk data and resolve
+    # normalized-title â†’ video_id map from the bulk data and resolve
     # empty vid_ids via title lookup. The normalization aggressively
     # folds whitespace and punctuation so minor filesystem sanitization
-    # differences (en-dash → hyphen, colons dropped, etc.) still match.
+    # differences (en-dash â†’ hyphen, colons dropped, etc.) still match.
     # closure delegates to text_utils.normalize_title with
     # the alnum-only + strip-id-bracket modes set. Trailing-punct strip
     # is OFF because the matcher distinguishes "title?" from "title".
@@ -253,7 +374,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
 
     # Resolve vid_ids for on-disk tuples that came back empty. Track
     # which (filepath, video_id) pairs we backfilled so we can persist
-    # them to the index DB after the scan — next run skips the title
+    # them to the index DB after the scan â€” next run skips the title
     # match entirely because the DB lookup at _scan_channel_videos
     # fills fp_to_id.
     _title_resolved: list[tuple[str, str, str]] = []  # (fp, vid, title)
@@ -308,7 +429,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
             _log.warning("views refresh title-resolution DB update failed "
                          "for %r: %s", name, e)
         # User-friendly wording: dropped "(no [id] in filename)"
-        # technicality — users shouldn't have to know about the
+        # technicality â€” users shouldn't have to know about the
         # internal DB state to understand what happened.
         stream.emit([
             [" \u2014 ", ["meta_bracket", "views_refresh_progress"]],
@@ -333,7 +454,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     if not _catalog_complete:
         try:
             stream.emit_dim(
-                " (catalog walk incomplete — skipping removed-from-YT "
+                " (catalog walk incomplete â€” skipping removed-from-YT "
                 "detection this pass)")
         except Exception:
             pass
@@ -342,7 +463,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         _newly_removed: list[str] = []
         _newly_restored: list[str] = []
         from .. import index as _idx
-        # Read-only state lookup — reader path avoids queueing behind sweep.
+        # Read-only state lookup â€” reader path avoids queueing behind sweep.
         _conn_rm = _idx._reader_open()
         if _catalog_complete and _conn_rm is not None:
             # Normalize the folder path to the SAME canonical form that
@@ -350,7 +471,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
             # in register_video). Old _like_esc(str(folder)) used the
             # Path's str form which can have forward-slash separators
             # on Windows when the Path was constructed from a forward-
-            # slash source — leaving the LIKE pattern mismatched
+            # slash source â€” leaving the LIKE pattern mismatched
             # against backslash-stored DB rows (audit: refresh_views.
             # py:294-352).
             _folder_norm = os.path.normpath(str(folder))
@@ -383,7 +504,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 if _conn_wr is not None:
                     with _idx._db_lock:
                         try:
-                            # Scope by channel too — filepath alone is
+                            # Scope by channel too â€” filepath alone is
                             # not a unique identity in a multi-channel
                             # archive on case-insensitive NTFS / pooled
                             # drives. A path collision across channels
@@ -436,7 +557,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                          "for %r: %s", name, e)
 
     on_disk_ids = {v[0] for v in on_disk if v[0]}
-    # Count duplicate video_ids (same id on disk in two folders — usually
+    # Count duplicate video_ids (same id on disk in two folders â€” usually
     # a manual file copy / channel-merge leftover). Set comprehension
     # silently drops duplicates; count them explicitly so the user can
     # see the inconsistency (audit: refresh_views H77).
@@ -445,7 +566,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         try:
             stream.emit_dim(
                 f" ({_on_disk_vid_count - len(on_disk_ids)} duplicate "
-                f"video_id(s) on disk — same video in multiple folders)")
+                f"video_id(s) on disk â€” same video in multiple folders)")
         except Exception:
             pass
 
@@ -455,7 +576,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     jsonl_by_id: dict[str, str] = {}
     # Scope by channel-name prefix so a sibling channel's JSONL that
     # accidentally lives under this tree doesn't pollute existing_by_id
-    # (audit: refresh_views H100 — same fix as C16/refresh_fetch).
+    # (audit: refresh_views H100 â€” same fix as C16/refresh_fetch).
     _expected_prefix = f".{name} "
     _expected_exact = f".{name} Metadata.jsonl"
     for dp, _dns, fns in os.walk(str(folder)):
@@ -469,7 +590,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 entries = _read_metadata_jsonl(jp)
             except Exception as _re:
                 try:
-                    stream.emit_dim(f" (jsonl read failed: {fn} — {_re})")
+                    stream.emit_dim(f" (jsonl read failed: {fn} â€” {_re})")
                 except Exception:
                     pass
                 continue
@@ -490,10 +611,10 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
             continue
         old = existing_by_id.get(vid)
         if old is None:
-            # Haven't fetched this video's full metadata yet — always
+            # Haven't fetched this video's full metadata yet â€” always
             # full-fetch it regardless of full_fetch_on_change. We
             # literally have no record for this video, so there's
-            # nothing to "update in place" — we have to do the full
+            # nothing to "update in place" â€” we have to do the full
             # --dump-json to create the entry. full_fetch_on_change
             # only governs whether CHANGED-COUNT entries also get
             # re-fetched (which re-pulls comments too, so the
@@ -503,36 +624,16 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
             changed_ids.append(vid)
             continue
         # Decide whether anything moved enough to warrant a full fetch.
-        _view_new = stats.get("view_count")
-        _like_new = stats.get("like_count")
-        _comment_new = stats.get("comment_count")
-        _view_old = old.get("view_count")
-        _like_old = old.get("like_count")
-        _comment_old = old.get("comment_count")
-        _changed = False
-        if _view_new is not None and _view_new != _view_old:
-            _changed = True
-        # like_count often missing in flat mode; only flag if it's
-        # explicitly different (not when the old had a real value and
-        # the new is None — that's a bulk-mode gap, not a real drop).
-        if (_like_new is not None and _like_old is not None
-                and _like_new != _like_old):
-            _changed = True
-        if (_comment_new is not None and _comment_old is not None
-                and _comment_new != _comment_old):
-            _changed = True
-
-        # "No flat data" detection (2026-05-14 fix): if flat-playlist
-        # returned None for view_count BUT we have a stored value, we
-        # can't tell whether it changed. The old code silently treated
-        # this as "same" and skipped — meaning bulk refresh was a no-op
-        # for any video yt-dlp's flat-playlist didn't return counts for.
-        # Now we route it through the per-video fetch path so we
-        # actually get current counts. ~17% of videos still need this
-        # even with the `youtubetab:skip=webpage` extractor arg
-        # (members-only, very recent uploads, etc.).
-        _no_flat_data = (_view_new is None and _view_old is not None)
-
+        # Pure classifier (T328 — see _classify_video_counts); the loop
+        # below only applies the result + emits the verbose trace.
+        _dec = _classify_video_counts(stats, old, full_fetch_on_change)
+        _view_new = _dec["view_new"]
+        _like_new = _dec["like_new"]
+        _comment_new = _dec["comment_new"]
+        _view_old = _dec["view_old"]
+        _like_old = _dec["like_old"]
+        _changed = _dec["changed"]
+        _no_flat_data = _dec["no_flat_data"]
         # Only bump in-place counters + fetched_at when something
         # actually changed. The previous "always bump fetched_at"
         # path meant every "no-op" refresh rewrote EVERY metadata
@@ -550,41 +651,34 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
             old["_dirty"] = True
 
         # VERBOSE-ONLY per-video diff trace. Compact one-liner showing
-        # the old→new counts and the decision. With 1000s of videos
-        # per channel this floods the log — that's intentional in
-        # Verbose mode — Verbose is intentionally noisy. Simple mode
+        # the oldâ†’new counts and the decision. With 1000s of videos
+        # per channel this floods the log â€” that's intentional in
+        # Verbose mode â€” Verbose is intentionally noisy. Simple mode
         # hides via `dim` tag.
         def _fmt_cnt(n):
-            return "—" if n is None else f"{n:,}"
-        if _no_flat_data:
-            _decision = "no flat data → full fetch"
-        elif _changed and full_fetch_on_change:
-            _decision = "changed → full fetch"
-        elif _changed:
-            _decision = "changed → in-place update"
-        else:
-            _decision = "unchanged → skip"
+            return "â€”" if n is None else f"{n:,}"
+        _decision = _dec["decision"]
         stream.emit([
-            ["    — ", ["dim"]],
-            [f"{vid} · views {_fmt_cnt(_view_old)}→{_fmt_cnt(_view_new)} · "
-             f"likes {_fmt_cnt(_like_old)}→{_fmt_cnt(_like_new)} · "
+            ["    â€” ", ["dim"]],
+            [f"{vid} Â· views {_fmt_cnt(_view_old)}â†’{_fmt_cnt(_view_new)} Â· "
+             f"likes {_fmt_cnt(_like_old)}â†’{_fmt_cnt(_like_new)} Â· "
              f"{_decision}\n", ["dim"]],
         ])
 
-        if _no_flat_data:
-            # Force a full per-video fetch — only path that can give
-            # us a current view count for this vid.
+        # Route by the classifier's action (T328). "full_fetch" covers both
+        # no-flat-data (only path to a current view count) and changed-with-
+        # full_fetch_on_change; "in_place" bumped counts already; "skip" is
+        # an unchanged no-op.
+        if _dec["action"] == "full_fetch":
             changed_ids.append(vid)
-        elif _changed and full_fetch_on_change:
-            changed_ids.append(vid)
-        elif _changed:
+        elif _dec["action"] == "in_place":
             updated_in_place += 1
         else:
             skipped_same += 1
 
     # Persist the in-place-updated entries. Group by jsonl path so we
     # only rewrite each file once. Skip entries that aren't actually
-    # dirty — see `_dirty` flag set above. The previous code added
+    # dirty â€” see `_dirty` flag set above. The previous code added
     # every video in existing_by_id to dirty_paths, churning every
     # jsonl on disk even for a no-op refresh.
     _hb_phase[0] = "writing updated counts"
@@ -603,7 +697,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         # Hold the per-path write lock across read+merge+write so a
         # concurrent writer's just-landed entry can't be clobbered by
         # our stale read. Without this, _write_metadata_jsonl's
-        # internal lock only serialized the WRITE half — two threads
+        # internal lock only serialized the WRITE half â€” two threads
         # could read, both miss the other's changes, then both write
         # (audit: refresh_views.py C15).
         with _lock_for(jp):
@@ -620,7 +714,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 # Mirror the refreshed view/like counts into the index DB so
                 # the global Videos view can sort the whole archive by
                 # views/likes off an indexed column (no sidecar walk at
-                # query time). Best-effort — never block the refresh.
+                # query time). Best-effort â€” never block the refresh.
                 try:
                     from .. import index as _idx_db
                     _idx_db.update_video_stats(
@@ -640,7 +734,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     if changed_ids:
         # With full_fetch_on_change=False (the views/likes-refresh
         # default), this list only contains videos that had NO
-        # existing metadata entry — we're filling in first-time
+        # existing metadata entry â€” we're filling in first-time
         # metadata, not comment refresh. Wording updated so a user
         # who clicked "Refresh views/likes" doesn't see a line
         # claiming we're pulling comments.
@@ -656,11 +750,11 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
             [f"{_n} video(s) {_what}\n",
              ["simpleline", "views_refresh_progress"]],
         ])
-        # Build a video_id → (filepath, title) map from on_disk so we
+        # Build a video_id â†’ (filepath, title) map from on_disk so we
         # can pass filepath + title_hint to fetch_single_video_metadata
         # (signature: channel, video_id, file_path, title_hint, stream).
         # The prior call had `stream` in the title_hint slot AND passed
-        # a nonexistent `cancel_event` kwarg — every per-video fetch
+        # a nonexistent `cancel_event` kwarg â€” every per-video fetch
         # raised TypeError and got caught as an error (users reported
         # 40/40 errors on a test channel). Fixed by passing args in
         # the right order; cancel/pause are still honored by the
@@ -688,7 +782,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 if cancel_event is not None and cancel_event.is_set():
                     break
             # Pause-wait between videos. The user might have clicked
-            # Pause minutes ago — they're waiting on this exact loop
+            # Pause minutes ago â€” they're waiting on this exact loop
             # to land here. Emit a Paused log line + signal active.
             if pause_event is not None and pause_event.is_set():
                 _enter_pause_wait(stream, f"{name} (metadata refresh)", queues)
@@ -706,7 +800,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 # _no_flat_data videos by definition already have a
                 # jsonl entry, and without the flag the fetcher's
                 # existing-entry guard returned {ok, skipped} without
-                # fetching — so "full fetch on change" never actually
+                # fetching â€” so "full fetch on change" never actually
                 # updated comments/descriptions and _no_flat_data
                 # videos kept stale counts forever, while the summary
                 # claimed success.
@@ -770,68 +864,19 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     # pink, errors red. Previously the whole line was one pink blob
     # which users called out as visual noise ("channel name should be
     # white, labels should be white, only the numbers highlight").
-    # "via bulk path" dropped — user-facing log doesn't need to
+    # "via bulk path" dropped â€” user-facing log doesn't need to
     # surface the internal code path.
-    _err_color = "red" if full_errors else "simpleline_pink"
-    tagged: list[list[str]] = [
-        [" \u2014 ", "meta_bracket"],
-        [f"{name}: ", "simpleline"],
-    ]
-    _first = True
-    def _sep():
-        if not _first:
-            tagged.append([" \u00b7 ", "simpleline"])
-    _emitted_something = False
-    if full_fetched:
-        _sep()
-        tagged.append([f"{full_fetched}", "simpleline_pink"])
-        tagged.append([" with updated counts", "simpleline"])
-        _first = False
-        _emitted_something = True
-    if updated_in_place:
-        _sep()
-        tagged.append([f"{updated_in_place}", "simpleline_pink"])
-        tagged.append([" counts updated in place", "simpleline"])
-        _first = False
-        _emitted_something = True
-    if skipped_same:
-        _sep()
-        tagged.append([f"{skipped_same}", "simpleline_pink"])
-        tagged.append([" unchanged", "simpleline"])
-        _first = False
-        _emitted_something = True
-    if full_errors:
-        _sep()
-        tagged.append([f"{full_errors}", _err_color])
-        tagged.append([" errors", _err_color])
-        _first = False
-        _emitted_something = True
-    if no_meta_entry and not full_fetched:
-        _sep()
-        tagged.append([f"{no_meta_entry}", "simpleline_pink"])
-        tagged.append([" need first fetch", "simpleline"])
-        _first = False
-        _emitted_something = True
-    if not _emitted_something:
-        # Zero matches across all counters. Normally the title-fallback
-        # loop above resolves legacy-tkinter archive files — so hitting
-        # this branch means even title-matching failed. Usually:
-        # (a) empty channel folder, (b) ambiguous titles (duplicates
-        # skipped for safety), or (c) filesystem-sanitized titles too
-        # divergent to match.
-        _n_disk = len(on_disk)
-        _n_bulk = len(bulk)
-        if _n_disk == 0:
-            tagged.append(["no videos on disk for this channel",
-                           "simpleline"])
-        elif _n_bulk == 0:
-            tagged.append(["channel returned no videos", "simpleline"])
-        else:
-            tagged.append([
-                f"no matches ({_n_disk} on disk vs {_n_bulk} from YouTube "
-                f"\u2014 titles too divergent to match)", "simpleline"])
-    tagged.append([f" (took {took:.1f}s)\n", "simpleline"])
-    stream.emit(tagged)
+    stream.emit(_build_refresh_summary_segments(
+        name=name,
+        full_fetched=full_fetched,
+        updated_in_place=updated_in_place,
+        skipped_same=skipped_same,
+        full_errors=full_errors,
+        no_meta_entry=no_meta_entry,
+        disk_count=len(on_disk),
+        bulk_count=len(bulk),
+        took=took,
+    ))
     return {
         "ok": True,
         "fetched": no_meta_entry,
@@ -841,6 +886,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         "bulk_fetched": len(bulk),
         "took": took,
     }
+
 
 
 # Patch 19 phase M5 (v69.2): thumbnail/video-id status ops moved out.

@@ -153,9 +153,10 @@ def search_video_titles(query: str,
 
     `channel` scopes the search: None / empty list → all channels;
     a string → that one channel; a list of strings → that subset.
-    Title is LIKE-based, case-insensitive. Result shape mirrors
-    search_fts so the frontend renderer can swap modes without
-    restructuring.
+    Uses videos_fts (FTS5) for fast indexed title matching; falls back
+    to LIKE '%term%' if the FTS table is unavailable (pre-migration DB).
+    Result shape mirrors search_fts so the frontend renderer can swap
+    modes without restructuring.
 
     `sort` accepts:
       "newest"  → upload date DESC (default, oldest behavior)
@@ -179,28 +180,7 @@ def search_video_titles(query: str,
     parts = [p.strip() for p in query.strip().split() if p.strip()]
     if not parts:
         return []
-    # Escape LIKE wildcards so a query containing % or _ matches those
-    # characters literally instead of acting as a wildcard (which made
-    # e.g. "%" match every title). ESCAPE '\' tells SQLite that a
-    # backslash-prefixed %/_/\ is a literal.
-    def _esc_like(s: str) -> str:
-        return (s.replace("\\", "\\\\")
-                 .replace("%", "\\%")
-                 .replace("_", "\\_"))
-    where_clauses = " AND ".join(
-        ["title LIKE ? COLLATE NOCASE ESCAPE '\\'"] * len(parts))
-    args: list[Any] = [f"%{_esc_like(p)}%" for p in parts]
     # Channel scope: accept string (legacy) or list (new multi-select).
-    chan_sql = ""
-    if isinstance(channel, str) and channel.strip():
-        chan_sql = " AND channel = ?"
-        args.append(channel.strip())
-    elif isinstance(channel, (list, tuple)) and channel:
-        _names = [str(c).strip() for c in channel if str(c).strip()]
-        if _names:
-            placeholders = ",".join(["?"] * len(_names))
-            chan_sql = f" AND channel IN ({placeholders})"
-            args.extend(_names)
     channel_key: Any
     if isinstance(channel, str):
         channel_key = channel.strip()
@@ -208,27 +188,6 @@ def search_video_titles(query: str,
         channel_key = tuple(str(c).strip() for c in channel if str(c).strip())
     else:
         channel_key = ""
-    # Year scope (inclusive). Mirror the FTS leg: prefer the video's
-    # UPLOAD year (upload_ts = file mtime = YT upload date), since the
-    # folder-derived `year` column is NULL for flat / non-year-organized
-    # channels — which made the old "(year >= ? OR year IS NULL)" filter a
-    # NO-OP. Fall back to `year` only when upload_ts is missing; stay
-    # lenient (include) only when both are unknown.
-    year_sql = ""
-    if year_from is not None:
-        year_from_i = int(year_from)
-        year_sql += (" AND ((upload_ts IS NOT NULL AND upload_ts >= ?)"
-                     " OR (upload_ts IS NULL AND year >= ?)"
-                     " OR (upload_ts IS NULL AND year IS NULL))")
-        args.append(_year_start_ts(year_from_i))
-        args.append(year_from_i)
-    if year_to is not None:
-        year_to_i = int(year_to)
-        year_sql += (" AND ((upload_ts IS NOT NULL AND upload_ts < ?)"
-                     " OR (upload_ts IS NULL AND year <= ?)"
-                     " OR (upload_ts IS NULL AND year IS NULL))")
-        args.append(_year_start_ts(year_to_i + 1))
-        args.append(year_to_i)
     requested_limit = max(1, int(limit))
     cache_key = (
         tuple(p.lower() for p in parts),
@@ -244,29 +203,90 @@ def search_video_titles(query: str,
         if cached is not None and now - cached[0] <= _TITLE_SEARCH_CACHE_TTL:
             _title_search_cache.move_to_end(cache_key)
             return [dict(row) for row in cached[1]]
-    args.append(requested_limit)
     # Translate sort key → SQL ORDER BY clause.
     order_sql = {
         "oldest":  "ts ASC",
         "newest":  "ts DESC",
-        "channel": "channel COLLATE NOCASE ASC, ts DESC",
-        "title":   "title COLLATE NOCASE ASC",
+        "channel": "v.channel COLLATE NOCASE ASC, ts DESC",
+        "title":   "v.title COLLATE NOCASE ASC",
     }.get((sort or "newest").lower(), "ts DESC")
+    # Build channel / year WHERE fragments (prefix v. for the FTS join).
+    chan_sql = ""
+    chan_args: list[Any] = []
+    if isinstance(channel, str) and channel.strip():
+        chan_sql = " AND v.channel = ?"
+        chan_args.append(channel.strip())
+    elif isinstance(channel, (list, tuple)) and channel:
+        _names = [str(c).strip() for c in channel if str(c).strip()]
+        if _names:
+            placeholders = ",".join(["?"] * len(_names))
+            chan_sql = f" AND v.channel IN ({placeholders})"
+            chan_args.extend(_names)
+    # Year scope — prefer upload_ts epoch, fall back to folder year.
+    year_sql = ""
+    year_args: list[Any] = []
+    if year_from is not None:
+        year_from_i = int(year_from)
+        year_sql += (" AND ((v.upload_ts IS NOT NULL AND v.upload_ts >= ?)"
+                     " OR (v.upload_ts IS NULL AND v.year >= ?)"
+                     " OR (v.upload_ts IS NULL AND v.year IS NULL))")
+        year_args += [_year_start_ts(year_from_i), year_from_i]
+    if year_to is not None:
+        year_to_i = int(year_to)
+        year_sql += (" AND ((v.upload_ts IS NOT NULL AND v.upload_ts < ?)"
+                     " OR (v.upload_ts IS NULL AND v.year <= ?)"
+                     " OR (v.upload_ts IS NULL AND v.year IS NULL))")
+        year_args += [_year_start_ts(year_to_i + 1), year_to_i]
+    rows: list[Any] = []
+    # ── FTS5 path — uses videos_fts index, O(log n) per query ──────────
     try:
-        with _idx._reader_lock:
-            cur = conn.execute(
-                f"SELECT video_id, title, channel, filepath, year, "
-                f"COALESCE(upload_ts, added_ts, 0) AS ts "
-                f"FROM videos WHERE {where_clauses}"
-                f"{chan_sql}"
-                f"{year_sql} "
-                f"AND is_duplicate_of IS NULL "
-                f"ORDER BY {order_sql} LIMIT ?",
-                args)
-            rows = cur.fetchall()
+        fts_q = _normalize_fts_query(" ".join(parts))
+        if fts_q:
+            fts_args: list[Any] = [fts_q] + chan_args + year_args + [requested_limit]
+            with _idx._reader_lock:
+                cur = conn.execute(
+                    f"SELECT v.video_id, v.title, v.channel, v.filepath, v.year,"
+                    f" COALESCE(v.upload_ts, v.added_ts, 0) AS ts"
+                    f" FROM videos_fts"
+                    f" JOIN videos v ON videos_fts.rowid = v.id"
+                    f" WHERE videos_fts MATCH ?"
+                    f" AND v.is_duplicate_of IS NULL"
+                    f"{chan_sql}{year_sql}"
+                    f" ORDER BY {order_sql} LIMIT ?",
+                    fts_args)
+                rows = cur.fetchall()
     except sqlite3.Error as exc:
-        _log.warning("search_video_titles query failed: %s", exc)
-        return []
+        _log.debug("search_video_titles FTS5 failed (%s); falling back to LIKE", exc)
+        rows = []
+    # ── LIKE fallback — used when FTS table missing or query bad ────────
+    if not rows:
+        def _esc_like(s: str) -> str:
+            return (s.replace("\\", "\\\\")
+                     .replace("%", "\\%")
+                     .replace("_", "\\_"))
+        like_clauses = " AND ".join(
+            ["title LIKE ? COLLATE NOCASE ESCAPE '\\'"] * len(parts))
+        like_args: list[Any] = [f"%{_esc_like(p)}%" for p in parts]
+        # LIKE path uses unaliased column names (no join)
+        like_chan_sql = chan_sql.replace("v.channel", "channel")
+        like_year_sql = (year_sql.replace("v.upload_ts", "upload_ts")
+                                  .replace("v.year", "year"))
+        like_args += chan_args + year_args + [requested_limit]
+        try:
+            with _idx._reader_lock:
+                cur = conn.execute(
+                    f"SELECT video_id, title, channel, filepath, year,"
+                    f" COALESCE(upload_ts, added_ts, 0) AS ts"
+                    f" FROM videos WHERE {like_clauses}"
+                    f"{like_chan_sql}{like_year_sql}"
+                    f" AND is_duplicate_of IS NULL"
+                    f" ORDER BY {order_sql.replace('v.channel', 'channel').replace('v.title', 'title')}"
+                    f" LIMIT ?",
+                    like_args)
+                rows = cur.fetchall()
+        except sqlite3.Error as exc:
+            _log.warning("search_video_titles LIKE fallback failed: %s", exc)
+            return []
     result = [{
         "video_id": r[0] or "",
         "title": r[1] or "",

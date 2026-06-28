@@ -8,7 +8,20 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+import urllib.request
+
+from ._shared import _log, webview
+from backend.ytarchiver_config import channels_for_subs_ui, config_is_writable, load_config, save_config
+from backend import archive_scan
+from backend import subs as subs_backend
+from backend import sync as sync_backend
+from backend.queues import QueueState
 
 _SUBS_PROBE_TIMEOUT_SEC = 15
 
@@ -329,7 +342,7 @@ class SubsMixin:
                                           "first, then retry the delete."),
                             }
                     except Exception as e:
-                        _log.debug("swallowed: %s", e)
+                        _log.warning("active-sync check before channel remove failed; delete may proceed while sync is running: %s", e)
                     # Take the folder-move branch INSIDE the lock so an
                     # incoming sync start can't slip past our check.
                     result = subs_backend.remove_channel(
@@ -772,7 +785,7 @@ class SubsMixin:
                         if self._queues.sync_enqueue(task):
                             mt_added += 1
                     except Exception as e:
-                        _log.debug("swallowed: %s", e)
+                        _log.warning("metadata sync_enqueue failed; channel skipped from queue-pending: %s", e)
             if mt_added or tx_added:
                 try:
                     self._on_queue_changed()

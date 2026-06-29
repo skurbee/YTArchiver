@@ -610,6 +610,19 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                     for _pf_vid, _pf_title in _to_prefetch:
                         if cancel_event is not None and cancel_event.is_set():
                             break
+                        # Pause the burst on a network outage (auto-resumes
+                        # via the net monitor's 2-probe recovery). Without
+                        # this, a bulk refresh during an outage fires 3x
+                        # ~210s timeouts PER video against a dead connection.
+                        # Mirrors sync/redownload's block_if_down checkpoint.
+                        try:
+                            from .. import net as _net
+                            _net.block_if_down(
+                                stream=stream,
+                                check_cancel=lambda: bool(
+                                    cancel_event and cancel_event.is_set()))
+                        except Exception as _nce:
+                            _log.debug("meta net-block check failed: %s", _nce)
                         if pause_event is not None and pause_event.is_set():
                             while (pause_event.is_set()
                                    and not (cancel_event is not None

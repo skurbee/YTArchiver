@@ -343,7 +343,7 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
                 f"starting across {_total_ch} channel(s)…", "simpleline_pink")
             stream.flush()
         except Exception as e:
-            _log.warning("thumbnail status walk failed for %r: %s", name, e)
+            _log.warning("thumbnail realign intro emit failed: %s", e)
 
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -555,8 +555,7 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
                             "missing": max(0, s["total"] - s["with_thumb"]),
                         }
         except Exception as e:
-            _log.warning("thumbnail status DB backfill failed for %r: %s",
-                         name, e)
+            _log.warning("thumbnail status DB backfill failed: %s", e)
 
     # Pass 1: figure out which channels can use the cache.
     # Patch fix (v68.3): also distrust cache entries with total>0 but

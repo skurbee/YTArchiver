@@ -20,9 +20,8 @@ from __future__ import annotations
 from .core import *  # noqa: F401,F403
 
 # Explicit underscore-name re-exports — external callers reach in.
-from .core import (  # noqa: F401
-    _read_metadata_jsonl,
-)
+# (_read_metadata_jsonl is defined in .io and re-exported below; no
+# separate .core re-export needed — it would just shadow the same object.)
 from .io import (  # noqa: F401
     _folder_for_channel,
     _get_metadata_jsonl_path,

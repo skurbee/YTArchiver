@@ -6481,5 +6481,122 @@ class DriftScanTests(unittest.TestCase):
                           "(RECOVERED-FROM-JSONL)===", content)
 
 
+class NetworkOutageGuardTests(unittest.TestCase):
+    """Regression lock for the 'internet drops -> bogus cookie-expired,
+    never auto-resumes' bug.
+
+    The download loop flags a yt-dlp line as network-suspicious, runs a
+    LIVE net probe, and only then decides between the network-pause
+    (auto-resume) path and the cookie-alert (manual) path. These tests
+    pin the cheap pre-filter so a network blip can never again be blindly
+    reported as a signed-out session.
+    """
+
+    def test_real_network_error_lines_are_flagged(self):
+        for line in [
+            "ERROR: unable to download webpage: <urlopen error "
+            "[Errno 11001] getaddrinfo failed>",
+            "ERROR: [youtube] dQw4: Unable to download webpage: <urlopen error "
+            "[Errno -3] Temporary failure in name resolution>",
+            "ERROR: Unable to download API page: <urlopen error [WinError 10054] "
+            "An existing connection was forcibly closed by the remote host>",
+            "ERROR: [youtube] dQw4: Unable to download webpage: "
+            "<urlopen error [WinError 10060] connection timed out>",
+            "ERROR: Read timed out.",
+        ]:
+            self.assertTrue(
+                sync_core._line_is_network_suspicious(line.lower()),
+                msg=f"network line should be flagged: {line!r}")
+
+    def test_ambiguous_cookie_shaped_lines_are_flagged(self):
+        # A dropped connection can surface as these too, so they MUST warrant
+        # a probe rather than an immediate 'signed out' verdict.
+        for line in [
+            "ERROR: [youtube] dQw4: Sign in to confirm you're not a bot",
+            "ERROR: [youtube] dQw4: Failed to extract any player response; "
+            "please report this issue",
+        ]:
+            self.assertTrue(
+                sync_core._line_is_network_suspicious(line.lower()),
+                msg=f"ambiguous line should be flagged: {line!r}")
+
+    def test_normal_progress_lines_are_not_flagged(self):
+        for line in [
+            "[download]  50.0% of   10.00MiB at    2.00MiB/s ETA 00:03",
+            '[Merger] Merging formats into "Some Video [dQw4].mp4"',
+            "[info] dQw4: Downloading 1 format(s): 137+140",
+            "[youtube] dQw4: Downloading webpage",
+            "DLTRACK:::Title:::Uploader:::20240101:::1048576:::60:::dQw4",
+        ]:
+            self.assertFalse(
+                sync_core._line_is_network_suspicious(line.lower()),
+                msg=f"normal line should NOT be flagged: {line!r}")
+
+    def test_hard_cookie_lines_are_not_network_suspicious(self):
+        # A genuine cookie failure (network up) must fall through to the
+        # cookie-alert path, so on its own it must NOT be network-suspicious.
+        for line in [
+            "WARNING: cookies are invalid",
+            "WARNING: cookies are missing",
+            "ERROR: unable to extract cookies from firefox",
+        ]:
+            self.assertFalse(
+                sync_core._line_is_network_suspicious(line.lower()),
+                msg=f"hard-cookie line should not be network-flagged: {line!r}")
+
+
+class YtdlpFreshnessTests(unittest.TestCase):
+    """Regression lock for the stale-yt-dlp startup nudge (root cause of the
+    'idle a month -> channel download face-plants' report). A month-old
+    date-versioned yt-dlp must be flagged stale; a fresh one must not; an
+    unparseable version must fail safe (never flagged)."""
+
+    def _stub(self, version):
+        from backend.api_mixins.settings_mixin import SettingsMixin
+
+        class _FakeStream:
+            def __init__(self):
+                self.lines = []
+
+            def emit(self, *a, **k):
+                self.lines.append(a)
+
+        class _Stub(SettingsMixin):
+            def ytdlp_version(self_inner):
+                return {"ok": True, "version": version}
+
+            def _settings_log_stream(self_inner):
+                return self_inner._fake_stream
+
+        s = _Stub()
+        s._fake_stream = _FakeStream()
+        return s
+
+    def test_old_ytdlp_is_flagged_stale(self):
+        old = datetime.now().date() - __import__("datetime").timedelta(days=120)
+        ver = f"{old.year}.{old.month:02d}.{old.day:02d}"
+        stub = self._stub(ver)
+        r = stub.check_ytdlp_freshness(max_age_days=30)
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["stale"])
+        self.assertGreaterEqual(r["age_days"], 100)
+        self.assertTrue(stub._fake_stream.lines, "stale yt-dlp should emit a warning")
+
+    def test_fresh_ytdlp_is_not_stale(self):
+        new = datetime.now().date() - __import__("datetime").timedelta(days=2)
+        ver = f"{new.year}.{new.month:02d}.{new.day:02d}"
+        stub = self._stub(ver)
+        r = stub.check_ytdlp_freshness(max_age_days=30)
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["stale"])
+        self.assertFalse(stub._fake_stream.lines, "fresh yt-dlp should not warn")
+
+    def test_unparseable_version_fails_safe(self):
+        stub = self._stub("unknown-custom-build")
+        r = stub.check_ytdlp_freshness()
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["stale"])
+
+
 if __name__ == "__main__":
     unittest.main()

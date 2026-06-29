@@ -694,6 +694,37 @@
       if (!_stillOnSameVideo2 || !_stillOnWatchView2) {
         return;
       }
+      // Surface decode/playback failures. Without this, a corrupt or
+      // partially-downloaded file — or a codec the WebView can't decode —
+      // fails SILENTLY: the play().catch() below swallows the rejection and
+      // there's no media-error handler, so the user is left staring at a
+      // black box with no explanation. Wire once per <video> element.
+      if (!vEl.dataset.errHooked) {
+        vEl.dataset.errHooked = "1";
+        vEl.addEventListener("error", () => {
+          const err = vEl.error;
+          // Ignore aborts (fired during our own teardown / src swaps) and
+          // the empty-src state — only surface real decode/format failures.
+          if (!err || err.code === 1 /* MEDIA_ERR_ABORTED */) return;
+          if (!vEl.getAttribute("src")) return;
+          const ph2 = document.getElementById("watch-video-placeholder");
+          if (!ph2) return;
+          const _esc = window._escapeHtml || (s => String(s ?? ""));
+          const codeMsg = ({
+            2: "a network error interrupted the video",
+            3: "the video file appears to be corrupt or incomplete",
+            4: "the file's format/codec isn't supported by the player",
+          })[err.code] || "the video couldn't be played";
+          vEl.hidden = true;
+          ph2.style.display = "";
+          const label2 = ph2.querySelector(".placeholder-label") || ph2;
+          label2.innerHTML =
+            `<div class="watch-video-error-title">⚠ Couldn't play this ` +
+            `video — ${_esc(codeMsg)}.</div>` +
+            `<div class="watch-video-error-detail watch-video-error-hint">` +
+            `Try Redownload to refetch the file, or Rescan archive.</div>`;
+        });
+      }
       vEl.src = url;
       vEl.hidden = false;
       if (ph) {

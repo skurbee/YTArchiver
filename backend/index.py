@@ -939,8 +939,8 @@ def mark_video_transcribed(filepath: str,
             except Exception as e: _log.debug("swallowed: %s", e)
         return True
     except sqlite3.Error as exc:
-        _log.warning("update_video_path failed from %r to %r: %s",
-                     old_path, new_path, exc)
+        _log.warning("mark_video_transcribed failed for %r: %s",
+                     filepath, exc)
         return False
 
 

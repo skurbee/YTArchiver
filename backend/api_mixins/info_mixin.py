@@ -11,11 +11,9 @@ from __future__ import annotations
 import os
 from datetime import datetime
 
-import os
 import re
 import sys
 import threading
-from datetime import datetime
 
 from ._shared import _log
 from backend.ytarchiver_config import CONFIG_FILE, config_is_writable, load_config, save_config

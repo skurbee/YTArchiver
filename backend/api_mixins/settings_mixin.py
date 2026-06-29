@@ -362,6 +362,39 @@ class SettingsMixin:
             return _api_err("MISSING_DEPENDENCY", str(e))
 
 
+    def check_ytdlp_freshness(self, max_age_days: int = 30):
+        """Non-blocking startup nudge: warn if yt-dlp's date-based version is
+        older than `max_age_days`. yt-dlp ships 'YYYY.MM.DD' versions; a stale
+        binary silently fails to extract videos (nsig errors), so we surface
+        its age before the user hits a mystery face-plant. Never blocks, never
+        auto-updates — just emits one warning line to the activity log."""
+        try:
+            info = self.ytdlp_version()
+            if not info.get("ok"):
+                return {"ok": False}
+            ver = (info.get("version") or "").strip()
+            m = re.match(r"(\d{4})\.(\d{1,2})\.(\d{1,2})", ver)
+            if not m:
+                return {"ok": True, "stale": False}
+            import datetime as _dt
+            rel = _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            age = (_dt.date.today() - rel).days
+            stale = age > max_age_days
+            if stale:
+                try:
+                    self._settings_log_stream().emit([
+                        ["⚠ ", "red"],
+                        [f"yt-dlp is {age} days old (v{ver}). YouTube changes "
+                         "often break old yt-dlp — if downloads start failing, "
+                         "update it in Settings → Update yt-dlp.\n", "red"],
+                    ])
+                except Exception as _ee:
+                    _log.debug("ytdlp freshness emit failed: %s", _ee)
+            return {"ok": True, "stale": stale, "age_days": age, "version": ver}
+        except Exception as e:
+            _log.debug("ytdlp freshness check failed: %s", e)
+            return {"ok": False}
+
     def ytdlp_update(self):
         """Run yt-dlp -U in a background thread; stream output to the log."""
         yt = sync_backend.find_yt_dlp()

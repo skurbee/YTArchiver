@@ -1860,6 +1860,8 @@ def main():
     def _startup_checks():
         try: api.check_dependencies()
         except Exception as e: _log.debug("swallowed: %s", e)
+        try: api.check_ytdlp_freshness()
+        except Exception as e: _log.debug("swallowed: %s", e)
         try: api.check_channel_folders()
         except Exception as e: _log.debug("swallowed: %s", e)
         try: api.check_app_update()

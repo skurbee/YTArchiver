@@ -29,7 +29,6 @@ def _backup_file_entries():
     from backend.ytarchiver_config import (
         APP_DATA_DIR,
         CHANNEL_ID_CACHE,
-        CONFIG_FILE,
         DISK_CACHE_FILE,
         QUEUE_FILE,
         SEEN_FILTER_TITLES,

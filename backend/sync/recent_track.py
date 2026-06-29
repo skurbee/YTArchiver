@@ -242,6 +242,7 @@ def _record_recent_download(filepath: str, channel: str, title: str,
             def _bg_sweep():
                 try:
                     from .. import index as _idx
+                    from ..ytarchiver_config import load_config
                     cfg_s = load_config()
                     output_dir = (cfg_s.get("output_dir") or "").strip()
                     if output_dir:

@@ -138,6 +138,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     # sync/core.py:919).
     with _core._cookie_alert_lock:
         _core._COOKIE_ALERT_FIRED = False
+        _core._STALE_YTDLP_NUDGE_FIRED = False
 
     # Start-of-pass header — show total remaining work, not len(config).
     # In resume mode that's the restored queue size; fresh mode it's the

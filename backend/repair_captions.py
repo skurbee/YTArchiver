@@ -817,6 +817,15 @@ def repair_archive(*, output_dir: str, log_stream,
     try:
       for i, (j, vid, t, tag) in enumerate(work, 1):
         _wait_if_paused()
+        # Pause on a network outage (auto-resumes via the net monitor's
+        # 2-probe recovery). Without this, an outage mid-repair fires the
+        # 429 backoff schedule + retries against a dead connection for
+        # every video. Mirrors sync/redownload/metadata's checkpoint.
+        try:
+            from .net import block_if_down as _block_if_down
+            _block_if_down(stream=log_stream, check_cancel=_cancelled)
+        except Exception as _nce:
+            _log.debug("repair net-block check failed: %s", _nce)
         if _cancelled():
             cancelled_early = True
             log_stream.emit_text(

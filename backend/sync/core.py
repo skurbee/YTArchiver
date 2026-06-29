@@ -212,12 +212,66 @@ _COOKIE_ALERT_PASSES_FIRED: set = set()
 # this, two concurrent channel-sync threads can both observe the flag
 # as False, both set it True, both emit the banner — duplicate alert.
 _cookie_alert_lock = threading.Lock()
+# Fired once per sync pass (reset in sync_all) so a stale-yt-dlp nudge
+# doesn't repeat for every failing channel in a multi-channel sync.
+_STALE_YTDLP_NUDGE_FIRED = False
 # Serialize ARCHIVE_FILE appends across the entire process. Two channel-
 # sync threads writing concurrently can interleave bytes mid-line, and
 # the loader silently drops malformed lines (audit: sync/core.py:1654).
 _archive_write_lock = threading.Lock()
 _LAST_429_BACKOFF_TS: float = 0.0
 _backoff_lock = threading.Lock()
+
+# Network-outage hints. A dropped / flapping connection makes yt-dlp emit
+# text that OVERLAPS its genuine "signed-out / can't extract player
+# response" wording — so historically a network blip got misreported as
+# "Browser is signed out of YouTube" and waited for a manual Resume that
+# never came. We use this list only to decide WHEN to probe; net.probe_once()
+# is the real arbiter before we ever pause (see the network-outage guard in
+# the download loop). Kept deliberately broad — a false match just costs one
+# quick probe that returns "up" and falls straight through to normal handling.
+_NETWORK_ERROR_HINTS = (
+    "unable to download webpage",
+    "unable to download api page",
+    "urlopen error",
+    "getaddrinfo failed",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "no address associated with hostname",
+    "failed to resolve",
+    "network is unreachable",
+    "no route to host",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "remote end closed connection",
+    "read timed out",
+    "the read operation timed out",
+    "[errno 11001]",   # WSAHOST_NOT_FOUND (Windows DNS lookup failed)
+    "[errno -2]",      # EAI_NONAME
+    "[errno -3]",      # EAI_AGAIN (temporary DNS failure)
+    "winerror 10051",  # network unreachable
+    "winerror 10054",  # connection reset by peer
+    "winerror 10060",  # connection timed out
+    "winerror 11001",  # host not found
+)
+
+
+def _line_is_network_suspicious(line_lower: str) -> bool:
+    """True if a yt-dlp output line *might* indicate a connectivity outage
+    and therefore warrants a live net probe before we classify it.
+
+    Deliberately includes the two cookie-SHAPED phrases ("sign in to
+    confirm", "failed to extract any player response") that a dropped
+    connection can also produce — so a network blip is never blindly
+    reported as a signed-out session (the original bug). The live
+    net.probe_once() call is what actually decides whether to pause.
+
+    `line_lower` must already be lowercased.
+    """
+    return (any(_h in line_lower for _h in _NETWORK_ERROR_HINTS)
+            or "sign in to confirm" in line_lower
+            or "failed to extract any player response" in line_lower)
 
 
 def _maybe_429_backoff(stream: LogStreamer,
@@ -825,6 +879,10 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # video" that recurred on every single sync).
     _filtered_this_run: set = set()
     _net_warned: set = set()   # vids already shown a "couldn't reach" notice
+    # nsig "unable to extract n function" failures this channel. These are
+    # dimmed per-line as transient, but a whole pass of them with zero
+    # downloads = an out-of-date yt-dlp (see the end-of-pass nudge below).
+    _extract_nsig_fails = 0
     current_title = ""
     dest_path = ""
     # Path captured from `[Merger] Merging formats into "PATH"` — this is
@@ -1262,6 +1320,39 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                             _path_to_counter[merge_dest_path] = _cs_n
                 stream.emit([[f" {s}\n", "dim"]])
                 continue
+
+            # ── Network-outage guard (runs BEFORE cookie detection) ────
+            # A dropped/flapping connection makes yt-dlp emit the SAME
+            # "can't extract / sign in to confirm" text as a genuine
+            # signed-out session — so without this guard a network blip
+            # got misreported as "Browser is signed out" and waited on a
+            # MANUAL resume that never came. Catch network-shaped failures
+            # (and double-check ambiguous cookie-shaped ones) with a LIVE
+            # probe; only if the net is really down do we pause — with
+            # AUTO-resume via net.block_if_down, mirroring the disk
+            # watchdog's pause/auto-retry pattern. Probe only fires for
+            # suspicious lines, so the happy path pays nothing.
+            _sl_guard = s.lower()
+            if _line_is_network_suspicious(_sl_guard):
+                try:
+                    from .. import net as _net
+                    if _net.net_down.is_set() or not _net.probe_once():
+                        _net.net_down.set()
+                        # Stop the current yt-dlp burning retries on a dead
+                        # pipe, then block until the connection is confirmed
+                        # back (2 stable probes). The videos this run missed
+                        # are re-walked on the next sync pass.
+                        try:
+                            proc.terminate()
+                        except Exception as _te:
+                            _log.debug("net-outage terminate failed: %s", _te)
+                        _net.block_if_down(
+                            stream=stream,
+                            check_cancel=lambda: bool(
+                                cancel_event and cancel_event.is_set()))
+                        break
+                except Exception as _ne:
+                    swallow("net-outage guard", _ne)
 
             # ── Cookie / sign-in error detection ───────────────────────
             # yt-dlp surfaces stale-cookie / signed-out-of-YouTube
@@ -2255,6 +2346,12 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     "this video is not available",
                 )
                 if any(frag in low for frag in _BENIGN_FRAGMENTS):
+                    # Count the nsig signature-decrypt failures specifically —
+                    # they're the tell-tale of a stale yt-dlp (used by the
+                    # end-of-pass nudge). Still dimmed per-line so a one-off
+                    # transient stays quiet.
+                    if "unable to extract n function" in low:
+                        _extract_nsig_fails += 1
                     stream.emit([[f" {s}\n", "dim"]])
                     continue
                 # yt-dlp's internal retry messages. Format examples:
@@ -2919,6 +3016,30 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 "no videos checked.")
         except Exception as _e:
             swallow("crash-exit emit", _e)
+    # Stale-yt-dlp nudge. A pass that downloaded NOTHING while hitting several
+    # nsig signature-decrypt failures almost always means an out-of-date yt-dlp
+    # that can't decrypt YouTube's current signatures — the "idle a while,
+    # suddenly everything fails" face-plant. Surface it ONCE per sync pass with
+    # an actionable message instead of the silent dimmed lines that hid it.
+    if downloaded == 0 and _extract_nsig_fails >= 3:
+        global _STALE_YTDLP_NUDGE_FIRED
+        _fire_stale_nudge = False
+        with _cookie_alert_lock:
+            if not _STALE_YTDLP_NUDGE_FIRED:
+                _STALE_YTDLP_NUDGE_FIRED = True
+                _fire_stale_nudge = True
+        if _fire_stale_nudge:
+            _sbar = "█" * 65
+            stream.emit([["\n" + _sbar + "\n", "red"]])
+            stream.emit([["█  ", "red"],
+                         ["yt-dlp couldn't extract any videos this pass.",
+                          "red"], ["\n", "red"]])
+            stream.emit([["█  ", "red"],
+                         ["It's almost certainly out of date — YouTube "
+                          "changes break old yt-dlp. Update it in "
+                          "Settings → Update yt-dlp, then sync again.",
+                          "red"], ["\n", "red"]])
+            stream.emit([[_sbar + "\n\n", "red"]])
     if _good_rcs:
         _ok = True
     elif _crashed:

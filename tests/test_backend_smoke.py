@@ -59,7 +59,10 @@ from backend.api_mixins import subs_mixin
 from backend.api_mixins import sync_mixin
 from backend.api_mixins import thumbnail_mixin
 from backend.api_mixins import transcribe_mixin
+from backend.api_mixins import window_mixin
 from backend.api_mixins.browse_mixin import BrowseMixin
+from backend.api_mixins.info_mixin import InfoMixin
+from backend.api_mixins.index_mixin import IndexMixin
 from backend.api_mixins.media_ops_mixin import MediaOpsMixin
 from backend.api_mixins.onboarding_mixin import OnboardingMixin
 from backend.api_mixins.queue_mixin import QueueMixin
@@ -70,6 +73,7 @@ from backend.api_mixins.sync_mixin import SyncMixin
 from backend.api_mixins.thumbnail_mixin import ThumbnailMixin
 from backend.api_mixins.transcribe_mixin import TranscribeMixin
 from backend.api_mixins.video_mixin import VideoMixin
+from backend.api_mixins.window_mixin import WindowMixin
 from backend.sync import core as sync_core
 from backend.sync import (
     log_rows,
@@ -1576,6 +1580,49 @@ class DiagnosticsMixinTests(unittest.TestCase):
         self.assertTrue(rows["ffprobe"]["ok"])
         self.assertEqual(rows["ffprobe"]["detail"], r"C:\Managed\ffprobe.exe")
 
+    def test_diagnostics_mixin_prefers_app_services_dependencies(self) -> None:
+        service_log = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service_channels = [{
+                "name": "Service Channel",
+                "url": "https://www.youtube.com/@service",
+                "initialized": True,
+            }]
+
+            class Api(diagnostics_mixin.DiagnosticsMixin):
+                def __init__(self):
+                    self._config = {
+                        "output_dir": "",
+                        "channels": [{"name": "Stale Channel",
+                                      "initialized": True}],
+                    }
+                    self._log_stream = mock.Mock()
+                    self.services = AppServices(
+                        load_config=lambda: {
+                            "output_dir": tmp,
+                            "channels": list(service_channels),
+                        },
+                        save_config=lambda cfg: True,
+                        queues=mock.Mock(),
+                        log_stream=service_log,
+                        transcribe=mock.Mock(),
+                        event_bus=mock.Mock(),
+                    )
+
+            with mock.patch("backend.api_mixins.diagnostics_mixin.load_config",
+                            side_effect=AssertionError("use services")):
+                api = Api()
+                result = api.check_channel_folders()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["missing"]), 1)
+        self.assertEqual(result["missing"][0]["name"], "Service Channel")
+        service_log.emit.assert_called_once()
+        service_log.flush.assert_called_once()
+        api._log_stream.emit.assert_not_called()
+        api._log_stream.flush.assert_not_called()
+
 
 class ThumbnailMixinTests(unittest.TestCase):
     def test_realign_poll_recovers_partial_lazy_state(self) -> None:
@@ -1911,6 +1958,96 @@ class MetadataMixinTests(unittest.TestCase):
         self.assertEqual(second["val"], "overwrite")
         self.assertTrue(second["event"].is_set())
 
+    def test_metadata_queue_all_prefers_app_services_dependencies(self) -> None:
+        service_queues = mock.Mock()
+        service_queues.sync_paused = False
+        service_queues.sync_enqueue.return_value = True
+        service_log = mock.Mock()
+
+        class Api(metadata_mixin.MetadataMixin):
+            def __init__(self):
+                self._config = {"channels": []}
+                self._queues = mock.Mock()
+                self._log_stream = mock.Mock()
+                self._on_queue_changed = mock.Mock()
+                self._maybe_autostart_sync = mock.Mock(return_value=True)
+                self.services = AppServices(
+                    load_config=lambda: {
+                        "channels": [
+                            {"name": "Bravo", "url": "b"},
+                            {"name": "Alpha", "url": "a"},
+                        ],
+                    },
+                    save_config=lambda cfg: True,
+                    queues=service_queues,
+                    log_stream=service_log,
+                    transcribe=mock.Mock(),
+                    event_bus=mock.Mock(),
+                )
+
+        api = Api()
+        with mock.patch("backend.api_mixins.metadata_mixin.load_config",
+                        side_effect=AssertionError("use services")):
+            result = api.metadata_queue_all(refresh=True)
+
+        self.assertEqual(result, {
+            "ok": True,
+            "queued": 2,
+            "channels": 2,
+            "started": True,
+            "paused": False,
+        })
+        self.assertEqual(
+            [call.args[0]["name"]
+             for call in service_queues.sync_enqueue.call_args_list],
+            ["Alpha", "Bravo"])
+        self.assertTrue(all(call.args[0]["refresh"]
+                            for call in service_queues.sync_enqueue.call_args_list))
+        service_log.emit_text.assert_called_once()
+        service_log.flush.assert_called_once()
+        api._queues.sync_enqueue.assert_not_called()
+        api._log_stream.emit_text.assert_not_called()
+        api._on_queue_changed.assert_called_once()
+        api._maybe_autostart_sync.assert_called_once()
+
+    def test_metadata_queue_year_prefers_app_services_dependencies(self) -> None:
+        service_queues = mock.Mock()
+        service_queues.sync_paused = True
+        service_log = mock.Mock()
+
+        class Api(metadata_mixin.MetadataMixin):
+            def __init__(self):
+                self._queues = mock.Mock()
+                self._log_stream = mock.Mock()
+                self._on_queue_changed = mock.Mock()
+                self._maybe_autostart_sync = mock.Mock(return_value=False)
+                self.services = AppServices(
+                    load_config=lambda: {},
+                    save_config=lambda cfg: True,
+                    queues=service_queues,
+                    log_stream=service_log,
+                    transcribe=mock.Mock(),
+                    event_bus=mock.Mock(),
+                )
+
+        with mock.patch.object(metadata_mixin.subs_backend, "get_channel",
+                               return_value={"name": "Fresh", "url": "u"}):
+            result = Api().metadata_queue_channel_year(
+                {"name": "Fresh"}, "2024", refresh=False)
+
+        self.assertEqual(result, {
+            "ok": True,
+            "queued": True,
+            "year": 2024,
+            "refresh": False,
+            "started": False,
+            "paused": True,
+        })
+        task = service_queues.sync_enqueue.call_args.args[0]
+        self.assertEqual(task["kind"], "metadata")
+        self.assertEqual(task["scope"], {"year": 2024})
+        service_log.emit_text.assert_called_once()
+        service_log.flush.assert_called_once()
 
 class BrowseMixinTests(unittest.TestCase):
     def tearDown(self) -> None:
@@ -2029,8 +2166,134 @@ class BrowseMixinTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("outside", result["error"])
 
+    def test_browse_mixin_prefers_app_services_for_manual_videos(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "Manual Video.mp4"
+            video.write_bytes(b"video")
+            (Path(tmp) / "Notes.txt").write_text("skip", encoding="utf-8")
+
+            class Api(BrowseMixin):
+                def __init__(self):
+                    self._config = {"video_out_dir": ""}
+                    self.services = AppServices(
+                        load_config=lambda: {"video_out_dir": tmp},
+                        save_config=lambda cfg: True,
+                        queues=mock.Mock(),
+                        log_stream=mock.Mock(),
+                        transcribe=mock.Mock(),
+                        event_bus=mock.Mock(),
+                    )
+
+            with mock.patch("backend.api_mixins.browse_mixin.load_config",
+                            side_effect=AssertionError("use services")):
+                result = Api().list_manual_videos(sort="title")
+
+        self.assertEqual(result["folder"], tmp)
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["rows"][0]["title"], "Manual Video")
+
+    def test_browse_refresh_metadata_prefers_app_services_dependencies(self) -> None:
+        video_id = "abc123def45"
+        service_log = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / f"Video [{video_id}].mp4"
+            video.write_bytes(b"video")
+
+            class Api(BrowseMixin):
+                def __init__(self):
+                    self._config = {"channels": [{"name": "Stale"}]}
+                    self._log_stream = mock.Mock()
+                    self._push_recent_refresh = mock.Mock()
+                    self.services = AppServices(
+                        load_config=lambda: {
+                            "output_dir": tmp,
+                            "channels": [{
+                                "name": "Fresh Channel",
+                                "url": "https://www.youtube.com/@fresh",
+                            }],
+                        },
+                        save_config=lambda cfg: True,
+                        queues=mock.Mock(),
+                        log_stream=service_log,
+                        transcribe=mock.Mock(),
+                        event_bus=mock.Mock(),
+                    )
+
+            api = Api()
+            with mock.patch("backend.api_mixins.browse_mixin.load_config",
+                            side_effect=AssertionError("use services")), \
+                    mock.patch("backend.metadata.fetch_single_video_metadata",
+                               return_value={
+                                   "ok": True,
+                                   "entry": {"title": "Fresh Metadata"},
+                               }) as fetch:
+                result = api.browse_refresh_video_metadata({
+                    "filepath": str(video),
+                    "video_id": video_id,
+                    "title": "Video",
+                    "channel": "Fresh Channel",
+                })
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["meta"], {"title": "Fresh Metadata"})
+        self.assertEqual(fetch.call_args.args[:4], (
+            {
+                "name": "Fresh Channel",
+                "url": "https://www.youtube.com/@fresh",
+            },
+            video_id,
+            str(video),
+            "Video",
+        ))
+        self.assertIs(fetch.call_args.args[4], service_log)
+        api._log_stream.emit_text.assert_not_called()
+        api._push_recent_refresh.assert_called_once()
+
 
 class RecentMixinTests(unittest.TestCase):
+    def test_recent_mixin_prefers_app_services_config(self) -> None:
+        saved: list[dict] = []
+
+        class Api(RecentMixin):
+            def __init__(self):
+                self._config = {
+                    "recent_downloads": [{
+                        "title": "Stale",
+                        "channel": "Old",
+                        "download_ts": 1,
+                    }],
+                }
+                self._reload_config = mock.Mock()
+                self.services = AppServices(
+                    load_config=lambda: {
+                        "channels": [{"name": "Fresh Channel"}],
+                        "recent_downloads": [{
+                            "title": "Fresh",
+                            "channel": "Fresh Channel",
+                            "download_ts": 2,
+                        }],
+                    },
+                    save_config=lambda cfg: saved.append(dict(cfg)) or True,
+                    queues=mock.Mock(),
+                    log_stream=mock.Mock(),
+                    transcribe=mock.Mock(),
+                    event_bus=mock.Mock(),
+                )
+
+        api = Api()
+        with mock.patch("backend.api_mixins.recent_mixin.load_config",
+                        side_effect=AssertionError("use services")), \
+                mock.patch("backend.api_mixins.recent_mixin.save_config",
+                           side_effect=AssertionError("use services")):
+            rows = api.get_recent_downloads()
+            cleared = api.clear_recent_downloads()
+
+        self.assertEqual(rows[0]["title"], "Fresh")
+        self.assertTrue(cleared["ok"])
+        self.assertEqual(saved[-1]["recent_downloads"], [])
+        api._reload_config.assert_called_once()
+
     def test_list_all_videos_clamps_limit_and_coerces_offset(self) -> None:
         mixin = RecentMixin()
 
@@ -2188,6 +2451,63 @@ class RecentMixinTests(unittest.TestCase):
         self.assertIn("config write failed", result["error"])
 
 
+class InfoMixinServicesTests(unittest.TestCase):
+    def test_info_mixin_prefers_app_services_for_fresh_config_paths(self) -> None:
+        saved: list[dict] = []
+        service_log = mock.Mock()
+
+        def fresh_config():
+            return {
+                "channels": [{"name": "One"}, {"name": "Two"}],
+                "output_dir": "FreshArchive",
+                "url_history": [f"url-{i}" for i in range(25)],
+                "last_sync": "2026-06-28 00:01",
+            }
+
+        class Api(InfoMixin):
+            def __init__(self):
+                self._config = {
+                    "channels": [],
+                    "output_dir": "stale-cache",
+                    "url_history": ["stale"],
+                    "last_sync": "",
+                }
+                self._log_stream = mock.Mock()
+                self.services = AppServices(
+                    load_config=fresh_config,
+                    save_config=lambda cfg: saved.append(dict(cfg)) or True,
+                    queues=mock.Mock(),
+                    log_stream=service_log,
+                    transcribe=mock.Mock(),
+                    event_bus=mock.Mock(),
+                )
+
+            def ytdlp_version(self):
+                return {"ok": True, "version": "2026.01.01"}
+
+        api = Api()
+        with mock.patch("backend.api_mixins.info_mixin.load_config",
+                        side_effect=AssertionError("use services")), \
+                mock.patch("backend.api_mixins.info_mixin.save_config",
+                           side_effect=AssertionError("use services")), \
+                mock.patch("backend.api_mixins.info_mixin.config_is_writable",
+                           return_value=True):
+            about = api.about_info()
+            history = api.url_history()
+            api._push_url_history("new-url")
+            last_sync = api.get_last_sync_label()
+
+        self.assertEqual(about["channels"], 2)
+        self.assertEqual(about["output_dir"], "FreshArchive")
+        self.assertEqual(about["ytdlp_version"], "2026.01.01")
+        self.assertEqual(history, [f"url-{i}" for i in range(20)])
+        self.assertEqual(saved[-1]["url_history"][0], "new-url")
+        self.assertEqual(len(saved[-1]["url_history"]), 20)
+        self.assertIn("Last Full Sync:", last_sync["label"])
+        api._log_stream.emit_dim.assert_not_called()
+        service_log.emit_dim.assert_not_called()
+
+
 class VideoMixinTests(unittest.TestCase):
     def test_video_delete_reports_partial_failure_when_index_cleanup_fails(self) -> None:
         mixin = VideoMixin()
@@ -2205,6 +2525,68 @@ class VideoMixinTests(unittest.TestCase):
         self.assertTrue(result["file_trashed"])
         self.assertTrue(result["cleanup_failed"])
         self.assertIn("db locked", result["error"])
+
+    def test_video_redownload_prefers_app_services_dependencies(self) -> None:
+        service_queues = mock.Mock()
+        service_log = mock.Mock()
+
+        class Api(VideoMixin):
+            def __init__(self):
+                self._config = {"channels": [{"name": "Stale Channel"}]}
+                self._queues = mock.Mock()
+                self._log_stream = mock.Mock()
+                self._sync_pause = threading.Event()
+                self.services = AppServices(
+                    load_config=lambda: {
+                        "output_dir": r"X:\Archive",
+                        "channels": [{
+                            "name": "Fresh Channel",
+                            "folder_override": "Fresh Folder",
+                            "url": "https://www.youtube.com/@fresh",
+                        }],
+                    },
+                    save_config=lambda cfg: True,
+                    queues=service_queues,
+                    log_stream=service_log,
+                    transcribe=mock.Mock(),
+                    event_bus=mock.Mock(),
+                )
+
+        class FakeReader:
+            def execute(self, *args, **kwargs):
+                return self
+
+            def fetchone(self):
+                return (r"X:\Archive\Fresh Folder\Video.mp4",
+                        "Fresh Channel")
+
+        class ImmediateThread:
+            def __init__(self, target, daemon=False):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with mock.patch("backend.index._reader_open",
+                        return_value=FakeReader()), \
+                mock.patch("backend.api_mixins.video_mixin.load_config",
+                           side_effect=AssertionError("use services")), \
+                mock.patch("backend.api_mixins.video_mixin"
+                           ".threading.Thread",
+                           ImmediateThread), \
+                mock.patch("backend.redownload.redownload_channel") as run:
+            result = Api().video_redownload("abc123def45", "Video", "720")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(run.call_args.args[:3], (
+            "Fresh Channel",
+            "https://www.youtube.com/@fresh",
+            r"X:\Archive\Fresh Folder",
+        ))
+        self.assertEqual(run.call_args.args[3], "720")
+        self.assertIs(run.call_args.kwargs["stream"], service_log)
+        self.assertIs(run.call_args.kwargs["queues"], service_queues)
+        self.assertEqual(run.call_args.kwargs["only_video_id"], "abc123def45")
 
 
 class LogRowsTests(unittest.TestCase):
@@ -3413,6 +3795,31 @@ class SyncCoreTests(unittest.TestCase):
         self.assertEqual(sleep.call_count, 60)
         self.assertEqual(stream.emit_text.call_count, 4)
 
+    def test_failed_video_merge_does_not_resurrect_timeout_giveup(self) -> None:
+        video_id = "abc123def45"
+
+        next_failed, gave_up = sync_core._merge_failed_video_ids(
+            {}, {video_id}, [], {video_id})
+
+        self.assertEqual(next_failed, {})
+        self.assertEqual(gave_up, [])
+
+    def test_archived_failed_video_ids_detects_stale_retry_state(self) -> None:
+        video_id = "abc123def45"
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = Path(td) / "ytarchive.txt"
+            archive_path.write_text(
+                f"youtube otherVideo1\n"
+                f"youtube {video_id}\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(sync_core, "ARCHIVE_FILE", archive_path):
+                found = sync_core._archived_failed_video_ids(
+                    {video_id, "missing0001"})
+
+        self.assertEqual(found, {video_id})
+
     def test_sync_all_pause_mid_download_keeps_task_visible(self) -> None:
         sync_all_module = __import__(
             "backend.sync.sync_all", fromlist=["sync_all"])
@@ -4149,6 +4556,116 @@ class AppServicesTests(unittest.TestCase):
         self.assertEqual(services.fresh_config()["output_dir"], "X:/Archive")
 
 
+class SettingsMixinServicesTests(unittest.TestCase):
+    def test_settings_mixin_prefers_app_services_dependencies(self) -> None:
+        saved: list[dict] = []
+        service_log = mock.Mock()
+        service_transcribe = mock.Mock()
+
+        def fresh_config():
+            return {
+                "output_dir": "FreshArchive",
+                "video_out_dir": "FreshManual",
+                "whisper_model": "tiny",
+                "default_resolution": "720",
+                "log_mode": "Simple",
+            }
+
+        class Api(settings_mixin.SettingsMixin):
+            def __init__(self):
+                self._config = {
+                    "output_dir": "stale-cache",
+                    "log_mode": "Verbose",
+                }
+                self._log_stream = mock.Mock()
+                self._transcribe = mock.Mock()
+                self._reload_config = mock.Mock()
+                self.services = AppServices(
+                    load_config=fresh_config,
+                    save_config=lambda cfg: saved.append(dict(cfg)) or True,
+                    queues=mock.Mock(),
+                    log_stream=service_log,
+                    transcribe=service_transcribe,
+                    event_bus=mock.Mock(),
+                )
+
+        api = Api()
+        with mock.patch("backend.api_mixins.settings_mixin.load_config",
+                        side_effect=AssertionError("use services")), \
+                mock.patch("backend.api_mixins.settings_mixin.config_is_writable",
+                           return_value=True):
+            loaded = api.settings_load()
+            mode_result = api.set_log_mode("Verbose")
+            save_result = api.settings_save({
+                "log_mode": "Simple",
+                "whisper_model": "small",
+            })
+
+        self.assertEqual(loaded["output_dir"], "FreshArchive")
+        self.assertTrue(mode_result["ok"])
+        self.assertTrue(save_result["ok"])
+        self.assertEqual(saved[-2]["log_mode"], "Verbose")
+        self.assertEqual(saved[-1]["whisper_model"], "small")
+        self.assertTrue(service_log.simple_mode)
+        service_transcribe.swap_model.assert_called_once_with("small")
+        api._log_stream.emit_dim.assert_not_called()
+        api._transcribe.swap_model.assert_not_called()
+        self.assertEqual(api._reload_config.call_count, 1)
+
+    def test_ytdlp_update_prefers_app_services_log_stream(self) -> None:
+        service_log = mock.Mock()
+
+        class Api(settings_mixin.SettingsMixin):
+            def __init__(self):
+                self._log_stream = mock.Mock()
+                self.services = AppServices(
+                    load_config=lambda: {},
+                    save_config=lambda cfg: True,
+                    queues=mock.Mock(),
+                    log_stream=service_log,
+                    transcribe=mock.Mock(),
+                    event_bus=mock.Mock(),
+                )
+
+        class FakeProc:
+            stdout = ["updated\n"]
+            returncode = 0
+
+            def wait(self):
+                return self.returncode
+
+        class ImmediateThread:
+            def __init__(self, target, daemon=False):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        old_cache = dict(settings_mixin.SettingsMixin._ytdlp_version_cache)
+        settings_mixin.SettingsMixin._ytdlp_version_cache = {
+            "yt-dlp.exe": {"ok": True, "version": "old", "path": "yt-dlp.exe"}
+        }
+        try:
+            with mock.patch.object(settings_mixin.sync_backend, "find_yt_dlp",
+                                   return_value="yt-dlp.exe"), \
+                    mock.patch.object(settings_mixin.threading, "Thread",
+                                      ImmediateThread), \
+                    mock.patch("subprocess.Popen", return_value=FakeProc()):
+                result = Api().ytdlp_update()
+        finally:
+            cache_after = dict(settings_mixin.SettingsMixin._ytdlp_version_cache)
+            settings_mixin.SettingsMixin._ytdlp_version_cache = old_cache
+
+        self.assertTrue(result["started"])
+        self.assertNotIn("yt-dlp.exe", cache_after)
+        service_log.emit.assert_any_call([
+            ["[Update] ", "update_head"],
+            ["Updating yt-dlp...\n", "update_sep"],
+        ])
+        service_log.emit_dim.assert_called_once_with(" updated")
+        service_log.flush.assert_called_once()
+
+
 class OnboardingMixinServicesTests(unittest.TestCase):
     def test_onboarding_mixin_prefers_app_services_config(self) -> None:
         saved: list[dict] = []
@@ -4234,6 +4751,138 @@ class QueueMixinServicesTests(unittest.TestCase):
         api._queues.to_ui_payload.assert_not_called()
         api._transcribe._ensure_worker.assert_not_called()
         api._log_stream.emit_text.assert_not_called()
+
+
+class WindowMixinServicesTests(unittest.TestCase):
+    def test_confirm_close_remember_prefers_app_services_dependencies(self) -> None:
+        saved: list[dict] = []
+        service_log = mock.Mock()
+        service_queues = mock.Mock()
+        started_threads = []
+
+        class FakeThread:
+            def __init__(self, target, daemon=False):
+                self.target = target
+                self.daemon = daemon
+
+            def start(self):
+                started_threads.append(self)
+
+        class Api(WindowMixin):
+            def __init__(self):
+                self._config = {"close_behavior": "stale"}
+                self._log_stream = mock.Mock()
+                self._queues = mock.Mock()
+                self._window = mock.Mock()
+                self._reload_config = mock.Mock()
+                self._close_dialog_pending = True
+                self.services = AppServices(
+                    load_config=lambda: {
+                        "close_behavior": "prompt",
+                        "other": "kept",
+                    },
+                    save_config=lambda cfg: saved.append(dict(cfg)) or False,
+                    queues=service_queues,
+                    log_stream=service_log,
+                    transcribe=mock.Mock(),
+                    event_bus=mock.Mock(),
+                )
+
+        api = Api()
+        with mock.patch("backend.api_mixins.window_mixin.load_config",
+                        side_effect=AssertionError("use services")), \
+                mock.patch("backend.api_mixins.window_mixin.save_config",
+                           side_effect=AssertionError("use services")), \
+                mock.patch.object(window_mixin.threading, "Thread",
+                                  side_effect=FakeThread):
+            result = api.confirm_close("tray", remember=True)
+
+        self.assertEqual(result, {"ok": True, "action": "tray"})
+        self.assertFalse(api._close_dialog_pending)
+        self.assertEqual(saved[-1], {
+            "close_behavior": "tray",
+            "other": "kept",
+        })
+        service_log.emit_dim.assert_called_once_with(
+            " (close behavior preference not saved)")
+        api._log_stream.emit_dim.assert_not_called()
+        api._reload_config.assert_not_called()
+        self.assertEqual(len(started_threads), 1)
+        api._window.hide.assert_not_called()
+
+
+class IndexMixinServicesTests(unittest.TestCase):
+    def test_index_count_transcripts_prefers_app_services_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Video Transcript.txt").write_text(
+                "transcript", encoding="utf-8")
+            (root / ".Channel Video Transcript.jsonl").write_text(
+                "{}", encoding="utf-8")
+            (root / ".Channel Metadata.jsonl").write_text(
+                "{}", encoding="utf-8")
+
+            class Api(IndexMixin):
+                def __init__(self):
+                    self._config = {"output_dir": ""}
+                    self.services = AppServices(
+                        load_config=lambda: {"output_dir": tmp},
+                        save_config=lambda cfg: True,
+                        queues=mock.Mock(),
+                        log_stream=mock.Mock(),
+                        transcribe=mock.Mock(),
+                        event_bus=mock.Mock(),
+                    )
+
+            with mock.patch("backend.api_mixins.index_mixin.load_config",
+                            side_effect=AssertionError("use services")):
+                result = Api().index_count_transcripts()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["txt_count"], 1)
+        self.assertEqual(result["jsonl_count"], 1)
+        self.assertEqual(result["total"], 2)
+
+    def test_index_rebuild_fts_prefers_app_services_log_stream(self) -> None:
+        service_log = mock.Mock()
+
+        class ImmediateThread:
+            def __init__(self, target, daemon=False):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        class Api(IndexMixin):
+            def __init__(self):
+                self._log_stream = mock.Mock()
+                self.services = AppServices(
+                    load_config=lambda: {},
+                    save_config=lambda cfg: True,
+                    queues=mock.Mock(),
+                    log_stream=service_log,
+                    transcribe=mock.Mock(),
+                    event_bus=mock.Mock(),
+                )
+
+        api = Api()
+        with mock.patch("backend.api_mixins.index_mixin.threading.Thread",
+                        ImmediateThread), \
+                mock.patch("backend.api_mixins.index_mixin.index_backend"
+                           ".rebuild_fts_index",
+                           return_value={"ok": True, "rows_indexed": 12}):
+            result = api.index_rebuild_fts()
+
+        self.assertEqual(result, {"ok": True, "started": True})
+        service_log.emit_text.assert_any_call(
+            "Rebuilding FTS search index from scratch\u2026",
+            "simpleline_blue")
+        service_log.emit_text.assert_any_call(
+            "\u2014 FTS rebuild complete: 12 rows indexed.",
+            "simpleline_green")
+        api._log_stream.emit_text.assert_not_called()
+        api._log_stream.emit_error.assert_not_called()
+        self.assertFalse(api._fts_rebuild_running)
 
 
 class TranscribeMixinServicesTests(unittest.TestCase):

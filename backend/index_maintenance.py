@@ -81,7 +81,16 @@ def sweep_new_videos(output_dir: str, channels: list,
     if not output_dir:
         return {"registered": 0, "ingested": 0}
     import time as _t
-    def _wait_while_busy(max_wait: float = 600.0) -> bool:
+    # max_wait is a safety cap against a wedged busy signal, NOT a normal
+    # exit path. The caller's gate now keys off live thread/job state
+    # (sync worker alive, single-download alive, GPU job, per-channel
+    # active) which can't get stuck True, so the cap can be generous: a
+    # full 105-channel pass with downloads + transcription routinely
+    # exceeds the old 600s, and barging ahead there made the sweep
+    # compete with the user's active download for the Z: pool — the exact
+    # thing this gate exists to prevent. One hour comfortably outlasts any
+    # pass while still bounding a genuine wedge.
+    def _wait_while_busy(max_wait: float = 3600.0) -> bool:
         """Pause low-priority sweep work while user-visible work is active."""
         if not callable(gpu_busy_fn):
             return False

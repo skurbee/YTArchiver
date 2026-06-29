@@ -23,6 +23,7 @@ import sqlite3
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import UTC
 from pathlib import Path
 from typing import Any
@@ -454,6 +455,20 @@ def _open() -> sqlite3.Connection | None:
                 "ON videos(channel, title, upload_ts)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_view_count ON videos(view_count)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_like_count ON videos(like_count)",
+                # PARTIAL COVERING index for the Browse Channels grid's
+                # per-channel "last added" query
+                #   SELECT channel, MAX(added_ts) FROM videos
+                #   WHERE is_duplicate_of IS NULL GROUP BY channel
+                # Measured at 689s (!) on a 104k-row / 20GB DB before this:
+                # the planner used idx_vid_ch_yr_mo for the GROUP BY but had
+                # to random-fetch added_ts + is_duplicate_of from the big
+                # table for every row (104k cold lookups). This index carries
+                # both grouping cols, is filtered to live rows, and is
+                # covering — so the query runs index-only in ~0.01s. Also
+                # serves list_all_videos' "recent"/"newest" first-page sorts
+                # (they group/scan the same live-rows-by-channel/added_ts set).
+                "CREATE INDEX IF NOT EXISTS idx_vid_chan_added_live "
+                "ON videos(channel, added_ts) WHERE is_duplicate_of IS NULL",
             ):
                 try:
                     _conn.execute(stmt)
@@ -475,12 +490,17 @@ def _open() -> sqlite3.Connection | None:
                            "left at %s: %s", _current_v, e)
                 raise
             _conn.commit()
-            try:
-                _qc = _conn.execute("PRAGMA quick_check").fetchone()
-                if _qc and str(_qc[0]).lower() != "ok":
-                    _log.warning("SQLite quick_check reported: %s", _qc[0])
-            except sqlite3.Error as exc:
-                _log.warning("SQLite quick_check failed: %s", exc)
+            # REMOVED: `PRAGMA quick_check` used to run here. On a large
+            # archive it reads the ENTIRE database file (20GB / 9M+
+            # segments) — minutes of cold disk I/O — and it ran inside this
+            # `_db_lock`-held connection-open on the FIRST _open() of every
+            # startup. That blocked every other _open()/_reader_open()
+            # (Browse, sweep, sync writes, watch-view transcript loads)
+            # behind it for the whole scan — the true cause of the
+            # multi-minute "Loading channels…" hang that scaled with DB
+            # size. Integrity verification does not belong in the hot
+            # connection-opener; if we want it back it must be opt-in /
+            # rare and run on a dedicated connection off the _db_lock.
             # Mark schema-ready so future _reader_open() calls can
             # skip the _db_lock-acquiring _open() call entirely.
             global _schema_inited
@@ -1420,6 +1440,44 @@ class _LowPriorityInterrupted(Exception):
     """Raised when startup preload should yield to user-visible work."""
 
 
+# ── Foreground-browse guard ────────────────────────────────────────────
+# The startup sweep + Browse preload both walk the (slow, ~16 MB/s) Z:
+# DrivePool to resolve thumbnails. Before this guard there was NO signal
+# telling them that the USER is actively loading a Browse view, so a
+# cold "Videos" open (up to 60 channel-wide thumbnail walks) ran head-to-
+# head with the preload walking the same disk — turning a ~10s open into
+# minutes. The fix: the API entry points that serve the Browse tab
+# (list_all_videos, list_videos_for_channel) bump this counter for the
+# duration of the user's query via `foreground_browse()`, and the
+# startup low-priority gate treats a non-zero count as "busy" so sweep +
+# preload park and hand the disk to the user. Preload's OWN internal
+# calls go straight to the index functions (not the API mixin), so they
+# never trip this — no self-deadlock.
+_fg_browse_lock = threading.Lock()
+_fg_browse_count = 0
+
+
+def is_foreground_browse_busy() -> bool:
+    """True while at least one user-initiated Browse query is in flight."""
+    with _fg_browse_lock:
+        return _fg_browse_count > 0
+
+
+@contextmanager
+def foreground_browse():
+    """Mark a user-initiated Browse query in flight so startup sweep +
+    preload yield the Z: pool to it. Re-entrant (counter, not flag)."""
+    global _fg_browse_count
+    with _fg_browse_lock:
+        _fg_browse_count += 1
+    try:
+        yield
+    finally:
+        with _fg_browse_lock:
+            if _fg_browse_count > 0:
+                _fg_browse_count -= 1
+
+
 def _low_priority_busy(busy_fn: Any | None) -> bool:
     if not callable(busy_fn):
         return False
@@ -1799,6 +1857,15 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     # to open on network-backed archives.
     out = [r for r in out if r.get("filepath")]
 
+    # Channel-wide thumbnail index. `find_thumbnail` walks UP the path
+    # at most 3 levels — it does NOT cross over to sibling year folders.
+    # On channels where thumbnails ended up in a different year's
+    # `.Thumbnails/` than where the mp4 currently lives (e.g.
+    # The PrimeTime had most thumbs in 2025/.Thumbnails/ but the mp4s
+    # got re-foldered into 2023/ and 2024/), every Browse video tile
+    # rendered as the gradient placeholder. Pre-walk the channel root
+    # once, build vid → path, and use it for vid-keyed lookup. Falls
+    # back to find_thumbnail for the no-vid / stem-only path.
     # Channel-wide thumbnail index. `find_thumbnail` walks UP the path
     # at most 3 levels — it does NOT cross over to sibling year folders.
     # On channels where thumbnails ended up in a different year's

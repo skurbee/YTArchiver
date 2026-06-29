@@ -2,9 +2,8 @@
 VideoMixin — extracted from the main Api class for browsability.
 
 Methods in this mixin are mixed into the Api class via multiple
-inheritance. They reference `self.<state>` which still resolves
-to the Api instance at runtime — no body changes were made
-when moving them out of main.py.
+inheritance. They prefer AppServices when present, with legacy
+private Api attributes kept as fallback state.
 """
 from __future__ import annotations
 
@@ -17,6 +16,36 @@ from backend.ytarchiver_config import config_is_writable, load_config, save_conf
 
 
 class VideoMixin:
+    def _video_services(self):
+        return getattr(self, "services", None)
+
+    def _video_config(self):
+        services = self._video_services()
+        if services is not None:
+            return services.fresh_config()
+        cfg = getattr(self, "_config", None)
+        if cfg is not None:
+            return cfg
+        return load_config()
+
+    def _video_save_config(self, cfg):
+        services = self._video_services()
+        if services is not None:
+            return services.save_config(cfg)
+        return save_config(cfg)
+
+    def _video_log_stream(self):
+        services = self._video_services()
+        stream = (getattr(services, "log_stream", None)
+                  if services is not None else None)
+        return stream if stream is not None else self._log_stream
+
+    def _video_queues(self):
+        services = self._video_services()
+        queues = (getattr(services, "queues", None)
+                  if services is not None else None)
+        return queues if queues is not None else self._queues
+
 
     def video_delete_file(self, filepath):
         """Move a video file to app trash and remove
@@ -82,15 +111,14 @@ class VideoMixin:
         # Also remove from recent_downloads if it was there.
         if config_is_writable():
             try:
-                cfg = load_config()
+                cfg = self._video_config()
                 _before = len(cfg.get("recent_downloads", []) or [])
                 cfg["recent_downloads"] = [
                     r for r in cfg.get("recent_downloads", []) or []
                     if (r.get("filepath") or "").lower() != fp.lower()
                 ]
                 if len(cfg["recent_downloads"]) != _before:
-                    from backend.ytarchiver_config import save_config as _sc
-                    _sc(cfg)
+                    self._video_save_config(cfg)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
         return {"ok": True,
@@ -142,7 +170,7 @@ class VideoMixin:
             return {"ok": False, "error": "Video has no filepath/channel"}
         # Find the channel config so we can hand the URL + folder to
         # the redownload pipeline.
-        cfg = self._config if self._config is not None else load_config()
+        cfg = self._video_config()
         ch = next((c for c in cfg.get("channels", []) or []
                    if (c.get("name") or c.get("folder") or "").strip().lower()
                       == (channel_name or "").strip().lower()), None)
@@ -175,6 +203,8 @@ class VideoMixin:
             import threading as _th
 
             from backend import redownload as _rd
+            log_stream = self._video_log_stream()
+            queues = self._video_queues()
             # Per-run event — the shared _sync_cancel stays set after
             # any stopped sync, ghost-cancelling this single-video
             # redownload instantly in that window.
@@ -184,15 +214,15 @@ class VideoMixin:
                     _rd.redownload_channel(
                         channel_name, ch_url,
                         _ch_folder, res,
-                        stream=self._log_stream,
+                        stream=log_stream,
                         cancel_ev=_vid_cancel,
                         pause_ev=self._sync_pause,
                         confirm_cb=None,
-                        queues=self._queues,
+                        queues=queues,
                         only_video_id=vid,
                     )
                 except Exception as e:
-                    self._log_stream.emit_error(
+                    log_stream.emit_error(
                         f"Single-video redownload failed: {e}")
             _th.Thread(target=_run, daemon=True).start()
             return {"ok": True, "title": title, "resolution": res}

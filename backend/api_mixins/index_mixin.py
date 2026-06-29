@@ -2,9 +2,9 @@
 IndexMixin — extracted from the main Api class for browsability.
 
 Methods in this mixin are mixed into the Api class via multiple
-inheritance. They reference `self.<state>` which still resolves
-to the Api instance at runtime — no body changes were made
-when moving them out of main.py.
+inheritance. They prefer AppServices when present for config and
+log dependencies, with legacy private Api attributes kept as fallback
+state.
 """
 from __future__ import annotations
 
@@ -19,6 +19,24 @@ from backend import index as index_backend
 
 
 class IndexMixin:
+    def _index_services(self):
+        return getattr(self, "services", None)
+
+    def _index_config(self):
+        services = self._index_services()
+        if services is not None:
+            return services.fresh_config()
+        cfg = getattr(self, "_config", None)
+        if cfg is not None:
+            return cfg
+        return load_config()
+
+    def _index_log_stream(self):
+        services = self._index_services()
+        stream = (getattr(services, "log_stream", None)
+                  if services is not None else None)
+        return stream if stream is not None else self._log_stream
+
 
     def get_index_summary(self):
         """Return Index tab data: cards + per-channel breakdown."""
@@ -60,7 +78,7 @@ class IndexMixin:
         """
         try:
             if not folder:
-                cfg = self._config or load_config()
+                cfg = self._index_config()
                 folder = (cfg.get("output_dir") or "").strip()
             if not folder or not os.path.isdir(folder):
                 return {"ok": False, "error": "Folder not found"}
@@ -106,7 +124,7 @@ class IndexMixin:
         if confirm_token != "YES-DELETE-ALL":
             return {"ok": False, "error": "Missing confirm token"}
         if not folder:
-            cfg = self._config or load_config()
+            cfg = self._index_config()
             folder = (cfg.get("output_dir") or "").strip()
         if not folder or not os.path.isdir(folder):
             return {"ok": False, "error": "Folder not found"}
@@ -130,10 +148,11 @@ class IndexMixin:
                         "error": "Delete-all-transcripts is already running"}
             self._delete_transcripts_running = True
         def _run():
-            self._log_stream.emit_text(
+            log_stream = self._index_log_stream()
+            log_stream.emit_text(
                 f"\u26A0 Deleting all transcripts under {folder}\u2026",
                 "red")
-            self._log_stream.flush()
+            log_stream.flush()
             deleted = 0
             errors = 0
             for dp, _dns, fns in os.walk(folder):
@@ -167,8 +186,8 @@ class IndexMixin:
                             raise OSError(result.get("error") or "delete failed")
                         deleted += 1
                         if deleted % 100 == 0:
-                            self._log_stream.emit_dim(f" deleted {deleted}\u2026")
-                            self._log_stream.flush()
+                            log_stream.emit_dim(f" deleted {deleted}\u2026")
+                            log_stream.flush()
                     except Exception:
                         errors += 1
             # Also clear the FTS index — no point keeping ingested data that
@@ -184,11 +203,11 @@ class IndexMixin:
                         conn.commit()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-            self._log_stream.emit_text(
+            log_stream.emit_text(
                 f"\u2014 Deleted {deleted} transcript file(s), {errors} errors. "
                 "FTS index cleared.",
                 "simpleline_red")
-            self._log_stream.flush()
+            log_stream.flush()
         def _run_wrapped():
             try:
                 _run()
@@ -208,7 +227,7 @@ class IndexMixin:
         (YTArchiver.py:24756 _update_index_warning).
         """
         try:
-            cfg = self._config or load_config()
+            cfg = self._index_config()
             output_dir = (cfg.get("output_dir") or "").strip()
             if not output_dir or not os.path.isdir(output_dir):
                 return {"ok": True, "unindexed": 0}
@@ -254,22 +273,23 @@ class IndexMixin:
                 return {"ok": False, "error": "FTS rebuild already running"}
             self._fts_rebuild_running = True
         def _run():
+            log_stream = self._index_log_stream()
             try:
-                self._log_stream.emit_text(
+                log_stream.emit_text(
                     "Rebuilding FTS search index from scratch\u2026", "simpleline_blue")
-                self._log_stream.flush()
+                log_stream.flush()
                 res = index_backend.rebuild_fts_index()
                 if res.get("ok"):
-                    self._log_stream.emit_text(
+                    log_stream.emit_text(
                         f"\u2014 FTS rebuild complete: {res.get('rows_indexed', 0):,} rows indexed.",
                         "simpleline_green")
                 else:
-                    self._log_stream.emit_error(
+                    log_stream.emit_error(
                         f"FTS rebuild failed: {res.get('error', 'unknown')}")
             except Exception as e:
-                self._log_stream.emit_error(f"FTS rebuild crashed: {e}")
+                log_stream.emit_error(f"FTS rebuild crashed: {e}")
             finally:
-                self._log_stream.flush()
+                log_stream.flush()
                 with self._fts_rebuild_lock:
                     self._fts_rebuild_running = False
         threading.Thread(target=_run, daemon=True).start()

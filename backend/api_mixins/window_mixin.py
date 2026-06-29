@@ -2,9 +2,9 @@
 WindowMixin — extracted from the main Api class for browsability.
 
 Methods in this mixin are mixed into the Api class via multiple
-inheritance. They reference `self.<state>` which still resolves
-to the Api instance at runtime — no body changes were made
-when moving them out of main.py.
+inheritance. They prefer AppServices when present for config, queue,
+and log dependencies, with legacy private Api attributes kept as
+fallback state.
 """
 from __future__ import annotations
 
@@ -21,6 +21,36 @@ from backend import window_state as winstate
 
 
 class WindowMixin:
+    def _window_services(self):
+        return getattr(self, "services", None)
+
+    def _window_config(self):
+        services = self._window_services()
+        if services is not None:
+            return services.fresh_config()
+        cfg = getattr(self, "_config", None)
+        if cfg is not None:
+            return cfg
+        return load_config()
+
+    def _window_save_config(self, cfg):
+        services = self._window_services()
+        if services is not None:
+            return services.save_config(cfg)
+        return save_config(cfg)
+
+    def _window_log_stream(self):
+        services = self._window_services()
+        stream = (getattr(services, "log_stream", None)
+                  if services is not None else None)
+        return stream if stream is not None else self._log_stream
+
+    def _window_queues(self):
+        services = self._window_services()
+        queues = (getattr(services, "queues", None)
+                  if services is not None else None)
+        return queues if queues is not None else self._queues
+
 
     def confirm_close(self, choice, remember=False):
         """Frontend hook for the close-to-tray dialog. `choice` is
@@ -54,20 +84,19 @@ class WindowMixin:
         except Exception: pass
         if remember:
             try:
-                from backend.ytarchiver_config import save_config as _sc
-                cfg = self._config or load_config()
+                cfg = self._window_config()
                 cfg["close_behavior"] = choice
-                if _sc(cfg):
+                if self._window_save_config(cfg):
                     self._reload_config()
                 else:
                     try:
-                        self._log_stream.emit_dim(
+                        self._window_log_stream().emit_dim(
                             " (close behavior preference not saved)")
                     except Exception:
                         pass
             except Exception as e:
                 try:
-                    self._log_stream.emit_dim(
+                    self._window_log_stream().emit_dim(
                         f" (close behavior preference not saved: {e})")
                 except Exception:
                     pass
@@ -118,7 +147,7 @@ class WindowMixin:
                 # the queue save a real chance.
                 try:
                     save_t = threading.Thread(
-                        target=lambda: self._queues.save_now(),
+                        target=lambda: self._window_queues().save_now(),
                         daemon=True)
                     save_t.start()
                     save_t.join(timeout=2.0)

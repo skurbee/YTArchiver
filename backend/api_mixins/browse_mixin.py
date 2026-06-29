@@ -2,9 +2,9 @@
 BrowseMixin — extracted from the main Api class for browsability.
 
 Methods in this mixin are mixed into the Api class via multiple
-inheritance. They reference `self.<state>` which still resolves
-to the Api instance at runtime — no body changes were made
-when moving them out of main.py.
+inheritance. They prefer AppServices when present for config and
+log dependencies, with legacy private Api attributes kept as fallback
+state.
 """
 from __future__ import annotations
 
@@ -107,6 +107,30 @@ def _guard_browse_launch_path(filepath: str, *, require_file: bool) -> dict:
 
 
 class BrowseMixin:
+    def _browse_services(self):
+        return getattr(self, "services", None)
+
+    def _browse_config(self):
+        services = self._browse_services()
+        if services is not None:
+            return services.fresh_config()
+        cfg = getattr(self, "_config", None)
+        if cfg is not None:
+            return cfg
+        return load_config()
+
+    def _browse_fresh_config(self):
+        services = self._browse_services()
+        if services is not None:
+            return services.fresh_config()
+        return load_config()
+
+    def _browse_log_stream(self):
+        services = self._browse_services()
+        stream = (getattr(services, "log_stream", None)
+                  if services is not None else None)
+        return stream if stream is not None else self._log_stream
+
 
     # ─── Browse tab (reads from transcription_index.db) ────────────────
 
@@ -118,7 +142,16 @@ class BrowseMixin:
         (dropped there by `chan_fetch_art` / metadata sweep). The frontend
         renders the avatar in the channel-grid card background.
         """
-        cfg = load_config()
+        # Foreground Browse query (the Channels grid) — make the startup
+        # sweep + preload yield the Z: pool while this loads, and keep this
+        # bridge call short so the window can close promptly if the user
+        # quits mid-load. Without the guard this raced the sweep's thumbnail
+        # backfill on the same disk and took minutes.
+        with index_backend.foreground_browse():
+            return self._browse_list_channels_impl()
+
+    def _browse_list_channels_impl(self):
+        cfg = self._browse_fresh_config()
         channels = cfg.get("channels", [])
         cache = archive_scan.load_disk_cache()
         base = (cfg.get("output_dir") or "").strip()
@@ -132,7 +165,8 @@ class BrowseMixin:
         from backend.sync import channel_folder_name as _cfn
         # Per-channel most-recent download timestamp, for the "recently
         # downloaded" sort in the channel grid. One grouped query over the
-        # index, keyed by lowercased channel name.
+        # index, keyed by lowercased channel name. Served index-only by
+        # idx_vid_chan_added_live so it stays sub-millisecond on a large DB.
         last_added: dict[str, float] = {}
         try:
             from backend import index as _idx
@@ -208,9 +242,10 @@ class BrowseMixin:
         - total_channels: len(config['channels'])
         """
         try:
-            cfg = load_config()
+            cfg = self._browse_fresh_config()
             total_channels = len(cfg.get("channels", []))
-            recent = index_backend.new_videos_in_last_n_days(int(days or 7))
+            with index_backend.foreground_browse():
+                recent = index_backend.new_videos_in_last_n_days(int(days or 7))
             return {
                 "ok": True,
                 "new_videos": recent.get("videos", 0),
@@ -225,7 +260,10 @@ class BrowseMixin:
 
     def browse_list_videos(self, channel, sort="newest", limit=500):
         """List videos in a channel from the index DB."""
-        return index_backend.list_videos_for_channel(channel, sort=sort, limit=limit)
+        # Foreground Browse query — make the startup sweep + preload yield
+        # the Z: pool while this user-initiated channel grid loads.
+        with index_backend.foreground_browse():
+            return index_backend.list_videos_for_channel(channel, sort=sort, limit=limit)
 
 
     def browse_get_transcript(self, payload):
@@ -512,7 +550,7 @@ class BrowseMixin:
             # but the unbounded walk used to freeze the UI for several
             # seconds when a metadata jsonl lived in an unexpected
             # location (audit: browse_mixin.py:329).
-            cfg = self._config or load_config()
+            cfg = self._browse_config()
             base = (cfg.get("output_dir") or "").strip()
             if base and channel:
                 from backend.sync import channel_folder_name as _cfn
@@ -569,7 +607,7 @@ class BrowseMixin:
                 return {"ok": False, "error": "No video_id"}
             if not filepath or not os.path.isfile(filepath):
                 return {"ok": False, "error": "Video file not found"}
-            cfg = self._config or load_config()
+            cfg = self._browse_config()
             ch_dict = None
             for ch in cfg.get("channels", []):
                 if (ch.get("name") or "") == channel:
@@ -580,7 +618,7 @@ class BrowseMixin:
             from backend.metadata import fetch_single_video_metadata
             res = fetch_single_video_metadata(
                 ch_dict, video_id, filepath, title,
-                self._log_stream, emit_inline_log=False, refresh=True)
+                self._browse_log_stream(), emit_inline_log=False, refresh=True)
             if not res.get("ok"):
                 return {"ok": False,
                         "error": res.get("error") or "fetch failed",
@@ -858,7 +896,7 @@ class BrowseMixin:
         Returns paginated rows with filepath, title (from filename), size_bytes,
         and mtime. Does NOT consult the index — walks the folder directly.
         """
-        cfg = self._config or load_config()
+        cfg = self._browse_config()
         folder = (cfg.get("video_out_dir") or cfg.get("output_dir") or "").strip()
         if not folder:
             return {"rows": [], "has_more": False, "folder": ""}

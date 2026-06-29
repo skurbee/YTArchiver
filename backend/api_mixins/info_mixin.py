@@ -2,9 +2,9 @@
 InfoMixin — extracted from the main Api class for browsability.
 
 Methods in this mixin are mixed into the Api class via multiple
-inheritance. They reference `self.<state>` which still resolves
-to the Api instance at runtime — no body changes were made
-when moving them out of main.py.
+inheritance. They prefer AppServices when present for fresh config,
+save, and log dependencies, with legacy private attributes kept as
+fallback state.
 """
 from __future__ import annotations
 
@@ -54,6 +54,33 @@ def _format_last_sync_label(ts_str):
 
 
 class InfoMixin:
+    def _info_services(self):
+        return getattr(self, "services", None)
+
+    def _info_config(self):
+        services = self._info_services()
+        if services is not None:
+            return services.fresh_config()
+        return self._config or load_config()
+
+    def _info_fresh_config(self):
+        services = self._info_services()
+        if services is not None:
+            return services.fresh_config()
+        return load_config()
+
+    def _info_save_config(self, cfg):
+        services = self._info_services()
+        if services is not None:
+            return services.save_config(cfg)
+        return save_config(cfg)
+
+    def _info_log_stream(self):
+        services = self._info_services()
+        stream = (getattr(services, "log_stream", None)
+                  if services is not None else None)
+        return stream if stream is not None else self._log_stream
+
 
     # ─── Environment / capabilities ──────────────────────────────────────
     def get_runtime_info(self):
@@ -161,7 +188,7 @@ class InfoMixin:
     # ─── About info ────────────────────────────────────────────────────
 
     def about_info(self):
-        cfg = self._config or load_config()
+        cfg = self._info_config()
         yt_ver = "unknown"
         try:
             r = self.ytdlp_version()
@@ -184,7 +211,7 @@ class InfoMixin:
 
     def url_history(self):
         """Return recently-typed YouTube URLs (latest first, max 20)."""
-        cfg = load_config()
+        cfg = self._info_fresh_config()
         # Apply the 20-item cap on read too. Older configs / imported
         # configs may have grown past the cap on disk (audit:
         # info_mixin.py:166), so we re-trim here defensively.
@@ -202,20 +229,19 @@ class InfoMixin:
         if not config_is_writable():
             return
         with InfoMixin._url_history_lock:
-            cfg = load_config()
+            cfg = self._info_fresh_config()
             hist = [u for u in (cfg.get("url_history", []) or []) if u != url]
             hist.insert(0, url)
             del hist[20:]
             cfg["url_history"] = hist
-            from backend.ytarchiver_config import save_config as _sc
-            _ok = _sc(cfg)
+            _ok = self._info_save_config(cfg)
             # Don't silently drop the URL if the save fails (write-gate
             # toggled off mid-call, disk full). Emit a dim line so the
             # user can investigate why their autocomplete history isn't
             # updating (audit: info_mixin H13).
             if not _ok:
                 try:
-                    self._log_stream.emit_dim(
+                    self._info_log_stream().emit_dim(
                         f"URL history save failed (config write-gate or disk) "
                         f"— '{(url or '')[:60]}' not added to autocomplete.")
                 except Exception:
@@ -233,6 +259,6 @@ class InfoMixin:
         sat at its placeholder forever after the first sync of a
         fresh session.
         """
-        cfg = load_config()
+        cfg = self._info_fresh_config()
         ts = cfg.get("last_sync", "") or ""
         return {"label": _format_last_sync_label(ts)}

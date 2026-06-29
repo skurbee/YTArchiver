@@ -361,6 +361,66 @@ def _clear_timeout_strike(vid: str) -> None:
         except Exception:
             pass
 
+
+def _archived_failed_video_ids(video_ids) -> set[str]:
+    """Return failed IDs that are already in yt-dlp's download archive."""
+    targets = {v for v in video_ids if isinstance(v, str) and v}
+    if not targets:
+        return set()
+    found: set[str] = set()
+    try:
+        with open(ARCHIVE_FILE, "r", encoding="utf-8",
+                  errors="replace") as archive:
+            for raw in archive:
+                parts = raw.strip().split()
+                if len(parts) >= 2 and parts[0] == "youtube":
+                    vid = parts[1]
+                    if vid in targets:
+                        found.add(vid)
+                        if len(found) == len(targets):
+                            break
+    except OSError:
+        return set()
+    return found
+
+
+def _merge_failed_video_ids(prior_failed, failed_this_run, downloaded_ids,
+                            gave_up_this_run=None) -> tuple[dict[str, int], list[str]]:
+    """Merge failed-video retry state without resurrecting given-up IDs."""
+    downloaded = {v for v in downloaded_ids if isinstance(v, str) and v}
+    gave_up_now = {v for v in (gave_up_this_run or set())
+                   if isinstance(v, str) and v}
+    failed_now = {
+        v for v in failed_this_run
+        if isinstance(v, str) and v
+        and v not in downloaded
+        and v not in gave_up_now
+    }
+
+    next_failed: dict[str, int] = {}
+    gave_up: list[str] = []
+    for vid, count in (prior_failed or {}).items():
+        if not isinstance(vid, str) or not isinstance(count, int):
+            continue
+        if vid in downloaded or vid in gave_up_now:
+            continue
+        if vid in failed_now:
+            # Failed AGAIN this sync. 3rd strike in a row -> give up.
+            if count + 1 >= 3:
+                gave_up.append(vid)
+            else:
+                next_failed[vid] = count + 1
+        elif count < 3:
+            next_failed[vid] = count  # retry pending; not seen this run
+
+    for vid in failed_now:
+        if vid in next_failed or vid in gave_up:
+            continue  # already accounted for above
+        next_failed[vid] = 1
+
+    return {v: c for v, c in next_failed.items() if c < 3}, gave_up
+
+
 _startupinfo = _make_startupinfo()
 
 
@@ -697,6 +757,15 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     if isinstance(_prior_failed, list):
         # Legacy shape — flat list. Convert to dict on the fly.
         _prior_failed = {v: 1 for v in _prior_failed if isinstance(v, str)}
+    if not isinstance(_prior_failed, dict):
+        _prior_failed = {}
+    _stored_prior_failed = dict(_prior_failed or {})
+    _archived_failed = _archived_failed_video_ids(_prior_failed.keys())
+    if _archived_failed:
+        _prior_failed = {
+            v: c for v, c in _prior_failed.items()
+            if v not in _archived_failed
+        }
     _retry_vids = [v for v, c in _prior_failed.items()
                    if isinstance(c, int) and 0 < c < 3]
     if _retry_vids:
@@ -739,6 +808,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # --break-on-existing skips past chronologically-newer successes
     # and these videos are silently lost.
     _failed_this_run: set = set()
+    _gave_up_this_run: set = set()
     _net_warned: set = set()   # vids already shown a "couldn't reach" notice
     current_title = ""
     dest_path = ""
@@ -2259,6 +2329,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     # so it stops nagging every single sync.
                     _gave_up_now = _record_timeout_strike(
                         current_vid_id, stream)
+                    if _gave_up_now:
+                        _gave_up_this_run.add(current_vid_id)
                 if (getattr(stream, "simple_mode", False)
                         and (_is_net_err or low.strip() in ("error:", "error"))):
                     # Show ONE friendly line on the final give-up; the bare
@@ -2412,27 +2484,9 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # - Existing retries that failed AGAIN get count++ (cap at 3 to
     #   give up on permanently-broken IDs and stop log spam).
     try:
-        _next_failed: dict[str, int] = {}
-        _gave_up: list[str] = []   # failed 3 syncs in a row → stop trying
-        for _v, _c in (_prior_failed or {}).items():
-            if not isinstance(_v, str) or not isinstance(_c, int):
-                continue
-            if _v in downloaded_ids:
-                continue  # retry succeeded — drop
-            if _v in _failed_this_run:
-                # Failed AGAIN this sync. 3rd strike in a row → give up.
-                if _c + 1 >= 3:
-                    _gave_up.append(_v)
-                else:
-                    _next_failed[_v] = _c + 1
-            elif _c < 3:
-                _next_failed[_v] = _c  # retry pending; not seen this run
-        for _v in _failed_this_run:
-            if _v in downloaded_ids:
-                continue  # error line but DLTRACK fired later — succeeded
-            if _v in _next_failed or _v in _gave_up:
-                continue  # already accounted for above
-            _next_failed[_v] = 1
+        _next_failed, _gave_up = _merge_failed_video_ids(
+            _prior_failed, _failed_this_run, downloaded_ids,
+            _gave_up_this_run)
         # FAILSAFE: permanently give up on IDs that failed 3 syncs in a row.
         # Write them to the download-archive so the channel walk stops
         # re-discovering them every sync — the OLD code just dropped them
@@ -2463,11 +2517,9 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         if _gave_up:
             try: stream.flush()
             except Exception as _fe: swallow("stream flush", _fe)
-        # Safety net: counts in _next_failed are already < 3 by construction.
-        _next_failed = {v: c for v, c in _next_failed.items() if c < 3}
         # Only write if something actually changed (avoid config churn
         # on every successful sync).
-        if _next_failed != (_prior_failed or {}):
+        if _next_failed != (_stored_prior_failed or {}):
             channel["failed_video_ids"] = _next_failed
             try:
                 with config_transaction() as _cfg2:

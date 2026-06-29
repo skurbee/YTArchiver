@@ -2,9 +2,9 @@
 MetadataMixin — extracted from the main Api class for browsability.
 
 Methods in this mixin are mixed into the Api class via multiple
-inheritance. They reference `self.<state>` which still resolves
-to the Api instance at runtime — no body changes were made
-when moving them out of main.py.
+inheritance. They prefer AppServices when present for config, queue,
+and log dependencies, with legacy private Api attributes kept as
+fallback state.
 """
 from __future__ import annotations
 
@@ -22,6 +22,36 @@ from backend import subs as subs_backend
 
 
 class MetadataMixin:
+    def _metadata_services(self):
+        return getattr(self, "services", None)
+
+    def _metadata_config(self):
+        services = self._metadata_services()
+        if services is not None:
+            return services.fresh_config()
+        cfg = getattr(self, "_config", None)
+        if cfg is not None:
+            return cfg
+        return load_config()
+
+    def _metadata_fresh_config(self):
+        services = self._metadata_services()
+        if services is not None:
+            return services.fresh_config()
+        return load_config()
+
+    def _metadata_log_stream(self):
+        services = self._metadata_services()
+        stream = (getattr(services, "log_stream", None)
+                  if services is not None else None)
+        return stream if stream is not None else self._log_stream
+
+    def _metadata_queues(self):
+        services = self._metadata_services()
+        queues = (getattr(services, "queues", None)
+                  if services is not None else None)
+        return queues if queues is not None else self._queues
+
 
     def _push_metadata_refresh(self):
         """Trigger a re-render of Settings > Metadata so the `XXm ago`
@@ -46,7 +76,7 @@ class MetadataMixin:
             self._window.evaluate_js(
                 "window._refreshMetadataTab && window._refreshMetadataTab();")
         except Exception as e:
-            try: self._log_stream.emit_dim(
+            try: self._metadata_log_stream().emit_dim(
                 f"(metadata tab refresh push failed: {e})")
             except Exception as e: _log.debug("swallowed: %s", e)
 
@@ -74,7 +104,7 @@ class MetadataMixin:
             self._window.evaluate_js(
                 "window.refreshSubsTable && window.refreshSubsTable();")
         except Exception as e:
-            try: self._log_stream.emit_dim(
+            try: self._metadata_log_stream().emit_dim(
                 f"(subs tab refresh push failed: {e})")
             except Exception as e: _log.debug("swallowed: %s", e)
 
@@ -103,7 +133,7 @@ class MetadataMixin:
             return {"ok": False, "error": "Channel not found"}
 
         # Count pre-existing metadata entries under this channel's folder.
-        cfg = self._config or load_config()
+        cfg = self._metadata_config()
         base = (cfg.get("output_dir") or "").strip()
         existing_count = 0
         if base:
@@ -127,7 +157,7 @@ class MetadataMixin:
             task["kind"] = "metadata"
             task["refresh"] = bool(refresh_mode)
             try:
-                self._queues.sync_enqueue(task)
+                self._metadata_queues().sync_enqueue(task)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             self._on_queue_changed()
@@ -137,7 +167,7 @@ class MetadataMixin:
             # metadata task \u2014 rule: "everything should be in
             # the task list; don't add things the user didn't ask for."
             try:
-                cfg = load_config() or {}
+                cfg = self._metadata_fresh_config() or {}
                 if cfg.get("autorun_sync", False) and not self.sync_is_running():
                     self.sync_start_all(add_downloads_from_config=False)
             except Exception as e:
@@ -150,10 +180,11 @@ class MetadataMixin:
                 choice = (self._prompt_metadata_already_downloaded(
                     ch_name, existing_count) or {}).get("choice", "skip")
                 if choice in ("skip", "cancel"):
-                    self._log_stream.emit_text(
+                    log_stream = self._metadata_log_stream()
+                    log_stream.emit_text(
                         f" \u2014 Metadata for {ch_name}: cancelled.",
                         "simpleline_pink")
-                    self._log_stream.flush()
+                    log_stream.flush()
                     return
                 # "append" = Check for New (fast, skip-existing)
                 # "overwrite" = Refresh Counts (re-hit every video)
@@ -195,23 +226,24 @@ class MetadataMixin:
         task["refresh"] = bool(refresh)
         task["scope"] = {"year": year_int}
         try:
-            self._queues.sync_enqueue(task)
+            self._metadata_queues().sync_enqueue(task)
         except Exception as e:
             return _api_err("METADATA_FAILED", str(e))
         self._on_queue_changed()
         label = "refresh" if refresh else "download"
         ch_name = ch.get("name") or ch.get("folder", "")
-        self._log_stream.emit_text(
+        log_stream = self._metadata_log_stream()
+        log_stream.emit_text(
             f" \u2014 Queued metadata {label} for {ch_name} ({year_int}) "
             f"on Sync Tasks.", "simpleline_pink")
-        self._log_stream.flush()
+        log_stream.flush()
         # Mirror metadata_queue_all's H-7 behavior — but the paused gate
         # still applies (see _maybe_autostart_sync).
         started = self._maybe_autostart_sync()
         return {"ok": True, "queued": True, "year": year_int,
                 "refresh": bool(refresh),
                 "started": started,
-                "paused": bool(self._queues.sync_paused)}
+                "paused": bool(self._metadata_queues().sync_paused)}
 
 
     # ─── Settings > Metadata tab: per-channel refresh status ─────────────
@@ -224,7 +256,7 @@ class MetadataMixin:
         for that channel, so stale channels float to the top when sorted
         oldest-first.
 
-        Pulls straight from `self._config["channels"]` — the timestamps
+        Pulls from the current config snapshot — the timestamps
         (`last_views_refresh_ts`, `last_comments_refresh_ts`) get stamped
         by `bulk_refresh_views_likes` and `refresh_channel_comments` in
         backend/metadata.py when those paths finish successfully.
@@ -232,7 +264,7 @@ class MetadataMixin:
         Returns list[dict] with keys: name, folder, url, video_count,
         last_views_refresh_ts, last_comments_refresh_ts.
         """
-        cfg = self._config if self._config is not None else load_config()
+        cfg = self._metadata_config()
         channels = list(cfg.get("channels", []) or [])
         if not channels:
             return []
@@ -320,7 +352,7 @@ class MetadataMixin:
         often catch videos within 30 minutes of upload, before
         comments exist).
         """
-        cfg = self._config or load_config()
+        cfg = self._metadata_config()
         channels = sorted(cfg.get("channels", []),
                           key=lambda c: (c.get("name") or "").lower())
         if not channels:
@@ -338,23 +370,24 @@ class MetadataMixin:
                 task["kind"] = "metadata_comments"
                 if _d is not None:
                     task["only_recent_days"] = _d
-                if self._queues.sync_enqueue(task):
+                if self._metadata_queues().sync_enqueue(task):
                     queued += 1
             except Exception as e:
-                self._log_stream.emit_error(
+                self._metadata_log_stream().emit_error(
                     f"Comments enqueue failed for {ch.get('name')}: {e}")
         self._on_queue_changed()
         scope_str = f" (last {_d}d)" if _d else ""
-        self._log_stream.emit_text(
+        log_stream = self._metadata_log_stream()
+        log_stream.emit_text(
             f" \u2014 Queued comments refresh{scope_str} for {queued} "
             f"channel(s) on Sync Tasks.", "simpleline_pink")
-        self._log_stream.flush()
+        log_stream.flush()
         # Auto-kick the worker \u2014 but only if the queue isn't paused.
         # See _maybe_autostart_sync docstring.
         started = self._maybe_autostart_sync() if queued > 0 else False
         return {"ok": True, "queued": queued, "channels": len(channels),
                 "only_recent_days": _d, "started": started,
-                "paused": bool(self._queues.sync_paused)}
+                "paused": bool(self._metadata_queues().sync_paused)}
 
 
     def metadata_backfill_ids_channel(self, identity, mode="fast"):
@@ -378,13 +411,13 @@ class MetadataMixin:
         task["kind"] = "videoid_backfill"
         task["mode"] = "thorough" if mode == "thorough" else "fast"
         try:
-            self._queues.sync_enqueue(task)
+            self._metadata_queues().sync_enqueue(task)
         except Exception as e:
             return _api_err("METADATA_FAILED", str(e))
         self._on_queue_changed()
         started = self._maybe_autostart_sync()
         return {"ok": True, "queued": True, "started": started,
-                "paused": bool(self._queues.sync_paused),
+                "paused": bool(self._metadata_queues().sync_paused),
                 "mode": task["mode"]}
 
 
@@ -401,7 +434,7 @@ class MetadataMixin:
         views/likes refresh path can't match any on-disk file to its
         YouTube row.
         """
-        cfg = self._config or load_config()
+        cfg = self._metadata_config()
         channels = sorted(cfg.get("channels", []),
                           key=lambda c: (c.get("name") or "").lower())
         if not channels:
@@ -430,10 +463,10 @@ class MetadataMixin:
                 task = dict(ch)
                 task["kind"] = "videoid_backfill"
                 task["mode"] = "thorough" if mode == "thorough" else "fast"
-                if self._queues.sync_enqueue(task):
+                if self._metadata_queues().sync_enqueue(task):
                     queued += 1
             except Exception as e:
-                self._log_stream.emit_error(
+                self._metadata_log_stream().emit_error(
                     f"Backfill enqueue failed for {ch.get('name')}: {e}")
         self._on_queue_changed()
         started = self._maybe_autostart_sync() if queued > 0 else False
@@ -441,7 +474,7 @@ class MetadataMixin:
                 "skipped_up_to_date": skipped,
                 "channels": len(channels),
                 "started": started,
-                "paused": bool(self._queues.sync_paused),
+                "paused": bool(self._metadata_queues().sync_paused),
                 "mode": "thorough" if mode == "thorough" else "fast"}
 
 
@@ -463,7 +496,7 @@ class MetadataMixin:
         task["kind"] = "metadata"
         task["refresh"] = True
         try:
-            self._queues.sync_enqueue(task)
+            self._metadata_queues().sync_enqueue(task)
         except Exception as e:
             return _api_err("METADATA_FAILED", str(e))
         self._on_queue_changed()
@@ -473,7 +506,7 @@ class MetadataMixin:
         # just duplicated info one line above.
         started = self._maybe_autostart_sync()
         return {"ok": True, "queued": True, "started": started,
-                "paused": bool(self._queues.sync_paused)}
+                "paused": bool(self._metadata_queues().sync_paused)}
 
 
     # ─── Refresh comments (separate per-channel action) ────────────────
@@ -509,22 +542,23 @@ class MetadataMixin:
             except (TypeError, ValueError):
                 pass
         try:
-            self._queues.sync_enqueue(task)
+            self._metadata_queues().sync_enqueue(task)
         except Exception as e:
             return _api_err("METADATA_FAILED", str(e))
         self._on_queue_changed()
         ch_name = ch.get("name") or ch.get("folder", "")
         scope_str = (f" (last {task['only_recent_days']}d)"
                      if task.get("only_recent_days") else "")
-        self._log_stream.emit_text(
+        log_stream = self._metadata_log_stream()
+        log_stream.emit_text(
             f" \u2014 Queued comments refresh for {ch_name}{scope_str} "
             f"on Sync Tasks.", "simpleline_pink")
-        self._log_stream.flush()
+        log_stream.flush()
         started = self._maybe_autostart_sync()
         return {"ok": True, "queued": True,
                 "only_recent_days": task.get("only_recent_days"),
                 "started": started,
-                "paused": bool(self._queues.sync_paused)}
+                "paused": bool(self._metadata_queues().sync_paused)}
 
 
     def metadata_queue_all(self, refresh=False):
@@ -538,7 +572,7 @@ class MetadataMixin:
         Mirrors YTArchiver.py:28296 _secret_download_all_metadata (new metadata)
         and :28326 _secret_refresh_all_metadata (views/likes refresh only).
         """
-        cfg = self._config or load_config()
+        cfg = self._metadata_config()
         channels = sorted(cfg.get("channels", []),
                           key=lambda c: (c.get("name") or "").lower())
         if not channels:
@@ -549,17 +583,18 @@ class MetadataMixin:
                 task = dict(ch)
                 task["kind"] = "metadata"
                 task["refresh"] = bool(refresh)
-                if self._queues.sync_enqueue(task):
+                if self._metadata_queues().sync_enqueue(task):
                     queued += 1
             except Exception as e:
-                self._log_stream.emit_error(
+                self._metadata_log_stream().emit_error(
                     f"Metadata enqueue failed for {ch.get('name')}: {e}")
         self._on_queue_changed()
         label = "refresh" if refresh else "download"
-        self._log_stream.emit_text(
+        log_stream = self._metadata_log_stream()
+        log_stream.emit_text(
             f" \u2014 Queued metadata {label} for {queued} channel(s) "
             f"on Sync Tasks.", "simpleline_pink")
-        self._log_stream.flush()
+        log_stream.flush()
         # always auto-fire the worker when the user explicitly
         # clicked "Queue all metadata" / "Refresh views/likes" — the
         # old code gated this on `autorun_sync=True`, so users with
@@ -570,7 +605,7 @@ class MetadataMixin:
         started = self._maybe_autostart_sync() if queued > 0 else False
         return {"ok": True, "queued": queued, "channels": len(channels),
                 "started": started,
-                "paused": bool(self._queues.sync_paused)}
+                "paused": bool(self._metadata_queues().sync_paused)}
 
 
     def _prompt_metadata_already_downloaded(self, channel_name, count):

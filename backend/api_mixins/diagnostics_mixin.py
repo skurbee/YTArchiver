@@ -2,9 +2,9 @@
 DiagnosticsMixin — extracted from the main Api class for browsability.
 
 Methods in this mixin are mixed into the Api class via multiple
-inheritance. They reference `self.<state>` which still resolves
-to the Api instance at runtime — no body changes were made
-when moving them out of main.py.
+inheritance. They prefer AppServices when present for config and
+log dependencies, with legacy private Api attributes kept as fallback
+state.
 """
 from __future__ import annotations
 
@@ -21,6 +21,21 @@ from backend.version import APP_VERSION
 
 
 class DiagnosticsMixin:
+    def _diagnostics_services(self):
+        return getattr(self, "services", None)
+
+    def _diagnostics_config(self):
+        services = self._diagnostics_services()
+        if services is not None:
+            return services.fresh_config()
+        return self._config or load_config()
+
+    def _diagnostics_log_stream(self):
+        services = self._diagnostics_services()
+        stream = (getattr(services, "log_stream", None)
+                  if services is not None else None)
+        return stream if stream is not None else self._log_stream
+
 
     def check_dependencies(self):
         """Probe for optional deps + subprocess runners, log anything missing.
@@ -76,12 +91,13 @@ class DiagnosticsMixin:
         # Log a one-line summary for the startup log
         missing = [r for r in rows if not r["ok"]]
         if missing:
-            self._log_stream.emit([
+            log_stream = self._diagnostics_log_stream()
+            log_stream.emit([
                 ["[Deps] ", "sync_bracket"],
                 [f"{len(missing)} missing: ", "red"],
                 [", ".join(r["name"] for r in missing) + "\n", "dim"],
             ])
-            self._log_stream.flush()
+            log_stream.flush()
             # Critical missing tools (yt-dlp + ffmpeg) prevent sync from
             # working at all. Surface a high-visibility warning to the
             # log AND push a toast so the user doesn't just see a generic
@@ -92,14 +108,14 @@ class DiagnosticsMixin:
                                 if r["name"] in CRITICAL]
             if missing_critical:
                 names = " + ".join(missing_critical)
-                self._log_stream.emit([
+                log_stream.emit([
                     ["[Deps] ", "sync_bracket"],
                     [f"⚠ {names} not found — ",
                      "red"],
                     ["downloads will fail until installed.\n",
                      "dim"],
                 ])
-                self._log_stream.flush()
+                log_stream.flush()
                 # Best-effort toast (pywebview window may not be live yet
                 # at first launch — fire after a short delay).
                 try:
@@ -111,7 +127,10 @@ class DiagnosticsMixin:
                             msg = (f"Missing: {names}. "
                                    "Install from Settings -> Dependencies "
                                    "for downloads to work.")
-                            self.services.event_bus.show_toast(
+                            services = self._diagnostics_services()
+                            if services is None:
+                                return
+                            services.event_bus.show_toast(
                                 msg, "error", ttl_ms=12000)
                         except Exception:
                             pass
@@ -128,7 +147,7 @@ class DiagnosticsMixin:
         channels marked `initialized=True`). The UI can then prompt the
         user to remove / locate / skip each one. Never modifies config.
         """
-        cfg = self._config or load_config()
+        cfg = self._diagnostics_config()
         base = (cfg.get("output_dir") or "").strip()
         if not base:
             return {"ok": False, "error": "output_dir not set", "missing": []}
@@ -145,12 +164,13 @@ class DiagnosticsMixin:
                     "expected": expected,
                 })
         if missing:
-            self._log_stream.emit([
+            log_stream = self._diagnostics_log_stream()
+            log_stream.emit([
                 ["[Subs] ", "sync_bracket"],
                 [f"{len(missing)} channel folder(s) missing \u2014 ", "red"],
                 ["see Subs tab for reconcile\n", "dim"],
             ])
-            self._log_stream.flush()
+            log_stream.flush()
         return {"ok": True, "missing": missing}
 
 
@@ -190,21 +210,22 @@ class DiagnosticsMixin:
                 current = APP_VERSION
                 if latest and _ver_tuple(latest) > _ver_tuple(current):
                     sep = "=" * 54
-                    self._log_stream.emit([[f"\n{sep}\n", "update_sep"]])
-                    self._log_stream.emit([
+                    log_stream = self._diagnostics_log_stream()
+                    log_stream.emit([[f"\n{sep}\n", "update_sep"]])
+                    log_stream.emit([
                         [f" \u2b06 Update available: {latest} ", "update_head"],
                         [f"(you have {current})\n", "update_head"],
                     ])
-                    self._log_stream.emit([[f" Download: {rel_url}\n", "update_head"]])
-                    self._log_stream.emit([[f"{sep}\n\n", "update_sep"]])
-                    self._log_stream.flush()
+                    log_stream.emit([[f" Download: {rel_url}\n", "update_head"]])
+                    log_stream.emit([[f"{sep}\n\n", "update_sep"]])
+                    log_stream.flush()
             except Exception as _e:
                 # surface the failure as a dim log line
                 # so the user has evidence the check ran (and why it
                 # failed). Old code silently swallowed, leaving no
                 # trace of whether the update probe ever fired.
                 try:
-                    self._log_stream.emit_dim(
+                    self._diagnostics_log_stream().emit_dim(
                         f"[Update] check skipped: {_e}")
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
@@ -220,7 +241,7 @@ class DiagnosticsMixin:
         is wrapped so the dialog always has something to show.
         """
         rows = []
-        cfg = self._config or load_config()
+        cfg = self._diagnostics_config()
 
         def _row(name, ok, detail):
             rows.append({"name": name, "ok": bool(ok), "detail": str(detail)})

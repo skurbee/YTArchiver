@@ -2,9 +2,8 @@
 RecentMixin — extracted from the main Api class for browsability.
 
 Methods in this mixin are mixed into the Api class via multiple
-inheritance. They reference `self.<state>` which still resolves
-to the Api instance at runtime — no body changes were made
-when moving them out of main.py.
+inheritance. They prefer AppServices when present, with legacy
+private Api attributes kept as fallback state.
 """
 from __future__ import annotations
 
@@ -20,6 +19,30 @@ from backend import index as index_backend
 
 
 class RecentMixin:
+    def _recent_services(self):
+        return getattr(self, "services", None)
+
+    def _recent_config(self):
+        services = self._recent_services()
+        if services is not None:
+            return services.fresh_config()
+        cfg = getattr(self, "_config", None)
+        if cfg is not None:
+            return cfg
+        return load_config()
+
+    def _recent_save_config(self, cfg):
+        services = self._recent_services()
+        if services is not None:
+            return services.save_config(cfg)
+        return save_config(cfg)
+
+    def _recent_log_stream(self):
+        services = self._recent_services()
+        stream = (getattr(services, "log_stream", None)
+                  if services is not None else None)
+        return stream if stream is not None else self._log_stream
+
 
     def get_recent_downloads(self):
         """Return real recent-downloads from config. Empty list when none.
@@ -27,8 +50,7 @@ class RecentMixin:
         Earlier builds fell back to a synthetic sample set which populated the
         Recent tab with fake videos the user couldn't delete. Removed.
         """
-        cfg = self._config if self._config is not None else load_config()
-        return recent_for_ui(cfg)
+        return recent_for_ui(self._recent_config())
 
 
     def list_all_videos(self, sort="recent", limit=60, offset=0, query=""):
@@ -45,10 +67,15 @@ class RecentMixin:
         except (TypeError, ValueError):
             _offset = 0
         try:
-            return index_backend.list_all_videos(
-                sort=str(sort or "recent"),
-                limit=_limit, offset=_offset,
-                query=str(query or ""))
+            # Mark this as a foreground Browse query so the startup sweep +
+            # Browse preload yield the Z: pool to it — a cold Videos open
+            # does up to 60 channel-wide thumbnail walks and must not run
+            # head-to-head with the background walkers on the same disk.
+            with index_backend.foreground_browse():
+                return index_backend.list_all_videos(
+                    sort=str(sort or "recent"),
+                    limit=_limit, offset=_offset,
+                    query=str(query or ""))
         except Exception as e:
             return {"rows": [], "has_more": False, "offset": _offset,
                     "error": str(e)}
@@ -63,10 +90,9 @@ class RecentMixin:
         equivalent. Returns {ok: bool, error?: str}.
         """
         try:
-            from backend.ytarchiver_config import save_config as _sc
-            cfg = self._config if self._config is not None else load_config()
+            cfg = self._recent_config()
             cfg["recent_downloads"] = []
-            ok = _sc(cfg)
+            ok = self._recent_save_config(cfg)
             if not ok:
                 return {"ok": False, "error": "Config write failed."}
             try: self._reload_config()
@@ -101,7 +127,9 @@ class RecentMixin:
                 "window._refreshVideosViewIfActive();")
         except Exception as e:
             # Best-effort — never let a UI push crash the download pipeline.
-            try: self._log_stream.emit_dim(f"(recent refresh push failed: {e})")
+            try:
+                self._recent_log_stream().emit_dim(
+                    f"(recent refresh push failed: {e})")
             except Exception as e: swallow("recent-push dim emit", e)
 
 
@@ -132,7 +160,7 @@ class RecentMixin:
             return path or ""
 
     def _recent_find_entry(self, ident: dict):
-        cfg = load_config()
+        cfg = self._recent_config()
         rows = cfg.get("recent_downloads", []) or []
         target_fp = self._norm_recent_path(ident.get("filepath", ""))
         target_vid = ident.get("video_id", "")
@@ -190,7 +218,7 @@ class RecentMixin:
              match via `utils.try_find_by_title` — recovers files the user
              manually moved between year/month split layouts.
         """
-        cfg = load_config()
+        cfg = self._recent_config()
         video_id_hint = ""
         # Iterate ALL matching entries — old code returned at the
         # first stored_path that existed, but with duplicates from
@@ -303,7 +331,7 @@ class RecentMixin:
         # fall back to the FTS DB row.
         vid = ""
         try:
-            cfg = self._config or load_config()
+            cfg = self._recent_config()
             for r in cfg.get("recent_downloads", []):
                 if (ident.get("filepath")
                         and self._norm_recent_path(r.get("filepath", ""))

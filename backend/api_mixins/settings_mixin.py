@@ -2,9 +2,9 @@
 SettingsMixin — extracted from the main Api class for browsability.
 
 Methods in this mixin are mixed into the Api class via multiple
-inheritance. They reference `self.<state>` which still resolves
-to the Api instance at runtime — no body changes were made
-when moving them out of main.py.
+inheritance. They prefer AppServices when present for config, log,
+and transcribe dependencies, with legacy private Api attributes kept
+as fallback state.
 """
 from __future__ import annotations
 
@@ -22,6 +22,43 @@ from backend.transcribe import TranscribeManager
 
 
 class SettingsMixin:
+    def _settings_services(self):
+        return getattr(self, "services", None)
+
+    def _settings_config(self):
+        services = self._settings_services()
+        if services is not None:
+            return services.fresh_config()
+        cfg = getattr(self, "_config", None)
+        if cfg is not None:
+            return cfg
+        return load_config()
+
+    def _settings_fresh_config(self):
+        services = self._settings_services()
+        if services is not None:
+            return services.fresh_config()
+        return load_config()
+
+    def _settings_save_config(self, cfg):
+        services = self._settings_services()
+        if services is not None:
+            return services.save_config(cfg)
+        from backend.ytarchiver_config import save_config as _save_config
+        return _save_config(cfg)
+
+    def _settings_log_stream(self):
+        services = self._settings_services()
+        stream = (getattr(services, "log_stream", None)
+                  if services is not None else None)
+        return stream if stream is not None else self._log_stream
+
+    def _settings_transcribe(self):
+        services = self._settings_services()
+        transcribe = (getattr(services, "transcribe", None)
+                      if services is not None else None)
+        return transcribe if transcribe is not None else self._transcribe
+
 
     def set_log_mode(self, mode):
         """UI toggled log mode. Pushes filter state into LogStreamer +
@@ -35,18 +72,18 @@ class SettingsMixin:
         save_exc = ""
         with SettingsMixin._settings_save_lock:
             try:
-                from backend.ytarchiver_config import save_config as _sc
-                cfg = load_config()
+                cfg = self._settings_fresh_config()
                 cfg["log_mode"] = mode
-                persisted = bool(_sc(cfg))
+                persisted = bool(self._settings_save_config(cfg))
             except Exception as _se:
                 persisted = False
                 save_exc = str(_se)
             if persisted:
-                if self._config is not None:
-                    self._config["log_mode"] = mode
+                cfg_ref = getattr(self, "_config", None)
+                if cfg_ref is not None:
+                    cfg_ref["log_mode"] = mode
                 # LogStreamer respects `simple_mode` when filtering dim/verbose lines
-                self._log_stream.simple_mode = (mode == "Simple")
+                self._settings_log_stream().simple_mode = (mode == "Simple")
             else:
                 # Save failed — reload from disk so in-memory state
                 # matches whatever's actually persisted, not the
@@ -143,7 +180,7 @@ class SettingsMixin:
     # ─── Settings dialog: load / save all tunables ─────────────────────
 
     def settings_load(self):
-        cfg = self._config or load_config()
+        cfg = self._settings_config()
         return {
             "output_dir": cfg.get("output_dir", ""),
             "video_out_dir": cfg.get("video_out_dir", ""),
@@ -198,7 +235,7 @@ class SettingsMixin:
             return self._settings_save_inner(data)
 
     def _settings_save_inner(self, data):
-        cfg = load_config()
+        cfg = self._settings_fresh_config()
         # Track the OLD whisper model so we can hot-apply a change to
         # the running TranscribeManager (audit U-7). Settings_save was
         # persisting the new model + reloading config, but the
@@ -269,12 +306,11 @@ class SettingsMixin:
         # "quit" (exit immediately), or "tray" (minimize to tray).
         if data.get("close_behavior") in ("ask", "quit", "tray"):
             cfg["close_behavior"] = data["close_behavior"]
-        from backend.ytarchiver_config import save_config as _sc
-        if not _sc(cfg):
+        if not self._settings_save_config(cfg):
             return {"ok": False, "error": "Save failed"}
         self._reload_config()
         # Push log mode into LogStreamer
-        self._log_stream.simple_mode = (cfg["log_mode"] == "Simple")
+        self._settings_log_stream().simple_mode = (cfg["log_mode"] == "Simple")
         # Audit U-7: hot-apply Whisper model change so the next job
         # uses the new model without requiring a full app restart.
         # The GPU popover already exposes per-job swap via
@@ -282,13 +318,14 @@ class SettingsMixin:
         _new_whisper = (cfg.get("whisper_model") or "").strip()
         if _new_whisper and _new_whisper != _old_whisper:
             try:
-                if hasattr(self._transcribe, "swap_model"):
-                    self._transcribe.swap_model(_new_whisper)
+                transcribe = self._settings_transcribe()
+                if hasattr(transcribe, "swap_model"):
+                    transcribe.swap_model(_new_whisper)
             except Exception as _e:
                 # Log + continue — settings still saved successfully,
                 # the user just needs to restart for the change to bite.
                 try:
-                    self._log_stream.emit_dim(
+                    self._settings_log_stream().emit_dim(
                         f" (whisper model swap deferred until restart: {_e})")
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
@@ -332,7 +369,8 @@ class SettingsMixin:
             return {"ok": False, "error": "yt-dlp not found"}
         def _run():
             import subprocess as _sp
-            self._log_stream.emit([
+            log_stream = self._settings_log_stream()
+            log_stream.emit([
                 ["[Update] ", "update_head"],
                 ["Updating yt-dlp...\n", "update_sep"],
             ])
@@ -342,7 +380,7 @@ class SettingsMixin:
                                   encoding="utf-8", errors="replace", bufsize=1,
                                   startupinfo=sync_backend._startupinfo)
                 for line in proc.stdout:
-                    self._log_stream.emit_dim(" " + line.rstrip())
+                    log_stream.emit_dim(" " + line.rstrip())
                 proc.wait()
                 # check proc.returncode before declaring
                 # success. Old code always emitted "update complete"
@@ -351,17 +389,17 @@ class SettingsMixin:
                 # fails but the banner still claimed it worked).
                 if proc.returncode == 0:
                     SettingsMixin._ytdlp_version_cache.pop(yt, None)
-                    self._log_stream.emit([["[Update] ", "update_head"],
-                                            ["yt-dlp update complete.\n", "update_sep"]])
+                    log_stream.emit([["[Update] ", "update_head"],
+                                     ["yt-dlp update complete.\n", "update_sep"]])
                 else:
-                    self._log_stream.emit_error(
+                    log_stream.emit_error(
                         f"yt-dlp update failed (exit code {proc.returncode}). "
                         "If a sync is running, stop it and try again — the "
                         ".exe can't be replaced while it's open.")
             except Exception as e:
-                self._log_stream.emit_error(f"yt-dlp update failed: {e}")
+                log_stream.emit_error(f"yt-dlp update failed: {e}")
             finally:
-                self._log_stream.flush()
+                log_stream.flush()
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "started": True}
 
@@ -391,11 +429,10 @@ class SettingsMixin:
         except OSError as _pe:
             return {"ok": False,
                     "error": f"Folder isn't writable: {_pe}"}
-        from backend.ytarchiver_config import save_config as _sc
         with SettingsMixin._settings_save_lock:
-            cfg = load_config()
+            cfg = self._settings_fresh_config()
             cfg["output_dir"] = path
-            ok = _sc(cfg)
+            ok = self._settings_save_config(cfg)
         if ok:
             self._reload_config()
             return {"ok": True, "path": path}

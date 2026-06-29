@@ -873,9 +873,43 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             output_dir = (cfg.get("output_dir") or "").strip()
             sweep_result = {"registered": 0, "ingested": 0}
 
-            # Startup maintenance is low priority. It should not compete with
-            # the user's first active download or a GPU job finishing.
+            # Startup maintenance (archive sweep + Browse preload) is the
+            # LOWEST-priority work in the app. It must fully yield to anything
+            # the user (or autorun) kicks off and NEVER compete for the Z:
+            # pool / SQLite writer / GIL while that runs.
+            #
+            # Gate on the COARSEST signals available so the gate stays CLOSED
+            # for the whole duration of a user-direct action instead of
+            # flickering open between its sub-steps:
+            #   * sync_is_running()           — the sync WORKER THREAD is alive.
+            #       Stays True across ALL channels of a pass. The old gate used
+            #       only is_any_sync_active(), which is set/cleared per channel
+            #       and so flickers False in every gap BETWEEN channels — each
+            #       gap let the sweep/preload threads sneak a chunk of disk I/O
+            #       onto the slow pool mid-pass, stalling the active download.
+            #   * archive_single_is_running() — a single ad-hoc download.
+            #   * _transcribe._current_job    — a Whisper/GPU job finishing.
+            #   * is_any_sync_active()        — belt-and-suspenders fallback.
             def _startup_low_priority_busy():
+                try:
+                    # User is actively loading a Browse view (Videos grid /
+                    # channel grid). Cold opens do channel-wide thumbnail
+                    # walks on the slow Z: pool — park sweep + preload so the
+                    # foreground query isn't fighting them for the disk.
+                    if index_backend.is_foreground_browse_busy():
+                        return True
+                except Exception:
+                    pass
+                try:
+                    if self.sync_is_running():
+                        return True
+                except Exception:
+                    pass
+                try:
+                    if self.archive_single_is_running():
+                        return True
+                except Exception:
+                    pass
                 try:
                     mgr = self._transcribe
                     if mgr._current_job is not None:
@@ -921,6 +955,18 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     dots_state["sweep"]["detail"] = ""
 
             def _run_preload():
+                # DISABLED. The Browse preload existed to mask a slow Browse
+                # — but the real cause was an un-indexed per-channel query
+                # (689s on a 104k-row/20GB DB), now fixed by the
+                # idx_vid_chan_added_live partial covering index. With the
+                # query indexed, on-demand Browse opens are sub-second, so
+                # this pass (which re-enriched up to 100k rows/channel —
+                # metadata JSONL parse + per-row thumbnail stats across the
+                # whole Z: pool) only competed with the user's foreground
+                # Browse load and is no longer worth running. Left as a
+                # no-op rather than deleted so the staging/UI plumbing
+                # (dots_state["preload"], the thread spawn) stays intact.
+                return
                 if not cfg.get("browse_preload_all", False):
                     return
                 ch_names = [(c.get("name") or c.get("folder") or "")
@@ -1700,6 +1746,36 @@ def main():
         try:
             threading.Thread(target=_do_destroy, daemon=True,
                              name="tray-quit-marshal").start()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        # Safety net: a Quit must never freeze the app. WebView2's
+        # destroy() blocks until any in-flight `js_api` bridge call
+        # returns, so a slow Browse load could stall the graceful
+        # close (which is what ends in os._exit). If the graceful path
+        # hasn't terminated the process within the timeout, do a
+        # best-effort flush + subprocess reap and hard-exit. This only
+        # ever runs after the user explicitly chose Quit, and is a no-op
+        # when the clean path exits first (process is already gone).
+        def _force_exit_watchdog():
+            try: time.sleep(10.0)
+            except Exception: pass
+            try: api._sync_cancel.set()
+            except Exception: pass
+            try: api._queues.save_now()
+            except Exception: pass
+            try:
+                from backend.process_runner import PROCESS_REGISTRY as _PR
+                _PR.kill_all(timeout=1.0)
+            except Exception: pass
+            try:
+                _log.warning("tray quit: graceful close exceeded 10s "
+                             "(likely a slow in-flight bridge call) — "
+                             "forcing hard exit")
+            except Exception: pass
+            os._exit(0)
+        try:
+            threading.Thread(target=_force_exit_watchdog, daemon=True,
+                             name="tray-quit-watchdog").start()
         except Exception as e:
             _log.debug("swallowed: %s", e)
 

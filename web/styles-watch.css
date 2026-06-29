@@ -245,19 +245,64 @@
    clutter. controlslist="nodownload noplaybackrate" empties it; this rule
    removes the now-pointless button too. */
 .watch-video-el::-webkit-media-controls-overflow-button { display: none !important; }
-/* In fullscreen the stage fills the screen and letterboxes the video. */
+/* CSS-based fullscreen (watchView.js toggles `.cssfs` on the stage).
+   We deliberately do NOT use the native Fullscreen API: in WebView2 a
+   natively-fullscreened <video> gets a dedicated GPU surface that composites
+   over (and on mouse-idle, INSTEAD OF) the DOM caption overlay, so the
+   overlay vanished when the controls auto-hid. CSS-filling the stage keeps
+   the <video> an ordinary composited element, so the overlay survives.
+   The `:fullscreen` variant is kept as a harmless fallback. */
+.watch-video-stage.cssfs,
 .watch-video-stage:fullscreen {
   display: flex;
   align-items: center;
   justify-content: center;
   background: #000;
 }
+.watch-video-stage.cssfs {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 99999;
+  border-radius: 0;
+  isolation: isolate;
+}
+.watch-video-stage.cssfs > .watch-video-el,
 .watch-video-stage:fullscreen > .watch-video-el {
   width: 100%;
   height: 100%;
   object-fit: contain;
   border-radius: 0;
 }
+/* Keep a real DOM layer overlapping the video after WebView2's native
+   controls fade out. Without this, Chromium can promote the video to a
+   DirectComposition plane that paints above sibling DOM, hiding captions
+   until mouse movement brings the controls back. */
+.watch-video-stage.cssfs::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+  background: rgba(0, 0, 0, 0.01);
+}
+/* CAPTION-OVERLAY FIX (WebView2 DirectComposition video overlay).
+   On Windows, WebView2 promotes a playing <video> to a dedicated zero-copy
+   hardware OVERLAY plane (power optimization). When the native controls
+   auto-hide on mouse-idle and nothing opaque overlaps the video, WebView2
+   presents ONLY that plane and paints it OVER the web layer — so the DOM
+   karaoke caption div vanished the instant the controls faded, and returned
+   the instant they came back. (It survived in OS-window fullscreen because
+   that uses a different presentation path — the tell.) A <video> with
+   opacity < 1 is NOT eligible for the hardware overlay (overlays must be
+   opaque), so this forces the video through the normal compositor and the
+   caption div renders on top and stays. 0.999 is visually imperceptible.
+   NOTE: translateZ/will-change do NOT fix this (layer promotion alone
+   doesn't disqualify the overlay); non-opacity does. main.py also disables
+   WebView2's DirectComposition video-overlays switch at process startup.
+   This CSS remains as a local fallback for runtimes that ignore that switch. */
+.watch-video-el { opacity: 0.999; }
 
 /* The overlay itself: a fixed-width (90%) 3-column grid centred over the
    video. With `1fr auto 1fr`, the two side columns are always equal, so
@@ -328,6 +373,7 @@
   transition: opacity 140ms ease;
 }
 .watch-video-stage:hover .cap-fs-btn,
+.watch-video-stage.cssfs .cap-fs-btn,
 .watch-video-stage:fullscreen .cap-fs-btn { opacity: 0.9; pointer-events: auto; }
 .cap-fs-btn:hover { background: rgba(0, 0, 0, 0.85); }
 

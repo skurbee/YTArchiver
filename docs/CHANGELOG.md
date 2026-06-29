@@ -6,6 +6,18 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v79.3 - 2026-06-29
+
+### Fixed
+- **Watch fullscreen transcript overlays stay visible after controls fade.** The Watch view now uses CSS-based fullscreen plus a WebView2 compositor guard so the transcript overlay remains visible when the mouse is idle and native video controls disappear.
+- **Duration-filtered videos no longer retry forever.** Videos intentionally skipped by yt-dlp match filters, such as channel minimum-duration rules, are removed from `failed_video_ids` instead of being retried on every sync.
+- **Generated app shell is back in sync.** The shipped HTML now includes the Launch-at-boot settings controls, the Browse > Manual view, and the Manual view script include that already existed in the source partials.
+
+### Validation
+- Backend smoke suite passed.
+- Frontend JavaScript syntax checks passed for all web modules.
+- Built with Python 3.13 using the PyInstaller spec file.
+
 ## v79.1 - 2026-06-28
 
 ### Fixed

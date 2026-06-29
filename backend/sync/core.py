@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 import threading
 import time
 from datetime import datetime
@@ -385,16 +384,25 @@ def _archived_failed_video_ids(video_ids) -> set[str]:
 
 
 def _merge_failed_video_ids(prior_failed, failed_this_run, downloaded_ids,
-                            gave_up_this_run=None) -> tuple[dict[str, int], list[str]]:
-    """Merge failed-video retry state without resurrecting given-up IDs."""
+                            gave_up_this_run=None,
+                            filtered_this_run=None) -> tuple[dict[str, int], list[str]]:
+    """Merge failed-video retry state without resurrecting given-up IDs.
+
+    `filtered_this_run` = videos yt-dlp match-filter-SKIPPED (e.g. too short
+    for the channel's min_duration). They're dropped from the retry list:
+    a permanently-filtered video would otherwise stay forever (never
+    downloaded, never errored, so its strike count never advances)."""
     downloaded = {v for v in downloaded_ids if isinstance(v, str) and v}
     gave_up_now = {v for v in (gave_up_this_run or set())
                    if isinstance(v, str) and v}
+    filtered = {v for v in (filtered_this_run or set())
+                if isinstance(v, str) and v}
     failed_now = {
         v for v in failed_this_run
         if isinstance(v, str) and v
         and v not in downloaded
         and v not in gave_up_now
+        and v not in filtered
     }
 
     next_failed: dict[str, int] = {}
@@ -402,7 +410,7 @@ def _merge_failed_video_ids(prior_failed, failed_this_run, downloaded_ids,
     for vid, count in (prior_failed or {}).items():
         if not isinstance(vid, str) or not isinstance(count, int):
             continue
-        if vid in downloaded or vid in gave_up_now:
+        if vid in downloaded or vid in gave_up_now or vid in filtered:
             continue
         if vid in failed_now:
             # Failed AGAIN this sync. 3rd strike in a row -> give up.
@@ -809,6 +817,13 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # and these videos are silently lost.
     _failed_this_run: set = set()
     _gave_up_this_run: set = set()
+    # Videos yt-dlp intentionally SKIPPED via --match-filter (e.g. a Short
+    # below the channel's min_duration). Not failures — recorded so the
+    # retry merge can DROP them from failed_video_ids instead of re-running
+    # them every sync forever (they never download, never error, so the
+    # 3-strike give-up never advances — the "Retrying 1 previously failed
+    # video" that recurred on every single sync).
+    _filtered_this_run: set = set()
     _net_warned: set = set()   # vids already shown a "couldn't reach" notice
     current_title = ""
     dest_path = ""
@@ -2203,6 +2218,14 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             # line. yt-dlp's own error format is "ERROR: ..." (or
             # "WARNING: ..."), which the stricter regex matches.
             low = s.lower()
+            # Match-filter skip ("... does not pass filter (duration >= 180),
+            # skipping ..") — yt-dlp deliberately skipped this video because it
+            # doesn't meet the channel's min/max-duration rule. NOT a failure.
+            # The line carries the title, not the id, so attribute it to the
+            # current video id captured from the preceding "[youtube] <id>:"
+            # line. Recorded so the retry merge drops it from failed_video_ids.
+            if "does not pass filter" in low and current_vid_id:
+                _filtered_this_run.add(current_vid_id)
             if (re.search(r"\berror[\s:\]\[]", low)
                     or re.search(r"\bwarning[\s:\]\[]", low)):
                 # Benign non-errors that yt-dlp prints as ERROR lines.
@@ -2486,7 +2509,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     try:
         _next_failed, _gave_up = _merge_failed_video_ids(
             _prior_failed, _failed_this_run, downloaded_ids,
-            _gave_up_this_run)
+            _gave_up_this_run, _filtered_this_run)
         # FAILSAFE: permanently give up on IDs that failed 3 syncs in a row.
         # Write them to the download-archive so the channel walk stops
         # re-discovering them every sync — the OLD code just dropped them

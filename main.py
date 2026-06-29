@@ -11,6 +11,21 @@ import threading
 import time
 from pathlib import Path
 
+
+def _ensure_webview2_browser_args() -> None:
+    """Disable WebView2's video overlay plane before the control is created."""
+    if os.name != "nt":
+        return
+    key = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"
+    switch = "--disable-direct-composition-video-overlays"
+    current = os.environ.get(key, "").strip()
+    if switch in current:
+        return
+    os.environ[key] = f"{current} {switch}".strip()
+
+
+_ensure_webview2_browser_args()
+
 # ── Version header — last updated 4.20.26 5:27pm ───────────────────────
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),

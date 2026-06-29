@@ -959,14 +959,39 @@
     const fsBtn = document.getElementById("watch-fs-btn");
     if (fsBtn && stage && !fsBtn._wired) {
       fsBtn._wired = true;
+      // CSS-based "fill the program window" — NOT the native Fullscreen API
+      // and NOT OS fullscreen.
+      //
+      // The native API (stage.requestFullscreen) is unusable here: WebView2
+      // promotes the playing <video> to a dedicated GPU surface and, once
+      // the controls auto-hide on mouse-idle, composites ONLY that surface —
+      // dropping the DOM caption overlay (and even native ::cue text) until
+      // the mouse moves. Instead we just CSS-fill the stage to the program
+      // window's content area (position:fixed; inset:0). The <video> stays an
+      // ordinary composited DOM element (exactly like windowed mode), so the
+      // caption overlay renders over it and survives the idle controls-hide —
+      // and it keeps honoring the user's caption size, since it's the same
+      // `.cap-ovl[data-cap-size]` element either way. The window itself is
+      // left alone (no OS fullscreen / taskbar takeover — by design).
+      const _escFs = (ev) => {
+        if (ev.key === "Escape" && stage.classList.contains("cssfs")) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          _setFs(false);
+        }
+      };
+      const _setFs = (on) => {
+        if (on === stage.classList.contains("cssfs")) return;
+        stage.classList.toggle("cssfs", on);
+        document.documentElement.classList.toggle("watch-cssfs", on);
+        if (on) document.addEventListener("keydown", _escFs, true);
+        else document.removeEventListener("keydown", _escFs, true);
+      };
       fsBtn.addEventListener("click", (e) => {
         // Don't let the click fall through to the video's native
         // click-to-play handler underneath.
         e.stopPropagation();
-        try {
-          if (document.fullscreenElement === stage) document.exitFullscreen();
-          else stage.requestFullscreen();
-        } catch { /* fullscreen unsupported / blocked */ }
+        _setFs(!stage.classList.contains("cssfs"));
       });
     }
 

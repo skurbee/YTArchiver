@@ -3804,6 +3804,20 @@ class SyncCoreTests(unittest.TestCase):
         self.assertEqual(next_failed, {})
         self.assertEqual(gave_up, [])
 
+    def test_failed_video_merge_drops_match_filtered_ids(self) -> None:
+        filtered_id = "short000001"
+        failed_id = "fail0000001"
+
+        next_failed, gave_up = sync_core._merge_failed_video_ids(
+            {filtered_id: 2, failed_id: 1},
+            {filtered_id, failed_id},
+            [],
+            filtered_this_run={filtered_id},
+        )
+
+        self.assertEqual(next_failed, {failed_id: 2})
+        self.assertEqual(gave_up, [])
+
     def test_archived_failed_video_ids_detects_stale_retry_state(self) -> None:
         video_id = "abc123def45"
         with tempfile.TemporaryDirectory() as td:

@@ -87,19 +87,21 @@ def _backfill_recent_duration(filepath: str) -> None:
 
 def set_recent_changed_hook(hook: Any | None) -> None:
     """Main.py wires this in __init__ so the Recent tab auto-refreshes
-    when a download completes. Hook gets no args — caller re-fetches the
-    current recent_downloads list and pushes to the UI."""
+    when a download completes. Hook receives an optional channel name
+    (the download's channel, when known) — caller re-fetches the current
+    recent_downloads list and pushes to the UI."""
     global _on_recent_changed_hook
     _on_recent_changed_hook = hook
 
 
-def fire_recent_changed_hook() -> None:
+def fire_recent_changed_hook(channel: str | None = None) -> None:
     """Best-effort fire of the registered hook. Used by sync/core.py's
     DLTRACK handler to push a live Recent-tab refresh right after a
-    download lands. Safe no-op when no hook is wired (tests, headless)."""
+    download lands. `channel` (when known) lets the UI target the matching
+    channel grid. Safe no-op when no hook is wired (tests, headless)."""
     if _on_recent_changed_hook is not None:
         try:
-            _on_recent_changed_hook()
+            _on_recent_changed_hook(channel)
         except Exception as e:
             swallow("recent-changed hook", e)
 
@@ -233,7 +235,7 @@ def _record_recent_download(filepath: str, channel: str, title: str,
         # immediately without needing a restart. Hook set by main.py's
         # Api.__init__; safe no-op when unset (unit tests).
         if _on_recent_changed_hook is not None:
-            try: _on_recent_changed_hook()
+            try: _on_recent_changed_hook(channel)
             except Exception as e: swallow("recent-changed hook", e)
         if _fire_sweep:
             # Spawn the sweep OUTSIDE the lock so it can't deadlock

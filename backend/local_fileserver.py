@@ -45,6 +45,7 @@ _lock = threading.Lock()
 # was only "..-in-segments + isabs + exists", which let any
 # absolute path on disk be read through http://127.0.0.1:PORT/file/.
 _allowed_roots: list[str] = []
+_allowed_files: set[str] = set()
 _request_token: str = ""
 
 
@@ -68,6 +69,27 @@ def set_allowed_roots(roots: list[str]) -> None:
     _allowed_roots = [r for r in (_normalize_root(x) for x in (roots or [])) if r]
 
 
+def _normalize_file(p: str) -> str:
+    try:
+        return os.path.normcase(os.path.realpath(p)).rstrip("/\\")
+    except Exception:
+        return ""
+
+
+def allow_file(path: str) -> None:
+    """Allow one exact file to be served.
+
+    Some app-managed manual downloads can live outside the configured archive
+    roots because the single-download flow supports custom "Save to" folders.
+    The bridge still authorizes those paths before emitting a URL; this exact
+    file grant lets the localhost server serve that already-approved path
+    without widening the root allowlist.
+    """
+    p = _normalize_file(path or "")
+    if p:
+        _allowed_files.add(p)
+
+
 def _is_under_allowed_root(path: str) -> bool:
     """True if `path` resolves to something under one of the registered
     allowed roots.
@@ -80,6 +102,9 @@ def _is_under_allowed_root(path: str) -> bool:
     the window. main.py must call set_allowed_roots() before relying on
     the fileserver.
     """
+    real_path = _normalize_file(path or "")
+    if real_path and real_path in _allowed_files:
+        return True
     if not _allowed_roots:
         try:
             _log.warning("local_fileserver: request before allowlist set — "
@@ -101,6 +126,10 @@ def _is_under_allowed_root(path: str) -> bool:
         _real = os.path.normcase(os.path.realpath(path)).rstrip("/\\")
     except Exception:
         _real = p
+    real_path = _normalize_file(path)
+    if real_path and real_path in _allowed_files:
+        return True
+
     for root in _allowed_roots:
         # os.path.normcase ensures case-insensitive prefix match on
         # Windows. The + os.sep guard prevents "/ArchiveBad" from

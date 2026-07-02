@@ -259,6 +259,9 @@
   transition: border-color 0.12s;
   display: flex;
   flex-direction: column;
+  content-visibility: auto;
+  contain-intrinsic-size: 240px 205px;
+  contain: layout paint style;
 }
 .video-card:hover {
   /* audit E-29: removed transform:translateY(-2px) — each hover
@@ -301,6 +304,38 @@
 /* "Removed from YT" badge — corner pill on tiles where the uploader
    deleted/privated/unlisted the video since download. Local file is
    still playable; we just can't refresh metadata for it. */
+.manual-card-badges {
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: flex-start;
+  pointer-events: none;
+  z-index: 3;
+}
+.manual-card-badge {
+  background: rgba(18, 22, 29, 0.84);
+  color: #e9edf4;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+  padding: 2px 5px;
+  border-radius: 2px;
+  text-transform: uppercase;
+}
+.manual-card-badge-ok {
+  background: rgba(34, 104, 61, 0.88);
+}
+.manual-card-badge-warn {
+  background: rgba(143, 98, 23, 0.90);
+}
+.manual-card-badge-bad {
+  background: rgba(148, 39, 39, 0.92);
+}
 .video-thumb .video-removed-badge {
   position: absolute;
   left: 6px;

@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, List
@@ -31,6 +32,10 @@ _METADATA_DRAWER_CACHE_LOCK = threading.Lock()
 _METADATA_DRAWER_CACHE: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
 _METADATA_DRAWER_CACHE_MAX = 128
 _TRANSCRIPT_SOURCE_SCAN_BYTES = 5 * 1024 * 1024
+_MANUAL_THUMB_BACKFILL_LOCK = threading.Lock()
+_MANUAL_THUMB_BACKFILL_INFLIGHT: set[str] = set()
+_MANUAL_DURATION_BACKFILL_LOCK = threading.Lock()
+_MANUAL_DURATION_BACKFILL_INFLIGHT: set[str] = set()
 
 
 def _iter_transcript_header_lines(path: str):
@@ -93,6 +98,103 @@ def _metadata_drawer_cache_put(video_id: str, channel: str,
             _METADATA_DRAWER_CACHE.popitem(last=False)
 
 
+def _real_norm(path: str) -> str:
+    try:
+        return os.path.normcase(os.path.realpath(os.path.normpath(path))).rstrip("/\\")
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
+def _same_or_under(path: str, root: str) -> bool:
+    p = _real_norm(path)
+    r = _real_norm(root)
+    if not p or not r:
+        return False
+    return p == r or p.startswith(r + os.sep) or p.startswith(r + "/")
+
+
+def _is_system_temp_path(path: str) -> bool:
+    candidates = {
+        tempfile.gettempdir(),
+        os.environ.get("TEMP", ""),
+        os.environ.get("TMP", ""),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Temp"),
+    }
+    return any(_same_or_under(path, c) for c in candidates if c)
+
+
+def _fmt_manual_duration(seconds: float | int | str | None) -> str:
+    try:
+        total = int(float(seconds or 0))
+    except (TypeError, ValueError):
+        return ""
+    if total <= 0:
+        return ""
+    h, m, s = total // 3600, (total % 3600) // 60, total % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _probe_manual_duration_seconds(filepath: str) -> float | None:
+    if not filepath or not os.path.isfile(filepath):
+        return None
+    try:
+        from backend.process_runner import find_ffprobe
+        ffprobe = find_ffprobe()
+    except Exception:
+        ffprobe = None
+    if not ffprobe:
+        return None
+    try:
+        from backend.subprocess_util import (
+            make_startupinfo,
+            subprocess_creationflags,
+        )
+        proc = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", filepath],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            encoding="utf-8",
+            errors="replace",
+            startupinfo=make_startupinfo(),
+            creationflags=subprocess_creationflags(),
+        )
+    except Exception as e:
+        _log.debug("manual duration probe failed for %r: %s", filepath, e)
+        return None
+    try:
+        dur = float((proc.stdout or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return dur if dur > 0 else None
+
+
+def _path_is_registered_video(filepath: str) -> bool:
+    """True if `filepath` exactly matches a registered video in the index.
+
+    A single/manual download can be saved anywhere the user chose (custom
+    "Save to" folder), outside the configured archive roots. Those files are
+    still app-managed — every download is registered in the `videos` table
+    with its full path — so we treat an exact index match as authorization to
+    play/open it. Exact (case-insensitive) match only: a crafted JS path that
+    isn't a known download stays rejected.
+    """
+    try:
+        from backend.index import _reader_lock, _reader_open
+        rconn = _reader_open()
+        if rconn is None:
+            return False
+        with _reader_lock:
+            row = rconn.execute(
+                "SELECT 1 FROM videos WHERE filepath=? COLLATE NOCASE LIMIT 1",
+                (filepath,),
+            ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
 def _guard_browse_launch_path(filepath: str, *, require_file: bool) -> dict:
     fp = os.path.normpath(filepath or "")
     if not fp:
@@ -101,9 +203,15 @@ def _guard_browse_launch_path(filepath: str, *, require_file: bool) -> dict:
     if not exists:
         return {"ok": False, "error": f"Not found: {fp}"}
     guard = file_ops.assert_within_managed_roots(fp)
-    if not guard.get("ok"):
-        return guard
-    return {"ok": True, "path": fp}
+    if guard.get("ok"):
+        return {"ok": True, "path": fp}
+    # Not under a configured root — but manual downloads can be saved to a
+    # custom location. They're still ours if the index has them, so allow an
+    # exact registered-video match (covers downloads saved anywhere on disk,
+    # existing or future) rather than rejecting them as "outside the archive".
+    if _path_is_registered_video(fp):
+        return {"ok": True, "path": fp}
+    return guard
 
 
 class BrowseMixin:
@@ -130,6 +238,145 @@ class BrowseMixin:
         stream = (getattr(services, "log_stream", None)
                   if services is not None else None)
         return stream if stream is not None else self._log_stream
+
+    def _queue_manual_local_thumbnail_backfill(
+            self, candidates: list[dict[str, Any]]) -> None:
+        win = getattr(self, "_window", None)
+        if win is None or not candidates:
+            return
+        todo: list[dict[str, str]] = []
+        with _MANUAL_THUMB_BACKFILL_LOCK:
+            for r in candidates:
+                fp = r.get("filepath") or ""
+                if not fp:
+                    continue
+                key = os.path.normcase(os.path.normpath(fp))
+                if key in _MANUAL_THUMB_BACKFILL_INFLIGHT:
+                    continue
+                _MANUAL_THUMB_BACKFILL_INFLIGHT.add(key)
+                todo.append({
+                    "key": key,
+                    "filepath": fp,
+                    "title": r.get("title") or "",
+                    "video_id": r.get("video_id") or "",
+                })
+        if not todo:
+            return
+
+        try:
+            stream = self._browse_log_stream()
+        except Exception:
+            stream = None
+
+        def _run():
+            ready: list[dict[str, str]] = []
+            try:
+                from backend import index as _idx
+                from backend.thumbnails import (
+                    _ensure_thumbnails_dir,
+                    _generate_local_thumbnail,
+                )
+                for item in todo:
+                    fp = item["filepath"]
+                    if not os.path.isfile(fp):
+                        continue
+                    video_id = item["video_id"]
+                    tp = _idx.find_thumbnail(fp, video_id)
+                    if not tp:
+                        thumb_dir = _ensure_thumbnails_dir(os.path.dirname(fp))
+                        tp = _generate_local_thumbnail(
+                            fp, thumb_dir, item["title"], video_id,
+                            stream=stream)
+                    if tp:
+                        ready.append({
+                            "filepath": fp,
+                            "thumbnail_url": _idx._file_url(tp),
+                            "thumbnail_source": "local",
+                        })
+                if ready:
+                    try:
+                        import json as _json
+                        payload = _json.dumps(ready)
+                        win.evaluate_js(
+                            "window._manualThumbsReady && "
+                            f"window._manualThumbsReady({payload});")
+                    except Exception as e:
+                        _log.debug("manual thumbnail push failed: %s", e)
+            finally:
+                with _MANUAL_THUMB_BACKFILL_LOCK:
+                    for item in todo:
+                        _MANUAL_THUMB_BACKFILL_INFLIGHT.discard(item["key"])
+
+        threading.Thread(target=_run, name="manual-local-thumbs",
+                         daemon=True).start()
+
+    def _apply_manual_duration(self, row: dict[str, Any]) -> bool:
+        if row.get("duration"):
+            return True
+        fp = row.get("filepath") or ""
+        dur = _probe_manual_duration_seconds(fp)
+        label = _fmt_manual_duration(dur)
+        if not label:
+            return False
+        row["duration"] = label
+        try:
+            from backend import index as _idx
+            _idx.set_video_duration(fp, dur)
+        except Exception as e:
+            _log.debug("manual duration persist failed for %r: %s", fp, e)
+        return True
+
+    def _queue_manual_duration_backfill(
+            self, candidates: list[dict[str, Any]]) -> None:
+        win = getattr(self, "_window", None)
+        if win is None or not candidates:
+            return
+        todo: list[dict[str, str]] = []
+        with _MANUAL_DURATION_BACKFILL_LOCK:
+            for r in candidates:
+                fp = r.get("filepath") or ""
+                if not fp:
+                    continue
+                key = os.path.normcase(os.path.normpath(fp))
+                if key in _MANUAL_DURATION_BACKFILL_INFLIGHT:
+                    continue
+                _MANUAL_DURATION_BACKFILL_INFLIGHT.add(key)
+                todo.append({"key": key, "filepath": fp})
+        if not todo:
+            return
+
+        def _run():
+            ready: list[dict[str, str]] = []
+            try:
+                from backend import index as _idx
+                for item in todo:
+                    fp = item["filepath"]
+                    dur = _probe_manual_duration_seconds(fp)
+                    label = _fmt_manual_duration(dur)
+                    if not label:
+                        continue
+                    try:
+                        _idx.set_video_duration(fp, dur)
+                    except Exception as e:
+                        _log.debug(
+                            "manual duration persist failed for %r: %s", fp, e)
+                    ready.append({"filepath": fp, "duration": label})
+                if ready:
+                    try:
+                        import json as _json
+                        payload = _json.dumps(ready)
+                        win.evaluate_js(
+                            "window._manualDurationsReady && "
+                            f"window._manualDurationsReady({payload});")
+                    except Exception as e:
+                        _log.debug("manual duration push failed: %s", e)
+            finally:
+                with _MANUAL_DURATION_BACKFILL_LOCK:
+                    for item in todo:
+                        _MANUAL_DURATION_BACKFILL_INFLIGHT.discard(item["key"])
+
+        threading.Thread(target=_run, name="manual-local-durations",
+                         daemon=True).start()
 
 
     # ─── Browse tab (reads from transcription_index.db) ────────────────
@@ -264,6 +511,29 @@ class BrowseMixin:
         # the Z: pool while this user-initiated channel grid loads.
         with index_backend.foreground_browse():
             return index_backend.list_videos_for_channel(channel, sort=sort, limit=limit)
+
+    def browse_list_videos_page(self, channel, sort="newest", limit=120,
+                                offset=0, query=""):
+        """Paginated channel videos for the default ungrouped Browse grid."""
+        try:
+            _limit = max(1, min(int(limit or 120), 500))
+        except (TypeError, ValueError):
+            _limit = 120
+        try:
+            _offset = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            _offset = 0
+        try:
+            with index_backend.foreground_browse():
+                return index_backend.list_videos_for_channel_page(
+                    str(channel or ""),
+                    sort=str(sort or "newest"),
+                    limit=_limit,
+                    offset=_offset,
+                    query=str(query or ""))
+        except Exception as e:
+            return {"rows": [], "has_more": False, "offset": _offset,
+                    "next_offset": _offset, "error": str(e)}
 
 
     def browse_get_transcript(self, payload):
@@ -641,6 +911,534 @@ class BrowseMixin:
             return {"ok": False, "error": str(e)}
 
 
+    def _manual_refresh_metadata_one(self, payload, *, push_refresh: bool):
+        """Refresh metadata for a single MANUAL download (not part of any
+        subscription). Fetches views/likes/description/comments by video_id and
+        writes the entry to a `.…Metadata.jsonl` NEXT TO the video file, where
+        browse_get_video_metadata's filepath-walk finds it — so loose downloads
+        outside the channel tree get metadata too.
+
+        payload: {filepath, video_id?, title?, channel?}
+        Returns: {ok, meta?, error?, transient?}
+        """
+        try:
+            filepath = (payload or {}).get("filepath") or ""
+            video_id = (payload or {}).get("video_id") or ""
+            title    = (payload or {}).get("title") or ""
+            channel  = (payload or {}).get("channel") or ""
+            if not video_id and filepath:
+                import re as _re
+                m = _re.search(r"\[([A-Za-z0-9_-]{11})\]",
+                               os.path.basename(filepath))
+                if m:
+                    video_id = m.group(1)
+            if not video_id:
+                return {"ok": False,
+                        "error": "No video ID for this download — can't fetch "
+                                 "metadata. (ID backfill is a separate step.)"}
+            if not filepath or not os.path.isfile(filepath):
+                return {"ok": False, "error": "Video file not found"}
+            dest = os.path.dirname(filepath)
+            # Synthetic channel: `name` only drives the JSONL filename; no
+            # year/month split for a loose single video. dest_folder steers
+            # the write next to the file.
+            syn = {"name": channel or "Manual",
+                   "split_years": False, "split_months": False}
+            from backend.metadata import fetch_single_video_metadata
+            res = fetch_single_video_metadata(
+                syn, video_id, filepath, title, self._browse_log_stream(),
+                emit_inline_log=False, refresh=True, dest_folder=dest)
+            if not res.get("ok"):
+                return {"ok": False,
+                        "error": res.get("error") or "fetch failed",
+                        "transient": bool(res.get("transient"))}
+            # Hide the freshly-written metadata/thumbnail sidecars so the
+            # manual-downloads folder still shows only the video file.
+            try:
+                from backend import utils as _u
+                _u.hide_stray_sidecars(dest, recursive=False)
+            except Exception as e:
+                swallow("manual meta hide sidecars", e)
+            if push_refresh:
+                try: self._push_recent_refresh()
+                except Exception as e: swallow("manual metadata refresh push", e)
+            return {"ok": True, "meta": res.get("entry")}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def manual_refresh_metadata(self, payload):
+        return self._manual_refresh_metadata_one(payload, push_refresh=True)
+
+    def _manual_bulk_rows(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        offset = 0
+        while True:
+            res = self.list_manual_videos("title", 500, offset)
+            page = (res or {}).get("rows") or []
+            if not page:
+                break
+            for r in page:
+                fp = r.get("filepath") or ""
+                key = os.path.normcase(os.path.normpath(fp)) if fp else ""
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                rows.append(r)
+            if not (res or {}).get("has_more"):
+                break
+            offset += len(page)
+            if offset > 10000:
+                break
+        return rows
+
+    def manual_bulk_action_summary(self):
+        """Preflight counts for Manual-tab bulk actions.
+
+        The frontend uses this to ask for confirmation before starting costly
+        work, and the workers use the same underlying row source so the counts
+        match what will actually be processed.
+        """
+        try:
+            rows = self._manual_bulk_rows()
+            total = len(rows)
+            with_id = 0
+            missing_id = 0
+            excluded_id = 0
+            tried_missing_id = 0
+            transcribed = 0
+            no_speech = 0
+            missing_files = 0
+            failed_attempts = 0
+
+            for r in rows:
+                fp = r.get("filepath") or ""
+                if not fp or not os.path.isfile(fp):
+                    missing_files += 1
+                if r.get("video_id"):
+                    with_id += 1
+                else:
+                    missing_id += 1
+                    if r.get("id_backfill_excluded_ts"):
+                        excluded_id += 1
+                    elif r.get("id_backfill_tried_ts"):
+                        tried_missing_id += 1
+                    try:
+                        failed_attempts += int(r.get("id_backfill_fail_count") or 0)
+                    except (TypeError, ValueError):
+                        pass
+
+                tx = (r.get("tx_status") or "").lower()
+                if tx not in {"transcribed", "done", "no_speech"}:
+                    if self._manual_has_local_transcript(r):
+                        tx = "transcribed"
+                if tx in {"transcribed", "done"}:
+                    transcribed += 1
+                elif tx == "no_speech":
+                    no_speech += 1
+
+            recover_eligible = max(0, missing_id - excluded_id)
+            transcribe_done = transcribed + no_speech
+            return {
+                "ok": True,
+                "total": total,
+                "with_id": with_id,
+                "missing_id": missing_id,
+                "recover_eligible": recover_eligible,
+                "recover_excluded": excluded_id,
+                "recover_tried": tried_missing_id,
+                "recover_failed_attempts": failed_attempts,
+                "metadata_eligible": with_id,
+                "metadata_skipped_no_id": missing_id,
+                "transcribed": transcribed,
+                "no_speech": no_speech,
+                "transcribe_eligible": max(0, total - transcribe_done),
+                "transcribe_skipped": transcribe_done,
+                "missing_files": missing_files,
+                "percent_with_id": round((with_id / total) * 100, 1)
+                                   if total else 0.0,
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def _manual_emit_text(self, text: str, tag: str = "dim") -> None:
+        try:
+            self._browse_log_stream().emit_text(text, tag)
+        except Exception as e:
+            _log.debug("manual bulk log emit failed: %s", e)
+
+    def _manual_emit_js(self, callback_name: str, payload: dict[str, Any]) -> None:
+        try:
+            win = getattr(self, "_window", None)
+            if win is None:
+                return
+            import json as _json
+            win.evaluate_js(
+                f"window.{callback_name} && "
+                f"window.{callback_name}({_json.dumps(payload)});")
+        except Exception as e:
+            _log.debug("manual bulk js emit failed: %s", e)
+
+    def manual_refresh_all_metadata(self):
+        existing = getattr(self, "_manual_refresh_all_thread", None)
+        if existing is not None and existing.is_alive():
+            return {"ok": False, "error": "Manual metadata refresh is already running"}
+
+        def _run():
+            summary = {
+                "ok": True,
+                "total": 0,
+                "refreshed": 0,
+                "skipped_no_id": 0,
+                "failed": 0,
+            }
+            try:
+                rows = self._manual_bulk_rows()
+                summary["total"] = len(rows)
+                self._manual_emit_text(
+                    f" - Manual metadata refresh: {len(rows):,} video(s) scanned.\n")
+                self._manual_emit_js("_manualRefreshAllProgress", {
+                    **summary,
+                    "current": 0,
+                    "phase": "scanned",
+                })
+                for i, r in enumerate(rows, 1):
+                    fp = r.get("filepath") or ""
+                    title = r.get("title") or os.path.basename(fp)
+                    self._manual_emit_js("_manualRefreshAllProgress", {
+                        **summary,
+                        "current": i,
+                        "phase": "fetching",
+                        "title": title,
+                    })
+                    if not fp or not os.path.isfile(fp):
+                        summary["failed"] += 1
+                        self._manual_emit_js("_manualRefreshAllProgress", {
+                            **summary,
+                            "current": i,
+                            "phase": "failed",
+                            "title": title,
+                        })
+                        continue
+                    payload = {
+                        "filepath": fp,
+                        "video_id": r.get("video_id") or "",
+                        "title": title,
+                        "channel": r.get("channel") or "",
+                    }
+                    res = self._manual_refresh_metadata_one(
+                        payload, push_refresh=False)
+                    if res.get("ok"):
+                        summary["refreshed"] += 1
+                        phase = "done"
+                    elif "video ID" in str(res.get("error") or ""):
+                        summary["skipped_no_id"] += 1
+                        phase = "skipping"
+                    else:
+                        summary["failed"] += 1
+                        phase = "failed"
+                    self._manual_emit_js("_manualRefreshAllProgress", {
+                        **summary,
+                        "current": i,
+                        "phase": phase,
+                        "title": title,
+                    })
+                    if i % 10 == 0 or i == len(rows):
+                        self._manual_emit_text(
+                            f" - Manual metadata [{i:,}/{len(rows):,}]: "
+                            f"{summary['refreshed']:,} refreshed, "
+                            f"{summary['skipped_no_id']:,} no ID, "
+                            f"{summary['failed']:,} failed.\n")
+                try:
+                    self._push_recent_refresh()
+                except Exception as e:
+                    swallow("manual metadata bulk refresh push", e)
+            except Exception as e:
+                summary = {"ok": False, "error": str(e)}
+            finally:
+                self._manual_emit_js("_manualRefreshAllDone", summary)
+
+        t = threading.Thread(target=_run, name="manual-metadata-all",
+                             daemon=True)
+        self._manual_refresh_all_thread = t
+        t.start()
+        return {"ok": True, "started": True}
+
+    def manual_transcribe_all(self, model=""):
+        existing = getattr(self, "_manual_transcribe_all_thread", None)
+        if existing is not None and existing.is_alive():
+            return {"ok": False, "error": "Manual transcription queueing is already running"}
+
+        apply_model = getattr(self, "_apply_runtime_whisper_model", None)
+        if callable(apply_model):
+            model_result = apply_model(model or "")
+            if not model_result.get("ok"):
+                return model_result
+
+        def _run():
+            summary = {
+                "ok": True,
+                "total": 0,
+                "queued": 0,
+                "skipped": 0,
+                "failed": 0,
+            }
+            try:
+                rows = self._manual_bulk_rows()
+                summary["total"] = len(rows)
+                self._manual_emit_text(
+                    f" - Manual transcribe: {len(rows):,} video(s) scanned.\n")
+                mgr_getter = getattr(self, "_transcribe_manager", None)
+                if not callable(mgr_getter):
+                    raise RuntimeError("Transcription manager is unavailable")
+                mgr = mgr_getter()
+                bulk_id = f"manual-{int(time.time())}"
+                candidates = [
+                    r for r in rows
+                    if (r.get("tx_status") or "").lower()
+                    not in {"transcribed", "done", "no_speech"}
+                ]
+                total = len(candidates)
+                summary["skipped"] = len(rows) - total
+                summary["candidate_total"] = total
+                self._manual_emit_js("_manualTranscribeAllProgress", {
+                    **summary,
+                    "current": 0,
+                    "phase": "scanned",
+                })
+                for i, r in enumerate(candidates, 1):
+                    fp = r.get("filepath") or ""
+                    title = r.get("title") or os.path.basename(fp)
+                    self._manual_emit_js("_manualTranscribeAllProgress", {
+                        **summary,
+                        "current": i,
+                        "phase": "queueing",
+                        "title": title,
+                    })
+                    if not fp or not os.path.isfile(fp):
+                        summary["failed"] += 1
+                        self._manual_emit_js("_manualTranscribeAllProgress", {
+                            **summary,
+                            "current": i,
+                            "phase": "failed",
+                            "title": title,
+                        })
+                        continue
+                    try:
+                        ok = mgr.enqueue(
+                            fp,
+                            title,
+                            channel=r.get("channel") or "",
+                            video_id=r.get("video_id") or "",
+                            bulk_id=bulk_id,
+                            bulk_total=total,
+                            bulk_index=i,
+                        )
+                    except Exception:
+                        ok = False
+                    if ok:
+                        summary["queued"] += 1
+                    else:
+                        summary["failed"] += 1
+                    self._manual_emit_js("_manualTranscribeAllProgress", {
+                        **summary,
+                        "current": i,
+                        "phase": "queued" if ok else "failed",
+                        "title": title,
+                    })
+                    if i % 10 == 0 or i == total:
+                        self._manual_emit_text(
+                            f" - Manual transcribe queue [{i:,}/{total:,}]: "
+                            f"{summary['queued']:,} queued, "
+                            f"{summary['failed']:,} failed.\n")
+                try:
+                    self._on_queue_changed()
+                except Exception as e:
+                    _log.debug("manual transcribe queue refresh failed: %s", e)
+            except Exception as e:
+                summary = {"ok": False, "error": str(e)}
+            finally:
+                self._manual_emit_js("_manualTranscribeAllQueued", summary)
+
+        t = threading.Thread(target=_run, name="manual-transcribe-all",
+                             daemon=True)
+        self._manual_transcribe_all_thread = t
+        t.start()
+        return {"ok": True, "started": True}
+
+
+    def manual_backfill_ids(self, dry_run=False, limit=None):
+        """Start recovering video IDs for no-ID manual downloads, in the
+        background. Searches YouTube by each file's embedded/fallback title and
+        matches on duration; writes confident matches, queues ambiguous ones
+        for review. Streams progress to the activity log; returns immediately.
+        """
+        import threading as _thr
+        existing = getattr(self, "_manual_backfill_thread", None)
+        if existing is not None and existing.is_alive():
+            return {"ok": False, "error": "Recover IDs is already running"}
+        self._manual_backfill_cancel = _thr.Event()
+        stream = self._browse_log_stream()
+        cancel = self._manual_backfill_cancel
+        _lim = None
+        try:
+            _lim = int(limit) if limit else None
+        except (TypeError, ValueError):
+            _lim = None
+
+        def _run():
+            summary = {"ok": False}
+            try:
+                from backend.metadata import manual_backfill as _mb
+                summary = _mb.backfill_manual_video_ids(
+                    stream, cancel_event=cancel,
+                    dry_run=bool(dry_run), limit=_lim)
+            except Exception as _e:
+                summary = {"ok": False, "error": str(_e)}
+                try: stream.emit_error(f"Recover IDs failed: {_e}")
+                except Exception as _ee: swallow("recover-ids err emit", _ee)
+            finally:
+                # Refresh the Manual grid so freshly-resolved rows pick up
+                # their new id (and thus the "Refresh metadata" action).
+                try: self._push_recent_refresh()
+                except Exception as _pe: swallow("recover-ids refresh", _pe)
+                # Reset the start/stop button in the UI.
+                try:
+                    if getattr(self, "_window", None) is not None:
+                        import json as _json
+                        _summary = _json.dumps(summary)
+                        self._window.evaluate_js(
+                            "window._manualBackfillDone && "
+                            f"window._manualBackfillDone({_summary});")
+                except Exception as _we: swallow("recover-ids done reset", _we)
+
+        t = _thr.Thread(target=_run, name="manual-id-backfill", daemon=True)
+        self._manual_backfill_thread = t
+        t.start()
+        return {"ok": True, "started": True, "dry_run": bool(dry_run)}
+
+    def manual_backfill_ids_cancel(self):
+        """Request the in-progress Recover IDs run to stop."""
+        ev = getattr(self, "_manual_backfill_cancel", None)
+        if ev is not None:
+            ev.set()
+        return {"ok": True}
+
+    def manual_backfill_review_list(self):
+        """Ambiguous matches saved for review by the last Recover IDs run.
+        Each: {filepath, title, duration, candidates:[{id,title,duration,
+        channel,title_sim,dur_delta}]}."""
+        try:
+            from backend.metadata.manual_backfill import REVIEW_FILE
+            if not REVIEW_FILE.exists():
+                return {"ok": True, "items": []}
+            import json as _json
+            items = []
+            for ln in REVIEW_FILE.read_text(
+                    encoding="utf-8", errors="replace").splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    items.append(_json.loads(ln))
+                except Exception:
+                    pass
+            return {"ok": True, "items": items}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def _manual_review_remove(self, filepath):
+        """Rewrite the review file without `filepath` (resolved or skipped)."""
+        try:
+            from backend.metadata.manual_backfill import REVIEW_FILE
+            if not REVIEW_FILE.exists():
+                return
+            import json as _json
+            key = os.path.normcase(os.path.normpath(filepath or ""))
+            kept = []
+            for ln in REVIEW_FILE.read_text(
+                    encoding="utf-8", errors="replace").splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    obj = _json.loads(ln)
+                    if os.path.normcase(os.path.normpath(
+                            obj.get("filepath") or "")) == key:
+                        continue
+                except Exception:
+                    pass
+                kept.append(ln)
+            REVIEW_FILE.write_text(
+                ("\n".join(kept) + "\n") if kept else "", encoding="utf-8")
+        except Exception as e:
+            swallow("review remove", e)
+
+    def manual_backfill_apply_pick(self, filepath, video_id, channel="", title=""):
+        """User picked a candidate for an ambiguous manual download: register
+        it with that id, queue its metadata refresh, and drop it from the
+        review list. The slow network metadata fetch runs in the background so
+        the picker can advance immediately."""
+        try:
+            if not filepath or not video_id:
+                return {"ok": False, "error": "missing filepath or video_id"}
+            if not os.path.isfile(filepath):
+                return {"ok": False, "error": "file not found"}
+            from backend import index as _idx
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            wrote = _idx.set_manual_video_id(
+                filepath, video_id, url, channel=channel or "")
+            if not wrote:
+                _idx.register_video(
+                    filepath, channel or "Single Videos",
+                    title or os.path.splitext(os.path.basename(filepath))[0],
+                    video_id=video_id)
+            self._manual_review_remove(filepath)
+            try: self._push_recent_refresh()
+            except Exception as e: swallow("review-pick refresh", e)
+
+            def _fetch_after_pick():
+                try:
+                    from backend.metadata import fetch_single_video_metadata
+                    fetch_single_video_metadata(
+                        {"name": channel or "Single Videos",
+                         "split_years": False, "split_months": False},
+                        video_id, filepath, title or "", self._browse_log_stream(),
+                        emit_inline_log=False, refresh=True,
+                        dest_folder=os.path.dirname(filepath))
+                    try:
+                        from backend import utils as _u
+                        _u.hide_stray_sidecars(
+                            os.path.dirname(filepath), recursive=False)
+                    except Exception as e:
+                        swallow("review-pick hide sidecars", e)
+                except Exception as e:
+                    swallow("review-pick metadata fetch", e)
+                finally:
+                    try: self._push_recent_refresh()
+                    except Exception as e: swallow("review-pick metadata push", e)
+
+            try:
+                threading.Thread(
+                    target=_fetch_after_pick,
+                    name="manual-review-metadata",
+                    daemon=True,
+                ).start()
+            except Exception as e:
+                swallow("review-pick metadata thread", e)
+            return {"ok": True, "metadata_started": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def manual_backfill_review_skip(self, filepath):
+        """Drop an item from the review list without resolving it."""
+        try:
+            self._manual_review_remove(filepath)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
     def browse_search(self, query, channel=None, limit=200, sort="relevance",
                       year_from=None, year_to=None):
         """FTS5 search across transcript segments.
@@ -890,18 +1688,75 @@ class BrowseMixin:
         {".mp4", ".webm", ".mkv", ".avi", ".mov", ".m4v"}
     )
 
-    def list_manual_videos(self, sort="newest", limit=60, offset=0):
-        """List video files in cfg['video_out_dir'] for the Manual Downloads view.
+    def _iter_manual_folder_videos(self, folder: str):
+        """Yield video files directly in video_out_dir.
 
-        Returns paginated rows with filepath, title (from filename), size_bytes,
-        and mtime. Does NOT consult the index — walks the folder directly.
+        The configured manual folder is also the parent of `Whole Channels`
+        in this archive layout. Recursing it pulls channel-sync libraries and
+        user collection subfolders into Manual, so the disk fallback stays
+        root-only. Custom Save-to downloads outside this root still appear via
+        the index path above.
+        """
+        with os.scandir(folder) as it:
+            for entry in it:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                ext = os.path.splitext(entry.name)[1].lower()
+                if ext not in self._MANUAL_VIDEO_EXTS:
+                    continue
+                yield entry.path
+
+    def _manual_has_local_transcript(self, row: dict[str, Any]) -> bool:
+        fp = row.get("filepath") or ""
+        if not fp:
+            return False
+        title = row.get("title") or os.path.splitext(os.path.basename(fp))[0]
+        channel = row.get("channel") or ""
+        candidates: list[str] = []
+        try:
+            from backend.transcribe.helpers import _resolve_transcript_paths
+            paths = _resolve_transcript_paths(fp, title, channel)
+            if paths:
+                candidates.extend([paths[0], paths[1]])
+        except Exception as e:
+            _log.debug("manual transcript path resolve failed: %s", e)
+
+        base, _ext = os.path.splitext(fp)
+        folder = os.path.dirname(fp)
+        stem = os.path.splitext(os.path.basename(fp))[0]
+        clean_stem = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", stem) or stem
+        for name in dict.fromkeys([stem, clean_stem]):
+            candidates.extend([
+                os.path.join(folder, f"{name} Transcript.txt"),
+                os.path.join(folder, f".{name} Transcript.jsonl"),
+            ])
+        candidates.extend([base + ".jsonl", base + ".txt"])
+
+        for path in dict.fromkeys(candidates):
+            if not path:
+                continue
+            try:
+                if os.path.isfile(path) and os.path.getsize(path) > 0:
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def list_manual_videos(self, sort="newest", limit=60, offset=0):
+        """List single/manual downloads for the Manual Downloads view.
+
+        Single downloads can be saved anywhere — the dedicated video_out_dir
+        OR a custom 'Save to' folder — so we list them from the INDEX (every
+        download is registered there) rather than just one folder. Two sources,
+        merged + de-duplicated by path:
+          1. The index — every single download, any location (rich rows:
+             channel, video_id, thumbnail, upload date).
+          2. A direct walk of video_out_dir — a safety net for any video file
+             dropped there that isn't in the index yet.
+        Returns paginated rows + the video_out_dir label.
         """
         cfg = self._browse_config()
         folder = (cfg.get("video_out_dir") or cfg.get("output_dir") or "").strip()
-        if not folder:
-            return {"rows": [], "has_more": False, "folder": ""}
-        if not os.path.isdir(folder):
-            return {"rows": [], "has_more": False, "folder": folder}
         try:
             lim = max(1, min(500, int(limit)))
         except (TypeError, ValueError):
@@ -912,43 +1767,169 @@ class BrowseMixin:
             off = 0
 
         rows: list[dict] = []
-        try:
-            for entry in os.scandir(folder):
-                if not entry.is_file(follow_symlinks=False):
-                    continue
-                ext = os.path.splitext(entry.name)[1].lower()
-                if ext not in self._MANUAL_VIDEO_EXTS:
-                    continue
-                try:
-                    st = entry.stat()
-                except OSError:
-                    continue
-                rows.append({
-                    "filepath": entry.path,
-                    "title": os.path.splitext(entry.name)[0],
-                    "size_bytes": st.st_size,
-                    "mtime": st.st_mtime,
-                    "channel": "",
-                    "video_id": "",
-                    "thumbnail_url": "",
-                })
-        except OSError as e:
-            _log.debug("list_manual_videos scandir failed: %s", e)
-            return {"rows": [], "has_more": False, "folder": folder,
-                    "error": str(e)}
+        seen: set[str] = set()
+        duplicate_index_paths: set[str] = set()
 
+        # 1. Index-registered single downloads (any location on disk).
+        #    include_thumbs=False is CRITICAL: the per-row channel-wide
+        #    thumbnail walk resolves a loose file's "channel root" to a huge
+        #    folder on pooled storage and hung the view for minutes. We do a
+        #    cheap per-page thumbnail lookup after pagination instead.
+        try:
+            from backend import index as _idx
+            try:
+                duplicate_index_paths = {
+                    os.path.normcase(os.path.normpath(p))
+                    for p in _idx.list_manual_duplicate_filepaths()
+                    if p
+                }
+            except Exception:
+                duplicate_index_paths = set()
+            for r in _idx.list_manual_videos(include_thumbs=False):
+                fp = r.get("filepath") or ""
+                if not fp:
+                    continue
+                if _is_system_temp_path(fp) or not os.path.isfile(fp):
+                    continue
+                key = os.path.normcase(os.path.normpath(fp))
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(r)
+        except Exception as e:
+            _log.debug("list_manual_videos index query failed: %s", e)
+
+        # 2. Folder-walk video_out_dir for any not-yet-indexed files.
+        #    Root-only by design; subfolders under this parent include channel
+        #    sync archives and separate user collections.
+        if folder and os.path.isdir(folder):
+            try:
+                for fp in self._iter_manual_folder_videos(folder):
+                    key = os.path.normcase(os.path.normpath(fp))
+                    if key in seen or key in duplicate_index_paths:
+                        continue
+                    try:
+                        st = os.stat(fp)
+                    except OSError:
+                        continue
+                    seen.add(key)
+                    rows.append({
+                        "filepath": fp,
+                        "title": os.path.splitext(os.path.basename(fp))[0],
+                        "size_bytes": st.st_size,
+                        "mtime": st.st_mtime,
+                        "channel": "", "video_id": "", "thumbnail_url": "",
+                        "upload_ts": None, "added_ts": None,
+                        "show_channel": True,
+                    })
+            except OSError as e:
+                _log.debug("list_manual_videos scandir failed: %s", e)
+
+        # Sort (newest/oldest by YT upload date → added → file mtime, all secs).
+        def _tkey(r):
+            return (r.get("upload_ts") or r.get("added_ts")
+                    or r.get("mtime") or 0)
         sort = str(sort or "newest")
         if sort == "newest":
-            rows.sort(key=lambda r: r["mtime"], reverse=True)
+            rows.sort(key=_tkey, reverse=True)
         elif sort == "oldest":
-            rows.sort(key=lambda r: r["mtime"])
+            rows.sort(key=_tkey)
         elif sort == "largest":
-            rows.sort(key=lambda r: r["size_bytes"], reverse=True)
+            rows.sort(key=lambda r: r.get("size_bytes") or 0, reverse=True)
         elif sort == "title":
-            rows.sort(key=lambda r: r["title"].lower())
+            rows.sort(key=lambda r: (r.get("title") or "").lower())
 
         page = rows[off: off + lim + 1]
         has_more = len(page) > lim
         page = page[:lim]
+
+        duration_attempts = 0
+        duration_cap = 8
+        background_duration_rows = []
+        for r in page:
+            if r.get("duration"):
+                continue
+            fp = r.get("filepath") or ""
+            if not fp:
+                continue
+            if duration_attempts < duration_cap:
+                duration_attempts += 1
+                if self._apply_manual_duration(r):
+                    continue
+            background_duration_rows.append(r)
+        self._queue_manual_duration_backfill(background_duration_rows)
+
+        # Thumbnails: ONLY for this page, and ONLY via the cheap up-walk
+        # (find_thumbnail) — NEVER the channel-wide tree walk. A co-located
+        # sidecar (the common case) is a few stats; a miss just falls back to
+        # the gradient placeholder.
+        try:
+            from backend import index as _idx2
+            from backend.thumbnails import (
+                _ensure_thumbnails_dir,
+                _generate_local_thumbnail,
+            )
+            local_attempts = 0
+            generate_cap = 4
+            background_thumb_rows = []
+            for r in page:
+                if r.get("thumbnail_url"):
+                    continue
+                fp = r.get("filepath") or ""
+                if not fp:
+                    continue
+                try:
+                    tp = _idx2.find_thumbnail(fp, r.get("video_id") or "")
+                    if tp:
+                        r["thumbnail_url"] = _idx2._file_url(tp)
+                        if not r.get("video_id"):
+                            stem = os.path.splitext(os.path.basename(fp))[0]
+                            if os.path.basename(tp).lower() == (
+                                    stem + ".local.jpg").lower():
+                                r["thumbnail_source"] = "local"
+                        continue
+                    if local_attempts < generate_cap:
+                        local_attempts += 1
+                        thumb_dir = _ensure_thumbnails_dir(os.path.dirname(fp))
+                        tp = _generate_local_thumbnail(
+                            fp, thumb_dir, r.get("title") or "",
+                            r.get("video_id") or "",
+                            stream=self._browse_log_stream())
+                        if tp:
+                            r["thumbnail_url"] = _idx2._file_url(tp)
+                            r["thumbnail_source"] = "local"
+                            continue
+                    background_thumb_rows.append(r)
+                except Exception:
+                    pass
+            self._queue_manual_local_thumbnail_backfill(background_thumb_rows)
+        except Exception as e:
+            _log.debug("manual page thumbnail lookup failed: %s", e)
+
+        for r in page:
+            if (r.get("tx_status") or "").lower() not in (
+                    "transcribed", "done", "no_speech"):
+                if self._manual_has_local_transcript(r):
+                    r["tx_status"] = "transcribed"
+            badges = []
+            if not r.get("video_id"):
+                if r.get("id_backfill_excluded_ts"):
+                    badges.append({"label": "ID excluded", "kind": "bad"})
+                else:
+                    badges.append({"label": "No ID", "kind": "warn"})
+            elif r.get("id_backfill_tried_ts"):
+                badges.append({"label": "Recovered ID", "kind": "ok"})
+            if r.get("thumbnail_source") == "local":
+                badges.append({"label": "Local thumb", "kind": "neutral"})
+            if r.get("video_id") and not (
+                    r.get("views") or r.get("view_count") is not None):
+                badges.append({"label": "Metadata missing", "kind": "warn"})
+            if r.get("tx_status") in ("transcribed", "done"):
+                badges.append({"label": "Transcript", "kind": "ok"})
+            elif r.get("tx_status") in ("failed", "error"):
+                badges.append({"label": "Transcript failed", "kind": "bad"})
+            if badges:
+                r["manual_badges"] = badges
+
         return {"rows": page, "has_more": has_more, "folder": folder,
                 "total": len(rows)}

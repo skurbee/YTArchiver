@@ -1184,6 +1184,9 @@ def main():
             _g_out = _cfg_boot.get("output_dir") or ""
             if _g_out:
                 _roots.append(_g_out)
+            _v_out = _cfg_boot.get("video_out_dir") or ""
+            if _v_out:
+                _roots.append(_v_out)
             for _ch in (_cfg_boot.get("channels") or []):
                 _co = _ch.get("output_dir") or ""
                 if _co:

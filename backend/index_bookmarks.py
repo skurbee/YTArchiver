@@ -22,6 +22,11 @@ _BOOKMARK_TEXT_MAX = 20000
 _BOOKMARK_NOTE_MAX = 4000
 _BOOKMARK_SHORT_TEXT_MAX = 1000
 _BOOKMARK_LIMIT_MAX = 5000
+_VIDEO_SELECT = (
+    "SELECT title, channel, filepath, video_id, size_bytes, year, month, "
+    "tx_status, added_ts, upload_ts, view_count, like_count, "
+    "removed_from_yt_ts, duration_s FROM videos"
+)
 
 
 def _bounded_text(value: Any, max_len: int) -> str:
@@ -32,7 +37,9 @@ def _coerce_start_time(value: Any) -> float:
     try:
         import math
         out = float(value or 0)
-        return out if math.isfinite(out) and out >= 0 else 0.0
+        if not math.isfinite(out):
+            return 0.0
+        return -1.0 if out < 0 else out
     except (TypeError, ValueError):
         return 0.0
 
@@ -51,6 +58,58 @@ def _coerce_limit(value: Any) -> int:
     except (TypeError, ValueError):
         out = 500
     return max(1, min(out, _BOOKMARK_LIMIT_MAX))
+
+
+def _enrich_video_fields(conn, item: dict[str, Any]) -> None:
+    row = None
+    video_id = (item.get("video_id") or "").strip()
+    title = (item.get("title") or "").strip()
+    channel = (item.get("channel") or "").strip()
+    if video_id:
+        row = conn.execute(
+            _VIDEO_SELECT
+            + " WHERE video_id=? ORDER BY COALESCE(added_ts, upload_ts, 0) DESC LIMIT 1",
+            (video_id,),
+        ).fetchone()
+    if row is None and title and channel:
+        row = conn.execute(
+            _VIDEO_SELECT
+            + " WHERE title=? AND channel=? "
+              "ORDER BY COALESCE(added_ts, upload_ts, 0) DESC LIMIT 1",
+            (title, channel),
+        ).fetchone()
+    if row is None and title:
+        row = conn.execute(
+            _VIDEO_SELECT
+            + " WHERE title=? ORDER BY COALESCE(added_ts, upload_ts, 0) DESC LIMIT 1",
+            (title,),
+        ).fetchone()
+    if row is None:
+        return
+    try:
+        video = _idx._build_browse_video_row(row, include_thumbs=False)
+    except Exception:
+        return
+    if not item.get("title"):
+        item["title"] = video.get("title") or ""
+    if not item.get("channel"):
+        item["channel"] = video.get("channel") or ""
+    if not item.get("video_id"):
+        item["video_id"] = video.get("video_id") or ""
+    for key in (
+        "filepath", "size_bytes", "duration", "uploaded", "upload_ts",
+        "views", "view_count", "tx_status", "removed_from_yt",
+    ):
+        if video.get(key) not in (None, ""):
+            item[key] = video.get(key)
+    fp = item.get("filepath") or ""
+    if fp:
+        try:
+            tp = _idx.find_thumbnail(fp, item.get("video_id") or "")
+            if tp:
+                item["thumbnail_url"] = _idx._file_url(tp)
+        except Exception:
+            pass
 
 
 def bookmark_add(video_id: str, title: str, channel: str,
@@ -96,10 +155,13 @@ def bookmark_list(limit: int = 500) -> list[dict[str, Any]]:
             "FROM bookmarks ORDER BY created DESC LIMIT ?",
             (limit,),
         )
-        return [{
+        rows = [{
             "id": r[0], "video_id": r[1], "title": r[2], "channel": r[3],
             "start_time": r[4], "text": r[5], "note": r[6], "created": r[7],
         } for r in cur.fetchall()]
+        for item in rows:
+            _enrich_video_fields(conn, item)
+        return rows
 
 
 def bookmark_remove(bm_id: int) -> bool:

@@ -26,6 +26,35 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
+  function _fmtBytes(bytes) {
+    const n = Number(bytes || 0);
+    if (!Number.isFinite(n) || n <= 0) return "";
+    if (n >= 1073741824) return (n / 1073741824).toFixed(1) + " GB";
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+    if (n >= 1024) return (n / 1024).toFixed(0) + " KB";
+    return `${n} B`;
+  }
+
+  function _fmtDate(value) {
+    const s = String(value || "").trim();
+    if (!s) return "";
+    const d = new Date(s);
+    if (Number.isNaN(d.getTime())) return s;
+    return d.toLocaleDateString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+    });
+  }
+
+  function _gradientFor(name) {
+    const s = String(name || "").trim();
+    const first = (s[0] || "?").toUpperCase();
+    const hue = (first.charCodeAt(0) * 47) % 360;
+    const hue2 = (hue + 40) % 360;
+    return `linear-gradient(135deg, hsl(${hue}, 55%, 28%) 0%, hsl(${hue2}, 60%, 18%) 100%)`;
+  }
+
   // ─── Browse > Bookmarks sub-mode ─────────────────────────────────────
   async function refreshBookmarks() {
     const list = document.getElementById("bookmarks-list");
@@ -165,6 +194,179 @@
     } catch (e) { console.warn("bookmarks:", e); }
   }
 
+  async function refreshBookmarksGrid() {
+    const list = document.getElementById("bookmarks-list");
+    if (!list || !nativeBridgeUp()) return;
+    try {
+      const res = await bridgeCall("bookmark_list");
+      const rows = Array.isArray(res) ? res : (res?.rows || []);
+      if (!rows || rows.length === 0) {
+        list.innerHTML = '<div class="browse-empty">No bookmarks yet. Right-click a transcript segment in Watch view to add one.</div>';
+        return;
+      }
+      const frag = document.createDocumentFragment();
+      for (const b of rows) {
+        const card = document.createElement("div");
+        card.className = "bookmark-card";
+        card.setAttribute("role", "button");
+        card.tabIndex = 0;
+        card.dataset.bookmarkId = String(b.id || "");
+
+        const startRaw = Number(b.start_time);
+        const isWholeVideo = (!Number.isFinite(startRaw) || startRaw < 0
+          || (startRaw === 0 && !String(b.text || "").trim()));
+        const start = isWholeVideo ? 0 : startRaw;
+        const title = b.title || "(untitled)";
+        const channel = b.channel || "";
+        card.setAttribute("aria-label", isWholeVideo
+          ? `Open bookmarked video ${title}`
+          : `Open bookmark ${title} at ${_formatTs(start)}`);
+
+        const thumb = document.createElement("div");
+        thumb.className = "bookmark-thumb";
+        thumb.style.background = _gradientFor(title);
+        if (b.thumbnail_url) {
+          const img = document.createElement("img");
+          img.className = "bookmark-thumb-img";
+          img.src = b.thumbnail_url;
+          img.alt = "";
+          img.loading = "lazy";
+          img.decoding = "async";
+          img.addEventListener("error", () => img.remove(), { once: true });
+          thumb.appendChild(img);
+        } else {
+          const play = document.createElement("span");
+          play.className = "bookmark-play";
+          play.innerHTML = "&#9654;";
+          thumb.appendChild(play);
+        }
+
+        const kind = document.createElement("span");
+        kind.className = "bookmark-kind " + (isWholeVideo ? "bookmark-kind-video" : "bookmark-kind-time");
+        kind.textContent = isWholeVideo ? "Video" : `At ${_formatTs(start)}`;
+        thumb.appendChild(kind);
+
+        const duration = document.createElement("span");
+        duration.className = "bookmark-duration";
+        duration.textContent = isWholeVideo ? (b.duration || "") : _formatTs(start);
+        if (duration.textContent) thumb.appendChild(duration);
+
+        const removeBtn = document.createElement("button");
+        removeBtn.className = "bookmark-remove";
+        removeBtn.dataset.remove = String(b.id || "");
+        removeBtn.title = "Delete bookmark";
+        removeBtn.textContent = "\u00d7";
+        thumb.appendChild(removeBtn);
+
+        const body = document.createElement("div");
+        body.className = "bookmark-card-body";
+        const titleEl = document.createElement("div");
+        titleEl.className = "bookmark-card-title";
+        titleEl.textContent = title;
+        body.appendChild(titleEl);
+
+        const channelEl = document.createElement("div");
+        channelEl.className = "bookmark-card-channel";
+        channelEl.textContent = channel;
+        body.appendChild(channelEl);
+
+        const meta = document.createElement("div");
+        meta.className = "bookmark-card-meta";
+        const metaParts = [];
+        if (b.uploaded) metaParts.push(_fmtDate(b.uploaded));
+        if (b.size_bytes) metaParts.push(_fmtBytes(b.size_bytes));
+        if (b.views) metaParts.push(`${b.views} views`);
+        meta.textContent = metaParts.join(" \u00b7 ");
+        body.appendChild(meta);
+
+        if (!isWholeVideo && b.text) {
+          const snippet = document.createElement("div");
+          snippet.className = "bookmark-card-snippet";
+          snippet.textContent = b.text;
+          body.appendChild(snippet);
+        }
+        if (b.note) {
+          const note = document.createElement("div");
+          note.className = "bookmark-card-note";
+          note.textContent = b.note;
+          body.appendChild(note);
+        }
+
+        card.appendChild(thumb);
+        card.appendChild(body);
+
+        removeBtn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          const label = (b.text && b.text.trim()) ? b.text : title;
+          const ok = await askDanger(
+            "Delete bookmark",
+            `Remove this bookmark?\n\n"${label.slice(0, 100)}"`,
+            "Delete");
+          if (!ok) return;
+          try {
+            const removed = await bridgeCall("bookmark_remove", b.id);
+            if (removed && removed.ok === false) {
+              window._showToast?.(
+                removed.error || "Couldn't delete (already gone?).", "warn");
+              return;
+            }
+            window._showToast?.("Bookmark removed.", "ok");
+          } catch (err) {
+            window._showToast?.(`Delete failed: ${err}`, "error");
+            return;
+          }
+          refreshBookmarksGrid();
+        });
+
+        const jump = async () => {
+          const openObj = {
+            filepath: b.filepath || "",
+            title,
+            channel,
+            video_id: b.video_id || "",
+            duration: b.duration || "",
+            thumbnail_url: b.thumbnail_url || "",
+            _seek_to: start,
+          };
+          try {
+            if (openObj.filepath && typeof window._openVideoInWatch === "function") {
+              window._openVideoInWatch(openObj);
+              return;
+            }
+            const r = await bridgeCall("recent_resolve", title, channel);
+            if (r?.ok && r.filepath && typeof window._openVideoInWatch === "function") {
+              window._openVideoInWatch({
+                filepath: r.filepath,
+                title,
+                channel,
+                video_id: openObj.video_id || r.video_id || "",
+                _seek_to: start,
+              });
+              return;
+            }
+            window._showToast?.("Couldn't find the source video for this bookmark.", "warn");
+          } catch (err) {
+            window._showToast?.("Jump failed: " + err, "error");
+          }
+        };
+        card.addEventListener("click", (e) => {
+          if (e.target.closest("[data-remove]")) return;
+          jump();
+        });
+        card.addEventListener("keydown", (e) => {
+          if (e.key !== "Enter" && e.key !== " ") return;
+          e.preventDefault();
+          jump();
+        });
+        frag.appendChild(card);
+      }
+      list.innerHTML = "";
+      list.appendChild(frag);
+    } catch (e) {
+      console.warn("bookmarks:", e);
+    }
+  }
+
   // Called from seedLogs once channel data arrives.
   // `channels` comes from get_subs_channels (no avatar/banner URLs). To get
   // the real channel-art paths for the grid we hit browse_list_channels
@@ -275,7 +477,7 @@
     return pick;
   }
 
-  window.refreshBookmarks = refreshBookmarks;
+  window.refreshBookmarks = refreshBookmarksGrid;
   window._primeBrowse = _primeBrowse;
   window._refreshBrowseWeekSummary = _refreshBrowseWeekSummary;
   window._askRedownload = _askRedownload;

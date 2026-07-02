@@ -25,6 +25,27 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
+  const CHANNEL_VIDEO_PAGE_SIZE = 120;
+  const _channelPage = {
+    active: false,
+    channel: "",
+    sort: "newest",
+    query: "",
+    offset: 0,
+    hasMore: false,
+    loading: false,
+  };
+
+  function _channelGroupingEnabled() {
+    return !!document.getElementById("browse-group-year")?.checked ||
+           !!document.getElementById("browse-group-month")?.checked;
+  }
+
+  function _currentVideoFilter() {
+    if (_browseState.view !== "videos") return "";
+    return (document.getElementById("browse-filter")?.value || "").trim();
+  }
+
   // ─── Manual-queue Whisper model picker ───────────────────────
   // Mirrors YTArchiver.py:22030 `_ask_whisper_model_dialog`. Shows a 4-option
   // modal (tiny/small/medium/large-v3) with a 60-second countdown that
@@ -310,6 +331,7 @@
 
     // Clear the previous channel's grid + update the breadcrumb title
     // IMMEDIATELY so switching channels never shows stale content.
+    _channelPage.active = false;
     _browseState.videos = [];
     const grid = document.getElementById("video-grid");
     if (grid) {
@@ -325,43 +347,16 @@
 
     // Native mode → real DB
     if (nativeBridgeUp()) {
+      if (!_channelGroupingEnabled()) {
+        const ok = await _loadChannelPage(channel, true, myLoadSeq);
+        if (ok) return;
+      }
+      _channelPage.active = false;
       try {
         const rows = await bridgeCall("browse_list_videos", name, sort, 50000);
         if (myLoadSeq !== loadVideosFor._seq) return; // stale, user clicked another channel
-        if (Array.isArray(rows) && rows.length > 0) {
-          _browseState.videos = rows.map(r => {
-            // Prefer the YouTube upload time (file mtime — yt-dlp --mtime)
-            // over the DB-insertion time. Falls back to added_ts when the
-            // file is missing (e.g. moved offline).
-            const epoch = r.upload_ts || r.added_ts || 0;
-            return {
-              title: r.title || "",
-              channel: r.channel || name,
-              filepath: r.filepath || "",
-              video_id: r.video_id || "",
-              uploaded: _formatAddedTs(epoch),
-              duration: "",
-              // Preserve the backend's view_count + formatted `views`
-              // display string. Pre-fix these were hardcoded to 0 / ""
-              // which silently broke the "Most Viewed" sort: the client
-              // `sortCurrentVideos` uses `view_count - view_count = 0`
-              // as the comparator → stable sort → no reorder → the grid
-              // stayed in whatever order the backend returned. Backend
-              // DOES sort by view_count when sort === "most_viewed", but
-              // the client-side re-sort on dropdown change clobbered it
-              // back to whatever was there first (usually newest).
-              views: r.views || "",
-              upload_ts: epoch * 1000,
-              view_count: r.view_count || 0,
-              like_count: r.like_count || 0,
-              size_bytes: r.size_bytes || 0,
-              tx_status: r.tx_status || "pending",
-              year: r.year, month: r.month,
-              // Thumbnail sidecar (file:// URL from .Thumbnails/ or next-to-video)
-              thumbnail: r.thumbnail || "",
-              thumbnail_url: r.thumbnail_url || "",
-            };
-          });
+        if (Array.isArray(rows)) {
+          _browseState.videos = rows.map(r => _mapVideoRow(r, name));
           sortCurrentVideos(sort);
           return;
         }
@@ -372,6 +367,132 @@
     _browseState.videos = [];
     window._showToast?.("Archive bridge unavailable. Videos will load once the app is ready.", "warn");
     sortCurrentVideos(sort);
+  }
+
+  async function _loadChannelPage(channel, reset, seq) {
+    const name = channel?.folder || channel?.name || "";
+    if (!name || !nativeBridgeUp()) return false;
+    if (!reset && (_channelPage.loading || !_channelPage.hasMore)) return true;
+
+    const sort = document.getElementById("browse-sort")?.value || "newest";
+    const query = _currentVideoFilter();
+    const offset = reset ? 0 : _channelPage.offset;
+    if (reset) {
+      _browseState.videos = [];
+      _channelPage.active = true;
+      _channelPage.channel = name;
+      _channelPage.sort = sort;
+      _channelPage.query = query;
+      _channelPage.offset = 0;
+      _channelPage.hasMore = true;
+    }
+    _channelPage.loading = true;
+    _renderChannelPageSentinel();
+    let stale = false;
+    try {
+      const res = await bridgeCall(
+        "browse_list_videos_page",
+        name, sort, CHANNEL_VIDEO_PAGE_SIZE, offset, query);
+      if (seq && seq !== loadVideosFor._seq) {
+        stale = true;
+        return true;
+      }
+      const rows = (res && res.rows) || [];
+      if (!Array.isArray(rows)) return false;
+
+      const mapped = rows.map(r => _mapVideoRow(r, name));
+      if (reset) {
+        _browseState.videos = mapped;
+      } else {
+        const seen = new Set((_browseState.videos || []).map(_videoKey));
+        for (const v of mapped) {
+          const key = _videoKey(v);
+          if (!seen.has(key)) {
+            seen.add(key);
+            _browseState.videos.push(v);
+          }
+        }
+      }
+      const nextOffset = Number(res?.next_offset);
+      _channelPage.active = true;
+      _channelPage.channel = name;
+      _channelPage.sort = sort;
+      _channelPage.query = query;
+      _channelPage.offset = Number.isFinite(nextOffset)
+        ? nextOffset : offset + mapped.length;
+      _channelPage.hasMore = !!res?.has_more;
+      _channelPage.loading = false;
+      sortCurrentVideos(sort);
+      return true;
+    } catch (e) {
+      console.warn("browse_list_videos_page failed:", e);
+      if (reset) _channelPage.active = false;
+      return false;
+    } finally {
+      if (!stale) {
+        _channelPage.loading = false;
+        _renderChannelPageSentinel();
+      }
+    }
+  }
+
+  function _videoKey(v) {
+    return v?.video_id || v?.filepath || v?.title || "";
+  }
+
+  function _renderChannelPageSentinel() {
+    const grid = document.getElementById("video-grid");
+    if (!grid) return;
+    grid.querySelector("#channel-video-page-sentinel")?.remove();
+    if (!_channelPage.active || _channelGroupingEnabled()) return;
+    if (!_channelPage.hasMore && (_browseState.videos || []).length) return;
+    if (!_channelPage.hasMore && !(_browseState.videos || []).length) {
+      const q = _channelPage.query || _currentVideoFilter();
+      grid.innerHTML = q
+        ? `<div class="browse-empty">No videos match "${escapeHtml(q)}".</div>`
+        : '<div class="browse-empty">No videos in this channel yet.</div>';
+      return;
+    }
+    const sentinel = document.createElement("div");
+    sentinel.id = "channel-video-page-sentinel";
+    sentinel.className = "video-grid-sentinel";
+    sentinel.textContent = _channelPage.loading
+      ? "Loading more videos..."
+      : "... more videos, scroll to load";
+    grid.appendChild(sentinel);
+  }
+
+  function _nearBottom(el) {
+    if (!el) return false;
+    return (el.scrollHeight - el.scrollTop - el.clientHeight) < 700;
+  }
+
+  let _channelScrollRaf = null;
+  function _onChannelScroll() {
+    if (_channelScrollRaf) return;
+    _channelScrollRaf = requestAnimationFrame(() => {
+      _channelScrollRaf = null;
+      if (_browseState.view !== "videos") return;
+      if (!_channelPage.active || !_channelPage.hasMore ||
+          _channelPage.loading || _channelGroupingEnabled()) {
+        return;
+      }
+      const cur = _browseState.currentChannel;
+      const shown = cur ? (cur.folder || cur.name || "") : "";
+      if (!shown || shown !== _channelPage.channel) return;
+      if (_nearBottom(document.getElementById("view-videos")) ||
+          _nearBottom(document.scrollingElement || document.documentElement)) {
+        _loadChannelPage(cur, false, loadVideosFor._seq);
+      }
+    });
+  }
+
+  function _wireChannelPagingScroll() {
+    if (_wireChannelPagingScroll._wired) return;
+    _wireChannelPagingScroll._wired = true;
+    document.getElementById("view-videos")
+      ?.addEventListener("scroll", _onChannelScroll, { passive: true });
+    window.addEventListener("scroll", _onChannelScroll, { passive: true });
   }
 
   function _formatAddedTs(ts) {
@@ -387,6 +508,44 @@
     // Abbreviation form is intentionally identical across counts
     // (matches "Nm/Nh/Nd/Nmo" style above). Was a dead ternary.
     return years + "y ago";
+  }
+
+  // Map one backend browse_list_videos row into the in-memory video shape
+  // used by _browseState.videos. Shared by loadVideosFor and the live
+  // download refresh (_refreshChannelVideosIfLoaded) so both stay identical.
+  function _mapVideoRow(r, name) {
+    // Prefer the YouTube upload time (file mtime — yt-dlp --mtime) over the
+    // DB-insertion time. Falls back to added_ts when the file is missing.
+    const epoch = r.upload_ts || r.added_ts || 0;
+    return {
+      title: r.title || "",
+      channel: r.channel || name,
+      filepath: r.filepath || "",
+      video_id: r.video_id || "",
+      uploaded: _formatAddedTs(epoch),
+      duration: r.duration || "",
+      // Keep the backend's view_count + formatted `views` string. If these
+      // are zeroed/blanked, the client-side "Most Viewed" sort silently
+      // no-ops (view_count - view_count === 0 → stable sort → no reorder).
+      views: r.views || "",
+      upload_ts: epoch * 1000,
+      view_count: r.view_count || 0,
+      like_count: r.like_count || 0,
+      size_bytes: r.size_bytes || 0,
+      tx_status: r.tx_status || "pending",
+      year: r.year, month: r.month,
+      // Thumbnail sidecar (file:// URL from .Thumbnails/ or next-to-video).
+      thumbnail: r.thumbnail || "",
+      thumbnail_url: r.thumbnail_url || "",
+    };
+  }
+
+  function _videoRowSig(v) {
+    return [
+      v.video_id || v.filepath || "",
+      v.thumbnail_url || "",
+      v.tx_status || "",
+    ].join("~");
   }
 
   function sortCurrentVideos(sortBy) {
@@ -405,11 +564,23 @@
     // A-then-B clicks landing B's video with A's transcript (audit:
     // browseContent.js C26). The inline duplicate of the load logic
     // had no token check, so two awaits could resolve out of order.
+    const paged = _channelPage.active && !_channelGroupingEnabled();
     window.renderVideoGrid(vids, async (v) => {
       if (typeof window._openVideoInWatch === "function") {
         window._openVideoInWatch(v);
       }
-    }, { groupByYear, groupByMonth });
+    }, { groupByYear, groupByMonth, disableClientLazy: paged });
+    if (!vids.length) {
+      const grid = document.getElementById("video-grid");
+      if (grid) {
+        const q = _channelPage.query || _currentVideoFilter();
+        grid.innerHTML = q
+          ? `<div class="browse-empty">No videos match "${escapeHtml(q)}".</div>`
+          : '<div class="browse-empty">No videos in this channel yet.</div>';
+      }
+      return;
+    }
+    if (paged) _renderChannelPageSentinel();
   }
 
   function _refreshVideoGridMetaBanner(vids) {
@@ -767,6 +938,64 @@
   window._askWhisperModel = _askWhisperModel;
   window._askTranscribeChannel = _askTranscribeChannel;
   window.loadVideosFor = loadVideosFor;
+  window._filterChannelVideosPaged = function () {
+    if (_browseState.view !== "videos" || !nativeBridgeUp()) return false;
+    if (_channelGroupingEnabled()) return false;
+    const cur = _browseState.currentChannel;
+    if (!cur) return false;
+    loadVideosFor(cur);
+    return true;
+  };
+
+  // Live refresh of the channel video grid when a download lands for the
+  // channel currently being viewed. Re-fetches that channel and re-renders
+  // ONLY if the set actually changed (no flash on a no-op). Runs whether or
+  // not the grid is the active view, so a download that arrives while the
+  // user is on another tab is already in place when they return to Browse.
+  let _chanRefreshBusy = false;
+  window._refreshChannelVideosIfLoaded = async function (channelName) {
+    const cur = _browseState.currentChannel;
+    if (!cur || !nativeBridgeUp()) return;
+    const shown = cur.folder || cur.name || "";
+    if (!shown) return;
+    if (channelName) {
+      // A specific channel's download — only relevant if we're showing it.
+      if (channelName !== shown) return;
+    } else if (_browseState.view !== "videos") {
+      // Unknown channel (the Browse-entry safety net): only refresh when the
+      // channel grid is the active view, so an unrelated background download
+      // doesn't trigger a full channel re-fetch.
+      return;
+    }
+    if (_chanRefreshBusy) return;
+    _chanRefreshBusy = true;
+    try {
+      const sort = document.getElementById("browse-sort")?.value || "newest";
+      if (_channelPage.active && !_channelGroupingEnabled()) {
+        await loadVideosFor(cur);
+        return;
+      }
+      const rows = await bridgeCall("browse_list_videos", shown, sort, 50000);
+      // Discard if the user switched channels (or left the videos view)
+      // during the fetch — don't clobber the newer view.
+      const curNow = _browseState.currentChannel;
+      const shownNow = curNow ? (curNow.folder || curNow.name || "") : "";
+      if (shownNow !== shown || !Array.isArray(rows)) return;
+      const newSig = rows.map(r => _videoRowSig(r)).join("|");
+      const oldSig = (_browseState.videos || [])
+        .map(v => _videoRowSig(v)).join("|");
+      if (newSig === oldSig) return;   // nothing new — leave the grid as-is
+      _browseState.videos = rows.map(r => _mapVideoRow(r, shown));
+      sortCurrentVideos(sort);
+    } catch (_e) { /* non-fatal — leave the current grid as-is */ }
+    finally { _chanRefreshBusy = false; }
+  };
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", _wireChannelPagingScroll,
+                              { once: true });
+  } else {
+    _wireChannelPagingScroll();
+  }
   window.sortCurrentVideos = sortCurrentVideos;
   window._formatTs = _formatTs;
   window.renderSearchResults = renderSearchResults;

@@ -1093,7 +1093,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             # card renders with an empty gradient placeholder forever.
             # Best-effort — hook is only set in app runtime.
             from .recent_track import fire_recent_changed_hook
-            fire_recent_changed_hook()
+            fire_recent_changed_hook(
+                _ch_snapshot.get("name") or _ch_snapshot.get("folder") or None)
 
         try:
             _fut = _meta_exec.submit(_task)

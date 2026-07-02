@@ -134,6 +134,16 @@ def _lookup_channel(channel_name: str) -> dict[str, Any] | None:
     return None
 
 
+def _per_video_transcript_paths(video_path: str, year: int, month: int,
+                                upload_date: str
+                                ) -> tuple[str, str, int, int, str]:
+    video_dir = os.path.dirname(os.path.abspath(video_path))
+    stem = os.path.splitext(os.path.basename(video_path))[0]
+    stem = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", stem) or stem
+    txt_path = os.path.join(video_dir, f"{stem} Transcript.txt")
+    return (txt_path, _get_jsonl_sidecar(txt_path), year, month, upload_date)
+
+
 def _resolve_transcript_paths(video_path: str, title: str,
                               channel_name: str,
                               combined_override: bool | None = None
@@ -191,6 +201,8 @@ def _resolve_transcript_paths(video_path: str, title: str,
         upload_date = ""
         now = datetime.now()
         year, month = now.year, now.month
+    if not ch and not (channel_name or "").strip():
+        return _per_video_transcript_paths(video_path, year, month, upload_date)
     # Loose / orphan video: not under a known channel folder (e.g. a
     # one-off single download sitting directly at the archive root, or a
     # video in a folder that isn't a subscription). The channel-folder
@@ -210,10 +222,7 @@ def _resolve_transcript_paths(video_path: str, title: str,
     except Exception:
         _under = True
     if not ch and not _under:
-        _stem = os.path.splitext(os.path.basename(video_path))[0]
-        _stem = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", _stem) or _stem
-        _txt = os.path.join(_video_dir, f"{_stem} Transcript.txt")
-        return (_txt, _get_jsonl_sidecar(_txt), year, month, upload_date)
+        return _per_video_transcript_paths(video_path, year, month, upload_date)
 
     # combined rule:
     # override True → always combined

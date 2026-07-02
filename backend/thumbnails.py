@@ -42,11 +42,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 from .log import get_logger
+from .subprocess_util import make_startupinfo, subprocess_creationflags
 from .utils import hide_file_win as _hide_file_win
 
 _log = get_logger(__name__)
@@ -61,6 +66,171 @@ def _ensure_thumbnails_dir(subfolder: str) -> str:
         return thumb_dir
     _hide_file_win(os.path.normpath(thumb_dir))
     return thumb_dir
+
+
+def _safe_thumb_stem(title: str) -> str:
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', title or "")
+    return safe.rstrip(". ")[:100] or "untitled"
+
+
+def _image_magic_ok(path: str) -> bool:
+    try:
+        if os.path.getsize(path) < 16:
+            return False
+        with open(path, "rb") as f:
+            head = f.read(12)
+        return (
+            head[:3] == b"\xFF\xD8\xFF"
+            or head[:4] == b"\x89PNG"
+            or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
+        )
+    except OSError:
+        return False
+
+
+def _find_ffmpeg() -> str | None:
+    p = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    if p:
+        return p
+    candidates: list[Path] = []
+    try:
+        candidates.append(Path(sys.executable).resolve().parent / "ffmpeg.exe")
+    except Exception:
+        pass
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        candidates.append(Path(meipass) / "ffmpeg.exe")
+    candidates.extend((
+        Path.cwd() / "ffmpeg.exe",
+        Path(__file__).resolve().parent.parent / "ffmpeg.exe",
+    ))
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return None
+
+
+def _extract_thumbnail_frame(ffmpeg: str, source: str, output: str,
+                             seek: str) -> bool:
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-ss", seek,
+        "-i", source,
+        "-frames:v", "1",
+        "-vf", "thumbnail,scale=640:-2",
+        output,
+    ]
+    subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=20,
+        startupinfo=make_startupinfo(),
+        creationflags=subprocess_creationflags(),
+    )
+    return _image_magic_ok(output)
+
+
+def _write_h264_color_repair_clip(ffmpeg: str, source: str,
+                                  output: str) -> bool:
+    """Copy a short H.264 clip while normalizing bad/unknown color metadata."""
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-t", "15",
+        "-i", source,
+        "-map", "0:v:0",
+        "-an",
+        "-c:v", "copy",
+        "-bsf:v",
+        "h264_metadata=colour_primaries=1:"
+        "transfer_characteristics=1:matrix_coefficients=1",
+        output,
+    ]
+    subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=25,
+        startupinfo=make_startupinfo(),
+        creationflags=subprocess_creationflags(),
+    )
+    try:
+        return os.path.getsize(output) > 0
+    except OSError:
+        return False
+
+
+def _generate_local_thumbnail(video_filepath: str, thumb_dir: str,
+                              title: str = "",
+                              video_id: str = "",
+                              stream=None) -> str | None:
+    """Create a hidden thumbnail sidecar from the local video file.
+
+    This is for imported/manual libraries when YouTube metadata has not been
+    recovered yet. The `.local` suffix makes these fallback images lose to
+    real YouTube thumbnails once metadata recovery downloads one.
+    """
+    if not video_filepath or not os.path.isfile(video_filepath):
+        return None
+    try:
+        os.makedirs(thumb_dir, exist_ok=True)
+    except OSError:
+        return None
+    _hide_file_win(os.path.normpath(thumb_dir))
+
+    stem = _safe_thumb_stem(Path(video_filepath).stem) + ".local"
+    target = os.path.join(thumb_dir, stem + ".jpg")
+    if _image_magic_ok(target):
+        return os.path.normpath(target)
+
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix="ytarchiver-thumb-") as td:
+            tmp_path = os.path.join(td, stem + ".tmp.jpg")
+            made = False
+            for seek in ("5", "1", "0"):
+                if _extract_thumbnail_frame(
+                        ffmpeg, video_filepath, tmp_path, seek):
+                    made = True
+                    break
+
+            if not made:
+                repair_clip = os.path.join(td, stem + ".h264-color.mp4")
+                if _write_h264_color_repair_clip(
+                        ffmpeg, video_filepath, repair_clip):
+                    for seek in ("5", "1", "0"):
+                        if _extract_thumbnail_frame(
+                                ffmpeg, repair_clip, tmp_path, seek):
+                            made = True
+                            break
+
+            if not made or not _image_magic_ok(tmp_path):
+                return None
+            shutil.copyfile(tmp_path, target)
+        try:
+            from .utils import hide_file_win
+            hide_file_win(target)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        return os.path.normpath(target)
+    except Exception as e:
+        if stream is not None:
+            try:
+                stream.emit([
+                    ["Local thumbnail unavailable: ", "dim"],
+                    [f"{e}\n", "dim"],
+                ])
+            except Exception as ee:
+                _log.debug("swallowed: %s", ee)
+        return None
 
 
 def _thumbnail_url_candidates(url: str, video_id: str) -> list[str]:
@@ -103,10 +273,7 @@ def _download_thumbnail(url: str, thumb_dir: str,
     # spaces so the resulting filename is valid on NTFS — bare
     # `[<>:"/\\|?*]` substitution missed those classes (audit:
     # thumbnails H84).
-    _src_title = title or ""
-    _safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', _src_title)
-    _safe = _safe.rstrip(". ")[:100] or "untitled"
-    safe_title = _safe
+    safe_title = _safe_thumb_stem(title or "")
     fname = f"{safe_title} [{video_id}].jpg"
     fpath = os.path.join(thumb_dir, fname)
     if os.path.isfile(fpath):

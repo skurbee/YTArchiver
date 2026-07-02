@@ -428,7 +428,7 @@
         <div class="browse-view" id="view-bookmarks" hidden>
           <div class="bookmarks-panel">
             <div class="bookmarks-toolbar">
-              <span class="subs-section-label">Bookmarked moments</span>
+              <span class="subs-section-label">Bookmarked videos &amp; moments</span>
               <div class="spacer"></div>
               <button class="btn btn-ghost btn-thin" id="btn-bookmarks-export"
                       title="Download all bookmarks as a CSV file (title, channel, timestamp, segment text)">Export CSV</button>
@@ -495,6 +495,7 @@
           <div class="recent-area">
             <div class="recent-header">
               <span class="recent-label" id="manual-folder-label">Single-video downloads</span>
+              <span class="manual-bulk-status" id="manual-bulk-status" hidden></span>
               <div class="spacer"></div>
               <label class="ctl-label ctl-label-thin browse-toolbar-spaced">Sort:</label>
               <select class="ctl-select" id="manual-sort">
@@ -503,6 +504,18 @@
                 <option value="largest">Largest first</option>
                 <option value="title">Title A&ndash;Z</option>
               </select>
+              <button class="btn btn-ghost btn-thin browse-toolbar-spaced"
+                      id="manual-recover-ids"
+                      title="Search YouTube by title and match on video length to recover missing video IDs for these downloads, so their metadata can be fetched. Runs in the background - watch the activity log.">Recover IDs</button>
+              <button class="btn btn-ghost btn-thin browse-toolbar-spaced"
+                      id="manual-refresh-all-metadata"
+                      title="Refresh YouTube metadata for every manual download that already has a video ID. Runs in the background - watch the activity log.">Refresh metadata</button>
+              <button class="btn btn-ghost btn-thin browse-toolbar-spaced"
+                      id="manual-transcribe-all"
+                      title="Queue every manual download that is not already transcribed.">Transcribe missing</button>
+              <button class="btn btn-ghost btn-thin browse-toolbar-spaced"
+                      id="manual-review-btn" hidden
+                      title="Resolve the ambiguous matches Recover IDs couldn't auto-pick.">Review matches</button>
             </div>
             <div class="recent-grid-frame" id="manual-grid-frame">
               <div class="video-grid" id="manual-grid">

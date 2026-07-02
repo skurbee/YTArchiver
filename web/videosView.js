@@ -52,6 +52,15 @@
     return n < 1000000000000 ? n * 1000 : n;
   }
 
+  function _pageSig(rows) {
+    return (rows || []).map(r => [
+      r.video_id || r.filepath || "",
+      r.thumbnail_url || "",
+      r.duration || "",
+      r.tx_status || "",
+    ].join("~")).join("|");
+  }
+
   function isActive() {
     const v = $("view-recent");
     return !!(v && !v.hidden && v.offsetParent !== null);
@@ -101,7 +110,7 @@
       if (myId !== _seq) return;  // superseded by a newer sort/reset
       const rows = (res && res.rows) || [];
       if (reset) {
-        _firstPageSig = rows.map(r => r.video_id || r.filepath || "").join("|");
+        _firstPageSig = _pageSig(rows);
       }
       if (reset && g) g.innerHTML = "";
       const frag = document.createDocumentFragment();
@@ -188,22 +197,29 @@
   // hit. _firstPageSig is keyed implicitly to the current sort because
   // loadPage() always rebuilds it for whatever sort is active.
   window._refreshVideosViewIfActive = async function () {
-    if (!isActive() || _loading) return;
+    if (_loading) return;
     if (!nativeBridgeUp()) return;
+    // Background-capable: refresh when the view is visible OR when it was
+    // already loaded once (`_firstPageSig` set). Updating the hidden grid
+    // keeps the new video preloaded so it's already there — no "pop-in" —
+    // when the user switches back to Browse. Skip only if never loaded
+    // (it'll load fresh on first open). DOM prepends on a hidden grid are
+    // cheap and safe.
+    if (!isActive() && !_firstPageSig) return;
     const sortAtCall = _sort;
     const filterAtCall = _filter;
     try {
       const res = await bridgeCall("list_all_videos", sortAtCall, PAGE, 0, filterAtCall);
       if (sortAtCall !== _sort || filterAtCall !== _filter || _loading) return;
       const rows = (res && res.rows) || [];
-      const newSig = rows.map(r => r.video_id || r.filepath || "").join("|");
+      const newSig = _pageSig(rows);
       if (newSig === _firstPageSig) return; // nothing changed
 
       // For "recent" sort: try a no-flash prepend — find how many NEW
       // items are at the top (before the old first item) and insert only
       // those, avoiding the blank-grid flash that loadPage(true) causes.
       if (sortAtCall === "recent" && _firstPageSig) {
-        const oldFirstId = _firstPageSig.split("|")[0];
+        const oldFirstId = _firstPageSig.split("|")[0].split("~")[0];
         const splitIdx = rows.findIndex(
           r => (r.video_id || r.filepath || "") === oldFirstId
         );

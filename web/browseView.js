@@ -169,16 +169,31 @@
 
     // Sort dropdown
     document.getElementById("browse-sort")?.addEventListener("change", (e) => {
+      if (_browseState.view === "videos" &&
+          typeof window._reloadCurrentChannelVideos === "function") {
+        window._reloadCurrentChannelVideos();
+        return;
+      }
       window.sortCurrentVideos?.(e.target.value);
     });
 
     // Group-by-year checkbox triggers a re-render with current sort
     document.getElementById("browse-group-year")?.addEventListener("change", () => {
+      if (_browseState.view === "videos" &&
+          typeof window._reloadCurrentChannelVideos === "function") {
+        window._reloadCurrentChannelVideos();
+        return;
+      }
       const sort = document.getElementById("browse-sort")?.value || "newest";
       window.sortCurrentVideos?.(sort);
     });
     // Group-by-month does the same, for channels organized yyyy/mm.
     document.getElementById("browse-group-month")?.addEventListener("change", () => {
+      if (_browseState.view === "videos" &&
+          typeof window._reloadCurrentChannelVideos === "function") {
+        window._reloadCurrentChannelVideos();
+        return;
+      }
       const sort = document.getElementById("browse-sort")?.value || "newest";
       window.sortCurrentVideos?.(sort);
     });
@@ -236,6 +251,10 @@
         showView("videos");
       });
     } else if (_browseState.view === "videos") {
+      if (typeof window._filterChannelVideosPaged === "function" &&
+          window._filterChannelVideosPaged(q)) {
+        return;
+      }
       const filtered = !q
         ? _browseState.videos
         : _browseState.videos.filter(v => (v.title || "").toLowerCase().includes(q));
@@ -591,4 +610,21 @@
   window.showView = showView;
   window._stopWatchVideo = _stopWatchVideo;
   window._pauseWatchVideo = _pauseWatchVideo;
+
+  // Single entry point the backend calls after each download lands
+  // (recent_mixin._push_recent_refresh). Fans out to every Browse grid that
+  // could be showing the new video — the all-Videos submode, the current
+  // channel grid, and the Manual (single-downloads) view. Each is a no-op
+  // when unaffected, and all run whether or not Browse is the active tab so
+  // hidden grids stay preloaded (no "pop-in" on return). `channel` is the
+  // download's channel name when known, "" otherwise.
+  window._onBrowseDownloadLanded = function (channel) {
+    const ch = channel || null;
+    try { window._refreshVideosViewIfActive && window._refreshVideosViewIfActive(); }
+    catch (_e) { /* non-fatal */ }
+    try { window._refreshChannelVideosIfLoaded && window._refreshChannelVideosIfLoaded(ch); }
+    catch (_e) { /* non-fatal */ }
+    try { window._refreshManualViewIfActive && window._refreshManualViewIfActive(); }
+    catch (_e) { /* non-fatal */ }
+  };
 })();

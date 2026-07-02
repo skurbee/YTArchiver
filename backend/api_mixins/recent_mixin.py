@@ -102,13 +102,14 @@ class RecentMixin:
             return {"ok": False, "error": str(e)}
 
 
-    def _push_recent_refresh(self):
-        """Re-fetch recent_downloads and push to the UI's Recent grid/list.
+    def _push_recent_refresh(self, channel=None):
+        """Re-fetch recent_downloads and push to the UI's Browse grids.
 
         Called from backend.sync._record_recent_download every time a new
-        video lands, so the Recent tab updates live ("does the
-        Recents tab not auto update/refresh when a download happens?").
-        Safe no-op when the window isn't ready yet.
+        video lands, so Browse updates live ("does the Recents tab not auto
+        update/refresh when a download happens?"). `channel` (when known)
+        lets the UI target the matching channel grid. Safe no-op when the
+        window isn't ready yet.
         """
         if self._window is None:
             return
@@ -118,13 +119,16 @@ class RecentMixin:
             # to disk; self._config may be stale.
             try: self._reload_config()
             except Exception as e: swallow("config reload on recent push", e)
-            # A new download just landed (and was registered in the index),
-            # so reload the Videos view if it's currently showing. The view
-            # pulls from api.list_all_videos (whole archive), not the old
-            # recent_downloads config list.
+            # A new download just landed (and was registered in the index).
+            # Fan out to every loaded Browse grid (all-Videos, the current
+            # channel grid, and the Manual view) so the new video appears
+            # live AND stays preloaded even if Browse isn't the active tab —
+            # no "pop-in" when the user switches back. Each grid is a no-op
+            # if it isn't showing the new video.
+            _ch_arg = _json.dumps(channel or "")
             self._window.evaluate_js(
-                "window._refreshVideosViewIfActive && "
-                "window._refreshVideosViewIfActive();")
+                "window._onBrowseDownloadLanded && "
+                f"window._onBrowseDownloadLanded({_ch_arg});")
         except Exception as e:
             # Best-effort — never let a UI push crash the download pipeline.
             try:

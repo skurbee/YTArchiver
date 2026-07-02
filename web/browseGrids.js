@@ -472,6 +472,7 @@
     // Automatically treat month-grouping as implying year-grouping.
     const groupByMonth = !!(opts && opts.groupByMonth);
     const useYear = groupByYear || groupByMonth;
+    const disableClientLazy = !!(opts && opts.disableClientLazy);
 
     // Lazy-load: on channels with 500+ videos, rendering all thumbnails at
     // once causes jank + high memory. Match YTArchiver.py:28108 (fires at
@@ -480,7 +481,7 @@
     // Mirrors OLD `_grid_check_load_more` / `_grid_build_cards(reset=False)`.
     const BATCH = 60;
     const LAZY_THRESHOLD = 120; // only lazy-load when enough videos to matter
-    const useLazy = !useYear && videos.length > LAZY_THRESHOLD;
+    const useLazy = !disableClientLazy && !useYear && videos.length > LAZY_THRESHOLD;
 
     if (useLazy) {
       grid.classList.remove("video-grid-grouped");

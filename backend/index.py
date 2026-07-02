@@ -315,7 +315,9 @@ def _open() -> sqlite3.Connection | None:
                 duration_s REAL,
                 size_bytes INTEGER,
                 tx_status TEXT DEFAULT 'pending',
-                added_ts REAL
+                added_ts REAL,
+                id_backfill_fail_count INTEGER DEFAULT 0,
+                id_backfill_excluded_ts REAL
             )""")
             # Migrations — idempotent ALTER statements for columns
             # added after initial schema. OLD-YTArchiver compatible:
@@ -381,6 +383,8 @@ def _open() -> sqlite3.Connection | None:
                 # IDs might help every time. Also used by future
                 # passes to deprioritize already-exhausted rows.
                 "ALTER TABLE videos ADD COLUMN id_backfill_tried_ts REAL",
+                "ALTER TABLE videos ADD COLUMN id_backfill_fail_count INTEGER DEFAULT 0",
+                "ALTER TABLE videos ADD COLUMN id_backfill_excluded_ts REAL",
                 # Marked when bulk views/likes refresh sees the file's
                 # video_id is NOT in YouTube's current flat-playlist
                 # response (uploader deleted / privated / unlisted the
@@ -469,6 +473,15 @@ def _open() -> sqlite3.Connection | None:
                 # (they group/scan the same live-rows-by-channel/added_ts set).
                 "CREATE INDEX IF NOT EXISTS idx_vid_chan_added_live "
                 "ON videos(channel, added_ts) WHERE is_duplicate_of IS NULL",
+                # Per-channel Browse paging. These keep the default newest/
+                # oldest and most-viewed page loads from scanning/sorting a
+                # whole large channel before the first cards can paint.
+                "CREATE INDEX IF NOT EXISTS idx_vid_chan_upload_page_live "
+                "ON videos(channel COLLATE NOCASE, upload_ts, added_ts) "
+                "WHERE is_duplicate_of IS NULL",
+                "CREATE INDEX IF NOT EXISTS idx_vid_chan_view_page_live "
+                "ON videos(channel COLLATE NOCASE, view_count, added_ts) "
+                "WHERE is_duplicate_of IS NULL",
             ):
                 try:
                     _conn.execute(stmt)
@@ -577,6 +590,13 @@ def _parse_year_month_from_path(filepath: str) -> tuple[int | None, int | None]:
 # falling back to a normalized-title match. The id is always inside the JSON,
 # so it's recoverable regardless of what the sidecar file is named.
 _VIDID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_YT_ID_IN_TEXT_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?(?:[^#\s]*&)?v=|shorts/|embed/)"
+    r"|youtu\.be/)([A-Za-z0-9_-]{11})"
+)
+_TITLE_DATE_SUFFIX_RE = re.compile(
+    r"\s*[\(\[]\s*\d{1,2}[.-]\d{1,2}[.-]\d{2,4}\s*[\)\]]\s*$"
+)
 _SIDECAR_ID_CACHE_MAX = 1000
 _sidecar_id_cache: OrderedDict[str, tuple[float, dict]] = OrderedDict()
 _sidecar_id_cache_lock = threading.Lock()
@@ -589,6 +609,22 @@ def _alnum_key(s: str) -> str:
     return "".join(c for c in (s or "").lower() if c.isalnum())
 
 
+def _transcript_identity_title_keys(title: str, norm_fn) -> set[str]:
+    """Title keys for strict transcript matching.
+
+    Manual/single downloads often carry a filename date suffix like
+    `Title (05.29.26)` while imported transcript rows retain the YouTube title
+    `Title`. Treat that one suffix as non-identifying, but keep the normal
+    exact normalized key so genuinely different titles still get rejected.
+    """
+    raw = title or ""
+    keys = {norm_fn(raw)}
+    stripped = _TITLE_DATE_SUFFIX_RE.sub("", raw).strip()
+    if stripped != raw:
+        keys.add(norm_fn(stripped))
+    return {k for k in keys if k}
+
+
 def _build_sidecar_id_map(dir_path: str) -> dict:
     """Map a directory's .info.json sidecars to ids."""
     by_name: dict[str, str] = {}
@@ -598,18 +634,54 @@ def _build_sidecar_id_map(dir_path: str) -> dict:
         names = os.listdir(dir_path)
     except OSError:
         return {"by_name": by_name, "by_stem": by_stem, "by_title": by_title}
+    text_sidecar_exts = (
+        ".url", ".webloc", ".website", ".txt", ".nfo", ".html", ".htm",
+    )
+
+    def _id_from_text(text: str) -> str:
+        if not text:
+            return ""
+        m = _YT_ID_IN_TEXT_RE.search(text)
+        if m and _VIDID_RE.fullmatch(m.group(1)):
+            return m.group(1)
+        m = re.search(r"(?:^|[?&\s])v=([A-Za-z0-9_-]{11})(?:[&#\s]|$)", text)
+        if m and _VIDID_RE.fullmatch(m.group(1)):
+            return m.group(1)
+        return ""
+
     for fn in names:
-        if not fn.endswith(".info.json"):
+        low_fn = fn.lower()
+        if not low_fn.endswith(".info.json") and not low_fn.endswith(text_sidecar_exts):
+            continue
+        full_path = os.path.join(dir_path, fn)
+        sidecar_stem = (
+            fn[:-len(".info.json")].lower()
+            if low_fn.endswith(".info.json")
+            else os.path.splitext(fn)[0].lower()
+        )
+        if not low_fn.endswith(".info.json"):
+            try:
+                with open(full_path, "r", encoding="utf-8",
+                          errors="replace") as f:
+                    vid = _id_from_text(f.read(256 * 1024))
+            except Exception:
+                vid = ""
+            if _VIDID_RE.fullmatch(vid or "") and sidecar_stem:
+                by_stem.setdefault(sidecar_stem, vid)
             continue
         try:
-            with open(os.path.join(dir_path, fn), "r", encoding="utf-8") as f:
+            with open(full_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception:
             continue
         vid = str(data.get("id") or "").strip()
         if not _VIDID_RE.fullmatch(vid):
+            for key in ("webpage_url", "original_url", "url"):
+                vid = _id_from_text(str(data.get(key) or ""))
+                if _VIDID_RE.fullmatch(vid):
+                    break
+        if not _VIDID_RE.fullmatch(vid):
             continue
-        sidecar_stem = fn[:-len(".info.json")].lower()
         if sidecar_stem:
             by_stem.setdefault(sidecar_stem, vid)
         # The exact output filename yt-dlp used (authoritative).
@@ -798,6 +870,14 @@ def register_video(filepath: str, channel: str, title: str | None = None,
                         existing id when the re-register didn't resolve one. */
                      video_id=COALESCE(excluded.video_id, videos.video_id),
                      video_url=COALESCE(excluded.video_url, videos.video_url),
+                     id_backfill_fail_count=CASE
+                       WHEN excluded.video_id IS NOT NULL THEN 0
+                       ELSE videos.id_backfill_fail_count
+                     END,
+                     id_backfill_excluded_ts=CASE
+                       WHEN excluded.video_id IS NOT NULL THEN NULL
+                       ELSE videos.id_backfill_excluded_ts
+                     END,
                      size_bytes=excluded.size_bytes,
                      duration_s=COALESCE(excluded.duration_s, videos.duration_s),
                      /* tx_status: preserve any non-'pending' value on
@@ -1993,6 +2073,69 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     return out
 
 
+def list_videos_for_channel_page(
+        channel: str, sort: str = "newest", limit: int = 120,
+        offset: int = 0, include_thumbs: bool = True,
+        query: str = "") -> dict[str, Any]:
+    """Paginated channel video list for the default Browse drilldown.
+
+    The legacy list_videos_for_channel() endpoint intentionally returns the
+    whole channel so year/month grouping can build complete buckets. The
+    common ungrouped grid only needs the next screenful; this path keeps the
+    SQL sort/limit in SQLite and only resolves thumbnails for rows that will
+    be rendered now.
+    """
+    conn = _reader_open()
+    try:
+        lim = max(1, min(int(limit or 120), 500))
+    except (TypeError, ValueError):
+        lim = 120
+    try:
+        off = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        off = 0
+    if conn is None:
+        return {"rows": [], "has_more": False, "offset": off,
+                "next_offset": off}
+    order = {
+        "newest": "upload_ts DESC, added_ts DESC",
+        "oldest": "(upload_ts IS NULL) ASC, upload_ts ASC, "
+                  "added_ts ASC",
+        "largest": "COALESCE(size_bytes, 0) DESC",
+        "title": "title COLLATE NOCASE ASC",
+        "most_viewed": "view_count DESC, added_ts DESC",
+    }.get((sort or "newest").lower(),
+          "upload_ts DESC, added_ts DESC")
+    where = ("WHERE channel=? COLLATE NOCASE "
+             "AND is_duplicate_of IS NULL")
+    params: list[Any] = [channel]
+    q = (query or "").strip()
+    if q:
+        esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where += " AND title LIKE ? ESCAPE '\\'"
+        params.append(f"%{esc}%")
+    params.extend([lim + 1, off])
+    try:
+        with _reader_lock:
+            cur = conn.execute(
+                "SELECT title, channel, filepath, video_id, size_bytes, "
+                "year, month, tx_status, added_ts, upload_ts, view_count, "
+                "like_count, removed_from_yt_ts, duration_s "
+                f"FROM videos {where} "
+                f"ORDER BY {order} LIMIT ? OFFSET ?",
+                params)
+            raw = cur.fetchall()
+    except sqlite3.Error as e:
+        _log.debug("list_videos_for_channel_page query failed: %s", e)
+        return {"rows": [], "has_more": False, "offset": off,
+                "next_offset": off}
+    has_more = len(raw) > lim
+    raw = raw[:lim]
+    out = [_build_browse_video_row(r, include_thumbs) for r in raw]
+    return {"rows": out, "has_more": has_more, "offset": off,
+            "next_offset": off + len(out)}
+
+
 def _file_url(path: str) -> str:
     """Return a URL the webview can use to load `path`.
 
@@ -2007,8 +2150,9 @@ def _file_url(path: str) -> str:
     if not path:
         return ""
     try:
-        from .local_fileserver import get_port, url_for
+        from .local_fileserver import allow_file, get_port, url_for
         if get_port():
+            allow_file(path)
             return url_for(path)
     except Exception as e:
         _log.debug("swallowed: %s", e)
@@ -2188,6 +2332,12 @@ def find_thumbnail(video_filepath: str,
                     return os.path.normpath(os.path.join(tf, fn))
         except OSError:
             continue
+
+    for tf in search_dirs:
+        for ext in (".jpg", ".jpeg", ".webp", ".png"):
+            p = os.path.join(tf, stem + ".local" + ext)
+            if os.path.isfile(p):
+                return os.path.normpath(p)
 
     return None
 
@@ -2476,6 +2626,369 @@ def backfill_video_ids_from_sidecars(progress=None) -> dict:
     return {"ok": True, "fixed": fixed, "null_rows": total}
 
 
+def _fmt_video_duration(s) -> str:
+    try:
+        s = int(float(s or 0))
+    except (TypeError, ValueError):
+        return ""
+    if s <= 0:
+        return ""
+    h, m, sec = s // 3600, (s % 3600) // 60, s % 60
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def _build_browse_video_row(r, include_thumbs: bool = True) -> dict:
+    """Shape one `videos` row into a Browse video-card dict.
+
+    Expects the column order used by list_all_videos / list_manual_videos:
+    (title, channel, filepath, video_id, size_bytes, year, month, tx_status,
+     added_ts, upload_ts, view_count, like_count, removed_from_yt_ts, duration_s)
+    """
+    (title, channel, fp, vid, size_b, yr, mo, tx, added, upts,
+     vc, lc, rem, dur_s) = r
+    d = {
+        "title": title or "", "channel": channel or "", "filepath": fp or "",
+        "video_id": vid or "", "size_bytes": size_b or 0,
+        "year": yr, "month": mo, "tx_status": tx, "added_ts": added,
+        "upload_ts": upts, "view_count": vc, "like_count": lc,
+        "duration": _fmt_video_duration(dur_s),
+        "removed_from_yt": bool(rem), "show_channel": True,
+    }
+    if upts:
+        try:
+            from datetime import datetime as _dt
+            d["uploaded"] = _dt.fromtimestamp(upts).strftime("%Y-%m-%d")
+        except (OverflowError, OSError, ValueError):
+            pass
+    views_label = _format_compact_count(vc)
+    if views_label:
+        d["views"] = views_label
+    if include_thumbs and fp:
+        try:
+            tp = find_thumbnail_channelwide(fp, vid)
+            if tp:
+                d["thumbnail_url"] = _file_url(tp)
+        except Exception:
+            pass
+    return d
+
+
+def _manual_like_prefix(path: str) -> str:
+    """SQL LIKE prefix for a directory: normalized, trailing separator (so
+    'Archive' can't match 'ArchiveBad'), LIKE-metacharacters escaped."""
+    n = os.path.normpath(path)
+    if not n.endswith(("\\", "/")):
+        n += os.sep
+    return n.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _manual_where_and_params() -> tuple[str, list]:
+    """Build the WHERE that classifies a `videos` row as a single/manual
+    download: any indexed video NOT inside a channel archive tree (output_dir)
+    or an index-only archive root (tp_archive_roots). Returns ("", []) when
+    there are no roots to classify against. Shared by list_manual_videos +
+    list_manual_videos_without_id so the classification stays identical.
+
+    Exclusion-ONLY — `video_out_dir` is deliberately NOT used as an *include*:
+    a user can set output_dir to a SUBFOLDER of video_out_dir (e.g.
+    video_out_dir `…\\YT videos`, channels under `…\\YT videos\\Whole Channels`),
+    and an 'under video_out_dir' include would then sweep in every channel
+    download. Excluding the channel/archive roots is correct for every layout,
+    since manual downloads live outside those roots by definition.
+    """
+    try:
+        from .ytarchiver_config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    out_dir = (cfg.get("output_dir") or "").strip()
+    roots = ([out_dir] if out_dir else [])
+    roots.extend(str(r) for r in (cfg.get("tp_archive_roots") or []) if r)
+    if not roots:
+        return ("", [])
+    where = "WHERE is_duplicate_of IS NULL"
+    params: list = []
+    for r in roots:
+        where += " AND filepath NOT LIKE ? ESCAPE '\\'"
+        params.append(_manual_like_prefix(r))
+    return (where, params)
+
+
+def list_manual_videos(include_thumbs: bool = True) -> list[dict]:
+    """All index rows that are single/manual downloads — i.e. saved in
+    video_out_dir OR outside every managed archive root (custom 'Save to'
+    locations). Channel downloads (under output_dir/<channel>/) and index-only
+    tp_archive_roots are excluded. Returns the FULL list (the SQL filter keeps
+    it small); the caller sorts + paginates. Rows match list_all_videos shape.
+    """
+    conn = _reader_open()
+    if conn is None:
+        return []
+    where, params = _manual_where_and_params()
+    if not where:
+        return []
+    try:
+        with _reader_lock:
+            cur = conn.execute(
+                "SELECT title, channel, filepath, video_id, size_bytes, year, month, "
+                "tx_status, added_ts, upload_ts, view_count, like_count, "
+                "removed_from_yt_ts, duration_s, id_backfill_tried_ts, "
+                "id_backfill_fail_count, id_backfill_excluded_ts "
+                f"FROM videos {where}",
+                params)
+            raw = cur.fetchall()
+    except sqlite3.Error as e:
+        _log.debug("list_manual_videos query failed: %s", e)
+        return []
+    out = []
+    for r in raw:
+        d = _build_browse_video_row(r[:14], include_thumbs)
+        d["id_backfill_tried_ts"] = r[14]
+        d["id_backfill_fail_count"] = int(r[15] or 0)
+        d["id_backfill_excluded_ts"] = r[16]
+        out.append(d)
+    return out
+
+
+def list_manual_videos_without_id(*, include_excluded: bool = False) -> list[dict]:
+    """Manual downloads that still have NO video_id — the backfill target.
+    Lightweight rows: {filepath, title, duration_s}."""
+    conn = _reader_open()
+    if conn is None:
+        return []
+    where, params = _manual_where_and_params()
+    if not where:
+        return []
+    where += " AND (video_id IS NULL OR video_id='')"
+    if not include_excluded:
+        where += " AND id_backfill_excluded_ts IS NULL"
+    try:
+        with _reader_lock:
+            cur = conn.execute(
+                "SELECT filepath, title, duration_s, id_backfill_tried_ts, "
+                f"id_backfill_fail_count, id_backfill_excluded_ts FROM videos {where}",
+                params)
+            raw = cur.fetchall()
+    except sqlite3.Error as e:
+        _log.debug("list_manual_videos_without_id query failed: %s", e)
+        return []
+    return [{
+        "filepath": r[0] or "",
+        "title": r[1] or "",
+        "duration_s": r[2],
+        "id_backfill_tried_ts": r[3],
+        "id_backfill_fail_count": int(r[4] or 0),
+        "id_backfill_excluded_ts": r[5],
+    } for r in raw]
+
+
+def list_manual_duplicate_filepaths() -> list[str]:
+    """Manual download paths that are indexed only as duplicates."""
+    conn = _reader_open()
+    if conn is None:
+        return []
+    try:
+        from .ytarchiver_config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    roots: list[str] = []
+    out_dir = (cfg.get("output_dir") or "").strip()
+    if out_dir:
+        roots.append(out_dir)
+    roots.extend(str(r) for r in (cfg.get("tp_archive_roots") or []) if r)
+    if not roots:
+        return []
+    where = "WHERE is_duplicate_of IS NOT NULL"
+    params: list = []
+    for r in roots:
+        where += " AND filepath NOT LIKE ? ESCAPE '\\'"
+        params.append(_manual_like_prefix(r))
+    try:
+        with _reader_lock:
+            cur = conn.execute(f"SELECT filepath FROM videos {where}", params)
+            return [r[0] or "" for r in cur.fetchall() if r and r[0]]
+    except sqlite3.Error as e:
+        _log.debug("list_manual_duplicate_filepaths query failed: %s", e)
+        return []
+
+
+def set_video_duration(filepath: str, duration_secs: float) -> bool:
+    """Persist a probed local duration for one indexed video filepath."""
+    if not filepath:
+        return False
+    try:
+        dur = float(duration_secs)
+    except (TypeError, ValueError):
+        return False
+    if dur <= 0:
+        return False
+    conn = _open()
+    if conn is None:
+        return False
+    try:
+        with _db_lock:
+            cur = conn.execute(
+                "UPDATE videos SET duration_s=? "
+                "WHERE filepath=? COLLATE NOCASE "
+                "AND (duration_s IS NULL OR duration_s<=0)",
+                (dur, os.path.normpath(filepath)))
+            conn.commit()
+            changed = cur.rowcount > 0
+        if changed:
+            invalidate_channel_videos(None)
+        return changed
+    except sqlite3.Error as e:
+        _log.debug("set_video_duration failed: %s", e)
+        return False
+
+
+def set_manual_video_id(filepath: str, video_id: str, video_url: str = "",
+                        channel: str | None = None) -> bool:
+    """Write a resolved video_id (+url, +tried stamp) onto a manual download
+    that currently has none. Returns True if a row was updated."""
+    if not filepath or not video_id:
+        return False
+    _now = int(time.time())
+    _url = video_url or f"https://www.youtube.com/watch?v={video_id}"
+    _np = os.path.normpath(filepath)
+    _channel = (channel or "").strip()
+    with _db_lock:
+        conn = _open()
+        if conn is None:
+            return False
+        try:
+            _set_channel_sql = ", channel=?" if _channel else ""
+            _args = [video_id, _url, _now]
+            if _channel:
+                _args.append(_channel)
+            _args.append(_np)
+            cur = conn.execute(
+                "UPDATE videos SET video_id=?, video_url=?, "
+                "id_backfill_tried_ts=?, id_backfill_fail_count=0, "
+                "id_backfill_excluded_ts=NULL "
+                f"{_set_channel_sql} "
+                "WHERE filepath=? COLLATE NOCASE AND (video_id IS NULL OR video_id='')",
+                tuple(_args))
+            if (cur.rowcount or 0) == 0 and filepath != _np:
+                _args = [video_id, _url, _now]
+                if _channel:
+                    _args.append(_channel)
+                _args.append(filepath)
+                cur = conn.execute(
+                    "UPDATE videos SET video_id=?, video_url=?, "
+                    "id_backfill_tried_ts=?, id_backfill_fail_count=0, "
+                    "id_backfill_excluded_ts=NULL "
+                    f"{_set_channel_sql} "
+                    "WHERE filepath=? COLLATE NOCASE AND (video_id IS NULL OR video_id='')",
+                    tuple(_args))
+            conn.commit()
+            return (cur.rowcount or 0) > 0
+        except sqlite3.Error as e:
+            _log.warning("set_manual_video_id failed: %s", e)
+            return False
+
+
+def stamp_manual_id_tried(filepath: str) -> None:
+    """Mark a manual download as 'backfill attempted' so re-runs can skip it
+    and the UI can tell 'tried but unresolved' from 'not yet tried'."""
+    if not filepath:
+        return
+    _now = int(time.time())
+    _np = os.path.normpath(filepath)
+    with _db_lock:
+        conn = _open()
+        if conn is None:
+            return
+        try:
+            cur = conn.execute(
+                "UPDATE videos SET id_backfill_tried_ts=? WHERE filepath=? COLLATE NOCASE",
+                (_now, _np))
+            if (cur.rowcount or 0) == 0 and filepath != _np:
+                conn.execute(
+                    "UPDATE videos SET id_backfill_tried_ts=? WHERE filepath=? COLLATE NOCASE",
+                    (_now, filepath))
+            conn.commit()
+        except sqlite3.Error as e:
+            _log.debug("stamp_manual_id_tried failed: %s", e)
+
+
+def mark_manual_id_backfill_failed(filepath: str, *,
+                                   title: str = "",
+                                   duration_secs: float | None = None,
+                                   exclude_after: int = 3) -> dict[str, Any]:
+    """Increment the no-ID manual recovery failure count for one file.
+
+    After `exclude_after` consecutive misses the row is excluded from future
+    automatic Recover IDs runs. A later successful set_manual_video_id resets
+    the count and exclusion timestamp.
+    """
+    if not filepath:
+        return {"ok": False, "error": "missing filepath"}
+    try:
+        threshold = max(1, int(exclude_after))
+    except (TypeError, ValueError):
+        threshold = 3
+    _now = int(time.time())
+    _np = os.path.normpath(filepath)
+
+    def _update(path: str) -> tuple[bool, dict[str, Any]]:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return False, {}
+            try:
+                cur = conn.execute(
+                    "UPDATE videos SET "
+                    "id_backfill_tried_ts=?, "
+                    "id_backfill_fail_count=COALESCE(id_backfill_fail_count, 0) + 1, "
+                    "id_backfill_excluded_ts=CASE "
+                    "  WHEN COALESCE(id_backfill_fail_count, 0) + 1 >= ? "
+                    "  THEN COALESCE(id_backfill_excluded_ts, ?) "
+                    "  ELSE id_backfill_excluded_ts END "
+                    "WHERE filepath=? COLLATE NOCASE "
+                    "AND (video_id IS NULL OR video_id='')",
+                    (_now, threshold, _now, path))
+                row = conn.execute(
+                    "SELECT id_backfill_fail_count, id_backfill_excluded_ts "
+                    "FROM videos WHERE filepath=? COLLATE NOCASE",
+                    (path,)).fetchone()
+                conn.commit()
+                return (cur.rowcount or 0) > 0, {
+                    "fail_count": int(row[0] or 0) if row else 0,
+                    "excluded_ts": row[1] if row else None,
+                }
+            except sqlite3.Error as e:
+                _log.debug("mark_manual_id_backfill_failed failed: %s", e)
+                return False, {"error": str(e)}
+
+    changed, info = _update(_np)
+    if not changed and filepath != _np:
+        changed, info = _update(filepath)
+    if not changed and os.path.isfile(filepath):
+        # Root-folder imported files may be discovered before any indexed row
+        # exists. Register a no-ID row so repeated misses can be remembered.
+        try:
+            register_video(
+                filepath,
+                "Single Videos",
+                title or os.path.splitext(os.path.basename(filepath))[0],
+                duration_secs=duration_secs)
+            changed, info = _update(_np)
+            if not changed and filepath != _np:
+                changed, info = _update(filepath)
+        except Exception as e:
+            _log.debug("register before manual-id-fail mark failed: %s", e)
+    if changed:
+        invalidate_channel_videos(None)
+    return {
+        "ok": bool(changed),
+        "fail_count": int((info or {}).get("fail_count") or 0),
+        "excluded": bool((info or {}).get("excluded_ts")),
+        "excluded_ts": (info or {}).get("excluded_ts"),
+    }
+
+
 def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
                     include_thumbs: bool = True, query: str = "") -> dict:
     """Paginated global video list across the whole archive (the Videos view).
@@ -2542,42 +3055,7 @@ def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
     has_more = len(raw) > lim
     raw = raw[:lim]
 
-    def _fmt_dur(s):
-        try: s = int(float(s or 0))
-        except (TypeError, ValueError): return ""
-        if s <= 0: return ""
-        h, m, sec = s // 3600, (s % 3600) // 60, s % 60
-        return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
-
-    out = []
-    for r in raw:
-        (title, channel, fp, vid, size_b, yr, mo, tx, added, upts,
-         vc, lc, rem, dur_s) = r
-        d = {
-            "title": title or "", "channel": channel or "", "filepath": fp or "",
-            "video_id": vid or "", "size_bytes": size_b or 0,
-            "year": yr, "month": mo, "tx_status": tx, "added_ts": added,
-            "upload_ts": upts, "view_count": vc, "like_count": lc,
-            "duration": _fmt_dur(dur_s),
-            "removed_from_yt": bool(rem), "show_channel": True,
-        }
-        if upts:
-            try:
-                from datetime import datetime as _dt
-                d["uploaded"] = _dt.fromtimestamp(upts).strftime("%Y-%m-%d")
-            except (OverflowError, OSError, ValueError):
-                pass
-        views_label = _format_compact_count(vc)
-        if views_label:
-            d["views"] = views_label
-        if include_thumbs and fp:
-            try:
-                tp = find_thumbnail_channelwide(fp, vid)
-                if tp:
-                    d["thumbnail_url"] = _file_url(tp)
-            except Exception:
-                pass
-        out.append(d)
+    out = [_build_browse_video_row(r, include_thumbs) for r in raw]
     # Store a copy in the result cache so the next open is instant.
     with _browse_cache_lock:
         _all_videos_cache_put(
@@ -2810,16 +3288,22 @@ def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
                 _norm_title = lambda s: (s or "").strip().lower()
             _wanted_channel = (channel or "").strip().casefold()
             _sample = _rows[:20]
-            if _wanted_title and not any(
-                    _norm_title(r[4] or "") == _wanted_title for r in _sample):
+            _wanted_title_keys = _transcript_identity_title_keys(
+                title or "", _norm_title)
+            if _wanted_title_keys and not any(
+                    _transcript_identity_title_keys(
+                        r[4] or "", _norm_title) & _wanted_title_keys
+                    for r in _sample):
                 _log.warning(
                     "refusing transcript rows with mismatched title: "
                     "wanted=%r got=%r video_id=%r",
                     title, _sample[0][4] if _sample else "", video_id)
                 _rows = []
-            if _rows and _wanted_channel and not any(
-                    (r[5] or "").strip().casefold() == _wanted_channel
-                    for r in _sample):
+            _sample_channels = [
+                (r[5] or "").strip().casefold() for r in _sample
+            ]
+            if (_rows and _wanted_channel and any(_sample_channels)
+                    and _wanted_channel not in _sample_channels):
                 _log.warning(
                     "refusing transcript rows with mismatched channel: "
                     "wanted=%r got=%r video_id=%r",

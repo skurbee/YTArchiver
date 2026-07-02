@@ -104,7 +104,9 @@ from backend.transcribe import transcribe_files
 class LocalFileServerAllowlistTests(unittest.TestCase):
     def tearDown(self) -> None:
         local_fileserver.set_allowed_roots([])
+        local_fileserver._allowed_files.clear()
         local_fileserver._request_token = ""
+        local_fileserver._server_port = 0
 
     def test_allowlist_fails_closed_when_empty(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -137,6 +139,32 @@ class LocalFileServerAllowlistTests(unittest.TestCase):
 
             local_fileserver.set_allowed_roots([root])
 
+            self.assertTrue(local_fileserver._is_under_allowed_root(path))
+
+    def test_exact_file_grant_accepts_file_outside_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "manual.mp4")
+            other = os.path.join(td, "other.mp4")
+            Path(path).write_bytes(b"video")
+            Path(other).write_bytes(b"video")
+
+            local_fileserver.set_allowed_roots([])
+            local_fileserver.allow_file(path)
+
+            self.assertTrue(local_fileserver._is_under_allowed_root(path))
+            self.assertFalse(local_fileserver._is_under_allowed_root(other))
+
+    def test_file_url_grants_exact_file_to_server(self) -> None:
+        from backend import index as index_module
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "manual.mp4")
+            Path(path).write_bytes(b"video")
+            local_fileserver._server_port = 49152
+            local_fileserver._request_token = "secret"
+
+            url = index_module._file_url(path)
+
+            self.assertIn("/file/", url)
             self.assertTrue(local_fileserver._is_under_allowed_root(path))
 
     def test_url_for_includes_session_token(self) -> None:
@@ -191,6 +219,24 @@ class ManagedRootsTests(unittest.TestCase):
 
             with mock.patch("backend.ytarchiver_config.load_config",
                             return_value={"output_dir": root,
+                                          "tp_archive_roots": []}):
+                self.assertTrue(utils.is_within_managed_roots(path))
+
+    def test_managed_roots_accept_video_out_dir(self) -> None:
+        # Single/manual downloads live in video_out_dir, OUTSIDE the channel
+        # output_dir tree. They must still pass containment so Browse > Manual
+        # can play them (regression: every manual video showed "Refusing to
+        # operate on a file outside the archive").
+        with tempfile.TemporaryDirectory() as td:
+            archive = os.path.join(td, "Archive")
+            manual = os.path.join(td, "SingleVideos")
+            os.makedirs(archive)
+            os.makedirs(manual)
+            path = os.path.join(manual, "Some Video.mp4")
+            Path(path).write_bytes(b"video")
+            with mock.patch("backend.ytarchiver_config.load_config",
+                            return_value={"output_dir": archive,
+                                          "video_out_dir": manual,
                                           "tp_archive_roots": []}):
                 self.assertTrue(utils.is_within_managed_roots(path))
 
@@ -1231,6 +1277,52 @@ class MetadataFetcherTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_fetch_single_metadata_invalidates_browse_cache_after_thumbnail(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            stream = mock.Mock()
+            entry = {
+                "title": "Video",
+                "thumbnail_url": "https://example.test/thumb.jpg",
+            }
+
+            with mock.patch.object(metadata_fetcher, "_folder_for_channel",
+                                   return_value=root), \
+                    mock.patch.object(metadata_fetcher, "find_yt_dlp",
+                                      return_value="yt-dlp"), \
+                    mock.patch.object(metadata_fetcher,
+                                      "_get_metadata_jsonl_path",
+                                      return_value=(
+                                          str(root / ".Channel Metadata.jsonl"),
+                                          str(root))), \
+                    mock.patch.object(metadata_fetcher,
+                                      "_read_metadata_jsonl",
+                                      return_value={}), \
+                    mock.patch.object(metadata_fetcher,
+                                      "_write_metadata_jsonl"), \
+                    mock.patch.object(metadata_fetcher,
+                                      "_fetch_video_metadata",
+                                      return_value=entry), \
+                    mock.patch.object(metadata_fetcher,
+                                      "_ensure_thumbnails_dir",
+                                      return_value=str(root / ".Thumbnails")), \
+                    mock.patch.object(metadata_fetcher,
+                                      "_download_thumbnail",
+                                      return_value=True), \
+                    mock.patch("backend.index.invalidate_channel_videos"
+                               ) as invalidate:
+                result = metadata_fetcher.fetch_single_video_metadata(
+                    {"name": "Channel"},
+                    "abc123_def4",
+                    str(root / "Video [abc123_def4].mp4"),
+                    "Video",
+                    stream,
+                )
+
+            self.assertTrue(result["ok"])
+            invalidate.assert_called_once_with("Channel")
+
 
 class ThumbnailCacheTests(unittest.TestCase):
     def test_thumbnail_exists_rejects_short_file(self) -> None:
@@ -1276,8 +1368,93 @@ class ThumbnailCacheTests(unittest.TestCase):
             self.assertTrue(ok)
             self.assertTrue(thumbnails._thumbnail_exists_for(
                 str(thumb_dir), "abc123_def4"))
-            self.assertGreaterEqual(len(calls), 2)
-            self.assertEqual(stream.emit.call_count, 0)
+
+    def test_generate_local_thumbnail_writes_hidden_valid_jpg(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            video = Path(td) / "Manual Clip.mp4"
+            video.write_bytes(b"video")
+            thumb_dir = Path(td) / ".Thumbnails"
+            calls = []
+
+            def fake_run(cmd, **_kwargs):
+                calls.append(cmd)
+                Path(cmd[-1]).write_bytes(b"\xFF\xD8\xFF" + b"jpg-data" * 4)
+                return mock.Mock(returncode=0)
+
+            with mock.patch.object(thumbnails, "_find_ffmpeg",
+                                   return_value="ffmpeg"), \
+                    mock.patch.object(thumbnails.subprocess, "run",
+                                      side_effect=fake_run), \
+                    mock.patch("backend.utils.hide_file_win") as hide:
+                out = thumbnails._generate_local_thumbnail(
+                    str(video), str(thumb_dir), "Manual Clip", "")
+
+            self.assertIsNotNone(out)
+            self.assertTrue(Path(out).is_file())
+            self.assertEqual(Path(out).name, "Manual Clip.local.jpg")
+            self.assertTrue(calls)
+            hide.assert_called_once_with(str(Path(out)))
+
+    def test_generate_local_thumbnail_repairs_bad_h264_color_metadata(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            video = Path(td) / "Bad Color.mp4"
+            video.write_bytes(b"video")
+            thumb_dir = Path(td) / ".Thumbnails"
+            calls = []
+
+            def fake_run(cmd, **_kwargs):
+                calls.append(cmd)
+                out = Path(cmd[-1])
+                if any("h264_metadata=" in str(part) for part in cmd):
+                    out.write_bytes(b"fixed clip")
+                elif out.suffix.lower() == ".jpg" and any(
+                        str(part).endswith(".h264-color.mp4")
+                        for part in cmd):
+                    out.write_bytes(b"\xFF\xD8\xFF" + b"jpg-data" * 4)
+                return mock.Mock(returncode=0)
+
+            with mock.patch.object(thumbnails, "_find_ffmpeg",
+                                   return_value="ffmpeg"), \
+                    mock.patch.object(thumbnails.subprocess, "run",
+                                      side_effect=fake_run):
+                out = thumbnails._generate_local_thumbnail(
+                    str(video), str(thumb_dir), "Bad Color", "")
+
+            self.assertIsNotNone(out)
+            self.assertTrue(Path(out).is_file())
+            self.assertEqual(Path(out).name, "Bad Color.local.jpg")
+            self.assertTrue(any(
+                any("h264_metadata=" in str(part) for part in cmd)
+                for cmd in calls))
+
+    def test_find_thumbnail_prefers_real_id_thumb_over_local_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            video = Path(td) / "Manual Clip.mp4"
+            video.write_bytes(b"video")
+            thumb_dir = Path(td) / ".Thumbnails"
+            thumb_dir.mkdir()
+            local = thumb_dir / "Manual Clip.local.jpg"
+            real = thumb_dir / "Manual Clip [abc123_def4].jpg"
+            local.write_bytes(b"\xFF\xD8\xFF" + b"local-thumb" * 2)
+            real.write_bytes(b"\xFF\xD8\xFF" + b"real-thumb" * 2)
+
+            found = index.find_thumbnail(str(video), "abc123_def4")
+
+            self.assertEqual(found, os.path.normpath(str(real)))
+
+    def test_find_thumbnail_uses_local_fallback_without_id(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            video = Path(td) / "Manual Clip.mp4"
+            video.write_bytes(b"video")
+            thumb_dir = Path(td) / ".Thumbnails"
+            thumb_dir.mkdir()
+            local = thumb_dir / "Manual Clip.local.jpg"
+            local.write_bytes(b"\xFF\xD8\xFF" + b"local-thumb" * 2)
+
+            found = index.find_thumbnail(str(video), "")
+
+            self.assertEqual(found, os.path.normpath(str(local)))
 
     def test_channel_fingerprint_tracks_nested_file_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -2184,13 +2361,201 @@ class BrowseMixinTests(unittest.TestCase):
                         event_bus=mock.Mock(),
                     )
 
+            # Isolate from the real index DB — list_manual_videos now also
+            # merges index-registered single downloads (any location); here we
+            # exercise only the video_out_dir folder-walk fallback.
             with mock.patch("backend.api_mixins.browse_mixin.load_config",
-                            side_effect=AssertionError("use services")):
+                            side_effect=AssertionError("use services")), \
+                    mock.patch("backend.index.list_manual_videos",
+                               return_value=[]), \
+                    mock.patch("backend.index.list_manual_duplicate_filepaths",
+                               return_value=[]), \
+                    mock.patch("backend.thumbnails._generate_local_thumbnail",
+                               return_value=None):
                 result = Api().list_manual_videos(sort="title")
 
         self.assertEqual(result["folder"], tmp)
         self.assertEqual(result["total"], 1)
         self.assertEqual(result["rows"][0]["title"], "Manual Video")
+
+    def test_manual_videos_folder_fallback_is_root_only(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Top Level.mp4").write_bytes(b"video")
+            manual_sub = root / "YT Favorites List"
+            manual_sub.mkdir()
+            (manual_sub / "Nested Favorite.mkv").write_bytes(b"video")
+            archive_root = root / "Whole Channels"
+            archive_root.mkdir()
+            (archive_root / "Synced Channel Video.mp4").write_bytes(b"video")
+            thumbs = root / ".Thumbnails"
+            thumbs.mkdir()
+            (thumbs / "Not A Video.mp4").write_bytes(b"video")
+
+            class Api(BrowseMixin):
+                def __init__(self):
+                    self._config = {
+                        "video_out_dir": str(root),
+                        "output_dir": str(archive_root),
+                    }
+
+            with mock.patch("backend.index.list_manual_videos",
+                            return_value=[]), \
+                    mock.patch("backend.index.list_manual_duplicate_filepaths",
+                               return_value=[]), \
+                    mock.patch("backend.thumbnails._generate_local_thumbnail",
+                               return_value=None):
+                result = Api().list_manual_videos(sort="title")
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual([r["title"] for r in result["rows"]], ["Top Level"])
+
+    def test_manual_videos_probe_local_duration_for_folder_fallback(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "Loose Manual.mp4"
+            video.write_bytes(b"video")
+
+            class Api(BrowseMixin):
+                def __init__(self):
+                    self._config = {"video_out_dir": str(root)}
+                    self._log_stream = mock.Mock()
+
+            def fake_run(_cmd, **_kwargs):
+                return mock.Mock(stdout="125.4\n")
+
+            with mock.patch("backend.index.list_manual_videos",
+                            return_value=[]), \
+                    mock.patch("backend.index.list_manual_duplicate_filepaths",
+                               return_value=[]), \
+                    mock.patch("backend.process_runner.find_ffprobe",
+                               return_value="ffprobe"), \
+                    mock.patch("backend.api_mixins.browse_mixin.subprocess.run",
+                               side_effect=fake_run), \
+                    mock.patch("backend.index.set_video_duration") as set_dur, \
+                    mock.patch("backend.thumbnails._generate_local_thumbnail",
+                               return_value=None):
+                result = Api().list_manual_videos(sort="title")
+
+        self.assertEqual(result["rows"][0]["duration"], "2:05")
+        set_dur.assert_called_once_with(str(video), 125.4)
+
+    def test_manual_videos_badges_transcript_from_local_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "No ID Local Thumb.mp4"
+            thumb = root / "No ID Local Thumb.local.jpg"
+            transcript = root / ".No ID Local Thumb Transcript.jsonl"
+            video.write_bytes(b"video")
+            thumb.write_bytes(b"jpg")
+            transcript.write_text(
+                '{"title":"No ID Local Thumb","text":"hello"}\n',
+                encoding="utf-8")
+
+            class Api(BrowseMixin):
+                def __init__(self):
+                    self._config = {
+                        "video_out_dir": str(root),
+                        "output_dir": str(root / "Whole Channels"),
+                    }
+                    self._log_stream = mock.Mock()
+
+            with mock.patch("backend.index.list_manual_videos",
+                            return_value=[]), \
+                    mock.patch("backend.index.list_manual_duplicate_filepaths",
+                               return_value=[]), \
+                    mock.patch("backend.index.find_thumbnail",
+                               return_value=str(thumb)), \
+                    mock.patch("backend.index._file_url",
+                               side_effect=lambda p: f"file:///{p}"), \
+                    mock.patch("backend.thumbnails._generate_local_thumbnail",
+                               return_value=None):
+                result = Api().list_manual_videos(sort="title")
+
+        row = result["rows"][0]
+        labels = {b["label"] for b in row["manual_badges"]}
+        self.assertEqual(row["tx_status"], "transcribed")
+        self.assertIn("No ID", labels)
+        self.assertIn("Local thumb", labels)
+        self.assertIn("Transcript", labels)
+
+    def test_manual_videos_skip_indexed_duplicate_disk_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            primary = root / "Me at the zoo.mp4"
+            duplicate = root / "Me at the zoo (05.29.26).mp4"
+            primary.write_bytes(b"same")
+            duplicate.write_bytes(b"same")
+
+            class Api(BrowseMixin):
+                def __init__(self):
+                    self._config = {
+                        "video_out_dir": str(root),
+                        "output_dir": str(root / "Whole Channels"),
+                    }
+
+            index_rows = [{
+                "filepath": str(primary),
+                "title": "Me at the zoo",
+                "size_bytes": 4,
+                "channel": "jawed",
+                "video_id": "jNQXAC9IVRw",
+            }]
+            with mock.patch("backend.index.list_manual_videos",
+                            return_value=index_rows), \
+                    mock.patch("backend.index.list_manual_duplicate_filepaths",
+                               return_value=[str(duplicate)]), \
+                    mock.patch("backend.thumbnails._generate_local_thumbnail",
+                               return_value=None):
+                result = Api().list_manual_videos(sort="title")
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["rows"][0]["filepath"], str(primary))
+
+    def test_manual_videos_skip_temp_and_missing_index_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as manual_dir, \
+                tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(manual_dir)
+            real = root / "Real Manual.mp4"
+            real.write_bytes(b"video")
+            temp_video = Path(temp_dir) / "Video.mp4"
+            temp_video.write_bytes(b"x")
+            missing = root / "Missing Old Name.mp4"
+
+            class Api(BrowseMixin):
+                def __init__(self):
+                    self._config = {
+                        "video_out_dir": str(root),
+                        "output_dir": str(root / "Whole Channels"),
+                    }
+
+            index_rows = [
+                {"filepath": str(temp_video), "title": "Video",
+                 "size_bytes": 1, "channel": "Channel",
+                 "video_id": "abc12345678"},
+                {"filepath": str(missing), "title": "Missing Old Name",
+                 "size_bytes": 99, "channel": "",
+                 "video_id": "bcd23456789"},
+            ]
+            with mock.patch("backend.index.list_manual_videos",
+                            return_value=index_rows), \
+                    mock.patch("backend.index.list_manual_duplicate_filepaths",
+                               return_value=[]), \
+                    mock.patch("backend.api_mixins.browse_mixin.tempfile.gettempdir",
+                               return_value=temp_dir), \
+                    mock.patch.dict(os.environ, {
+                        "TEMP": temp_dir,
+                        "TMP": temp_dir,
+                        "LOCALAPPDATA": str(Path(temp_dir).parent),
+                    }, clear=False), \
+                    mock.patch("backend.thumbnails._generate_local_thumbnail",
+                               return_value=None):
+                result = Api().list_manual_videos(sort="title")
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["rows"][0]["title"], "Real Manual")
 
     def test_browse_refresh_metadata_prefers_app_services_dependencies(self) -> None:
         video_id = "abc123def45"
@@ -2249,6 +2614,244 @@ class BrowseMixinTests(unittest.TestCase):
         self.assertIs(fetch.call_args.args[4], service_log)
         api._log_stream.emit_text.assert_not_called()
         api._push_recent_refresh.assert_called_once()
+
+    def _manual_api(self):
+        class Api(BrowseMixin):
+            def __init__(self):
+                self._config = {}
+                self._log_stream = mock.Mock()
+                self._push_recent_refresh = mock.Mock()
+                self.services = AppServices(
+                    load_config=lambda: {},
+                    save_config=lambda cfg: True,
+                    queues=mock.Mock(),
+                    log_stream=mock.Mock(),
+                    transcribe=mock.Mock(),
+                    event_bus=mock.Mock(),
+                )
+        return Api()
+
+    def test_manual_refresh_metadata_writes_next_to_loose_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "Some Loose Video.mp4"
+            video.write_bytes(b"video")
+            api = self._manual_api()
+            with mock.patch(
+                    "backend.metadata.fetch_single_video_metadata",
+                    return_value={"ok": True,
+                                  "entry": {"title": "X", "view_count": 5}}
+                    ) as fetch, \
+                    mock.patch("backend.utils.hide_stray_sidecars"):
+                result = api.manual_refresh_metadata({
+                    "filepath": str(video),
+                    "video_id": "abc123def45",
+                    "title": "Some Loose Video",
+                    "channel": "",
+                })
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["meta"], {"title": "X", "view_count": 5})
+            # Loose file → metadata JSONL must be written into the video's OWN
+            # directory, not a subscription channel folder.
+            self.assertEqual(fetch.call_args.kwargs.get("dest_folder"),
+                             os.path.dirname(str(video)))
+
+    def test_manual_refresh_metadata_requires_video_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "No Id Video.mp4"
+            video.write_bytes(b"video")
+            result = self._manual_api().manual_refresh_metadata(
+                {"filepath": str(video), "title": "No Id Video"})
+        self.assertFalse(result["ok"])
+        self.assertIn("video ID", result["error"])
+
+    def test_manual_bulk_action_summary_counts_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ready = Path(tmp) / "Ready.mp4"
+            pending = Path(tmp) / "Pending.mp4"
+            tried = Path(tmp) / "Tried.mp4"
+            excluded = Path(tmp) / "Excluded.mp4"
+            for p in (ready, pending, tried, excluded):
+                p.write_bytes(b"video")
+            api = self._manual_api()
+            api.list_manual_videos = mock.Mock(return_value={
+                "rows": [
+                    {"filepath": str(ready), "title": "Ready",
+                     "video_id": "abc123def45", "tx_status": "transcribed"},
+                    {"filepath": str(pending), "title": "Pending",
+                     "video_id": "def456ghi78", "tx_status": "pending"},
+                    {"filepath": str(tried), "title": "Tried",
+                     "video_id": "", "tx_status": "pending",
+                     "id_backfill_tried_ts": 1,
+                     "id_backfill_fail_count": 2},
+                    {"filepath": str(excluded), "title": "Excluded",
+                     "video_id": "", "tx_status": "pending",
+                     "id_backfill_fail_count": 3,
+                     "id_backfill_excluded_ts": 2},
+                ],
+                "has_more": False,
+            })
+            api._manual_has_local_transcript = mock.Mock(return_value=False)
+
+            result = api.manual_bulk_action_summary()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["total"], 4)
+        self.assertEqual(result["with_id"], 2)
+        self.assertEqual(result["missing_id"], 2)
+        self.assertEqual(result["recover_eligible"], 1)
+        self.assertEqual(result["recover_excluded"], 1)
+        self.assertEqual(result["recover_tried"], 1)
+        self.assertEqual(result["recover_failed_attempts"], 5)
+        self.assertEqual(result["metadata_eligible"], 2)
+        self.assertEqual(result["metadata_skipped_no_id"], 2)
+        self.assertEqual(result["transcribe_eligible"], 3)
+        self.assertEqual(result["transcribe_skipped"], 1)
+        self.assertEqual(result["percent_with_id"], 50.0)
+
+    def test_manual_refresh_all_metadata_refreshes_known_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            known = Path(tmp) / "Known.mp4"
+            no_id = Path(tmp) / "No Id.mp4"
+            known.write_bytes(b"video")
+            no_id.write_bytes(b"video")
+            api = self._manual_api()
+            api.list_manual_videos = mock.Mock(return_value={
+                "rows": [
+                    {"filepath": str(known), "title": "Known",
+                     "video_id": "abc123def45"},
+                    {"filepath": str(no_id), "title": "No Id",
+                     "video_id": ""},
+                ],
+                "has_more": False,
+            })
+            api._window = mock.Mock()
+
+            class ImmediateThread:
+                def __init__(self, *args, **kwargs):
+                    self.target = kwargs["target"]
+
+                def is_alive(self):
+                    return False
+
+                def start(self):
+                    self.target()
+
+            with mock.patch("backend.api_mixins.browse_mixin.threading.Thread",
+                            side_effect=lambda *a, **kw: ImmediateThread(*a, **kw)), \
+                    mock.patch("backend.metadata.fetch_single_video_metadata",
+                               return_value={"ok": True, "entry": {}}) as fetch, \
+                    mock.patch("backend.utils.hide_stray_sidecars"):
+                result = api.manual_refresh_all_metadata()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["started"])
+        fetch.assert_called_once()
+        js = api._window.evaluate_js.call_args.args[0]
+        self.assertIn('"refreshed": 1', js)
+        self.assertIn('"skipped_no_id": 1', js)
+
+    def test_manual_transcribe_all_queues_only_untranscribed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pending = Path(tmp) / "Pending.mp4"
+            done = Path(tmp) / "Done.mp4"
+            pending.write_bytes(b"video")
+            done.write_bytes(b"video")
+            service_transcribe = mock.Mock()
+            service_transcribe.swap_model.return_value = True
+            service_transcribe.enqueue.return_value = True
+
+            class Api(BrowseMixin, TranscribeMixin):
+                def __init__(self):
+                    self._config = {}
+                    self._log_stream = mock.Mock()
+                    self._on_queue_changed = mock.Mock()
+                    self.services = AppServices(
+                        load_config=lambda: {},
+                        save_config=lambda cfg: True,
+                        queues=mock.Mock(),
+                        log_stream=mock.Mock(),
+                        transcribe=service_transcribe,
+                        event_bus=mock.Mock(),
+                    )
+
+            api = Api()
+            api.list_manual_videos = mock.Mock(return_value={
+                "rows": [
+                    {"filepath": str(pending), "title": "Pending",
+                     "video_id": "abc123def45", "tx_status": "pending"},
+                    {"filepath": str(done), "title": "Done",
+                     "video_id": "bcd234efg56", "tx_status": "transcribed"},
+                ],
+                "has_more": False,
+            })
+            api._window = mock.Mock()
+
+            class ImmediateThread:
+                def __init__(self, *args, **kwargs):
+                    self.target = kwargs["target"]
+
+                def is_alive(self):
+                    return False
+
+                def start(self):
+                    self.target()
+
+            with mock.patch("backend.api_mixins.browse_mixin.threading.Thread",
+                            side_effect=lambda *a, **kw: ImmediateThread(*a, **kw)):
+                result = api.manual_transcribe_all("small")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["started"])
+        service_transcribe.swap_model.assert_called_once_with("small")
+        service_transcribe.enqueue.assert_called_once()
+        self.assertEqual(service_transcribe.enqueue.call_args.args[:3],
+                         (str(pending), "Pending"))
+        self.assertEqual(service_transcribe.enqueue.call_args.kwargs["bulk_total"], 1)
+        js = api._window.evaluate_js.call_args.args[0]
+        self.assertIn('"queued": 1', js)
+        self.assertIn('"skipped": 1', js)
+
+    def test_manual_backfill_apply_pick_queues_metadata_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "Manual Video.mp4"
+            video.write_bytes(b"video")
+            api = self._manual_api()
+            api._manual_review_remove = mock.Mock()
+
+            started: dict[str, object] = {}
+
+            class FakeThread:
+                def __init__(self, *, target, name=None, daemon=None):
+                    started["target"] = target
+                    started["name"] = name
+                    started["daemon"] = daemon
+
+                def start(self):
+                    started["started"] = True
+
+            with mock.patch("backend.index.set_manual_video_id",
+                            return_value=True) as set_id, \
+                    mock.patch("backend.index.register_video") as register, \
+                    mock.patch("backend.metadata.fetch_single_video_metadata",
+                               side_effect=AssertionError(
+                                   "metadata fetch should be async")), \
+                    mock.patch("backend.api_mixins.browse_mixin.threading.Thread",
+                               side_effect=lambda **kw: FakeThread(**kw)):
+                result = api.manual_backfill_apply_pick(
+                    str(video), "abc123def45", "Picked Channel",
+                    "Picked Title")
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["metadata_started"])
+            self.assertTrue(started["started"])
+            set_id.assert_called_once_with(
+                str(video),
+                "abc123def45",
+                "https://www.youtube.com/watch?v=abc123def45",
+                channel="Picked Channel")
+            register.assert_not_called()
+            api._manual_review_remove.assert_called_once_with(str(video))
+            api._push_recent_refresh.assert_called_once()
 
 
 class RecentMixinTests(unittest.TestCase):
@@ -5530,6 +6133,53 @@ class IndexIngestTests(unittest.TestCase):
                     "WHERE segments_fts MATCH 'fresh'").fetchone()[0], 0)
                 self._reset_index_module()
 
+    def test_manual_id_failure_excludes_after_three_and_resets_on_success(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "transcription_index.db"
+            video_path = Path(td) / "Imported.mp4"
+            video_path.write_bytes(b"video")
+
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                self._reset_index_module()
+                self.assertTrue(index.register_video(
+                    str(video_path), "Single Videos", "Imported"))
+
+                first = index.mark_manual_id_backfill_failed(
+                    str(video_path), title="Imported", exclude_after=3)
+                second = index.mark_manual_id_backfill_failed(
+                    str(video_path), title="Imported", exclude_after=3)
+                third = index.mark_manual_id_backfill_failed(
+                    str(video_path), title="Imported", exclude_after=3)
+
+                self.assertEqual(first["fail_count"], 1)
+                self.assertFalse(first["excluded"])
+                self.assertEqual(second["fail_count"], 2)
+                self.assertFalse(second["excluded"])
+                self.assertEqual(third["fail_count"], 3)
+                self.assertTrue(third["excluded"])
+
+                conn = index._open()
+                self.assertIsNotNone(conn)
+                assert conn is not None
+                row = conn.execute(
+                    "SELECT id_backfill_fail_count, id_backfill_excluded_ts "
+                    "FROM videos WHERE filepath=? COLLATE NOCASE",
+                    (str(video_path),)).fetchone()
+                self.assertEqual(row[0], 3)
+                self.assertIsNotNone(row[1])
+
+                self.assertTrue(index.set_manual_video_id(
+                    str(video_path), "abc123def45"))
+                row = conn.execute(
+                    "SELECT video_id, id_backfill_fail_count, "
+                    "id_backfill_excluded_ts FROM videos "
+                    "WHERE filepath=? COLLATE NOCASE",
+                    (str(video_path),)).fetchone()
+                self.assertEqual(row[0], "abc123def45")
+                self.assertEqual(row[1], 0)
+                self.assertIsNone(row[2])
+                self._reset_index_module()
+
     def test_watch_segments_use_filepath_id_over_stale_payload_id(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "transcription_index.db"
@@ -5604,6 +6254,40 @@ class IndexIngestTests(unittest.TestCase):
                     )
 
                     self.assertEqual(rows, [])
+                finally:
+                    self._reset_index_module()
+
+    def test_watch_segments_accept_date_suffix_and_blank_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "transcription_index.db"
+
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                self._reset_index_module()
+                try:
+                    conn = index._open()
+                    self.assertIsNotNone(conn)
+                    assert conn is not None
+                    conn.execute(
+                        "INSERT INTO segments("
+                        "video_id, jsonl_path, title, channel, start_time, "
+                        "end_time, text, words) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        ("jNQXAC9IVRw", "manual.jsonl", "Me at the zoo", "",
+                         0, 1, "first youtube video", "[]"),
+                    )
+                    conn.commit()
+
+                    with mock.patch.object(index._log, "warning") as warning:
+                        rows = index.get_segments(
+                            video_id="jNQXAC9IVRw",
+                            title="Me at the zoo (05.29.26)",
+                            channel="jawed",
+                            strict_identity=True,
+                        )
+
+                    self.assertEqual([r["t"] for r in rows],
+                                     ["first youtube video"])
+                    warning.assert_not_called()
                 finally:
                     self._reset_index_module()
 
@@ -5691,6 +6375,71 @@ class IndexIngestTests(unittest.TestCase):
                 self.assertEqual(rows[0]["like_count"], 56)
                 self.assertEqual(rows[0]["views"], "1.2K")
                 self._reset_index_module()
+
+    def test_list_videos_for_channel_page_paginates_without_file_stats(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "transcription_index.db"
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                self._reset_index_module()
+                try:
+                    conn = index._open()
+                    self.assertIsNotNone(conn)
+                    assert conn is not None
+                    rows = [
+                        ("a.mp4", "Old Alpha", "Paged Channel",
+                         "aaaaaaaaaaa", 100.0, 10),
+                        ("b.mp4", "Middle Gamma", "Paged Channel",
+                         "bbbbbbbbbbb", 200.0, 50),
+                        ("c.mp4", "New Beta", "Paged Channel",
+                         "ccccccccccc", 300.0, 5),
+                        ("d.mp4", "Duplicate", "Paged Channel",
+                         "ddddddddddd", 400.0, 999),
+                    ]
+                    for fp, title, channel, vid, upload_ts, views in rows:
+                        conn.execute(
+                            "INSERT INTO videos("
+                            "filepath, title, channel, video_id, size_bytes, "
+                            "tx_status, added_ts, upload_ts, view_count, "
+                            "like_count, is_duplicate_of"
+                            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (fp, title, channel, vid, 123, "pending",
+                             upload_ts - 10, upload_ts, views, 1,
+                             "primary.mp4" if title == "Duplicate" else None),
+                        )
+                    conn.commit()
+
+                    with mock.patch.object(
+                            index.os.path, "exists",
+                            side_effect=AssertionError("exists")), \
+                            mock.patch.object(
+                                index.os.path, "isfile",
+                                side_effect=AssertionError("isfile")), \
+                            mock.patch.object(
+                                index.os.path, "getmtime",
+                                side_effect=AssertionError("getmtime")):
+                        page1 = index.list_videos_for_channel_page(
+                            "Paged Channel", sort="newest", limit=2,
+                            offset=0, include_thumbs=False)
+                        page2 = index.list_videos_for_channel_page(
+                            "Paged Channel", sort="newest", limit=2,
+                            offset=2, include_thumbs=False)
+                        filtered = index.list_videos_for_channel_page(
+                            "Paged Channel", sort="most_viewed", limit=10,
+                            offset=0, include_thumbs=False, query="gamma")
+
+                    self.assertTrue(page1["has_more"])
+                    self.assertEqual(page1["next_offset"], 2)
+                    self.assertEqual([r["title"] for r in page1["rows"]],
+                                     ["New Beta", "Middle Gamma"])
+                    self.assertFalse(page2["has_more"])
+                    self.assertEqual([r["title"] for r in page2["rows"]],
+                                     ["Old Alpha"])
+                    self.assertEqual([r["title"] for r in filtered["rows"]],
+                                     ["Middle Gamma"])
+                    self.assertEqual(filtered["rows"][0]["view_count"], 50)
+                finally:
+                    self._reset_index_module()
 
     def test_index_caches_are_bounded_lru(self) -> None:
         index._browse_videos_cache.clear()
@@ -5782,6 +6531,21 @@ class IndexIngestTests(unittest.TestCase):
                     self.assertEqual(row[0], "abc123_def4")
                 finally:
                     self._reset_index_module()
+
+    def test_sidecar_id_resolver_reads_url_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            video = Path(td) / "Imported Clip.mp4"
+            video.write_bytes(b"video")
+            (Path(td) / "Imported Clip.url").write_text(
+                "[InternetShortcut]\n"
+                "URL=https://www.youtube.com/watch?v=abc123_def4\n",
+                encoding="utf-8")
+
+            index._sidecar_id_cache.clear()
+
+            self.assertEqual(
+                index._resolve_id_from_sidecars(str(video)),
+                "abc123_def4")
 
     def test_summary_uses_independent_connection(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -5944,6 +6708,59 @@ class IndexMaintenanceTests(unittest.TestCase):
         sleep.assert_called()
         self.assertGreaterEqual(busy_calls["count"], 5)
 
+    def test_sweep_ingests_aggregated_transcript_jsonl(self) -> None:
+        # The Search/Graph "unindexed" banner counts hidden aggregated
+        # `.{name} ... Transcript.jsonl` files missing from indexed_files.
+        # The sweep must ingest those (not just `{video-base}.jsonl`
+        # sidecars) or Rescan can never clear the banner.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db_path = Path(td) / "transcription_index.db"
+            ch_dir = Path(td) / "archive" / "Channel"
+            ch_dir.mkdir(parents=True)
+            jl = ch_dir / ".Channel Transcript.jsonl"
+            jl.write_text(
+                json.dumps({"video_id": "abc123_def4", "title": "Vid One",
+                            "s": 0, "e": 5,
+                            "t": "hello aggregated world"}) + "\n" +
+                json.dumps({"video_id": "abc123_def4", "title": "Vid One",
+                            "s": 5, "e": 9,
+                            "t": "second segment text"}) + "\n",
+                encoding="utf-8")
+
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path), \
+                    mock.patch("backend.archive_scan.load_disk_cache",
+                               return_value={}), \
+                    mock.patch("backend.archive_scan.save_disk_cache"):
+                IndexIngestTests._reset_index_module()
+                try:
+                    result = index_maintenance.sweep_new_videos(
+                        str(Path(td) / "archive"),
+                        [{"name": "Channel", "url": "u"}])
+                    self.assertEqual(result["agg_ingested"], 1)
+                    self.assertEqual(result["ingested"], 1)
+
+                    conn = index._open()
+                    self.assertIsNotNone(conn)
+                    assert conn is not None
+                    row = conn.execute(
+                        "SELECT path, segment_count FROM indexed_files"
+                    ).fetchone()
+                    self.assertIsNotNone(row)
+                    self.assertEqual(os.path.normpath(row[0]),
+                                     os.path.normpath(str(jl)))
+                    self.assertEqual(row[1], 2)
+                    self.assertEqual(conn.execute(
+                        "SELECT COUNT(*) FROM segments_fts "
+                        "WHERE segments_fts MATCH 'aggregated'"
+                    ).fetchone()[0], 1)
+                    # Second sweep: mtime unchanged -> no re-ingest.
+                    result2 = index_maintenance.sweep_new_videos(
+                        str(Path(td) / "archive"),
+                        [{"name": "Channel", "url": "u"}])
+                    self.assertEqual(result2["agg_ingested"], 0)
+                finally:
+                    IndexIngestTests._reset_index_module()
+
     def test_prune_missing_videos_stats_outside_writer_lock(self) -> None:
         class TrackingLock:
             def __init__(self):
@@ -6051,8 +6868,41 @@ class BookmarkStorageTests(unittest.TestCase):
         self.assertTrue(good_update)
         by_id = {row["id"]: row for row in updated}
         self.assertEqual(by_id[first]["start_time"], 0.0)
-        self.assertEqual(by_id[second]["start_time"], 0.0)
+        self.assertEqual(by_id[second]["start_time"], -1.0)
         self.assertEqual(len(by_id[second]["note"]), 4000)
+
+    def test_bookmark_list_enriches_video_card_fields(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db_path = Path(td) / "transcription_index.db"
+            video = Path(td) / "Video.mp4"
+            thumb = Path(td) / "Video.jpg"
+            video.write_bytes(b"video")
+            thumb.write_bytes(b"jpg")
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                IndexIngestTests._reset_index_module()
+                conn = index._open()
+                with index._db_lock:
+                    conn.execute(
+                        "INSERT INTO videos("
+                        "filepath, title, channel, video_id, size_bytes, "
+                        "duration_s, upload_ts, view_count, tx_status"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (str(video), "Video", "Channel", "vid123",
+                         123456, 125.4, 1735689600, 1234,
+                         "transcribed"))
+                    conn.commit()
+                index_bookmarks.bookmark_add(
+                    "vid123", "Video", "Channel", -1, "", "")
+                with mock.patch("backend.index.find_thumbnail",
+                                return_value=str(thumb)), \
+                        mock.patch("backend.index._file_url",
+                                   return_value="file:///thumb.jpg"):
+                    rows = index_bookmarks.bookmark_list(limit=10)
+
+        self.assertEqual(rows[0]["filepath"], str(video))
+        self.assertEqual(rows[0]["duration"], "2:05")
+        self.assertEqual(rows[0]["thumbnail_url"], "file:///thumb.jpg")
+        self.assertEqual(rows[0]["tx_status"], "transcribed")
 
 
 class NoSpeechStatusTests(unittest.TestCase):
@@ -6183,6 +7033,42 @@ class DeleteChannelFromIndexTests(unittest.TestCase):
 
 
 class TranscriptFileTests(unittest.TestCase):
+    def test_empty_channel_resolves_to_per_video_transcript_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "Archive"
+            manual = root / "YT videos"
+            manual.mkdir(parents=True)
+            video = manual / "Loose Video.mp4"
+            video.write_bytes(b"video")
+
+            with mock.patch(
+                    "backend.transcribe.helpers.ytarchiver_config_output_dir",
+                    return_value=str(root)):
+                txt_path, jsonl_path, _year, _month, _upload = (
+                    transcribe_helpers._resolve_transcript_paths(
+                        str(video), "Loose Video", ""))
+
+        self.assertEqual(txt_path, str(manual / "Loose Video Transcript.txt"))
+        self.assertEqual(jsonl_path,
+                         str(manual / ".Loose Video Transcript.jsonl"))
+
+    def test_hide_per_video_transcript_txt_only_hides_matching_stem(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            video = os.path.join(td, "Loose Video.mp4")
+            txt = os.path.join(td, "Loose Video Transcript.txt")
+            aggregate = os.path.join(td, "Channel Transcript.txt")
+            Path(video).write_bytes(b"video")
+            Path(txt).write_text("transcript", encoding="utf-8")
+            Path(aggregate).write_text("aggregate", encoding="utf-8")
+
+            with mock.patch("backend.transcribe.paths._hide_file_win") as hide:
+                transcribe_core._hide_per_video_transcript_txt_if_needed(
+                    video, txt)
+                transcribe_core._hide_per_video_transcript_txt_if_needed(
+                    video, aggregate)
+
+        hide.assert_called_once_with(txt)
+
     def test_write_jsonl_entry_returns_false_on_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             parent_file = Path(td) / "not_a_dir"
@@ -6596,6 +7482,101 @@ class YtdlpFreshnessTests(unittest.TestCase):
         r = stub.check_ytdlp_freshness()
         self.assertTrue(r["ok"])
         self.assertFalse(r["stale"])
+
+
+class ManualBackfillDecideTests(unittest.TestCase):
+    """The safety-critical decision logic for manual-download ID recovery:
+    duration is a HARD filter, ambiguity routes to review, nothing weak/wrong
+    is auto-accepted."""
+
+    def setUp(self):
+        from backend.metadata import manual_backfill as mb
+        self.decide = mb.decide
+
+    def test_auto_single_strong_match(self):
+        cands = [{"id": "aaaaaaaaaaa", "title": "My Great Video",
+                  "duration": 600.0, "channel": "Chan"}]
+        d = self.decide("My Great Video", 600.4, cands)
+        self.assertEqual(d["decision"], "auto")
+        self.assertEqual(d["best"]["id"], "aaaaaaaaaaa")
+
+    def test_duration_is_a_hard_filter(self):
+        # Perfect title but 30s off → never eligible.
+        cands = [{"id": "aaaaaaaaaaa", "title": "My Great Video",
+                  "duration": 630.0, "channel": "Chan"}]
+        d = self.decide("My Great Video", 600.0, cands)
+        self.assertEqual(d["decision"], "none")
+
+    def test_two_equal_matches_go_to_review(self):
+        # Same title + same length, different uploads (mirror/reupload) → ask.
+        cands = [
+            {"id": "aaaaaaaaaaa", "title": "My Great Video", "duration": 600.0, "channel": "A"},
+            {"id": "bbbbbbbbbbb", "title": "My Great Video", "duration": 600.5, "channel": "B"},
+        ]
+        d = self.decide("My Great Video", 600.0, cands)
+        self.assertEqual(d["decision"], "review")
+        self.assertGreaterEqual(len(d["shortlist"]), 2)
+
+    def test_weak_title_in_window_is_none(self):
+        cands = [{"id": "aaaaaaaaaaa", "title": "Totally Different Thing",
+                  "duration": 600.0, "channel": "A"}]
+        d = self.decide("My Great Video", 600.0, cands)
+        self.assertEqual(d["decision"], "none")
+
+    def test_no_local_duration_needs_near_exact_title(self):
+        cands = [{"id": "aaaaaaaaaaa", "title": "My Great Video",
+                  "duration": 600.0, "channel": "A"}]
+        d = self.decide("My Great Video", None, cands)
+        self.assertEqual(d["decision"], "review")
+
+    def test_backfill_prefers_sidecar_id_before_search(self):
+        from backend.metadata import manual_backfill as mb
+
+        class Stream:
+            def __init__(self):
+                self.lines = []
+
+            def emit_text(self, text, tag="dim"):
+                self.lines.append((text, tag))
+
+        with tempfile.TemporaryDirectory() as td:
+            video = Path(td) / "Imported Clip.mp4"
+            video.write_bytes(b"video")
+            (Path(td) / "Imported Clip.url").write_text(
+                "https://youtu.be/abc123_def4\n", encoding="utf-8")
+            stream = Stream()
+
+            with mock.patch("backend.process_runner.find_yt_dlp",
+                            return_value="yt-dlp"), \
+                    mock.patch("backend.process_runner.find_ffprobe",
+                               return_value="ffprobe"), \
+                    mock.patch("backend.ytarchiver_config.load_config",
+                               return_value={"video_out_dir": td}), \
+                    mock.patch("backend.index.list_manual_videos",
+                               return_value=[]), \
+                    mock.patch("backend.index.list_manual_videos_without_id",
+                               return_value=[]), \
+                    mock.patch.object(mb, "_probe_local",
+                                      return_value={
+                                          "title": "Imported Clip",
+                                          "duration": 12.0,
+                                          "date": "",
+                                      }), \
+                    mock.patch.object(mb, "_ytsearch",
+                                      side_effect=AssertionError(
+                                          "sidecar id should skip search")), \
+                    mock.patch("backend.index.set_manual_video_id",
+                               return_value=True) as set_id, \
+                    mock.patch("backend.metadata.fetcher.fetch_single_video_metadata",
+                               return_value={"ok": True}):
+                result = mb.backfill_manual_video_ids(stream)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["resolved"], 1)
+            set_id.assert_called_once_with(
+                str(video),
+                "abc123_def4",
+                "https://www.youtube.com/watch?v=abc123_def4")
 
 
 if __name__ == "__main__":

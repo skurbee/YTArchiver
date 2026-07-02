@@ -74,6 +74,15 @@ def _ensure_fail_count_column(conn) -> None:
 _log = get_logger(__name__)
 
 
+def _invalidate_browse_thumbnail_cache(channel_name: str) -> None:
+    """Drop Browse caches after a thumbnail sidecar is written."""
+    try:
+        from .. import index as _idx
+        _idx.invalidate_channel_videos(channel_name or None)
+    except Exception as e:
+        swallow("browse thumbnail cache invalidation", e)
+
+
 def _enter_pause_wait(stream: LogStreamer, label: str, queues) -> None:
     """Worker hit a pause-wait. Routes through pause_helpers.emit_paused."""
     from ..pause_helpers import emit_paused
@@ -258,6 +267,7 @@ def fetch_single_video_metadata(channel: dict[str, Any],
                                 stream: LogStreamer,
                                 emit_inline_log: bool = True,
                                 refresh: bool = False,
+                                dest_folder: str | None = None,
                                 ) -> dict[str, Any]:
     """Fetch metadata for ONE just-downloaded video, inline per-video.
 
@@ -281,7 +291,11 @@ def fetch_single_video_metadata(channel: dict[str, Any],
     if not video_id or not file_path:
         return {"ok": False, "error": "missing id or path"}
 
-    folder = _folder_for_channel(channel)
+    # `dest_folder` (manual/loose single-video refresh) writes the metadata
+    # JSONL straight into the video's OWN folder instead of a subscription
+    # channel folder — that's where browse_get_video_metadata's filepath-walk
+    # looks, so a loose download outside the channel tree still gets metadata.
+    folder = dest_folder or _folder_for_channel(channel)
     if folder is None:
         return {"ok": False, "error": "no output_dir"}
 
@@ -355,12 +369,28 @@ def fetch_single_video_metadata(channel: dict[str, Any],
 
     # Thumbnail (best-effort). Stream passed through so fetch errors
     # surface as verbose-only dim log lines instead of disappearing.
+    thumb_saved = False
     if entry.get("thumbnail_url"):
         thumb_dir = _ensure_thumbnails_dir(subfolder)
-        _download_thumbnail(
+        thumb_saved = _download_thumbnail(
             entry["thumbnail_url"], thumb_dir,
             title_hint or entry.get("title", ""), video_id,
             stream=stream if emit_inline_log else None)
+    if thumb_saved:
+        _invalidate_browse_thumbnail_cache(name)
+
+    # Keep the materialized Browse/Manual stats current for single-video
+    # metadata refreshes too. Bulk refreshes already write these columns, but
+    # this per-video path is what Manual Downloads uses.
+    try:
+        from .. import index as _idx_db
+        _idx_db.update_video_stats([(
+            video_id,
+            entry.get("view_count"),
+            entry.get("like_count"),
+        )])
+    except Exception as e:
+        swallow("single metadata stats update", e)
 
     if emit_inline_log:
         # Per-video metadata done line. Matches the three-line simple-mode
@@ -466,6 +496,7 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
     total = sum(len(g["videos"]) for g in groups.values())
     t0 = time.time()
     fetched = skipped = errors = refreshed = thumb_only = 0
+    thumbs_changed = False
     idx = 0
 
     # Sticky active status line pinned at the bottom of the log while
@@ -888,9 +919,10 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                 except Exception as e:
                     swallow("fail-count reset after successful fetch", e)
             if entry.get("thumbnail_url"):
-                _download_thumbnail(entry["thumbnail_url"], thumb_dir,
-                                    title or entry.get("title", ""), vid_id,
-                                    stream=stream)
+                if _download_thumbnail(entry["thumbnail_url"], thumb_dir,
+                                       title or entry.get("title", ""), vid_id,
+                                       stream=stream):
+                    thumbs_changed = True
 
         if changed:
             try:
@@ -912,6 +944,9 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
     # X — N fetched ..." footer doesn't sit below a phantom "Fetching
     # Metadata: X..." line that's no longer accurate.
     _clear_active()
+
+    if thumbs_changed:
+        _invalidate_browse_thumbnail_cache(name)
 
     elapsed = time.time() - t0
     summary_parts = []

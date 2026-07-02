@@ -106,15 +106,16 @@
         if (target === "subs" && typeof window._clearSubsFilter === "function") {
           window._clearSubsFilter();
         }
-        // Returning to Browse: the Videos sub-grid is a one-time render that
-        // doesn't re-query on its own, so a download that landed while the
-        // user was on another tab wouldn't appear until they changed the sort.
-        // Re-check page 1 on return and re-render only if it actually changed
-        // (no-op + no flash when nothing was added). rAF so the panel's
-        // visibility has settled before the active-view check runs.
-        if (target === "browse" && typeof window._refreshVideosViewIfActive === "function") {
+        // Returning to Browse: the grids are one-time renders that don't
+        // re-query on their own, so a download that landed while the user was
+        // on another tab wouldn't appear until they changed the sort. Re-check
+        // on return and re-render only if something actually changed (no-op +
+        // no flash otherwise). With the background updates the grids are
+        // usually already current, so this is a cheap safety net. rAF so the
+        // panel's visibility has settled before the active-view checks run.
+        if (target === "browse" && typeof window._onBrowseDownloadLanded === "function") {
           requestAnimationFrame(() => {
-            try { window._refreshVideosViewIfActive(); } catch (_e) { /* non-fatal */ }
+            try { window._onBrowseDownloadLanded(null); } catch (_e) { /* non-fatal */ }
           });
         }
         // Clear any lingering row-selected highlights when switching

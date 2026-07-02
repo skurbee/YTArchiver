@@ -49,6 +49,11 @@ def _managed_root_for(path: str) -> str:
     output_dir = (cfg.get("output_dir") or "").strip()
     if output_dir:
         roots.append(output_dir)
+    # Single-video downloads live here, outside the channel tree (mirrors
+    # is_within_managed_roots so containment stays consistent).
+    video_out_dir = (cfg.get("video_out_dir") or "").strip()
+    if video_out_dir:
+        roots.append(video_out_dir)
     roots.extend(str(r) for r in (cfg.get("tp_archive_roots") or []) if r)
     try:
         target = os.path.normcase(os.path.realpath(path))

@@ -56,8 +56,8 @@ def check_disk_space(path: str, required_bytes: int) -> bool:
 
 def is_within_managed_roots(path: str) -> bool:
     """True if `path` resolves to a location under one of the archive roots
-    this app manages: the global output_dir, any per-channel output_dir, and
-    the tp_archive_roots (index-only roots). Used to gate destructive
+    this app manages: the global output_dir, the single-video video_out_dir,
+    and the tp_archive_roots (index-only roots). Used to gate destructive
     os.remove calls that originate from the JS bridge (the trust boundary),
     so a crafted/compromised filepath can't drive a delete outside the
     archive. Fail-closed: returns False when no roots are configured or the
@@ -73,6 +73,13 @@ def is_within_managed_roots(path: str) -> bool:
     _g = (cfg.get("output_dir") or "").strip()
     if _g:
         roots.append(_g)
+    # Single-video ("manual") downloads land in video_out_dir, which sits
+    # OUTSIDE the channel archive tree. Without it here, the Browse > Manual
+    # view couldn't play any of them ("Refusing to operate on a file outside
+    # the archive"). It's an app-managed download location, so include it.
+    _v = (cfg.get("video_out_dir") or "").strip()
+    if _v:
+        roots.append(_v)
     # (Channels don't store their own output_dir — their folders nest under
     # the global output_dir added above, so no per-channel root is needed.)
     for _r in (cfg.get("tp_archive_roots") or []):

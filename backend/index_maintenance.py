@@ -353,6 +353,46 @@ def sweep_new_videos(output_dir: str, channels: list,
                     and "size_bytes" in existing_row):
                 existing_row["sweep_fingerprint"] = post_walk_fp or current_fp
 
+    # ── Aggregated transcript sidecars ──────────────────────────────
+    # The per-channel walk above only ingests `{video-base}.jsonl`
+    # sidecars, but the transcribe pipeline writes aggregated hidden
+    # `.{name} ... Transcript.jsonl` files — and the Search/Graph
+    # "unindexed" banner (index_unindexed_count) counts exactly those.
+    # Any aggregated jsonl created or touched outside the live
+    # transcribe path (caption repair, punct restore, folder reorg,
+    # files added while the app was closed) was invisible to this
+    # sweep, so the banner stayed stuck at "N transcript files aren't
+    # yet in the search index" no matter how many times the user hit
+    # Rescan. Walk them here with the same filename filter the banner
+    # uses, ignoring the fingerprint skip above (these files may
+    # predate the stamped fingerprints).
+    agg_ingested = 0
+    try:
+        for dp, _dns, fns in _os.walk(output_dir):
+            for fn in fns:
+                if not (fn.startswith(".")
+                        and fn.endswith("Transcript.jsonl")):
+                    continue
+                _wait_while_busy()
+                jp = _os.path.normpath(_os.path.join(dp, fn))
+                if not _jsonl_needs_ingest(sweep_conn, jp):
+                    continue
+                rel = _os.path.relpath(dp, output_dir)
+                agg_ch = rel.split(_os.sep)[0] if rel != "." else ""
+                # `.Foo Transcript.jsonl` -> visible `Foo Transcript.txt`
+                root_name = fn[1:-len(".jsonl")]
+                txt_fp = _os.path.join(dp, root_name + ".txt")
+                try:
+                    if _idx.ingest_jsonl(txt_fp, jp, root_name, agg_ch,
+                                         _conn_override=sweep_conn):
+                        agg_ingested += 1
+                        ingested += 1
+                except Exception as e:
+                    _log.debug("aggregated jsonl ingest failed (%s): %s",
+                               jp, e)
+    except Exception as e:
+        _log.warning("aggregated transcript sweep failed: %s", e)
+
     # Persist the updated fingerprints by MERGING into a FRESH load —
     # never by saving our start-of-sweep snapshot. The sweep walks for
     # minutes while sync's update_disk_cache_for_channel and
@@ -385,6 +425,7 @@ def sweep_new_videos(output_dir: str, channels: list,
         _log.debug("swallowed: %s", e)
 
     return {"registered": registered, "ingested": ingested,
+            "agg_ingested": agg_ingested,
             "id_backfilled": id_backfilled,
             "skipped_unchanged": skipped_unchanged,
             "walked": total_ch - skipped_unchanged}

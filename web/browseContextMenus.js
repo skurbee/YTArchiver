@@ -299,7 +299,7 @@
               // Manual → Whisper model picker (60s countdown auto-picks default).
               const model = await (window._askWhisperModel?.(`"${title}"`));
               if (model === null) return;
-              api?.transcribe_enqueue?.(filepath, title);
+              api?.transcribe_enqueue?.(filepath, title, model || "");
               window._showToast?.("Queued for whisper.", "ok");
             }
           }},
@@ -414,7 +414,7 @@
             if (filepath && nativeBridgeUp()) {
               const model = await (window._askWhisperModel?.(`"${title}"`));
               if (model === null) return;
-              api?.transcribe_enqueue?.(filepath, title);
+              api?.transcribe_enqueue?.(filepath, title, model || "");
               window._showToast?.("Queued for whisper.", "ok");
             }
           }},
@@ -436,6 +436,89 @@
             bridgeCall("video_redownload", videoId, title, _res);
             window._showToast?.(`Redownload queued at ${_res}.`, "ok");
           }}] : []),
+          { sep: true },
+          { label: "Delete file", cls: "dim",
+            action: () => bridgeCall("video_delete_file", filepath) },
+        ];
+        showContextMenu(e.clientX, e.clientY, items);
+      });
+    }
+
+    // Manual Downloads grid — single/loose downloads. Same .video-card class
+    // as the Videos grid, but "Refresh metadata" routes through
+    // manual_refresh_metadata (writes the JSONL next to the loose file; the
+    // channel-scoped refresh hard-fails on non-subscription rows). Metadata +
+    // YouTube links are gated on a known video_id; Redownload is omitted (it
+    // needs a subscription channel). Transcribe/Re-transcribe work on any file.
+    const manualGrid = document.getElementById("manual-grid");
+    if (manualGrid) {
+      manualGrid.addEventListener("contextmenu", (e) => {
+        const card = e.target.closest(".video-card");
+        if (!card) return;
+        e.preventDefault();
+        const filepath = card.dataset.filepath || "";
+        const videoId = card.dataset.videoId || "";
+        const title = card.dataset.title || "";
+        const channel = card.dataset.channel || "";
+        const ytUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : "";
+        const api = window.YT?.api;
+        const items = [
+          { label: "Play video", action: () => {
+            if (filepath && typeof window._openVideoInWatch === "function") {
+              window._openVideoInWatch({ title, channel, filepath, video_id: videoId });
+            } else if (filepath && nativeBridgeUp()) {
+              api?.browse_open_video?.(filepath);
+            }
+          }},
+          ...(ytUrl ? [
+            { label: "Open on YouTube", action: () => window.open(ytUrl, "_blank") },
+            { label: "Copy YouTube URL", action: () => {
+              navigator.clipboard?.writeText(ytUrl);
+              window._showToast?.("URL copied.", "ok");
+            }},
+          ] : []),
+          { label: "Show in Explorer", action: () => {
+            if (filepath) api?.browse_show_in_explorer?.(filepath);
+          }},
+          ...(videoId ? [{ label: "Bookmark video",
+            action: () => _bookmarkVideo({ videoId, title, channel }) }] : []),
+          { sep: true },
+          // Metadata refresh only when we have a video_id to fetch by.
+          ...(videoId ? [{ label: "Refresh metadata", action: async () => {
+            if (!nativeBridgeUp()) {
+              window._showToast?.("Refresh unavailable.", "warn");
+              return;
+            }
+            window._showToast?.({ msg: "Refreshing metadata…", ttlMs: 15000 });
+            try {
+              const res = await api?.manual_refresh_metadata?.(
+                { filepath, video_id: videoId, title, channel });
+              if (res?.ok) {
+                window._showToast?.("Metadata refreshed.", "ok");
+              } else {
+                window._showToast?.(res?.error || "Refresh failed.",
+                                    res?.transient ? "warn" : "error");
+              }
+            } catch (err) {
+              window._showToast?.(`Refresh failed: ${err?.message || err}`, "error");
+            }
+          }}] : []),
+          { label: "Transcribe now", action: async () => {
+            if (filepath && nativeBridgeUp()) {
+              const model = await (window._askWhisperModel?.(`"${title}"`));
+              if (model === null) return;
+              api?.transcribe_enqueue?.(filepath, title, model || "");
+              window._showToast?.("Queued for whisper.", "ok");
+            }
+          }},
+          { label: "Re-transcribe…", action: async () => {
+            if (!filepath || !nativeBridgeUp()) return;
+            const model = await (window._askWhisperModel?.(`"${title}"`));
+            if (!model) return;
+            const res = await api?.transcribe_retranscribe?.(filepath, title, videoId || "");
+            if (res?.ok) window._showToast?.(`Queued ${model} re-transcription.`, "ok");
+            else window._showToast?.(res?.error || "Re-transcribe failed.", "error");
+          }},
           { sep: true },
           { label: "Delete file", cls: "dim",
             action: () => bridgeCall("video_delete_file", filepath) },

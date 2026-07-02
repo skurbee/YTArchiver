@@ -64,6 +64,31 @@ from ..log import get_logger
 _log = get_logger(__name__)
 
 
+def _hide_per_video_transcript_txt_if_needed(video_path: str,
+                                             txt_path: str) -> None:
+    """Hide loose/manual per-video Transcript.txt sidecars.
+
+    Channel aggregate transcripts are intentionally visible, but manual single
+    videos write `<video stem> Transcript.txt` next to the media file. Those
+    should behave like metadata/jsonl sidecars in Explorer.
+    """
+    try:
+        video_dir = os.path.normcase(os.path.normpath(
+            os.path.dirname(video_path)))
+        txt_dir = os.path.normcase(os.path.normpath(os.path.dirname(txt_path)))
+        if video_dir != txt_dir:
+            return
+        stem = os.path.splitext(os.path.basename(video_path))[0]
+        stem = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", stem) or stem
+        expected = f"{stem} Transcript.txt"
+        if os.path.normcase(os.path.basename(txt_path)) != os.path.normcase(expected):
+            return
+        from .paths import _hide_file_win
+        _hide_file_win(txt_path)
+    except Exception as e:
+        _log.debug("manual transcript txt hide failed: %s", e)
+
+
 # path + format + hide helpers moved to
 # transcribe/paths.py. Re-imported here so internal calls and external
 # `from backend.transcribe import _foo` callers keep working.
@@ -2575,11 +2600,13 @@ class TranscribeManager:
                 # (or re-marking the video transcribed) would certify
                 # a state the visible transcript doesn't match.
                 return
+            _hide_per_video_transcript_txt_if_needed(video_path, txt_path)
         else:
             if not _write_transcript_entry(txt_path, title, upload_date,
                                            duration, source_tag, text):
                 self._stream.emit_error(f"Could not write transcript to {txt_path}")
                 return
+            _hide_per_video_transcript_txt_if_needed(video_path, txt_path)
             if not _write_jsonl_entry(jsonl_path, vid_id, title, segs):
                 self._stream.emit_error(
                     f"Could not write transcript JSONL to {jsonl_path} "

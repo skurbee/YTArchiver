@@ -12,9 +12,9 @@ A tour of the UI is on the [**wiki**](https://github.com/skurbee/YTArchiver/wiki
 
 * **Channel subscriptions** — add channels to a sub list with per-channel settings
 * **Selective archiving** — set a start date, grab the full history, or only pull new uploads
-* **Auto-sync** — set a recurring interval (1hr, 3hr, 6hr, etc.) to automatically check all subbed channels for new videos
+* **Auto-sync** — set a recurring interval (30 min, 1 hr, on up to 24 hr) to automatically check all subbed channels for new videos
 * **Duration filters** — exclude Shorts, livestreams, or long-form videos by setting min/max duration limits
-* **Resolution control** — per-channel resolution settings (144p–1080p, or "best")
+* **Resolution control** — per-channel resolution settings (up to 2160p / 4K, or "best")
 * **Redownload** — change a channel's resolution and retroactively redownload all videos at the new setting
 * **Resumable downloads** — ID caching, so interrupted syncs pick back up without re-scanning
 * **Cookie support** — uses Firefox cookies for age-restricted or member content, and helps avoid IP rate-limiting
@@ -59,8 +59,9 @@ A tour of the UI is on the [**wiki**](https://github.com/skurbee/YTArchiver/wiki
 
 ### UI & Workflow
 
-* **Four-tab layout** — Download, Subs, Browse, Settings
-* **Settings categories** — General / Performance / Appearance / Tools / Index sub-tabs
+* **Five-tab layout** — Download, Subs, Browse, Health, Settings
+* **Health tab** — library maintenance and status in one place: Metadata, Index, and Tools dashboards and actions
+* **Settings** — a single page of real preferences (General / Performance / Appearance sections)
 * **Simple / Verbose log modes** — toggle between a readable sync view and full yt-dlp output
 * **Pause / resume** — pause active downloads or transcriptions mid-session and resume without losing progress
 * **Processing task queue** — transcription and compression jobs run in their own reorderable queue, separate from downloads

@@ -26,6 +26,15 @@
     const sel = document.getElementById("auto-sync-select");
     const cd = document.getElementById("autorun-countdown");
     if (!sel) return;
+    // Enhance the native <select> into the custom yt-dd widget. Styled
+    // native selects in pywebview/Chromium don't repaint their closed
+    // label when `.value` is set programmatically, so the interval saved
+    // in config (autorun_interval) rendered as "Off" at every launch even
+    // though the scheduler was already armed — the user re-picked it each
+    // time. dropdown.js only auto-enhances `.settings-view` selects, so
+    // this one (in the download controls row) was missed. Enhance it here
+    // and repaint after fetchAnchor sets the value below.
+    try { window.enhanceSelect?.(sel); } catch (e) { /* non-fatal */ }
     // When Auto-sync is enabled, the Sync Tasks "Auto" checkbox MUST stay
     // checked — otherwise the timer fires, items get queued, and nothing
     // runs them (reported quirk). Lock the checkbox on (and reflect the
@@ -83,6 +92,11 @@
           anchored_at_ms: Date.now(),
         };
         if (sel.value !== st.label) sel.value = st.label;
+        // Force the yt-dd trigger label to match the just-set value —
+        // programmatic `.value` changes don't emit `change`, so the
+        // widget's own listener never fires and the label would stay
+        // stuck at the HTML default ("Off").
+        try { sel._ytddRepaint?.(); } catch (e) { /* non-fatal */ }
         reconcileSyncAutoLock(st.label !== "Off");
       } catch (e) {
         // Null the anchor so a failed fetch doesn't leave a stale
@@ -141,7 +155,24 @@
       } catch (e) { window._showToast?.("Error: " + e, "error"); }
       finally { _selChangeInFlight = false; }
     });
-    fetchAnchor().then(paint);
+    // Initial load. initAutorun runs at DOMContentLoaded, which can be
+    // BEFORE pywebview injects window.pywebview.api — in that case
+    // fetchAnchor() bails on the nativeBridgeUp() guard and the dropdown
+    // stays at its default "Off" even though autorun_interval is saved
+    // (the user then re-picks it every launch, thinking it didn't save).
+    // Gate the first fetch on the bridge-ready promise, with an immediate
+    // attempt first for the already-up case. Mirrors the pywebviewready
+    // retry pattern used by columnWidth.js / browseContent.js.
+    const _initialLoad = () => fetchAnchor().then(paint);
+    _initialLoad();
+    if (!nativeBridgeUp()) {
+      const _ready = window.YT?.bridge?.ready;
+      if (_ready && typeof _ready.then === "function") {
+        _ready.then(_initialLoad);
+      } else {
+        window.addEventListener("pywebviewready", _initialLoad, { once: true });
+      }
+    }
     // Capture interval ids + clean up on beforeunload so they don't
     // leak across pywebview reloads (audit: autoSync.js H140).
     const _paintIv = setInterval(paint, 1000);

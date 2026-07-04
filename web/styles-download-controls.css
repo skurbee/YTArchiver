@@ -496,6 +496,19 @@
   border-color: var(--c-accent);
 }
 
+/* Auto-sync dropdown is enhanced into the yt-dd widget (see autoSync.js).
+   dropdown.js's own hide rule is scoped to `.settings-view`, so hide the
+   now-redundant native original here, and shrink the widget to match this
+   row's compact native controls instead of the taller Settings sizing. */
+#auto-sync-select.yt-dd-enhanced { display: none !important; }
+.controls-row-thin .yt-dd {
+  min-width: 84px;
+  height: 26px;
+  font-size: var(--fs-sm);
+  border-radius: 2px;
+}
+.controls-row-thin .yt-dd-trigger { padding: 0 6px; }
+
 .spacer { flex: 1; }
 
 /* Index tab control row (rescan / rebuild FTS / refresh) */

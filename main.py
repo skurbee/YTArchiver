@@ -1338,6 +1338,12 @@ def main():
         "min_size": (640, 480),
         "background_color": "#0f1012",
         "resizable": True,
+        # Create the window already hidden when launched via the boot
+        # Registry entry's `--start-minimized` flag. Doing it at create
+        # time is reliable; the post-load `window.hide()` in
+        # _startup_checks alone let the WebView2 window flash/stay visible
+        # on boot because the window is shown before that callback runs.
+        "hidden": _start_minimized,
     }
     if ws.get("x") is not None and ws.get("y") is not None:
         kwargs["x"] = int(ws["x"])

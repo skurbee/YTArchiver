@@ -104,7 +104,7 @@ class QueueMixin:
                 except Exception as e: _log.debug("swallowed: %s", e)
                 try:
                     self._queue_log_stream().emit_text(
-                        " - GPU Auto enabled — queue will drain.",
+                        " - Auto-processing enabled — queue will drain.",
                         "simpleline_green")
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
@@ -116,7 +116,7 @@ class QueueMixin:
                 # re-enable Auto or click Start in the GPU Tasks popover.
                 try:
                     self._queue_log_stream().emit_text(
-                        " - GPU Auto disabled — incoming transcriptions "
+                        " - Auto-processing disabled — incoming transcriptions "
                         "will queue. (In-flight job finishes first.)",
                         "simpleline_blue")
                 except Exception as e:
@@ -327,3 +327,31 @@ class QueueMixin:
             "sync": bool(queues.sync_paused),
             "gpu": bool(queues.gpu_paused),
         }
+
+
+    def gpu_start(self, which="gpu"):
+        """One-shot 'Start' for the Processing queue: drain the backlog now
+        even though Auto is off, WITHOUT re-enabling Auto. Auto stays the
+        user's manual gate — new arrivals keep queuing until they click Start
+        again. Also clears any lingering pause so a paused-at-launch queue
+        starts cleanly. (`which` accepted for call-signature symmetry with
+        queue_pause/queue_resume; the Processing queue is the only drainable
+        one.)"""
+        queues = self._queue_state()
+        queues.set_gpu_paused(False)
+        try:
+            self._queue_transcribe().request_drain()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        try:
+            self._on_queue_changed()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        try:
+            self._queue_log_stream().emit_text(
+                " - Processing started — draining the queue. "
+                "(Auto stays off.)",
+                "simpleline_green")
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        return {"ok": True}

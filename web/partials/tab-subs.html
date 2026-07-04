@@ -44,6 +44,19 @@
                 title="Delete all selected channels">Delete&hellip;</button>
       </div>
 
+      <!-- Compact always-visible legend for the Transcribe / Metadata
+           mark columns (the "A ✓" shorthand is opaque otherwise) plus a
+           hint that the headers sort. Full detail stays in each header's
+           hover tooltip. -->
+      <div class="subs-legend">
+        <span class="subs-legend-label">Transcribe / Metadata:</span>
+        <span><b>A&nbsp;&#10003;</b> auto&nbsp;on&nbsp;&amp;&nbsp;complete</span>
+        <span><b>&#10003;</b> complete&nbsp;(manual)</span>
+        <span><b>&mdash;&nbsp;-N</b> N&nbsp;behind</span>
+        <span><b>&mdash;</b> off</span>
+        <span class="subs-legend-hint">Click a column header to sort.</span>
+      </div>
+
       <!-- Channel table -->
       <div class="subs-table-frame">
         <table class="subs-table" id="subs-table">
@@ -59,6 +72,7 @@
             <col class="col-num"/>
             <col class="col-num"/>
             <col class="col-num"/>
+            <col class="col-actions"/>
           </colgroup>
           <thead>
             <!-- data-sort keys must match the kinds map in wireTableSort
@@ -80,6 +94,7 @@
               <th data-sort="n_vids"># Vids</th>
               <th data-sort="size">Size</th>
               <th data-sort="avg_size" title="Average file size = total size / # videos">Avg</th>
+              <th class="col-actions" data-nosort aria-label="Row actions"></th>
             </tr>
           </thead>
           <tbody id="subs-table-body"></tbody>
@@ -103,15 +118,19 @@
              without shoving subsequent labels into the wrong cell. -->
         <div class="edit-form">
 
-          <!-- Row 1: Folder Name + Channel URL side-by-side -->
+          <!-- Row 1: Channel URL + Folder Name side-by-side. URL comes
+               FIRST because it's the thing the user has on the clipboard;
+               the Folder Name auto-fills from it (editChannel.js
+               _maybeAutoFillFolder), so it's the second, usually-untouched
+               field. -->
           <div class="edit-row">
-            <div class="edit-field edit-field-grow">
-              <label class="edit-gl">Folder Name</label>
-              <input type="text" class="ctl-input" id="edit-folder" placeholder="Target folder name" />
-            </div>
             <div class="edit-field edit-field-grow">
               <label class="edit-gl">Channel URL</label>
               <input type="text" class="ctl-input" id="edit-url" placeholder="https://www.youtube.com/@handle" />
+            </div>
+            <div class="edit-field edit-field-grow">
+              <label class="edit-gl">Folder Name</label>
+              <input type="text" class="ctl-input" id="edit-folder" placeholder="Auto-fills from the URL" />
             </div>
           </div>
 

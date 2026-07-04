@@ -47,6 +47,10 @@
     const ths = thead.querySelectorAll("th");
     let currentSort = { col: null, dir: 1 };
     ths.forEach((th, i) => {
+      // Skip non-sortable headers (e.g. the row-actions kebab column) —
+      // they carry data-nosort so they don't get a pointer cursor or a
+      // click-to-sort handler (sorting by a button column is nonsense).
+      if (th.hasAttribute("data-nosort")) return;
       // Re-init guard so a hot-reload / repeat initColumnSort call
       // doesn't stack N click handlers on each th — a single click
       // would otherwise trigger N sorts in succession (audit:
@@ -336,6 +340,26 @@
     tbody.addEventListener("click", (e) => {
       const tr = e.target.closest("tr");
       if (!tr) return;
+      // Kebab (⋮) click → open the SAME menu the right-click uses,
+      // anchored at the button. This is the visible trigger for the
+      // otherwise right-click-only channel actions. stopPropagation so
+      // the click doesn't reach document-level outside-click handlers.
+      const kebab = e.target.closest(".row-kebab");
+      if (kebab) {
+        e.preventDefault();
+        e.stopPropagation();
+        [...tbody.querySelectorAll("tr.row-selected")]
+          .forEach(r => r.classList.remove("row-selected"));
+        tr.classList.add("row-selected");
+        _updateSubsBulkBar();
+        const kr = kebab.getBoundingClientRect();
+        tr.dispatchEvent(new MouseEvent("contextmenu", {
+          bubbles: true, cancelable: true,
+          clientX: Math.min(window.innerWidth - 8, kr.left),
+          clientY: Math.min(window.innerHeight - 8, kr.bottom),
+        }));
+        return;
+      }
       const allTrs = [...tbody.querySelectorAll("tr")];
       const idx = allTrs.indexOf(tr);
       if (e.ctrlKey || e.metaKey) {

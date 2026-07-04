@@ -35,6 +35,7 @@ from ..log_stream import LogStreamer
 from ..subprocess_util import make_startupinfo as _make_startupinfo
 from .paths import (
     _generate_distributed_words,
+    _hide_per_video_transcript_txt_if_needed,
 )
 from .transcribe_files import (
     _write_jsonl_entry,
@@ -436,6 +437,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
         except Exception as e:
             _log.debug("swallowed: %s", e)
         return False
+    _hide_per_video_transcript_txt_if_needed(video_path, txt_path)
     if not _write_jsonl_entry(jsonl_path, vid_id, title, segs):
         try:
             stream.emit_error(

@@ -711,7 +711,8 @@ class ArchiveMixin:
                                     from .. import utils as _u
                                     _u.hide_stray_sidecars(
                                         os.path.dirname(final_path),
-                                        recursive=False)
+                                        recursive=False,
+                                        hide_per_video_transcripts=True)
                                 except Exception as _he:
                                     swallow("hide sidecars after download", _he)
                             # Drop from deferred livestream journal if

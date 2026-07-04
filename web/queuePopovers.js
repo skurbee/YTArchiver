@@ -39,16 +39,52 @@
       const btn = document.getElementById(btnId);
       const pop = document.getElementById(popId);
       if (!btn || !pop) continue;
+      btn.setAttribute("aria-expanded", "false");
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
-        const wasOpen = pop.classList.contains("open");
-        // Close any other popover
-        document.querySelectorAll(".queue-popover.open").forEach(p => p.classList.remove("open"));
-        if (!wasOpen) {
-          anchorPopover(pop, btn);
-          pop.classList.add("open");
-        }
+        _togglePopover(popId, btn);
       });
+    }
+
+    // Shared open/close toggle so the SAME popover can be summoned from
+    // the toolbar buttons AND the global status-bar segments, anchored to
+    // whichever element was clicked. Anchoring to the clicked element (not
+    // always the toolbar button) matters because the status bar lives on
+    // every tab, while the toolbar button is only visible on Download.
+    function _togglePopover(popId, anchorEl) {
+      const pop = document.getElementById(popId);
+      if (!pop || !anchorEl) return;
+      const wasOpen = pop.classList.contains("open");
+      closeAllQueuePopovers();
+      if (!wasOpen) {
+        anchorPopover(pop, anchorEl);
+        pop.classList.add("open");
+        for (const [bId, pId] of pairs) {
+          if (pId === popId) {
+            document.getElementById(bId)?.setAttribute("aria-expanded", "true");
+          }
+        }
+      }
+    }
+    // Public entry point for the status bar. `which` = "sync" | "gpu".
+    window.toggleQueuePopover = function (which, anchorEl) {
+      const popId = which === "gpu" ? "popover-gpu-tasks" : "popover-sync-tasks";
+      const fallbackBtn = document.getElementById(
+        which === "gpu" ? "btn-gpu-tasks" : "btn-sync-tasks");
+      _togglePopover(popId, anchorEl || fallbackBtn);
+    };
+
+    // Close every open popover and clear the aria-expanded flag on its
+    // trigger button. The flag does double duty: it's correct a11y state
+    // AND the custom-tooltip system (uxPolish.js) skips any element that's
+    // aria-expanded, so the button's tooltip can't render on top of the
+    // popover it just opened.
+    function closeAllQueuePopovers() {
+      document.querySelectorAll(".queue-popover.open")
+        .forEach(p => p.classList.remove("open"));
+      for (const [bId] of pairs) {
+        document.getElementById(bId)?.setAttribute("aria-expanded", "false");
+      }
     }
 
     // Close on outside click — but ignore clicks inside modals /
@@ -62,15 +98,23 @@
         return;
       }
       const open = document.querySelectorAll(".queue-popover.open");
+      let anyClosed = false;
       open.forEach(p => {
-        if (!p.contains(e.target)) p.classList.remove("open");
+        if (!p.contains(e.target)) { p.classList.remove("open"); anyClosed = true; }
       });
+      // Reset the trigger flags if any popover actually closed here.
+      if (anyClosed) {
+        for (const [bId, pId] of pairs) {
+          const p = document.getElementById(pId);
+          if (p && !p.classList.contains("open")) {
+            document.getElementById(bId)?.setAttribute("aria-expanded", "false");
+          }
+        }
+      }
     });
     // Close on Escape
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") {
-        document.querySelectorAll(".queue-popover.open").forEach(p => p.classList.remove("open"));
-      }
+      if (e.key === "Escape") closeAllQueuePopovers();
     });
     // Reposition on window resize
     window.addEventListener("resize", () => {

@@ -62,12 +62,12 @@
       "#manual-review-body{max-height:60vh;overflow-y:auto;}" +
       ".mrev-local{padding:4px 0 10px;border-bottom:1px solid var(--border,#333);margin-bottom:8px;}" +
       ".mrev-local-title{font-weight:600;}" +
-      ".mrev-local-sub,.mrev-cand-sub{font-size:11px;color:var(--text-dim,#999);}" +
-      ".mrev-pick-label{font-size:12px;color:var(--text-dim,#999);margin:4px 0 6px;}" +
+      ".mrev-local-sub,.mrev-cand-sub{font-size:var(--fs-xs);color:var(--text-dim,#999);}" +
+      ".mrev-pick-label{font-size:var(--fs-sm);color:var(--text-dim,#999);margin:4px 0 6px;}" +
       ".mrev-cand{display:flex;align-items:center;gap:10px;padding:7px 4px;border-bottom:1px solid var(--border,#2a2a2a);}" +
       ".mrev-cand-info{flex:1;min-width:0;}" +
       ".mrev-cand-title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}" +
-      ".mrev-yt{font-size:11px;white-space:nowrap;cursor:pointer;color:var(--accent,#6cf);}";
+      ".mrev-yt{font-size:var(--fs-xs);white-space:nowrap;cursor:pointer;color:var(--accent,#6cf);}";
     document.head.appendChild(style);
 
     const bd = document.createElement("div");

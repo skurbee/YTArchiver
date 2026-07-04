@@ -11,6 +11,32 @@ import threading
 import time
 from pathlib import Path
 
+_BOOT_T0 = time.perf_counter()
+_BOOT_TRACE_ENABLED = os.environ.get("YTARCHIVER_BOOT_TRACE") == "1"
+
+
+def _boot_trace(label: str) -> None:
+    """Append a tiny boot timing mark for packaged startup diagnosis."""
+    if not _BOOT_TRACE_ENABLED:
+        return
+    try:
+        base = (os.environ.get("APPDATA")
+                or os.environ.get("LOCALAPPDATA")
+                or str(Path.home()))
+        trace_dir = Path(base) / "YTArchiver"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        elapsed = time.perf_counter() - _BOOT_T0
+        wall = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        exe_name = Path(sys.executable).name
+        with (trace_dir / "boot_trace.log").open("a", encoding="utf-8") as f:
+            f.write(f"{wall}\tpid={os.getpid()}\t+{elapsed:.3f}s\t"
+                    f"{label}\texe={exe_name}\n")
+    except Exception:
+        pass
+
+
+_boot_trace("module start")
+
 
 def _ensure_webview2_browser_args() -> None:
     """Disable WebView2's video overlay plane before the control is created."""
@@ -99,6 +125,7 @@ if os.name == "nt":
 
 try:
     import webview
+    _boot_trace("webview imported")
 except ImportError:
     try:
         import ctypes
@@ -119,6 +146,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 INDEX = WEB / "index.html"
+_boot_trace("paths resolved")
 
 # Phase 0 demo-data shim (backend/sample_logs.py + web/sample.json) was
 # removed once real backends were wired up. No-config / DEMO_MODE paths
@@ -132,10 +160,13 @@ sys.path.insert(0, str(ROOT))
 try:
     from backend.html_assembler import assemble_index_html
     assemble_index_html(WEB)
+    _boot_trace("html assembled")
 except Exception as _e:  # pragma: no cover - boot-time best effort
     print(f"[html_assembler] could not (re)build index.html: {_e}")
+    _boot_trace("html assemble failed")
 
 from backend import autorun as autorun_backend
+from backend.archive_capacity import archive_capacity_status
 from backend import index as index_backend
 from backend import net as net_backend
 from backend import sync as sync_backend
@@ -154,6 +185,7 @@ from backend.ytarchiver_config import (
     load_config,
     save_config,
 )
+_boot_trace("backend imports complete")
 
 _log = _get_logger("main")
 
@@ -183,6 +215,7 @@ from backend.api_mixins import (
     VideoMixin,
     WindowMixin,
 )
+_boot_trace("api mixins imported")
 
 
 class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, DiagnosticsMixin, IndexMixin, InfoMixin, LivestreamsMixin, MediaOpsMixin, MetadataMixin, OnboardingMixin, QueueMixin, RecentMixin, RedownloadMixin, SettingsMixin, StartupMixin, SubsMixin, SyncMixin, ThumbnailMixin, TranscribeMixin, VideoMixin, WindowMixin):
@@ -367,14 +400,19 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # never-auto-start rule applies to restored items too.
         try:
             _resuming = self._queues.get_loaded_resuming()
+            _consumed_resuming = []
             _rs = _resuming.get("sync")
             if isinstance(_rs, dict):
                 _rs.pop("_in_flight", None)
                 self._queues.sync_requeue_front(_rs)
+                _consumed_resuming.append("sync")
             _rg = _resuming.get("gpu")
             if isinstance(_rg, dict):
                 _rg.pop("_in_flight", None)
                 self._queues.gpu_enqueue(_rg)
+                _consumed_resuming.append("gpu")
+            if _consumed_resuming:
+                self._queues.clear_resuming_slots(*_consumed_resuming)
             if isinstance(_rs, dict) or isinstance(_rg, dict):
                 _log.info("restored in-flight queue item(s) from last session")
         except Exception as e:
@@ -560,7 +598,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     job = payload['gpu'][0] if payload['gpu'] else {}
                     label = (job.get("kind") or "").title() or "Processing"
                     target = job.get("name") or job.get("title") or ""
-                    tip = f"YT Archiver \u2014 {label}"
+                    tip = f"YTArchiver \u2014 {label}"
                     if target:
                         if len(target) > 35:
                             target = target[:32] + "\u2026"
@@ -570,7 +608,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 elif sync_working:
                     job = payload['sync'][0] if payload['sync'] else {}
                     target = job.get("name") or job.get("title") or ""
-                    tip = "YT Archiver \u2014 Syncing"
+                    tip = "YTArchiver \u2014 Syncing"
                     if target:
                         if len(target) > 35:
                             target = target[:32] + "\u2026"
@@ -579,7 +617,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     tray.set_tooltip(tip)
                 else:
                     tray.stop_spin()
-                    tray.set_tooltip("YT Archiver \u2014 Idle")
+                    tray.set_tooltip("YTArchiver \u2014 Idle")
         except Exception as e:
             _log.debug("swallowed: %s", e)
 
@@ -969,62 +1007,10 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     dots_state["sweep"]["phase"] = ""
                     dots_state["sweep"]["detail"] = ""
 
-            def _run_preload():
-                # DISABLED. The Browse preload existed to mask a slow Browse
-                # — but the real cause was an un-indexed per-channel query
-                # (689s on a 104k-row/20GB DB), now fixed by the
-                # idx_vid_chan_added_live partial covering index. With the
-                # query indexed, on-demand Browse opens are sub-second, so
-                # this pass (which re-enriched up to 100k rows/channel —
-                # metadata JSONL parse + per-row thumbnail stats across the
-                # whole Z: pool) only competed with the user's foreground
-                # Browse load and is no longer worth running. Left as a
-                # no-op rather than deleted so the staging/UI plumbing
-                # (dots_state["preload"], the thread spawn) stays intact.
-                return
-                if not cfg.get("browse_preload_all", False):
-                    return
-                ch_names = [(c.get("name") or c.get("folder") or "")
-                            for c in cfg.get("channels", [])]
-                ch_names = [n for n in ch_names if n]
-                dots_state["preload"]["phase"] = "Preloading Browse tab"
-                dots_state["preload"]["detail"] = ""
-                def _on_preload(idx, total, name):
-                    clean = (name or "")[:32]
-                    dots_state["preload"]["phase"] = "Preloading Browse tab"
-                    dots_state["preload"]["detail"] = f"{idx}/{total} \u2014 {clean}"
-                try:
-                    index_backend.preload_all_channels(
-                        ch_names, progress_cb=_on_preload,
-                        low_priority_busy_fn=_startup_low_priority_busy,
-                        limit=100_000)
-                except Exception as _pe:
-                    s.emit_error(f"Preload failed: {_pe}")
-                    _flush_now()
-                finally:
-                    dots_state["preload"]["phase"] = ""
-                    dots_state["preload"]["detail"] = ""
-
-            # Spawn both on their own threads and wait for both.
+            # Run the archive sweep (index new files) on its own thread.
             t_sweep = threading.Thread(target=_run_sweep, daemon=True)
-            t_preload = threading.Thread(target=_run_preload, daemon=True)
             t_sweep.start()
-            t_preload.start()
             t_sweep.join()
-            t_preload.join()
-
-            # Pull the post-stage-3 totals so the preload indicator slot
-            # can hold a persistent dim-italic completion line. (Used to
-            # be a green log milestone — moved off the activity log per
-            # user request: "move the Browse tab preload complete line
-            # to where the browse preload dim line is".)
-            try:
-                from backend import archive_scan as _as
-                idx = _as.index_summary()
-                _stage3_n_ch = idx["cards"].get("channels", 0) if idx else 0
-                _stage3_n_vids = idx["cards"].get("videos", 0) if idx else 0
-            except Exception:
-                _stage3_n_ch, _stage3_n_vids = 0, 0
 
             sweep_reg = sweep_result["registered"]
             sweep_ing = sweep_result["ingested"]
@@ -1044,23 +1030,16 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
 
             # Storage-pressure warning stays at the tail.
             try:
-                import shutil as _sh
                 cfg2 = self._config or load_config()
                 od = (cfg2.get("output_dir") or "").strip()
                 if od:
-                    du = _sh.disk_usage(od if os.path.isdir(od) else os.path.dirname(od) or ".")
-                    pct = du.used / du.total * 100.0 if du.total else 0
-                    free_gb = du.free / (1024 ** 3)
-                    if pct >= 90:
+                    probe = od if os.path.isdir(od) else os.path.dirname(od) or "."
+                    cap = archive_capacity_status(probe, cfg2)
+                    if cap.get("status") == "warning":
+                        detail = cap.get("detail") or "Archive drive is over its warning threshold"
                         s.emit([
                             ["\u26a0 ", "red"],
-                            [f"Archive drive is {pct:.1f}% full \u2014 only {free_gb:.1f} GB free. "
-                             f"New syncs may fail.\n", "red"]])
-                        _flush_now()
-                    elif pct >= 80:
-                        s.emit([
-                            ["\u26a0 ", "simpleline_compress"],
-                            [f"Archive drive at {pct:.1f}% capacity ({free_gb:.1f} GB free).\n", "dim"]])
+                            [f"Archive drive warning: {detail}. New syncs may fail.\n", "red"]])
                         _flush_now()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
@@ -1078,10 +1057,6 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             # is done), preload slot gets the completion summary.
             try:
                 _push_indicator("sweep", None)
-                _push_indicator("preload",
-                                f"Browse preload complete: "
-                                f"{_stage3_n_ch} channels \u00b7 "
-                                f"{_stage3_n_vids:,} videos cached")
             except Exception as e:
                 _log.debug("swallowed: %s", e)
 
@@ -1104,6 +1079,7 @@ def _configured_whisper_model_for_restore(valid_models):
 
 
 def main():
+    _boot_trace("main start")
     _start_minimized = "--start-minimized" in sys.argv
 
     # Put the app-managed bin dir (%APPDATA%/YTArchiver/bin) on PATH FIRST,
@@ -1117,12 +1093,14 @@ def main():
         _deps_boot.ensure_bin_on_path()
     except Exception as e:
         _log.debug("ensure_bin_on_path failed (non-fatal): %s", e)
+    _boot_trace("bin path ready")
 
     # Start the network-down monitor in the background
     try:
         net_backend.start_monitor()
     except Exception as e:
         _log.debug("swallowed: %s", e)
+    _boot_trace("net monitor started")
 
     # Dated config snapshot — cheap insurance against corruption
     try:
@@ -1131,6 +1109,7 @@ def main():
             print(f"[config] dated snapshot: {snap}")
     except Exception as e:
         _log.debug("swallowed: %s", e)
+    _boot_trace("config backup checked")
 
     # T087: boot-failure safety net. The heavy, port-binding construction
     # below (local fileserver, cmd-server on 127.0.0.1:9855, Api(), tray)
@@ -1204,8 +1183,11 @@ def main():
         print(f"[fileserver] serving local assets on 127.0.0.1:{_port}")
     except Exception as _fe:
         print(f"[fileserver] failed to start: {_fe}")
+    _boot_trace("local fileserver handled")
 
+    _boot_trace("api construct begin")
     api = Api()
+    _boot_trace("api construct done")
     # Hand the live Api to the boot safety net so an emergency teardown can
     # still flush queues if a later boot step (cmd-server, tray) raises.
     _boot_state["api"] = api
@@ -1342,9 +1324,11 @@ def main():
         _cmd.start_server(APP_VERSION, on_log=_cmd_log)
     except Exception as _ce:
         print(f"[cmd] failed to start: {_ce}")
+    _boot_trace("cmd server handled")
 
     # Load saved window state (position / size / maximized)
     ws = winstate.load_window_state()
+    _boot_trace("window state loaded")
     kwargs = {
         "title": "YTArchiver",
         "url": str(INDEX),
@@ -1358,7 +1342,9 @@ def main():
     if ws.get("x") is not None and ws.get("y") is not None:
         kwargs["x"] = int(ws["x"])
         kwargs["y"] = int(ws["y"])
+    _boot_trace("create_window begin")
     window = webview.create_window(**kwargs)
+    _boot_trace("create_window done")
     api.set_window(window)
 
     # Dark title bar via DWM (Windows 10 19041+ / Windows 11). Matches
@@ -1392,7 +1378,17 @@ def main():
                     _log.debug("swallowed: %s", e)
         except Exception as e:
             _log.debug("swallowed: %s", e)
-    threading.Thread(target=_apply_dark_titlebar_when_ready, daemon=True).start()
+    def _start_dark_titlebar_thread():
+        try:
+            threading.Thread(
+                target=_apply_dark_titlebar_when_ready,
+                daemon=True,
+                name="dark-titlebar",
+            ).start()
+            _boot_trace("dark titlebar thread started")
+        except Exception as e:
+            _log.debug("dark titlebar thread failed: %s", e)
+    _boot_trace("dark titlebar deferred")
 
     # Debounced window-state save. pywebview emits resize/move at ~60Hz
     # during a drag — without debounce that's 60 config-file writes per
@@ -1693,7 +1689,9 @@ def main():
         api._shutdown_cleanup_fn = _shutdown_cleanup
     except Exception as e:
         _log.debug("swallowed: %s", e)
+    _boot_trace("shutdown cleanup wired")
 
+    _boot_trace("window events bind begin")
     try:
         window.events.resized += _on_resized
         window.events.moved += _on_moved
@@ -1703,6 +1701,7 @@ def main():
     except Exception:
         # pywebview may not expose all of these on every platform/version
         pass
+    _boot_trace("window events bind done")
 
     # Start tray icon (optional — silently no-ops if pystray is missing)
     def _tray_show():
@@ -1796,18 +1795,21 @@ def main():
                              name="tray-quit-watchdog").start()
         except Exception as e:
             _log.debug("swallowed: %s", e)
+    _boot_trace("tray callbacks defined")
 
     # Tray is optional (pystray import or icon load can fail); wrap
     # construction so a tray failure doesn't kill the whole app launch.
     # All later tray.* references are guarded by `if tray is not None`
     # (audit: main.py H11).
     tray = None
+    _boot_trace("tray construct begin")
     try:
         tray = TrayController(on_show=_tray_show, on_hide=_tray_hide,
                               on_sync=_tray_sync, on_quit=_tray_quit,
-                              tooltip="YT Archiver \u2014 Idle")
+                              tooltip="YTArchiver \u2014 Idle")
     except Exception as _trayE:
         _log.debug("tray construction failed (continuing window-only): %s", _trayE)
+    _boot_trace("tray constructed")
     # Always-on-top toggle (restore saved pref, defaults to off)
     _on_top_state = {"on": bool(ws.get("always_on_top", False))}
     def _toggle_on_top():
@@ -1848,6 +1850,7 @@ def main():
             api.attach_tray(tray)
         except Exception as e:
             _log.debug("tray start failed (continuing window-only): %s", e)
+    _boot_trace("tray started")
 
     # Start the network-down monitor so sync workers can pause on outage.
     # Cheap (single background thread, 30s TCP probe); no-op on full uptime.
@@ -1861,6 +1864,10 @@ def main():
     # ping, leftover temp/partial file sweep. All run in background threads
     # so they never block window.show.
     def _startup_checks():
+        _boot_trace("startup callback begin")
+        try: api._log_stream.mark_ready()
+        except Exception as e: _log.debug("log stream ready failed: %s", e)
+        _start_dark_titlebar_thread()
         try: api.check_dependencies()
         except Exception as e: _log.debug("swallowed: %s", e)
         try: api.check_ytdlp_freshness()
@@ -1898,6 +1905,7 @@ def main():
                 window.hide()
             except Exception as e:
                 _log.debug("start-minimized hide failed: %s", e)
+        _boot_trace("startup callback end")
     # Defer startup checks until pywebview has actually rendered the
     # window. Previously this thread started BEFORE webview.start(), so
     # api.check_dependencies / check_channel_folders / check_app_update
@@ -1905,7 +1913,9 @@ def main():
     # warnings either silently dropped or landed in a queue the
     # frontend never drained. webview.start's `func=` argument runs the
     # callable on its own thread AFTER the DOM is ready.
+    _boot_trace("webview.start begin")
     webview.start(func=_startup_checks, debug=False)
+    _boot_trace("webview.start returned")
     # After webview returns, stop the tray icon so pystray's mainloop exits
     try:
         tray.stop()

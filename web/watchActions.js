@@ -315,6 +315,10 @@
       window.setCaptionPref?.("size", v);
       const sel = document.getElementById("watch-cap-size");
       if (sel && sel.value !== v) sel.value = v;
+      // Style + word-count only matter when the overlay is ON. Collapse
+      // them when size=off so the default state isn't two mystery selects.
+      const extras = document.getElementById("watch-overlay-extras");
+      if (extras) extras.classList.toggle("collapsed", v === "off");
       try { localStorage.setItem(_capSizeKey, v); } catch {}
       if (_nativeBridgeUp()) {
         try { _bridgeCall("settings_save", { caption_overlay_size: v }); } catch {}
@@ -371,6 +375,30 @@
     });
     document.getElementById("watch-cap-mode")?.addEventListener("change", (ev) => {
       _applyCapMode(ev.target.value);
+    });
+
+    // Non-speech ([Music] / [Applause] / ♪) visibility toggle for the
+    // transcript. Adds/removes `.hide-nonspeech` on the transcript
+    // container (which survives per-video re-renders since only its inner
+    // body is rebuilt). Persisted across sessions.
+    const _nonSpeechKey = "ytarchiver_hide_nonspeech";
+    function _applyNonSpeech(hide) {
+      const tr = document.getElementById("watch-transcript");
+      const btn = document.getElementById("btn-tx-nonspeech");
+      if (tr) tr.classList.toggle("hide-nonspeech", !!hide);
+      if (btn) {
+        btn.classList.toggle("active", !!hide);
+        btn.setAttribute("aria-pressed", hide ? "true" : "false");
+        btn.innerHTML = hide ? "Show ♪" : "Hide ♪";
+      }
+      try { localStorage.setItem(_nonSpeechKey, hide ? "1" : "0"); } catch {}
+    }
+    try {
+      if (localStorage.getItem(_nonSpeechKey) === "1") _applyNonSpeech(true);
+    } catch {}
+    document.getElementById("btn-tx-nonspeech")?.addEventListener("click", () => {
+      const tr = document.getElementById("watch-transcript");
+      _applyNonSpeech(!(tr && tr.classList.contains("hide-nonspeech")));
     });
 
     // ⋮ More — overflow menu for less-used watch-view actions.
@@ -476,19 +504,21 @@
     // a different video.
     window._syncWatchRetranscribeButton = function () {
       const btn = document.getElementById("btn-watch-retranscribe");
-      if (!btn) return;
       const cur = window._watchCurrentVideo;
       const vid = cur && cur.video_id ? cur.video_id : "";
-      if (vid && window._inflightRetranscribes.has(vid)) {
-        const p = window._inflightRetranscribes.get(vid);
-        btn.dataset.busy = "1";
-        btn.disabled = true;
-        btn.textContent = `Re-transcribing… ${p}%`;
-      } else {
-        btn.dataset.busy = "";
-        btn.disabled = false;
-        btn.textContent = "Re-transcribe…";
+      if (btn) {
+        if (vid && window._inflightRetranscribes.has(vid)) {
+          const p = window._inflightRetranscribes.get(vid);
+          btn.dataset.busy = "1";
+          btn.disabled = true;
+          btn.textContent = `Re-transcribing… ${p}%`;
+        } else {
+          btn.dataset.busy = "";
+          btn.disabled = false;
+          btn.textContent = "Re-transcribe…";
+        }
       }
+      window._syncWatchRetranscribeBanner?.();
     };
 
     document.getElementById("btn-watch-retranscribe")?.addEventListener("click", async () => {
@@ -541,6 +571,7 @@
           v.filepath, v.title || "", vid);
       } catch (e) {
         if (vid) window._inflightRetranscribes.delete(vid);
+        window._syncWatchRetranscribeButton?.();
         window._showToast?.(`Re-transcribe call failed: ${e?.message || e}`, "error");
         return;
       }

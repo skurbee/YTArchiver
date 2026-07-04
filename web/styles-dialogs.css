@@ -64,13 +64,13 @@
   padding: 12px 16px 8px;
   border-bottom: 1px solid var(--c-border);
   color: var(--c-text);
-  font-size: 13px;
+  font-size: var(--fs-md);
   font-weight: 600;
 }
 .askq-body {
   padding: 14px 16px;
   color: var(--c-text);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
   white-space: pre-wrap;
   max-height: 60vh;
@@ -103,7 +103,7 @@
   align-items: center;
   gap: 6px;
   margin: 8px 0 12px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--c-dim);
   user-select: none;
 }
@@ -123,7 +123,7 @@
 .askq-scroll-body {
   max-height: 55vh;
   overflow-y: auto;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .askq-empty-padded {
   padding: 16px;
@@ -146,13 +146,13 @@
 }
 .about-meta {
   margin-top: 10px;
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
 }
 .about-meta-row-spaced {
   margin-top: 8px;
 }
 .about-code {
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .autorun-history-row {
   padding: 3px 12px;
@@ -188,7 +188,7 @@
 }
 .compress-dry-note {
   padding: 8px 4px 0;
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .drift-summary-box {
   padding: 8px 10px;
@@ -218,7 +218,7 @@
   margin-bottom: 4px;
 }
 .drift-section-note {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   margin-bottom: 6px;
 }
 .drift-empty-row {
@@ -240,10 +240,10 @@
 }
 .drift-done-note {
   padding: 8px 4px 0;
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .askq-help-text {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.4;
   margin-bottom: 10px;
   color: var(--c-dim, #94a3b8);
@@ -257,7 +257,7 @@
   gap: 8px 12px;
 }
 .askq-small-label {
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .askq-manual-grid {
   grid-template-columns: auto 1fr;
@@ -275,7 +275,7 @@
 }
 .askq-history-entries {
   font-family: var(--font-log);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   padding: 6px 0;
 }
 /* Text-input field in askTextInput dialog */
@@ -286,7 +286,7 @@
   border: 1px solid var(--c-border);
   color: var(--c-text);
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   border-radius: 3px;
 }
 .askq-input:focus {
@@ -323,7 +323,7 @@
 .askq-buttons .btn {
   min-width: 84px;
   padding: 6px 14px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .askq-buttons .btn-primary {
   background: var(--c-sync);
@@ -339,7 +339,7 @@
 .askq-buttons .btn-danger:hover { background: #7e2020; }
 .askq-countdown {
   margin: 8px 0 12px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--c-dim);
 }
 @keyframes askq-fade {
@@ -357,7 +357,7 @@
   align-items: center;
   gap: 6px;
   padding: 5px 4px 2px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--c-dim);
   font-family: var(--font-log);
 }
@@ -379,12 +379,12 @@
   top: 50%;
   transform: translateY(-50%);
   color: var(--c-dim);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   pointer-events: none;
 }
 .subs-filter-input {
   flex: 1 1 auto;
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   padding: 3px 22px 3px 22px;
   height: 24px;
 }
@@ -398,7 +398,7 @@
   background: transparent;
   border: 0;
   color: var(--c-dim);
-  font-size: 14px;
+  font-size: var(--fs-lg);
   line-height: 1;
   width: 18px;
   height: 18px;
@@ -427,7 +427,7 @@
   padding: 2px 8px;
   border-radius: 2px;
   cursor: pointer;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-family: var(--font-ui);
   opacity: 0;
   transition: opacity 0.1s;
@@ -440,9 +440,9 @@
   margin: 2px 14px 6px;
   padding: 4px 8px;
   background: rgba(245, 166, 35, 0.06);
-  border: 1px solid #6b3a10;
+  border: 1px solid var(--c-warn);
   border-radius: 2px;
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
 }
 .deferred-livestreams[hidden] { display: none; }
 .deferred-head {
@@ -452,7 +452,7 @@
   color: var(--c-log-sum);
 }
 .deferred-label { font-weight: 600; }
-.deferred-hint { color: var(--c-dim); font-size: 11px; }
+.deferred-hint { color: var(--c-dim); font-size: var(--fs-xs); }
 .deferred-list {
   display: flex;
   flex-wrap: wrap;
@@ -460,7 +460,7 @@
   margin-top: 3px;
   color: var(--c-log-sum);
   font-family: var(--font-log);
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .deferred-row {
   display: inline-flex;
@@ -472,7 +472,7 @@
   border: none;
   color: var(--c-dim);
   cursor: pointer;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 0 3px;
 }
 .deferred-row button:hover { color: var(--c-log-red); }
@@ -480,7 +480,7 @@
   /* "Ignore" is a stronger action than × (drop) — permanently adds
      to the skip set. Make it a touch more prominent than the tiny
      × glyph without looking destructive. */
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 1px 6px;
   border-radius: 3px;
   border: 1px solid var(--c-dim);
@@ -516,7 +516,7 @@
   border: none;
   color: var(--c-text);
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   padding: 5px 10px;
   text-align: left;
   border-radius: 2px;
@@ -593,7 +593,7 @@
   border: 1px solid var(--c-border);
   border-left: 3px solid var(--c-accent);
   color: var(--c-text);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   padding: 10px 14px;
   border-radius: 3px;
   box-shadow: 0 8px 24px rgba(0,0,0,0.5);
@@ -644,10 +644,10 @@
   max-width: 560px;
 }
 .yt-modal-title {
-  font-size: 16px; font-weight: 600; margin-bottom: 4px;
+  font-size: var(--fs-xl); font-weight: 600; margin-bottom: 4px;
 }
 .yt-modal-sub {
-  font-size: 12px; color: var(--c-accent); margin-bottom: 14px;
+  font-size: var(--fs-sm); color: var(--c-accent); margin-bottom: 14px;
 }
 .yt-modal-sub-spaced {
   margin-top: 10px;
@@ -672,7 +672,7 @@
 }
 .yt-modal-stats.larger { color: var(--c-modal-warn-fg); }
 .yt-modal-countdown {
-  font-size: 11px; color: var(--c-accent);
+  font-size: var(--fs-xs); color: var(--c-accent);
   text-align: center; margin-bottom: 14px;
 }
 .yt-modal-buttons {
@@ -683,7 +683,7 @@
   background: var(--c-modal-btn); color: var(--c-text);
   border: 1px solid var(--c-modal-btn-border);
   border-radius: 5px;
-  padding: 7px 14px; font-size: 12px;
+  padding: 7px 14px; font-size: var(--fs-sm);
   cursor: pointer;
 }
 .yt-modal-btn:hover { background: var(--c-modal-btn-hover); }
@@ -702,7 +702,7 @@
 .yt-modal-res-options {
   display: grid; grid-template-columns: repeat(4, 1fr);
   gap: 8px 14px; margin: 10px 0 14px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .yt-modal-res-options label {
   display: flex; align-items: center; gap: 6px; cursor: pointer;
@@ -712,7 +712,7 @@
   background: rgba(255, 255, 255, 0.05);
   padding: 1px 6px;
   border-radius: 3px;
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   color: var(--c-text);
 }
 .yt-modal-btn:disabled {

@@ -956,7 +956,8 @@ class BrowseMixin:
             # manual-downloads folder still shows only the video file.
             try:
                 from backend import utils as _u
-                _u.hide_stray_sidecars(dest, recursive=False)
+                _u.hide_stray_sidecars(
+                    dest, recursive=False, hide_per_video_transcripts=True)
             except Exception as e:
                 swallow("manual meta hide sidecars", e)
             if push_refresh:
@@ -1409,7 +1410,8 @@ class BrowseMixin:
                     try:
                         from backend import utils as _u
                         _u.hide_stray_sidecars(
-                            os.path.dirname(filepath), recursive=False)
+                            os.path.dirname(filepath), recursive=False,
+                            hide_per_video_transcripts=True)
                     except Exception as e:
                         swallow("review-pick hide sidecars", e)
                 except Exception as e:
@@ -1919,15 +1921,16 @@ class BrowseMixin:
                     badges.append({"label": "No ID", "kind": "warn"})
             elif r.get("id_backfill_tried_ts"):
                 badges.append({"label": "Recovered ID", "kind": "ok"})
+            tx = (r.get("tx_status") or "").lower()
             if r.get("thumbnail_source") == "local":
-                badges.append({"label": "Local thumb", "kind": "neutral"})
+                badges.append({"label": "Local thumb", "kind": "ok"})
             if r.get("video_id") and not (
                     r.get("views") or r.get("view_count") is not None):
                 badges.append({"label": "Metadata missing", "kind": "warn"})
-            if r.get("tx_status") in ("transcribed", "done"):
-                badges.append({"label": "Transcript", "kind": "ok"})
-            elif r.get("tx_status") in ("failed", "error"):
+            if tx in ("failed", "error"):
                 badges.append({"label": "Transcript failed", "kind": "bad"})
+            elif tx not in ("transcribed", "done"):
+                badges.append({"label": "No transcript", "kind": "bad"})
             if badges:
                 r["manual_badges"] = badges
 

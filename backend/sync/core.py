@@ -415,6 +415,92 @@ def _clear_timeout_strike(vid: str) -> None:
             pass
 
 
+# ── Plain-English translation of yt-dlp ERROR lines (Simple log mode) ──────
+# The cryptic yt-dlp output is perfect for Verbose mode, but Simple mode must
+# ALWAYS be human readable. The benign / network / members-only / retry
+# filters upstream already divert most noise; whatever real ERROR line
+# survives to the display branch would otherwise reach Simple mode as raw,
+# scary text ("ERROR: unable to download video data: HTTP Error 403:
+# Forbidden ..."). This maps the common failure signatures to one short,
+# plain-English sentence. Ordered most-specific-first. The generic fallback
+# is accurate because any error reaching here also re-queues the failed
+# video for the next sync pass.
+def _humanize_ytdlp_error(low: str) -> str:
+    """Map a raw yt-dlp ERROR line (already lowercased) to a plain reason."""
+    # Disk / filesystem
+    if ("no space left" in low or "not enough space" in low
+            or "errno 28" in low or "disk full" in low):
+        return "Ran out of disk space while saving this video."
+    if ("permission denied" in low or "errno 13" in low
+            or "winerror 5" in low or "access is denied" in low):
+        return ("Couldn't save the file (permission denied) — check the "
+                "archive folder isn't read-only.")
+    if ("being used by another process" in low or "winerror 32" in low
+            or "unable to rename" in low or "unable to move" in low):
+        return ("Couldn't save the file — it may be open in another "
+                "program. Will retry on the next sync.")
+    # Age / sign-in gates
+    if ("confirm your age" in low or "age-restricted" in low
+            or "age restricted" in low
+            or "inappropriate for some users" in low):
+        return ("This video is age-restricted — it needs a signed-in "
+                "account (set up cookies in Settings) to download.")
+    if (("not a bot" in low and "confirm you" in low)
+            or "sign in to confirm" in low):
+        return ("YouTube asked for sign-in to confirm you're not a bot — "
+                "set up browser cookies in Settings, then retry.")
+    # Availability / rights
+    if "copyright grounds" in low or "blocked it on copyright" in low:
+        return ("This video is blocked on copyright grounds and can't be "
+                "downloaded.")
+    if ("not available in your country" in low
+            or "not available in your region" in low
+            or "geo restricted" in low or "geo-restricted" in low
+            or "blocked in your country" in low):
+        return "This video isn't available in your region."
+    if "requested format" in low and "not available" in low:
+        return "YouTube didn't offer a downloadable format for this video."
+    if "no video formats" in low:
+        return "YouTube didn't offer a downloadable format for this video."
+    # Live / premiere
+    if ("premieres in" in low or "will begin in" in low
+            or "live event will begin" in low or "is a premiere" in low):
+        return ("This is an upcoming premiere/live stream — it'll download "
+                "once it airs.")
+    # Rate limiting
+    if ("http error 429" in low or "too many requests" in low
+            or "rate limit" in low or "rate-limit" in low):
+        return ("YouTube is rate-limiting downloads — pausing briefly, then "
+                "retrying.")
+    # HTTP status codes
+    if ("http error 403" in low or "403: forbidden" in low
+            or "403 forbidden" in low):
+        return ("YouTube refused the download (HTTP 403). Will retry on the "
+                "next sync.")
+    if "http error 404" in low or "404: not found" in low:
+        return "This video's page returned 404 (not found)."
+    if re.search(r"http error 5\d\d", low) or "internal server error" in low:
+        return "YouTube had a server error (5xx). Will retry on the next sync."
+    # SSL / certificate
+    if ("ssl" in low or "certificate verify" in low
+            or "certificate" in low):
+        return ("A secure-connection (SSL) error interrupted the download. "
+                "Will retry on the next sync.")
+    # Post-processing / ffmpeg
+    if ("postprocessing" in low or "post-processing" in low
+            or "ffmpeg" in low or "error opening output" in low
+            or "conversion failed" in low):
+        return ("The video downloaded but couldn't be finalized "
+                "(post-processing error).")
+    # Generic download-data / fragment failures
+    if "unable to download video data" in low or "fragment" in low:
+        return "The download was interrupted. Will retry on the next sync."
+    if "unable to download webpage" in low:
+        return "Couldn't load the video's page. Will retry on the next sync."
+    # Fallback — accurate: the failed video is re-queued for the next pass.
+    return "Couldn't download this video — will retry on the next sync."
+
+
 def _archived_failed_video_ids(video_ids) -> set[str]:
     """Return failed IDs that are already in yt-dlp's download archive."""
     targets = {v for v in video_ids if isinstance(v, str) and v}
@@ -879,6 +965,11 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # video" that recurred on every single sync).
     _filtered_this_run: set = set()
     _net_warned: set = set()   # vids already shown a "couldn't reach" notice
+    # Vids already shown a humanized ERROR notice in Simple mode. yt-dlp can
+    # emit several ERROR lines for one failed video (split video+audio
+    # streams); without this, Simple mode would print the same plain-English
+    # notice two or three times per video.
+    _simple_err_shown: set = set()
     # nsig "unable to extract n function" failures this channel. These are
     # dimmed per-line as transient, but a whole pass of them with zero
     # downloads = an out-of-date yt-dlp (see the end-of-pass nudge below).
@@ -2452,11 +2543,16 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                         current_vid_id, stream)
                     if _gave_up_now:
                         _gave_up_this_run.add(current_vid_id)
-                if (getattr(stream, "simple_mode", False)
-                        and (_is_net_err or low.strip() in ("error:", "error"))):
-                    # Show ONE friendly line on the final give-up; the bare
-                    # "ERROR:" header and any mid-retry partials render
-                    # nothing in Simple mode.
+                _simple = getattr(stream, "simple_mode", False)
+                if not _simple:
+                    # Verbose mode: raw yt-dlp text, unchanged — the cryptic
+                    # detail is exactly what Verbose is for.
+                    stream.emit([[f" {s}\n",
+                                  "red" if "error" in low else "filterskip"]])
+                elif _is_net_err:
+                    # Network failure: show ONE friendly line on the final
+                    # give-up; the bare "ERROR:" header and any mid-retry
+                    # partials render nothing (the give-up line covers them).
                     if (_is_giveup and _first_giveup_for_vid
                             and not _gave_up_now):
                         stream.emit([
@@ -2464,8 +2560,23 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                              "timeout) — will retry on the next "
                              "sync.\n", "red"],
                         ])
-                else:
-                    stream.emit([[f" {s}\n", "red" if "error" in low else "filterskip"]])
+                elif "error" in low and low.strip() not in ("error:", "error"):
+                    # Any other real ERROR line. Simple mode must ALWAYS be
+                    # human readable, so translate yt-dlp's cryptic text into
+                    # a plain-English notice (Verbose already showed the raw
+                    # line above). De-dup per video so a split video+audio
+                    # failure doesn't print the same notice two or three times.
+                    if not (current_vid_id and current_vid_id in _simple_err_shown):
+                        if current_vid_id:
+                            _simple_err_shown.add(current_vid_id)
+                        _reason = _humanize_ytdlp_error(low)
+                        _who = (current_title or "").strip()
+                        if _who:
+                            stream.emit([[f" ⚠ {_who} — {_reason}\n", "red"]])
+                        else:
+                            stream.emit([[f" ⚠ {_reason}\n", "red"]])
+                # else: bare "ERROR:" header or a WARNING line — suppressed in
+                # Simple mode (raw text stays Verbose-only).
                 if "error" in low:
                     errors += 1
                     # capture the video ID that failed so we
@@ -2670,10 +2781,6 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     except Exception as e:
         swallow("failed-id persist", e)
 
-    # Clear current-sync marker
-    if queues is not None:
-        queues.set_current_sync(None)
-
     # Drain the inline-metadata executor. Every video dispatched during
     # this pass is now waiting (or running) on the one worker thread.
     # If a cancel was raised, drop pending tasks immediately rather
@@ -2682,6 +2789,27 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # a slow YouTube call (audit: sync/core.py:1820).
     if _meta_exec is not None:
         try:
+            _pending_meta = [f for f in _meta_futures if not f.done()]
+            _pending_meta_count = len(_pending_meta)
+            if (_pending_meta_count and queues is not None
+                    and not (cancel_event is not None and cancel_event.is_set())):
+                _finalizing = dict(channel)
+                _finalizing["_status_label"] = "Metadata finalizing"
+                queues.set_current_sync(_finalizing)
+                try:
+                    # "dim" tag = verbose-only (VERBOSE_ONLY_TAGS): this is a
+                    # progress diagnostic the user doesn't need in Simple mode.
+                    # Still shown (dimmed) in Verbose mode.
+                    stream.emit([
+                        [" Finishing metadata for ", "dim"],
+                        [f"{_pending_meta_count}", "dim"],
+                        [" video", "dim"],
+                        ["s" if _pending_meta_count != 1 else "", "dim"],
+                        [" before marking the channel complete...\n", "dim"],
+                    ])
+                    stream.flush()
+                except Exception as e:
+                    swallow("metadata-finalizing emit", e)
             if cancel_event is not None and cancel_event.is_set():
                 # Cancel-fast: drop queued, but BRIEFLY drain in-flight
                 # futures so their save_config writes complete before
@@ -2708,8 +2836,27 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 # metadata and their "⏳ Metadata queued…" rows stuck
                 # in the log forever.
                 _meta_exec.shutdown(wait=True, cancel_futures=False)
+                if _pending_meta_count:
+                    try:
+                        stream.emit([
+                            [" Metadata finalization complete.\n",
+                             "dim"],
+                        ])
+                        stream.flush()
+                    except Exception as e:
+                        swallow("metadata-finalized emit", e)
         except Exception as e:
             swallow("meta-executor shutdown", e)
+
+    # Clear current-sync only after post-download metadata work drains.
+    # Clearing it earlier made the app look idle after the last video
+    # download while the sync thread was still fetching/writing sidecars.
+    if queues is not None and not (
+            cancel_event is not None and cancel_event.is_set()):
+        try:
+            queues.set_current_sync(None)
+        except Exception as e:
+            swallow("current-sync clear after metadata", e)
 
     # Consolidated activity-log row — request: replace the
     # historical 3 rows with ONE [Dwnld] row per channel per sync pass

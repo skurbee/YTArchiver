@@ -42,11 +42,11 @@
 }
 .clear-menu-caret {
   opacity: 0.7;
-  font-size: 10px;
+  font-size: var(--fs-2xs);
 }
 .subs-section-label {
   color: var(--c-accent);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: 600;
 }
 .subs-table-frame {
@@ -63,7 +63,7 @@
   width: 100%;
   border-collapse: collapse;
   font-family: var(--font-log);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--c-text);
   table-layout: fixed;
 }
@@ -86,7 +86,7 @@
   padding: 6px 8px 8px;
   color: var(--c-dim);
   font-weight: 400;
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   white-space: nowrap;
 }
 /* Sort direction arrow injected via `th.dataset.arrow` in wireTableSort. */
@@ -95,13 +95,42 @@
   content: attr(data-arrow);
   color: var(--c-accent);
   margin-left: 4px;
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   vertical-align: 1px;
 }
 .subs-table th[data-arrow=""]::after,
 .recent-table th[data-arrow=""]::after {
   content: "";
 }
+/* Hover hint — a faint up/down glyph on any column that isn't the active
+   sort, so it's obvious the headers are clickable (the cursor:pointer
+   alone wasn't a strong enough signal). The active column keeps its real
+   arrow via the rule above. */
+.subs-table th[data-arrow=""]:hover::after,
+.subs-table th:not([data-arrow]):hover::after,
+.recent-table th[data-arrow=""]:hover::after,
+.recent-table th:not([data-arrow]):hover::after {
+  content: "\2195";
+  color: var(--c-dim);
+  opacity: 0.7;
+  margin-left: 4px;
+  font-size: var(--fs-2xs);
+  vertical-align: 1px;
+}
+/* Compact legend for the Transcribe / Metadata mark columns + a sort
+   hint. Always visible so the "A ✓" shorthand isn't opaque. */
+.subs-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px 14px;
+  padding: 3px 2px 6px;
+  font-size: var(--fs-2xs);
+  color: var(--c-dim);
+}
+.subs-legend b,
+.subs-legend-label { color: var(--c-text-muted); font-weight: 600; }
+.subs-legend-hint { margin-left: auto; font-style: italic; }
 .subs-table th.col-folder {
   text-align: left;
   padding-left: 10px;
@@ -128,7 +157,7 @@
    name when `_redownload_progress.json` exists for that channel. */
 .sub-redwnl-dot {
   color: var(--c-log-redwnl);
-  font-size: 9px;
+  font-size: var(--fs-3xs);
   vertical-align: middle;
   margin-left: 4px;
   line-height: 1;
@@ -158,10 +187,41 @@
    one in both the <thead> and each <tbody> row (see index.html ~line
    271 + logs.js renderSubsTable). Also hides the matching <col> so
    the remaining columns expand to fill the reclaimed width. */
-.subs-table.hide-avg-col thead th:last-child,
-.subs-table.hide-avg-col tbody td:last-child,
-.subs-table.hide-avg-col colgroup col:last-child {
+/* Avg column is now the SECOND-to-last cell (a non-sortable row-actions
+   kebab column is always last), so the avg-hide toggle targets
+   :nth-last-child(2) instead of :last-child. */
+.subs-table.hide-avg-col thead th:nth-last-child(2),
+.subs-table.hide-avg-col tbody td:nth-last-child(2),
+.subs-table.hide-avg-col colgroup col:nth-last-child(2) {
   display: none;
+}
+
+/* Row-actions column — a ⋮ kebab that opens the same menu as right-click,
+   making the channel actions discoverable. Always last; never hidden. */
+.subs-table col.col-actions { width: 30px; }
+.subs-table th.col-actions,
+.subs-table td.col-actions {
+  text-align: center;
+  padding: 0;
+  overflow: visible;
+}
+.row-kebab {
+  border: none;
+  background: transparent;
+  color: var(--c-dim);
+  cursor: pointer;
+  font-size: var(--fs-md);
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 3px;
+  /* Dim-but-present at rest (discoverable), full strength on row hover. */
+  opacity: 0.4;
+  transition: opacity 0.1s ease, background 0.1s ease, color 0.1s ease;
+}
+.subs-table tbody tr:hover .row-kebab { opacity: 1; }
+.row-kebab:hover {
+  background: var(--c-hover);
+  color: var(--c-text);
 }
 
 .add-channel-box {
@@ -183,12 +243,12 @@
   padding: 8px 12px 10px;
   border-top: 1px solid var(--c-border);
   background: rgba(255, 255, 255, 0.015);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .edit-channel-box > .subs-section-label {
   display: block;
   margin-bottom: 6px;
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   color: var(--c-accent);
 }
 
@@ -230,7 +290,7 @@
 }
 .edit-gl {
   color: var(--c-accent);
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   white-space: nowrap;
   text-align: left;
 }
@@ -242,7 +302,7 @@
   background: var(--c-surface);
   border: 1px solid var(--c-border);
   border-radius: 3px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 /* Removed duplicate `.edit-nudge-row[hidden]` rule — the global
    `[hidden] { display: none !important }` in
@@ -277,7 +337,7 @@
 .edit-grid .ctl-input,
 .edit-grid .ctl-select {
   padding: 3px 7px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   height: 24px;
   min-width: 0;
 }
@@ -314,7 +374,7 @@
   border-left: 1px solid var(--c-border);
 }
 .edit-compress-group[hidden] { display: none; }
-.edit-compress-group .edit-dim { font-size: 11.5px; }
+.edit-compress-group .edit-dim { font-size: var(--fs-sm); }
 .edit-batch {
   width: 54px;
   flex: 0 0 54px;
@@ -323,14 +383,14 @@
    a no-op layout container, so `.edit-grid .icon-btn-slim` never
    matches — global `.icon-btn-slim` styling lives in
    styles-browse.css (audit: styles-tabs-data L156). */
-.edit-grid .edit-dim { color: var(--c-dim); font-size: 11.5px; }
+.edit-grid .edit-dim { color: var(--c-dim); font-size: var(--fs-sm); }
 
 /* Compact inline radio */
 .radio-label-inline {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--c-text);
   cursor: pointer;
   user-select: none;
@@ -371,7 +431,7 @@
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--c-text);
   cursor: pointer;
   user-select: none;
@@ -397,19 +457,19 @@
   text-align: center;
   line-height: 10px;
   color: var(--c-log-green);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-weight: 700;
 }
 .edit-hint {
   color: var(--c-dim);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-style: italic;
 }
 .edit-row-actions {
   margin-top: 6px;
   gap: 6px;
 }
-.edit-row-actions .btn { padding: 4px 11px; font-size: 11.5px; }
+.edit-row-actions .btn { padding: 4px 11px; font-size: var(--fs-sm); }
 .btn-cancel-red {
   background: var(--c-cancel);
   border-color: #7e2020;
@@ -434,7 +494,7 @@
 }
 .recent-label {
   color: var(--c-dim);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .btn-warn {
   background: var(--c-warn);
@@ -458,7 +518,7 @@
   width: 100%;
   border-collapse: collapse;
   font-family: var(--font-log);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--c-text);
   table-layout: fixed;
 }
@@ -473,7 +533,7 @@
   padding: 6px 10px 8px;
   color: var(--c-dim);
   font-weight: 400;
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
@@ -527,7 +587,7 @@
      confirm dialog drew the context menu on top of the dialog,
      trapping the user. Dropped to 9500 so modals always overlay. */
   z-index: 9500;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-family: var(--font-ui);
   user-select: none;
 }
@@ -561,7 +621,7 @@
   top: 50%;
   transform: translateY(-50%);
   color: var(--c-dim);
-  font-size: 9px;
+  font-size: var(--fs-3xs);
 }
 .ctx-submenu {
   position: absolute;
@@ -573,7 +633,20 @@
   padding: 4px 0;
   min-width: 160px;
   display: none;
+  /* Was rendering BEHIND the menu items below it: later positioned rows
+     paint over an earlier row's flyout. Lift the flyout (and its hovered
+     parent row) so it always sits on top; the shadow reads it as a layer. */
+  z-index: 10;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
 }
+.ctx-submenu-wrap.submenu-left::after {
+  content: "\25C2";
+}
+.ctx-submenu-wrap.submenu-left > .ctx-submenu {
+  left: auto;
+  right: 100%;
+}
+.ctx-submenu-wrap:hover { z-index: 10; }
 .ctx-submenu-wrap:hover > .ctx-submenu { display: block; }
 
 /* ═══ Queue popovers (Sync Tasks, GPU Tasks) ═══
@@ -610,14 +683,14 @@
   gap: 6px;
 }
 .gpu-popover-model-label {
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .gpu-popover-model-select {
   flex: 1 1 auto;
 }
 .queue-popover-title {
   color: var(--c-text);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: 600;
 }
 .queue-auto-wrap {
@@ -625,7 +698,7 @@
   align-items: center;
   gap: 4px;
   color: var(--c-text);
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   cursor: pointer;
   user-select: none;
 }
@@ -634,7 +707,7 @@
   align-items: center;
   gap: 4px;
   color: var(--c-dim);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   user-select: none;
 }
 .queue-model-swap-wrap > span {
@@ -642,7 +715,7 @@
 }
 .ctl-select.ctl-select-thin {
   padding: 1px 16px 1px 6px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   height: 20px;
 }
 .queue-auto-wrap input[type="checkbox"] {
@@ -664,7 +737,7 @@
   position: absolute;
   inset: 0;
   color: var(--c-log-green);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   line-height: 10px;
   text-align: center;
 }
@@ -686,7 +759,7 @@
   gap: 6px;
   padding: 4px 10px;
   font-family: var(--font-log);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--c-text-strong);
   cursor: grab;
   border-left: 2px solid transparent;
@@ -714,12 +787,12 @@
 }
 .queue-task-index {
   color: var(--c-dim);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   text-align: right;
 }
 .queue-task-state {
   color: var(--c-log-green);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   text-align: center;
   line-height: 1;
 }
@@ -771,7 +844,7 @@
   background: transparent;
   border: none;
   color: var(--c-dim);
-  font-size: 14px;
+  font-size: var(--fs-lg);
   cursor: pointer;
   padding: 0 4px;
   line-height: 1;
@@ -782,7 +855,7 @@
   color: var(--c-text-muted);
   font-style: italic;
   text-align: center;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .queue-popover-footer {
   display: flex;
@@ -799,7 +872,7 @@
   background: var(--c-btn);
   border: 1px solid var(--c-border);
   color: var(--c-text);
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   font-family: var(--font-ui);
   padding: 4px 10px;
   border-radius: 2px;
@@ -813,8 +886,7 @@
 }
 .queue-btn-cancel:hover { background: var(--c-modal-danger-hover); }
 .queue-btn-thin {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 3px 8px;
   margin-left: auto;
 }
-

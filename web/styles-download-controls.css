@@ -29,7 +29,7 @@
 }
 .url-error-text {
   color: var(--c-log-red, #e66);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-style: italic;
 }
 
@@ -44,7 +44,7 @@
 }
 .video-opts-panel legend {
   color: var(--c-accent);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   padding: 0 8px;
 }
@@ -57,7 +57,7 @@
 .vo-row-checks { gap: 24px; }
 .vo-label {
   color: var(--c-dim);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   min-width: 68px;
 }
 .vo-input {
@@ -66,7 +66,7 @@
   border: 1px solid var(--c-border);
   color: var(--c-text);
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   padding: 4px 8px;
   border-radius: 3px;
 }
@@ -79,7 +79,7 @@
   border: 1px solid var(--c-border);
   color: var(--c-text);
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   padding: 3px 8px;
   border-radius: 3px;
   cursor: pointer;
@@ -89,7 +89,7 @@
   align-items: center;
   gap: 6px;
   color: var(--c-text);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   cursor: pointer;
 }
 .vo-check input[type="checkbox"] {
@@ -124,7 +124,7 @@
 .vo-download-btn {
   align-self: stretch;
   min-width: 130px;
-  font-size: 13px;
+  font-size: var(--fs-md);
   font-weight: 600;
   padding: 0 14px;
 }
@@ -140,7 +140,7 @@
 }
 .channel-opts-panel legend {
   color: var(--c-accent);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   padding: 0 8px;
 }
@@ -152,12 +152,12 @@
 }
 .co-label {
   color: var(--c-dim);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   min-width: 68px;
 }
 .co-sep { color: var(--c-dim); }
-.co-hint { color: var(--c-dim); font-size: 11px; font-style: italic; }
-.co-mode-text { color: var(--c-text); font-size: 12px; }
+.co-hint { color: var(--c-dim); font-size: var(--fs-xs); font-style: italic; }
+.co-mode-text { color: var(--c-text); font-size: var(--fs-sm); }
 
 /* Channel nudge panel (YTArchiver.py:4458 channel_nudge_panel) */
 .channel-nudge-panel {
@@ -169,18 +169,18 @@
   background: rgba(245, 160, 35, 0.08);
   border: 1px solid rgba(245, 160, 35, 0.3);
   border-radius: 4px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   cursor: pointer;            /* whole box is clickable -> jumps to Subs */
 }
 .channel-nudge-panel:hover {
   background: rgba(245, 160, 35, 0.14);
 }
-.channel-nudge-icon { font-size: 14px; }
+.channel-nudge-icon { font-size: var(--fs-lg); }
 .channel-nudge-text { color: var(--c-text); }
 .channel-nudge-panel .btn { margin-left: auto; }
 .ctl-label {
   color: var(--c-accent);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   min-width: 70px;
 }
 .ctl-input {
@@ -189,7 +189,7 @@
   border: 1px solid var(--c-border);
   color: var(--c-text);
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   padding: 6px 9px;
   border-radius: 2px;
   outline: none;
@@ -226,7 +226,7 @@
   color: var(--c-text);
   border: 1px solid var(--c-border);
   padding: 6px 14px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   border-radius: 2px;
   cursor: pointer;
   font-family: var(--font-ui);
@@ -358,7 +358,7 @@
 
 .btn-thin {
   padding: 4px 12px;
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
 }
 
 /* Sync Tasks + GPU Tasks icon-only buttons with notification badge */
@@ -391,6 +391,21 @@
 .icon-btn-sync:hover,
 .icon-btn-gpu:hover { background: var(--c-primary); }
 
+/* Labeled variant — the two queue buttons (Queue / Processing) carry a
+   text label so they read as real controls, not mystery icons. Width
+   grows to fit; the count badge stays pinned to the top-right corner. */
+.icon-btn-labeled {
+  width: auto;
+  gap: 6px;
+  padding: 0 10px;
+}
+.icon-btn-label {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+}
+
 /* Blink states — driven by window.setQueueState() from backend */
 .icon-btn-sync[data-blink-state="on"] { background: var(--c-queue-active-bg); border-color: var(--c-queue-active-border); }
 .icon-btn-sync[data-blink-state="paused"] { background: var(--c-queue-active-bg); border-color: var(--c-queue-active-border); }
@@ -405,7 +420,7 @@
   border-radius: 7px;
   background: var(--c-badge-danger);
   color: #fff;
-  font-size: 9px;
+  font-size: var(--fs-3xs);
   font-weight: 700;
   line-height: 14px;
   padding: 0 3px;
@@ -416,7 +431,7 @@
 
 .status-text {
   color: var(--c-dim);
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   margin-left: 12px;
   white-space: nowrap;
 }
@@ -443,14 +458,18 @@
    Individual slots inherit the dim/italic style; the stack container
    handles layout. Right-aligned in the Auto-sync controls row. */
 .preload-indicator-stack {
-  display: inline-flex;
+  /* Hidden: the global bottom status bar now carries indexing / sweep /
+     preload progress, so this Download-tab top-right copy is redundant.
+     Kept in the DOM (just hidden) so window._setIndicator's targets still
+     exist and the status-bar mirror keeps working. */
+  display: none;
   flex-direction: column;
   align-items: flex-end;
   gap: 0;
   line-height: 1.25;
 }
 .preload-indicator {
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   font-style: italic;
   color: var(--c-dim);
   white-space: nowrap;
@@ -460,14 +479,14 @@
 }
 .ctl-label-thin {
   min-width: auto;
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
 }
 .ctl-select {
   background: var(--c-input);
   border: 1px solid var(--c-border);
   color: var(--c-text);
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   padding: 4px 6px;
   border-radius: 2px;
   outline: none;
@@ -492,10 +511,10 @@
 }
 .index-controls .btn-thin {
   padding: 4px 10px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .index-controls #idx-last-built {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--c-dim);
   white-space: nowrap;
 }
@@ -507,14 +526,14 @@
 }
 .log-mode-label {
   color: var(--c-dim);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .radio-label {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   color: var(--c-text);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   cursor: pointer;
   user-select: none;
 }

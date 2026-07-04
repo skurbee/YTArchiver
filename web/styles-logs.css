@@ -59,13 +59,20 @@
   position: absolute;
   left: 50%; top: 50%;
   transform: translate(-50%, -50%);
-  width: 32px;
-  height: 2px;
-  background: var(--c-border);
-  border-radius: 1px;
+  width: 40px;
+  height: 3px;
+  /* Visible at rest (was --c-border on near-black = nearly invisible, so
+     nobody knew the log was resizable) — dim grip that brightens + widens
+     on hover to read as a draggable handle. */
+  background: var(--c-dim);
+  opacity: 0.55;
+  border-radius: 2px;
+  transition: opacity 0.12s ease, background 0.12s ease, width 0.12s ease;
 }
 .paned-splitter:hover::after {
   background: var(--c-accent);
+  opacity: 1;
+  width: 56px;
 }
 .main-log-frame {
   flex: 1 1 auto;
@@ -88,7 +95,7 @@
   z-index: 4;
   padding: 3px 10px;
   font-family: var(--font-ui, system-ui, sans-serif);
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   font-weight: 500;
   color: #eaeaea;
   background: rgba(35, 110, 64, 0.92);
@@ -109,7 +116,7 @@
   overflow-y: auto;
   overflow-x: hidden;
   font-family: var(--font-log);
-  font-size: 12px; /* Consolas 9 pt ≈ 12px at 96dpi */
+  font-size: var(--fs-sm); /* Consolas 9 pt ≈ 12px at 96dpi */
   line-height: 16px;
   color: var(--c-log-txt);
   white-space: nowrap;

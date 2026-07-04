@@ -108,6 +108,8 @@
       "initDragDropUrl",
       "initClearLog",
       "initQueueBlink",
+      "initStatusBar",
+      "initCommandPalette",
       "initQueueAutoCheckboxes",
       "initDeferredLivestreams",
       "initKeyboardShortcuts",
@@ -172,6 +174,10 @@
     _safe("initRepairCaptionsDialog", () => window.initRepairCaptionsDialog?.());
     _safe("initPunctRestoreDialog", () => window.initPunctRestoreDialog?.());
     _safe("initQueueModals",       () => window.initQueueModals?.());
+    // Global status bar wraps renderQueues / setQueueState / _setIndicator,
+    // so it must init AFTER queue + log modules have assigned those globals.
+    _safe("initStatusBar",         () => window.initStatusBar?.());
+    _safe("initCommandPalette",    () => window.initCommandPalette?.());
     _safe("initWatchActions",      () => window.initWatchActions?.());
     _safe("initLogContextMenu",    () => window.initLogContextMenu?.());
 

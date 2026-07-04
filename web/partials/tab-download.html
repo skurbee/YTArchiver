@@ -118,21 +118,25 @@
 
         <div class="spacer"></div>
 
-        <!-- Sync Tasks icon button with badge -->
-        <button class="icon-btn icon-btn-sync" id="btn-sync-tasks"
-                title="Sync Tasks &mdash; view pending downloads">
+        <!-- Sync Tasks icon button with label + badge -->
+        <button class="icon-btn icon-btn-labeled icon-btn-sync" id="btn-sync-tasks"
+                aria-expanded="false"
+                title="Sync queue &mdash; view pending downloads">
           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
             <path d="M5 2h6a1 1 0 0 1 1 1v1h1a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h1V3a1 1 0 0 1 1-1zm1 1v2h4V3H6zM4 6v8h8V6H4zm1 2h6v1H5V8zm0 2h6v1H5v-1zm0 2h4v1H5v-1z"/>
           </svg>
+          <span class="icon-btn-label">Sync</span>
           <span class="icon-badge" id="badge-sync" hidden>0</span>
         </button>
 
-        <!-- GPU Tasks icon button with badge -->
-        <button class="icon-btn icon-btn-gpu" id="btn-gpu-tasks"
-                title="Processing Tasks &mdash; view transcribe / encode queue">
+        <!-- GPU Tasks icon button with label + badge -->
+        <button class="icon-btn icon-btn-labeled icon-btn-gpu" id="btn-gpu-tasks"
+                aria-expanded="false"
+                title="Processing queue &mdash; view transcribe / encode tasks">
           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
             <path d="M2 3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H9v2h2v1H5v-1h2v-2H3a1 1 0 0 1-1-1V3zm1 0v7h10V3H3z"/>
           </svg>
+          <span class="icon-btn-label">Processing</span>
           <span class="icon-badge" id="badge-gpu" hidden>0</span>
         </button>
 
@@ -161,17 +165,13 @@
               role="status" aria-live="polite" aria-atomic="true"></span>
 
         <div class="spacer"></div>
-        <!-- Startup status stack &mdash; two stacked slots so "Indexing new
-             files" and "Preloading Browse tab" can show simultaneously
-             when they run in parallel. Top slot carries
-             sweep-flavored text (Starting up / Scanning disk /
-             Indexing new files). Bottom slot carries browse-preload
-             text. Either or both hidden when idle. Backend drives via
-             window._setIndicator(slot, text|null). -->
+        <!-- Startup status slot &mdash; carries the file-indexer / disk-scan
+             progress (Starting up / Scanning disk / Indexing new files).
+             Hidden by CSS now that the bottom status bar shows this; kept
+             so window._setIndicator("sweep", ...) has a target. -->
         <span class="preload-indicator-stack" id="browse-preload-indicator-stack"
               role="status" aria-live="polite" aria-atomic="true">
           <span id="browse-preload-slot-sweep" class="preload-indicator" hidden></span>
-          <span id="browse-preload-slot-preload" class="preload-indicator" hidden></span>
         </span>
       </div>
 

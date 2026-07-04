@@ -94,6 +94,24 @@
 
         <!-- View: video grid -->
         <div class="browse-view" id="view-videos" hidden>
+          <!-- Channel action header (Batch 8): the channel page is now a
+               place to ACT on the channel (sync / settings / folder), not
+               just watch it. Populated + shown by loadVideosFor(); this view
+               is used only for a specific channel's videos (the all-videos
+               "Videos" submode uses #view-recent), so it's safe here. -->
+          <div class="channel-page-header" id="channel-page-header" hidden>
+            <div class="cph-info" id="cph-info"></div>
+            <div class="cph-actions">
+              <button class="btn btn-sync btn-thin" id="cph-sync-now" type="button"
+                      title="Sync this channel now">&#8635; Sync now</button>
+              <button class="btn btn-ghost btn-thin" id="cph-settings" type="button"
+                      title="Edit this channel's settings">&#9881; Settings</button>
+              <button class="btn btn-ghost btn-thin" id="cph-folder" type="button"
+                      title="Open the channel folder">Open folder</button>
+              <button class="btn btn-ghost btn-thin" id="cph-more" type="button"
+                      aria-haspopup="true" aria-label="More channel actions">&#8942;</button>
+            </div>
+          </div>
           <div class="video-grid" id="video-grid"></div>
         </div>
 
@@ -164,26 +182,40 @@
                   <option value="1.5">1.5×</option>
                   <option value="2">2×</option>
                 </select>
-                <label class="ctl-label ctl-label-thin watch-overlay-label"
-                       title="Show the current transcript word overlaid on the video.&#10;Works in windowed and fullscreen.">Overlay:</label>
-                <select class="ctl-select" id="watch-cap-size"
-                        title="Overlay text size — Off hides the overlay">
-                  <option value="off" selected>Off</option>
-                  <option value="small">Small</option>
-                  <option value="medium">Medium</option>
-                  <option value="large">Large</option>
-                </select>
-                <select class="ctl-select" id="watch-cap-bg"
-                        title="Overlay background style">
-                  <option value="translucent" selected>Translucent</option>
-                  <option value="outline">Outline</option>
-                  <option value="none">None</option>
-                </select>
-                <select class="ctl-select" id="watch-cap-mode"
-                        title="1 word: just the spoken word.&#10;3 words: previous + current + next (neighbors dimmer).">
-                  <option value="single" selected>1 word</option>
-                  <option value="phrase3">3 words</option>
-                </select>
+                <!-- Overlay controls grouped under one label. The style +
+                     word-count selects were unlabeled mystery dropdowns
+                     ("Translucent" / "1 word"); they now sit in a labeled
+                     group and only appear once the overlay is turned on
+                     (size != Off), so the default state isn't confusing. -->
+                <div class="watch-overlay-group">
+                  <label class="ctl-label ctl-label-thin watch-overlay-label"
+                         title="Show the current transcript word overlaid on the video.&#10;Works in windowed and fullscreen.">Overlay:</label>
+                  <select class="ctl-select" id="watch-cap-size"
+                          aria-label="Overlay size"
+                          title="Overlay text size — Off hides the overlay">
+                    <option value="off" selected>Off</option>
+                    <option value="small">Small</option>
+                    <option value="medium">Medium</option>
+                    <option value="large">Large</option>
+                  </select>
+                  <span class="watch-overlay-extras collapsed" id="watch-overlay-extras">
+                    <label class="overlay-sublabel">style</label>
+                    <select class="ctl-select" id="watch-cap-bg"
+                            aria-label="Overlay background style"
+                            title="Overlay background style">
+                      <option value="translucent" selected>Translucent</option>
+                      <option value="outline">Outline</option>
+                      <option value="none">None</option>
+                    </select>
+                    <label class="overlay-sublabel">words</label>
+                    <select class="ctl-select" id="watch-cap-mode"
+                            aria-label="Words shown in overlay"
+                            title="1 word: just the spoken word.&#10;3 words: previous + current + next (neighbors dimmer).">
+                      <option value="single" selected>1 word</option>
+                      <option value="phrase3">3 words</option>
+                    </select>
+                  </span>
+                </div>
                 <div class="spacer"></div>
                 <label class="checkbox-label" title="Keep transcript scrolled to current line">
                   <input type="checkbox" id="watch-autofollow" checked />
@@ -235,6 +267,9 @@
                       id="btn-watch-shortcuts"
                       title="Keyboard shortcuts:&#10;Space &mdash; play/pause&#10;← / → &mdash; seek 5s&#10;↑ / ↓ &mdash; volume&#10;B &mdash; bookmark&#10;M &mdash; mute toggle&#10;Ctrl+F &mdash; focus Find"
                       aria-label="Keyboard shortcuts">?</span>
+                <button class="btn btn-ghost btn-thin tx-nonspeech-toggle"
+                        id="btn-tx-nonspeech" type="button" aria-pressed="false"
+                        title="Hide non-speech cues like [Music] and [Applause] from the transcript">Hide &#9834;</button>
                 <div class="spacer"></div>
                 <label class="find-label">Find:</label>
                 <input type="text" class="ctl-input find-input" id="watch-find"

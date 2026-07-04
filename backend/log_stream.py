@@ -108,6 +108,7 @@ class LogStreamer:
 
     def __init__(self, window=None):
         self._window = window
+        self._ready = False
         self._buffer: list[SegmentList] = []
         self._buffer_activity: list[dict] = []
         # staging buffers populated by _flush_now_locked
@@ -134,12 +135,14 @@ class LogStreamer:
 
     def set_window(self, window):
         self._window = window
-        # Flush any messages buffered while _window was None — workers
-        # that started Timer-driven log emits during Api.__init__ (the
-        # restore-paused notice, dependency-check banners, etc.) would
-        # otherwise sit in the buffer until the next emit triggered a
-        # flush, occasionally surfacing minutes late or never. Best-
-        # effort; failure leaves the buffer for the next normal flush.
+        # Do not flush here. pywebview.create_window() returns before
+        # webview.start() has a live JS bridge; evaluate_js in that gap
+        # can block startup for ~20s. mark_ready() flushes after the
+        # frontend is running.
+
+    def mark_ready(self):
+        """Mark the JS bridge ready and flush buffered startup messages."""
+        self._ready = True
         try:
             self.flush()
         except Exception as e:
@@ -202,7 +205,8 @@ class LogStreamer:
         _fire_now = False
         with self._lock:
             self._buffer.append(segments)
-            if len(self._buffer) >= self.MAX_BATCH_SIZE:
+            if (self._ready and self._window is not None
+                    and len(self._buffer) >= self.MAX_BATCH_SIZE):
                 # swap buffers under lock, fire JS bridge
                 # call outside the lock. Also cancel any scheduled
                 # timer so we don't double-fire.
@@ -255,6 +259,8 @@ class LogStreamer:
         # `if _flush_timer is not None: return` check happened outside
         # any lock, racing with the timer's own self-clear.
         with self._lock:
+            if not self._ready or self._window is None:
+                return
             if self._flush_timer is not None:
                 return
             t = threading.Timer(self.BATCH_INTERVAL_SEC, self._flush)
@@ -300,7 +306,12 @@ class LogStreamer:
         # threads (set_window / shutdown), so re-reading self._window after
         # the None-check could see it flip mid-flush.
         win = self._window
-        if win is None:
+        if win is None or not self._ready:
+            with self._lock:
+                if main_batch:
+                    self._buffer = list(main_batch) + self._buffer
+                if act_batch:
+                    self._buffer_activity = list(act_batch) + self._buffer_activity
             return
         try:
             payload = {"main": main_batch, "activity": act_batch}

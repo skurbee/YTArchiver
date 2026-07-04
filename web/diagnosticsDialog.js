@@ -49,10 +49,13 @@
           return;
         }
         const frag = document.createDocumentFragment();
-        let okN = 0, failN = 0;
+        let okN = 0, warnN = 0, failN = 0;
         for (const r of res.rows) {
           const row = document.createElement("div");
-          row.className = "diag-row" + (r.ok ? " diag-ok" : " diag-fail");
+          const status = (r.status === "warning")
+            ? "warning"
+            : (r.ok ? "ok" : "fail");
+          row.className = "diag-row diag-" + status;
           row.innerHTML = `
             <span class="diag-dot"></span>
             <span class="diag-name"></span>
@@ -61,13 +64,21 @@
           row.querySelector(".diag-name").textContent = r.name;
           row.querySelector(".diag-detail").textContent = r.detail || "";
           frag.appendChild(row);
-          if (r.ok) okN++; else failN++;
+          if (status === "warning") warnN++;
+          else if (status === "fail") failN++;
+          else okN++;
         }
         rowsEl.innerHTML = "";
         rowsEl.appendChild(frag);
-        summaryEl.textContent = failN === 0
-          ? `All ${okN} checks passed`
-          : `${okN} ok \u2014 ${failN} problem${failN === 1 ? "" : "s"}`;
+        if (failN > 0) {
+          summaryEl.textContent = warnN > 0
+            ? `${okN} ok - ${warnN} warning${warnN === 1 ? "" : "s"} - ${failN} problem${failN === 1 ? "" : "s"}`
+            : `${okN} ok - ${failN} problem${failN === 1 ? "" : "s"}`;
+        } else if (warnN > 0) {
+          summaryEl.textContent = `${okN} ok - ${warnN} warning${warnN === 1 ? "" : "s"}`;
+        } else {
+          summaryEl.textContent = `All ${okN} checks passed`;
+        }
       } catch (e) {
         rowsEl.innerHTML = `<div class="browse-empty askq-empty-padded">Error: ${escapeHtml(String(e))}</div>`;
       }

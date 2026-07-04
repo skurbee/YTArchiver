@@ -45,6 +45,20 @@ _tx_retry_lock = threading.Lock()
 _tx_retry_thread: threading.Thread | None = None
 
 
+def _sqlite_is_busy(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _rollback_quietly(conn: sqlite3.Connection | None, label: str) -> None:
+    if conn is None:
+        return
+    try:
+        conn.rollback()
+    except Exception as exc:
+        _log.debug("%s rollback skipped: %s", label, exc)
+
+
 def _invalidate_top_words_cache() -> None:
     try:
         from . import index_graph as _graph
@@ -749,7 +763,9 @@ def register_video(filepath: str, channel: str, title: str | None = None,
                    tx_status: str = "pending",
                    video_id: str | None = None,
                    duration_secs: float | None = None,
-                   _conn_override: sqlite3.Connection | None = None) -> bool:
+                   _conn_override: sqlite3.Connection | None = None,
+                   _busy_retry_deadline_sec: float = 300.0,
+                   _busy_retry_sleep_base: float = 0.5) -> bool:
     """Add a newly downloaded video to the videos table.
 
     Called by sync.py each time a .mp4 lands. Browse tab + Index tab both
@@ -939,20 +955,46 @@ def register_video(filepath: str, channel: str, title: str | None = None,
         # drop a just-downloaded video from the index. Back off and retry
         # so the registration actually lands. Non-transient sqlite errors
         # fall through to the outer handler immediately.
-        _attempts = 6
-        for _attempt in range(_attempts):
+        _busy_started = time.monotonic()
+        _last_busy_notice = 0.0
+        _attempt = 0
+        _deadline = max(0.0, float(_busy_retry_deadline_sec or 0.0))
+        _sleep_base = max(0.01, float(_busy_retry_sleep_base or 0.5))
+        while True:
+            _attempt += 1
             try:
                 with _ctx:
                     _do_register_write()
                 break
             except sqlite3.OperationalError as _oe:
-                _msg = str(_oe).lower()
-                if ("locked" in _msg or "busy" in _msg) and _attempt < _attempts - 1:
+                if _sqlite_is_busy(_oe):
+                    # A failed write can leave this connection inside an
+                    # aborted transaction. Roll back before retrying so a
+                    # single sweep-side lock does not poison every later file.
+                    _rollback_quietly(conn, "register_video busy")
+                    _elapsed = time.monotonic() - _busy_started
+                    if _elapsed < _deadline:
+                        _now = time.monotonic()
+                        if _attempt == 1:
+                            _log.debug(
+                                "register_video DB busy; waiting up to %.0fs "
+                                "for %s: %s",
+                                _deadline, filepath, _oe)
+                        elif (_elapsed >= 30.0
+                              and _now - _last_busy_notice >= 30.0):
+                            _last_busy_notice = _now
+                            _log.warning(
+                                "register_video still waiting on DB lock "
+                                "after %.0fs for %s: %s",
+                                _elapsed, filepath, _oe)
+                        time.sleep(min(5.0, _sleep_base * min(_attempt, 10)))
+                        continue
                     _log.warning(
-                        "register_video DB busy, retry %d/%d: %s",
-                        _attempt + 1, _attempts, _oe)
-                    time.sleep(0.5 * (_attempt + 1))
-                    continue
+                        "register_video deferred for %s: database stayed "
+                        "busy for %.0fs: %s",
+                        filepath, _elapsed, _oe)
+                    return False
+                _rollback_quietly(conn, "register_video error")
                 raise
         # Drop the browse-list cache for this channel so the next grid
         # click picks up the newly-registered video.
@@ -975,6 +1017,7 @@ def register_video(filepath: str, channel: str, title: str | None = None,
                          fp, e)
         return True
     except sqlite3.Error as e:
+        _rollback_quietly(conn, "register_video final error")
         _log.error("register_video failed for %s: %s", filepath, e)
         return False
 
@@ -1433,6 +1476,7 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
         # still inflated the reported "ingested" total before this fix.
         return len(rows)
     except sqlite3.Error as e:
+        _rollback_quietly(conn, "ingest_jsonl error")
         _log.error("ingest_jsonl failed for %s: %s", jsonl_path, e)
         return 0
 
@@ -1651,87 +1695,28 @@ def preload_channel_videos(channel: str,
     return len(rows)
 
 
-def preload_all_channels(channel_names: list[str],
-                         progress_cb: Any | None = None,
-                         cancel_ev: Any | None = None,
-                         low_priority_busy_fn: Any | None = None,
+def preload_all_channels(channels,
                          sort: str = "newest",
-                         limit: int = 500) -> dict[str, int]:
-    """Warm the per-channel video-list cache for every subscribed channel.
-
-    Design rule: browse preload should ALWAYS be the bottom priority —
-    if a user is downloading or loading the metadata page, that should
-    supersede the preload.
-
-    How we deliver on that:
-    1. Reads go through `_reader_conn` (separate from the writer's
-       `_conn`), so preload never grabs `_db_lock`. WAL mode means
-       writers don't block readers and vice versa.
-    2. A 30 ms politeness yield between channels lets other Python
-       threads (sync worker, GPU worker, HTTP requests for metadata
-       page) advance. On 100+ channels this adds ~3 seconds total —
-       imperceptible vs the multi-minute preload duration on a real
-       archive.
-    3. If sync or GPU is actively running, startup callers can provide
-       low_priority_busy_fn; preload then waits between channels and
-       interrupts uncached thumbnail walks instead of competing with
-       download finalization.
-
-    Returns {channel_name: row_count}.
-    """
-    import time as _t
+                         limit: int = 500,
+                         low_priority_busy_fn: Any | None = None) -> dict:
+    """Warm per-channel Browse caches, yielding to foreground work."""
     out: dict[str, int] = {}
-    total = len(channel_names)
-
-    def _wait_if_busy() -> bool:
-        while _low_priority_busy(low_priority_busy_fn):
-            if cancel_ev is not None and cancel_ev.is_set():
-                return False
-            _t.sleep(0.5)
-        return True
-
-    i = 0
-    while i < total:
-        ch = channel_names[i]
-        if cancel_ev is not None and cancel_ev.is_set():
-            break
-        if not _wait_if_busy():
-            break
-        if progress_cb is not None:
-            try: progress_cb(i + 1, total, ch)
-            except Exception as e: _log.debug("swallowed: %s", e)
-        try:
-            out[ch] = preload_channel_videos(
-                ch, sort=sort, limit=limit,
-                low_priority_busy_fn=low_priority_busy_fn)
-        except _LowPriorityInterrupted:
-            # User-visible work started mid-channel. Do not cache a
-            # partial preload; wait, then retry the same channel later.
-            if not _wait_if_busy():
-                break
+    for channel in channels or []:
+        if not channel:
             continue
-        except Exception:
-            out[ch] = 0
-        i += 1
-        # Politeness yield. Active sync/GPU = longer yield.
-        try:
-            from . import sync as _sync
-            active = _sync.is_any_sync_active()
-        except Exception:
-            active = False
-        _t.sleep(0.2 if active else 0.03)
-    # Warm the global "Videos" view's first page now that every channel's
-    # thumbnail data is hot. list_all_videos has its own result cache
-    # (_all_videos_cache) but no warmer, so without this the first
-    # Browse>Videos click still paid the cold ~10s per-row thumbnail walk.
-    # Match videosView.js's default request exactly: sort="recent",
-    # PAGE=60, offset=0, include_thumbs=True.
-    if (not (cancel_ev is not None and cancel_ev.is_set())
-            and _wait_if_busy()):
-        try:
-            list_all_videos("recent", 60, 0, include_thumbs=True)
-        except Exception as e:
-            _log.debug("preload all-videos first page failed: %s", e)
+        while True:
+            while _low_priority_busy(low_priority_busy_fn):
+                time.sleep(0.25)
+            try:
+                out[channel] = preload_channel_videos(
+                    channel,
+                    sort=sort,
+                    limit=limit,
+                    low_priority_busy_fn=low_priority_busy_fn,
+                )
+                break
+            except _LowPriorityInterrupted:
+                time.sleep(0.25)
     return out
 
 

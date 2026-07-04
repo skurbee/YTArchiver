@@ -48,7 +48,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>YT Archiver</title>
+  <title>YTArchiver</title>
   <link rel="stylesheet" href="styles.css?v=2" />
   <link rel="stylesheet" href="styles-settings.css?v=2" />
   <link rel="stylesheet" href="styles-download-controls.css?v=1" />
@@ -64,19 +64,19 @@
 
   <!-- Header strip -->
   <div class="header-strip">
-    <span class="header-title">YT ARCHIVER</span>
+    <span class="header-title">YTArchiver</span>
     <span class="header-version" id="header-version">loading&hellip;</span>
+    <button class="header-help" id="btn-shortcuts-help" type="button"
+            title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
   </div>
 
-  <!-- Tab row. Recent was previously a top-level tab (hangover from an
-       earlier draft) but users wanted it moved under Browse alongside
-       Channels / Search / Graph / Bookmarks so all "library navigation"
-       lives in one place. See the `panel-browse` sidebar below for the
-       new location. -->
+  <!-- Tab row. Download / Subs / Browse are the work tabs on the left.
+       Health and Settings are grouped on the right as app/admin tabs. -->
   <div class="tab-row">
     <div class="tab active" data-tab="download">Download</div>
     <div class="tab" data-tab="subs">Subs</div>
     <div class="tab browse-tab" data-tab="browse">Browse</div>
+    <div class="tab health-tab" data-tab="health">Health</div>
     <div class="tab settings-tab" data-tab="settings">Settings</div>
   </div>
   <!-- Download tab -->
@@ -199,21 +199,25 @@
 
         <div class="spacer"></div>
 
-        <!-- Sync Tasks icon button with badge -->
-        <button class="icon-btn icon-btn-sync" id="btn-sync-tasks"
-                title="Sync Tasks &mdash; view pending downloads">
+        <!-- Sync Tasks icon button with label + badge -->
+        <button class="icon-btn icon-btn-labeled icon-btn-sync" id="btn-sync-tasks"
+                aria-expanded="false"
+                title="Sync queue &mdash; view pending downloads">
           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
             <path d="M5 2h6a1 1 0 0 1 1 1v1h1a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h1V3a1 1 0 0 1 1-1zm1 1v2h4V3H6zM4 6v8h8V6H4zm1 2h6v1H5V8zm0 2h6v1H5v-1zm0 2h4v1H5v-1z"/>
           </svg>
+          <span class="icon-btn-label">Sync</span>
           <span class="icon-badge" id="badge-sync" hidden>0</span>
         </button>
 
-        <!-- GPU Tasks icon button with badge -->
-        <button class="icon-btn icon-btn-gpu" id="btn-gpu-tasks"
-                title="Processing Tasks &mdash; view transcribe / encode queue">
+        <!-- GPU Tasks icon button with label + badge -->
+        <button class="icon-btn icon-btn-labeled icon-btn-gpu" id="btn-gpu-tasks"
+                aria-expanded="false"
+                title="Processing queue &mdash; view transcribe / encode tasks">
           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
             <path d="M2 3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H9v2h2v1H5v-1h2v-2H3a1 1 0 0 1-1-1V3zm1 0v7h10V3H3z"/>
           </svg>
+          <span class="icon-btn-label">Processing</span>
           <span class="icon-badge" id="badge-gpu" hidden>0</span>
         </button>
 
@@ -242,17 +246,13 @@
               role="status" aria-live="polite" aria-atomic="true"></span>
 
         <div class="spacer"></div>
-        <!-- Startup status stack &mdash; two stacked slots so "Indexing new
-             files" and "Preloading Browse tab" can show simultaneously
-             when they run in parallel. Top slot carries
-             sweep-flavored text (Starting up / Scanning disk /
-             Indexing new files). Bottom slot carries browse-preload
-             text. Either or both hidden when idle. Backend drives via
-             window._setIndicator(slot, text|null). -->
+        <!-- Startup status slot &mdash; carries the file-indexer / disk-scan
+             progress (Starting up / Scanning disk / Indexing new files).
+             Hidden by CSS now that the bottom status bar shows this; kept
+             so window._setIndicator("sweep", ...) has a target. -->
         <span class="preload-indicator-stack" id="browse-preload-indicator-stack"
               role="status" aria-live="polite" aria-atomic="true">
           <span id="browse-preload-slot-sweep" class="preload-indicator" hidden></span>
-          <span id="browse-preload-slot-preload" class="preload-indicator" hidden></span>
         </span>
       </div>
 
@@ -341,6 +341,19 @@
                 title="Delete all selected channels">Delete&hellip;</button>
       </div>
 
+      <!-- Compact always-visible legend for the Transcribe / Metadata
+           mark columns (the "A ✓" shorthand is opaque otherwise) plus a
+           hint that the headers sort. Full detail stays in each header's
+           hover tooltip. -->
+      <div class="subs-legend">
+        <span class="subs-legend-label">Transcribe / Metadata:</span>
+        <span><b>A&nbsp;&#10003;</b> auto&nbsp;on&nbsp;&amp;&nbsp;complete</span>
+        <span><b>&#10003;</b> complete&nbsp;(manual)</span>
+        <span><b>&mdash;&nbsp;-N</b> N&nbsp;behind</span>
+        <span><b>&mdash;</b> off</span>
+        <span class="subs-legend-hint">Click a column header to sort.</span>
+      </div>
+
       <!-- Channel table -->
       <div class="subs-table-frame">
         <table class="subs-table" id="subs-table">
@@ -356,6 +369,7 @@
             <col class="col-num"/>
             <col class="col-num"/>
             <col class="col-num"/>
+            <col class="col-actions"/>
           </colgroup>
           <thead>
             <!-- data-sort keys must match the kinds map in wireTableSort
@@ -377,6 +391,7 @@
               <th data-sort="n_vids"># Vids</th>
               <th data-sort="size">Size</th>
               <th data-sort="avg_size" title="Average file size = total size / # videos">Avg</th>
+              <th class="col-actions" data-nosort aria-label="Row actions"></th>
             </tr>
           </thead>
           <tbody id="subs-table-body"></tbody>
@@ -400,15 +415,19 @@
              without shoving subsequent labels into the wrong cell. -->
         <div class="edit-form">
 
-          <!-- Row 1: Folder Name + Channel URL side-by-side -->
+          <!-- Row 1: Channel URL + Folder Name side-by-side. URL comes
+               FIRST because it's the thing the user has on the clipboard;
+               the Folder Name auto-fills from it (editChannel.js
+               _maybeAutoFillFolder), so it's the second, usually-untouched
+               field. -->
           <div class="edit-row">
-            <div class="edit-field edit-field-grow">
-              <label class="edit-gl">Folder Name</label>
-              <input type="text" class="ctl-input" id="edit-folder" placeholder="Target folder name" />
-            </div>
             <div class="edit-field edit-field-grow">
               <label class="edit-gl">Channel URL</label>
               <input type="text" class="ctl-input" id="edit-url" placeholder="https://www.youtube.com/@handle" />
+            </div>
+            <div class="edit-field edit-field-grow">
+              <label class="edit-gl">Folder Name</label>
+              <input type="text" class="ctl-input" id="edit-folder" placeholder="Auto-fills from the URL" />
             </div>
           </div>
 
@@ -604,193 +623,172 @@
   <!-- Recent tab -->
   <!-- (Recent tab moved into Browse as a submode &mdash; see `view-recent`
        inside panel-browse below.) -->
-  <!-- Settings tab: left-sidebar layout, multiple sub-views.
-       [General] &mdash; paths, defaults, log mode, whisper model
-       [Performance] &mdash; startup tuning (disk scan, browse preload)
-       [Appearance] &mdash; UI preferences (subs table, recent view)
-       [Tools] &mdash; yt-dlp, channel/backup export-import, bulk metadata
-       [Index] &mdash; archive index management (Stats, Build/Update,
-                       Rebuild, Archive roots, Auto-update, Log)
-       the user wanted everything index-related in one place, not spread
-       between Browse and Settings. All sub-views share one Save button
-       in the footer below. -->
+  <!-- Settings tab: one scrollable settings page. General, Performance, and
+       Appearance are sections instead of separate sub-tabs because the latter
+       two only have a small number of options. -->
   <div class="tab-panel" id="panel-settings">
-    <div class="settings-area">
-      <!-- Left sub-nav -->
-      <div class="settings-sidebar">
-        <div class="settings-subnav-label">CATEGORY</div>
-        <div class="settings-subnav-btn active" data-settings-view="general">General</div>
-        <div class="settings-subnav-btn" data-settings-view="performance">Performance</div>
-        <div class="settings-subnav-btn" data-settings-view="appearance">Appearance</div>
-        <div class="settings-subnav-btn" data-settings-view="tools">Tools</div>
-        <div class="settings-subnav-btn" data-settings-view="metadata">Metadata</div>
-        <div class="settings-subnav-btn" data-settings-view="index">Index</div>
+    <div class="settings-main settings-single-page">
+      <div class="settings-view" id="settings-view-general">
+
+        <label class="subs-section-label">General</label>
+        <div class="edit-grid">
+          <label class="edit-gl">Archive root</label>
+          <div class="edit-gv-inline">
+            <input type="text" class="ctl-input" id="settings-output-dir" readonly />
+            <button class="btn btn-ghost btn-thin" id="settings-browse-output">Browse&hellip;</button>
+          </div>
+          <div class="edit-gh">
+            Where new channel downloads land. Changing this only affects
+            <b>new</b> downloads &mdash; existing videos stay where they are.
+            Move them manually if you want everything in one place.
+          </div>
+
+          <label class="edit-gl">Video downloads</label>
+          <div class="edit-gv-inline">
+            <input type="text" class="ctl-input" id="settings-video-dir" readonly />
+            <button class="btn btn-ghost btn-thin" id="settings-browse-video">Browse&hellip;</button>
+          </div>
+          <div class="edit-gh">
+            Default save location for single-video downloads (URL bar
+            on the Download tab).
+          </div>
+
+          <label class="edit-gl">Default resolution</label>
+          <select class="ctl-select" id="settings-default-res">
+            <option value="audio">Audio only</option>
+            <option value="144">144p</option>
+            <option value="240">240p</option>
+            <option value="360">360p</option>
+            <option value="480">480p</option>
+            <option value="720" selected>720p</option>
+            <option value="1080">1080p</option>
+            <option value="1440">1440p</option>
+            <option value="2160">2160p (4K)</option>
+            <option value="best">Best available</option>
+          </select>
+
+          <label class="edit-gl">Auto-transcribe model</label>
+          <select class="ctl-select" id="settings-whisper-model">
+            <option value="tiny">tiny (fastest)</option>
+            <option value="small" selected>small</option>
+            <option value="medium">medium</option>
+            <option value="large-v3">large-v3 (best)</option>
+          </select>
+
+          <label class="edit-gl">When closing window</label>
+          <select class="ctl-select" id="settings-close-behavior">
+            <option value="ask" selected>Ask each time</option>
+            <option value="tray">Minimize to tray</option>
+            <option value="quit">Quit immediately</option>
+          </select>
+
+          <label class="edit-gl">Auto-sync timing</label>
+          <select class="ctl-select" id="settings-autorun-mode"
+                  title="Timer counts down a fixed interval from now; Clock-aligned fires at wall-clock boundaries (e.g. every :00/:30)">
+            <option value="timer">Timer (countdown)</option>
+            <option value="clock">Clock-aligned (fixed times)</option>
+          </select>
+
+          <label class="edit-gl">Launch at boot</label>
+          <div class="edit-gv-stack">
+            <label class="edit-gv-inline settings-preload-toggle">
+              <input type="checkbox" id="settings-launch-at-boot" />
+              <span>Start YTArchiver when Windows signs in</span>
+            </label>
+            <label class="edit-gv-inline settings-preload-toggle" id="settings-boot-minimized-wrap" hidden>
+              <input type="checkbox" id="settings-boot-minimized" />
+              <span>Start minimized to tray</span>
+            </label>
+          </div>
+        </div>
+
+        <label class="subs-section-label">Performance</label>
+        <div class="edit-grid">
+          <label class="edit-gl">Disk scan</label>
+          <div class="edit-gv-inline edit-gap-6">
+            <span class="edit-dim">rescan archive if cache older than</span>
+            <input type="text" class="ctl-input edit-num settings-disk-staleness-input"
+                   id="settings-disk-staleness" value="24" />
+            <span class="edit-dim">hours &nbsp;&middot;&nbsp; 0 = always rescan</span>
+          </div>
+
+          <label class="edit-gl">Archive drive warning</label>
+          <div class="edit-gv-inline edit-gap-6 settings-archive-capacity-row">
+            <span class="edit-dim">warning type</span>
+            <select class="ctl-select" id="settings-archive-capacity-mode">
+              <option value="percent" selected>Percent full</option>
+              <option value="free_gb">GB free</option>
+            </select>
+            <input type="text" class="ctl-input edit-num settings-archive-capacity-input"
+                   id="settings-archive-capacity-threshold" value="90" />
+            <span class="edit-dim" id="settings-archive-capacity-unit">% full</span>
+          </div>
+        </div>
+
+        <label class="subs-section-label">Appearance</label>
+        <div class="edit-grid">
+          <label class="edit-gl">Subs table</label>
+          <div class="edit-gv-stack">
+            <label class="edit-gv-inline settings-preload-toggle">
+              <input type="checkbox" id="settings-show-avg-size" />
+              <span>Show Avg filesize in subs tab</span>
+            </label>
+          </div>
+
+          <label class="edit-gl">Log mode</label>
+          <select class="ctl-select" id="settings-log-mode">
+            <option value="Simple" selected>Simple</option>
+            <option value="Verbose">Verbose</option>
+          </select>
+        </div>
+
+        <div class="settings-actions" id="settings-actions-footer">
+          <span class="settings-autosave-note" id="settings-autosave-note"
+                role="status" aria-live="polite" aria-atomic="true">Changes are saved automatically</span>
+        </div>
       </div>
+    </div>
 
-      <!-- Right: active sub-view -->
+    <div class="mini-log-frame">
+      <div class="main-log mini-log" id="settings-mini-log" tabindex="-1"></div>
+    </div>
+  </div>
+  <!-- Health tab: library maintenance + status. Metadata / Index / Tools
+       live here because they are actions and dashboards, not preferences. -->
+  <div class="tab-panel" id="panel-health">
+    <div class="settings-area">
+      <div class="settings-sidebar">
+        <div class="settings-subnav-label">LIBRARY</div>
+        <div class="settings-subnav-btn active" data-settings-view="metadata">Metadata</div>
+        <div class="settings-subnav-btn" data-settings-view="index">Index</div>
+        <div class="settings-subnav-btn" data-settings-view="tools">Tools</div>
+      </div>
       <div class="settings-main">
-
-        <!-- General settings &mdash; core config everyone sets once -->
-        <div class="settings-view" id="settings-view-general">
-          <label class="subs-section-label">General</label>
-          <div class="edit-grid">
-            <label class="edit-gl">Archive root</label>
-            <div class="edit-gv-inline">
-              <input type="text" class="ctl-input" id="settings-output-dir" readonly />
-              <button class="btn btn-ghost btn-thin" id="settings-browse-output">Browse&hellip;</button>
-            </div>
-            <div class="edit-gh">
-              Where new channel downloads land. Changing this only affects
-              <b>new</b> downloads &mdash; existing videos stay where they are.
-              Move them manually if you want everything in one place.
-            </div>
-
-            <label class="edit-gl">Video downloads</label>
-            <div class="edit-gv-inline">
-              <input type="text" class="ctl-input" id="settings-video-dir" readonly />
-              <button class="btn btn-ghost btn-thin" id="settings-browse-video">Browse&hellip;</button>
-            </div>
-            <div class="edit-gh">
-              Default save location for single-video downloads (URL bar
-              on the Download tab).
-            </div>
-
-            <label class="edit-gl">Default resolution</label>
-            <select class="ctl-select" id="settings-default-res">
-              <option value="audio">Audio only</option>
-              <option value="144">144p</option>
-              <option value="240">240p</option>
-              <option value="360">360p</option>
-              <option value="480">480p</option>
-              <option value="720" selected>720p</option>
-              <option value="1080">1080p</option>
-              <option value="1440">1440p</option>
-              <option value="2160">2160p (4K)</option>
-              <option value="best">Best available</option>
-            </select>
-
-            <label class="edit-gl">Auto-transcribe model</label>
-            <select class="ctl-select" id="settings-whisper-model">
-              <option value="tiny">tiny (fastest)</option>
-              <option value="small" selected>small</option>
-              <option value="medium">medium</option>
-              <option value="large-v3">large-v3 (best)</option>
-            </select>
-
-            <!-- X-button behavior. main.py:7552 reads this from
-                 close_behavior; "ask" pops the Quit/Tray/Cancel modal,
-                 "quit" exits immediately, "tray" minimizes to tray
-                 without prompting. Saved via settings_save and also
-                 written by the close-modal "Remember my choice" box. -->
-            <label class="edit-gl">When closing window</label>
-            <select class="ctl-select" id="settings-close-behavior">
-              <option value="ask" selected>Ask each time</option>
-              <option value="tray">Minimize to tray</option>
-              <option value="quit">Quit immediately</option>
-            </select>
-
-            <!-- Auto-sync firing mode. Timer = countdown ("next in 14m");
-                 Clock = snap to wall-clock boundaries ("Next at 7:00pm").
-                 Applied immediately via autorun_set_mode (not the bulk
-                 settings Save). -->
-            <label class="edit-gl">Auto-sync timing</label>
-            <select class="ctl-select" id="settings-autorun-mode"
-                    title="Timer counts down a fixed interval from now; Clock-aligned fires at wall-clock boundaries (e.g. every :00/:30)">
-              <option value="timer">Timer (countdown)</option>
-              <option value="clock">Clock-aligned (fixed times)</option>
-            </select>
-
-            <!-- Launch at boot: writes/clears HKCU Run Registry key so
-                 Windows auto-starts YTArchiver on login. -->
-            <label class="edit-gl">Launch at boot</label>
-            <div class="edit-gv-stack">
-              <label class="edit-gv-inline settings-preload-toggle">
-                <input type="checkbox" id="settings-launch-at-boot" />
-                <span>Start YTArchiver when Windows signs in</span>
-              </label>
-              <label class="edit-gv-inline settings-preload-toggle" id="settings-boot-minimized-wrap" hidden>
-                <input type="checkbox" id="settings-boot-minimized" />
-                <span>Start minimized to tray</span>
-              </label>
-            </div>
-          </div>
-        </div>
-
-        <!-- Performance &mdash; startup tuning -->
-        <div class="settings-view" id="settings-view-performance" hidden>
-          <label class="subs-section-label">Performance</label>
-          <div class="edit-grid">
-            <!-- Disk-scan staleness: re-walk the archive to refresh sizes
-                 only if the cached folder stats are older than this many
-                 hours. 0 = walk every launch (old behavior, safest).
-                 Higher = faster boots but outside-the-app drift takes
-                 longer to reconcile. -->
-            <label class="edit-gl">Disk scan</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <span class="edit-dim">rescan archive if cache older than</span>
-              <input type="text" class="ctl-input edit-num settings-disk-staleness-input"
-                     id="settings-disk-staleness" value="24" />
-              <span class="edit-dim">hours &nbsp;&middot;&nbsp; 0 = always rescan</span>
-            </div>
-
-            <!-- Browse preload: warm every channel's video list into
-                 memory at boot so Browse clicks are instant. -->
-            <label class="edit-gl">Browse preload</label>
-            <div class="edit-gv-stack">
-              <label class="edit-gv-inline settings-preload-toggle">
-                <input type="checkbox" id="settings-preload-all" />
-                <span>Preload every video at launch</span>
-              </label>
-              <div class="edit-gv-inline settings-preload-hint-row" id="settings-preload-hint-wrap">
-                <span class="edit-dim" id="settings-preload-all-hint"></span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Appearance &mdash; UI preferences -->
-        <div class="settings-view" id="settings-view-appearance" hidden>
-          <label class="subs-section-label">Appearance</label>
-          <div class="edit-grid">
-            <!-- Subs tab Avg column visibility toggle. The Avg column
-                 (total size / # videos) is a derived stat some users
-                 find noisy; hide it without losing the underlying data. -->
-            <label class="edit-gl">Subs table</label>
-            <div class="edit-gv-stack">
-              <label class="edit-gv-inline settings-preload-toggle">
-                <input type="checkbox" id="settings-show-avg-size" />
-                <span>Show Avg filesize in subs tab</span>
-              </label>
-            </div>
-
-            <!-- (Recent view List/Grid toggle removed — the Videos view is
-                 always the thumbnail grid now.) -->
-
-            <!-- Log mode &mdash; was originally on the General tab, moved
-                 here per UI feedback. Simple = high-level human-readable
-                 messages only; Verbose = every yt-dlp / ffmpeg subprocess
-                 line streams to the log. -->
-            <label class="edit-gl">Log mode</label>
-            <select class="ctl-select" id="settings-log-mode">
-              <option value="Simple" selected>Simple</option>
-              <option value="Verbose">Verbose</option>
-            </select>
-          </div>
-        </div>
 
         <!-- Tools &mdash; yt-dlp, import/export, bulk metadata -->
         <div class="settings-view" id="settings-view-tools" hidden>
-          <label class="subs-section-label">Tools</label>
+          <label class="subs-section-label">Dependencies</label>
           <div class="edit-grid">
-            <div class="edit-gh settings-tool-group">Dependencies</div>
             <label class="edit-gl">yt-dlp</label>
             <div class="edit-gv-inline edit-gap-8">
               <span class="edit-dim" id="settings-ytdlp-version">checking&hellip;</span>
               <button class="btn btn-ghost btn-thin" id="btn-ytdlp-update"
-                      title="Run yt-dlp -U to update to the latest release">Update</button>
+                      title="Update yt-dlp to the latest release on the selected channel">Update</button>
             </div>
 
-            <div class="edit-gh settings-tool-group">Backup and migration</div>
+            <label class="edit-gl">Release channel</label>
+            <div class="edit-gv-inline edit-gap-8">
+              <select class="ctl-select" id="settings-ytdlp-channel"
+                      title="Stable is safest. Beta (nightly) carries YouTube fixes days-to-weeks ahead of stable — switch to it if downloads start failing with 403 errors while Stable is already up to date.">
+                <option value="stable">Stable</option>
+                <option value="nightly">Beta (nightly)</option>
+              </select>
+            </div>
+
+          </div>
+
+          <label class="subs-section-label">Backup and Migration</label>
+          <div class="edit-grid">
             <label class="edit-gl">Channels</label>
             <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-export-channels"
@@ -807,7 +805,7 @@
                 <button class="btn btn-ghost btn-thin" id="btn-import-backup"
                         title="Restore a backup zip (snapshots current config first)">Restore&hellip;</button>
               </div>
-              <span id="backup-age-display" style="font-size:11px;color:var(--c-dim);line-height:1.4"></span>
+              <span id="backup-age-display" style="font-size:var(--fs-xs);color:var(--c-dim);line-height:1.4"></span>
             </div>
 
             <!-- "Metadata (all channels)" row removed &mdash; a dedicated
@@ -821,7 +819,10 @@
                  users asked for it grouped with the other archive-
                  wide Tools actions. Button id stays `btn-scan-archive`
                  so `initScanArchive()` in app.js finds it unchanged. -->
-            <div class="edit-gh settings-tool-group">Archive integrity</div>
+          </div>
+
+          <label class="subs-section-label">Archive Integrity</label>
+          <div class="edit-grid">
             <label class="edit-gl">Archive</label>
             <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-scan-archive"
@@ -845,7 +846,10 @@
                  HTML + JS but had no UI buttons to trigger them. Both
                  handlers (app.js:6436 / 6471) use getElementById which
                  silently no-ops when the elements are absent. -->
-            <div class="edit-gh settings-tool-group">App info and setup</div>
+          </div>
+
+          <label class="subs-section-label">App Info and Setup</label>
+          <div class="edit-grid">
             <label class="edit-gl">Info &amp; Self-check</label>
             <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-about"
@@ -889,7 +893,10 @@
                  from .jsonl data, queues Whisper retranscribe for
                  entries that only exist in .txt, and cleans up FTS5
                  phantom rows (C-9). -->
-            <div class="edit-gh settings-tool-group">Transcript repair</div>
+          </div>
+
+          <label class="subs-section-label">Transcript Repair</label>
+          <div class="edit-grid">
             <label class="edit-gl">Transcript drift</label>
             <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-drift-scan"
@@ -925,7 +932,10 @@
                  a fresh bootstrap. Useful if the user deleted a
                  channel folder manually, or wants to re-walk the
                  whole catalog after a filter change. -->
-            <div class="edit-gh settings-tool-group">Advanced state repair</div>
+          </div>
+
+          <label class="subs-section-label">Advanced State Repair</label>
+          <div class="edit-grid">
             <label class="edit-gl">Channel sync state</label>
             <div class="edit-gv-inline edit-gap-6">
               <button class="btn btn-ghost btn-thin" id="btn-reset-sync-state"
@@ -951,7 +961,7 @@
              Rows show when each channel's views/likes and comments
              were last refreshed; sort defaults to "oldest first" so
              stale channels float to the top and are easy to spot. -->
-        <div class="settings-view" id="settings-view-metadata" hidden>
+        <div class="settings-view" id="settings-view-metadata">
           <label class="subs-section-label">Metadata</label>
           <div class="metadata-panel">
             <div class="metadata-hint">
@@ -1120,27 +1130,13 @@
 
           </div>
         </div>
-
-        <!-- Auto-save footer. Every editable field persists itself the
-             moment it changes (selects/checkboxes on change, the staleness
-             field on commit, the path fields when a folder is picked) via a
-             key-guarded settings_save call — so there's no Save button to
-             forget. This note confirms persistence and flashes "Saved ✓" on
-             each write. Hidden on the Index/Metadata views (their own
-             controls auto-save through settingsInfra). -->
-        <div class="settings-actions" id="settings-actions-footer">
-          <span class="settings-autosave-note" id="settings-autosave-note"
-                role="status" aria-live="polite" aria-atomic="true">Changes are saved automatically</span>
-        </div>
       </div>
     </div>
 
-    <!-- Mini log (matches Subs / Recent / Browse tabs) -->
     <div class="mini-log-frame">
-      <div class="main-log mini-log" id="settings-mini-log" tabindex="-1"></div>
+      <div class="main-log mini-log" id="health-mini-log" tabindex="-1"></div>
     </div>
   </div>
-
   <!-- Browse tab &mdash; YouTube-style 3-view flow -->
   <div class="tab-panel" id="panel-browse">
 
@@ -1237,6 +1233,24 @@
 
         <!-- View: video grid -->
         <div class="browse-view" id="view-videos" hidden>
+          <!-- Channel action header (Batch 8): the channel page is now a
+               place to ACT on the channel (sync / settings / folder), not
+               just watch it. Populated + shown by loadVideosFor(); this view
+               is used only for a specific channel's videos (the all-videos
+               "Videos" submode uses #view-recent), so it's safe here. -->
+          <div class="channel-page-header" id="channel-page-header" hidden>
+            <div class="cph-info" id="cph-info"></div>
+            <div class="cph-actions">
+              <button class="btn btn-sync btn-thin" id="cph-sync-now" type="button"
+                      title="Sync this channel now">&#8635; Sync now</button>
+              <button class="btn btn-ghost btn-thin" id="cph-settings" type="button"
+                      title="Edit this channel's settings">&#9881; Settings</button>
+              <button class="btn btn-ghost btn-thin" id="cph-folder" type="button"
+                      title="Open the channel folder">Open folder</button>
+              <button class="btn btn-ghost btn-thin" id="cph-more" type="button"
+                      aria-haspopup="true" aria-label="More channel actions">&#8942;</button>
+            </div>
+          </div>
           <div class="video-grid" id="video-grid"></div>
         </div>
 
@@ -1307,26 +1321,40 @@
                   <option value="1.5">1.5×</option>
                   <option value="2">2×</option>
                 </select>
-                <label class="ctl-label ctl-label-thin watch-overlay-label"
-                       title="Show the current transcript word overlaid on the video.&#10;Works in windowed and fullscreen.">Overlay:</label>
-                <select class="ctl-select" id="watch-cap-size"
-                        title="Overlay text size — Off hides the overlay">
-                  <option value="off" selected>Off</option>
-                  <option value="small">Small</option>
-                  <option value="medium">Medium</option>
-                  <option value="large">Large</option>
-                </select>
-                <select class="ctl-select" id="watch-cap-bg"
-                        title="Overlay background style">
-                  <option value="translucent" selected>Translucent</option>
-                  <option value="outline">Outline</option>
-                  <option value="none">None</option>
-                </select>
-                <select class="ctl-select" id="watch-cap-mode"
-                        title="1 word: just the spoken word.&#10;3 words: previous + current + next (neighbors dimmer).">
-                  <option value="single" selected>1 word</option>
-                  <option value="phrase3">3 words</option>
-                </select>
+                <!-- Overlay controls grouped under one label. The style +
+                     word-count selects were unlabeled mystery dropdowns
+                     ("Translucent" / "1 word"); they now sit in a labeled
+                     group and only appear once the overlay is turned on
+                     (size != Off), so the default state isn't confusing. -->
+                <div class="watch-overlay-group">
+                  <label class="ctl-label ctl-label-thin watch-overlay-label"
+                         title="Show the current transcript word overlaid on the video.&#10;Works in windowed and fullscreen.">Overlay:</label>
+                  <select class="ctl-select" id="watch-cap-size"
+                          aria-label="Overlay size"
+                          title="Overlay text size — Off hides the overlay">
+                    <option value="off" selected>Off</option>
+                    <option value="small">Small</option>
+                    <option value="medium">Medium</option>
+                    <option value="large">Large</option>
+                  </select>
+                  <span class="watch-overlay-extras collapsed" id="watch-overlay-extras">
+                    <label class="overlay-sublabel">style</label>
+                    <select class="ctl-select" id="watch-cap-bg"
+                            aria-label="Overlay background style"
+                            title="Overlay background style">
+                      <option value="translucent" selected>Translucent</option>
+                      <option value="outline">Outline</option>
+                      <option value="none">None</option>
+                    </select>
+                    <label class="overlay-sublabel">words</label>
+                    <select class="ctl-select" id="watch-cap-mode"
+                            aria-label="Words shown in overlay"
+                            title="1 word: just the spoken word.&#10;3 words: previous + current + next (neighbors dimmer).">
+                      <option value="single" selected>1 word</option>
+                      <option value="phrase3">3 words</option>
+                    </select>
+                  </span>
+                </div>
                 <div class="spacer"></div>
                 <label class="checkbox-label" title="Keep transcript scrolled to current line">
                   <input type="checkbox" id="watch-autofollow" checked />
@@ -1378,6 +1406,9 @@
                       id="btn-watch-shortcuts"
                       title="Keyboard shortcuts:&#10;Space &mdash; play/pause&#10;← / → &mdash; seek 5s&#10;↑ / ↓ &mdash; volume&#10;B &mdash; bookmark&#10;M &mdash; mute toggle&#10;Ctrl+F &mdash; focus Find"
                       aria-label="Keyboard shortcuts">?</span>
+                <button class="btn btn-ghost btn-thin tx-nonspeech-toggle"
+                        id="btn-tx-nonspeech" type="button" aria-pressed="false"
+                        title="Hide non-speech cues like [Music] and [Applause] from the transcript">Hide &#9834;</button>
                 <div class="spacer"></div>
                 <label class="find-label">Find:</label>
                 <input type="text" class="ctl-input find-input" id="watch-find"
@@ -1688,6 +1719,29 @@
     </div>
   </div>
 
+
+  <!-- Global status bar — always-visible one-line summary of what the app
+       is doing (sync / processing / indexing) so "what's happening?" has a
+       single answer instead of being scattered across the log, the italic
+       indicator line, two popover buttons, and the tray. Sync/Processing
+       segments open their queue popovers; Log jumps to the full log. -->
+  <div class="global-status-bar" id="global-status-bar">
+    <button type="button" class="gsb-seg" id="gsb-sync" title="Sync queue — click for details">
+      <span class="gsb-dot gsb-dot-sync"></span><span class="gsb-text" id="gsb-sync-text">Sync idle</span>
+    </button>
+    <span class="gsb-sep"></span>
+    <button type="button" class="gsb-seg" id="gsb-gpu" title="Processing queue — click for details">
+      <span class="gsb-dot gsb-dot-gpu"></span><span class="gsb-text" id="gsb-gpu-text">Processing idle</span>
+    </button>
+    <span class="gsb-seg gsb-index" id="gsb-index" hidden></span>
+    <div class="gsb-spacer"></div>
+    <button type="button" class="gsb-seg gsb-errors" id="gsb-errors" hidden
+            title="Errors this session — click to view the log">
+      <span id="gsb-errors-count">0</span> errors
+    </button>
+    <button type="button" class="gsb-seg gsb-log-btn" id="gsb-log-btn"
+            title="Open the full activity log">Log</button>
+  </div>
   <!-- Sync Tasks popover (button-anchored) -->
   <div class="queue-popover" id="popover-sync-tasks" role="dialog" aria-label="Sync Tasks">
     <div class="queue-popover-header">
@@ -2346,6 +2400,8 @@
   <script src="queuePending.js?v=1"></script>
   <script src="refreshSizes.js?v=1"></script>
   <script src="smallInits.js?v=1"></script>
+  <script src="statusBar.js?v=1"></script>
+  <script src="commandPalette.js?v=1"></script>
   <script src="app.js?v=79"></script>
 </body>
 </html>

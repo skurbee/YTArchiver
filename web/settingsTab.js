@@ -33,6 +33,7 @@
     const browseOut = document.getElementById("settings-browse-output");
     const browseVid = document.getElementById("settings-browse-video");
     const ytdlpBtn = document.getElementById("btn-ytdlp-update");
+    const ytdlpChannelSel = document.getElementById("settings-ytdlp-channel");
     const expBtn = document.getElementById("btn-export-channels");
     const impBtn = document.getElementById("btn-import-channels");
     const bkExpBtn = document.getElementById("btn-export-backup");
@@ -78,47 +79,39 @@
     // Last-persisted disk-staleness, so a blur on an invalid/blank value
     // can revert the field instead of saving garbage.
     let _diskLastGood = "24";
+    let _archiveCapacity = { mode: "percent", percent: 90, free_gb: 100 };
+    let _archiveCapacityLastGood = "90";
+
+    function _capMode() {
+      const mode = document.getElementById("settings-archive-capacity-mode")?.value;
+      return mode === "free_gb" ? "free_gb" : "percent";
+    }
+
+    function _capClamp(mode, value) {
+      const n = parseInt(value, 10);
+      if (!Number.isFinite(n)) return null;
+      return mode === "free_gb"
+        ? Math.max(1, Math.min(1000000, n))
+        : Math.max(1, Math.min(100, n));
+    }
+
+    function _renderArchiveCapacityControls() {
+      const modeEl = document.getElementById("settings-archive-capacity-mode");
+      const valueEl = document.getElementById("settings-archive-capacity-threshold");
+      const unitEl = document.getElementById("settings-archive-capacity-unit");
+      const mode = (_archiveCapacity.mode === "free_gb") ? "free_gb" : "percent";
+      const value = mode === "free_gb" ? _archiveCapacity.free_gb : _archiveCapacity.percent;
+      if (modeEl) modeEl.value = mode;
+      if (valueEl) {
+        valueEl.value = String(value);
+        valueEl.placeholder = mode === "free_gb" ? "100" : "90";
+      }
+      if (unitEl) unitEl.textContent = mode === "free_gb" ? "GB free" : "% full";
+      _archiveCapacityLastGood = String(value);
+    }
 
     // RAM estimate is intentionally a range: real rows vary with title,
     // path depth, thumbnails, and Python object overhead.
-    const BYTES_PER_ROW_LOW = 2048;
-    const BYTES_PER_ROW_HIGH = 6144;
-    function _fmtMB(bytes) {
-      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-      return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-    }
-    async function _updatePreloadHints() {
-      try {
-        let nCh = 0, nVids = 0;
-        if (nativeBridgeUp()) {
-          const idx = await bridgeCall("get_index_summary");
-          nCh = idx?.cards?.channels ?? 0;
-          nVids = idx?.cards?.videos ?? 0;
-        }
-        const allEl = document.getElementById("settings-preload-all");
-        const hintB = document.getElementById("settings-preload-all-hint");
-        if (!hintB) return;
-        // Context-aware warning — show the user what the trade-off
-        // actually is depending on which way the toggle is set, per
-        // request: "On warning: longer load time on launch.
-        // Off warning: longer load time on first browse tab load."
-        if (allEl?.checked) {
-          const estLow = nVids * BYTES_PER_ROW_LOW;
-          const estHigh = nVids * BYTES_PER_ROW_HIGH;
-          hintB.innerHTML =
-            `<span class="settings-warn-icon">\u26A0</span> ` +
-            `All ${nVids.toLocaleString()} videos loaded at launch \u2014 ` +
-            `startup takes longer (several seconds to a couple minutes on large archives). ` +
-            `Rough RAM: ~${_fmtMB(estLow)}-${_fmtMB(estHigh)}.`;
-        } else {
-          hintB.innerHTML =
-            `<span class="settings-warn-icon">\u26A0</span> ` +
-            `Channels load on first click of each \u2014 brief "Loading\u2026" screen the ` +
-            `first time you open a channel each session, then cached for the rest of the session.`;
-        }
-      } catch (_e) {}
-    }
-
     function _fmtBackupAge(ts) {
       if (!ts) return "Last backup: never";
       const days = Math.floor((Date.now() / 1000 - ts) / 86400);
@@ -139,11 +132,20 @@
         document.getElementById("settings-whisper-model").value = s.whisper_model || "small";
         document.getElementById("settings-default-res").value = s.default_resolution || "720";
         document.getElementById("settings-log-mode").value = s.log_mode || "Simple";
+        if (ytdlpChannelSel) {
+          ytdlpChannelSel.value =
+            ["stable", "nightly"].includes(s.ytdlp_channel) ? s.ytdlp_channel : "stable";
+          ytdlpChannelSel._ytddRepaint?.();
+        }
         // Startup knobs
         const stEl = document.getElementById("settings-disk-staleness");
         if (stEl) { stEl.value = String(s.disk_scan_staleness_hours ?? 24); _diskLastGood = stEl.value; }
-        const paEl = document.getElementById("settings-preload-all");
-        if (paEl) paEl.checked = !!s.browse_preload_all;
+        _archiveCapacity = {
+          mode: s.archive_capacity_warning_mode === "free_gb" ? "free_gb" : "percent",
+          percent: _capClamp("percent", s.archive_capacity_warning_percent ?? 90) ?? 90,
+          free_gb: _capClamp("free_gb", s.archive_capacity_warning_free_gb ?? 100) ?? 100,
+        };
+        _renderArchiveCapacityControls();
         const avgEl = document.getElementById("settings-show-avg-size");
         if (avgEl) avgEl.checked = (s.show_avg_size !== false);
         // Apply current toggle to the Subs table right away so opening
@@ -198,7 +200,6 @@
             if (sel._ytddRepaint) sel._ytddRepaint();
           });
         }
-        _updatePreloadHints();
         // Backup age (T295)
         const bkAgeEl = document.getElementById("backup-age-display");
         if (bkAgeEl) bkAgeEl.textContent = _fmtBackupAge(s.last_backup_ts || 0);
@@ -221,13 +222,6 @@
       ?.addEventListener("change", (e) => saveField("log_mode", e.target.value));
     document.getElementById("settings-close-behavior")
       ?.addEventListener("change", (e) => saveField("close_behavior", e.target.value));
-
-    // Preload-all toggle: update the live hint AND persist.
-    document.getElementById("settings-preload-all")
-      ?.addEventListener("change", (e) => {
-        _updatePreloadHints();
-        saveField("browse_preload_all", !!e.target.checked);
-      });
 
     // Avg-size toggle: live-apply to the Subs table AND persist.
     document.getElementById("settings-show-avg-size")
@@ -256,6 +250,39 @@
     });
     _diskEl?.addEventListener("keydown", (e) => {
       if (e.key === "Enter") { e.preventDefault(); _diskEl.blur(); }
+    });
+
+    const _capModeEl = document.getElementById("settings-archive-capacity-mode");
+    const _capThresholdEl = document.getElementById("settings-archive-capacity-threshold");
+    _capModeEl?.addEventListener("change", (e) => {
+      _archiveCapacity.mode = e.target.value === "free_gb" ? "free_gb" : "percent";
+      _renderArchiveCapacityControls();
+      saveField("archive_capacity_warning_mode", _archiveCapacity.mode);
+    });
+    _capThresholdEl?.addEventListener("change", () => {
+      const mode = _capMode();
+      const n = _capClamp(mode, _capThresholdEl.value);
+      if (n == null) {
+        window._showToast?.(
+          mode === "free_gb"
+            ? "Archive warning threshold must be a whole number of GB."
+            : "Archive warning threshold must be a whole-number percent.",
+          "error");
+        _capThresholdEl.value = _archiveCapacityLastGood;
+        return;
+      }
+      _capThresholdEl.value = String(n);
+      _archiveCapacityLastGood = String(n);
+      if (mode === "free_gb") {
+        _archiveCapacity.free_gb = n;
+        saveField("archive_capacity_warning_free_gb", n);
+      } else {
+        _archiveCapacity.percent = n;
+        saveField("archive_capacity_warning_percent", n);
+      }
+    });
+    _capThresholdEl?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); _capThresholdEl.blur(); }
     });
 
     // Launch at boot / start minimized to tray.
@@ -710,12 +737,69 @@
       }
     });
 
+    // Human label for the currently-selected channel.
+    function _channelLabel() {
+      return ytdlpChannelSel?.value === "nightly" ? "beta (nightly)" : "stable";
+    }
+
+    // ytdlp_update() fires a background thread and returns immediately, so
+    // the version label won't reflect a completed update on its own. Poll
+    // ytdlp_version (its cache is busted on update success) until the string
+    // changes, then paint it. Falls back to a plain refresh on timeout so
+    // the label never gets stuck on "updating…".
+    async function _refreshYtdlpVersion() {
+      const vEl = document.getElementById("settings-ytdlp-version");
+      if (!vEl) return;
+      try {
+        const v = await bridgeCall("ytdlp_version");
+        vEl.textContent = v?.ok ? v.version : (v?.error || "not found");
+      } catch { vEl.textContent = "check failed"; }
+    }
+    async function _pollYtdlpVersion(prevVersion) {
+      const vEl = document.getElementById("settings-ytdlp-version");
+      if (vEl) vEl.textContent = "updating…";
+      for (let i = 0; i < 30; i++) {          // ~60s ceiling
+        await new Promise((r) => setTimeout(r, 2000));
+        let v;
+        try { v = await bridgeCall("ytdlp_version"); } catch { continue; }
+        if (v?.ok && v.version && v.version !== prevVersion) {
+          if (vEl) vEl.textContent = v.version;
+          return;
+        }
+      }
+      await _refreshYtdlpVersion();           // timed out — show current
+    }
+
     ytdlpBtn?.addEventListener("click", async () => {
       const ok = await askConfirm("Update yt-dlp",
-        "Run `yt-dlp -U` to fetch the latest release?\n\nOutput streams to the main log.",
+        `Update yt-dlp to the latest ${_channelLabel()} release?\n\n` +
+        "Output streams to the main log.",
         { confirm: "Update" });
       if (!ok) return;
+      const prev = document.getElementById("settings-ytdlp-version")?.textContent || "";
       await bridgeCall("ytdlp_update");
+      _pollYtdlpVersion(prev);
+    });
+
+    // Release-channel switch. Persist the choice, then offer to update
+    // right away — switching channels only takes effect once yt-dlp is
+    // actually updated to it (`--update-to <channel>`). Declining leaves
+    // the preference saved; the next Update (or startup nudge) honors it.
+    ytdlpChannelSel?.addEventListener("change", async (e) => {
+      const channel = e.target.value === "nightly" ? "nightly" : "stable";
+      await saveField("ytdlp_channel", channel);
+      const label = channel === "nightly" ? "beta (nightly)" : "stable";
+      const go = await askConfirm(`Switch to ${label}?`,
+        (channel === "nightly"
+          ? "Beta pulls YouTube fixes ahead of stable — good when stable is up to date but downloads still fail with 403 errors.\n\n"
+          : "This switches back to the stable channel (may downgrade to the latest stable release).\n\n") +
+        `Update yt-dlp to ${label} now?\n\nIf a sync is running, stop it first — the .exe can't be replaced while it's open.`,
+        { confirm: "Update now", cancel: "Later" });
+      if (go) {
+        const prev = document.getElementById("settings-ytdlp-version")?.textContent || "";
+        await bridgeCall("ytdlp_update");
+        _pollYtdlpVersion(prev);
+      }
     });
 
     expBtn?.addEventListener("click", async () => {

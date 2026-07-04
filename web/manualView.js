@@ -243,24 +243,6 @@
     return card;
   }
 
-  function _addManualLocalThumbBadge(card) {
-    const thumb = card?.querySelector(".video-thumb");
-    if (!thumb) return;
-    let wrap = thumb.querySelector(".manual-card-badges");
-    if (!wrap) {
-      wrap = document.createElement("div");
-      wrap.className = "manual-card-badges";
-      thumb.appendChild(wrap);
-    }
-    const exists = Array.from(wrap.children).some(
-      el => (el.textContent || "").trim().toLowerCase() === "local thumb");
-    if (exists) return;
-    const pill = document.createElement("span");
-    pill.className = "manual-card-badge manual-card-badge-neutral";
-    pill.textContent = "Local thumb";
-    wrap.appendChild(pill);
-  }
-
   function _removeManualPlayPlaceholder(thumb) {
     for (const child of Array.from(thumb.children)) {
       if (child.tagName === "SPAN" && !child.className
@@ -292,7 +274,6 @@
         img.addEventListener("load", () => {
           thumb.style.background = "";
           _removeManualPlayPlaceholder(thumb);
-          _addManualLocalThumbBadge(card);
         }, { once: true });
         img.addEventListener("error", () => img.remove(), { once: true });
         img.src = url;
@@ -363,7 +344,7 @@
     el.appendChild(nameEl);
     if (r.size_bytes) {
       const sz = document.createElement("div");
-      sz.style.cssText = "font-size:11px;color:var(--text-dim);margin-top:4px;";
+      sz.style.cssText = "font-size:var(--fs-xs);color:var(--text-dim);margin-top:4px;";
       sz.textContent = _fmtSize(r.size_bytes);
       el.appendChild(sz);
     }
@@ -372,6 +353,47 @@
         bridgeCall("browse_open_video", r.filepath);
     });
     return _decorateManualCard(el, r);
+  }
+
+  // ── Instant-paint cache (perceived performance) ──────────────────────
+  // First open of this view used to show a bare "Loading…" spinner for the
+  // whole ~query time. Now the first page's rows are remembered (in memory
+  // + localStorage across sessions) and painted instantly; the fresh query
+  // replaces them in place. With no cache yet, shaped skeletons stand in.
+  const _CACHE_KEY = "ytarchiver_manual_page1";
+  let _cachedPage1 = null;
+  function _loadCachedPage1() {
+    if (_cachedPage1) return _cachedPage1;
+    try {
+      const raw = localStorage.getItem(_CACHE_KEY);
+      const arr = raw ? JSON.parse(raw) : null;
+      if (Array.isArray(arr) && arr.length) { _cachedPage1 = arr; return arr; }
+    } catch (e) { /* unavailable / corrupt */ }
+    return null;
+  }
+  function _saveCachedPage1(rows) {
+    _cachedPage1 = rows;
+    try { localStorage.setItem(_CACHE_KEY, JSON.stringify(rows.slice(0, 24))); }
+    catch (e) { /* quota / unavailable */ }
+  }
+  function _skeletonHtml(n) {
+    let s = "";
+    for (let i = 0; i < n; i++) {
+      s += '<div class="video-card skeleton-card" aria-hidden="true">'
+         + '<div class="video-thumb skeleton-box"></div>'
+         + '<div class="video-card-body">'
+         + '<div class="skeleton-line skeleton-box"></div>'
+         + '<div class="skeleton-line skeleton-box short"></div>'
+         + '</div></div>';
+    }
+    return s;
+  }
+  function _paintRows(g, rows) {
+    if (!g) return;
+    g.innerHTML = "";
+    const frag = document.createDocumentFragment();
+    for (const r of rows) { const c = _cardFor(r); if (c) frag.appendChild(c); }
+    g.appendChild(frag);
   }
 
   async function loadPage(reset) {
@@ -383,8 +405,12 @@
     const g = grid();
     const moreEl = $("manual-load-more");
     if (reset && g) {
-      g.innerHTML = '<div class="grid-loading"><div class="grid-spinner"></div>'
-        + '<span class="grid-loading-label">Loading…</span></div>';
+      // Instant paint instead of a bare spinner: last-known cards (memory
+      // or last session) if any, else shaped skeletons. Fresh data below
+      // replaces this the moment the query returns.
+      const cached = _loadCachedPage1();
+      if (cached && cached.length) { _paintRows(g, cached); g.classList.add("is-refreshing"); }
+      else { g.innerHTML = _skeletonHtml(8); }
     } else if (moreEl) { moreEl.hidden = false; }
     try {
       const res = await bridgeCall("list_manual_videos", _sort, PAGE, _offset);
@@ -392,6 +418,8 @@
       const rows = (res && res.rows) || [];
       if (reset) {
         _firstPageSig = _pageSig(rows);
+        _saveCachedPage1(rows);
+        if (g) g.classList.remove("is-refreshing");
       }
       if (reset && g) g.innerHTML = "";
       const frag = document.createDocumentFragment();

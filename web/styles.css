@@ -93,6 +93,19 @@
   --font-ui: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
   --font-log: "Consolas", "Cascadia Mono", "Courier New", monospace;
 
+  /* Type scale — single source of truth for UI text sizes (Batch 2).
+     Replaced 22 ad-hoc sizes (incl. five half-pixel sizes) with these
+     named steps; half-pixels were rounded up to the nearest step
+     (<=0.5px shift). 15px (2 uses) and display/hero sizes (>=20px)
+     stay literal pending a deliberate heading-scale pass. */
+  --fs-3xs: 9px;
+  --fs-2xs: 10px;
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-lg: 14px;
+  --fs-xl: 16px;
+
   /* Four variables referenced via var() in styles-browse.css +
      styles-dialogs.css that were never defined here, so every use
      fell through to its inline fallback or to inherited color
@@ -128,7 +141,7 @@ html, body {
   background: var(--c-bg);
   color: var(--c-text);
   font-family: var(--font-ui);
-  font-size: 13px;
+  font-size: var(--fs-md);
   height: 100%;
   overflow: hidden;
   -webkit-user-select: none;
@@ -153,15 +166,100 @@ body {
 }
 .header-title {
   font-weight: 700;
-  font-size: 14px;
+  font-size: var(--fs-lg);
   letter-spacing: 0.5px;
+  /* Source string is the canonical "YTArchiver"; the brand look stays
+     all-caps via transform (renders "YTARCHIVER", no stray space). */
+  text-transform: uppercase;
   color: var(--c-text);
   margin-right: 10px;
 }
 .header-version {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--c-dim);
   font-weight: 400;
+}
+/* "?" keyboard-shortcuts button — far right of the header strip. Makes
+   the shortcut layer discoverable instead of guess-only. */
+.header-help {
+  margin-left: auto;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1px solid var(--c-border);
+  background: var(--c-btn);
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.1s, border-color 0.1s, background 0.1s;
+}
+.header-help:hover {
+  color: var(--c-text);
+  border-color: var(--c-accent);
+  background: var(--c-hover);
+}
+
+/* Keyboard-shortcuts help overlay (built by shortcuts.js). */
+.shortcuts-help-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9600;
+}
+.shortcuts-help {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 8px;
+  padding: 18px 20px;
+  min-width: 340px;
+  max-width: 460px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.shk-title {
+  font-size: var(--fs-lg);
+  font-weight: 700;
+  color: var(--c-text);
+  margin-bottom: 12px;
+}
+.shk-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 0;
+}
+.shk-key {
+  flex: 0 0 88px;
+  text-align: center;
+  font-family: var(--font-log);
+  font-size: var(--fs-xs);
+  color: var(--c-text);
+  background: var(--c-input);
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+.shk-desc {
+  font-size: var(--fs-sm);
+  color: var(--c-text-muted);
+}
+.shk-hint {
+  margin-top: 12px;
+  font-size: var(--fs-xs);
+  color: var(--c-dim);
+  text-align: center;
+}
+.shk-hint .shk-key {
+  flex: none;
+  display: inline-block;
+  padding: 1px 5px;
 }
 
 /* ═══ Tab row ═══ */
@@ -176,7 +274,7 @@ body {
 }
 .tab {
   padding: 8px 22px 9px;
-  font-size: 12.5px;
+  font-size: var(--fs-md);
   color: var(--c-dim);
   cursor: pointer;
   background: var(--c-surface);
@@ -225,7 +323,7 @@ body {
 }
 .boot-issue-main strong {
   color: #ffd58a;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   white-space: nowrap;
 }
 #boot-issue-summary {
@@ -252,9 +350,89 @@ body {
    `margin-left: auto` on Settings pushes it to the right edge, creating
    visual separation from the main tab group. (Recent was folded into
    Browse — comment updated 2026-05-13.) */
-.tab.settings-tab {
+.tab.health-tab {
   margin-left: auto;
 }
+
+/* ═══ Global status bar (bottom of every tab) ═══
+   Always-visible one-line summary of what the app is doing. A body-level
+   flex child (0 0 26px), so it pins to the window bottom under the active
+   tab panel. */
+.global-status-bar {
+  flex: 0 0 26px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  background: var(--c-surface);
+  border-top: 1px solid var(--c-border);
+  font-size: var(--fs-xs);
+  color: var(--c-text-muted);
+  user-select: none;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.gsb-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 46%;
+  padding: 3px 6px;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gsb-seg:hover { background: var(--c-hover); color: var(--c-text); }
+.gsb-seg.gsb-active { color: var(--c-text); }
+.gsb-dot {
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--c-dim);
+  opacity: 0.55;
+}
+.gsb-dot.gsb-dot-sync.on {
+  background: var(--c-log-green);
+  opacity: 1;
+  animation: gsb-pulse 1.4s ease-in-out infinite;
+}
+.gsb-dot.gsb-dot-gpu.on {
+  background: var(--c-log-red);
+  opacity: 1;
+  animation: gsb-pulse 1.4s ease-in-out infinite;
+}
+.gsb-dot.paused {
+  background: var(--c-log-sum);
+  opacity: 1;
+  animation: none;
+}
+@keyframes gsb-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.gsb-sep {
+  flex: 0 0 1px;
+  width: 1px;
+  height: 14px;
+  background: var(--c-border);
+}
+.gsb-spacer { flex: 1 1 auto; }
+/* Index/sweep segment is informational, not clickable. */
+.gsb-index {
+  max-width: 32%;
+  color: var(--c-dim);
+  font-style: italic;
+  cursor: default;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gsb-index:hover { background: transparent; color: var(--c-dim); }
+.gsb-errors { color: var(--c-log-red); }
+.gsb-errors:hover { background: var(--c-cancel); color: #fff; }
+.gsb-log-btn { color: var(--c-dim); }
 
 /* Clickable Total: X TB label in Subs header */
 .status-text.clickable-total {
@@ -299,7 +477,7 @@ body {
 .settings-subnav-label {
   padding: 4px 16px 8px;
   color: var(--c-dim);
-  font-size: 10.5px;
+  font-size: var(--fs-xs);
   letter-spacing: 0.5px;
   font-weight: 600;
 }
@@ -308,7 +486,7 @@ body {
      used !important to override these values — consolidated to one
      authoritative rule per UI audit #28. */
   padding: 10px 22px;
-  font-size: 13.5px;
+  font-size: var(--fs-lg);
   color: var(--c-text);
   cursor: pointer;
   user-select: none;
@@ -340,6 +518,15 @@ body {
   display: flex;
   flex-direction: column;
   overflow-y: auto;
+}
+.settings-single-page .settings-actions {
+  width: 100%;
+  max-width: 920px;
+  box-sizing: border-box;
+  margin: 8px auto 0;
+  padding: 10px 28px 20px;
+  border-top: 0;
+  justify-content: flex-start;
 }
 .settings-view {
   flex: 1 1 auto;
@@ -380,4 +567,80 @@ body {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* ═══ Command palette (Ctrl+K) ═══ */
+.cmdp-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+  z-index: 9700;
+}
+.cmdp {
+  width: 560px;
+  max-width: 92vw;
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 10px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.cmdp-input {
+  border: none;
+  border-bottom: 1px solid var(--c-border);
+  background: transparent;
+  color: var(--c-text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-lg);
+  padding: 14px 16px;
+  outline: none;
+}
+.cmdp-input::placeholder { color: var(--c-dim); }
+.cmdp-list {
+  max-height: 52vh;
+  overflow-y: auto;
+  padding: 6px;
+}
+.cmdp-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.cmdp-item.sel,
+.cmdp-item:hover { background: var(--c-hover); }
+.cmdp-label {
+  color: var(--c-text);
+  font-size: var(--fs-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cmdp-hint {
+  flex: 0 0 auto;
+  font-size: var(--fs-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--c-dim);
+  padding: 1px 7px;
+  border-radius: 10px;
+  border: 1px solid var(--c-border);
+}
+.cmdp-hint-channel { color: var(--c-log-blue); }
+.cmdp-hint-action { color: var(--c-ok-fg); }
+.cmdp-hint-health { color: var(--c-warn-fg); }
+.cmdp-empty {
+  padding: 16px;
+  text-align: center;
+  color: var(--c-dim);
+  font-style: italic;
 }

@@ -1,14 +1,14 @@
 /* ═══════════════════════════════════════════════════════════════════════
-   settingsInfra.js — Settings tab sub-tab navigation + Archive Roots panel
+   settingsInfra.js — Health sub-tab navigation + Archive Roots panel
 
    Extracted from indexControls.js (Patch 15, v71.7).
 
-   Two related Settings-tab plumbing functions:
+   Two related plumbing functions:
      • initSettingsSubTabs — wires the sub-navigation buttons
-       (General / Performance / Appearance / Tools / Metadata / Index)
-       that switch which inner view is visible inside the Settings panel.
-     • initSettingsArchiveRoots — Archive Roots list inside Settings →
-       Index, plus the Auto-update-every-N controls and the right-click
+       (Metadata / Index / Tools) that switch which inner view is visible
+       inside the Health panel.
+     • initSettingsArchiveRoots — Archive Roots list inside Health -> Index,
+       plus the Auto-update-every-N controls and the right-click
        "Delete all transcriptions for this root" action.
 
    Publishes:
@@ -44,61 +44,54 @@
   const showContextMenu = window.showContextMenu || (() => {});
 
   function initSettingsSubTabs() {
-    const buttons = document.querySelectorAll(".settings-subnav-btn");
-    const views = {
-      general: document.getElementById("settings-view-general"),
-      performance: document.getElementById("settings-view-performance"),
-      appearance: document.getElementById("settings-view-appearance"),
-      tools: document.getElementById("settings-view-tools"),
-      metadata: document.getElementById("settings-view-metadata"),
-      index: document.getElementById("settings-view-index"),
-    };
-    const saveFooter = document.getElementById("settings-actions-footer");
+    // Wire each independent sub-nav area. Health uses the .settings-area /
+    // .settings-subnav-btn / .settings-view structure.
+    document.querySelectorAll(".settings-area").forEach(_initSubNavArea);
+  }
+
+  function _initSubNavArea(area) {
+    const buttons = area.querySelectorAll(".settings-subnav-btn");
     if (!buttons.length) return;
-    document.querySelector(".settings-sidebar")?.setAttribute("role", "tablist");
+    // Views are derived from their ids ("settings-view-<key>").
+    const views = {};
+    area.querySelectorAll(".settings-view").forEach((v) => {
+      const k = v.id.replace(/^settings-view-/, "");
+      if (k) views[k] = v;
+    });
+    // Only the Settings area carries the auto-save footer.
+    const saveFooter = area.querySelector("#settings-actions-footer");
+    area.querySelector(".settings-sidebar")?.setAttribute("role", "tablist");
     const show = (key) => {
-      buttons.forEach(b => b.classList.toggle("active", b.dataset.settingsView === key));
-      buttons.forEach(b => {
+      buttons.forEach((b) => {
         const active = b.dataset.settingsView === key;
+        b.classList.toggle("active", active);
         b.setAttribute("aria-selected", active ? "true" : "false");
       });
       for (const k of Object.keys(views)) {
         if (views[k]) views[k].hidden = (k !== key);
       }
-      // Hide Save on Index + Metadata (both have their own actions
-      // and no form fields). Show on everything else.
+      // Hide the auto-save note on views that have their own actions.
       if (saveFooter) {
-        saveFooter.style.display = (key === "index" || key === "metadata") ? "none" : "";
+        saveFooter.style.display =
+          (key === "index" || key === "metadata") ? "none" : "";
       }
-      if (key === "index") {
-        // Pull fresh numbers every visit — stale "Loading…" was showing
-        // up after first paint because the initial fetch was racing boot.
-        if (typeof window._refreshIndexStats === "function") {
-          window._refreshIndexStats();
-        }
-      }
-      if (key === "metadata") {
-        // Pull fresh per-channel refresh timestamps every visit.
-        if (typeof window._refreshMetadataTab === "function") {
-          window._refreshMetadataTab();
-        }
-      }
+      // Refresh-on-show hooks.
+      if (key === "index") window._refreshIndexStats?.();
+      if (key === "metadata") window._refreshMetadataTab?.({ preferCache: true });
     };
-    buttons.forEach(b => {
+    buttons.forEach((b) => {
       b.setAttribute("role", "tab");
       b.tabIndex = 0;
       if (b.dataset.settingsView) {
         b.setAttribute("aria-controls", "settings-view-" + b.dataset.settingsView);
       }
       b.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          b.click();
-        }
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); b.click(); }
       });
-      b.addEventListener("click", () => show(b.dataset.settingsView || "general"));
+      b.addEventListener("click", () => show(b.dataset.settingsView));
     });
-    show(document.querySelector(".settings-subnav-btn.active")?.dataset.settingsView || "general");
+    show(area.querySelector(".settings-subnav-btn.active")?.dataset.settingsView
+         || buttons[0].dataset.settingsView);
   }
 
   // Settings > Index sub-tab: Archive Roots list + Auto-update-every-N +

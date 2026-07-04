@@ -289,10 +289,11 @@ def sweep_new_videos(output_dir: str, channels: list,
                         if fp_lower in noid:
                             _wait_while_busy()
                             try:
-                                _idx.register_video(fp, ch_name,
-                                                    _conn_override=sweep_conn)
-                                id_backfilled += 1
-                                noid.discard(fp_lower)
+                                if _idx.register_video(
+                                        fp, ch_name,
+                                        _conn_override=sweep_conn):
+                                    id_backfilled += 1
+                                    noid.discard(fp_lower)
                             except Exception as _bfe:
                                 _log.debug("sweep id-backfill failed (%s): %s",
                                            fp, _bfe)
@@ -319,8 +320,11 @@ def sweep_new_videos(output_dir: str, channels: list,
                     if size == 0:
                         continue
                     _wait_while_busy()
-                    _idx.register_video(fp, ch_name, _conn_override=sweep_conn)
+                    if not _idx.register_video(
+                            fp, ch_name, _conn_override=sweep_conn):
+                        continue
                     registered += 1
+                    existing.add(fp_lower)
                     # Ingest .jsonl sidecar if present.
                     base = _os.path.splitext(fp)[0]
                     jp = base + ".jsonl"

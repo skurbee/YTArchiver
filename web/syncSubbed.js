@@ -362,9 +362,19 @@
       // when queue_is_paused is absent — a method-existence fallback the
       // YT.api proxy can't express (it resolves every name to a function).
       const api = window.pywebview?.api;
-      if (!api?.queue_is_paused) { api?.transcribe_cancel_all?.(); return; }
-      const st = await api.queue_is_paused();
-      if (st?.gpu) {
+      if (!api) return;
+      // Act on the button's PAINTED state (queueBlink keeps
+      // dataset.pauseState current), so the click always matches the label
+      // the user sees. "start" = Auto-off backlog waiting to be drained;
+      // "paused"/"pending" = resume a paused run; else = pause a running one.
+      const st = document.getElementById("btn-pause-gpu-queue")
+        ?.dataset?.pauseState || "";
+      if (st === "start") {
+        await checkedQueueApi(
+          api, "gpu_start", "gpu",
+          "Processing started \u2014 draining the queue.", "ok",
+          "Couldn't start processing.");
+      } else if (st === "paused" || st === "pending") {
         await checkedQueueApi(
           api, "queue_resume", "gpu",
           "Processing queue resumed.", "ok",

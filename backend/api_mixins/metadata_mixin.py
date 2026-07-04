@@ -478,7 +478,7 @@ class MetadataMixin:
                 "mode": "thorough" if mode == "thorough" else "fast"}
 
 
-    def metadata_refresh_views_channel(self, identity):
+    def metadata_refresh_views_channel(self, identity, only_recent_days=None):
         """Per-channel views/likes refresh — no prompt, straight enqueue.
 
         metadata_recheck_channel prompts the user when existing metadata
@@ -495,6 +495,12 @@ class MetadataMixin:
         task = dict(ch)
         task["kind"] = "metadata"
         task["refresh"] = True
+        try:
+            _d = int(only_recent_days) if only_recent_days is not None else None
+            if _d is not None and _d > 0:
+                task["scope"] = {"days": _d}
+        except (TypeError, ValueError):
+            pass
         try:
             self._metadata_queues().sync_enqueue(task)
         except Exception as e:

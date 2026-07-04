@@ -89,6 +89,18 @@
     if (r.bottom > window.innerHeight) {
       menu.style.top = (window.innerHeight - r.height - 4) + "px";
     }
+    // Keep the root menu anchored near the click/button; flip flyout
+    // submenus left only when a right-opening submenu would leave the
+    // viewport.
+    menu.querySelectorAll(".ctx-submenu-wrap").forEach((wrap) => {
+      const sub = wrap.querySelector(".ctx-submenu");
+      if (!sub) return;
+      const wr = wrap.getBoundingClientRect();
+      const sw = sub.getBoundingClientRect().width || 180;
+      if (wr.right + sw > window.innerWidth - 4 && wr.left - sw > 4) {
+        wrap.classList.add("submenu-left");
+      }
+    });
     const first = menu.querySelector(".ctx-menu-item");
     if (first) setTimeout(() => first.focus(), 0);
     setTimeout(() => {

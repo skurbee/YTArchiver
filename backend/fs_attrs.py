@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 
 from .fs_search import VIDEO_EXTS_EXTENDED as _FS_VIDEO_EXTS
 from .log import get_logger
@@ -10,9 +11,27 @@ from .log import get_logger
 _log = get_logger(__name__)
 
 _VISIBLE_MEDIA_EXTS = tuple(sorted(_FS_VIDEO_EXTS))
+_TRANSCRIPT_SUFFIX = " transcript.txt"
+_TRANSCRIPT_STEM_SUFFIX = " transcript"
+_YT_ID_SUFFIX_RE = re.compile(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$")
 
 
-def _archive_file_should_be_visible(name: str) -> bool:
+def _strip_youtube_id_suffix(stem: str) -> str:
+    return _YT_ID_SUFFIX_RE.sub("", stem) or stem
+
+
+def _manual_transcript_media_key(name: str) -> str:
+    root, ext = os.path.splitext(name)
+    if ext.lower() != ".txt":
+        return ""
+    if not root.lower().endswith(_TRANSCRIPT_STEM_SUFFIX):
+        return ""
+    return root[: -len(_TRANSCRIPT_STEM_SUFFIX)].lower()
+
+
+def _archive_file_should_be_visible(
+        name: str, *, hide_per_video_transcripts: bool = False,
+        media_stems: set[str] | None = None) -> bool:
     """Whitelist test: True for video/media files and the conjoined
     `… Transcript.txt`. Everything else is a sidecar that must be hidden.
     Matches the user contract: an archive folder shows only the videos +
@@ -20,7 +39,11 @@ def _archive_file_should_be_visible(name: str) -> bool:
     low = name.lower()
     if low.endswith(_VISIBLE_MEDIA_EXTS):
         return True
-    if low.endswith(" transcript.txt"):
+    if low.endswith(_TRANSCRIPT_SUFFIX):
+        if hide_per_video_transcripts:
+            media_key = _manual_transcript_media_key(name)
+            if media_key and media_key in (media_stems or set()):
+                return False
         return True
     return False
 
@@ -155,7 +178,8 @@ def _set_hidden_if_needed(path, entry=None) -> bool:
         return False
 
 
-def hide_stray_sidecars(folder, recursive=True, cancel_event=None) -> int:
+def hide_stray_sidecars(folder, recursive=True, cancel_event=None,
+                        hide_per_video_transcripts=False) -> int:
     """Sweep `folder` and set the Windows HIDDEN attribute on every file
     that is NOT a video/media file and NOT a `… Transcript.txt`, plus any
     dot-prefixed subdirectory (`.Thumbnails`, `.ChannelArt`). This is the
@@ -184,7 +208,24 @@ def hide_stray_sidecars(folder, recursive=True, cancel_event=None) -> int:
         except OSError:
             continue
         with it:
-            for entry in it:
+            try:
+                entries = list(it)
+            except OSError:
+                continue
+            media_stems: set[str] = set()
+            if hide_per_video_transcripts:
+                for entry in entries:
+                    try:
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        root, ext = os.path.splitext(entry.name)
+                        if ext.lower() not in _VISIBLE_MEDIA_EXTS:
+                            continue
+                        media_stems.add(root.lower())
+                        media_stems.add(_strip_youtube_id_suffix(root).lower())
+                    except OSError:
+                        continue
+            for entry in entries:
                 if cancel_event is not None and cancel_event.is_set():
                     break
                 try:
@@ -200,7 +241,10 @@ def hide_stray_sidecars(folder, recursive=True, cancel_event=None) -> int:
                             stack.append(entry.path)
                         continue
                     # Regular file.
-                    if _archive_file_should_be_visible(name):
+                    if _archive_file_should_be_visible(
+                            name,
+                            hide_per_video_transcripts=hide_per_video_transcripts,
+                            media_stems=media_stems):
                         continue
                     if _set_hidden_if_needed(entry.path, entry):
                         newly += 1

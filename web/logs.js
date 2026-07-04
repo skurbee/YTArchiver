@@ -576,7 +576,8 @@
   // clearStartupLine, whisper_progress replacements), we snapshot the last
   // N lines of the main log into each mini after every mutation.
   const MINI_LOG_IDS = ["subs-mini-log", "browse-mini-log",
-                        "recent-mini-log", "settings-mini-log"];
+                        "recent-mini-log", "health-mini-log",
+                        "settings-mini-log"];
   const MINI_LINES = 5;
 
   // cache DOM refs across calls. mirrorMiniLogs is
@@ -602,7 +603,7 @@
 
   // Coalesce mirror calls into one per animation frame. Without this,
   // every line append during heavy sync output (hundreds of emits/sec)
-  // re-clones 5 last main-log children into all 4 mini-logs — 20 deep
+  // re-clones 5 last main-log children into every mini-log — a lot of deep
   // clones + attribute strips per emit, a documented WebView2 jank
   // source (audit: logs.js C31). rAF batching collapses a burst into
   // one mirror per frame.
@@ -912,7 +913,7 @@
         _trimMainLog(el);
         _snapIfFollowing(el);
         // Mirror the last N main-log lines into every mini log (Subs / Browse
-        // / Recent / Settings). One snapshot per batch — not per line —
+        // / Recent / Health / Settings). One snapshot per batch — not per line —
         // so mini logs track main exactly.
         mirrorMiniLogs();
       }

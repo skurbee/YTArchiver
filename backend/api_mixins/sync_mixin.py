@@ -186,7 +186,7 @@ class SyncMixin:
         try:
             if getattr(self, "_tray", None):
                 self._tray.start_spin("blue")
-                self._tray.set_tooltip("YT Archiver \u2014 Syncing...")
+                self._tray.set_tooltip("YTArchiver \u2014 Syncing...")
         except Exception as e:
             _log.debug("swallowed: %s", e)
         def _run():
@@ -205,7 +205,7 @@ class SyncMixin:
                 try:
                     if getattr(self, "_tray", None):
                         self._tray.stop_spin()
-                        self._tray.set_tooltip("YT Archiver \u2014 Idle")
+                        self._tray.set_tooltip("YTArchiver \u2014 Idle")
                         # Clear session download badge — fresh pass next time
                         try: self._tray.set_badge(0)
                         except Exception as e: _log.debug("swallowed: %s", e)
@@ -353,7 +353,12 @@ class SyncMixin:
             removed = self._queues.sync_clear()
         except Exception as e:
             _log.debug("swallowed: %s", e)
+        _was_running = bool(self._queues.current_sync)
         self._sync_cancel.set()
+        try:
+            self._queues.clear_resuming_slots("sync", clear_current=True)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         # Clear Queue must also drain + stop the redownload chain.
         # sync_clear() above already emptied its UI rows; leaving
         # _redwnl_pending populated would let the worker resurrect and
@@ -369,7 +374,6 @@ class SyncMixin:
         # Report whether a channel was actively running so the UI can
         # show clearer feedback ("stopping current download" vs "nothing
         # was queued").
-        _was_running = bool(self._queues.current_sync)
         self._on_queue_changed()
         return {"ok": True, "removed": removed, "running": _was_running}
 
@@ -396,6 +400,10 @@ class SyncMixin:
         removed = 0
         try:
             removed = self._queues.sync_clear()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        try:
+            self._queues.clear_resuming_slots("sync", clear_current=True)
         except Exception as e:
             _log.debug("swallowed: %s", e)
         # Drain the redownload pending list too (same as sync_cancel
@@ -730,7 +738,7 @@ class SyncMixin:
         try:
             if getattr(self, "_tray", None):
                 self._tray.start_spin("blue")
-                self._tray.set_tooltip(f"YT Archiver \u2014 Syncing {ch_name}")
+                self._tray.set_tooltip(f"YTArchiver \u2014 Syncing {ch_name}")
         except Exception as e:
             _log.debug("swallowed: %s", e)
         def _run():
@@ -787,7 +795,7 @@ class SyncMixin:
                 try:
                     if getattr(self, "_tray", None):
                         self._tray.stop_spin()
-                        self._tray.set_tooltip("YT Archiver \u2014 Idle")
+                        self._tray.set_tooltip("YTArchiver \u2014 Idle")
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
                 # Clear stale sync-progress. Single-channel sync was the

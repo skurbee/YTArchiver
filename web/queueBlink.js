@@ -394,9 +394,9 @@
     // handlers below). Also hide the Pause/Cancel pair entirely when the
     // queue is empty — nothing to act on means no buttons.
     _paintPopoverPauseBtn("btn-pause-sync-queue",
-                           _blinkState.sync, "Sync");
+                           _blinkState.sync, "Sync", false);
     _paintPopoverPauseBtn("btn-pause-gpu-queue",
-                           _blinkState.gpu, "GPU");
+                           _blinkState.gpu, "Processing", true);
     // Sync popover: no sibling buttons in the footer — hide the entire
     // footer when there's nothing to act on so we don't show an empty
     // bar with just the border-top. But keep it visible while the
@@ -436,30 +436,40 @@
   // Helper: paint one popover-footer pause button based on a pipeline's
   // blink state. Called by paintBlinkState for both Sync and GPU
   // popovers. Flips the label, title, and SVG icon.
-  function _paintPopoverPauseBtn(btnId, state, label) {
+  function _paintPopoverPauseBtn(btnId, state, label, canStart) {
     const btn = document.getElementById(btnId);
     if (!btn) return;
     const activelyPaused = state.running && state.paused;
     const deadPausedWithItems = !state.running && state.paused && state.count > 0;
     const isPaused = activelyPaused || deadPausedWithItems;
+    // "Start": nothing is running but jobs are queued. For the Processing
+    // queue (canStart) this is a real, clickable action even when the pause
+    // flag was never set — i.e. the Auto-off backlog case the user hit after
+    // gaming. Clicking does a one-shot drain (Auto stays off). Takes
+    // precedence over the Resume label so a queued-but-idle Processing queue
+    // reads "Start", not the nonsensical "Pause". Sync has its own Sync
+    // Subbed button, so canStart is false there and behavior is unchanged.
+    const startable = !!canStart && !state.running && state.count > 0;
     // Pause-pending: requested but worker still finishing current op.
     // Also held for a minimum window after the click so a fast pause
     // handshake doesn't skip the visual feedback.
     const isPending = _isPipelinePending(state);
     const svg = btn.querySelector("svg");
     const span = btn.querySelector("span");
-    if (span) span.textContent = isPaused ? "Resume" : "Pause";
+    if (span) span.textContent = startable ? "Start" : (isPaused ? "Resume" : "Pause");
     btn.title = isPending
       ? `Pause queued — ${label.toLowerCase()} job finishing first. Click to cancel pause.`
-      : (isPaused
-          ? `Resume ${label.toLowerCase()} queue`
-          : `Pause ${label.toLowerCase()} queue (current job finishes first)`);
+      : (startable
+          ? `Start the ${label.toLowerCase()} queue now (Auto stays off)`
+          : (isPaused
+              ? `Resume ${label.toLowerCase()} queue`
+              : `Pause ${label.toLowerCase()} queue (current job finishes first)`));
     btn.dataset.pauseState = isPending
       ? "pending"
-      : (isPaused ? "paused" : "running");
+      : (startable ? "start" : (isPaused ? "paused" : "running"));
     btn.classList.toggle("pause-pending", isPending);
     if (svg) {
-      const want = isPaused ? "play" : "bars";
+      const want = (startable || isPaused) ? "play" : "bars";
       if (svg.dataset.icon !== want) {
         svg.dataset.icon = want;
         svg.innerHTML = isPaused

@@ -165,7 +165,9 @@ class MediaOpsMixin:
                 # Loose singles + anything directly under the archive root
                 # (non-recursive — channel subfolders were handled above).
                 try:
-                    n_root = _u.hide_stray_sidecars(output_dir, recursive=False)
+                    n_root = _u.hide_stray_sidecars(
+                        output_dir, recursive=False,
+                        hide_per_video_transcripts=True)
                     if n_root > 0:
                         total_hidden += n_root
                         folders_touched += 1

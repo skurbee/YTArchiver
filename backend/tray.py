@@ -89,7 +89,7 @@ class TrayController:
                  on_hide: Callable[[], None] | None = None,
                  on_sync: Callable[[], None] | None = None,
                  on_quit: Callable[[], None] | None = None,
-                 tooltip: str = "YT Archiver"):
+                 tooltip: str = "YTArchiver"):
         self._on_show = on_show
         self._on_hide = on_hide
         self._on_sync = on_sync
@@ -132,7 +132,7 @@ class TrayController:
             return None
         items = []
         if self._on_show:
-            items.append(pystray.MenuItem("Show YT Archiver", lambda: self._on_show(), default=True))
+            items.append(pystray.MenuItem("Show YTArchiver", lambda: self._on_show(), default=True))
         if self._on_hide:
             items.append(pystray.MenuItem("Hide", lambda: self._on_hide()))
         items.append(pystray.Menu.SEPARATOR)

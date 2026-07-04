@@ -67,13 +67,53 @@
     // "loading…" (spinner) and the real percentage. Cleared on each
     // refresh + force-recheck so the indicator shows up again.
     let _thumbsLoaded = false;
+    let _thumbStatusInFlight = false;
+    let _lastRowsLoadAt = 0;
     let _loadGen = 0;
     let _pendingRefreshTimer = null;
+
+    // Instant-paint cache (perceived performance): remember the channel
+    // rows across sessions so opening this tab paints last-known data
+    // immediately instead of a full-table "Loading channels…" spinner
+    // while the (sometimes multi-second) index-DB query runs.
+    const _META_CACHE_KEY = "ytarchiver_meta_rows";
+    function _loadCachedMeta() {
+      try {
+        const raw = localStorage.getItem(_META_CACHE_KEY);
+        const arr = raw ? JSON.parse(raw) : null;
+        if (Array.isArray(arr) && arr.length) return arr;
+      } catch (e) { /* unavailable / corrupt */ }
+      return null;
+    }
+    function _saveCachedMeta(rows) {
+      try { localStorage.setItem(_META_CACHE_KEY, JSON.stringify(rows || [])); }
+      catch (e) { /* quota / unavailable */ }
+    }
+    function _rowsHaveThumbStatus(rows) {
+      return (rows || []).some((r) =>
+        Object.prototype.hasOwnProperty.call(r || {}, "thumb_total")
+        || Object.prototype.hasOwnProperty.call(r || {}, "thumb_with")
+        || Object.prototype.hasOwnProperty.call(r || {}, "thumb_missing"));
+    }
+    function _mergeThumbStatus(thRes) {
+      const thMap = thRes?.rows || {};
+      for (const r of _rows) {
+        const key = (r.name || r.folder || "").toLowerCase();
+        const t = thMap[key];
+        if (t) {
+          r.thumb_total = t.total || 0;
+          r.thumb_with = t.with_thumb || 0;
+          r.thumb_missing = t.missing || 0;
+        }
+      }
+      _thumbsLoaded = true;
+      _saveCachedMeta(_rows);
+    }
     const _scheduleMetadataRefresh = () => {
       if (_pendingRefreshTimer) clearTimeout(_pendingRefreshTimer);
       _pendingRefreshTimer = setTimeout(() => {
         _pendingRefreshTimer = null;
-        try { window._refreshMetadataTab?.(); } catch (e) {}
+        try { window._refreshMetadataTab?.({ force: true }); } catch (e) {}
       }, 2000);
     };
     // Cutoff for the "Still on YT" column. bulk_refresh_views_likes only
@@ -255,14 +295,24 @@
       const _onyt_card = document.getElementById("md-tot-card-onyt");
       if (_onyt_card) {
         // Override the static title so the tooltip reflects scope.
-        _onyt_card.title = onChannelsChecked === 0
-          ? "No channels have been views/likes-refreshed since the "
+        if (onChannelsChecked === 0) {
+          _onyt_card.title = "No channels have been views/likes-refreshed since the "
             + "removed-from-YouTube detection shipped. Run a bulk "
-            + "Refresh views/likes to populate this column."
-          : `${onChannelsChecked} of ${nChannels} channel(s) have been `
+            + "Refresh views/likes to populate this column.";
+        } else if (onChannelsChecked >= nChannels) {
+          const live = Math.max(0, onTotChecked - onRemovedChecked);
+          _onyt_card.title = `All ${nChannels} channel(s) have been checked. `
+            + `${fmt(live)} of ${fmt(onTotChecked)} tracked video(s) are `
+            + "still on YouTube"
+            + (onRemovedChecked
+              ? `; ${fmt(onRemovedChecked)} are removed, private, or unlisted.`
+              : "; no removed videos were found.");
+        } else {
+          _onyt_card.title = `${onChannelsChecked} of ${nChannels} channel(s) have been `
             + `checked. The other ${nChannels - onChannelsChecked} have `
-            + `no removal data yet — run Refresh views/likes on them to `
+            + `no removal data yet - run Refresh views/likes on them to `
             + `include them in this number.`;
+        }
       }
       if (onChannelsChecked === 0) {
         setCard("md-tot-card-onyt", "md-tot-onyt",
@@ -481,10 +531,24 @@
       return `${m}m ${pad(ss)}s`;
     };
 
-    window._refreshMetadataTab = async () => {
+    window._refreshMetadataTab = async (opts = {}) => {
       if (!nativeBridgeUp()) {
         tbody.innerHTML = '<tr><td colspan="8" class="md-empty">Native mode required.</td></tr>';
         return;
+      }
+      const preferCache = !!opts.preferCache;
+      const force = !!opts.force;
+      const cacheTtlMs = 5 * 60 * 1000;
+      const cachedForPaint = _rows.length ? _rows : _loadCachedMeta();
+      if (cachedForPaint && cachedForPaint.length) {
+        _rows = cachedForPaint;
+        _thumbsLoaded = _thumbsLoaded || _rowsHaveThumbStatus(_rows);
+        try { render(); } catch (e) { /* stale cache shape */ }
+        if (preferCache && !force && _lastRowsLoadAt
+            && (Date.now() - _lastRowsLoadAt) < cacheTtlMs
+            && (_thumbsLoaded || _thumbStatusInFlight)) {
+          return;
+        }
       }
       const _myLoadGen = ++_loadGen;
       // Live "Loading channels..." with elapsed counter so the table
@@ -492,6 +556,18 @@
       // index DB lock is held by an in-flight sweep / ingest, in
       // which case this call blocks until they finish).
       const _t0 = Date.now();
+      // Instant paint: if we already have rows (this session or persisted
+      // from last), show them immediately and refresh in place. Only the
+      // genuine first-ever load (no cache) falls back to the elapsed
+      // ticker below, which explains a slow index-DB query.
+      let _ticker = null;
+      const _cached = _rows.length ? _rows : _loadCachedMeta();
+      if (_cached && _cached.length) {
+        _rows = _cached;
+        _thumbsLoaded = _thumbsLoaded || _rowsHaveThumbStatus(_rows);
+        try { render(); } catch (e) { /* stale cache shape */ }
+        if (table) table.classList.add("is-refreshing");
+      } else {
       tbody.innerHTML = '<tr><td colspan="8" class="md-empty">'
         + 'Loading channels\u2026 <span id="md-load-info" class="md-load-info"></span>'
         + '</td></tr>';
@@ -516,10 +592,12 @@
         _info.textContent = msg;
       };
       _paint();
-      const _ticker = setInterval(_paint, 1000);
+      _ticker = setInterval(_paint, 1000);
+      }
       // Mark thumbnails as not-yet-loaded so the column renders a
       // spinner until the bulk walk completes.
       _thumbsLoaded = false;
+      _thumbStatusInFlight = false;
       try {
         const rows = await bridgeCall("get_channel_metadata_status");
         if (_myLoadGen !== _loadGen) {
@@ -527,6 +605,9 @@
           return;
         }
         _rows = Array.isArray(rows) ? rows : [];
+        _lastRowsLoadAt = Date.now();
+        _saveCachedMeta(_rows);
+        if (table) table.classList.remove("is-refreshing");
         // Issue #154 (fix): thumbnail_status_bulk walks every channel
         // folder on disk (~100k probes on a 100-channel archive on a
         // network-pooled drive — multi-minute). DO NOT await it here.
@@ -534,24 +615,23 @@
         // column, then kick the bulk walk in the background and patch
         // the column when it returns.
         if (nativeBridgeUp()) {
+          _thumbStatusInFlight = true;
           bridgeCall("thumbnail_status_bulk").then((thRes) => {
-            if (_myLoadGen !== _loadGen) return;
-            const thMap = thRes?.rows || {};
-            for (const r of _rows) {
-              const key = (r.name || r.folder || "").toLowerCase();
-              const t = thMap[key];
-              if (t) {
-                r.thumb_total = t.total || 0;
-                r.thumb_with = t.with_thumb || 0;
-                r.thumb_missing = t.missing || 0;
-              }
+            if (_myLoadGen !== _loadGen) {
+              _thumbStatusInFlight = false;
+              return;
             }
-            _thumbsLoaded = true;
+            _thumbStatusInFlight = false;
+            _mergeThumbStatus(thRes);
             // Re-render once thumb data is in. Cheap — same rows,
             // just rebuilt with the merged values.
             try { render(); } catch {}
           }).catch(() => {
-            if (_myLoadGen !== _loadGen) return;
+            if (_myLoadGen !== _loadGen) {
+              _thumbStatusInFlight = false;
+              return;
+            }
+            _thumbStatusInFlight = false;
             _thumbsLoaded = true;
             try { render(); } catch {}
           });
@@ -563,8 +643,15 @@
       } catch (e) {
         console.error("get_channel_metadata_status:", e);
         clearInterval(_ticker);
-        tbody.innerHTML = `<tr><td colspan="8" class="md-empty">`
-          + `Failed to load: ${escapeHtml(String(e))}</td></tr>`;
+        if (table) table.classList.remove("is-refreshing");
+        // If cached rows are already on screen, keep them and just toast —
+        // don't replace real (if stale) data with an error message.
+        if (_rows.length) {
+          window._showToast?.("Couldn't refresh metadata — showing cached data.", "warn");
+        } else {
+          tbody.innerHTML = `<tr><td colspan="8" class="md-empty">`
+            + `Failed to load: ${escapeHtml(String(e))}</td></tr>`;
+        }
         return;
       }
       clearInterval(_ticker);
@@ -1044,7 +1131,7 @@
 
     if (bReload) {
       bReload.addEventListener("click", () => {
-        window._refreshMetadataTab?.();
+        window._refreshMetadataTab?.({ force: true });
       });
     }
 
@@ -1087,18 +1174,10 @@
           ]);
           if (_myLoadGen !== _loadGen) return;
           _rows = Array.isArray(metaRows) ? metaRows : [];
-          const thMap = thRes?.rows || {};
-          for (const r of _rows) {
-            const key = (r.name || r.folder || "").toLowerCase();
-            const t = thMap[key];
-            if (t) {
-              r.thumb_total = t.total || 0;
-              r.thumb_with = t.with_thumb || 0;
-              r.thumb_missing = t.missing || 0;
-            }
-          }
-          _thumbsLoaded = true;
+          _lastRowsLoadAt = Date.now();
+          _mergeThumbStatus(thRes);
           try { render(); } catch {}
+          const thMap = thRes?.rows || {};
           const ch = Object.keys(thMap).length;
           window._showToast?.(
             `Rechecked ${ch} channel(s).`, "ok");

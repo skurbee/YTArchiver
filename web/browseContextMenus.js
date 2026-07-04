@@ -100,7 +100,17 @@
                                   "error");
             }
           }},
-          { label: _metaLabel, action: () => api?.metadata_recheck_channel?.({ name }) },
+          { label: `${_metaLabel}\u2026`,
+            submenu: [
+              { label: "Last 7 days",
+                action: () => api?.metadata_refresh_views_channel?.({ name }, 7) },
+              { label: "Last 30 days",
+                action: () => api?.metadata_refresh_views_channel?.({ name }, 30) },
+              { label: "Last 90 days",
+                action: () => api?.metadata_refresh_views_channel?.({ name }, 90) },
+              { label: "All videos (slow)",
+                action: () => api?.metadata_refresh_views_channel?.({ name }, null) },
+            ]},
           // New 2026-04-23: comments refresh, separate from views/likes.
           // Submenu offers scope choices so a 4000-video channel doesn't
           // get re-hit end-to-end when the user only cares about recent
@@ -576,6 +586,52 @@
         ]);
       });
     }
+
+    // ── Visible ⋮ kebab on grid cards ──────────────────────────────────
+    // The card right-click menus above are the only way to reach card
+    // actions, and nothing on screen hints they exist. Inject a corner
+    // kebab (lazily, on first hover, so no card renderer needs touching)
+    // that re-fires the SAME contextmenu event the grid listeners catch.
+    _initCardKebabs();
+  }
+
+  function _initCardKebabs() {
+    if (window._cardKebabsInited) return;
+    window._cardKebabsInited = true;
+    const SEL = ".video-card, .channel-card";
+    // Lazy inject: add a kebab the first time a card is hovered. Cards
+    // rebuilt on re-render are fresh elements (no _kebabAdded flag) so
+    // they get a kebab on their next hover — survives grid refreshes
+    // without hooking every renderer.
+    document.addEventListener("mouseover", (e) => {
+      const card = e.target.closest(SEL);
+      if (!card || card._kebabAdded) return;
+      card._kebabAdded = true;
+      const host = card.classList.contains("video-card")
+        ? (card.querySelector(".video-thumb") || card)
+        : card;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "card-kebab";
+      btn.tabIndex = -1;
+      btn.title = "Actions";
+      btn.setAttribute("aria-label", "Card actions");
+      btn.innerHTML = "&#8942;";
+      // stopPropagation on the button's OWN listeners so the click never
+      // bubbles to the card's open-video / open-channel handler.
+      btn.addEventListener("mousedown", (ev) => ev.stopPropagation());
+      btn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const r = btn.getBoundingClientRect();
+        card.dispatchEvent(new MouseEvent("contextmenu", {
+          bubbles: true, cancelable: true,
+          clientX: Math.min(window.innerWidth - 8, r.left),
+          clientY: Math.min(window.innerHeight - 8, r.bottom),
+        }));
+      });
+      host.appendChild(btn);
+    });
   }
 
   function _parseTs(s) {

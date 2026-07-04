@@ -64,37 +64,13 @@ from ..log import get_logger
 _log = get_logger(__name__)
 
 
-def _hide_per_video_transcript_txt_if_needed(video_path: str,
-                                             txt_path: str) -> None:
-    """Hide loose/manual per-video Transcript.txt sidecars.
-
-    Channel aggregate transcripts are intentionally visible, but manual single
-    videos write `<video stem> Transcript.txt` next to the media file. Those
-    should behave like metadata/jsonl sidecars in Explorer.
-    """
-    try:
-        video_dir = os.path.normcase(os.path.normpath(
-            os.path.dirname(video_path)))
-        txt_dir = os.path.normcase(os.path.normpath(os.path.dirname(txt_path)))
-        if video_dir != txt_dir:
-            return
-        stem = os.path.splitext(os.path.basename(video_path))[0]
-        stem = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", stem) or stem
-        expected = f"{stem} Transcript.txt"
-        if os.path.normcase(os.path.basename(txt_path)) != os.path.normcase(expected):
-            return
-        from .paths import _hide_file_win
-        _hide_file_win(txt_path)
-    except Exception as e:
-        _log.debug("manual transcript txt hide failed: %s", e)
-
-
 # path + format + hide helpers moved to
 # transcribe/paths.py. Re-imported here so internal calls and external
 # `from backend.transcribe import _foo` callers keep working.
 from .paths import (  # noqa: F401
     _get_jsonl_sidecar,
     _get_transcript_filename,
+    _hide_per_video_transcript_txt_if_needed,
 )
 
 # Patch 16 (v71.8): pure helpers + PunctuationManager extracted to
@@ -273,6 +249,12 @@ class TranscribeManager:
         self._worker_thread: threading.Thread | None = None
         self._cancel_all = threading.Event()
         self._paused = threading.Event()
+        # One-shot "Start" drain. When set, the worker processes the current
+        # backlog even though the Auto checkbox (autorun_gpu) is OFF, then
+        # self-clears the moment the queue empties and re-parks. This is the
+        # "click Start to process what's stacked up, but leave Auto off"
+        # path — Auto stays the user's manual gate; new arrivals keep queuing.
+        self._manual_drain = threading.Event()
         self._current_job: dict[str, Any] | None = None
         # Per-batch stats for autorun_history [Trnscr] rows. Mirrors
         # YTArchiver.py:22575 _record_transcription — one row per channel
@@ -1105,6 +1087,8 @@ class TranscribeManager:
 
     def cancel_all(self):
         self._cancel_all.set()
+        # Drop any pending one-shot drain intent — the queue is being emptied.
+        self._manual_drain.clear()
         with self._jobs_lock:
             self._jobs.clear()
             job = self._current_job
@@ -1134,6 +1118,16 @@ class TranscribeManager:
 
     def resume(self):
         self._paused.clear()
+
+    def request_drain(self):
+        """One-shot 'Start': drain the queued jobs now even though the Auto
+        checkbox is off, WITHOUT turning Auto back on. Clears any lingering
+        pause, arms the manual-drain gate, and (re)starts the worker. The
+        worker self-clears the gate the instant the queue empties, so future
+        arrivals keep queuing until the user clicks Start again."""
+        self._paused.clear()
+        self._manual_drain.set()
+        self._ensure_worker()
 
     def is_active(self) -> bool:
         """True if a GPU job is currently running OR jobs remain queued.
@@ -1216,7 +1210,9 @@ class TranscribeManager:
             # only the explicit _paused flag does.
             _signaled_paused_active = False
             while (not self._cancel_all.is_set() and
-                   (self._paused.is_set() or not self._auto_enabled())):
+                   (self._paused.is_set()
+                    or not (self._auto_enabled()
+                            or self._manual_drain.is_set()))):
                 if (self._paused.is_set()
                         and not _signaled_paused_active
                         and self._queues is not None):
@@ -1247,6 +1243,10 @@ class TranscribeManager:
                     _log.debug("swallowed: %s", e)
             with self._jobs_lock:
                 if not self._jobs:
+                    # Queue drained. If this was a one-shot manual "Start"
+                    # (Auto still off), disarm it now so future arrivals
+                    # queue again instead of auto-draining.
+                    self._manual_drain.clear()
                     break
                 job = self._jobs.pop(0)
                 self._current_job = job
@@ -1589,8 +1589,10 @@ class TranscribeManager:
         # front of the queue and bail. Without this guard the worker
         # would keep firing auto-captions / Whisper for several
         # already-popped jobs even though the user explicitly asked
-        # for queue-up behavior.
-        if not self._auto_enabled():
+        # for queue-up behavior. Exception: a one-shot manual "Start"
+        # (self._manual_drain) is an explicit request to process the
+        # backlog now, so it overrides the Auto-off re-park.
+        if not (self._auto_enabled() or self._manual_drain.is_set()):
             with self._jobs_lock:
                 self._jobs.insert(0, job)
             return

@@ -64,6 +64,11 @@ DEFAULT_CONFIG = {
     "autorun_mode": "timer",
     "autorun_history": [],
     "log_mode": "Simple",
+    # yt-dlp release channel the in-app updater targets. "stable" (the
+    # default, safest) or "nightly" (yt-dlp's beta channel — carries
+    # YouTube fixes days-to-weeks ahead of stable; use it when stable is
+    # current but downloads still 403). Read by ytdlp_update().
+    "ytdlp_channel": "stable",
     "autorun_gpu": False,
     "autorun_sync": False,
     "chan_col_widths": {},
@@ -85,11 +90,9 @@ DEFAULT_CONFIG = {
     # Disk-scan staleness: skip the 20-40s boot walk if the cache was
     # written within this many hours. 0 = always walk (OLD behavior).
     "disk_scan_staleness_hours": 24,
-    # Browse preload: warm N videos per channel so Browse clicks are
-    # instant. Higher = more RAM, more boot time. the user's large
-    # archive at 150 ≈ ~17 MB; at "all" ≈ ~110 MB. Default 150.
-    "browse_preload_limit": 150,
-    "browse_preload_all": False, # override limit and preload every row
+    "archive_capacity_warning_mode": "percent",
+    "archive_capacity_warning_percent": 90,
+    "archive_capacity_warning_free_gb": 100,
     # Timestamp of the last completed disk walk — compared against
     # disk_scan_staleness_hours to decide whether to skip on next boot.
     "last_disk_scan_ts": 0.0,

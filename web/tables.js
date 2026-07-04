@@ -131,6 +131,7 @@
         <td>${escapeHtml(r.n_vids)}</td>
         <td>${escapeHtml(r.size)}</td>
         <td>${escapeHtml(r.avg_size || "—")}</td>
+        <td class="col-actions"><button type="button" class="row-kebab" tabindex="-1" title="Channel actions" aria-label="Channel actions">&#8942;</button></td>
       `;
       frag.appendChild(tr);
     }

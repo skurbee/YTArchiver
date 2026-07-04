@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import threading
 import urllib.request
 
 from ._shared import _log, webview
+from backend.archive_capacity import archive_capacity_status
 from backend.ytarchiver_config import CONFIG_FILE, config_is_writable, load_config
 from backend.version import APP_VERSION
 
@@ -243,8 +243,14 @@ class DiagnosticsMixin:
         rows = []
         cfg = self._diagnostics_config()
 
-        def _row(name, ok, detail):
-            rows.append({"name": name, "ok": bool(ok), "detail": str(detail)})
+        def _row(name, ok, detail, status=None):
+            row_status = status or ("ok" if ok else "fail")
+            rows.append({
+                "name": name,
+                "ok": bool(ok),
+                "status": row_status,
+                "detail": str(detail),
+            })
 
         # 1. yt-dlp
         try:
@@ -309,21 +315,9 @@ class DiagnosticsMixin:
         # 5. Archive root + free space
         try:
             base = (cfg.get("output_dir") or "").strip()
-            if not base:
-                _row("Archive root", False, "Not configured (Settings > Archive root)")
-            elif not os.path.isdir(base):
-                _row("Archive root", False, "(missing)")
-            else:
-                import shutil
-                total, used, free = shutil.disk_usage(base)
-                free_gb = free / (1024 ** 3)
-                pct = (used / total * 100) if total else 0.0
-                # Mask the absolute path so a pasted diagnostics dump
-                # doesn't leak the user's Z:\ archive root in a public
-                # bug report. Only the drive letter is shown.
-                _drv = os.path.splitdrive(base)[0] or base
-                _row("Archive root", True,
-                     f"{_drv}\\\u2026 \u2014 {free_gb:.0f} GB free ({pct:.0f}% full)")
+            status = archive_capacity_status(base, cfg)
+            _row("Archive root", status.get("ok", False),
+                 status.get("detail", ""), status.get("status"))
         except Exception as e:
             _row("Archive root", False, str(e))
 

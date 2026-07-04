@@ -141,8 +141,93 @@
     try { vEl._capOverlay && vEl._capOverlay.classList.remove("show"); } catch { /* ignore */ }
   }
 
+  // seconds -> "m:ss" / "h:mm:ss" for the paragraph gutter timestamps.
+  function _fmtParaTs(sec) {
+    sec = Math.max(0, Math.floor(Number(sec) || 0));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    const mm = h ? String(m).padStart(2, "0") : String(m);
+    return (h ? h + ":" : "") + mm + ":" + String(s).padStart(2, "0");
+  }
+
+  // Non-speech cue detection — bracketed "[Music]" / "[Applause]",
+  // parenthesized "(laughs)", or musical-note runs "♪♪♪". Tagged so the
+  // "Hide ♪" toggle can collapse them out of the reading flow.
+  function _isNonSpeechToken(tok) {
+    const t = (tok || "").trim();
+    if (!t) return false;
+    if (/^[[(][^\])]*[\])]$/.test(t)) return true;
+    if (/^[♩♪♫♬♭♮♯]+$/.test(t)) return true;
+    return false;
+  }
+
+  // Paragraph grouping thresholds. Captions often arrive in huge source
+  // segments, so paragraphing works at sentence boundaries inside those
+  // segments instead of only between segments.
+  const _PARA_GAP = 2.0;
+  const _PARA_TARGET_SPAN = 45;
+  const _PARA_TARGET_SENTENCES = 4;
+  const _PARA_TARGET_CHARS = 700;
+  const _PARA_MIN_WORDS_FOR_PAUSE = 20;
+
+  function _cleanTranscriptText(text) {
+    return String(text || "").replace(/\s+/g, " ").trim();
+  }
+
+  function _isSentenceBoundaryText(text) {
+    const t = _cleanTranscriptText(text);
+    if (!t) return false;
+    if (_isNonSpeechToken(t)) return true;
+    return /[.!?…]["')\]]*$/.test(t);
+  }
+
+  function _paintRetranscribeControl(ctrl) {
+    if (!ctrl) return;
+    const vid = ctrl.dataset.videoId || "";
+    const canStart = ctrl.dataset.canStart === "1";
+    const inflight = window._inflightRetranscribes;
+    const busy = !!(vid && inflight && inflight.has && inflight.has(vid));
+    const pct = busy ? Math.max(0, Math.min(99, parseInt(inflight.get(vid), 10) || 0)) : 0;
+    const link = ctrl.querySelector(".watch-retranscribe-link");
+    const progress = ctrl.querySelector(".watch-retranscribe-progress");
+    const fill = ctrl.querySelector(".watch-retranscribe-fill");
+    const text = ctrl.querySelector(".watch-retranscribe-progress-text");
+    const banner = ctrl.closest(".watch-src-banner");
+
+    ctrl.classList.toggle("is-busy", busy);
+    if (banner) banner.classList.toggle("is-progress-pinned", busy);
+    ctrl.hidden = (!busy && !canStart);
+    if (link) link.hidden = busy || !canStart;
+    if (progress) progress.hidden = !busy;
+    if (!busy) return;
+
+    if (text) {
+      text.textContent = pct > 0 ? `Whisper ${pct}%` : "Queued";
+      text.title = pct > 0
+        ? `Re-transcribing with Whisper, ${pct}%`
+        : "Re-transcribe queued";
+    }
+    if (fill) {
+      fill.style.width = pct > 0 ? `${pct}%` : "36%";
+      fill.classList.toggle("is-indeterminate", pct <= 0);
+    }
+  }
+
+  function _paintRetranscribeControls() {
+    document.querySelectorAll(".watch-retranscribe-control")
+      .forEach(_paintRetranscribeControl);
+  }
+  window._syncWatchRetranscribeBanner = _paintRetranscribeControls;
+
   /** Build the scrollable transcript body from segment data.
    * Returns { body, segEls, allWordEls, wordIndex }.
+   *
+   * Words are grouped into sentence-safe chunks, then into paragraphs by
+   * silence gaps / size targets. Each paragraph gets a clickable gutter timestamp — turning
+   * the old undifferentiated wall into a readable, seekable article. The
+   * `.seg` / `.word` spans stay in document order inside `body`, so
+   * karaoke (which reads segEls + querySelectorAll(".word")) is unaffected.
    *
    * Token-count reconciliation: when the punctuated-text token count
    * matches the raw word-timestamp count, punctuated tokens drive the
@@ -152,51 +237,166 @@
     const body = document.createElement("div");
     body.className = "watch-transcript-body";
     const segEls = [];
+
+    let curParaText = null;    // .para-text span currently being filled
+    let paraStartSec = 0;      // start time of the current paragraph
+    let prevEnd = null;        // end time of the previous timed chunk
+    let prevEndReliable = false; // did the previous chunk carry a real end?
+    let prevBoundarySafe = false;
+    let paraChars = 0;
+    let paraWords = 0;
+    let paraSentences = 0;
+
+    const startParagraph = (startSec) => {
+      const para = document.createElement("div");
+      para.className = "transcript-para";
+      const ts = document.createElement("button");
+      ts.type = "button";
+      ts.className = "para-ts";
+      ts.dataset.s = String(startSec);
+      ts.textContent = _fmtParaTs(startSec);
+      ts.title = "Jump to " + _fmtParaTs(startSec);
+      ts.tabIndex = -1;
+      const text = document.createElement("span");
+      text.className = "para-text";
+      para.appendChild(ts);
+      para.appendChild(text);
+      body.appendChild(para);
+      curParaText = text;
+      paraStartSec = startSec;
+      paraChars = 0;
+      paraWords = 0;
+      paraSentences = 0;
+    };
+
     for (const seg of transcript) {
-      const segEl = document.createElement("span");
-      segEl.className = "seg";
-      segEl.dataset.s = seg.s ?? 0;
-      segEl.dataset.e = seg.e ?? 0;
+      const segStart = Number(seg.s) || 0;
+      const segEnd = Number(seg.e);
+      const segEndReliable = Number.isFinite(segEnd) && segEnd > segStart;
       const words = Array.isArray(seg.words) && seg.words.length
         ? seg.words
         : (seg.w && seg.w.length ? seg.w : null);
       const segText = seg.t || seg.text || "";
       const textTokens = segText.trim().split(/\s+/).filter(Boolean);
+
+      const wordItems = [];
+      const addItem = (text, s, e) => {
+        if (!text) return;
+        const item = { text: String(text), s: Number(s), e: Number(e) };
+        if (!Number.isFinite(item.s)) item.s = segStart;
+        if (!Number.isFinite(item.e)) delete item.e;
+        wordItems.push(item);
+      };
       if (words && textTokens.length === words.length) {
         for (let i = 0; i < words.length; i++) {
-          const wobj = words[i];
-          const span = document.createElement("span");
-          span.className = "word";
-          span.dataset.s = wobj.s ?? 0;
-          span.dataset.e = wobj.e ?? 0;
-          span.textContent = textTokens[i] + " ";
-          segEl.appendChild(span);
+          addItem(textTokens[i], words[i].s ?? segStart, words[i].e);
         }
       } else if (words) {
-        for (const wobj of words) {
+        for (const wobj of words) addItem(wobj.w || "", wobj.s ?? segStart, wobj.e);
+      } else if (textTokens.length > 1) {
+        // Last-resort fallback for text-only transcripts. If the segment has
+        // an end time, spread words across it so paragraph timestamps remain
+        // useful; otherwise every word clicks back to the segment start.
+        const span = segEndReliable ? (segEnd - segStart) : 0;
+        for (let i = 0; i < textTokens.length; i++) {
+          const s = span ? segStart + (span * i / textTokens.length) : segStart;
+          const e = span ? segStart + (span * (i + 1) / textTokens.length) : undefined;
+          addItem(textTokens[i], s, e);
+        }
+      } else if (segText) {
+        addItem(segText, seg.s ?? 0, seg.e);
+      }
+      if (!wordItems.length) continue;
+
+      const renderChunk = (items, safeBoundary) => {
+        if (!items.length) return;
+        const first = items[0];
+        const last = items[items.length - 1];
+        const chunkStart = Number.isFinite(first.s) ? first.s : segStart;
+        let chunkEnd = Number.isFinite(last.e) ? last.e : null;
+        if (chunkEnd == null || chunkEnd <= chunkStart) {
+          chunkEnd = Number.isFinite(last.s) && last.s > chunkStart
+            ? last.s
+            : (segEndReliable ? segEnd : chunkStart);
+        }
+
+        // Gap-based breaks only when the previous chunk had a trustworthy
+        // end time. Some transcripts carry starts only; using the start as a
+        // pseudo-end would shred text into tiny paragraphs.
+        const gap = (prevEnd == null) ? Infinity
+                  : (prevEndReliable ? (chunkStart - prevEnd) : 0);
+        const paraAge = (prevEnd == null) ? 0 : Math.max(0, prevEnd - paraStartSec);
+        const pauseBreak = prevBoundarySafe
+          && gap >= _PARA_GAP
+          && paraWords >= _PARA_MIN_WORDS_FOR_PAUSE;
+        const sizeBreak = prevBoundarySafe
+          && (paraAge >= _PARA_TARGET_SPAN
+              || paraSentences >= _PARA_TARGET_SENTENCES
+              || paraChars >= _PARA_TARGET_CHARS);
+        if (!curParaText || pauseBreak || sizeBreak) {
+          startParagraph(chunkStart);
+        }
+
+        const segEl = document.createElement("span");
+        segEl.className = "seg";
+        segEl.dataset.s = chunkStart;
+        segEl.dataset.e = chunkEnd;
+        let nonSpeech = 0, total = 0;
+        const chunkTextParts = [];
+        const addWord = (text, s, e) => {
           const span = document.createElement("span");
           span.className = "word";
-          span.dataset.s = wobj.s ?? 0;
-          span.dataset.e = wobj.e ?? 0;
-          span.textContent = (wobj.w || "") + " ";
+          span.dataset.s = (s ?? 0);
+          if (e != null) span.dataset.e = e;
+          span.textContent = text + " ";
+          if (_isNonSpeechToken(text)) { span.classList.add("tx-nonspeech"); nonSpeech++; }
+          total++;
           segEl.appendChild(span);
+        };
+        for (const item of items) {
+          chunkTextParts.push(item.text);
+          addWord(item.text, item.s ?? chunkStart, item.e);
         }
-      } else {
-        const span = document.createElement("span");
-        span.className = "word";
-        span.dataset.s = String(seg.s ?? 0);
-        span.textContent = segText + " ";
-        segEl.appendChild(span);
+        // A chunk that is ENTIRELY non-speech (a standalone "[Music]"
+        // line) gets tagged too, so the toggle collapses the whole line.
+        if (total > 0 && nonSpeech === total) segEl.classList.add("tx-nonspeech");
+        // Trailing space between chunks keeps words from running together.
+        segEl.appendChild(document.createTextNode(" "));
+        curParaText.appendChild(segEl);
+        segEls.push(segEl);
+
+        const chunkText = chunkTextParts.join(" ");
+        paraChars += chunkText.length + 1;
+        paraWords += total;
+        if (safeBoundary && !_isNonSpeechToken(chunkText)) paraSentences += 1;
+
+        prevEndReliable = Number.isFinite(chunkEnd) && chunkEnd > chunkStart;
+        prevEnd = prevEndReliable ? chunkEnd : chunkStart;
+        prevBoundarySafe = !!safeBoundary;
+      };
+
+      let chunk = [];
+      for (let i = 0; i < wordItems.length; i++) {
+        const item = wordItems[i];
+        chunk.push(item);
+        const safeBoundary = _isSentenceBoundaryText(item.text);
+        if (safeBoundary || i === wordItems.length - 1) {
+          renderChunk(chunk, safeBoundary);
+          chunk = [];
+        }
       }
-      // Trailing space between segments keeps words from running together.
-      segEl.appendChild(document.createTextNode(" "));
-      body.appendChild(segEl);
-      segEls.push(segEl);
     }
+
     // Delegated click listener — one closure on the body instead of N
-    // per-word closures (memory pressure on long transcripts). Walks up
-    // to nearest .word and seeks via dataset.s.
+    // per-element closures. A paragraph timestamp seeks to the paragraph
+    // start; otherwise the nearest word seeks via its dataset.s.
     body.addEventListener("click", (e) => {
+      const tsEl = e.target && e.target.closest && e.target.closest(".para-ts");
+      if (tsEl) {
+        const ps = parseFloat(tsEl.dataset.s);
+        if (Number.isFinite(ps)) _seekTo(vEl, ps);
+        return;
+      }
       const wEl = e.target && e.target.closest && e.target.closest(".word");
       if (!wEl) return;
       const _s = parseFloat(wEl.dataset.s);
@@ -328,17 +528,41 @@
     const dot = document.createElement("span");
     dot.className = "watch-src-dot";
 
-    const buildRetranscribeLink = () => {
+    const buildRetranscribeControl = (canStart) => {
+      const wrap = document.createElement("span");
+      wrap.className = "watch-retranscribe-control";
+      wrap.dataset.videoId = (video && video.video_id) || "";
+      wrap.dataset.canStart = canStart ? "1" : "0";
       const a = document.createElement("a");
       a.href = "#";
       a.className = "watch-retranscribe-link";
-      a.textContent = "re-transcribe with Whisper";
+      a.setAttribute("role", "button");
+      a.title = "Re-transcribe with Whisper for more accurate results";
+      a.textContent = "Re-transcribe with Whisper";
       a.addEventListener("click", (ev) => {
         ev.preventDefault();
         const btn = document.getElementById("btn-watch-retranscribe");
         if (btn) btn.click();
       });
-      return a;
+      const prog = document.createElement("span");
+      prog.className = "watch-retranscribe-progress";
+      prog.hidden = true;
+      prog.setAttribute("role", "status");
+      prog.setAttribute("aria-live", "polite");
+      const progText = document.createElement("span");
+      progText.className = "watch-retranscribe-progress-text";
+      const bar = document.createElement("span");
+      bar.className = "watch-retranscribe-bar";
+      bar.setAttribute("aria-hidden", "true");
+      const fill = document.createElement("span");
+      fill.className = "watch-retranscribe-fill";
+      bar.appendChild(fill);
+      prog.appendChild(progText);
+      prog.appendChild(bar);
+      wrap.appendChild(a);
+      wrap.appendChild(prog);
+      _paintRetranscribeControl(wrap);
+      return wrap;
     };
 
     if (src === "whisper") {
@@ -356,6 +580,7 @@
         ? `Whisper transcription — ${model.toLowerCase()} model`
         : "Whisper transcription";
       banner.appendChild(txt);
+      banner.appendChild(buildRetranscribeControl(false));
       return banner;
     }
     if (src === "yt_captions_punct" || src === "yt_captions_raw") {
@@ -371,11 +596,10 @@
       // has lowercase per-segment content. Basing the badge on visible
       // content reflects what the user sees instead of pipeline state.
       const label = _hasContentPunct
-        ? "YouTube auto-captions (punctuated) — transcript is approximate · "
-        : "YouTube auto-captions — transcript is approximate · ";
+        ? "YouTube auto-captions (punctuated) — transcript is approximate. "
+        : "YouTube auto-captions — transcript is approximate. ";
       banner.appendChild(document.createTextNode(label));
-      banner.appendChild(buildRetranscribeLink());
-      banner.appendChild(document.createTextNode(" for improved results"));
+      banner.appendChild(buildRetranscribeControl(true));
       return banner;
     }
     // Unknown. Per ArchivePlayer app.js:1140 — don't flag with a warning
@@ -696,9 +920,8 @@
       }
       // Surface decode/playback failures. Without this, a corrupt or
       // partially-downloaded file — or a codec the WebView can't decode —
-      // fails SILENTLY: the play().catch() below swallows the rejection and
-      // there's no media-error handler, so the user is left staring at a
-      // black box with no explanation. Wire once per <video> element.
+      // can fail SILENTLY without the handler below, leaving the user
+      // staring at a black box with no explanation. Wire once per <video> element.
       if (!vEl.dataset.errHooked) {
         vEl.dataset.errHooked = "1";
         vEl.addEventListener("error", () => {
@@ -741,8 +964,10 @@
       // survives — re-applied on every new video load so the HTMLMediaElement
       // doesn't reset to 100% on src change. Saves back on volume-change.
       _applyPersistedVolume(vEl);
-      // Try autoplay (user has already clicked in the app, so this is allowed)
-      vEl.play().catch(() => { /* user can click play */ });
+      // Opening a video from the grid should start playback immediately.
+      // The race-token checks above prevent stale loads from starting in
+      // the background after the user navigates away.
+      vEl.play().catch(() => { /* user can click play if autoplay is blocked */ });
     } else {
       // No playback possible — show placeholder with actionable error.
       // reported clicking a "(1)" duplicate that had a stale DB

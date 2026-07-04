@@ -1,0 +1,384 @@
+  <!-- Health tab: library maintenance + status. Metadata / Index / Tools
+       live here because they are actions and dashboards, not preferences. -->
+  <div class="tab-panel" id="panel-health">
+    <div class="settings-area">
+      <div class="settings-sidebar">
+        <div class="settings-subnav-label">LIBRARY</div>
+        <div class="settings-subnav-btn active" data-settings-view="metadata">Metadata</div>
+        <div class="settings-subnav-btn" data-settings-view="index">Index</div>
+        <div class="settings-subnav-btn" data-settings-view="tools">Tools</div>
+      </div>
+      <div class="settings-main">
+
+        <!-- Tools &mdash; yt-dlp, import/export, bulk metadata -->
+        <div class="settings-view" id="settings-view-tools" hidden>
+          <label class="subs-section-label">Dependencies</label>
+          <div class="edit-grid">
+            <label class="edit-gl">yt-dlp</label>
+            <div class="edit-gv-inline edit-gap-8">
+              <span class="edit-dim" id="settings-ytdlp-version">checking&hellip;</span>
+              <button class="btn btn-ghost btn-thin" id="btn-ytdlp-update"
+                      title="Update yt-dlp to the latest release on the selected channel">Update</button>
+            </div>
+
+            <label class="edit-gl">Release channel</label>
+            <div class="edit-gv-inline edit-gap-8">
+              <select class="ctl-select" id="settings-ytdlp-channel"
+                      title="Stable is safest. Beta (nightly) carries YouTube fixes days-to-weeks ahead of stable — switch to it if downloads start failing with 403 errors while Stable is already up to date.">
+                <option value="stable">Stable</option>
+                <option value="nightly">Beta (nightly)</option>
+              </select>
+            </div>
+
+          </div>
+
+          <label class="subs-section-label">Backup and Migration</label>
+          <div class="edit-grid">
+            <label class="edit-gl">Channels</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <button class="btn btn-ghost btn-thin" id="btn-export-channels"
+                      title="Save your channel list to a JSON file">Export&hellip;</button>
+              <button class="btn btn-ghost btn-thin" id="btn-import-channels"
+                      title="Merge a saved channel list into your current subs">Import&hellip;</button>
+            </div>
+
+            <label class="edit-gl">Full backup</label>
+            <div class="edit-gv-stack">
+              <div class="edit-gv-inline edit-gap-6">
+                <button class="btn btn-ghost btn-thin" id="btn-export-backup"
+                        title="Save config + queue state + all journals to a zip">Export&hellip;</button>
+                <button class="btn btn-ghost btn-thin" id="btn-import-backup"
+                        title="Restore a backup zip (snapshots current config first)">Restore&hellip;</button>
+              </div>
+              <span id="backup-age-display" style="font-size:var(--fs-xs);color:var(--c-dim);line-height:1.4"></span>
+            </div>
+
+            <!-- "Metadata (all channels)" row removed &mdash; a dedicated
+                 Metadata tab now hosts these actions + per-channel
+                 refresh status, making this Tools duplication
+                 redundant. btn-metadata-queue-all and btn-metadata-
+                 refresh-all still exist on the Metadata tab itself. -->
+
+            <!-- Moved from the Browse toolbar (issue #135) &mdash; it was
+                 an odd fit up there with per-channel navigation and
+                 users asked for it grouped with the other archive-
+                 wide Tools actions. Button id stays `btn-scan-archive`
+                 so `initScanArchive()` in app.js finds it unchanged. -->
+          </div>
+
+          <label class="subs-section-label">Archive Integrity</label>
+          <div class="edit-grid">
+            <label class="edit-gl">Archive</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <button class="btn btn-ghost btn-thin" id="btn-scan-archive"
+                      title="Re-scan archive folders for new files added outside the app">Rescan archive&hellip;</button>
+            </div>
+
+            <!-- Bug 5: enforce the hidden-sidecars contract. Walks every
+                 channel folder + the archive root and sets the Windows
+                 HIDDEN attribute on any visible sidecar (.info.json,
+                 .description, stray thumbs, .jsonl, etc.) so each folder
+                 shows only the videos + the conjoined Transcript.txt when
+                 Explorer's "show hidden files" is off. Non-destructive —
+                 only flips the hidden bit; never moves or deletes. -->
+            <label class="edit-gl">Hidden sidecars</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <button class="btn btn-ghost btn-thin" id="btn-hide-sidecars"
+                      title="Scan the whole archive and hide any stray sidecar files (.info.json, leftover thumbnails, .jsonl, etc.) so each folder shows only the videos + the Transcript.txt. Only sets the Windows hidden attribute — nothing is moved or deleted.">Scan &amp; repair&hellip;</button>
+            </div>
+
+            <!-- bug W-3: About + Diagnostics dialogs existed in the
+                 HTML + JS but had no UI buttons to trigger them. Both
+                 handlers (app.js:6436 / 6471) use getElementById which
+                 silently no-ops when the elements are absent. -->
+          </div>
+
+          <label class="subs-section-label">App Info and Setup</label>
+          <div class="edit-grid">
+            <label class="edit-gl">Info &amp; Self-check</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <button class="btn btn-ghost btn-thin" id="btn-about"
+                      title="App version and config info">About&hellip;</button>
+              <button class="btn btn-ghost btn-thin" id="btn-diagnostics"
+                      title="Check yt-dlp, ffmpeg, Python 3.11, GPU, etc.">Diagnostics&hellip;</button>
+            </div>
+
+            <!-- Re-open the first-run setup wizard (archive folder picker +
+                 dependency installer for yt-dlp / ffmpeg / Whisper). -->
+            <label class="edit-gl">Setup</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <button class="btn btn-ghost btn-thin" id="btn-run-setup"
+                      title="Re-run first-time setup: archive folder + install yt-dlp / ffmpeg / Whisper">Run setup again&hellip;</button>
+            </div>
+
+            <!-- feature F8: projected compress savings dry-run.
+                 Reads duration + size from the index DB and shows how
+                 much disk would be saved at each quality tier &mdash; no
+                 actual compression runs. -->
+            <label class="edit-gl">Compress</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <button class="btn btn-ghost btn-thin" id="btn-compress-dry-run"
+                      title="Project disk savings at each quality tier without compressing anything">Dry-run savings&hellip;</button>
+            </div>
+
+            <!-- Realign misplaced thumbnails. Walks every channel's
+                 .Thumbnails/ dir, finds thumbs whose [video_id] points
+                 to an mp4 in a DIFFERENT year/month folder, and moves
+                 them next to their mp4. Reports a dry-run preview
+                 first; user confirms before any files move. -->
+            <label class="edit-gl">Thumbnails</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <button class="btn btn-ghost btn-thin" id="btn-thumb-realign"
+                      title="Move thumbnails that drifted into the wrong year folder back next to their video file. Shows a dry-run preview before doing anything.">Realign misplaced&hellip;</button>
+            </div>
+
+            <!-- feature H-2: transcript drift scan + fix. Cross-
+                 references .txt / .jsonl / FTS for a channel and
+                 reports mismatches. Fix rebuilds missing .txt entries
+                 from .jsonl data, queues Whisper retranscribe for
+                 entries that only exist in .txt, and cleans up FTS5
+                 phantom rows (C-9). -->
+          </div>
+
+          <label class="subs-section-label">Transcript Repair</label>
+          <div class="edit-grid">
+            <label class="edit-gl">Transcript drift</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <button class="btn btn-ghost btn-thin" id="btn-drift-scan"
+                      title="Scan a channel's .txt / .jsonl / FTS for drift and offer a repair">Scan &amp; fix&hellip;</button>
+            </div>
+
+            <!-- Repair YT auto-captions for videos archived before v64.7
+                 (the parser-fix release). Re-fetches each video's VTT,
+                 re-parses with the fixed parser, rewrites the per-word
+                 array in the JSONL + DB. Whisper-transcribed videos
+                 are auto-skipped. Slow (hits YT per video) — progress
+                 streams to the main log. -->
+            <label class="edit-gl">YT auto-captions</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <button class="btn btn-ghost btn-thin" id="btn-repair-yt-captions"
+                      title="Re-parse YT auto-captions for videos archived before v64.7 to fix dropped words and segment-boundary duplications">Repair&hellip;</button>
+            </div>
+
+            <!-- Restore transcript punctuation for legacy YT-captioned
+                 videos whose per-segment text was never run through
+                 punct restoration at ingest. Reads from segments.text,
+                 runs each through PunctuationManager, writes back to
+                 DB + JSONL. No YT calls. -->
+            <label class="edit-gl">Transcript punctuation</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <button class="btn btn-ghost btn-thin" id="btn-punct-restore"
+                      title="Add sentence punctuation + capitalization to per-segment text for legacy YT-captioned videos. Local CPU/GPU only, no YT calls.">Restore&hellip;</button>
+            </div>
+
+            <!-- audit SM-1: reset sync state for a specific channel.
+                 Clears initialized/sync_complete/batch_resume_index/
+                 init_batch_after/last_sync so the next sync starts
+                 a fresh bootstrap. Useful if the user deleted a
+                 channel folder manually, or wants to re-walk the
+                 whole catalog after a filter change. -->
+          </div>
+
+          <label class="subs-section-label">Advanced State Repair</label>
+          <div class="edit-grid">
+            <label class="edit-gl">Channel sync state</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <button class="btn btn-ghost btn-thin" id="btn-reset-sync-state"
+                      title="Reset a channel's bootstrap/sync state so the next sync walks from scratch">Reset channel&hellip;</button>
+            </div>
+
+            <!-- Fill missing video lengths by ffprobing each file locally
+                 (no YouTube). The disk-sweep / import paths register videos
+                 without a duration, so the Videos grid shows no length badge
+                 for them; this reads the true runtime from the file itself.
+                 Local only; progress streams to the main log; stoppable and
+                 resumable (re-run picks up the rest). -->
+            <label class="edit-gl">Video lengths</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <button class="btn btn-ghost btn-thin" id="btn-fix-video-lengths"
+                      title="Read each video's true length with ffprobe (local, no YouTube) to fill in missing lengths shown in Browse &gt; Videos. Progress streams to the log; you can Stop and re-run to resume.">Check / fix&hellip;</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Metadata &mdash; per-channel refresh status + quick actions.
+             Added 2026-04-23 after the bulk views-refresh path landed.
+             Rows show when each channel's views/likes and comments
+             were last refreshed; sort defaults to "oldest first" so
+             stale channels float to the top and are easy to spot. -->
+        <div class="settings-view" id="settings-view-metadata">
+          <label class="subs-section-label">Metadata</label>
+          <div class="metadata-panel">
+            <div class="metadata-hint">
+              Per-channel metadata refresh status. <b>Views/likes</b>
+              uses the fast bulk path (one yt-dlp call per channel)
+              and only re-fetches videos whose counts actually changed.
+              <b>Comments</b> is slower (per-video yt-dlp calls &mdash; no
+              bulk mode exists) so scope it to recent uploads when
+              possible.
+            </div>
+
+            <!-- Archive-wide totals strip. Aggregates every channel's
+                 stats into one snapshot so the user can see the
+                 archive's overall health at a glance without scanning
+                 the per-channel table. Populated on every table
+                 refresh (incl. force-recheck). -->
+            <div class="metadata-totals" id="metadata-totals" hidden>
+              <div class="md-total-card">
+                <div class="md-total-label">Channels</div>
+                <div class="md-total-value" id="md-tot-channels">&mdash;</div>
+              </div>
+              <div class="md-total-card">
+                <div class="md-total-label">Videos</div>
+                <div class="md-total-value" id="md-tot-videos">&mdash;</div>
+              </div>
+              <div class="md-total-card" id="md-tot-card-ids"
+                   title="Across the whole archive: how many on-disk videos have a resolvable video_id stored in the index DB.">
+                <div class="md-total-label">Video IDs</div>
+                <div class="md-total-value" id="md-tot-ids">&mdash;</div>
+              </div>
+              <div class="md-total-card" id="md-tot-card-thumbs"
+                   title="Across the whole archive: how many on-disk videos have a thumbnail sidecar.">
+                <div class="md-total-label">Thumbnails</div>
+                <div class="md-total-value" id="md-tot-thumbs">&mdash;</div>
+              </div>
+              <div class="md-total-card" id="md-tot-card-onyt"
+                   title="Across the whole archive: how many videos are still publicly listed on YouTube. Updated when bulk views/likes refresh runs.">
+                <div class="md-total-label">Still on YT</div>
+                <div class="md-total-value" id="md-tot-onyt">&mdash;</div>
+              </div>
+            </div>
+
+            <!-- Bulk row -->
+            <div class="metadata-bulk-row">
+              <button class="btn btn-ghost btn-thin" id="btn-md-refresh-all-views"
+                      title="Queue a fast views/likes refresh for every subscribed channel">
+                Refresh views/likes &mdash; all channels
+              </button>
+              <button class="btn btn-ghost btn-thin" id="btn-md-refresh-all-comments"
+                      title="Queue a comments refresh for every channel. Prompts for scope: 1 month / 1 year / all.">
+                Refresh comments &mdash; all channels
+              </button>
+              <button class="btn btn-ghost btn-thin" id="btn-md-backfill-all-ids"
+                      title="For every channel missing video_ids, do a one-time flat-playlist + title-match pass to fill them in. Essential for archives migrated from the tkinter-era YTArchiver.">
+                Fix missing video IDs &mdash; all channels
+              </button>
+              <button class="btn btn-ghost btn-thin" id="btn-md-refetch-all-thumbs"
+                      title="Walk every channel and download any missing thumbnail sidecars from URLs cached in metadata.jsonl. Runs in the background; progress appears in the log.">
+                Refetch missing thumbnails &mdash; all channels
+              </button>
+              <button class="btn btn-ghost btn-thin" id="btn-md-recheck-thumbs"
+                      title="Bypass caches and recompute every stat from scratch. Use if numbers look stale or you edited files outside the app.">
+                Force recheck &mdash; all stats
+                <span class="md-recheck-progress" id="md-recheck-progress" hidden></span>
+              </button>
+              <div class="spacer"></div>
+              <button class="btn btn-ghost btn-thin" id="btn-md-reload"
+                      title="Re-query per-channel refresh times">Reload</button>
+            </div>
+
+            <!-- Per-channel table -->
+            <div class="metadata-table-wrap">
+              <table class="metadata-table" id="metadata-table">
+                <thead>
+                  <tr>
+                    <th class="md-col-name" data-sort="name">Channel</th>
+                    <th class="md-col-num" data-sort="videos">Videos</th>
+                    <th class="md-col-ids" data-sort="ids"
+                        title="Checkmark means every on-disk video has a resolvable video_id stored in the index DB (fast views/likes refresh works). Warn/X means a video_id backfill is recommended &mdash; click Fix IDs on the row.">Video IDs</th>
+                    <th class="md-col-ids" data-sort="thumbs"
+                        title="Coverage of per-video thumbnail sidecars. Right-click a channel row → 'Refetch missing thumbnails' to backfill.">Thumbnails</th>
+                    <th class="md-col-onyt" data-sort="onyt"
+                        title="How many videos in your archive are still on YouTube. Detected during bulk views/likes refresh &mdash; files whose video_id is no longer in the channel's flat-playlist response are flagged as removed.">Still on YT</th>
+                    <th class="md-col-ts" data-sort="views" data-sort-active
+                        title="Last time views/likes were bulk-refreshed for this channel (or the channel was bootstrapped)">Views refreshed</th>
+                    <th class="md-col-ts" data-sort="comments"
+                        title="Last time comments were refreshed for this channel (or the channel was bootstrapped)">Comments refreshed</th>
+                    <th class="md-col-act"></th>
+                  </tr>
+                </thead>
+                <tbody id="metadata-tbody">
+                  <tr><td colspan="8" class="md-empty">Loading&hellip;</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Index management -->
+        <div class="settings-view" id="settings-view-index" hidden>
+          <label class="subs-section-label">Index</label>
+          <div class="settings-index-grid">
+
+            <!-- Explainer &mdash; short note on what Index is so Settings
+                 doesn't just drop you into "Build / Update Index" with
+                 no context. -->
+            <div class="index-section index-explainer">
+              <div class="index-section-hint">
+                The <b>Index</b> is a searchable catalog of every transcript
+                in your archive. The Browse &rarr; Search tab queries it to
+                find spoken phrases across channels. New downloads get
+                indexed automatically &mdash; use the buttons below to
+                refresh stats, add extra archive folders, or rebuild from
+                scratch after large external changes.
+              </div>
+            </div>
+
+            <!-- Stats -->
+            <div class="index-section">
+              <div class="index-section-label">Statistics</div>
+              <pre class="index-stats-text" id="index-stats-text">&mdash;</pre>
+            </div>
+
+            <!-- Actions + progress -->
+            <div class="index-section index-actions-row">
+              <button class="btn btn-sync" id="btn-idx-build">Build / Update Index</button>
+              <button class="btn btn-ghost" id="btn-idx-rebuild">Rebuild from Scratch</button>
+              <span class="status-text" id="idx-progress">&nbsp;</span>
+            </div>
+
+            <!-- Additional archive roots beyond the primary Archive root.
+                 Right-click a root entry for "Delete all transcriptions" -->
+            <div class="index-section">
+              <div class="index-section-label">Additional archive roots</div>
+              <div class="index-section-hint">
+                The primary <b>Archive root</b> (set on the General tab) is
+                always indexed. Use this list to index extra folders too.
+                Right-click a root &rarr; Delete All Transcriptions.
+              </div>
+              <div class="index-roots-list" id="settings-roots-list" tabindex="0"></div>
+              <div class="index-section-buttons">
+                <button class="btn btn-ghost btn-thin" id="btn-settings-add-root">Add Folder&hellip;</button>
+                <button class="btn btn-ghost btn-thin" id="btn-settings-remove-root">Remove Selected</button>
+              </div>
+            </div>
+
+            <!-- Auto-update on every N downloads -->
+            <div class="index-section">
+              <div class="index-section-label">Auto-update</div>
+              <label class="index-auto-label">
+                <input type="checkbox" id="settings-auto-index-enabled" />
+                <span>Re-index automatically every</span>
+              </label>
+              <input type="text" class="ctl-input edit-num index-auto-threshold"
+                     id="settings-auto-index-threshold" value="10" />
+              <span class="edit-dim">downloads</span>
+            </div>
+
+            <!-- Log -->
+            <div class="index-section index-log-section">
+              <div class="index-section-label">Log</div>
+              <div class="index-log-frame">
+                <div class="main-log" id="index-log"></div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mini-log-frame">
+      <div class="main-log mini-log" id="health-mini-log" tabindex="-1"></div>
+    </div>
+  </div>

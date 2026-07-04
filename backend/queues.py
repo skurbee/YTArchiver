@@ -165,6 +165,47 @@ class QueueState:
         with self._lock:
             return dict(self._loaded_resuming or {})
 
+    def clear_resuming_slots(self, *kinds: str,
+                             clear_current: bool = False) -> bool:
+        """Forget persisted crash-resume entries for the requested lanes.
+
+        The resuming sidecar is authoritative only while an item is truly
+        in-flight. Once startup has converted it back into normal queued work,
+        or the user has explicitly cleared/cancelled the queue, keeping the
+        sidecar around resurrects stale work on every launch.
+        """
+        wanted = {str(k or "").strip().lower() for k in kinds}
+        wanted.discard("")
+        if not wanted:
+            wanted = {"sync", "gpu"}
+
+        changed = False
+        with self._lock:
+            for kind in wanted:
+                if kind in self._loaded_resuming:
+                    self._loaded_resuming.pop(kind, None)
+                    changed = True
+                if clear_current and kind == "sync" and self.current_sync is not None:
+                    self.current_sync = None
+                    changed = True
+                if clear_current and kind == "gpu" and self.current_gpu is not None:
+                    self.current_gpu = None
+                    changed = True
+            payload = (self._build_resuming_payload_locked()
+                       if config_is_writable() else None)
+
+        ok = True
+        if payload is not None:
+            try:
+                ok = self._write_resuming_payload(payload)
+            except Exception:
+                ok = False
+        if changed:
+            self._notify()
+            if clear_current:
+                self.save_now()
+        return ok
+
     def add_listener(self, fn: Callable[[], None]):
         # LOW FIX (audit 5.23 LOW-4): hold _lock around the listener-list
         # mutation. Today listeners are only added once at startup so the
@@ -213,6 +254,48 @@ class QueueState:
 
     # ── load/save ────────────────────────────────────────────────────
 
+    @staticmethod
+    def _sync_identity_key(ch: dict[str, Any]) -> tuple[str, str, str] | None:
+        """Return the uniqueness key used by sync_enqueue: kind + target."""
+        if not isinstance(ch, dict):
+            return None
+        kind = str(ch.get("kind") or "download").strip().lower()
+        url = str(ch.get("url") or "").strip()
+        if url:
+            return (kind, "url", url)
+        name = str(ch.get("name") or ch.get("folder") or "").strip()
+        if name:
+            return (kind, "name", name)
+        return None
+
+    @classmethod
+    def _dedupe_sync_items(cls, items: list[Any]) -> tuple[list[dict[str, Any]], bool]:
+        deduped: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        changed = False
+        for item in items:
+            if not isinstance(item, dict):
+                changed = True
+                continue
+            key = cls._sync_identity_key(item)
+            if key is not None:
+                if key in seen:
+                    changed = True
+                    continue
+                seen.add(key)
+            deduped.append(item)
+        return deduped, changed
+
+    def _rebuild_order_locked(self) -> list[list[str]]:
+        order: list[list[str]] = []
+        for ch in self.sync:
+            order.append(["sync", str(ch.get("url") or "")])
+        for item in self.gpu:
+            ident = str(item.get("id") or item.get("path")
+                        or item.get("bulk_id") or "")
+            order.append(["gpu", ident])
+        return order
+
     def load(self) -> bool:
         """Load queue state from ytarchiver_queue.json. Returns True on success.
 
@@ -240,15 +323,29 @@ class QueueState:
                 except OSError: pass
             return False
         sidecar_exists, sidecar_resuming = self._load_resuming_sidecar()
+        raw_sync = data.get("sync", [])
+        if not isinstance(raw_sync, list):
+            raw_sync = []
+        sync_items, sync_normalized = self._dedupe_sync_items(raw_sync)
+        raw_gpu = data.get("gpu", [])
+        if not isinstance(raw_gpu, list):
+            raw_gpu = []
+        gpu_items = [g for g in raw_gpu if isinstance(g, dict)]
+        gpu_normalized = len(gpu_items) != len(raw_gpu)
+        raw_order = data.get("order", [])
+        if not isinstance(raw_order, list):
+            raw_order = []
         with self._lock:
-            self.sync = list(data.get("sync", []))
+            self.sync = sync_items
             # LOW FIX (audit 5.23 LOW-3): no longer load five dead lists
             # (reorg / video / transcribe / redownload / metadata). If an
             # old queue file on disk still has those keys, they're silently
             # ignored. None of those kinds carried real items in practice
             # — they all ride the sync queue with a `kind=` discriminator.
-            self.gpu = list(data.get("gpu", []))
-            self.order = list(data.get("order", []))
+            self.gpu = gpu_items
+            self.order = (self._rebuild_order_locked()
+                          if sync_normalized or gpu_normalized
+                          else list(raw_order))
             self.gpu_paused = bool(data.get("gpu_paused", False))
             self.sync_paused = bool(data.get("sync_paused", False))
 
@@ -287,6 +384,8 @@ class QueueState:
             if sidecar_exists:
                 self._loaded_resuming = sidecar_resuming
         self._notify()
+        if sync_normalized or gpu_normalized:
+            self.save_debounced()
         return True
 
     def _resuming_file(self):
@@ -612,7 +711,7 @@ class QueueState:
         self.save_debounced()
         return True
 
-    def sync_requeue_front(self, channel: dict[str, Any]) -> None:
+    def sync_requeue_front(self, channel: dict[str, Any]) -> bool:
         """Insert `channel` at the front of the sync queue atomically.
         Used by sync_all on a pause-interrupted channel so Resume picks
         the in-flight channel back up first. Replaces a bare
@@ -621,11 +720,17 @@ class QueueState:
         `sync_enqueue` callers (audit: sync/sync_all.py C7).
         """
         url = channel.get("url", "")
+        key = self._sync_identity_key(channel)
         with self._lock:
+            if key is not None:
+                for existing in self.sync:
+                    if self._sync_identity_key(existing) == key:
+                        return False
             self.sync.insert(0, copy.deepcopy(channel))
             self.order.insert(0, ["sync", url])
         self._notify()
         self.save_debounced()
+        return True
 
     def sync_clear(self) -> int:
         """Remove every queued sync task; keep the currently-running one.
@@ -636,7 +741,7 @@ class QueueState:
             self.order = [o for o in self.order if not (o and o[0] == "sync")]
         if removed:
             self._notify()
-            self.save_debounced()
+            self.save_now()
         return removed
 
     def gpu_clear(self) -> int:
@@ -647,7 +752,7 @@ class QueueState:
             self.order = [o for o in self.order if not (o and o[0] == "gpu")]
         if removed:
             self._notify()
-            self.save_debounced()
+            self.save_now()
         return removed
 
     def sync_reorder(self, url: str, new_index: int) -> bool:
@@ -973,6 +1078,9 @@ class QueueState:
         "Download" → green, etc.
         """
         name = ch.get("name") or ch.get("folder") or "?"
+        status_label = str(ch.get("_status_label") or "").strip()
+        if running and status_label:
+            return f"{status_label} \u2014 {name}"
         kind = (ch.get("kind") or "download").lower()
         if kind == "metadata":
             # Keep "Metadata" as the leading word so `colorizeTaskName`

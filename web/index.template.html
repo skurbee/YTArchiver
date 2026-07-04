@@ -48,7 +48,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>YT Archiver</title>
+  <title>YTArchiver</title>
   <link rel="stylesheet" href="styles.css?v=2" />
   <link rel="stylesheet" href="styles-settings.css?v=2" />
   <link rel="stylesheet" href="styles-download-controls.css?v=1" />
@@ -64,19 +64,19 @@
 
   <!-- Header strip -->
   <div class="header-strip">
-    <span class="header-title">YT ARCHIVER</span>
+    <span class="header-title">YTArchiver</span>
     <span class="header-version" id="header-version">loading&hellip;</span>
+    <button class="header-help" id="btn-shortcuts-help" type="button"
+            title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
   </div>
 
-  <!-- Tab row. Recent was previously a top-level tab (hangover from an
-       earlier draft) but users wanted it moved under Browse alongside
-       Channels / Search / Graph / Bookmarks so all "library navigation"
-       lives in one place. See the `panel-browse` sidebar below for the
-       new location. -->
+  <!-- Tab row. Download / Subs / Browse are the work tabs on the left.
+       Health and Settings are grouped on the right as app/admin tabs. -->
   <div class="tab-row">
     <div class="tab active" data-tab="download">Download</div>
     <div class="tab" data-tab="subs">Subs</div>
     <div class="tab browse-tab" data-tab="browse">Browse</div>
+    <div class="tab health-tab" data-tab="health">Health</div>
     <div class="tab settings-tab" data-tab="settings">Settings</div>
   </div>
 
@@ -90,7 +90,32 @@
 
   <!-- @include partials/tab-settings.html -->
 
+  <!-- @include partials/tab-health.html -->
+
   <!-- @include partials/tab-browse.html -->
+
+  <!-- Global status bar — always-visible one-line summary of what the app
+       is doing (sync / processing / indexing) so "what's happening?" has a
+       single answer instead of being scattered across the log, the italic
+       indicator line, two popover buttons, and the tray. Sync/Processing
+       segments open their queue popovers; Log jumps to the full log. -->
+  <div class="global-status-bar" id="global-status-bar">
+    <button type="button" class="gsb-seg" id="gsb-sync" title="Sync queue — click for details">
+      <span class="gsb-dot gsb-dot-sync"></span><span class="gsb-text" id="gsb-sync-text">Sync idle</span>
+    </button>
+    <span class="gsb-sep"></span>
+    <button type="button" class="gsb-seg" id="gsb-gpu" title="Processing queue — click for details">
+      <span class="gsb-dot gsb-dot-gpu"></span><span class="gsb-text" id="gsb-gpu-text">Processing idle</span>
+    </button>
+    <span class="gsb-seg gsb-index" id="gsb-index" hidden></span>
+    <div class="gsb-spacer"></div>
+    <button type="button" class="gsb-seg gsb-errors" id="gsb-errors" hidden
+            title="Errors this session — click to view the log">
+      <span id="gsb-errors-count">0</span> errors
+    </button>
+    <button type="button" class="gsb-seg gsb-log-btn" id="gsb-log-btn"
+            title="Open the full activity log">Log</button>
+  </div>
 
   <!-- @include partials/popovers.html -->
 
@@ -166,6 +191,8 @@
   <script src="queuePending.js?v=1"></script>
   <script src="refreshSizes.js?v=1"></script>
   <script src="smallInits.js?v=1"></script>
+  <script src="statusBar.js?v=1"></script>
+  <script src="commandPalette.js?v=1"></script>
   <script src="app.js?v=79"></script>
 </body>
 </html>

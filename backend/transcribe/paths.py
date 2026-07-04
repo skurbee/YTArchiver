@@ -18,6 +18,7 @@ Public API (also re-exported by `backend.transcribe`):
 from __future__ import annotations
 
 import os
+import re
 
 from ..log import get_logger
 from ..utils import (
@@ -29,6 +30,33 @@ from ..utils import (
 from ..utils import hide_file_win as _hide_file_win  # noqa: F401
 
 _log = get_logger(__name__)
+
+
+def _per_video_transcript_stem(video_path: str) -> str:
+    stem = os.path.splitext(os.path.basename(video_path))[0]
+    return re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", stem) or stem
+
+
+def _hide_per_video_transcript_txt_if_needed(video_path: str,
+                                             txt_path: str) -> None:
+    """Hide loose/manual per-video Transcript.txt sidecars.
+
+    Channel aggregate transcripts are intentionally visible, but manual single
+    videos write `<video stem> Transcript.txt` next to the media file. Those
+    should behave like metadata/jsonl sidecars in Explorer.
+    """
+    try:
+        video_dir = os.path.normcase(os.path.normpath(
+            os.path.dirname(video_path)))
+        txt_dir = os.path.normcase(os.path.normpath(os.path.dirname(txt_path)))
+        if video_dir != txt_dir:
+            return
+        expected = f"{_per_video_transcript_stem(video_path)} Transcript.txt"
+        if os.path.normcase(os.path.basename(txt_path)) != os.path.normcase(expected):
+            return
+        _hide_file_win(txt_path)
+    except Exception as e:
+        _log.debug("manual transcript txt hide failed: %s", e)
 
 
 def _get_transcript_filename(ch_name: str, folder_path: str,

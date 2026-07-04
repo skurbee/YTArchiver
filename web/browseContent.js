@@ -311,6 +311,39 @@
     }).catch(() => {});
   };
 
+  // ── Channel action header (Batch 8) ────────────────────────────────
+  // The channel currently shown in #view-videos, remembered so the header
+  // buttons (Sync now / Settings / Open folder) know which channel to act on.
+  let _cphChannel = null;
+  function _updateChannelHeader(channel) {
+    _cphChannel = channel || null;
+    const header = document.getElementById("channel-page-header");
+    const info = document.getElementById("cph-info");
+    if (!header) return;
+    if (!channel) { header.hidden = true; return; }
+    const name = channel.folder || channel.name || "";
+    const parts = [];
+    const vids = channel.n_vids || channel.video_count;
+    if (vids) parts.push(`${Number(vids).toLocaleString()} videos`);
+    if (channel.size) parts.push(String(channel.size));
+    // Live sync state for this channel.
+    let state = "";
+    try { state = window._queueHasSyncForChannel?.(name) || ""; } catch (e) { /* ignore */ }
+    let badge = "";
+    if (state === "running") badge = '<span class="cph-badge cph-badge-run">Syncing now</span>';
+    else if (state === "queued") badge = '<span class="cph-badge">Queued to sync</span>';
+    if (info) {
+      const esc = window._escapeHtml || ((s) => String(s ?? ""));
+      info.innerHTML =
+        parts.map((p) => `<span>${esc(p)}</span>`).join('<span class="cph-dot">·</span>')
+        + badge;
+    }
+    // Disable Sync-now while this channel is already running/queued.
+    const syncBtn = document.getElementById("cph-sync-now");
+    if (syncBtn) syncBtn.disabled = !!state;
+    header.hidden = false;
+  }
+
   async function loadVideosFor(channel) {
     const name = channel.folder || channel.name || "";
     const sort = document.getElementById("browse-sort")?.value || "newest";
@@ -340,6 +373,10 @@
     }
     const titleEl = document.getElementById("browse-main-title");
     if (titleEl) titleEl.textContent = name;
+
+    // Populate + show the channel action header (Batch 8 — channel page can
+    // now sync / configure / open-folder, not just watch).
+    _updateChannelHeader(channel);
 
     // Track the in-flight channel name so if another channel is clicked
     // before this one's fetch returns, we discard the stale result.
@@ -655,6 +692,82 @@
     // The browseSearch handler is the authoritative one because it
     // also short-circuits the e.repeat autorepeat stream (audit:
     // browseContent.js:472).
+
+    // ── Channel action header buttons (Batch 8) ──────────────────────
+    // Reuse the exact backend paths the Subs context menu uses, so a
+    // channel can be synced / configured / opened straight from its
+    // Browse page instead of only from the Subs tab.
+    document.getElementById("cph-sync-now")?.addEventListener("click", async () => {
+      const ch = _cphChannel;
+      const name = ch && (ch.folder || ch.name || "");
+      if (!name || !nativeBridgeUp()) return;
+      try {
+        const r = await bridgeCall("sync_one_channel", { name });
+        if (r?.ok && r?.queued) {
+          window._showToast?.(`Added "${r.name || name}" to sync queue.`, "ok");
+        } else if (r?.error) {
+          window._showToast?.(r.error, "error");
+        }
+      } catch (e) {
+        window._showToast?.("Sync failed: " + e, "error");
+      }
+      _updateChannelHeader(ch);
+    });
+    document.getElementById("cph-settings")?.addEventListener("click", () => {
+      const ch = _cphChannel;
+      const name = ch && (ch.folder || ch.name || "");
+      if (!name) return;
+      // The edit panel lives in the Subs tab. Switch there FIRST — otherwise
+      // _editChannelFromContext opens the panel on a hidden tab and it looks
+      // like nothing happened.
+      document.querySelector('.tab[data-tab="subs"]')?.click();
+      setTimeout(() => window._editChannelFromContext?.(name), 60);
+    });
+    document.getElementById("cph-folder")?.addEventListener("click", () => {
+      const ch = _cphChannel;
+      const name = ch && (ch.folder || ch.name || "");
+      if (name && nativeBridgeUp()) bridgeCall("chan_open_folder", name);
+    });
+    // ⋮ More — reuse the FULL channel-card context menu (reorg, redownload,
+    // re-transcribe, remove, open-on-YouTube, …) by dispatching a
+    // contextmenu on this channel's grid card, anchored at the button. No
+    // menu duplication; the card menu stays the single source of truth.
+    document.getElementById("cph-more")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const ch = _cphChannel;
+      if (!ch) return;
+      let card = null;
+      const idx = Array.isArray(_browseState.channels)
+        ? _browseState.channels.indexOf(ch) : -1;
+      if (idx >= 0) {
+        card = document.querySelector(
+          `#channel-grid .channel-card[data-channel-index="${idx}"]`);
+      }
+      if (!card) {
+        const name = (ch.folder || ch.name || "").trim();
+        card = [...document.querySelectorAll("#channel-grid .channel-card")].find(
+          (c) => (c.querySelector(".channel-card-name")?.textContent || "").trim() === name);
+      }
+      if (!card) return;
+      const r = e.currentTarget.getBoundingClientRect();
+      const menuWidth = 180; // .ctx-menu min-width; keeps dropdown right-aligned to ⋮.
+      card.dispatchEvent(new MouseEvent("contextmenu", {
+        bubbles: true, cancelable: true,
+        clientX: Math.min(window.innerWidth - 8, Math.max(8, r.right - menuWidth)),
+        clientY: Math.min(window.innerHeight - 8, r.bottom),
+      }));
+      // Drop the redundant "Sync now" item — the header already has a
+      // dedicated Sync now button (reuse the card menu, minus that one row).
+      const menu = document.querySelector("#ctx-menu-root .ctx-menu");
+      if (menu) {
+        menu.querySelectorAll(":scope > .ctx-menu-item").forEach((item) => {
+          if (!item.classList.contains("ctx-submenu-wrap")
+              && (item.textContent || "").trim().toLowerCase() === "sync now") {
+            item.remove();
+          }
+        });
+      }
+    });
   }
 
   function renderSearchResults(container, hits, q) {

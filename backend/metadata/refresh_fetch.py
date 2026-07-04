@@ -149,7 +149,20 @@ def fetch_channel_metadata(channel: dict[str, Any],
     _scope_year: int | None = None
     if scope and isinstance(scope.get("year"), int):
         _scope_year = int(scope["year"])
-    _scope_banner = f" ({_scope_year} only)" if _scope_year is not None else ""
+    _scope_days: int | None = None
+    if scope and scope.get("days") is not None:
+        try:
+            _d = int(scope.get("days"))
+            if _d > 0:
+                _scope_days = _d
+        except (TypeError, ValueError):
+            _scope_days = None
+    _scope_bits: list[str] = []
+    if _scope_year is not None:
+        _scope_bits.append(f"{_scope_year} only")
+    if _scope_days is not None:
+        _scope_bits.append(f"last {_scope_days}d")
+    _scope_banner = f" ({', '.join(_scope_bits)})" if _scope_bits else ""
     stream.emit([["  \u2014 ", "meta_bracket"],
                  [f"Rechecking {name}{_scope_banner}...\n", "simpleline"]])
 
@@ -163,6 +176,16 @@ def fetch_channel_metadata(channel: dict[str, Any],
     # if we can't place them in a year, we can't honor the year scope.
     if _scope_year is not None:
         on_disk = [v for v in on_disk if v[2] == _scope_year]
+    if _scope_days is not None:
+        _cutoff_ts = time.time() - (_scope_days * 86400)
+
+        def _mtime_in_scope(item: tuple) -> bool:
+            try:
+                return os.path.getmtime(item[4]) >= _cutoff_ts
+            except Exception:
+                return False
+
+        on_disk = [v for v in on_disk if _mtime_in_scope(v)]
     on_disk_ids = [v[0] for v in on_disk if v[0]]
     # Previously-failed fetches + previously-failed id-resolves —
     # OLD-YTArchiver compatible skip logic. Videos marked in the DB

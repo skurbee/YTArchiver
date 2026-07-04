@@ -13,7 +13,7 @@ import os
 import random
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ..log import get_logger
@@ -185,7 +185,8 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     the view count, don't waste any more yt-dlp calls" flows.
 
     `scope={"year": N}` honors the year-scoped refresh introduced for
-    the Browse grid year-head right-click.
+    the Browse grid year-head right-click. `scope={"days": N}` limits
+    the actual refresh work to videos uploaded in the last N days.
 
     Returns the same shape as fetch_channel_metadata so the sync
     worker's summary-parser keeps working: `{ok, fetched, refreshed,
@@ -214,7 +215,20 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     _scope_year: int | None = None
     if scope and isinstance(scope.get("year"), int):
         _scope_year = int(scope["year"])
-    _banner = f" ({_scope_year} only)" if _scope_year is not None else ""
+    _scope_days: int | None = None
+    if scope and scope.get("days") is not None:
+        try:
+            _d = int(scope.get("days"))
+            if _d > 0:
+                _scope_days = _d
+        except (TypeError, ValueError):
+            _scope_days = None
+    _scope_bits: list[str] = []
+    if _scope_year is not None:
+        _scope_bits.append(f"{_scope_year} only")
+    if _scope_days is not None:
+        _scope_bits.append(f"last {_scope_days}d")
+    _banner = f" ({', '.join(_scope_bits)})" if _scope_bits else ""
     # Log kept user-friendly â€” previously said "(flat-playlist)" which
     # is an implementation detail (yt-dlp mode) the user doesn't need
     # to see in Simple mode.
@@ -295,6 +309,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                                      cancel_event, pause_event,
                                      queues=queues,
                                      progress_cb=_catalog_progress)
+    bulk_all = bulk
     # Lock in the final catalog count once the walk completes.
     _hb_catalog_count[0] = max(_hb_catalog_count[0], len(bulk))
     _hb_phase[0] = "matching local files"
@@ -324,6 +339,29 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         return {"ok": False, "error": "bulk_empty",
                 "fetched": 0, "refreshed": 0, "errors": 0, "skipped": 0,
                 "bulk_fetched": 0}
+    if _scope_days is not None:
+        cutoff = datetime.now(UTC) - timedelta(days=_scope_days)
+
+        def _is_recent_upload(stats: dict[str, Any]) -> bool:
+            raw = str((stats or {}).get("upload_date") or "").strip()
+            if len(raw) != 8 or not raw.isdigit():
+                return False
+            try:
+                return datetime.strptime(raw, "%Y%m%d").replace(tzinfo=UTC) >= cutoff
+            except ValueError:
+                return False
+
+        bulk = {vid: stats for vid, stats in bulk.items()
+                if _is_recent_upload(stats)}
+        if not bulk:
+            _hb_guard.stop()
+            stream.emit([
+                [" \u2014 ", ["meta_bracket", "views_refresh_progress"]],
+                [f"{name}: no videos in last {_scope_days}d.\n",
+                 ["simpleline", "views_refresh_progress"]],
+            ])
+            return {"ok": True, "fetched": 0, "refreshed": 0,
+                    "errors": 0, "skipped": 0, "bulk_fetched": 0}
 
     # Verbose-only: announce the bulk-stats walk landed and how many
     # videos it found. Helps the user follow the multi-phase flow.
@@ -450,7 +488,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     # mid-walk, 60s stall, yt-dlp dying after streaming some rows)
     # would make "not in bulk" flag thousands of perfectly-live videos
     # as removed from YouTube.
-    _catalog_complete = bool(getattr(bulk, "complete", False))
+    _catalog_complete = bool(getattr(bulk_all, "complete", False))
     if not _catalog_complete:
         try:
             stream.emit_dim(
@@ -488,7 +526,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                     continue
                 _key = os.path.normpath(_fp)
                 _db_vid, _db_removed_ts = _db_state.get(_key, (None, None))
-                _is_in_catalog = (_v in bulk)
+                _is_in_catalog = (_v in bulk_all)
                 if not _is_in_catalog and _db_removed_ts is None:
                     _newly_removed.append(_fp)
                 elif _is_in_catalog and _db_removed_ts is not None:

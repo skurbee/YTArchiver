@@ -15,6 +15,7 @@ import sys
 import threading
 
 from ._shared import _api_err, _log
+from backend.archive_capacity import normalize_archive_capacity_warning
 from backend.ytarchiver_config import config_is_writable, load_config, save_config
 from backend import sync as sync_backend
 from backend.log_stream import LogStreamer
@@ -181,20 +182,25 @@ class SettingsMixin:
 
     def settings_load(self):
         cfg = self._settings_config()
+        cap = normalize_archive_capacity_warning(cfg)
         return {
             "output_dir": cfg.get("output_dir", ""),
             "video_out_dir": cfg.get("video_out_dir", ""),
             "whisper_model": cfg.get("whisper_model", "small"),
             "default_resolution": cfg.get("default_resolution", "720"),
             "log_mode": cfg.get("log_mode", "Simple"),
+            # yt-dlp release channel the updater targets: "stable" or
+            # "nightly" (beta). Surfaced by the Health > Tools yt-dlp row.
+            "ytdlp_channel": (cfg.get("ytdlp_channel") or "stable"),
             # Index tab surfaces these directly — must round-trip.
             "tp_archive_roots": list(cfg.get("tp_archive_roots") or []),
             "auto_index_enabled": bool(cfg.get("auto_index_enabled", False)),
             "auto_index_threshold": int(cfg.get("auto_index_threshold", 10) or 10),
             # Startup knobs (Settings > General surfaces these too).
             "disk_scan_staleness_hours": int(cfg.get("disk_scan_staleness_hours", 24) or 0),
-            "browse_preload_limit": int(cfg.get("browse_preload_limit", 150) or 150),
-            "browse_preload_all": bool(cfg.get("browse_preload_all", False)),
+            "archive_capacity_warning_mode": cap["mode"],
+            "archive_capacity_warning_percent": cap["percent"],
+            "archive_capacity_warning_free_gb": cap["free_gb"],
             "last_disk_scan_ts": float(cfg.get("last_disk_scan_ts", 0) or 0),
             "last_backup_ts": float(cfg.get("last_backup_ts", 0) or 0),
             # Subs table column visibility toggles. Default False for
@@ -248,6 +254,9 @@ class SettingsMixin:
         if data.get("default_resolution"): cfg["default_resolution"] = data["default_resolution"]
         if data.get("log_mode") in ("Simple", "Verbose"):
             cfg["log_mode"] = data["log_mode"]
+        # yt-dlp release channel — only accept the two known values.
+        if data.get("ytdlp_channel") in ("stable", "nightly"):
+            cfg["ytdlp_channel"] = data["ytdlp_channel"]
         # Index-tab persistence: archive roots + auto-index toggle + threshold.
         if isinstance(data.get("tp_archive_roots"), list):
             cfg["tp_archive_roots"] = [str(r) for r in data["tp_archive_roots"] if r]
@@ -263,13 +272,18 @@ class SettingsMixin:
                 cfg["disk_scan_staleness_hours"] = max(0, min(10_000,
                     int(data["disk_scan_staleness_hours"])))
             except Exception as e: _log.debug("swallowed: %s", e)
-        if "browse_preload_limit" in data:
+        if data.get("archive_capacity_warning_mode") in ("percent", "free_gb"):
+            cfg["archive_capacity_warning_mode"] = data["archive_capacity_warning_mode"]
+        if "archive_capacity_warning_percent" in data:
             try:
-                cfg["browse_preload_limit"] = max(1, min(100_000,
-                    int(data["browse_preload_limit"])))
+                cfg["archive_capacity_warning_percent"] = max(1, min(100,
+                    int(data["archive_capacity_warning_percent"])))
             except Exception as e: _log.debug("swallowed: %s", e)
-        if "browse_preload_all" in data:
-            cfg["browse_preload_all"] = bool(data["browse_preload_all"])
+        if "archive_capacity_warning_free_gb" in data:
+            try:
+                cfg["archive_capacity_warning_free_gb"] = max(1, min(1_000_000,
+                    int(data["archive_capacity_warning_free_gb"])))
+            except Exception as e: _log.debug("swallowed: %s", e)
         # Subs table column visibility
         if "show_avg_size" in data:
             cfg["show_avg_size"] = bool(data["show_avg_size"])
@@ -396,19 +410,30 @@ class SettingsMixin:
             return {"ok": False}
 
     def ytdlp_update(self):
-        """Run yt-dlp -U in a background thread; stream output to the log."""
+        """Update yt-dlp in a background thread; stream output to the log.
+
+        Targets the configured release channel via `--update-to <channel>`
+        (stable or nightly). Using `--update-to` rather than the older `-U`
+        lets the Beta toggle both switch channels AND update in one step —
+        e.g. picking Beta runs `--update-to nightly`, and switching back
+        runs `--update-to stable` (which downgrades to latest stable)."""
         yt = sync_backend.find_yt_dlp()
         if not yt:
             return {"ok": False, "error": "yt-dlp not found"}
+        cfg = self._settings_config()
+        channel = (cfg.get("ytdlp_channel") or "stable").strip().lower()
+        if channel not in ("stable", "nightly"):
+            channel = "stable"
+        _label = "beta (nightly)" if channel == "nightly" else "stable"
         def _run():
             import subprocess as _sp
             log_stream = self._settings_log_stream()
             log_stream.emit([
                 ["[Update] ", "update_head"],
-                ["Updating yt-dlp...\n", "update_sep"],
+                [f"Updating yt-dlp to {_label}...\n", "update_sep"],
             ])
             try:
-                proc = _sp.Popen([yt, "-U"],
+                proc = _sp.Popen([yt, "--update-to", channel],
                                   stdout=_sp.PIPE, stderr=_sp.STDOUT,
                                   encoding="utf-8", errors="replace", bufsize=1,
                                   startupinfo=sync_backend._startupinfo)

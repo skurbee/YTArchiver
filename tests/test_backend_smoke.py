@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from backend import (
+    archive_capacity,
     archive_scan,
     autorun as autorun_backend,
     channel_art,
@@ -21,6 +22,7 @@ from backend import (
     deps_installer,
     disk_watch,
     drift_scan,
+    fs_attrs,
     fs_safety,
     index,
     index_bookmarks,
@@ -424,6 +426,41 @@ class ArchiveMixinTests(unittest.TestCase):
 
 
 class UtilsTests(unittest.TestCase):
+    def test_archive_capacity_percent_threshold_warns(self) -> None:
+        with mock.patch.object(archive_capacity.os.path, "isdir",
+                               return_value=True), \
+                mock.patch.object(archive_capacity.shutil, "disk_usage",
+                                  return_value=(1000, 910, 90)):
+            status = archive_capacity.archive_capacity_status(
+                "Z:/Archive",
+                {
+                    "archive_capacity_warning_mode": "percent",
+                    "archive_capacity_warning_percent": 90,
+                },
+            )
+
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["status"], "warning")
+        self.assertIn("91% full", status["detail"])
+
+    def test_archive_capacity_free_gb_threshold_warns(self) -> None:
+        gib = 1024 ** 3
+        with mock.patch.object(archive_capacity.os.path, "isdir",
+                               return_value=True), \
+                mock.patch.object(archive_capacity.shutil, "disk_usage",
+                                  return_value=(1000 * gib, 940 * gib, 60 * gib)):
+            status = archive_capacity.archive_capacity_status(
+                "Z:/Archive",
+                {
+                    "archive_capacity_warning_mode": "free_gb",
+                    "archive_capacity_warning_free_gb": 100,
+                },
+            )
+
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["status"], "warning")
+        self.assertIn("60 GB free", status["detail"])
+
     def test_check_disk_space_fails_closed_on_probe_error(self) -> None:
         # check_disk_space lives in fs_safety after the utils split; patch
         # the shutil + logger in THAT module, not the re-export shim.
@@ -1593,9 +1630,37 @@ class TextUtilsTests(unittest.TestCase):
         self.assertTrue(utils._archive_file_should_be_visible("Video.mp4"))
         self.assertTrue(utils._archive_file_should_be_visible(
             "Channel Transcript.txt"))
+        self.assertFalse(utils._archive_file_should_be_visible(
+            "Video Transcript.txt",
+            hide_per_video_transcripts=True,
+            media_stems={"video"}))
         self.assertFalse(utils._archive_file_should_be_visible("audio.m4a"))
         self.assertFalse(utils._archive_file_should_be_visible(
             "rawtranscript.txt"))
+
+    def test_hide_stray_sidecars_can_hide_manual_transcript_txt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "Loose Video [abc123_def4].mp4").write_bytes(b"video")
+            loose_txt = root / "Loose Video Transcript.txt"
+            loose_txt.write_text("transcript", encoding="utf-8")
+            (root / "Channel Transcript.txt").write_text(
+                "aggregate", encoding="utf-8")
+            hidden = []
+
+            def fake_hide(path, entry=None):
+                hidden.append(Path(path).name)
+                return True
+
+            with mock.patch.object(fs_attrs.os, "name", "nt"), \
+                    mock.patch.object(fs_attrs, "_set_hidden_if_needed",
+                                      side_effect=fake_hide):
+                count = utils.hide_stray_sidecars(
+                    str(root), recursive=False,
+                    hide_per_video_transcripts=True)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(hidden, [loose_txt.name])
 
     def test_extract_video_id_accepts_all_alpha_db_fallback(self) -> None:
         conn = sqlite3.connect(":memory:")
@@ -2479,7 +2544,40 @@ class BrowseMixinTests(unittest.TestCase):
         self.assertEqual(row["tx_status"], "transcribed")
         self.assertIn("No ID", labels)
         self.assertIn("Local thumb", labels)
-        self.assertIn("Transcript", labels)
+        self.assertNotIn("Transcript", labels)
+
+    def test_manual_videos_badges_missing_transcript_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "Pending.mp4"
+            video.write_bytes(b"video")
+
+            class Api(BrowseMixin):
+                def __init__(self):
+                    self._config = {
+                        "video_out_dir": str(root),
+                        "output_dir": str(root / "Whole Channels"),
+                    }
+                    self._log_stream = mock.Mock()
+
+            with mock.patch("backend.index.list_manual_videos",
+                            return_value=[{
+                                "filepath": str(video),
+                                "title": "Pending",
+                                "video_id": "abc123def45",
+                                "tx_status": "pending",
+                                "duration": "1:00",
+                                "thumbnail_url": "file:///thumb.jpg",
+                                "views": 1,
+                            }]), \
+                    mock.patch("backend.index.list_manual_duplicate_filepaths",
+                               return_value=[]):
+                result = Api().list_manual_videos(sort="title")
+
+        row = result["rows"][0]
+        labels = {b["label"] for b in row["manual_badges"]}
+        self.assertIn("No transcript", labels)
+        self.assertNotIn("Transcript", labels)
 
     def test_manual_videos_skip_indexed_duplicate_disk_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4011,6 +4109,9 @@ class TranscribeVttTests(unittest.TestCase):
                                       "_write_transcript_entry"), \
                     mock.patch.object(transcribe_vtt,
                                       "_write_jsonl_entry"), \
+                    mock.patch.object(
+                        transcribe_vtt,
+                        "_hide_per_video_transcript_txt_if_needed") as hide, \
                     mock.patch.object(transcribe_vtt,
                                       "_bump_transcription_pending"), \
                     mock.patch("backend.index.ingest_jsonl"), \
@@ -4022,6 +4123,7 @@ class TranscribeVttTests(unittest.TestCase):
 
             self.assertTrue(ok)
             self.assertTrue(user_vtt.exists())
+            hide.assert_called_once_with(str(video), str(txt))
 
     def test_auto_caption_jsonl_failure_does_not_mark_transcribed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -5089,6 +5191,50 @@ class ConfigTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
 
+    def test_archive_capacity_warning_settings_round_trip(self) -> None:
+        saved = []
+
+        class Api(settings_mixin.SettingsMixin):
+            def __init__(self):
+                self._config = {
+                    "log_mode": "Simple",
+                    "archive_capacity_warning_mode": "percent",
+                    "archive_capacity_warning_percent": 90,
+                    "archive_capacity_warning_free_gb": 100,
+                }
+                self._log_stream = mock.Mock()
+                self._transcribe = mock.Mock()
+                self._reload_config = mock.Mock()
+
+        def fake_save(cfg):
+            saved.append(dict(cfg))
+            return True
+
+        with mock.patch.object(settings_mixin, "config_is_writable",
+                               return_value=True), \
+                mock.patch.object(settings_mixin, "load_config",
+                                  return_value={
+                                      "log_mode": "Simple",
+                                      "archive_capacity_warning_mode": "percent",
+                                      "archive_capacity_warning_percent": 90,
+                                      "archive_capacity_warning_free_gb": 100,
+                                  }), \
+                mock.patch.object(ytarchiver_config, "save_config",
+                                  side_effect=fake_save):
+            api = Api()
+            loaded = api.settings_load()
+            result = api.settings_save({
+                "archive_capacity_warning_mode": "free_gb",
+                "archive_capacity_warning_percent": 150,
+                "archive_capacity_warning_free_gb": 75,
+            })
+
+        self.assertEqual(loaded["archive_capacity_warning_mode"], "percent")
+        self.assertTrue(result["ok"])
+        self.assertEqual(saved[-1]["archive_capacity_warning_mode"], "free_gb")
+        self.assertEqual(saved[-1]["archive_capacity_warning_percent"], 100)
+        self.assertEqual(saved[-1]["archive_capacity_warning_free_gb"], 75)
+
     def test_ytdlp_update_clears_cached_version_on_success(self) -> None:
         class Api(settings_mixin.SettingsMixin):
             def __init__(self):
@@ -5670,6 +5816,22 @@ class QueueStateTests(unittest.TestCase):
         finally:
             q.mark_orphan()
 
+    def test_sync_payload_uses_running_status_label(self) -> None:
+        q = queues.QueueState()
+        try:
+            q.current_sync = {
+                "name": "The Rest Is Science",
+                "_status_label": "Metadata finalizing",
+            }
+
+            row = q.to_ui_payload()["sync"][0]
+
+            self.assertEqual(
+                row["name"], "Metadata finalizing \u2014 The Rest Is Science")
+            self.assertEqual(row["status"], "running")
+        finally:
+            q.mark_orphan()
+
     def test_corrupt_queue_file_is_sidelined(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             queue_file = Path(td) / "queue.json"
@@ -6132,6 +6294,65 @@ class IndexIngestTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM segments_fts "
                     "WHERE segments_fts MATCH 'fresh'").fetchone()[0], 0)
                 self._reset_index_module()
+
+    def test_register_video_recovers_after_busy_retry_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "transcription_index.db"
+            video_dir = Path(td) / "Channel"
+            video_dir.mkdir()
+            video_path = video_dir / "Locked Retry [abc123_def4].mp4"
+            video_path.write_bytes(b"video")
+
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                self._reset_index_module()
+                conn = index._open()
+                self.assertIsNotNone(conn)
+                assert conn is not None
+
+                locker = sqlite3.connect(
+                    str(db_path), timeout=0.1, check_same_thread=False)
+                writer = sqlite3.connect(
+                    str(db_path), timeout=0.01, check_same_thread=False)
+                releaser_done = threading.Event()
+
+                def release_lock() -> None:
+                    try:
+                        releaser_done.wait(0.15)
+                        locker.rollback()
+                    finally:
+                        releaser_done.set()
+
+                try:
+                    locker.execute("PRAGMA journal_mode=WAL")
+                    writer.execute("PRAGMA journal_mode=WAL")
+                    writer.execute("PRAGMA busy_timeout=10")
+                    locker.execute("BEGIN IMMEDIATE")
+                    t = threading.Thread(target=release_lock)
+                    t.start()
+
+                    self.assertTrue(index.register_video(
+                        str(video_path), "Channel", "Locked Retry",
+                        video_id="abc123_def4",
+                        _conn_override=writer,
+                        _busy_retry_deadline_sec=2.0,
+                        _busy_retry_sleep_base=0.01))
+                    t.join(timeout=1.0)
+
+                    row = conn.execute(
+                        "SELECT title, video_id FROM videos "
+                        "WHERE filepath=? COLLATE NOCASE",
+                        (os.path.normpath(str(video_path)),),
+                    ).fetchone()
+                    self.assertEqual(row, ("Locked Retry", "abc123_def4"))
+                finally:
+                    releaser_done.set()
+                    try:
+                        locker.rollback()
+                    except sqlite3.Error:
+                        pass
+                    locker.close()
+                    writer.close()
+                    self._reset_index_module()
 
     def test_manual_id_failure_excludes_after_three_and_resets_on_success(self) -> None:
         with tempfile.TemporaryDirectory() as td:

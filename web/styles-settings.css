@@ -76,7 +76,7 @@
    so the content sits inside the card's interior margins. */
 .settings-view .edit-grid > .edit-gl {
   padding: 16px 0 16px 22px;
-  font-size: 14px;
+  font-size: var(--fs-lg);
   font-weight: 500;
   color: var(--c-text);
   text-align: left;
@@ -97,27 +97,13 @@
    root only affecting NEW downloads). Audit U-14. */
 .settings-view .edit-grid > .edit-gh {
   grid-column: 1 / -1;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--c-dim);
   line-height: 1.4;
   padding: 0 22px 14px 0;
   margin-top: -8px;
   border-top: none;  /* override the row-divider rule above */
 }
-.settings-view .edit-grid > .settings-tool-group {
-  color: var(--c-accent);
-  font-weight: 700;
-  letter-spacing: 0.3px;
-  text-transform: uppercase;
-  padding: 14px 22px 8px 0;
-  margin-top: 0;
-  border-top: 1px solid var(--c-border);
-}
-.settings-view .edit-grid > .settings-tool-group:first-child {
-  border-top: none;
-  padding-top: 4px;
-}
-
 /* Thin horizontal dividers between rows. The label and value cells
    sit in the same row, so applying border-top to ALL cells except
    the first row gives a continuous line across both columns. */
@@ -183,7 +169,7 @@
 /* Inputs — modern sizing with full content space (no vertical padding
    clipping). */
 .settings-view .ctl-input {
-  font-size: 13.5px;
+  font-size: var(--fs-lg);
   padding: 8px 12px;
   height: 36px;
   background: var(--c-bg);
@@ -215,7 +201,7 @@
   color: var(--c-text);
   border: 1px solid var(--c-border);
   border-radius: 6px;
-  font-size: 13.5px;
+  font-size: var(--fs-lg);
   cursor: pointer;
   user-select: none;
   box-sizing: border-box;
@@ -243,7 +229,7 @@
   flex: 0 0 auto;
   margin-left: 10px;
   color: var(--c-accent);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   line-height: 1;
   transition: transform 0.15s;
 }
@@ -278,7 +264,7 @@
 .yt-dd-menu[hidden] { display: none; }
 .yt-dd-option {
   padding: 7px 12px;
-  font-size: 13.5px;
+  font-size: var(--fs-lg);
   color: var(--c-text);
   cursor: pointer;
   white-space: nowrap;
@@ -312,17 +298,23 @@
 .settings-view .settings-disk-staleness-input {
   width: 56px;
 }
+.settings-view .settings-archive-capacity-input {
+  width: 72px;
+}
+.settings-view .settings-archive-capacity-row .yt-dd {
+  min-width: 130px;
+}
 
 /* Browse / secondary buttons inside rows */
 .settings-view .btn.btn-ghost.btn-thin {
   padding: 6px 14px;
   min-height: 34px;
-  font-size: 12.5px;
+  font-size: var(--fs-md);
   flex: 0 0 auto;
   border-radius: 5px;
 }
 .settings-view .edit-dim {
-  font-size: 12.5px;
+  font-size: var(--fs-md);
   color: var(--c-dim);
   /* Allow shrinking + wrapping so long hint lines don't overflow out
      of their row box into the row above/below. */
@@ -352,7 +344,7 @@
 }
 .settings-actions .btn {
   padding: 9px 22px;
-  font-size: 13px;
+  font-size: var(--fs-md);
   min-height: 36px;
 }
 
@@ -360,18 +352,18 @@
    flashes green "Saved ✓" on each persist, red on failure. */
 .settings-autosave-note {
   display: inline-block;
-  font-size: 12.5px;
+  font-size: var(--fs-md);
   color: var(--c-dim);
   font-style: italic;
   transition: color 0.15s ease;
 }
 .settings-autosave-note.is-saved {
-  color: var(--c-ok-fg, #a3c99a);
+  color: var(--c-ok-fg, var(--c-ok-fg));
   font-style: normal;
   font-weight: 500;
 }
 .settings-autosave-note.is-error {
-  color: var(--c-bad-fg, #d87a7a);
+  color: var(--c-bad-fg, var(--c-bad-fg));
   font-style: normal;
   font-weight: 500;
 }
@@ -383,7 +375,7 @@
 }
 .settings-subnav-label {
   padding: 0 22px 10px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   letter-spacing: 1.2px;
 }
 /* (Second .settings-subnav-btn block + !important overrides were
@@ -409,7 +401,7 @@
 .metadata-hint {
   color: var(--c-text);
   opacity: 0.82;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
   background: var(--c-surface);
   border: 1px solid var(--c-border);
@@ -442,7 +434,7 @@
   min-width: 0;
 }
 .metadata-totals .md-total-label {
-  font-size: 10.5px;
+  font-size: var(--fs-xs);
   color: var(--c-dim);
   text-transform: uppercase;
   letter-spacing: 0.4px;
@@ -452,7 +444,7 @@
   text-overflow: ellipsis;
 }
 .metadata-totals .md-total-value {
-  font-size: 14px;
+  font-size: var(--fs-lg);
   color: var(--c-text);
   font-variant-numeric: tabular-nums;
   font-weight: 500;
@@ -467,7 +459,7 @@
    (96…" truncation at the typical Settings panel width). */
 .metadata-totals .md-total-value .md-total-primary {
   display: block;
-  font-size: 16px;
+  font-size: var(--fs-xl);
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
@@ -475,7 +467,7 @@
 }
 .metadata-totals .md-total-value .md-total-sub {
   display: block;
-  font-size: 10.5px;
+  font-size: var(--fs-xs);
   font-weight: 400;
   color: var(--c-dim);
   margin-top: 1px;
@@ -515,7 +507,7 @@
   table-layout: fixed;
   border-collapse: collapse;
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--c-text);
 }
 .metadata-table thead th {
@@ -525,7 +517,7 @@
   border-bottom: 1px solid var(--c-border);
   color: var(--c-accent);
   font-weight: 700;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   letter-spacing: 0.3px;
   cursor: pointer;
   user-select: none;
@@ -536,7 +528,7 @@
 .metadata-table thead th[data-sort-active]::after {
   content: " \25BE"; /* ▾ */
   opacity: 0.6;
-  font-size: 10px;
+  font-size: var(--fs-2xs);
 }
 .metadata-table thead th[data-sort-active][data-sort-dir="asc"]::after {
   content: " \25B4"; /* ▴ */
@@ -572,7 +564,7 @@
 .metadata-table .md-row-chev {
   display: inline-block;
   color: var(--c-dim);
-  font-size: 16px;
+  font-size: var(--fs-xl);
   line-height: 1;
   font-weight: 400;
   opacity: 0.5;
@@ -598,7 +590,7 @@
   border-radius: 4px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.35);
   padding: 4px 0;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--c-text);
   user-select: none;
   animation: md-cm-pop 0.08s ease-out;
@@ -665,7 +657,7 @@
 .metadata-table .md-thumb-loading {
   color: var(--c-dim);
   font-style: italic;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   white-space: nowrap;
 }
 .metadata-table .md-spinner {
@@ -743,7 +735,7 @@
 .metadata-table .md-id-neutral { color: var(--c-text); }
 .metadata-table .md-id-ratio {
   color: var(--c-dim);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   margin-left: 2px;
 }
 .metadata-table .md-col-act {
@@ -763,7 +755,7 @@
   margin: 0 !important;
   line-height: 18px;
   text-align: center;
-  font-size: 14px;
+  font-size: var(--fs-lg);
   font-weight: 700;
   letter-spacing: 1px;
 }
@@ -789,7 +781,7 @@
    while the slow get_channel_metadata_status query is in flight. Slightly
    dimmer + smaller so the primary "Loading channels..." text reads first. */
 .metadata-table .md-load-info {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   opacity: 0.75;
   margin-left: 6px;
 }
@@ -801,7 +793,7 @@
   border: 1px solid var(--c-border);
   color: var(--c-text);
   border-radius: 2px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   cursor: pointer;
   font-family: inherit;
   white-space: nowrap;
@@ -834,7 +826,7 @@
 
 .index-section-hint {
   color: var(--c-dim);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   margin-bottom: 6px;
   line-height: 1.5;
 }
@@ -864,7 +856,7 @@
 .import-skip-intro,
 .backup-preview-total {
   margin-bottom: 8px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .import-skip-group {
   margin-bottom: 8px;
@@ -877,7 +869,7 @@
   font-weight: 400;
 }
 .import-skip-names {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--c-accent);
   padding-left: 10px;
 }
@@ -891,7 +883,7 @@
 }
 .backup-preview-table {
   width: 100%;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   border-collapse: collapse;
 }
 .backup-preview-table thead tr {
@@ -916,4 +908,3 @@
   flex-direction: column;
   overflow-y: auto;
 }
-

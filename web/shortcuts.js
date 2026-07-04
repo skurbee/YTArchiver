@@ -56,6 +56,13 @@
         if (e.key === "F5") return;
       }
 
+      // "?" (Shift+/): toggle the keyboard-shortcuts help overlay. Only
+      // when not typing, so "?" in a text field types normally.
+      if (!editing && e.key === "?" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        toggleShortcutsHelp();
+        return;
+      }
       // Ctrl+Q: quit (close window via tray-quit path)
       if ((e.ctrlKey || e.metaKey) && e.key === "q") {
         e.preventDefault();
@@ -115,14 +122,19 @@
         document.getElementById("btn-sync-subbed")?.click();
         return;
       }
-      // Ctrl+K: jump to Subs tab + focus filter.
+      // Ctrl+K: open the command palette (search actions + channels).
       if ((e.ctrlKey || e.metaKey) && e.key === "k") {
         e.preventDefault();
-        document.querySelector('.tab[data-tab="subs"]')?.click();
-        setTimeout(() => {
-          const f = document.getElementById("subs-filter");
-          if (f) { f.focus(); f.select?.(); }
-        }, 60);
+        if (typeof window.openCommandPalette === "function") {
+          window.openCommandPalette();
+        } else {
+          // Fallback to the old behavior if the palette isn't loaded.
+          document.querySelector('.tab[data-tab="subs"]')?.click();
+          setTimeout(() => {
+            const f = document.getElementById("subs-filter");
+            if (f) { f.focus(); f.select?.(); }
+          }, 60);
+        }
         return;
       }
       // Ctrl+P: open Sync Tasks popover
@@ -131,10 +143,8 @@
         document.getElementById("btn-sync-tasks")?.click();
         return;
       }
-      // Number keys 1-4: switch tabs (Download / Subs / Browse / Settings).
-      // Was `[1-5]` — only 4 tabs exist in index.html, so `5` did
-      // nothing (audit: shortcuts.js H138).
-      if (!editing && /^[1-4]$/.test(e.key)) {
+      // Number keys 1-5: switch tabs (Download / Subs / Browse / Health / Settings).
+      if (!editing && /^[1-5]$/.test(e.key)) {
         const tabs = document.querySelectorAll(".tab");
         const idx = parseInt(e.key, 10) - 1;
         if (tabs[idx]) tabs[idx].click();
@@ -145,10 +155,58 @@
       // the modal's own handler instead of closing popovers behind
       // it (audit: shortcuts.js L67).
       if (e.key === "Escape" && !_modalOpen) {
+        if (_closeShortcutsHelp()) return;
         window.closeContextMenu?.();
         document.querySelectorAll(".queue-popover.open").forEach(p => p.classList.remove("open"));
       }
     });
+
+    // Visible entry point so the shortcuts are discoverable, not just
+    // guessable. The "?" button lives in the header strip.
+    document.getElementById("btn-shortcuts-help")
+      ?.addEventListener("click", (e) => { e.preventDefault(); toggleShortcutsHelp(); });
   }
+
+  // ── Keyboard-shortcuts help overlay ──────────────────────────────────
+  // Built lazily on first open. The list is authored here (single source)
+  // rather than scraped from the handlers above.
+  const SHORTCUTS = [
+    ["Ctrl + S", "Sync all subscribed channels"],
+    ["Ctrl + L", "Focus the video-URL field (Download tab)"],
+    ["Ctrl + F", "Search transcripts + titles"],
+    ["Ctrl + K", "Command palette (search actions + channels)"],
+    ["Ctrl + P", "Open the sync queue"],
+    ["1 - 5", "Switch tabs (Download / Subs / Browse / Health / Settings)"],
+    ["F11", "Toggle fullscreen"],
+    ["Ctrl + Q", "Quit YTArchiver"],
+    ["Esc", "Close menus, popovers, and dialogs"],
+    ["?", "Show / hide this list"],
+  ];
+
+  function _closeShortcutsHelp() {
+    const el = document.getElementById("shortcuts-help-backdrop");
+    if (el) { el.remove(); return true; }
+    return false;
+  }
+
+  function toggleShortcutsHelp() {
+    if (_closeShortcutsHelp()) return;
+    const backdrop = document.createElement("div");
+    backdrop.id = "shortcuts-help-backdrop";
+    backdrop.className = "shortcuts-help-backdrop";
+    const rows = SHORTCUTS.map(([k, d]) =>
+      `<div class="shk-row"><kbd class="shk-key">${k}</kbd>` +
+      `<span class="shk-desc">${d}</span></div>`).join("");
+    backdrop.innerHTML =
+      `<div class="shortcuts-help" role="dialog" aria-label="Keyboard shortcuts">` +
+      `<div class="shk-title">Keyboard shortcuts</div>${rows}` +
+      `<div class="shk-hint">Press <kbd class="shk-key">?</kbd> or ` +
+      `<kbd class="shk-key">Esc</kbd> to close</div></div>`;
+    backdrop.addEventListener("click", (e) => {
+      if (e.target === backdrop) _closeShortcutsHelp();
+    });
+    document.body.appendChild(backdrop);
+  }
+
   window.initKeyboardShortcuts = initKeyboardShortcuts;
 })();

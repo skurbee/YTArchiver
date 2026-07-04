@@ -50,6 +50,10 @@
     document.addEventListener("mouseover", (e) => {
       const el = e.target.closest("[title], [data-tooltip]");
       if (!el || el === currentEl) return;
+      // Don't show a tooltip for an element whose popover/menu is open
+      // (aria-expanded). Otherwise re-hovering a queue button after it
+      // opens its popover paints the tooltip on top of the popover.
+      if (el.getAttribute("aria-expanded") === "true") { hide(); return; }
       // ALWAYS migrate any current `title` to `data-tooltip` and
       // REMOVE the title attribute. Earlier versions only migrated on
       // first hover, but elements whose tooltip text changes dynamically
@@ -98,6 +102,7 @@
     document.addEventListener("focusin", (e) => {
       const el = e.target.closest("[title], [data-tooltip]");
       if (!el || el === currentEl) return;
+      if (el.getAttribute("aria-expanded") === "true") { hide(); return; }
       const titleAttr = el.getAttribute("title");
       if (titleAttr) {
         el.setAttribute("data-tooltip", titleAttr);

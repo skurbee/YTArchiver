@@ -437,7 +437,11 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         if _had_gpu_items:
             try: self._transcribe.pause()
             except Exception as e: _log.debug("transcribe pause-on-restore failed: %s", e)
-            self._queues.set_gpu_paused(True)
+            # restored=True keeps the "prior-session pause" marker alive so a
+            # fresh auto-sync download (Auto on) can auto-release this backlog
+            # via sync_start / enqueue instead of stranding it behind the
+            # launch pause until the user clicks Resume by hand.
+            self._queues.set_gpu_paused(True, restored=True)
         else:
             self._queues.set_gpu_paused(False)
         if _had_sync_items or _had_gpu_items:
@@ -1903,6 +1907,42 @@ def main():
         try:
             from backend.index import backfill_video_stats_if_needed as _bvs
             threading.Thread(target=_bvs, daemon=True).start()
+        except Exception as e: _log.debug("swallowed: %s", e)
+        # Duration backfill for the Index panel's "Hours of video" stat —
+        # fills videos.duration_s from each video's longest segment for
+        # older imports that lack it. Makes that panel's hours read an
+        # instant SUM instead of a multi-minute per-segment GROUP BY that
+        # used to hang it. One-time, idempotent; own daemon thread.
+        try:
+            from backend.index import backfill_video_durations_if_needed as _bvd
+            threading.Thread(target=_bvd, daemon=True).start()
+        except Exception as e: _log.debug("swallowed: %s", e)
+        # One-time video_id recovery for legacy NULL-id imports (channels
+        # whose only transcript is an aggregated `.{Name} Transcript.jsonl`,
+        # so the sweep's .info.json id-backfill couldn't recover them). Fills
+        # video_id by matching (channel, title) to the ingested segments,
+        # then flips now-linked pending videos to transcribed. Gated by a
+        # config flag so the one-time GROUP-BY scan doesn't run every boot;
+        # new downloads always capture their id, so once is enough.
+        try:
+            from backend.ytarchiver_config import load_config as _lc_vid
+            if not _lc_vid().get("video_id_seg_backfill_done"):
+                def _vid_seg_backfill():
+                    try:
+                        from backend.index import (
+                            backfill_video_ids_from_segments as _bvi)
+                        r = _bvi()
+                        if r.get("ok"):
+                            from backend.ytarchiver_config import (
+                                config_transaction as _ctx)
+                            with _ctx() as _cfg:
+                                _cfg["video_id_seg_backfill_done"] = True
+                            _log.info("video_id seg-backfill: filled %s, "
+                                      "reconciled %s",
+                                      r.get("filled"), r.get("reconciled"))
+                    except Exception as _e:
+                        _log.debug("video_id seg-backfill thread: %s", _e)
+                threading.Thread(target=_vid_seg_backfill, daemon=True).start()
         except Exception as e: _log.debug("swallowed: %s", e)
         # If launched with --start-minimized (e.g. from Windows boot Registry
         # entry), hide the window immediately so the app is tray-only on boot.

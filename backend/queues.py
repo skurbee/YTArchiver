@@ -62,6 +62,15 @@ class QueueState:
         # was registered. Runtime-only — never persisted.
         self.gpu_paused_active: bool = False
         self.sync_paused_active: bool = False
+        # True only when gpu_paused was RESTORED from disk on load (i.e. the
+        # user paused in a PRIOR session and quit). Lets the enqueue / sync-
+        # start paths auto-release a stale prior-session pause when the user
+        # initiates fresh work, WITHOUT ever clearing a pause the user set in
+        # the current session (that was silently un-pausing a deliberately
+        # paused Processing queue — e.g. an auto-sync download resumed it).
+        # Any explicit set_gpu_paused() call clears this (it's now a current-
+        # session decision). Runtime-only — never persisted.
+        self.gpu_pause_restored: bool = False
 
         # Current in-flight items (not yet re-queued, but shown in popover)
         self.current_sync: dict[str, Any] | None = None
@@ -348,6 +357,9 @@ class QueueState:
                           else list(raw_order))
             self.gpu_paused = bool(data.get("gpu_paused", False))
             self.sync_paused = bool(data.get("sync_paused", False))
+            # Mark a restored pause so the enqueue / sync-start paths may
+            # auto-release THIS (prior-session) pause but never a fresh one.
+            self.gpu_pause_restored = self.gpu_paused
 
             # resuming-dict handling. New-format files
             # (schema_version 2+) keep in-flight items in a separate
@@ -968,6 +980,8 @@ class QueueState:
             sync_paused = self.sync_paused
             gpu_paused_active = self.gpu_paused_active
             sync_paused_active = self.sync_paused_active
+            sync_count = len(sync_q) + (1 if cur_sync else 0)
+            gpu_count = len(gpu_q) + (1 if cur_gpu else 0)
 
         sync_list = []
         if cur_sync:
@@ -1006,6 +1020,8 @@ class QueueState:
                 "status": "running",
                 "path": (cur_gpu.get("path") or "").strip(),
                 "bulk_id": running_bulk_id,
+                "bulk_total": int(cur_gpu.get("bulk_total") or 0),
+                "bulk_index": int(cur_gpu.get("bulk_index") or 0),
                 "kind": (cur_gpu.get("kind") or "transcribe"),
                 "title": (cur_gpu.get("title") or ""),
                 "channel": (cur_gpu.get("channel") or "").strip(),
@@ -1059,6 +1075,8 @@ class QueueState:
         return {
             "sync": sync_list,
             "gpu": gpu_list,
+            "sync_count": sync_count,
+            "gpu_count": gpu_count,
             "gpu_paused": gpu_paused,
             "sync_paused": sync_paused,
             # Pause-pending vs pause-active distinction so the UI can blink
@@ -1149,10 +1167,21 @@ class QueueState:
 
     # ── pause state ─────────────────────────────────────────────────
 
-    def set_gpu_paused(self, paused: bool):
+    def set_gpu_paused(self, paused: bool, restored: bool = False):
         with self._lock:
             old_paused = self.gpu_paused
             self.gpu_paused = bool(paused)
+            # Any explicit set is a current-session decision, so it's no
+            # longer a "restored" pause the auto-release paths may clear —
+            # UNLESS the caller is the launch-restore path re-affirming a
+            # pause that load() already marked restored (`restored=True`).
+            # Without this carve-out, main.py's `set_gpu_paused(True)` right
+            # after load() wiped the restored flag load() had just set, so
+            # the sync-start / enqueue auto-release ("fresh work + Auto on
+            # → drain the restored backlog") could NEVER fire — a fresh
+            # auto-sync download sat parked until the user hit Resume by
+            # hand even with Auto checked.
+            self.gpu_pause_restored = bool(paused and restored)
             # Only reset the active flag on a True→False transition.
             # Previously this reset on EVERY call, so a redundant
             # pause (e.g. tray + UI both flipping the bit) wrongly

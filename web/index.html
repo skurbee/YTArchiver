@@ -1002,6 +1002,11 @@
                 <div class="md-total-label">Still on YT</div>
                 <div class="md-total-value" id="md-tot-onyt">&mdash;</div>
               </div>
+              <div class="md-total-card" id="md-tot-card-transcribed"
+                   title="Across the whole archive: how many on-disk videos have an actual transcript (YouTube captions or Whisper). Videos where Whisper found no speech are not counted.">
+                <div class="md-total-label">Transcribed</div>
+                <div class="md-total-value" id="md-tot-transcribed">&mdash;</div>
+              </div>
             </div>
 
             <!-- Bulk row -->
@@ -1015,7 +1020,7 @@
                 Refresh comments &mdash; all channels
               </button>
               <button class="btn btn-ghost btn-thin" id="btn-md-backfill-all-ids"
-                      title="For every channel missing video_ids, do a one-time flat-playlist + title-match pass to fill them in. Essential for archives migrated from the tkinter-era YTArchiver.">
+                      title="For every channel missing video_ids, do a one-time flat-playlist + title-match pass to fill them in. Essential for older archives imported without video IDs.">
                 Fix missing video IDs &mdash; all channels
               </button>
               <button class="btn btn-ghost btn-thin" id="btn-md-refetch-all-thumbs"
@@ -1043,6 +1048,8 @@
                         title="Checkmark means every on-disk video has a resolvable video_id stored in the index DB (fast views/likes refresh works). Warn/X means a video_id backfill is recommended &mdash; click Fix IDs on the row.">Video IDs</th>
                     <th class="md-col-ids" data-sort="thumbs"
                         title="Coverage of per-video thumbnail sidecars. Right-click a channel row → 'Refetch missing thumbnails' to backfill.">Thumbnails</th>
+                    <th class="md-col-ids" data-sort="transcribed"
+                        title="How many of this channel's on-disk videos have an actual transcript (YouTube captions or Whisper). Videos where Whisper found no speech are not counted.">Transcribed</th>
                     <th class="md-col-onyt" data-sort="onyt"
                         title="How many videos in your archive are still on YouTube. Detected during bulk views/likes refresh &mdash; files whose video_id is no longer in the channel's flat-playlist response are flagged as removed.">Still on YT</th>
                     <th class="md-col-ts" data-sort="views" data-sort-active
@@ -1053,7 +1060,7 @@
                   </tr>
                 </thead>
                 <tbody id="metadata-tbody">
-                  <tr><td colspan="8" class="md-empty">Loading&hellip;</td></tr>
+                  <tr><td colspan="9" class="md-empty">Loading&hellip;</td></tr>
                 </tbody>
               </table>
             </div>
@@ -1097,7 +1104,7 @@
             <div class="index-section">
               <div class="index-section-label">Additional archive roots</div>
               <div class="index-section-hint">
-                The primary <b>Archive root</b> (set on the General tab) is
+                The primary <b>Archive root</b> (set in the Settings tab) is
                 always indexed. Use this list to index extra folders too.
                 Right-click a root &rarr; Delete All Transcriptions.
               </div>

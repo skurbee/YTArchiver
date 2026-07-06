@@ -9,5 +9,5 @@ and `backend/api_mixins/_shared.py` import these names.
 """
 from __future__ import annotations
 
-APP_VERSION      = "v80.3"
-APP_VERSION_DATE = "7.04.26 12:35PM"
+APP_VERSION      = "v80.4"
+APP_VERSION_DATE = "7.06.26 1:41PM"

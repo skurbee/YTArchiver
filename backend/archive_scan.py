@@ -558,24 +558,18 @@ def index_db_stats() -> dict[str, Any]:
             _row = _own.execute("SELECT COUNT(*) FROM segments").fetchone()
             if _row:
                 segments_count = int(_row[0] or 0)
-            # Hours of video — prefer the summed videos.duration_s
-            # column (populated by register_video). For rows where
-            # duration_s is NULL, fall back to the maximum
-            # segments.end_time per video so transcribed videos
-            # without explicit duration metadata still contribute.
+            # Hours of video — sum the videos.duration_s column, which is
+            # populated by register_video for new downloads and backfilled
+            # from each video's longest segment end_time for older imports
+            # (index.backfill_video_durations_if_needed, run once at boot).
+            # This is an instant indexed aggregate over the ~100k-row videos
+            # table. The previous per-segment `MAX(end_time) ... GROUP BY
+            # video_id` fallback over the multi-million-row segments table
+            # ran for minutes on a large archive and hung this panel — the
+            # backfill makes it unnecessary while yielding the same total.
             _row = _own.execute(
                 "SELECT COALESCE(SUM(duration_s), 0) FROM videos "
                 "WHERE duration_s IS NOT NULL").fetchone()
-            if _row:
-                hours += float(_row[0] or 0) / 3600.0
-            _row = _own.execute(
-                "SELECT COALESCE(SUM(max_end), 0) FROM ("
-                "  SELECT MAX(s.end_time) AS max_end "
-                "  FROM segments s "
-                "  LEFT JOIN videos v ON v.video_id = s.video_id "
-                "  WHERE v.duration_s IS NULL OR v.video_id IS NULL "
-                "  GROUP BY s.video_id"
-                ")").fetchone()
             if _row:
                 hours += float(_row[0] or 0) / 3600.0
             # Archive-wide transcription COVERAGE: videos that have an actual

@@ -75,12 +75,15 @@ class MediaOpsMixin:
                 self._log_stream.flush()
                 sweep = index_backend.sweep_new_videos(output_dir, channels)
                 _agg = sweep.get("agg_ingested", 0)
+                _rec = sweep.get("tx_reconciled", 0)
                 self._log_stream.emit_text(
                     f"\u2014 Rescan complete: "
                     f"+{sweep.get('registered', 0)} videos, "
                     f"+{sweep.get('ingested', 0)} transcripts ingested"
                     + (f" ({_agg} aggregated transcript file(s) indexed)"
                        if _agg else "")
+                    + (f"; {_rec} video(s) reconciled to transcribed"
+                       if _rec else "")
                     + ".",
                     "simpleline_green")
                 # Push a refresh signal to the frontend so the Browse

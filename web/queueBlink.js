@@ -155,8 +155,12 @@
       window.renderQueues = (queues) => {
         _touchBlinkState();
         origRenderQueues(queues);
-        _blinkState.sync.count = (queues?.sync || []).length;
-        _blinkState.gpu.count = (queues?.gpu || []).length;
+        const _syncCount = queues?.sync_count;
+        const _gpuCount = queues?.gpu_count;
+        _blinkState.sync.count = Number.isFinite(_syncCount)
+          ? Math.max(0, Number(_syncCount)) : (queues?.sync || []).length;
+        _blinkState.gpu.count = Number.isFinite(_gpuCount)
+          ? Math.max(0, Number(_gpuCount)) : (queues?.gpu || []).length;
         // Paused flags may be missing on partial payloads (e.g. a
         // legacy caller that only passes {sync, gpu}) — only overwrite
         // when the key is present so we don't reset the state that
@@ -472,7 +476,10 @@
       const want = (startable || isPaused) ? "play" : "bars";
       if (svg.dataset.icon !== want) {
         svg.dataset.icon = want;
-        svg.innerHTML = isPaused
+        // Render the glyph off `want`, not `isPaused` — otherwise a
+        // "Start" button (startable but not paused) got the pause bars
+        // even though it means "play now" (user saw "⏸ Start").
+        svg.innerHTML = want === "play"
           ? '<path d="M3 2v10l8-5z"/>'
           : '<rect x="3" y="2" width="3" height="10" rx="0.5"/>' +
             '<rect x="8" y="2" width="3" height="10" rx="0.5"/>';

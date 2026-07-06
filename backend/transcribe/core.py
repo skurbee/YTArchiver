@@ -772,7 +772,13 @@ class TranscribeManager:
             with self._jobs_lock:
                 if (self._auto_enabled() and self._paused.is_set()
                         and self._queues is not None
-                        and getattr(self._queues, "gpu_paused", False)):
+                        and getattr(self._queues, "gpu_paused", False)
+                        and getattr(self._queues, "gpu_pause_restored", False)):
+                    # Only auto-release a pause RESTORED from a prior session
+                    # (the "don't auto-fire restored items until fresh work"
+                    # convenience). A pause the user set THIS session is left
+                    # intact so an incoming auto-sync/download can't silently
+                    # resume a deliberately-paused Processing queue.
                     self._paused.clear()
                     self._queues.set_gpu_paused(False)
         except Exception as e:
@@ -886,6 +892,19 @@ class TranscribeManager:
         except Exception as e:
             _log.debug("swallowed: %s", e)
 
+    def clear_pending_journal(self):
+        """Persist an empty pending-transcribe journal."""
+        try:
+            import json as _json
+            p = _pending_journal_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = str(p) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump([], f, indent=2)
+            os.replace(tmp, p)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+
     def _persist_pending(self):
         """Write current pending jobs to disk so a crash/restart recovers them."""
         try:
@@ -952,7 +971,58 @@ class TranscribeManager:
             # Cache existing-title sets per channel so we don't re-walk the
             # folder N times.
             _title_cache: dict[str, set] = {}
-            def _already_transcribed(video_path: str, title: str, channel: str) -> bool:
+            _no_speech_title_cache: dict[str, set] = {}
+            def _already_transcribed(video_path: str, title: str,
+                                     channel: str, video_id: str = "") -> bool:
+                try:
+                    from .. import index as _idx
+                    vid = (video_id or _extract_video_id(video_path) or "").strip()
+                    tx_status = _idx.video_tx_status(
+                        video_id=vid or None,
+                        title=(title or None),
+                    ).lower()
+                    if tx_status == "no_speech":
+                        return True
+                    conn = _idx._reader_open() or _idx._open()
+                    if conn is not None:
+                        lock = (_idx._reader_lock
+                                if _idx._reader_open() is not None
+                                else _idx._db_lock)
+                        fp = os.path.normpath(video_path or "")
+                        with lock:
+                            row = conn.execute(
+                                "SELECT tx_status FROM videos "
+                                "WHERE filepath=? COLLATE NOCASE LIMIT 1",
+                                (fp,),
+                            ).fetchone()
+                        if row and (row[0] or "").lower() == "no_speech":
+                            return True
+                    ch_key = (channel or "").strip().lower()
+                    if ch_key:
+                        titles = _no_speech_title_cache.get(ch_key)
+                        if titles is None:
+                            titles = set()
+                            conn = _idx._reader_open() or _idx._open()
+                            if conn is not None:
+                                lock = (_idx._reader_lock
+                                        if _idx._reader_open() is not None
+                                        else _idx._db_lock)
+                                with lock:
+                                    rows = conn.execute(
+                                        "SELECT title FROM videos "
+                                        "WHERE channel=? COLLATE NOCASE "
+                                        "AND tx_status='no_speech'",
+                                        (channel,),
+                                    ).fetchall()
+                                titles = {
+                                    _norm_title(str(r[0] or ""))
+                                    for r in rows if r and r[0]
+                                }
+                            _no_speech_title_cache[ch_key] = titles
+                        if _norm_title(title or "") in titles:
+                            return True
+                except Exception as e:
+                    _log.debug("no_speech restore skip lookup failed: %s", e)
                 # Legacy per-video .jsonl from an earlier build
                 base = os.path.splitext(video_path)[0]
                 if os.path.isfile(base + ".jsonl"):
@@ -978,7 +1048,20 @@ class TranscribeManager:
                 path = j.get("path") or ""
                 if not path or not os.path.isfile(path):
                     continue
-                if _already_transcribed(path, j.get("title", ""), j.get("channel", "")):
+                # A RE-transcribe job intentionally targets an
+                # already-transcribed video, so the "already transcribed?"
+                # skip must NOT drop it — otherwise a channel re-transcribe
+                # paused-and-restarted lost every remaining job on reload
+                # (they showed in the popover but never ran on Start).
+                # Only plain transcribe jobs skip when the transcript exists.
+                if not j.get("retranscribe") and _already_transcribed(
+                        path, j.get("title", ""), j.get("channel", ""),
+                        j.get("video_id", "")):
+                    if self._queues is not None:
+                        try:
+                            self._queues.gpu_remove(path)
+                        except Exception as e:
+                            _log.debug("stale GPU queue remove failed: %s", e)
                     continue
                 # rehydrate all saved job fields (retranscribe,
                 # video_id, combined_override, bulk_*) so a restarted
@@ -1054,6 +1137,11 @@ class TranscribeManager:
                 else:
                     keep.append(j)
             self._jobs[:] = keep
+        if removed:
+            try:
+                self._persist_pending()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         return removed
 
     def reorder_pending_job(self, identifier: str, new_index: int) -> bool:
@@ -1112,6 +1200,7 @@ class TranscribeManager:
                 self._queues.gpu_clear()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
+        self.clear_pending_journal()
 
     def pause(self):
         self._paused.set()
@@ -1128,6 +1217,18 @@ class TranscribeManager:
         self._paused.clear()
         self._manual_drain.set()
         self._ensure_worker()
+
+    def _emit_manual_processing_done(self, job: dict[str, Any],
+                                     kind: str = "transcribe"):
+        title = (job.get("title") or "").strip()
+        if not title:
+            title = os.path.basename(job.get("path") or "video")
+        channel = (job.get("channel") or "").strip()
+        suffix = f" ({channel})" if channel else ""
+        verb = "Transcribed" if kind == "transcribe" else "Processed"
+        self._stream.emit_text(
+            f" - {verb}: {title}{suffix}",
+            "simpleline_blue")
 
     def is_active(self) -> bool:
         """True if a GPU job is currently running OR jobs remain queued.
@@ -1265,6 +1366,9 @@ class TranscribeManager:
             # "Transcribing X" / "Compressing X" while the rest shrink
             # upward. Label verb comes from the job's `kind`.
             _job_kind = job.get("kind") or "transcribe"
+            _tail_log_on_done = (
+                _job_kind == "transcribe" and self._manual_drain.is_set()
+            )
             if self._queues is not None:
                 try:
                     self._queues.gpu_pop_matching(
@@ -1276,6 +1380,9 @@ class TranscribeManager:
                         "title": job.get("title", ""),
                         "path": job.get("path", ""),
                         "channel": job.get("channel", ""),
+                        "bulk_id": job.get("bulk_id", ""),
+                        "bulk_total": int(job.get("bulk_total") or 0),
+                        "bulk_index": int(job.get("bulk_index") or 0),
                     })
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
@@ -1309,7 +1416,8 @@ class TranscribeManager:
                 elif "empty transcript" in _msg_lower:
                     _vid_for_empty = (job.get("video_id") or "").strip()
                     _empty_marker = f"tx_done_{_vid_for_empty}" if _vid_for_empty else ""
-                    _empty_tags = [t for t in (_empty_marker, "dim") if t]
+                    _empty_tags = [t for t in (
+                        _empty_marker, "dim", job.get("job_tag", "")) if t]
                     self._stream.emit([[
                         f" — no speech detected in {job.get('title') or 'video'}.\n",
                         _empty_tags,
@@ -1321,7 +1429,8 @@ class TranscribeManager:
                     # Genuine RuntimeError — treat as a crash.
                     _vid_for_err = (job.get("video_id") or "").strip()
                     _marker = f"tx_done_{_vid_for_err}" if _vid_for_err else ""
-                    _err_tags = [t for t in (_marker, "red") if t]
+                    _err_tags = [t for t in (
+                        _marker, "red", job.get("job_tag", "")) if t]
                     self._stream.emit([[
                         f"{_job_kind.capitalize()} crashed: {_empty_e}\n",
                         _err_tags,
@@ -1337,7 +1446,8 @@ class TranscribeManager:
                 # orphaned itself under unrelated later channels.
                 _vid_for_err = (job.get("video_id") or "").strip()
                 _marker = f"tx_done_{_vid_for_err}" if _vid_for_err else ""
-                _err_tags = [t for t in (_marker, "red") if t]
+                _err_tags = [t for t in (
+                    _marker, "red", job.get("job_tag", "")) if t]
                 # Use the structured emit form so we can carry the
                 # marker; emit_error doesn't accept tag lists.
                 self._stream.emit([[
@@ -1346,7 +1456,8 @@ class TranscribeManager:
                 ]])
                 crashed = True
             finally:
-                if job.get("_requeued_no_tally"):
+                _requeued_no_tally = bool(job.get("_requeued_no_tally"))
+                if _requeued_no_tally:
                     job.pop("_requeued_no_tally", None)
                 elif crashed:
                     stats["err"] += 1
@@ -1406,6 +1517,13 @@ class TranscribeManager:
                 if self._queues is not None:
                     try:
                         self._queues.set_current_gpu(None)
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
+                if (_tail_log_on_done and not _requeued_no_tally
+                        and not crashed and not job["cancel"].is_set()
+                        and not self._cancel_all.is_set()):
+                    try:
+                        self._emit_manual_processing_done(job, _job_kind)
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
                 self._persist_pending()
@@ -1640,6 +1758,7 @@ class TranscribeManager:
                                    job_tag=job_tag,
                                    video_id_hint=job.get("video_id", ""),
                                    from_download=bool(job.get("from_download")))):
+            job["_pending_decremented"] = True
             if job.get("cb"):
                 try:
                     job["cb"]({"auto_captions": True})

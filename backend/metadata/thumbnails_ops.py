@@ -67,9 +67,10 @@ def _active_channel_keys(channels: list[dict[str, Any]] | None) -> set[str]:
 
 
 def _output_dir_where() -> tuple[str, list[str]]:
+    duplicate_clause = "is_duplicate_of IS NULL"
     out_dir = (load_config() or {}).get("output_dir") or ""
     if not out_dir:
-        return "", []
+        return f"WHERE {duplicate_clause}", []
     norm = os.path.normpath(out_dir).rstrip("\\/")
     prefixes = [norm + os.sep]
     alt = norm.replace("\\", "/")
@@ -79,7 +80,7 @@ def _output_dir_where() -> tuple[str, list[str]]:
     args = [_like_esc(p) + "%" for p in prefixes]
     return (
         "WHERE filepath IS NOT NULL AND filepath != '' AND "
-        f"({clauses})",
+        f"({clauses}) AND {duplicate_clause}",
         args,
     )
 
@@ -228,6 +229,18 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
                     "video_id=%s url=%s",
                     name, vid_id, url, exc_info=True)
                 still_missing += 1
+    # We just wrote new files into this channel's `.Thumbnails/` dirs and
+    # flipped has_thumbnail=1 in the DB. Drop the persisted status-cache
+    # entry so a plain reload of Settings > Metadata re-walks and shows the
+    # fresh count — otherwise the Thumbnails % column keeps reporting the
+    # pre-sweep number (the fingerprint doesn't see files that deep, and the
+    # DB fast path is disabled for any channel with an id-less NULL row).
+    if fetched:
+        try:
+            from ..thumbnails import invalidate_thumb_cache_entry
+            invalidate_thumb_cache_entry(name)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
     return {"checked": checked, "fetched": fetched,
             "missing": still_missing}
 
@@ -766,7 +779,10 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
                     "           AND id_backfill_tried_ts IS NOT NULL "
                     "           THEN 1 ELSE 0 END) AS tried, "
                     "  SUM(CASE WHEN removed_from_yt_ts IS NOT NULL "
-                    "           THEN 1 ELSE 0 END) AS removed "
+                    "           THEN 1 ELSE 0 END) AS removed, "
+                    "  SUM(CASE WHEN tx_status IN "
+                    "           ('transcribed', 'done', 'no_speech') "
+                    "           THEN 1 ELSE 0 END) AS transcribed "
                     f"FROM videos {where_sql} GROUP BY channel",
                     where_args,
                 ).fetchall()
@@ -809,6 +825,10 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
             tried = int(r[3] or 0) if _has_tried_col and len(r) > 3 else 0
             removed = (int(r[4] or 0) if _has_removed_col and len(r) > 4
                        else 0)
+            # transcribed count only comes back on the full (newest) query
+            # variant, appended after `removed` (r[5]). Older-DB fallbacks
+            # don't select it, so it degrades to 0 there.
+            transcribed = int(r[5] or 0) if len(r) > 5 else 0
             cur = out.get(ch_low)
             if cur is None:
                 out[ch_low] = {
@@ -817,6 +837,7 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
                     "missing": max(0, total - with_id),
                     "tried_failed": tried,
                     "removed_from_yt": removed,
+                    "transcribed": transcribed,
                 }
             else:
                 cur["total"] += total
@@ -824,6 +845,7 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
                 cur["missing"] = max(0, cur["total"] - cur["with_id"])
                 cur["tried_failed"] += tried
                 cur["removed_from_yt"] = cur.get("removed_from_yt", 0) + removed
+                cur["transcribed"] = cur.get("transcribed", 0) + transcribed
     except Exception:
         return {}
     # Refresh the TTL cache so the next page-load gets instant data.

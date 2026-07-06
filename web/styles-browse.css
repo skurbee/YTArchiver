@@ -1069,9 +1069,19 @@
   overflow: hidden;
 }
 .index-stats-note {
+  /* Lives inside the monospace <pre>, so reset the inherited pre font +
+     no-wrap and give it a clear separator so it reads as an intentional
+     footnote rather than a line crammed onto the stats block. */
+  display: block;
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--c-border);
   color: var(--c-dim);
+  font-family: var(--font-ui);
   font-size: var(--fs-xs);
-  margin-top: 4px;
+  font-style: italic;
+  line-height: 1.4;
+  white-space: normal;
 }
 .index-actions-row {
   display: flex;

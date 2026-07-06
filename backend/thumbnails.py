@@ -499,6 +499,31 @@ def _save_thumb_cache(cache: dict[str, dict[str, Any]]) -> None:
         except OSError: pass
 
 
+def invalidate_thumb_cache_entry(channel_name: str) -> None:
+    """Drop one channel's persisted thumbnail-status entry so the next
+    `count_thumbnail_status_bulk(force=False)` re-walks that channel's disk
+    instead of returning a stale count.
+
+    Needed after a thumbnail sweep / realign FETCHES or MOVES files: those
+    land inside `.Thumbnails/` sub-dirs, which sit below the depth-2 folder
+    fingerprint AND (for any channel with an id-less video that keeps a
+    permanent `has_thumbnail IS NULL` row) can't ride the DB fast path. So
+    without this, the Settings > Metadata Thumbnails % column kept showing
+    the pre-sweep number even after the user reloaded (the sweep updated
+    the DB, but the column fell back to this stale cache). Best-effort.
+    """
+    key = (channel_name or "").strip().lower()
+    if not key:
+        return
+    try:
+        cache = _load_thumb_cache()
+        if key in cache:
+            cache.pop(key, None)
+            _save_thumb_cache(cache)
+    except Exception:
+        pass
+
+
 def _channel_fingerprint(folder: Path) -> float:
     """Max mtime across the channel folder plus shallow year/month content.
 

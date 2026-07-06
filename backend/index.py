@@ -1444,17 +1444,29 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
                 "VALUES (?, ?, ?)",
                 (jp, jsonl_mtime, len(rows)),
             )
-            # flip tx_status='transcribed' on successful
-            # ingest so channel_transcription_stats reflects reality
-            # right away. Previously only mark_video_transcribed did
-            # this, and if ingest_jsonl was called without a follow-up
-            # mark_video_transcribed the Edit-channel footer and stats
-            # queries reported stale 'pending' counts for videos that
-            # had segments in the index.
+            # flip tx_status='transcribed' on successful ingest so stats
+            # reflect reality right away. Match on BOTH the video filepath
+            # (per-video sidecar case: `fp` is the mp4) AND the segments'
+            # own video_ids (aggregated per-channel transcript case: `fp`
+            # is the channel-level `.{Name} Transcript.txt`, which matches
+            # no individual video row — so the filepath UPDATE flips
+            # nothing, which is why entire aggregated-transcript channels
+            # stayed 'pending' despite being fully indexed). sweep_new_videos
+            # also runs a global reconcile; flipping here keeps a fresh
+            # ingest instantly correct without waiting for the next rescan.
             _tx_cur = conn.execute(
                 "UPDATE videos SET tx_status='transcribed' "
                 "WHERE filepath=? COLLATE NOCASE", (fp,))
             _tx_rowcount = _tx_cur.rowcount or 0
+            _seg_vids = list({_r[0] for _r in rows if _r[0]})
+            for _i in range(0, len(_seg_vids), 400):
+                _chunk = _seg_vids[_i:_i + 400]
+                _ph = ",".join("?" * len(_chunk))
+                _vc = conn.execute(
+                    "UPDATE videos SET tx_status='transcribed' "
+                    f"WHERE tx_status != 'transcribed' AND video_id IN ({_ph})",
+                    _chunk)
+                _tx_rowcount += _vc.rowcount or 0
             conn.commit()
             if rows:
                 _invalidate_top_words_cache()
@@ -2556,6 +2568,133 @@ def backfill_video_stats_if_needed(progress=None) -> dict:
     except sqlite3.Error:
         return {"ok": False, "skipped": True}
     return backfill_video_stats(progress=progress)
+
+
+def backfill_video_durations_if_needed() -> dict:
+    """One-time: fill `videos.duration_s` from each video's longest segment
+    end_time for transcribed videos that have no stored duration (mostly
+    older imports registered before duration was captured).
+
+    Why: the Index panel's "Hours of video" used to sum duration_s AND, for
+    every NULL-duration video, fall back to a `MAX(end_time) ... GROUP BY
+    video_id` aggregate over the whole (multi-million-row) segments table.
+    On a large archive that ran for minutes and blocked the stats panel
+    (it never appeared to load). Persisting the value once means the panel
+    can read the instant `SUM(duration_s)` from then on, with the same
+    result. Idempotent — no-op once every transcribed video has a duration.
+    """
+    try:
+        conn = _reader_open()
+        if conn is None:
+            return {"ok": False, "skipped": True}
+        with _reader_lock:
+            row = conn.execute(
+                "SELECT 1 FROM videos v "
+                "WHERE v.duration_s IS NULL AND v.video_id IS NOT NULL "
+                "AND EXISTS (SELECT 1 FROM segments s "
+                "            WHERE s.video_id = v.video_id) LIMIT 1"
+            ).fetchone()
+        if not row:
+            return {"ok": True, "skipped": True, "reason": "no gaps"}
+    except sqlite3.Error:
+        return {"ok": False, "skipped": True}
+    try:
+        with _db_lock:
+            c = _open()
+            if c is None:
+                return {"ok": False, "error": "no db", "filled": 0}
+            cur = c.execute(
+                "UPDATE videos SET duration_s = ("
+                "  SELECT MAX(s.end_time) FROM segments s "
+                "  WHERE s.video_id = videos.video_id) "
+                "WHERE duration_s IS NULL AND video_id IS NOT NULL "
+                "AND EXISTS (SELECT 1 FROM segments s2 "
+                "            WHERE s2.video_id = videos.video_id)"
+            )
+            filled = cur.rowcount
+            c.commit()
+        return {"ok": True, "filled": int(filled or 0)}
+    except sqlite3.Error as e:
+        _log.debug("duration backfill failed: %s", e)
+        return {"ok": False, "error": str(e), "filled": 0}
+
+
+def backfill_video_ids_from_segments() -> dict:
+    """One-time recovery: fill `videos.video_id` for legacy NULL-id rows by
+    matching (channel, title) against the segments already ingested from the
+    aggregated per-channel transcripts, which carry each video's real id.
+
+    This covers channels whose only transcript/metadata is the aggregated
+    `.{Name} Transcript.jsonl` (no per-video `.info.json`), so the sweep's
+    register_video id-backfill can't recover them. Filling the id links the
+    orphaned segments to the row and lets metadata (keyed by video_id)
+    attach; the reconcile at the end then flips any now-linked pending
+    videos to 'transcribed'.
+
+    SAFE BY CONSTRUCTION — only assigns when a (channel, title) maps to
+    exactly ONE video_id in segments AND that id isn't already used by
+    another row. Ambiguous titles and would-be duplicates are left NULL
+    rather than guessed. Idempotent. Returns {ok, filled, reconciled}.
+    """
+    try:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return {"ok": False, "filled": 0, "reconciled": 0}
+            null_rows = conn.execute(
+                "SELECT id, channel, title FROM videos "
+                "WHERE (video_id IS NULL OR video_id='') "
+                "AND channel IS NOT NULL AND title IS NOT NULL").fetchall()
+            if not null_rows:
+                return {"ok": True, "filled": 0, "reconciled": 0}
+            # Ids already claimed by some row — never duplicate one.
+            used = {r[0] for r in conn.execute(
+                "SELECT video_id FROM videos "
+                "WHERE video_id IS NOT NULL AND video_id != ''")}
+            # Group the NULL rows by (channel, title) so each distinct pair
+            # is looked up once. Per-pair lookups use the title index (a
+            # handful of segments per video) — far cheaper than a GROUP BY
+            # over the whole multi-million-row segments table.
+            pairs: dict[tuple, list] = {}
+            for rid, ch, title in null_rows:
+                pairs.setdefault((ch, title), []).append(rid)
+            updates = []
+            for (ch, title), rids in pairs.items():
+                # LIMIT 2: one row -> unique match, two -> ambiguous (skip).
+                vids = [r[0] for r in conn.execute(
+                    "SELECT DISTINCT video_id FROM segments "
+                    "WHERE channel=? AND title=? "
+                    "AND video_id IS NOT NULL AND video_id != '' LIMIT 2",
+                    (ch, title))]
+                if len(vids) != 1:
+                    continue  # no match or ambiguous — leave NULL
+                vid = vids[0]
+                if vid in used:
+                    continue  # would duplicate an existing/just-claimed id
+                # If several NULL rows share this title (dup files), only the
+                # first can take the id — the rest stay NULL.
+                updates.append((vid, rids[0]))
+                used.add(vid)
+            for _i in range(0, len(updates), 500):
+                conn.executemany(
+                    "UPDATE videos SET video_id=? WHERE id=? "
+                    "AND (video_id IS NULL OR video_id='')",
+                    updates[_i:_i + 500])
+            conn.commit()
+            # Newly-linked rows that have segments but stale status → flip.
+            rc = conn.execute(
+                "UPDATE videos SET tx_status='transcribed' "
+                "WHERE tx_status != 'transcribed' "
+                "AND video_id IS NOT NULL AND video_id != '' "
+                "AND EXISTS (SELECT 1 FROM segments s "
+                "            WHERE s.video_id = videos.video_id)")
+            reconciled = rc.rowcount or 0
+            conn.commit()
+        return {"ok": True, "filled": len(updates),
+                "reconciled": int(reconciled or 0)}
+    except sqlite3.Error as e:
+        _log.error("video_id segment backfill failed: %s", e)
+        return {"ok": False, "filled": 0, "reconciled": 0, "error": str(e)}
 
 
 def backfill_video_ids_from_sidecars(progress=None) -> dict:

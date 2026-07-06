@@ -37,6 +37,12 @@
     return String(n).trim();
   }
 
+  function _queueCount(kind) {
+    const raw = _queues?.[`${kind}_count`];
+    if (Number.isFinite(raw)) return Math.max(0, Number(raw));
+    return (_queues[kind] || []).length;
+  }
+
   function _truncate(s, n) {
     s = String(s || "");
     return s.length > n ? s.slice(0, n - 1) + "…" : s;
@@ -46,7 +52,7 @@
   function _segText(kind, verbRunning, idleLabel) {
     const list = _queues[kind] || [];
     const st = _state[kind] || {};
-    const count = list.length;
+    const count = _queueCount(kind);
     if (st.paused) {
       return count ? `${idleLabel.split(" ")[0]} paused (${count})`
                    : `${idleLabel.split(" ")[0]} paused`;

@@ -51,6 +51,139 @@ def _jsonl_needs_ingest(conn: sqlite3.Connection, jsonl_path: str) -> bool:
         return True
 
 
+def _reconcile_tx_status_from_transcript_titles(
+        conn: sqlite3.Connection,
+        output_dir: str,
+        channels: list,
+        wait_fn=None) -> int:
+    """Flip stale pending rows when aggregate transcript text proves done.
+
+    Older aggregate Transcript.txt files may not have video IDs in their
+    headers/jsonl. Transcribe All still treats those entries as complete by
+    normalized title; the Health tab must use the same evidence or it reports
+    stale pending counts forever.
+    """
+    if conn is None or not output_dir or not channels:
+        return 0
+
+    import re as _re
+    from .transcribe.helpers import (
+        _norm_title,
+        _scan_existing_transcript_titles,
+    )
+
+    strip_id = _re.compile(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$")
+
+    def _maybe_wait() -> None:
+        if callable(wait_fn):
+            try:
+                wait_fn()
+            except Exception:
+                pass
+
+    def _folder_name(ch: dict[str, Any]) -> str:
+        try:
+            from .sync import channel_folder_name as _cfn
+            return _cfn(ch)
+        except Exception:
+            return ((ch.get("folder_override") or "").strip()
+                    or (ch.get("folder") or "").strip()
+                    or (ch.get("name") or "").strip())
+
+    def _names_for(ch: dict[str, Any], folder_name: str) -> list[str]:
+        names: list[str] = []
+        for val in (ch.get("name"), ch.get("folder"), ch.get("folder_override"),
+                    folder_name):
+            val = (val or "").strip()
+            if val and val.lower() not in {n.lower() for n in names}:
+                names.append(val)
+        return names
+
+    total_changed = 0
+    for ch in channels:
+        if not isinstance(ch, dict):
+            continue
+        ch_name = (ch.get("name") or "").strip()
+        folder_name = _folder_name(ch)
+        if not folder_name:
+            continue
+        folder = os.path.join(output_dir, folder_name)
+        if not os.path.isdir(folder):
+            continue
+
+        names = _names_for(ch, folder_name)
+        if not names:
+            continue
+        where = " OR ".join(["channel=? COLLATE NOCASE"] * len(names))
+        try:
+            rows = conn.execute(
+                "SELECT id, title, filepath, video_id FROM videos "
+                f"WHERE ({where}) "
+                "AND COALESCE(tx_status, 'pending') != 'transcribed'",
+                names,
+            ).fetchall()
+        except sqlite3.Error as e:
+            _log.debug("tx_status title reconcile query failed (%s): %s",
+                       ch_name or folder_name, e)
+            continue
+        if not rows:
+            continue
+
+        _maybe_wait()
+        already = _scan_existing_transcript_titles(
+            folder, ch_name or folder_name)
+        if not already:
+            continue
+        done_vids = {
+            vid for (_raw, vid) in already.values()
+            if (vid or "").strip()
+        }
+
+        ids: list[int] = []
+        for n, row in enumerate(rows, start=1):
+            if n % 100 == 0:
+                _maybe_wait()
+            row_id, title, filepath, video_id = row
+            vid = (video_id or "").strip()
+            if vid and vid in done_vids:
+                ids.append(int(row_id))
+                continue
+
+            candidates = []
+            title_s = (title or "").strip()
+            if title_s:
+                candidates.append(title_s)
+                plain = strip_id.sub("", title_s).strip()
+                if plain and plain != title_s:
+                    candidates.append(plain)
+            fp_s = (filepath or "").strip()
+            if fp_s:
+                stem = os.path.splitext(os.path.basename(fp_s))[0].strip()
+                if stem:
+                    candidates.append(stem)
+                    plain = strip_id.sub("", stem).strip()
+                    if plain and plain != stem:
+                        candidates.append(plain)
+
+            if any(_norm_title(c) in already for c in candidates if c):
+                ids.append(int(row_id))
+
+        if not ids:
+            continue
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            placeholders = ",".join(["?"] * len(chunk))
+            cur = conn.execute(
+                "UPDATE videos SET tx_status='transcribed' "
+                f"WHERE id IN ({placeholders})",
+                chunk,
+            )
+            total_changed += cur.rowcount or 0
+        conn.commit()
+
+    return total_changed
+
+
 def sweep_new_videos(output_dir: str, channels: list,
                      progress_cb=None,
                      gpu_busy_fn=None) -> dict:
@@ -397,6 +530,44 @@ def sweep_new_videos(output_dir: str, channels: list,
     except Exception as e:
         _log.warning("aggregated transcript sweep failed: %s", e)
 
+    # ── Self-heal tx_status against ground truth ─────────────────────
+    # tx_status is a denormalized flag; the aggregated-transcript ingest
+    # could not reliably flip it (it can only match an individual video by
+    # filepath, but aggregated ingest is keyed to the channel-level .txt),
+    # so whole channels drifted to a stale 'pending' even though their
+    # segments were fully indexed. Reconcile here against the real signal —
+    # a video whose video_id has >=1 segment IS transcribed — so the flag
+    # can never silently drift out of sync on any future rescan. Cheap:
+    # only non-transcribed rows are probed, each via the idx_seg_video_id
+    # index (EXISTS), so this is a handful of seconds even on a large DB.
+    reconciled = 0
+    try:
+        _rc = sweep_conn.execute(
+            "UPDATE videos SET tx_status='transcribed' "
+            "WHERE tx_status != 'transcribed' "
+            "AND video_id IS NOT NULL AND video_id != '' "
+            "AND EXISTS (SELECT 1 FROM segments s "
+            "            WHERE s.video_id = videos.video_id)")
+        reconciled = _rc.rowcount or 0
+        sweep_conn.commit()
+        if reconciled:
+            _log.info("tx_status reconcile: flipped %d video(s) to "
+                      "'transcribed' (had segments but stale status)",
+                      reconciled)
+    except Exception as e:
+        _log.debug("tx_status reconcile failed: %s", e)
+
+    title_reconciled = 0
+    try:
+        title_reconciled = _reconcile_tx_status_from_transcript_titles(
+            sweep_conn, output_dir, channels, _wait_while_busy)
+        if title_reconciled:
+            _log.info("tx_status title reconcile: flipped %d video(s) to "
+                      "'transcribed' (matched existing Transcript.txt)",
+                      title_reconciled)
+    except Exception as e:
+        _log.debug("tx_status title reconcile failed: %s", e)
+
     # Persist the updated fingerprints by MERGING into a FRESH load —
     # never by saving our start-of-sweep snapshot. The sweep walks for
     # minutes while sync's update_disk_cache_for_channel and
@@ -431,6 +602,9 @@ def sweep_new_videos(output_dir: str, channels: list,
     return {"registered": registered, "ingested": ingested,
             "agg_ingested": agg_ingested,
             "id_backfilled": id_backfilled,
+            "tx_reconciled": reconciled + title_reconciled,
+            "tx_reconciled_by_id": reconciled,
+            "tx_reconciled_by_title": title_reconciled,
             "skipped_unchanged": skipped_unchanged,
             "walked": total_ch - skipped_unchanged}
 

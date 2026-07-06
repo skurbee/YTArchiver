@@ -51,9 +51,15 @@
   window.renderQueues = function (queues) {
     renderTaskList("sync-tasks-body", queues.sync, "No sync tasks queued.", "sync");
     renderTaskList("gpu-tasks-body", queues.gpu, "No processing tasks queued.", "gpu");
-    _updateBadge("badge-sync", (queues.sync || []).length);
-    _updateBadge("badge-gpu", (queues.gpu || []).length);
+    _updateBadge("badge-sync", _queueCount(queues, "sync"));
+    _updateBadge("badge-gpu", _queueCount(queues, "gpu"));
   };
+
+  function _queueCount(queues, kind) {
+    const raw = queues?.[`${kind}_count`];
+    if (Number.isFinite(raw)) return Math.max(0, Number(raw));
+    return (queues?.[kind] || []).length;
+  }
 
   function _updateBadge(id, n) {
     const el = document.getElementById(id);

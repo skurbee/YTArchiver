@@ -172,14 +172,18 @@ class SyncMixin:
         # it fired `queue_resume` with no effect. Clear both.
         try: self._queues.set_sync_paused(False)
         except Exception as e: _log.warning("sync start: could not clear sync_paused flag; Pause button may show stale state: %s", e)
-        # Starting sync implies "resume all work" — clear the GPU pause
-        # flag too so transcribe jobs dispatched from this pass actually
-        # process instead of piling up behind a stale paused flag left
-        # over from a prior session.
+        # Release ONLY a pause restored from a prior session (user paused then
+        # quit) so leftover restored transcribe work isn't stuck behind it when
+        # a fresh sync starts. A pause the user set in the CURRENT session is
+        # left intact — clearing it on every sync start silently un-paused a
+        # deliberately-paused Processing queue (an auto-sync catching a download
+        # resumed it mid-batch; user-reported). gpu_pause_restored flips False
+        # the moment the user touches the pause this session.
         try:
-            self._queues.set_gpu_paused(False)
-            self._transcribe.resume()
-        except Exception as e: _log.warning("sync start: could not clear GPU paused flag; transcribe jobs may stall: %s", e)
+            if getattr(self._queues, "gpu_pause_restored", False):
+                self._queues.set_gpu_paused(False)
+                self._transcribe.resume()
+        except Exception as e: _log.warning("sync start: could not clear restored GPU pause: %s", e)
         # Start tray icon spin animation so the user can see sync is live
         # even when the window is minimized. Matches YTArchiver.py:3526
         # _tray_start_spin(red=False).
@@ -499,7 +503,19 @@ class SyncMixin:
         except Exception as e:
             _log.debug("swallowed: %s", e)
         try:
+            self._queues.clear_resuming_slots("gpu", clear_current=True)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        try:
             self._transcribe.drop_running_from_journal()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        try:
+            self._transcribe.clear_pending_journal()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        try:
+            removed += self._queues.gpu_clear()
         except Exception as e:
             _log.debug("swallowed: %s", e)
         self._on_queue_changed()

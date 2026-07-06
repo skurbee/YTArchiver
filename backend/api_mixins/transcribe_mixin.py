@@ -264,7 +264,8 @@ class TranscribeMixin:
 
 
     def transcribe_retranscribe(self, path, title="", video_id="",
-                                 _on_complete_extra=None):
+                                 _on_complete_extra=None, *,
+                                 _log_queued=True):
         """Queue a re-transcription of a video with the current Whisper model.
         Mirrors YTArchiver.py:16369 `_run_retranscribe_job`.
 
@@ -406,7 +407,7 @@ class TranscribeMixin:
         # already-running job, etc.). Previously a successful enqueue
         # was silent — the only feedback was the toast, which is easy
         # to miss if it fires under a modal or off-screen.
-        if ok:
+        if ok and _log_queued:
             try:
                 _disp = title or os.path.basename(path)
                 _ch = f" ({channel_name})" if channel_name else ""

@@ -74,11 +74,31 @@ class ThumbnailMixin:
         missing thumbnails for one channel. Returns immediately; the
         sweep result goes to the log.
         """
-        name = folder_or_name if isinstance(folder_or_name, str) else (
-            folder_or_name.get("name") or folder_or_name.get("folder", ""))
-        ch = subs_backend.get_channel({"name": name})
+        # Pass the FULL identity (url + name + folder) to get_channel, not a
+        # name-only lookup. The Metadata table sends {folder, url} with NO
+        # name, and a channel whose stored `folder` is empty/None (so the
+        # row's folder resolves to "") then produced an empty name → the
+        # match found nothing and reported a bogus "Channel not found" even
+        # though the channel is subscribed. The URL still resolves it, which
+        # is exactly how every sibling row action (backfill / views /
+        # comments) looks the channel up — this just brings thumbnail
+        # refetch in line with them.
+        if isinstance(folder_or_name, str):
+            identity = {"name": folder_or_name}
+        else:
+            identity = {
+                "name": folder_or_name.get("name", ""),
+                "folder": folder_or_name.get("folder", ""),
+                "url": folder_or_name.get("url", ""),
+            }
+        ch = subs_backend.get_channel(identity)
         if not ch:
             return {"ok": False, "error": "Channel not found"}
+        # Prefer the resolved channel's own name for log lines — the
+        # identity's name/folder may have been blank (the very case above).
+        name = (ch.get("name") or ch.get("folder")
+                or identity.get("name") or identity.get("folder")
+                or "channel")
         def _run():
             log_stream = self._thumbnail_log_stream()
             try:

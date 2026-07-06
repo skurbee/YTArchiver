@@ -518,11 +518,14 @@
         // full metadata sweep. Removed to keep the menu focused.
         { sep: true },
         { label: _txLabel, cls: _txDisabled ? "dim" : "",
+          title: "Transcribe only videos that don't have a transcript yet (YouTube captions first, Whisper fallback)",
           action: () => { if (!_txDisabled) _askTranscribeChannel(chan); }},
         // right-click → re-transcribe entire channel with
         // model selection. Confirms first because this can be a long
         // GPU job (hundreds of videos on large channels).
-        { label: "Re-transcribe channel…", action: async () => {
+        { label: "Re-transcribe channel…",
+          title: "Redo every video with Whisper, replacing existing transcripts (use this to fix bad/corrupted ones)",
+          action: async () => {
           const model = await (window._askWhisperModel?.(`channel "${chan}"`));
           if (!model) return;
           const ok = await askDanger(

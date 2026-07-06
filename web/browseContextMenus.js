@@ -80,7 +80,9 @@
           // right-click → re-transcribe whole channel
           // with a Whisper model picker. Same API as the Subs context
           // menu version.
-          { label: "Re-transcribe channel…", action: async () => {
+          { label: "Re-transcribe channel…",
+            title: "Redo every video with Whisper, replacing existing transcripts (use this to fix bad/corrupted ones)",
+            action: async () => {
             const model = await (window._askWhisperModel?.(`channel "${name}"`));
             if (!model) return;
             const ok = await askDanger(
@@ -128,6 +130,7 @@
                 action: () => api?.metadata_refresh_comments_channel?.({ name }, null) },
             ]},
           { label: _txLabel,
+            title: "Transcribe only videos that don't have a transcript yet (YouTube captions first, Whisper fallback)",
             action: () => window._askTranscribeChannel?.(name) },
           { sep: true },
           { label: "Reorg folder",

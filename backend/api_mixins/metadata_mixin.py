@@ -334,6 +334,12 @@ class MetadataMixin:
                 # so the user can tell a channel's "real" coverage
                 # vs total file count.
                 "removed_from_yt": _idstats.get("removed_from_yt", 0),
+                # Per-channel transcription coverage — how many on-disk
+                # videos have an actual transcript (tx_status='transcribed').
+                # Summed into the Metadata "Transcribed" total tile. Comes
+                # free from the same bulk GROUP BY as the id stats.
+                "tx_transcribed": _idstats.get("transcribed", 0),
+                "tx_total": _idstats.get("total", 0),
             })
         # Sort oldest-refresh-first by default so stale channels float up.
         # A missing timestamp (never refreshed) sorts as oldest (ts=0).

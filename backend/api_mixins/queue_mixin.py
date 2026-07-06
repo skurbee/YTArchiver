@@ -47,6 +47,25 @@ class QueueMixin:
             return services.save_config(cfg)
         return save_config(cfg)
 
+    def _queue_gpu_count(self):
+        queues = self._queue_state()
+        try:
+            counts = queues.counts()
+            return max(0, int(counts.get("gpu") or 0))
+        except Exception:
+            pass
+        try:
+            return max(0, len(getattr(queues, "gpu", []) or []))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _queue_task_count_label(count):
+        if count <= 0:
+            return "the queue"
+        suffix = "" if count == 1 else "s"
+        return f"{count:,} queued task{suffix}"
+
     def get_queues(self):
         """Return the real live queue state — empty list when nothing's queued.
 
@@ -310,12 +329,34 @@ class QueueMixin:
     def queue_resume(self, which="both"):
         """Resume a paused queue."""
         queues = self._queue_state()
+        gpu_count = self._queue_gpu_count() if which in ("gpu", "both") else 0
         if which in ("sync", "both"):
             self._sync_pause.clear()
             queues.set_sync_paused(False)
         if which in ("gpu", "both"):
             queues.set_gpu_paused(False)
-            self._queue_transcribe().resume()
+            # request_drain() (not plain resume()) so the backlog that
+            # accumulated while paused actually drains AND its completion
+            # lines land at the live log tail. Two reasons resume() alone
+            # was wrong here:
+            #   1. Visibility — a job drained long after its download emits
+            #      its "Transcribed …" line in-place over the sync-reserved
+            #      tx_done_<vid> placeholder, which by now has scrolled far
+            #      up (or been trimmed), so the user saw the [Trnscr]
+            #      activity row appear with NO matching log lines. The
+            #      manual-drain path emits a fresh tail line instead.
+            #   2. Auto-off — resume() only clears the pause Event; with the
+            #      Auto checkbox off the worker re-parks on the Auto gate
+            #      and never drains. request_drain() arms a one-shot drain
+            #      that empties the backlog regardless, then re-parks.
+            self._queue_transcribe().request_drain()
+            try:
+                self._queue_log_stream().emit_text(
+                    " - Processing queue resumed - draining "
+                    f"{self._queue_task_count_label(gpu_count)}.",
+                    "simpleline_green")
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         self._on_queue_changed()
         return {"ok": True, "paused": False}
 
@@ -338,6 +379,7 @@ class QueueMixin:
         queue_pause/queue_resume; the Processing queue is the only drainable
         one.)"""
         queues = self._queue_state()
+        gpu_count = self._queue_gpu_count()
         queues.set_gpu_paused(False)
         try:
             self._queue_transcribe().request_drain()
@@ -349,8 +391,9 @@ class QueueMixin:
             _log.debug("swallowed: %s", e)
         try:
             self._queue_log_stream().emit_text(
-                " - Processing started — draining the queue. "
-                "(Auto stays off.)",
+                " - Processing started - draining "
+                f"{self._queue_task_count_label(gpu_count)}. "
+                "Auto stays off.",
                 "simpleline_green")
         except Exception as e:
             _log.debug("swallowed: %s", e)

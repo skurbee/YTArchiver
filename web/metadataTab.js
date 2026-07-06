@@ -150,6 +150,14 @@
       || ((s) => String(s ?? "").replace(/[&<>"']/g, c =>
           ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])));
 
+    const fmtPct = (a, b, digits = 1) => {
+      if (b <= 0) return "0%";
+      if (a >= b) return "100%";
+      const factor = 10 ** digits;
+      const floored = Math.floor(((a / b) * 100) * factor) / factor;
+      return `${floored.toFixed(digits)}%`;
+    };
+
     const sortRows = (rows) => {
       const mult = _sortDir === "asc" ? 1 : -1;
       const kfn = {
@@ -168,6 +176,14 @@
         thumbs: (r) => {
           const t = r.thumb_total || 0;
           const w = r.thumb_with || 0;
+          return t > 0 ? ((t - w) / t) : 0;
+        },
+        // Transcribed — sort by the not-transcribed ratio so the
+        // least-covered channels float to the top when descending,
+        // matching the ids/thumbs "worst-first" behavior.
+        transcribed: (r) => {
+          const t = r.tx_total || 0;
+          const w = r.tx_transcribed || 0;
           return t > 0 ? ((t - w) / t) : 0;
         },
         // "Still on YT" column — sort by the removed-from-YT ratio so
@@ -208,6 +224,7 @@
       let nVideos = 0;
       let idTot = 0, idWith = 0;
       let thTot = 0, thWith = 0;
+      let txTot = 0, txWith = 0;
       // For Still-on-YT: only aggregate channels that have actually been
       // bulk-checked since the removed-from-YT detection shipped. Sum-
       // ming the others would dilute the percentage with channels whose
@@ -220,6 +237,8 @@
         idWith += (r.id_with_id || 0);
         thTot += (r.thumb_total || 0);
         thWith += (r.thumb_with || 0);
+        txTot += (r.tx_total || 0);
+        txWith += (r.tx_transcribed || 0);
         const _vts = r.last_views_refresh_ts || 0;
         if (_vts >= REMOVED_DETECTION_SINCE) {
           onTotChecked += (r.id_total || 0);
@@ -268,7 +287,7 @@
       if (idTot > 0) {
         const p = pct(idWith, idTot);
         setCard("md-tot-card-ids", "md-tot-ids",
-                `${p.toFixed(1)}%`,
+                fmtPct(idWith, idTot),
                 `${fmt(idWith)} / ${fmt(idTot)}`,
                 tier(p));
       } else {
@@ -278,7 +297,7 @@
       if (thTot > 0) {
         const p = pct(thWith, thTot);
         setCard("md-tot-card-thumbs", "md-tot-thumbs",
-                `${p.toFixed(1)}%`,
+                fmtPct(thWith, thTot),
                 `${fmt(thWith)} / ${fmt(thTot)}`,
                 tier(p));
       } else {
@@ -286,6 +305,18 @@
                 _thumbsLoaded ? "—" : "loading…",
                 "",
                 null);
+      }
+      // Transcribed tile — archive-wide transcription coverage
+      // (videos with a real transcript / total videos). Same %-tile
+      // shape + color tiers as IDs / Thumbs.
+      if (txTot > 0) {
+        const p = pct(txWith, txTot);
+        setCard("md-tot-card-transcribed", "md-tot-transcribed",
+                fmtPct(txWith, txTot),
+                `${fmt(txWith)} / ${fmt(txTot)}`,
+                tier(p));
+      } else {
+        setCard("md-tot-card-transcribed", "md-tot-transcribed", "—", "", null);
       }
       // Still-on-YT tile. ONLY counts channels actually checked since
       // detection shipped (see filter above). Three states:
@@ -322,18 +353,9 @@
       } else if (onTotChecked > 0 && onRemovedChecked > 0) {
         const live = Math.max(0, onTotChecked - onRemovedChecked);
         const p = pct(live, onTotChecked);
-        // Bug fix v62.4: a tiny number of removals on a huge total
-        // (e.g. 20 removed of 101,988 = 99.98%) used to round up to
-        // "100.0%" via toFixed(1). The user then saw "100%" in the
-        // card while per-row entries showed 99.8%/99.9% — a confusing
-        // mismatch even though both sides agreed on the underlying
-        // count. Bump to toFixed(2) whenever toFixed(1) would round
-        // to "100.0" so the "we found N removed" signal stays in the
-        // displayed percentage instead of getting hidden by rounding.
-        let pStr = p.toFixed(1);
-        if (pStr === "100.0" && p < 100) pStr = p.toFixed(2);
+        // Never display 100% unless every tracked item is actually present.
         setCard("md-tot-card-onyt", "md-tot-onyt",
-                `${pStr}%`,
+                fmtPct(live, onTotChecked),
                 `${fmt(live)} / ${fmt(onTotChecked)} · `
                   + `${fmt(onRemovedChecked)} removed`
                   + (onChannelsChecked < nChannels
@@ -367,7 +389,7 @@
         }
       });
       if (!_rows.length) {
-        tbody.innerHTML = '<tr><td colspan="8" class="md-empty">No channels configured.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" class="md-empty">No channels configured.</td></tr>';
         return;
       }
       const sorted = sortRows(_rows);
@@ -395,7 +417,7 @@
           idHtml = '<span class="md-id-dim" title="No videos registered in the index DB for this channel">&mdash;</span>';
         } else {
           const pct = idWith / idTotal;
-          const pctStr = (pct * 100).toFixed(1) + "%";
+          const pctStr = fmtPct(idWith, idTotal);
           // Rich tooltip: show the split between "tried but
           // couldn't resolve" (probably genuinely unrecoverable)
           // vs "not yet attempted" (run Fix IDs to pick these up).
@@ -447,7 +469,7 @@
           thumbHtml = '<span class="md-id-dim" title="No on-disk videos to check">&mdash;</span>';
         } else {
           const pct = thWith / thTotal;
-          const pctStr = (pct * 100).toFixed(1) + "%";
+          const pctStr = fmtPct(thWith, thTotal);
           let detail = `${thWith.toLocaleString()} of ${thTotal.toLocaleString()} video(s) have a thumbnail sidecar`;
           if (thMissing > 0) {
             detail += ` \u2014 ${thMissing.toLocaleString()} missing. Right-click channel \u2192 "Refetch missing thumbnails"`;
@@ -460,6 +482,31 @@
             thumbHtml = `<span class="md-id-warn" title="${detail}">\u26A0 ${pctStr}</span>`;
           } else {
             thumbHtml = `<span class="md-id-neutral" title="${detail}">${pctStr}</span>`;
+          }
+        }
+
+        // Transcribed coverage column. Unlike IDs/thumbs (where a gap is
+        // a fixable defect) low transcription is often just work-in-
+        // progress, so we color by the same 90/50 tiers as the Transcribed
+        // card but skip the ⚠/✗ symbols to avoid implying every non-100%
+        // channel needs action. 100% still gets the ✓ for at-a-glance scan.
+        const txTotal = r.tx_total || 0;
+        const txWith = r.tx_transcribed || 0;
+        let txHtml;
+        if (txTotal === 0) {
+          txHtml = '<span class="md-id-dim" title="No on-disk videos to check">&mdash;</span>';
+        } else {
+          const pctVal = (txWith / txTotal) * 100;
+          const pctStr = fmtPct(txWith, txTotal);
+          const detail = `${txWith.toLocaleString()} of ${txTotal.toLocaleString()} video(s) have a transcript`;
+          if (txWith >= txTotal) {
+            txHtml = `<span class="md-id-ok" title="${detail}">✓ 100%</span>`;
+          } else if (pctVal >= 90) {
+            txHtml = `<span class="md-id-neutral" title="${detail}">${pctStr}</span>`;
+          } else if (pctVal >= 50) {
+            txHtml = `<span class="md-id-warn" title="${detail}">${pctStr}</span>`;
+          } else {
+            txHtml = `<span class="md-id-bad" title="${detail}">${pctStr}</span>`;
           }
         }
 
@@ -486,7 +533,7 @@
           onYtHtml = `<span class="md-id-ok" title="${onTotal.toLocaleString()} video(s) on disk, all still on YouTube as of the last bulk refresh.">\u2713 100%</span>`;
         } else {
           const pct = onLive / onTotal;
-          const pctStr = (pct * 100).toFixed(1) + "%";
+          const pctStr = fmtPct(onLive, onTotal);
           const detail = `${onLive.toLocaleString()} of ${onTotal.toLocaleString()} still on YouTube \u2014 ${onRemoved.toLocaleString()} removed / privated / unlisted by the uploader since download. Removed videos can't be metadata-refreshed; local files + IDs are preserved.`;
           if (pct < 0.50) {
             onYtHtml = `<span class="md-id-bad" title="${detail}">\u2717 ${pctStr} (${onLive.toLocaleString()}/${onTotal.toLocaleString()})</span>`;
@@ -508,6 +555,7 @@
           <td class="md-col-num">${(r.video_count || 0).toLocaleString()}</td>
           <td class="md-col-ids">${idHtml}</td>
           <td class="md-col-ids">${thumbHtml}</td>
+          <td class="md-col-ids">${txHtml}</td>
           <td class="md-col-onyt">${onYtHtml}</td>
           <td class="md-col-ts ${v.cls}">${v.text}</td>
           <td class="md-col-ts ${c.cls}">${c.text}</td>
@@ -533,7 +581,7 @@
 
     window._refreshMetadataTab = async (opts = {}) => {
       if (!nativeBridgeUp()) {
-        tbody.innerHTML = '<tr><td colspan="8" class="md-empty">Native mode required.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" class="md-empty">Native mode required.</td></tr>';
         return;
       }
       const preferCache = !!opts.preferCache;
@@ -568,7 +616,7 @@
         try { render(); } catch (e) { /* stale cache shape */ }
         if (table) table.classList.add("is-refreshing");
       } else {
-      tbody.innerHTML = '<tr><td colspan="8" class="md-empty">'
+      tbody.innerHTML = '<tr><td colspan="9" class="md-empty">'
         + 'Loading channels\u2026 <span id="md-load-info" class="md-load-info"></span>'
         + '</td></tr>';
       const _info = document.getElementById("md-load-info");
@@ -649,7 +697,7 @@
         if (_rows.length) {
           window._showToast?.("Couldn't refresh metadata — showing cached data.", "warn");
         } else {
-          tbody.innerHTML = `<tr><td colspan="8" class="md-empty">`
+          tbody.innerHTML = `<tr><td colspan="9" class="md-empty">`
             + `Failed to load: ${escapeHtml(String(e))}</td></tr>`;
         }
         return;
@@ -735,6 +783,15 @@
            : pick === "fast" ? "fast"
            : null;
     };
+    const _rowForIdent = (ident) => {
+      try {
+        return _rows.find(r => ident.folder && r.folder === ident.folder)
+          || _rows.find(r => ident.url && r.url === ident.url)
+          || null;
+      } catch {
+        return null;
+      }
+    };
     const _runRowAct = async (act, ident, rowRefs) => {
       if (!nativeBridgeUp()) return;
       if (act === "views") {
@@ -760,8 +817,7 @@
         // so the dialog can show real time estimates.
         let _vc = 0;
         try {
-          const _r = _rows.find(r => ident.folder && r.folder === ident.folder)
-            || _rows.find(r => ident.url && r.url === ident.url);
+          const _r = _rowForIdent(ident);
           _vc = _r?.video_count || 0;
         } catch {}
         const _mode = await _promptBackfillMode(
@@ -794,6 +850,54 @@
               "ok");
           } else if (res?.error) {
             window._showToast?.(res.error, "error");
+          }
+        } catch (err) {
+          window._showToast?.(String(err), "error");
+        }
+      } else if (act === "transcribe") {
+        const row = _rowForIdent(ident);
+        const channelName = row?.name || ident.folder || "";
+        if (!channelName) {
+          window._showToast?.("Channel name unavailable.", "error");
+          return;
+        }
+        if (typeof window._askTranscribeChannel === "function") {
+          await window._askTranscribeChannel(channelName);
+          return;
+        }
+        try {
+          const res = await bridgeCall("chan_transcribe_all", channelName);
+          if (!res?.ok) {
+            window._showToast?.(res?.error || "Transcribe failed to start.",
+              "error");
+          } else if (res?.needs_choice) {
+            const pick = askChoice ? await askChoice({
+              title: "Transcribe - " + channelName,
+              message: "Where should transcript files be placed?",
+              choices: [
+                { label: `Follow organization (${res.org_label} folders)`,
+                  value: "follow", primary: true },
+                { label: "Combined (one file for entire channel)",
+                  value: "combined" },
+              ],
+              countdownSecs: 60,
+              countdownLabel: "Auto-selecting Follow organization in",
+            }) : "follow";
+            if (pick === null) return;
+            const retry = await bridgeCall(
+              "chan_transcribe_all", channelName, pick === "combined");
+            if (!retry?.ok) {
+              window._showToast?.(
+                retry?.error || "Transcribe failed to start.", "error");
+            } else {
+              window._showToast?.(
+                `Queued ${retry?.queued || 0} video(s) for transcription.`,
+                "ok");
+            }
+          } else {
+            window._showToast?.(
+              `Queued ${res?.queued || 0} video(s) for transcription.`,
+              "ok");
           }
         } catch (err) {
           window._showToast?.(String(err), "error");
@@ -838,7 +942,11 @@
       _closeRowMenu();
       let ident = {};
       try { ident = JSON.parse(tr.dataset.identity || "{}"); } catch {}
+      const row = _rowForIdent(ident);
       const needsFix = tr.classList.contains("md-row-needs-fix");
+      const txTotal = row?.tx_total || 0;
+      const txWith = row?.tx_transcribed || 0;
+      const needsTranscribe = txTotal > 0 && txWith < txTotal;
       // Reorder so the most-likely action is FIRST — askChoice focuses
       // the first primary-kinded button for keyboard confirm. Since
       // the default kind is now primary (all green), ordering alone
@@ -861,6 +969,8 @@
       };
       const fixItem = mkItem("Fix missing video IDs", "backfill",
                              { warn: needsFix });
+      const transcribeItem = mkItem("Transcribe missing", "transcribe",
+                                    { warn: needsTranscribe });
       const viewsItem = mkItem("Refresh views/likes", "views");
       const thumbsItem = mkItem("Refetch missing thumbnails", "thumbs");
       // "Refresh comments" carries a hover-submenu with day-scope picks.
@@ -884,8 +994,10 @@
       // auto-focus, not color, under the new default-to-primary kind.
       if (needsFix) {
         menu.appendChild(fixItem);
+        if (needsTranscribe) menu.appendChild(transcribeItem);
         menu.appendChild(viewsItem);
       } else {
+        if (needsTranscribe) menu.appendChild(transcribeItem);
         menu.appendChild(viewsItem);
         menu.appendChild(fixItem);
       }

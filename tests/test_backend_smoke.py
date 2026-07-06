@@ -1876,6 +1876,99 @@ class ThumbnailMixinTests(unittest.TestCase):
         self.assertEqual(result, {"ok": False, "error": "unknown token"})
         self.assertTrue(hasattr(api, "_realign_jobs_lock"))
 
+    def test_invalidate_thumb_cache_entry_drops_stale_channel(self) -> None:
+        """After a sweep fetches thumbnails, the channel's persisted status
+        entry must be dropped so a plain (force=False) reload re-walks disk
+        instead of returning the pre-sweep count. Case-insensitive key."""
+        from backend import thumbnails as _th
+        store = {
+            "techlinked": {"fingerprint": 1.0, "total": 1285,
+                           "with_thumb": 1154, "missing": 131},
+            "other channel": {"fingerprint": 2.0, "total": 5,
+                              "with_thumb": 5, "missing": 0},
+        }
+        with mock.patch.object(_th, "_load_thumb_cache",
+                               side_effect=lambda: dict(store)), \
+                mock.patch.object(_th, "_save_thumb_cache",
+                                  side_effect=lambda c: store.clear()
+                                  or store.update(c)):
+            _th.invalidate_thumb_cache_entry("TechLinked")
+        self.assertNotIn("techlinked", store)         # stale entry gone
+        self.assertIn("other channel", store)         # siblings untouched
+
+    def test_sweep_invalidates_thumb_cache_when_fetched(self) -> None:
+        """sweep_missing_thumbnails must invalidate the channel's status
+        cache when it actually fetched files (so the % column refreshes),
+        and must NOT bother when nothing changed."""
+        from backend.metadata import thumbnails_ops as _ops
+        from backend import thumbnails as _th
+        calls: list[str] = []
+
+        def _fake_sweep_body(fetched):
+            # Exercise only the tail invalidation branch by patching the
+            # rest of the sweep to a no-op that returns a chosen count.
+            if fetched:
+                _th.invalidate_thumb_cache_entry("Neo")
+
+        with mock.patch.object(_th, "invalidate_thumb_cache_entry",
+                               side_effect=lambda n: calls.append(n)):
+            # fetched>0 → invalidate; fetched==0 → skip.
+            _fake_sweep_body(3)
+            _fake_sweep_body(0)
+        self.assertEqual(calls, ["Neo"])
+        # Guard: the real sweep tail references the helper by the same name.
+        self.assertTrue(hasattr(_th, "invalidate_thumb_cache_entry"))
+        self.assertIn("invalidate_thumb_cache_entry",
+                      _ops.sweep_missing_thumbnails.__code__.co_names)
+
+    def test_refetch_thumbnails_forwards_url_when_folder_blank(self) -> None:
+        """Regression: a subscribed channel whose stored `folder` is
+        empty/None makes the Metadata row send {folder:"", url:...} with no
+        name. refetch_thumbnails must forward that URL to get_channel (like
+        every sibling row action) rather than collapse to a name-only lookup
+        that finds nothing and returns a bogus "Channel not found"."""
+        class InlineThread:
+            def __init__(self, target, *args, **kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        captured: dict = {}
+
+        def _fake_get_channel(identity):
+            captured.clear()
+            captured.update(identity or {})
+            # Real get_channel resolves this by URL; a name-only lookup
+            # (identity["name"] == "") would return None here.
+            if identity.get("url"):
+                return {"name": "Neo", "url": identity["url"]}
+            if (identity.get("name") or identity.get("folder")):
+                return {"name": identity.get("name") or identity.get("folder")}
+            return None
+
+        class Api(ThumbnailMixin):
+            def __init__(self):
+                self._config = None
+                self._log_stream = mock.Mock()
+                self.services = None
+
+        api = Api()
+        with mock.patch("backend.api_mixins.thumbnail_mixin"
+                        ".subs_backend.get_channel",
+                        side_effect=_fake_get_channel), \
+                mock.patch.object(thumbnail_mixin.threading, "Thread",
+                                  side_effect=InlineThread), \
+                mock.patch("backend.metadata.sweep_missing_thumbnails",
+                           return_value={"fetched": 0, "missing": 0,
+                                         "checked": 0}):
+            res = api.refetch_thumbnails(
+                {"folder": "", "url": "https://www.youtube.com/@neoexplains"})
+
+        self.assertTrue(res.get("started"))
+        self.assertEqual(captured.get("url"),
+                         "https://www.youtube.com/@neoexplains")
+
     def test_thumbnail_mixin_prefers_app_services_dependencies(self) -> None:
         class InlineThread:
             def __init__(self, target, *args, **kwargs):
@@ -3839,6 +3932,92 @@ class TranscribeManagerQueueTests(unittest.TestCase):
             self.assertEqual(len(mgr._jobs), 0)
             bump.assert_not_called()
 
+    def test_auto_caption_fast_path_marks_pending_decremented(self) -> None:
+        stream = mock.Mock()
+        mgr = transcribe_core.TranscribeManager(stream)
+        job = {
+            "path": "Video.mp4",
+            "title": "Video",
+            "channel": "Channel",
+            "cancel": threading.Event(),
+            "retranscribe": False,
+        }
+
+        with mock.patch.object(transcribe_core, "_try_auto_captions",
+                               return_value=True):
+            mgr._transcribe_one(job)
+
+        self.assertTrue(job.get("_pending_decremented"))
+
+    def test_no_speech_line_replaces_own_progress_row(self) -> None:
+        stream = mock.Mock()
+        mgr = transcribe_core.TranscribeManager(stream)
+        job = {
+            "path": "Silent.mp4",
+            "title": "Silent",
+            "channel": "Channel",
+            "cancel": threading.Event(),
+            "job_tag": "whisper_job_77",
+        }
+        mgr._jobs = [job]
+
+        with mock.patch.object(mgr, "is_available", return_value=True), \
+                mock.patch.object(mgr, "_persist_pending"), \
+                mock.patch.object(mgr, "_flush_batch_stats"), \
+                mock.patch.object(transcribe_core,
+                                  "_bump_transcription_pending"), \
+                mock.patch.object(
+                    mgr, "_transcribe_one",
+                    side_effect=RuntimeError(
+                        "Whisper returned an empty transcript")):
+            mgr._worker_loop()
+
+        emitted = stream.emit.call_args_list[0].args[0]
+        tags = emitted[0][1]
+        self.assertIn("no speech detected", emitted[0][0])
+        self.assertIn("dim", tags)
+        self.assertIn("whisper_job_77", tags)
+
+    def test_load_pending_drops_no_speech_jobs(self) -> None:
+        stream = mock.Mock()
+        mgr = transcribe_core.TranscribeManager(stream)
+        q = queues.QueueState()
+        mgr.attach_queues(q)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = root / "transcription_index.db"
+            indexed_video = root / "Indexed.mp4"
+            queued_video = root / "Unboxed： Intel X25-V 40GB SSD.mp4"
+            indexed_video.write_bytes(b"v")
+            queued_video.write_bytes(b"v")
+            q.gpu = [{"path": str(queued_video),
+                      "title": "Unboxed： Intel X25-V 40GB SSD"}]
+            journal = root / "pending.json"
+            journal.write_text(json.dumps([{
+                "path": str(queued_video),
+                "title": "Unboxed： Intel X25-V 40GB SSD",
+                "channel": "Chan",
+                "video_id": "",
+            }]), encoding="utf-8")
+
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path), \
+                    mock.patch.object(transcribe_core,
+                                      "_pending_journal_path",
+                                      return_value=journal):
+                IndexIngestTests._reset_index_module()
+                self.assertTrue(index.register_video(
+                    str(indexed_video), "Chan",
+                    "Unboxed: Intel X25-V 40GB SSD",
+                    video_id="vSilent0001"))
+                self.assertTrue(index.mark_video_no_speech(str(indexed_video)))
+
+                recovered = mgr.load_pending()
+
+        self.assertEqual(recovered, 0)
+        self.assertEqual(mgr._jobs, [])
+        self.assertEqual(q.gpu, [])
+        q.mark_orphan()
+
     def test_reorder_pending_job_mirrors_gpu_popover_order(self) -> None:
         stream = mock.Mock()
         mgr = transcribe_core.TranscribeManager(stream)
@@ -3896,13 +4075,34 @@ class TranscribeManagerQueueTests(unittest.TestCase):
                 mgr._jobs_lock.release()
 
         with mock.patch.object(mgr, "_stop_subprocess",
-                               side_effect=fake_stop) as stop:
+                               side_effect=fake_stop) as stop, \
+                mock.patch.object(mgr, "clear_pending_journal") as clear_j:
             mgr.cancel_all()
 
         cancel.set.assert_called_once()
         stop.assert_called_once_with(force=True)
+        clear_j.assert_called_once()
         self.assertEqual(mgr._jobs, [])
         self.assertEqual(lock_held_during_stop, [True])
+
+    def test_cancel_all_persists_empty_pending_journal(self) -> None:
+        stream = mock.Mock()
+        mgr = transcribe_core.TranscribeManager(stream)
+        mgr._jobs = [{"path": "queued.mp4", "title": "Queued"}]
+
+        with tempfile.TemporaryDirectory() as td:
+            journal = Path(td) / "pending.json"
+            with mock.patch.object(transcribe_core,
+                                   "_pending_journal_path",
+                                   return_value=journal):
+                mgr._persist_pending()
+                self.assertNotEqual(
+                    json.loads(journal.read_text(encoding="utf-8")), [])
+
+                mgr.cancel_all()
+
+                self.assertEqual(
+                    json.loads(journal.read_text(encoding="utf-8")), [])
 
     def test_send_cancel_command_writes_worker_protocol_message(self) -> None:
         stream = mock.Mock()
@@ -3918,6 +4118,20 @@ class TranscribeManagerQueueTests(unittest.TestCase):
         proc.stdin.write.assert_called_once_with(
             json.dumps({"command": "cancel"}) + "\n")
         proc.stdin.flush.assert_called_once()
+
+    def test_manual_processing_done_emits_tail_log_line(self) -> None:
+        stream = mock.Mock()
+        mgr = transcribe_core.TranscribeManager(stream)
+
+        mgr._emit_manual_processing_done({
+            "title": "Finished Video",
+            "channel": "Channel Name",
+            "path": r"C:\Archive\Finished Video.mp4",
+        })
+
+        stream.emit_text.assert_called_once_with(
+            " - Transcribed: Finished Video (Channel Name)",
+            "simpleline_blue")
 
     def test_start_subprocess_waits_for_concurrent_start(self) -> None:
         stream = mock.Mock()
@@ -4124,6 +4338,50 @@ class TranscribeVttTests(unittest.TestCase):
             self.assertTrue(ok)
             self.assertTrue(user_vtt.exists())
             hide.assert_called_once_with(str(video), str(txt))
+
+    def test_auto_caption_standalone_done_line_includes_title(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            video = root / "Standalone Video [abc123_def4].mp4"
+            video.write_bytes(b"video")
+            user_vtt = root / "Standalone Video [abc123_def4].en.vtt"
+            user_vtt.write_text("WEBVTT", encoding="utf-8")
+            txt = root / "Transcript.txt"
+            jsonl = root / ".Transcript.jsonl"
+            stream = mock.Mock()
+
+            with mock.patch.object(transcribe_vtt, "_parse_vtt",
+                                   return_value=[{"s": 0.0, "e": 1.0,
+                                                  "t": "hello world"}]), \
+                    mock.patch.object(transcribe_vtt,
+                                      "_resolve_transcript_paths",
+                                      return_value=(str(txt), str(jsonl),
+                                                    2026, 6,
+                                                    "06.14.2026")), \
+                    mock.patch.object(transcribe_vtt,
+                                      "_write_transcript_entry",
+                                      return_value=True), \
+                    mock.patch.object(transcribe_vtt,
+                                      "_write_jsonl_entry",
+                                      return_value=True), \
+                    mock.patch.object(transcribe_vtt,
+                                      "_hide_per_video_transcript_txt_if_needed"), \
+                    mock.patch.object(transcribe_vtt,
+                                      "_bump_transcription_pending"), \
+                    mock.patch("backend.index.ingest_jsonl"), \
+                    mock.patch("backend.index.mark_video_transcribed"), \
+                    mock.patch("backend.ytarchiver_config"
+                               ".remove_pending_tx_id"):
+                ok = transcribe_vtt._try_auto_captions(
+                    str(video), "Standalone Video", "Channel", stream, None,
+                    from_download=False)
+
+            self.assertTrue(ok)
+            emitted = stream.emit.call_args[0][0]
+            text = "".join(part for part, _tag in emitted)
+            self.assertIn("Standalone Video", text)
+            self.assertIn("Channel", text)
+            self.assertIn("auto-captions", text)
 
     def test_auto_caption_jsonl_failure_does_not_mark_transcribed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -5515,6 +5773,50 @@ class QueueMixinServicesTests(unittest.TestCase):
         api._transcribe._ensure_worker.assert_not_called()
         api._log_stream.emit_text.assert_not_called()
 
+    def test_gpu_start_and_resume_emit_main_log_feedback(self) -> None:
+        service_queues = mock.Mock()
+        service_queues.counts.return_value = {"gpu": 5}
+        service_log = mock.Mock()
+        service_transcribe = mock.Mock()
+
+        class Api(QueueMixin):
+            def __init__(self):
+                self._queues = mock.Mock()
+                self._transcribe = mock.Mock()
+                self._log_stream = mock.Mock()
+                self._config = None
+                self._sync_pause = threading.Event()
+                self._on_queue_changed = mock.Mock()
+                self.services = AppServices(
+                    load_config=lambda: {},
+                    save_config=lambda cfg: True,
+                    queues=service_queues,
+                    log_stream=service_log,
+                    transcribe=service_transcribe,
+                    event_bus=mock.Mock(),
+                )
+
+        api = Api()
+
+        start_result = api.gpu_start()
+        service_queues.counts.return_value = {"gpu": 2}
+        resume_result = api.queue_resume("gpu")
+
+        self.assertEqual(start_result, {"ok": True})
+        self.assertEqual(resume_result, {"ok": True, "paused": False})
+        # Both gpu_start AND queue_resume now drain via request_drain() so the
+        # backlog empties and its completion lines reach the live log tail
+        # (resume() alone left them invisibly replacing a scrolled-away
+        # placeholder, and never drained at all when Auto was off).
+        self.assertEqual(service_transcribe.request_drain.call_count, 2)
+        service_transcribe.resume.assert_not_called()
+        service_log.emit_text.assert_any_call(
+            " - Processing started - draining 5 queued tasks. Auto stays off.",
+            "simpleline_green")
+        service_log.emit_text.assert_any_call(
+            " - Processing queue resumed - draining 2 queued tasks.",
+            "simpleline_green")
+
 
 class WindowMixinServicesTests(unittest.TestCase):
     def test_confirm_close_remember_prefers_app_services_dependencies(self) -> None:
@@ -6020,6 +6322,36 @@ class QueueStateTests(unittest.TestCase):
         finally:
             q.mark_orphan()
 
+    def test_gpu_payload_count_tracks_raw_bulk_items(self) -> None:
+        q = queues.QueueState()
+        try:
+            q.current_gpu = {
+                "kind": "transcribe",
+                "title": "Video 2",
+                "channel": "Channel",
+                "path": "two.mp4",
+                "bulk_id": "bulk1",
+                "bulk_index": 1,
+                "bulk_total": 4,
+            }
+            q.gpu = [
+                {"kind": "transcribe", "title": "Video 3",
+                 "channel": "Channel", "path": "three.mp4",
+                 "bulk_id": "bulk1"},
+                {"kind": "transcribe", "title": "Video 4",
+                 "channel": "Channel", "path": "four.mp4",
+                 "bulk_id": "bulk1"},
+            ]
+
+            payload = q.to_ui_payload()
+
+            self.assertEqual(payload["gpu_count"], 3)
+            self.assertEqual(len(payload["gpu"]), 2)
+            self.assertIn("(2/4)", payload["gpu"][0]["name"])
+            self.assertIn("(2 more)", payload["gpu"][1]["name"])
+        finally:
+            q.mark_orphan()
+
     def test_sync_remove_at_uses_identity_when_index_stale(self) -> None:
         q = queues.QueueState()
         try:
@@ -6101,6 +6433,26 @@ class DiskWatchTests(unittest.TestCase):
 
 
 class SyncMixinQueueTests(unittest.TestCase):
+    def test_gpu_clear_queue_clears_visible_pending_and_resume_state(self) -> None:
+        api = sync_mixin.SyncMixin()
+        api._queues = mock.Mock()
+        api._queues.gpu_clear.side_effect = [3, 2]
+        api._transcribe = mock.Mock()
+        api._on_queue_changed = mock.Mock()
+
+        result = api.gpu_clear_queue()
+
+        self.assertEqual(result, {"ok": True, "removed": 5})
+        self.assertEqual(api._queues.gpu_clear.call_count, 2)
+        api._queues.set_current_gpu.assert_called_once_with(None)
+        api._queues.clear_resuming_slots.assert_called_once_with(
+            "gpu", clear_current=True)
+        api._transcribe.cancel_all.assert_called_once()
+        api._transcribe.skip_current.assert_called_once()
+        api._transcribe.drop_running_from_journal.assert_called_once()
+        api._transcribe.clear_pending_journal.assert_called_once()
+        api._on_queue_changed.assert_called_once()
+
     def test_gpu_defer_removes_existing_duplicate_before_enqueue(self) -> None:
         api = sync_mixin.SyncMixin()
         queues_mock = mock.Mock()
@@ -6840,6 +7192,63 @@ class IndexMaintenanceTests(unittest.TestCase):
     def tearDown(self) -> None:
         IndexIngestTests._reset_index_module()
 
+    def test_health_status_counts_exclude_duplicate_rows(self) -> None:
+        from backend.metadata import thumbnails_ops as metadata_thumbs
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db_path = Path(td) / "transcription_index.db"
+            root = Path(td) / "archive"
+            root.mkdir()
+            keep = root / "Keep.mp4"
+            dup = root / "Dup.mp4"
+            keep.write_bytes(b"video")
+            dup.write_bytes(b"video")
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path), \
+                    mock.patch.object(metadata_thumbs, "load_config",
+                                      return_value={"output_dir": str(root)}):
+                IndexIngestTests._reset_index_module()
+                try:
+                    conn = index._open()
+                    self.assertIsNotNone(conn)
+                    assert conn is not None
+                    conn.executemany(
+                        "INSERT INTO videos("
+                        "filepath, title, channel, video_id, size_bytes, "
+                        "tx_status, is_duplicate_of"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            (
+                                str(keep),
+                                "Keep",
+                                "Channel",
+                                "abc123_def4",
+                                123,
+                                "transcribed",
+                                None,
+                            ),
+                            (
+                                str(dup),
+                                "Dup",
+                                "Channel",
+                                "",
+                                123,
+                                "pending",
+                                str(keep),
+                            ),
+                        ],
+                    )
+                    conn.commit()
+
+                    rows = metadata_thumbs.count_video_id_status_bulk(
+                        [{"name": "Channel"}], force=True)
+
+                    self.assertEqual(rows["channel"]["total"], 1)
+                    self.assertEqual(rows["channel"]["with_id"], 1)
+                    self.assertEqual(rows["channel"]["missing"], 0)
+                    self.assertEqual(rows["channel"]["transcribed"], 1)
+                finally:
+                    IndexIngestTests._reset_index_module()
+
     def test_jsonl_needs_ingest_uses_indexed_file_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             jp = Path(td) / "Video.jsonl"
@@ -6871,6 +7280,61 @@ class IndexMaintenanceTests(unittest.TestCase):
                 conn.commit()
                 self.assertTrue(index_maintenance._jsonl_needs_ingest(
                     conn, str(jp)))
+            finally:
+                conn.close()
+
+    def test_reconcile_tx_status_from_transcript_titles_marks_done_rows(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "archive"
+            channel_dir = root / "Channel"
+            channel_dir.mkdir(parents=True)
+            (channel_dir / "Channel Transcript.txt").write_text(
+                "===(Already Done), (Jan 1 2026), (1m), "
+                "(YT CAPTIONS)===\nbody\n\n",
+                encoding="utf-8",
+            )
+            conn = sqlite3.connect(":memory:")
+            try:
+                conn.execute(
+                    "CREATE TABLE videos("
+                    "id INTEGER PRIMARY KEY, "
+                    "title TEXT, channel TEXT, filepath TEXT, "
+                    "video_id TEXT, tx_status TEXT)")
+                conn.executemany(
+                    "INSERT INTO videos("
+                    "title, channel, filepath, video_id, tx_status"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (
+                            "Already Done",
+                            "Channel",
+                            str(channel_dir
+                                / "Already Done [abc123_def4].mp4"),
+                            "",
+                            "pending",
+                        ),
+                        (
+                            "Needs Work",
+                            "Channel",
+                            str(channel_dir / "Needs Work [def456_ghi7].mp4"),
+                            "",
+                            "pending",
+                        ),
+                    ],
+                )
+                conn.commit()
+
+                changed = (
+                    index_maintenance
+                    ._reconcile_tx_status_from_transcript_titles(
+                        conn, str(root), [{"name": "Channel"}]))
+
+                self.assertEqual(changed, 1)
+                rows = dict(conn.execute(
+                    "SELECT title, tx_status FROM videos").fetchall())
+                self.assertEqual(rows["Already Done"], "transcribed")
+                self.assertEqual(rows["Needs Work"], "pending")
             finally:
                 conn.close()
 
@@ -7189,6 +7653,74 @@ class NoSpeechStatusTests(unittest.TestCase):
                 self.assertEqual(stats["total_videos"], 3)
                 self.assertEqual(stats["transcribed_videos"], 1)
                 IndexIngestTests._reset_index_module()
+
+    def test_channel_transcribe_all_skips_no_speech_videos(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db_path = Path(td) / "transcription_index.db"
+            chan_dir = Path(td) / "Chan"
+            chan_dir.mkdir(parents=True)
+            vid = "vSilent0001"
+            video = chan_dir / f"silent [{vid}].mp4"
+            video.write_bytes(b"v")
+
+            class Api(ChannelMixin):
+                def _coerce_channel_name(self, value):
+                    return str(value)
+
+                def _channel_folder_for_name(self, name):
+                    return {"name": name}, str(chan_dir)
+
+            api = Api()
+            api._transcribe = mock.Mock()
+            api._log_stream = mock.Mock()
+            api._on_queue_changed = mock.Mock()
+
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                IndexIngestTests._reset_index_module()
+                self.assertTrue(index.register_video(
+                    str(video), "Chan", "silent", video_id=vid))
+                self.assertTrue(index.mark_video_no_speech(str(video)))
+
+                result = api.chan_transcribe_all("Chan", combined=True)
+
+            self.assertEqual(result["queued"], 0)
+            self.assertEqual(result["skipped"], 1)
+            api._transcribe.enqueue.assert_not_called()
+            log_text = "".join(
+                part for part, _tag in api._log_stream.emit.call_args.args[0])
+            self.assertIn("already handled", log_text)
+            self.assertIn("no-speech", log_text)
+
+    def test_health_metadata_counts_no_speech_as_covered(self) -> None:
+        from backend.metadata import thumbnails_ops as metadata_thumbs
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db_path = Path(td) / "transcription_index.db"
+            root = Path(td) / "archive"
+            root.mkdir()
+            spoken = root / "spoken [vTrans00001].mp4"
+            silent = root / "silent [vSilent0001].mp4"
+            spoken.write_bytes(b"v")
+            silent.write_bytes(b"v")
+
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path), \
+                    mock.patch.object(metadata_thumbs, "load_config",
+                                      return_value={"output_dir": str(root)}):
+                IndexIngestTests._reset_index_module()
+                self.assertTrue(index.register_video(
+                    str(spoken), "Chan", "spoken",
+                    video_id="vTrans00001"))
+                self.assertTrue(index.register_video(
+                    str(silent), "Chan", "silent",
+                    video_id="vSilent0001"))
+                self.assertTrue(index.mark_video_transcribed(str(spoken)))
+                self.assertTrue(index.mark_video_no_speech(str(silent)))
+
+                rows = metadata_thumbs.count_video_id_status_bulk(
+                    [{"name": "Chan"}], force=True)
+
+            self.assertEqual(rows["chan"]["total"], 2)
+            self.assertEqual(rows["chan"]["transcribed"], 2)
 
 
 class DeleteChannelFromIndexTests(unittest.TestCase):

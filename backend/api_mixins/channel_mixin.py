@@ -169,11 +169,19 @@ class ChannelMixin:
             if not fp or not os.path.isfile(fp):
                 skipped += 1
                 continue
-            res = self.transcribe_retranscribe(fp, t, vid)
+            res = self.transcribe_retranscribe(fp, t, vid,
+                                               _log_queued=False)
             if isinstance(res, dict) and res.get("ok"):
                 queued += 1
             else:
                 skipped += 1
+        try:
+            video_word = "Video" if queued == 1 else "Videos"
+            self._transcribe_log_stream().emit_text(
+                f" — Queued re-transcribe: {name}, {queued:,} {video_word}",
+                "simpleline_blue")
+        except Exception:
+            pass
         return {"ok": True, "queued": queued, "skipped": skipped,
                 "total": len(rows), "channel": name,
                 "model": model or "default"}
@@ -332,7 +340,7 @@ class ChannelMixin:
 
         queued = 0
         skipped = 0
-        bulk = []  # (video_path, title)
+        bulk = []  # (video_path, title, video_id)
         for vid in pending_ids:
             info = id_to_path.get(vid)
             if not info:
@@ -352,17 +360,22 @@ class ChannelMixin:
             if os.path.normpath(fp).lower() in queued_paths:
                 skipped += 1
                 continue
-            bulk.append((fp, title or os.path.splitext(os.path.basename(fp))[0]))
+            bulk.append((
+                fp,
+                title or os.path.splitext(os.path.basename(fp))[0],
+                vid,
+            ))
 
         if bulk:
             import uuid as _uuid
             bulk_id = _uuid.uuid4().hex[:12]
             bulk_total = len(bulk)
-            for idx, (video, title) in enumerate(bulk):
+            for idx, (video, title, vid) in enumerate(bulk):
                 if self._transcribe.enqueue(video, title, channel=name,
                                             bulk_id=bulk_id,
                                             bulk_total=bulk_total,
-                                            bulk_index=idx):
+                                            bulk_index=idx,
+                                            video_id=vid):
                     queued += 1
                 else:
                     skipped += 1
@@ -466,9 +479,34 @@ class ChannelMixin:
         from backend.transcribe import _norm_title, _scan_existing_transcript_titles
         already = _scan_existing_transcript_titles(folder, name)
         done_vids = {vid for (_raw, vid) in already.values() if vid}
+        no_speech_vids: set[str] = set()
+        no_speech_paths: set[str] = set()
+        no_speech_titles: set[str] = set()
+        try:
+            from backend import index as _idx
+            conn = _idx._reader_open() or _idx._open()
+            if conn is not None:
+                with _idx._reader_lock:
+                    rows = conn.execute(
+                        "SELECT video_id, filepath, title FROM videos "
+                        "WHERE channel=? COLLATE NOCASE "
+                        "AND tx_status='no_speech'",
+                        (name,),
+                    ).fetchall()
+                for r in rows:
+                    if r[0]:
+                        no_speech_vids.add(str(r[0]).strip())
+                    if r[1]:
+                        no_speech_paths.add(os.path.normcase(
+                            os.path.normpath(os.path.abspath(str(r[1])))))
+                    if r[2]:
+                        no_speech_titles.add(_norm_title(str(r[2])))
+        except Exception as e:
+            _log.debug("no_speech skip lookup failed for %s: %s", name, e)
 
         skipped = 0
-        bulk = []  # (video_path, plain_title)
+        no_speech_skipped = 0
+        bulk = []  # (video_path, plain_title, video_id)
         import re as _re
         for dp, _dns, fns in os.walk(folder):
             for fn in fns:
@@ -481,6 +519,15 @@ class ChannelMixin:
                                       "", title) or title
                 vid_m = _re.search(r"\[([A-Za-z0-9_-]{11})\]", title)
                 vid_id = vid_m.group(1) if vid_m else ""
+                video_key = os.path.normcase(
+                    os.path.normpath(os.path.abspath(video)))
+                if ((vid_id and vid_id in no_speech_vids)
+                        or video_key in no_speech_paths
+                        or _norm_title(plain_title) in no_speech_titles
+                        or _norm_title(title) in no_speech_titles):
+                    skipped += 1
+                    no_speech_skipped += 1
+                    continue
                 # Per-video legacy .jsonl sidecar (OLD format)
                 if os.path.isfile(base_path + ".jsonl"):
                     skipped += 1
@@ -495,14 +542,14 @@ class ChannelMixin:
                 if vid_id and vid_id in done_vids:
                     skipped += 1
                     continue
-                bulk.append((video, plain_title))
+                bulk.append((video, plain_title, vid_id))
 
         queued = 0
         if bulk:
             import uuid as _uuid
             bulk_id = _uuid.uuid4().hex[:12]
             bulk_total = len(bulk)
-            for idx, (video, plain_title) in enumerate(bulk):
+            for idx, (video, plain_title, vid_id) in enumerate(bulk):
                 # Pass combined flag through so the transcribe worker writes
                 # to the right aggregated file. Respects the user's choice
                 # even when it conflicts with the channel's split_years flag.
@@ -510,12 +557,15 @@ class ChannelMixin:
                 self._transcribe.enqueue(video, plain_title, channel=name,
                                          combined=bool(combined),
                                          bulk_id=bulk_id, bulk_total=bulk_total,
-                                         bulk_index=idx)
+                                         bulk_index=idx,
+                                         video_id=vid_id)
                 queued += 1
         self._log_stream.emit([
             ["[GPU] ", "trans_bracket"],
             [f"Transcribe all for {name}: ", "simpleline_blue"],
-            [f"{queued} queued, {skipped} already transcribed"
+            [f"{queued} queued, {skipped} already handled"
+             + (f" ({no_speech_skipped} no-speech)"
+                if no_speech_skipped else "")
              + (" (combined)" if combined and split_years else ""),
              "simpleline"],
             ["\n", None],

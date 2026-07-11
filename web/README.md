@@ -4,7 +4,7 @@ The HTML / CSS / JS that pywebview renders inside the YTArchiver window.
 
 ## File layout
 
-The frontend is split into ~50 focused modules. Each module is wrapped in
+The frontend is split into ~60 focused modules. Each module is wrapped in
 its own IIFE and publishes a handful of `window.<name>` entry points; the
 modules are loaded in dependency order by `index.html`. `app.js` is a
 small boot orchestrator that calls each module's `init*` function.
@@ -15,7 +15,7 @@ small boot orchestrator that calls each module's `init*` function.
 |------|---------|
 | `index.html`          | **Build artifact** — assembled at boot from the template + partials. Don't edit this directly; edit the source files below. |
 | `index.template.html` | Shell with `<!-- @include partials/foo.html -->` markers. |
-| `partials/tab-download.html`, `tab-subs.html`, `tab-settings.html`, `tab-browse.html` | Per-tab markup. |
+| `partials/tab-download.html`, `tab-subs.html`, `tab-browse.html`, `tab-health.html`, `tab-settings.html`, `onboarding.html` | Per-tab and onboarding markup. |
 | `partials/popovers.html`, `dialogs.html`, `modals.html` | Floating overlays. |
 
 The assembler is `backend/html_assembler.py`; it runs at `main.py`
@@ -29,7 +29,7 @@ startup and only rewrites `index.html` when generated content changes.
 | `styles-settings.css`       | Settings page |
 | `styles-download-controls.css` | Download tab toolbar |
 | `styles-logs.css`           | Activity log + main log + tag classes |
-| `styles-tabs-data.css`      | Subs + Recent tables, queue popovers |
+| `styles-tabs-data.css`      | Subs table, data panels, queue popovers |
 | `styles-browse.css`         | Browse tab framing + sub-modes + Index panel |
 | `styles-browse-grids.css`   | Channel + Video grids |
 | `styles-watch.css`          | Watch view + captions + metadata drawer |
@@ -42,8 +42,8 @@ startup and only rewrites `index.html` when generated content changes.
 | `app.js`         | Tiny boot orchestrator — calls every module's `init*`. Owns the MutationObserver-cleanup pool. |
 | `logs.js`        | Log infrastructure (`_logBatch`, scroll state, in-place row replace, mini-log mirror). |
 | `watchView.js`   | Watch view + karaoke transcript + WebVTT captions + metadata drawer. |
-| `browseGrids.js` | Channel grid + Video grid + `_buildVideoCard` (shared with Recent). |
-| `tables.js`      | Subs channel table + Recent list/grid. |
+| `browseGrids.js` | Channel grid + Video grid + `_buildVideoCard` (shared by Videos/Manual cards). |
+| `tables.js`      | Subs channel table. |
 | `queueRender.js` | Sync / GPU task popover row renderer (drag-reorder, right-click). |
 | `metadataTab.js` | Settings → Metadata refresh-status table. |
 
@@ -68,7 +68,7 @@ startup and only rewrites `index.html` when generated content changes.
 | `queueBlink.js`  | Header Pause/Resume button + queue badge state machine. |
 | `logContextMenu.js` | Right-click menu on every log surface (Copy, Save, Clear). |
 | `uxPolish.js`    | Custom tooltip system + global click-defocus. |
-| `smallInits.js`  | `initLastSyncTicker`, `initRecentFilter`, `initSubsFilter`, splitter persistence, archive-rescan push handler. |
+| `smallInits.js`  | `initLastSyncTicker`, `initSubsFilter`, splitter persistence, archive-rescan push handler. |
 
 ### JS — per-tab modules
 
@@ -81,13 +81,13 @@ startup and only rewrites `index.html` when generated content changes.
 | `syncSubbed.js`         | header   | Sync Subbed button + pause/resume state. |
 | `autoSync.js`           | header   | Auto-sync interval dropdown + countdown. |
 | `liveDrawer.js`         | header   | Deferred-livestreams drawer. |
-| `columnSort.js`         | Subs / Recent | Clickable column-header sort + Subs context menu. |
-| `columnWidth.js`        | Subs / Recent | Drag-to-resize column widths, persisted. |
-| `recentContextMenu.js`  | Recent   | Right-click menu + multi-select on the Recent table. |
+| `columnSort.js`         | Subs     | Clickable column-header sort. |
+| `columnWidth.js`        | Subs     | Drag-to-resize column widths, persisted. |
 | `browseView.js`         | Browse   | Sub-mode toggle + channel→video→watch flow + `filterCurrentView`. |
 | `browseContent.js`      | Browse   | Video grid loader, search-result renderer, Whisper picker, `initQueueAutoCheckboxes`. |
 | `browseSearch.js`       | Browse   | Search input + result list + viewer pane + sort dropdown + un-indexed banner. |
 | `browseContextMenus.js` | Browse   | Right-click menus on channel and video cards. |
+| `videosView.js`         | Browse   | Archive-wide Videos grid with lazy loading, sorting, and title/channel filtering. |
 | `bookmarks.js`          | Browse   | Bookmarks sub-mode + week summary + redownload prompt. |
 | `watchActions.js`       | Browse → Watch | Every interactive control on the watch view (incl. retranscribe). |
 | `graphTab.js`           | Browse → Graph | Word-frequency charts + word cloud via Chart.js. |
@@ -101,6 +101,7 @@ startup and only rewrites `index.html` when generated content changes.
 | `compressDryRunDialog.js` | Settings | Compress dry-run results modal. |
 | `repairCaptionsDialog.js` | Settings | Repair YT auto-captions modal. |
 | `punctRestoreDialog.js` | Settings | Restore transcript punctuation modal. |
+| `provenanceDialog.js`   | Health   | Embed file tags modal (MP4 provenance + txt header IDs). |
 | `queuePopovers.js`      | header   | Sync Tasks + GPU Tasks popover open/close. |
 | `queuePending.js`       | Subs     | "Queue Pending" header button + badge count. |
 | `refreshSizes.js`       | Subs     | Click-to-rescan on the Total: N TB label. |

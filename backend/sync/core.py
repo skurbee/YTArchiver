@@ -701,7 +701,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # fast with a clear message instead of letting yt-dlp crash mid-download.
     # A minimum of 500MB free keeps room for the largest plausible single
     # video; actual videos are streamed so we don't need to pre-allocate.
-    from ..utils import check_directory_writable, check_disk_space
+    from ..utils import (check_directory_writable, check_disk_space,
+                         ytdlp_embed_tag_args)
     preflight_dir = base_dir if not ch_dir.exists() else ch_dir
     if not check_directory_writable(str(preflight_dir)):
         stream.emit([["ERROR: ", "red"],
@@ -779,6 +780,9 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         # subfolders. Useless to the archive (they don't reference any
         # video) and they polluted every channel's tree.
         "--no-write-playlist-metafiles",
+        # Embed provenance tags (title/channel/ISO date/watch URL) inside
+        # the MP4 container itself — see utils.ytdlp_embed_tag_args.
+        *ytdlp_embed_tag_args(),
         # After each video completes, emit one line we can parse to map
         # title→id (filenames don't carry the ID in drop-in mode). Matches
         # YTArchiver.py:17281 DLTRACK line.
@@ -949,6 +953,11 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # so SyncResult can report a real `total` = downloaded + skipped.
     # Used by the batch-cooldown heuristic in sync_all().
     _archived_skipped = 0
+    # Count existing-file hits as "walk evidence" too. A newly-added
+    # subscription can point at a folder whose videos are already on disk;
+    # that first manual sync should still graduate the channel to the
+    # fast path even when it has zero new downloads.
+    _existing_file_skipped = 0
     # track which video IDs hit an error during this run.
     # At end of sync we diff against successful downloads and persist
     # the leftovers into channel["failed_video_ids"] so the next sync
@@ -2173,6 +2182,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 # line we announced on the Destination will stay, but we
                 # won't add any more noise. The pass summary "0 downloaded"
                 # is the authoritative count.
+                _existing_file_skipped += 1
                 stream.emit([[" ", "dim"], [f"{s[:140]}\n", "dim"]])
                 continue
 
@@ -2652,6 +2662,10 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
 
     elapsed = time.time() - t_start
     took = _fmt_duration(elapsed)
+    _sync_interrupted_now = bool(
+        (cancel_event is not None and cancel_event.is_set())
+        or (pause_event is not None and pause_event.is_set())
+    )
 
     # Per-channel [Sync] Done line is now rendered by sync_start_all via
     # _sync_row_emit — one compact `[N/total] Name \u2014 summary` row that
@@ -2920,6 +2934,14 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
 
     # Remember the fresh IDs in the channel cache for the next sync pass
     # (lets the quick-check-new-uploads fast path skip enumeration).
+    if (not _sync_interrupted_now) and _filtered_this_run:
+        try:
+            from .. import channel_cache as _cc
+            _cc.append_filtered_ids(url, sorted(_filtered_this_run),
+                                    min_dur, max_dur)
+        except Exception as e:
+            swallow("channel-cache filtered append", e)
+
     if downloaded_ids and (cancel_event is None or not cancel_event.is_set()):
         try:
             from .. import channel_cache as _cc
@@ -2958,10 +2980,16 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             now = datetime.now()
             _dirty = False
             with config_transaction() as cfg2:
-                # require AT LEAST ONE video to have been walked before stamping
-                # initialized=True. A first sync with zero downloads likely hit a
-                # filter/auth wall and was never actually bootstrapped.
-                _walked_meaningfully = (downloaded > 0)
+                # Require evidence that yt-dlp actually walked at least one
+                # video before stamping initialized=True. A first sync with
+                # zero new downloads can still be valid when every item was
+                # already on disk or already in the global download archive.
+                _walked_meaningfully = (
+                    downloaded > 0
+                    or _existing_file_skipped > 0
+                    or _archived_skipped > 0
+                    or bool(_filtered_this_run)
+                )
                 _meta_did_fetch = _read_meta_count("fetched") > 0
                 _now_ts = time.time()
                 _matched_any = False
@@ -2981,10 +3009,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                            and _walked_meaningfully)
                     c["last_sync"] = now.strftime("%Y-%m-%d %H:%M")
                     _dirty = True
-                    _was_interrupted = bool(
-                        (cancel_event is not None and cancel_event.is_set())
-                        or (pause_event is not None and pause_event.is_set())
-                    )
+                    _was_interrupted = _sync_interrupted_now
                     if _walked_meaningfully and not _was_interrupted:
                         if not c.get("initialized", False):
                             c["initialized"] = True
@@ -3196,7 +3221,10 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         # All None: every pass was terminated mid-flight. Treat as
         # successful if any work was actually done (partial cancel),
         # otherwise as a no-op failure.
-        _ok = (downloaded > 0)
+        _ok = (downloaded > 0
+               or _existing_file_skipped > 0
+               or _archived_skipped > 0
+               or bool(_filtered_this_run))
     # Report the most informative exit code: prefer a real one, fall
     # back to last proc.returncode if it exists, else 0.
     _exit_for_caller = next(iter(_good_rcs), None)
@@ -3204,7 +3232,9 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         _exit_for_caller = next(iter(_crashed), proc.returncode if proc else 0)
     return SyncResult(ok=_ok, downloaded=downloaded, errors=errors,
                       took=took, exit=_exit_for_caller,
-                      total=downloaded + _archived_skipped)
+                      total=(downloaded + _archived_skipped
+                             + _existing_file_skipped
+                             + len(_filtered_this_run)))
 
 
 

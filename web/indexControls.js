@@ -191,7 +191,7 @@
     refreshStats();
   }
 
-  // Compat shim for the old _applyIndexSummary consumers (browse-tab preload).
+  // Compat shim for old _applyIndexSummary consumers.
   // Since the Index tab no longer has idx-channels/idx-videos/etc. elements,
   // _applyIndexSummary is now a no-op at refresh time — the new section
   // builds its own stats via refreshStats() inside initIndexControls. But

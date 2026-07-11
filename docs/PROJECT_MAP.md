@@ -89,6 +89,20 @@ walk doesn't have to happen every time the UI repaints.
 **Key functions:** `scan_channel_folder`, `scan_all_channels`,
 `enrich_channels_with_stats`, `index_summary`, `archive_totals`.
 
+### `auto_backup.py`  ·  scheduled backups + the archive's info folder
+Maintains `<archive root>/YTArchiver Info/`: a generated
+`ABOUT THIS ARCHIVE.txt` documenting every file convention in the
+archive, a copy of the running exe (frozen builds), and scheduled
+full-state backup ZIPs (config, subscriptions, download-ID archive,
+queue, filters). Owns `build_backup_zip` — the single zip-writing core
+that the Health tab's manual Export (backup_mixin) also calls. The
+newest 4 backups are kept; older ones move to the archive trash.
+
+**Key classes/functions:** `class AutoBackupScheduler` (daemon timer,
+"off"/"daily"/"weekly"/"monthly" via `auto_backup_interval`),
+`run_backup`, `build_backup_zip`, `backup_file_entries`,
+`refresh_info_folder`.
+
 ### `autorun.py`  ·  recurring background sync
 Schedules sync passes on a recurring interval (every X minutes). Also
 owns the activity-log history that's written to `config.autorun_history`
@@ -147,7 +161,7 @@ have a real file). Used by the maintenance pass in Settings.
 ### `index.py`  ·  the SQLite database (entry module)
 THE central data store. Every downloaded video gets a row here with
 its title, channel, upload date, duration, file path, transcription
-state, and metadata-fetch state. Browse / Search / Recent / Graph
+state, and metadata-fetch state. Browse / Search / Videos / Graph
 all read from this DB.
 
 Also stores transcript SEGMENTS (one row per Whisper segment per
@@ -161,8 +175,7 @@ re-exports for back-compat.
 
 **Key functions (still in this file):** `register_video`,
 `mark_video_transcribed`, `ingest_jsonl`, `list_recent_videos`,
-`list_videos_for_channel`, `preload_channel_videos`,
-`preload_all_channels`, `find_thumbnail`,
+`list_videos_for_channel`, `list_all_videos`, `find_thumbnail`,
 `new_videos_in_last_n_days`, `channel_transcription_stats`,
 `get_segments`, `get_segment_context`, `summary`.
 
@@ -280,6 +293,20 @@ of failing every download retry.
 
 **Key functions:** `probe_once`, `start_monitor`, `block_if_down`.
 
+### `provenance.py`  ·  "Embed file tags" backfill
+Retrofits the archive's existing files with the embedded identity new
+downloads get. Phase A upgrades legacy Transcript.txt headers with the
+`(youtu.be/<id>)` field (ids matched from the sibling `.jsonl`,
+unambiguous titles only). Phase B stream-copy remuxes each known-ID
+MP4 (`ffmpeg -map 0 -c copy -movflags +faststart`) to embed title /
+channel / upload-date / watch-URL tags — no re-encode, atomic
+tmp+replace, mtimes preserved. A ledger in APPDATA makes re-runs skip
+already-tagged files. Runs as a sync-queue task (kind `provenance`),
+so it inherits pause / resume / cancel.
+
+**Key functions:** `embed_provenance_archive` (queue-task body),
+`_upgrade_txt_file`, `_embed_one`, `_mp4_worklist`.
+
 ### `punct_worker.py`  ·  punctuation restoration subprocess
 Whisper outputs ALL CAPS or all-lowercase raw text with no commas /
 periods. This subprocess runs a HuggingFace punctuation model that
@@ -355,7 +382,7 @@ Package layout (all symbols re-exported via `sync/__init__.py`):
 - `ytdlp_proc.py` — yt-dlp executable lookup, cookies, format strings, and batch-file helpers
 - `ytdlp_events.py` — yt-dlp output parsing helpers
 - `ytdlp_session.py` — process launch, watchdog, finish/cleanup helpers
-- `recent_track.py` — Recent-tab download tracking (`_record_recent_download`)
+- `recent_track.py` — recent-download history tracking (`_record_recent_download`)
 - `active_state.py` — in-flight sync-channel tracking + metadata-changed hook
 - `display_push.py` — sync-progress JSON writes for a companion display
 
@@ -375,7 +402,7 @@ Package layout (all symbols re-exported via `sync/__init__.py`):
 - `emit_consolidated_auto_row`, `emit_metadata_activity_row` —
   the consolidated `[Dwnld] N downloaded · M transcribed` activity-
   log row format.
-- `_record_recent_download` — appends to the Recent tab's list.
+- `_record_recent_download` — appends to the recent-download history.
 - `prefetch_channel_total`, `quick_check_new_uploads` — the fast
   "are there any new videos?" check without a full channel walk.
 
@@ -452,9 +479,9 @@ level timestamps) to stdout.
 transcript viewer behave on long monologues.
 
 ### `window_state.py`  ·  remember window geometry
-Persists the pywebview window size, position, and last-active tab to
-`%APPDATA%\YTArchiver\window_state.json` on close, restores on
-launch.
+Persists the pywebview window size, position, and last-active tab
+inside `ytarchiver_config.json` (under the `window_state` key, so it
+roams with the user's other settings) on close, restores on launch.
 
 **Key functions:** `load_window_state`, `save_window_state`,
 `_sanitize_geometry`.
@@ -466,7 +493,7 @@ interval, log mode, recent downloads, etc. The single source of truth
 for "what does this user have configured".
 
 Also formats the data for UI consumption (channels-for-Subs-table,
-recent-downloads-for-Recent-tab, autorun-history-for-Activity-log).
+recent-download history, autorun-history-for-Activity-log).
 
 **Key functions:** `load_config`, `save_config`, `config_file_exists`,
 `config_is_writable`, `backup_config_on_start`,
@@ -486,12 +513,13 @@ on Windows.
 ### `index.html`
 The single page. Defines:
 - Header strip (title + version)
-- Tab row (Subs / Browse / Settings)
-- Three tab panels — each is a full screen of UI
+- Tab row (Download / Subs / Browse / Health / Settings)
+- Five tab panels — each is a full screen of UI
 - Floating overlays (modals, context menu, drawers, popups)
-- Script tags loading util.js / bridge.js / ~40 feature modules,
+- Script tags loading util.js / bridge.js / ~55 feature modules,
   then `logs.js`, then the rendering modules
-  (`queueRender.js`, `tables.js`, `browseGrids.js`, `watchView.js`),
+  (`queueRender.js`, `tables.js`, `browseGrids.js`, `videosView.js`,
+  `watchView.js`),
   then `app.js`
 
 The top-of-file comment in this file lists every section so a new dev
@@ -507,7 +535,7 @@ Split into themed sheets that load in cascade order:
 - `styles-settings.css` — Settings page
 - `styles-download-controls.css` — Download tab controls
 - `styles-logs.css` — Activity log + main log + tag classes
-- `styles-tabs-data.css` — Subs + Recent tables, queue popovers
+- `styles-tabs-data.css` — Subs table, data panels, queue popovers
 - `styles-browse.css` — Browse tab framing + sub-modes
 - `styles-browse-grids.css` — Channel + Video grids
 - `styles-watch.css` — Watch view + captions + drawer
@@ -530,7 +558,7 @@ cleanup pool.
 
 Exports a handful of `window.<name>` functions that Python calls via
 `evaluate_js(...)` — but the heavy ones (renderSubsTable,
-renderRecentTable, renderQueues, renderWatchView, renderChannelGrid,
+renderQueues, renderWatchView, renderChannelGrid,
 renderVideoGrid, _onRetranscribeComplete, etc.) now live in the
 extracted modules.
 
@@ -577,13 +605,13 @@ later modules read earlier modules' globals.
   Publishes `renderQueues`, `_queueStateSnapshot`.
 - `queuePopovers.js` — open/close behavior of the popover containers
   themselves (anchor, outside-click close, Escape).
-- `tables.js` — Subs channel table + Recent list/grid views.
-  Publishes `renderSubsTable`, `renderRecentTable`,
-  `_applySubsFilter`, `_applyRecentFilter`, `_applyRecentViewMode`.
+- `tables.js` — Subs channel table.
+  Publishes `renderSubsTable`, `_applySubsFilter`,
+  `_applySubsAvgVisibility`.
 - `browseGrids.js` — Channel grid (Browse landing) + Video grid
   (inside a channel) with year/month grouping and lazy-load batching.
   Publishes `renderChannelGrid`, `renderVideoGrid`, `_buildVideoCard`
-  (also reused by the Recent grid).
+  (also reused by the archive-wide Videos and Manual grids).
 - `watchView.js` — Embedded video player + transcript karaoke +
   WebVTT caption overlay + metadata drawer.
   Publishes `renderWatchView`, `loadWatchMetadataDrawer`,
@@ -596,10 +624,11 @@ later modules read earlier modules' globals.
   buttons.
 - `autoSync.js`, `liveDrawer.js` — autorun controls + livestreams
   drawer.
-- `columnSort.js`, `columnWidth.js` — table column sort + resize.
-- `recentContextMenu.js`, `browseContextMenus.js` — right-click menus.
-- `browseView.js`, `browseContent.js`, `browseSearch.js` —
-  Browse-tab view switching, content rendering, search.
+- `columnSort.js`, `columnWidth.js` — Subs table column sort + resize.
+- `browseContextMenus.js` — right-click menus on Browse cards.
+- `browseView.js`, `browseContent.js`, `browseSearch.js`, `videosView.js` —
+  Browse-tab view switching, content rendering, search, and the archive-wide
+  Videos grid.
 - `bookmarks.js`, `watchActions.js` — Watch view actions + bookmarks.
 - `graphTab.js` — Chart.js-driven word-frequency graphs.
 - `settingsTab.js`, `indexControls.js`, `aboutDialog.js`,

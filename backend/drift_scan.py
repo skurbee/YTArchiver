@@ -82,7 +82,9 @@ from .text_utils import normalize_title as _norm_title
 # video with parens in its name showed up as drift (audit:
 # drift_scan.py:80).
 _HEADER_RE = re.compile(
-    r'^===\((.+?)\),\s*(\([^)]*\)),\s*(\([^)]*\)),\s*(\([^)]*\))===',
+    r'^===\((.+?)\),\s*(\([^)]*\)),\s*(\([^)]*\)),\s*'
+    r'(\((?!youtu\.be/)[^)]*\))'
+    r'(?:,\s*\(youtu\.be/([A-Za-z0-9_-]{11})\))?===',
     re.MULTILINE)
 
 # Id bracket suffix extraction (matches `... [abc12_def-3]` at end of
@@ -121,6 +123,10 @@ def _scan_txt_titles(folder_path: str) -> dict[str, list[dict[str, Any]]]:
                         im = _ID_BRACKET_RE.search(raw)
                         if im:
                             vid_id = im.group(1)
+                        elif m.group(5):
+                            # v2 headers carry the id in the trailing
+                            # (youtu.be/<id>) field.
+                            vid_id = m.group(5)
                         raw_plain = _ID_BRACKET_RE.sub("", raw).strip() or raw
                         rec = {"raw": raw, "video_id": vid_id, "txt_path": fp,
                                "date": (m.group(2) or "").strip("()"),
@@ -377,7 +383,7 @@ def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
 
 def _write_transcript_entry_plain(txt_path: str, title: str, date_str: str,
                                   duration_str: str, source_tag: str,
-                                  text: str) -> bool:
+                                  text: str, video_id: str = "") -> bool:
     """Append a new header+body entry to an aggregated Transcript.txt.
 
     Used by apply_channel to reconstruct missing .txt entries from
@@ -392,7 +398,14 @@ def _write_transcript_entry_plain(txt_path: str, title: str, date_str: str,
         os.makedirs(os.path.dirname(txt_path), exist_ok=True)
     except OSError:
         pass
-    header = f"===({title}), ({date_str}), ({duration_str}), ({source_tag})==="
+    try:
+        from backend.transcribe.transcribe_files import (
+            _header_url_field as _hurl)
+        _url_field = _hurl(video_id)
+    except Exception:
+        _url_field = ""
+    header = (f"===({title}), ({date_str}), ({duration_str}), "
+              f"({source_tag}){_url_field}===")
     body = text.rstrip() + "\n\n"
     # Read-append-tmp-replace, SERIALIZED with the transcribe writers
     # via their shared per-path lock. The atomic-replace alone did NOT
@@ -663,7 +676,8 @@ def apply_channel(channel: dict[str, Any], output_dir: str,
             # reuse the same field for consistency with other entries.
             if _write_transcript_entry_plain(
                     txt_path, title, date_str, dur_str, src_tag,
-                    data.get("text", "")):
+                    data.get("text", ""),
+                    video_id=data.get("video_id", "")):
                 actions["txt_reconstructed"] += 1
                 details["txt_reconstructed_titles"].append(title)
 

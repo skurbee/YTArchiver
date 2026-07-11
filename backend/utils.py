@@ -116,6 +116,36 @@ def channel_has_transcripts(channel_folder: str) -> bool:
     return False
 
 
+# ── Embedded provenance tags (yt-dlp) ─────────────────────────────────
+
+def ytdlp_embed_tag_args() -> list[str]:
+    """yt-dlp args that embed provenance INSIDE the downloaded file's
+    container (MP4 tags), so every file stays self-describing even if
+    it's renamed, moved, or copied without preserving mtimes.
+
+    Shared by all three download paths (sync, single-URL, redownload)
+    so the tag set can't drift between them.
+
+    Tag layout (what Explorer's Details pane shows):
+      title   -> real video title (unsanitized)
+      artist  -> channel name ("Contributing artists" column)
+      date    -> upload date, ISO 8601. yt-dlp's default is bare
+                 YYYYMMDD which Explorer misparses into a garbage
+                 Year value; the >%Y-%m-%d strftime override fixes it.
+                 Trailing | = empty (not "NA") when upload_date is
+                 missing, so ffmpeg drops the tag instead of writing
+                 junk.
+      comment -> canonical watch URL — carries the video id, which is
+                 deliberately NOT in the filename (clean-title rule).
+    """
+    return [
+        "--embed-metadata",
+        "--parse-metadata", "%(upload_date>%Y-%m-%d|)s:%(meta_date)s",
+        "--parse-metadata", "%(webpage_url|)s:%(meta_comment)s",
+        "--parse-metadata", "%(uploader,channel|)s:%(meta_artist)s",
+    ]
+
+
 # ── Recent-file locator (YTArchiver.py:32900 / 32946 / 32966) ──────────
 
 _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".m4a", ".mov")

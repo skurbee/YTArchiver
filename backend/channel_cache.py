@@ -86,7 +86,9 @@ def get_cached_ids(url: str) -> list[str] | None:
 def set_cached_ids(url: str, ids: Iterable[str]):
     with _lock:
         _load_locked()
+        prior = _cache.get(url) if isinstance(_cache.get(url), dict) else {}
         _cache[url] = {
+            **prior,
             "last_refreshed": time.time(),
             "ids": list(ids),
         }
@@ -122,8 +124,9 @@ def append_ids(url: str, new_ids: Iterable[str]):
             rec = {"last_refreshed": 0.0, "ids": []}
         else:
             # Copy so we don't mutate original_rec in place.
-            rec = {"last_refreshed": original_rec.get("last_refreshed", 0.0),
-                   "ids": list(original_rec.get("ids", []))}
+            rec = dict(original_rec)
+            rec["last_refreshed"] = original_rec.get("last_refreshed", 0.0)
+            rec["ids"] = list(original_rec.get("ids", []))
         # Prepend newly-downloaded IDs (they're latest)
         rec["ids"] = list(new) + [i for i in rec["ids"] if i not in set(new)]
         # NOTE: intentionally not updating rec["last_refreshed"] here.
@@ -134,6 +137,72 @@ def append_ids(url: str, new_ids: Iterable[str]):
                 _cache.pop(url, None)
             else:
                 _cache[url] = original_rec
+
+
+def _duration_rule_key(min_duration: object = 0,
+                       max_duration: object = 0) -> str:
+    def _clean(value: object) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+    return f"{_clean(min_duration)}:{_clean(max_duration)}"
+
+
+def get_filtered_ids(url: str, min_duration: object = 0,
+                     max_duration: object = 0) -> list[str]:
+    """Return video IDs seen and skipped by the current duration rule.
+
+    These are not downloads and must not go into ytarchiver_archive.txt:
+    changing the duration limits may make them eligible later. The key keeps
+    each rule isolated so a past "too short" skip does not poison a future
+    wider sync range.
+    """
+    key = _duration_rule_key(min_duration, max_duration)
+    with _lock:
+        _load_locked()
+        rec = _cache.get(url)
+        if not isinstance(rec, dict):
+            return []
+        by_rule = rec.get("filtered_ids")
+        if not isinstance(by_rule, dict):
+            return []
+        ids = by_rule.get(key, [])
+        return list(ids) if isinstance(ids, list) else []
+
+
+def append_filtered_ids(url: str, ids: Iterable[str],
+                        min_duration: object = 0,
+                        max_duration: object = 0,
+                        limit: int = 5000) -> None:
+    new = [i for i in ids if isinstance(i, str) and i]
+    if not new:
+        return
+    key = _duration_rule_key(min_duration, max_duration)
+    with _lock:
+        _load_locked()
+        original_rec = _cache.get(url)
+        if isinstance(original_rec, dict):
+            rec = dict(original_rec)
+            rec["ids"] = list(original_rec.get("ids", []))
+        else:
+            rec = {"last_refreshed": 0.0, "ids": []}
+        by_rule = rec.get("filtered_ids")
+        if not isinstance(by_rule, dict):
+            by_rule = {}
+        else:
+            by_rule = {str(k): list(v) if isinstance(v, list) else []
+                       for k, v in by_rule.items()}
+        seen = list(new) + [i for i in by_rule.get(key, [])
+                            if i not in set(new)]
+        by_rule[key] = seen[:max(1, int(limit or 1))]
+        rec["filtered_ids"] = by_rule
+        _cache[url] = rec
+        if not _save_locked():
+            if isinstance(original_rec, dict):
+                _cache[url] = original_rec
+            else:
+                _cache.pop(url, None)
 
 
 def clear(url: str | None = None):

@@ -84,8 +84,6 @@
       "initSyncButton",
       "initColumnSort",
       "initQueuePendingButton",
-      "initRecentContextMenu",
-      "initRecentFilter",
       "initSettingsTab",
       "initSettingsSubTabs",
       "initSettingsArchiveRoots",
@@ -101,6 +99,7 @@
       "initCompressDryRunDialog",
       "initRepairCaptionsDialog",
       "initPunctRestoreDialog",
+      "initProvenanceDialog",
       "initQueueModals",
       "initWatchActions",
       "initLogContextMenu",
@@ -151,10 +150,6 @@
     _safe("initColumnSort",       () => window.initColumnSort?.());
     _safe("initQueuePendingButton", () => window.initQueuePendingButton?.(_trackObserver));
 
-    // Recent tab
-    _safe("initRecentContextMenu", () => window.initRecentContextMenu?.());
-    _safe("initRecentFilter",      () => window.initRecentFilter?.());
-
     // Settings tab + sub-tabs
     _safe("initSettingsTab",         () => window.initSettingsTab?.());
     _safe("initSettingsSubTabs",     () => window.initSettingsSubTabs?.());
@@ -173,6 +168,7 @@
     _safe("initCompressDryRunDialog", () => window.initCompressDryRunDialog?.());
     _safe("initRepairCaptionsDialog", () => window.initRepairCaptionsDialog?.());
     _safe("initPunctRestoreDialog", () => window.initPunctRestoreDialog?.());
+    _safe("initProvenanceDialog",  () => window.initProvenanceDialog?.());
     _safe("initQueueModals",       () => window.initQueueModals?.());
     // Global status bar wraps renderQueues / setQueueState / _setIndicator,
     // so it must init AFTER queue + log modules have assigned those globals.

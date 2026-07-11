@@ -16,7 +16,7 @@ import time
 
 from ._shared import _api_err, _log
 from backend.log import swallow
-from backend.ytarchiver_config import load_config
+from backend.ytarchiver_config import ARCHIVE_FILE, load_config
 from backend import subs as subs_backend
 from backend import sync as sync_backend
 from backend.queues import QueueState
@@ -591,6 +591,67 @@ class SyncMixin:
             ch.get("url", ""), cached)
 
 
+    def _sync_quick_check_no_new_channel(self, ch):
+        url = (ch.get("url") or "").strip()
+        mode = (ch.get("mode") or "full").lower()
+        sync_ok = bool(ch.get("sync_complete", False))
+        if ch.get("init_complete", False):
+            sync_ok = True
+        if (not url or not ch.get("init_complete", False) or not sync_ok
+                or mode not in ("full", "new", "fromdate")
+                or (ch.get("failed_video_ids") or {})):
+            return False
+        try:
+            from backend.sync.sync_all import _channel_folder_has_media
+            if not _channel_folder_has_media(load_config(), ch):
+                return False
+        except Exception as e:
+            swallow("single quickcheck disk gate", e)
+
+        known = set()
+        vid_re = re.compile(r"^[A-Za-z0-9_-]{11}$")
+        try:
+            if os.path.isfile(ARCHIVE_FILE):
+                with open(ARCHIVE_FILE, "r", encoding="utf-8",
+                          errors="replace") as af:
+                    for line in af:
+                        parts = line.strip().split(None, 1)
+                        if len(parts) == 2 and vid_re.match(parts[1]):
+                            known.add(parts[1])
+        except OSError:
+            pass
+        opts = None
+        cc = None
+        try:
+            from backend import channel_cache as cc
+            from backend.sync.options import normalize_channel_sync_options
+            opts = normalize_channel_sync_options(ch)
+            known.update(cc.get_filtered_ids(
+                url, opts.min_duration, opts.max_duration))
+        except Exception as e:
+            swallow("single quickcheck filtered cache", e)
+        if not known:
+            return False
+        try:
+            min_duration = opts.min_duration if opts is not None else 0
+            max_duration = opts.max_duration if opts is not None else 0
+            qc = sync_backend.quick_check_new_uploads(
+                url, known, check_count=5, timeout_sec=30,
+                min_duration=min_duration,
+                max_duration=max_duration)
+            if qc.get("filtered_ids") and cc is not None:
+                try:
+                    cc.append_filtered_ids(
+                        url, qc.get("filtered_ids") or [],
+                        min_duration, max_duration)
+                except Exception as e:
+                    swallow("single quickcheck filtered-id append", e)
+            return bool(qc.get("ok") and not qc.get("has_new"))
+        except Exception as e:
+            swallow("single quickcheck", e)
+            return False
+
+
     def sync_skip_current(self):
         """Skip the currently-running sync item and advance to the next.
 
@@ -783,18 +844,23 @@ class SyncMixin:
                     ["(1 channel) ===\n", "header"],
                 ])
                 _sync_row_emit(self._log_stream, 1, 1, ch_name)
-                res = sync_backend.sync_channel(
-                    ch, self._log_stream, self._sync_cancel,
-                    queues=self._queues,
-                    transcribe_mgr=self._transcribe,
-                    pause_event=self._sync_pause,
-                    pass_idx=1, pass_total=1,
-                ) or {}
+                quick_no_new = self._sync_quick_check_no_new_channel(ch)
+                if quick_no_new:
+                    res = {"downloaded": 0, "errors": 0}
+                else:
+                    res = sync_backend.sync_channel(
+                        ch, self._log_stream, self._sync_cancel,
+                        queues=self._queues,
+                        transcribe_mgr=self._transcribe,
+                        pause_event=self._sync_pause,
+                        pass_idx=1, pass_total=1,
+                    ) or {}
                 _dl = int(res.get("downloaded", 0) or 0)
                 _err = int(res.get("errors", 0) or 0)
                 _sync_row_emit(
                     self._log_stream, 1, 1, ch_name,
-                    summary=_short_summary(_dl, _err),
+                    summary=("no new videos" if quick_no_new
+                             else _short_summary(_dl, _err)),
                     name_tag="simpleline_green" if _dl > 0 else "simpleline",
                     summary_tag="simpleline_green" if _dl > 0 else "dim",
                 )

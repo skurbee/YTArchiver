@@ -312,13 +312,9 @@
       if (findWrap) findWrap.hidden = false;
       showView("channels");
     } else if (mode === "recent") {
-      // Recent was moved from a top-level tab into a Browse submode
-      // (users wanted all library navigation in one place). Reuses
-      // the same #recent-table / #recent-table-body ids as before so
-      // the existing render + click wiring keeps working. Recent has
-      // its own filter input inside the view, so hide the top-level
-      // find-wrap entirely (wrap, not just input — otherwise the
-      // icon orphans).
+      // Videos is the all-archive grid. It owns its own server-side
+      // filter input, so hide the top-level find-wrap entirely (wrap,
+      // not just input — otherwise the icon orphans).
       document.getElementById("view-recent").hidden = false;
       title.textContent = "Videos";
       backBtn.hidden = true;

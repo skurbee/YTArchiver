@@ -1127,6 +1127,10 @@ class QueueState:
             # Restore transcript punctuation task \u2014 same pink color
             # family as the other transcript-side repair tools.
             return f"Metadata restore punctuation \u2014 {name}"
+        if kind == "provenance":
+            # Embed file tags task \u2014 same pink (metadata-family)
+            # color as the other archive-repair tools.
+            return f"Metadata embed file tags \u2014 {name}"
         if kind == "redownload":
             # Classic showed active redownload as "Redownload
             # ChannelName (480p)" with a Pause/Resume state.

@@ -258,6 +258,17 @@
         removeBtn.textContent = "\u00d7";
         thumb.appendChild(removeBtn);
 
+        // Note editor (audit S2) \u2014 the backend has supported per-bookmark
+        // notes end-to-end (DB column, bookmark_update_note, CSV export)
+        // but no UI ever set one, so the note display below never fired.
+        const noteBtn = document.createElement("button");
+        noteBtn.className = "bookmark-note-btn";
+        noteBtn.dataset.note = String(b.id || "");
+        noteBtn.title = b.note ? "Edit note" : "Add note";
+        noteBtn.textContent = "\u270e";
+        if (b.note) noteBtn.classList.add("has-note");
+        thumb.appendChild(noteBtn);
+
         const body = document.createElement("div");
         body.className = "bookmark-card-body";
         const titleEl = document.createElement("div");
@@ -294,6 +305,45 @@
 
         card.appendChild(thumb);
         card.appendChild(body);
+
+        noteBtn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          if (!nativeBridgeUp()) {
+            window._showToast?.("Native mode required.", "warn");
+            return;
+          }
+          const entered = await (askTextInput
+            ? askTextInput({
+                title: b.note ? "Edit note" : "Add note",
+                message: `Note for "${title.slice(0, 80)}"` +
+                         (b.note ? "\n(Clear the text to remove the note.)" : ""),
+                placeholder: "Why did you bookmark this?",
+                initial: b.note || "",
+                confirm: "Save",
+                // allowEmpty so an existing note can be cleared by
+                // saving an empty field; Cancel returns null.
+                allowEmpty: true,
+              })
+            : Promise.resolve(prompt("Note:", b.note || "")));
+          if (entered === null || entered === undefined) return; // cancelled
+          const newNote = String(entered).trim();
+          if (newNote === String(b.note || "").trim()) return; // no change
+          try {
+            const res = await bridgeCall("bookmark_update_note", b.id, newNote);
+            if (res && res.ok === false) {
+              window._showToast?.(
+                res.error || "Couldn't save the note (bookmark gone?).",
+                "warn");
+              return;
+            }
+            window._showToast?.(
+              newNote ? "Note saved." : "Note removed.", "ok");
+          } catch (err) {
+            window._showToast?.(`Note save failed: ${err}`, "error");
+            return;
+          }
+          refreshBookmarksGrid();
+        });
 
         removeBtn.addEventListener("click", async (e) => {
           e.stopPropagation();
@@ -350,7 +400,7 @@
           }
         };
         card.addEventListener("click", (e) => {
-          if (e.target.closest("[data-remove]")) return;
+          if (e.target.closest("[data-remove], [data-note]")) return;
           jump();
         });
         card.addEventListener("keydown", (e) => {

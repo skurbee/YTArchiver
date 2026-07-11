@@ -129,11 +129,11 @@
 .settings-view .edit-gap-8 {
   gap: 8px;
 }
-.settings-view .settings-preload-toggle {
+.settings-view .settings-checkbox-row {
   gap: 6px;
   cursor: pointer;
 }
-.settings-view .settings-preload-hint-row {
+.settings-view .settings-hint-row {
   gap: 6px;
   margin-top: 2px;
 }
@@ -323,7 +323,7 @@
   white-space: normal;
   line-height: 1.4;
 }
-/* Inside a vertical stack (e.g. Browse preload's checkbox + hint),
+/* Inside a vertical stack (e.g. checkbox + hint),
    the hint row should naturally wrap and not try to right-align. */
 .settings-view .edit-gv-stack > .edit-gv-inline:not(:first-child) {
   justify-content: flex-end;

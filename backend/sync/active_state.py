@@ -69,9 +69,7 @@ def is_sync_active(channel_name: str) -> bool:
 
 
 def is_any_sync_active() -> bool:
-    """True iff at least one channel is currently mid-sync. Used by the
-    Browse preloader to back off priority when user-visible work is in
-    flight."""
+    """True iff at least one channel is currently mid-sync."""
     with _active_sync_lock:
         return len(_active_sync_channels) > 0
 

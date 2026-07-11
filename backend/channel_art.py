@@ -279,8 +279,7 @@ def banner_thumb_path_for(folder_path: str) -> str | None:
     Originals are 2048x1152+ / ~350KB; decoding 100+ of them on the
     Browse grid stalls scroll rendering. The thumb is ~30KB and decodes
     in ~1ms, so scrolling stays smooth even on 100+ channel archives.
-    Created lazily by `ensure_banner_thumb()` (called on demand when the
-    grid is about to render, or from the startup preload pass).
+    Created lazily by `ensure_banner_thumb()` when the grid is about to render.
     """
     if not folder_path:
         return None

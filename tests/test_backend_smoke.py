@@ -1762,6 +1762,45 @@ class ChannelMixinTests(unittest.TestCase):
                 mixin._channel_folder_for_name("Chan"),
                 {"ok": False, "error": "output_dir not set"})
 
+    def test_chan_fix_dates_cancel_sets_active_event(self) -> None:
+        # Audit S4: the fix-dates cancel event used to be function-local,
+        # so nothing could ever stop a running pass. It now lives on the
+        # Api instance and chan_fix_dates_cancel sets it.
+        mixin = ChannelMixin()
+        mixin._queues = mock.Mock(current_sync=None, current_gpu=None)
+        mixin._log_stream = mock.Mock()
+        started = threading.Event()
+        captured = {}
+
+        def fake_fix_dates(folder, stream, cancel_event=None):
+            captured["cancel_event"] = cancel_event
+            started.set()
+            cancel_event.wait(timeout=1.0)
+
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(channel_mixin.subs_backend, "get_channel",
+                                  return_value={
+                                      "name": "Chan",
+                                      "url": "https://example.test/ch"}), \
+                mock.patch.object(channel_mixin, "load_config",
+                                  return_value={"output_dir": td}), \
+                mock.patch.object(channel_mixin.reorg_backend,
+                                  "fix_file_dates",
+                                  side_effect=fake_fix_dates):
+            result = mixin.chan_fix_file_dates({"name": "Chan"})
+            self.assertTrue(started.wait(timeout=1.0))
+            # A second start while one is running must be refused
+            # (single-slot guard).
+            second = mixin.chan_fix_file_dates({"name": "Chan"})
+            cancel_result = mixin.chan_fix_dates_cancel()
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(second["ok"])
+        self.assertIn("already running", second["error"])
+        self.assertTrue(cancel_result["ok"])
+        self.assertTrue(cancel_result["running"])
+        self.assertTrue(captured["cancel_event"].is_set())
+
 
 class SyncStartLockTests(unittest.TestCase):
     def test_locked_start_refuses_to_replace_live_sync_thread(self) -> None:
@@ -2038,54 +2077,6 @@ class ThumbnailMixinTests(unittest.TestCase):
         service_log.flush.assert_called()
         api._log_stream.emit_text.assert_not_called()
         api._log_stream.flush.assert_not_called()
-
-
-class BrowsePreloadPriorityTests(unittest.TestCase):
-    def test_preload_all_channels_waits_while_low_priority_busy(self) -> None:
-        busy_checks = {"count": 0}
-        preload_calls: list[tuple[str, object]] = []
-
-        def busy() -> bool:
-            busy_checks["count"] += 1
-            return busy_checks["count"] <= 2
-
-        def fake_preload(channel, **kwargs):
-            preload_calls.append((channel, kwargs.get("low_priority_busy_fn")))
-            return 4
-
-        with mock.patch.object(index, "preload_channel_videos",
-                               side_effect=fake_preload), \
-                mock.patch.object(index.time, "sleep") as sleep, \
-                mock.patch.object(index, "list_all_videos",
-                                  return_value={"rows": []}):
-            result = index.preload_all_channels(
-                ["Channel A"], low_priority_busy_fn=busy)
-
-        self.assertEqual(result, {"Channel A": 4})
-        self.assertEqual([c for c, _ in preload_calls], ["Channel A"])
-        self.assertIs(preload_calls[0][1], busy)
-        self.assertGreaterEqual(sleep.call_count, 2)
-
-    def test_preload_all_channels_retries_after_interruption(self) -> None:
-        attempts = {"count": 0}
-
-        def fake_preload(channel, **kwargs):
-            attempts["count"] += 1
-            if attempts["count"] == 1:
-                raise index._LowPriorityInterrupted()
-            return 7
-
-        with mock.patch.object(index, "preload_channel_videos",
-                               side_effect=fake_preload), \
-                mock.patch.object(index.time, "sleep"), \
-                mock.patch.object(index, "list_all_videos",
-                                  return_value={"rows": []}):
-            result = index.preload_all_channels(
-                ["Channel A"],
-                low_priority_busy_fn=lambda: False)
-
-        self.assertEqual(result, {"Channel A": 7})
-        self.assertEqual(attempts["count"], 2)
 
 
 class SubsTests(unittest.TestCase):
@@ -2671,6 +2662,42 @@ class BrowseMixinTests(unittest.TestCase):
         labels = {b["label"] for b in row["manual_badges"]}
         self.assertIn("No transcript", labels)
         self.assertNotIn("Transcript", labels)
+
+    def test_manual_videos_badges_no_speech_is_neutral(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "Silent.mp4"
+            video.write_bytes(b"video")
+
+            class Api(BrowseMixin):
+                def __init__(self):
+                    self._config = {
+                        "video_out_dir": str(root),
+                        "output_dir": str(root / "Whole Channels"),
+                    }
+                    self._log_stream = mock.Mock()
+
+            with mock.patch("backend.index.list_manual_videos",
+                            return_value=[{
+                                "filepath": str(video),
+                                "title": "Silent",
+                                "video_id": "abc123def45",
+                                "tx_status": "no_speech",
+                                "duration": "1:00",
+                                "thumbnail_url": "file:///thumb.jpg",
+                                "views": 1,
+                            }]), \
+                    mock.patch("backend.index.list_manual_duplicate_filepaths",
+                               return_value=[]), \
+                    mock.patch(
+                        "backend.api_mixins.browse_mixin._is_system_temp_path",
+                        return_value=False):
+                result = Api().list_manual_videos(sort="title")
+
+        badges = result["rows"][0]["manual_badges"]
+        transcript_badge = next(
+            b for b in badges if b["label"] == "No transcript")
+        self.assertEqual(transcript_badge["kind"], "neutral")
 
     def test_manual_videos_skip_indexed_duplicate_disk_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4617,7 +4644,6 @@ class RedownloadMixinTests(unittest.TestCase):
                 self.services = AppServices(
                     load_config=lambda: {
                         "channels": [{"url": "https://youtube.com/@service"}],
-                        "autorun_interval_mins": 30,
                     },
                     save_config=lambda cfg: True,
                     queues=service_queues,
@@ -4629,13 +4655,9 @@ class RedownloadMixinTests(unittest.TestCase):
         api = Api()
         with mock.patch("backend.api_mixins.redownload_mixin.load_config",
                         side_effect=AssertionError("use services")), \
-                mock.patch("backend.api_mixins.redownload_mixin"
-                           ".archive_scan.load_disk_cache",
-                           return_value={}), \
                 mock.patch("backend.redownload.redownload_channel") as run, \
                 mock.patch("backend.archive_scan.invalidate_channel"):
             resume = api.resume_pending_redownloads()
-            pending = api.queue_pending_check()
             api._run_redownload_one(
                 {"name": "Service Channel",
                  "url": "https://youtube.com/@service"},
@@ -4647,8 +4669,6 @@ class RedownloadMixinTests(unittest.TestCase):
         self.assertEqual(resume, {"ok": True, "resumed": 1, "skipped": 0})
         service_queues.sync_remove.assert_called_once_with(
             "https://youtube.com/@service")
-        self.assertEqual(pending["count"], 1)
-        self.assertEqual(pending["total"], 1)
         run.assert_called_once()
         self.assertIs(run.call_args.kwargs["stream"], service_log)
         self.assertIs(run.call_args.kwargs["queues"], service_queues)
@@ -4860,6 +4880,114 @@ class SyncCoreTests(unittest.TestCase):
             self.assertEqual(payload["sync"][0]["status"], "queued")
         finally:
             q.mark_orphan()
+
+    def test_channel_folder_has_media_probe(self) -> None:
+        # [H1] helper: empty/missing folder → False (must not quick-skip);
+        # populated folder → True; unresolvable config → fail-open True.
+        sync_all_module = __import__(
+            "backend.sync.sync_all", fromlist=["sync_all"])
+        probe = sync_all_module._channel_folder_has_media
+        with tempfile.TemporaryDirectory() as td:
+            cfg = {"output_dir": td}
+            ch = {"name": "Chan", "url": "https://www.youtube.com/@chan"}
+            # Folder missing entirely.
+            self.assertFalse(probe(cfg, ch))
+            folder = Path(td) / "Chan"
+            folder.mkdir()
+            # Folder exists but is empty.
+            self.assertFalse(probe(cfg, ch))
+            # Sidecars / partial artifacts alone don't count as media.
+            (folder / "Chan Transcript.txt").write_text("x", encoding="utf-8")
+            (folder / "clip.mp4.part").write_bytes(b"x")
+            self.assertFalse(probe(cfg, ch))
+            # A real media file (year-split layout) flips it True.
+            year_dir = folder / "2024"
+            year_dir.mkdir()
+            (year_dir / "video.mp4").write_bytes(b"x")
+            self.assertTrue(probe(cfg, ch))
+        # No output_dir configured → fail-open (fast path allowed).
+        self.assertTrue(probe({}, {"name": "Chan"}))
+
+    def _run_sync_all_quickcheck_case(self, *, make_media: bool):
+        """Drive one sync_all pass over a fast-path-eligible channel and
+        report whether the quick check and sync_channel each ran."""
+        sync_all_module = __import__(
+            "backend.sync.sync_all", fromlist=["sync_all"])
+        q = queues.QueueState()
+        calls = {"qc": 0, "sync": 0}
+
+        def fake_quick_check(*args, **kwargs):
+            calls["qc"] += 1
+            return {"ok": True, "has_new": False,
+                    "checked": 5, "fresh_ids": []}
+
+        def fake_sync_channel(*args, **kwargs):
+            calls["sync"] += 1
+            return sync_core.SyncResult(ok=True, downloaded=0, errors=0)
+
+        with tempfile.TemporaryDirectory() as td:
+            channel = {
+                "name": "Chan",
+                "url": "https://www.youtube.com/@chan",
+                "mode": "full",
+                "initialized": True,
+                "init_complete": True,
+                "sync_complete": True,
+            }
+            folder = Path(td) / "Chan"
+            folder.mkdir()
+            if make_media:
+                (folder / "video.mp4").write_bytes(b"x")
+            archive = Path(td) / "archive.txt"
+            archive.write_text("youtube abcdefgh123\n", encoding="utf-8")
+            try:
+                with mock.patch.object(q, "save_debounced",
+                                       return_value=None), \
+                        mock.patch.object(
+                            sync_all_module, "load_config",
+                            return_value={"channels": [channel],
+                                          "output_dir": td}), \
+                        mock.patch.object(sync_all_module, "ARCHIVE_FILE",
+                                          str(archive)), \
+                        mock.patch.object(
+                            sync_all_module, "config_transaction",
+                            side_effect=lambda: contextlib.nullcontext({})), \
+                        mock.patch.object(sync_all_module,
+                                          "clear_sync_progress"), \
+                        mock.patch.object(sync_all_module,
+                                          "quick_check_new_uploads",
+                                          side_effect=fake_quick_check), \
+                        mock.patch.object(sync_all_module, "sync_channel",
+                                          side_effect=fake_sync_channel), \
+                        mock.patch.object(sync_all_module,
+                                          "_should_batch_limit",
+                                          return_value=False):
+                    self.assertTrue(q.sync_enqueue(channel))
+                    result = sync_all_module.sync_all(
+                        mock.Mock(),
+                        cancel_event=threading.Event(),
+                        queues=q,
+                        add_downloads_from_config=False,
+                    )
+                self.assertTrue(result["ok"])
+            finally:
+                q.mark_orphan()
+        return calls
+
+    def test_quickcheck_skips_populated_channel(self) -> None:
+        # Baseline: populated folder + all-archived probe → quick check
+        # runs and sync_channel is skipped (fast path intact).
+        calls = self._run_sync_all_quickcheck_case(make_media=True)
+        self.assertEqual(calls["qc"], 1)
+        self.assertEqual(calls["sync"], 0)
+
+    def test_quickcheck_never_skips_emptied_channel(self) -> None:
+        # [H1]: an EMPTIED channel folder must fall through to
+        # sync_channel (whose repopulate branch bypasses the download
+        # archive) instead of being quick-skipped as "no new videos".
+        calls = self._run_sync_all_quickcheck_case(make_media=False)
+        self.assertEqual(calls["qc"], 0)
+        self.assertEqual(calls["sync"], 1)
 
 
 class CompressTests(unittest.TestCase):
@@ -5077,6 +5205,29 @@ class QuickcheckTests(unittest.TestCase):
         self.assertTrue(second["timed_out"])
         self.assertTrue(third["quickcheck_skipped"])
         self.assertEqual(run.call_count, 2)
+
+    def test_quick_check_treats_duration_filtered_ids_as_known(self) -> None:
+        url = "https://youtube.com/@example"
+        proc = mock.Mock()
+        proc.stdout = (
+            "KNOWNVIDEO1|||300|||not_live\n"
+            "SHORTVIDEO1|||60|||not_live\n"
+        )
+
+        with mock.patch.object(quickcheck, "find_yt_dlp",
+                               return_value="yt-dlp"), \
+                mock.patch.object(quickcheck, "_find_cookie_source",
+                                  return_value=[]), \
+                mock.patch.object(quickcheck.subprocess, "run",
+                                  return_value=proc):
+            result = quickcheck.quick_check_new_uploads(
+                url, {"KNOWNVIDEO1"}, min_duration=180)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["has_new"])
+        self.assertEqual(result["checked"], 2)
+        self.assertEqual(result["fresh_ids"], [])
+        self.assertEqual(result["filtered_ids"], ["SHORTVIDEO1"])
 
 
 class ProcessRunnerCacheTests(unittest.TestCase):
@@ -5681,7 +5832,7 @@ class SettingsMixinServicesTests(unittest.TestCase):
         self.assertNotIn("yt-dlp.exe", cache_after)
         service_log.emit.assert_any_call([
             ["[Update] ", "update_head"],
-            ["Updating yt-dlp...\n", "update_sep"],
+            ["Updating yt-dlp to stable...\n", "update_sep"],
         ])
         service_log.emit_dim.assert_called_once_with(" updated")
         service_log.flush.assert_called_once()
@@ -8116,8 +8267,11 @@ class DriftScanTests(unittest.TestCase):
             content = txt.read_text(encoding="utf-8")
             self.assertTrue(result["ok"])
             self.assertEqual(result["actions"]["txt_reconstructed"], 1)
+            # v80: reconstruction carries the jsonl's video id into the
+            # header's trailing (youtu.be/<id>) field.
             self.assertIn("===(Video), (02.03.2024), (0:00), "
-                          "(RECOVERED-FROM-JSONL)===", content)
+                          "(RECOVERED-FROM-JSONL), (youtu.be/abc123_def4)===",
+                          content)
 
 
 class NetworkOutageGuardTests(unittest.TestCase):

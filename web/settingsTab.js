@@ -159,6 +159,13 @@
           const cb = (s.close_behavior || "ask").toLowerCase();
           cbEl.value = ["ask","tray","quit"].includes(cb) ? cb : "ask";
         }
+        // v80 auto-backup cadence — "off" | "daily" | "weekly" | "monthly".
+        const abEl = document.getElementById("settings-auto-backup");
+        if (abEl) {
+          const ab = (s.auto_backup_interval || "off").toLowerCase();
+          abEl.value = ["off","daily","weekly","monthly"].includes(ab)
+            ? ab : "off";
+        }
         // Auto-sync timing mode — read from the live scheduler state
         // (not the settings blob, since it's applied immediately).
         try {
@@ -222,6 +229,8 @@
       ?.addEventListener("change", (e) => saveField("log_mode", e.target.value));
     document.getElementById("settings-close-behavior")
       ?.addEventListener("change", (e) => saveField("close_behavior", e.target.value));
+    document.getElementById("settings-auto-backup")
+      ?.addEventListener("change", (e) => saveField("auto_backup_interval", e.target.value));
 
     // Avg-size toggle: live-apply to the Subs table AND persist.
     document.getElementById("settings-show-avg-size")

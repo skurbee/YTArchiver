@@ -54,7 +54,7 @@ VERBOSE_ONLY_TAGS = frozenset({
     # `tx_done_<vid>` placeholder and its eventual ✓ replacement.
     "transcribe_using",
     # Simple mode only shows the three green startup milestones
-    # ("Disk scan complete", "Browse tab preload complete", "Startup
+    # ("Disk scan complete", "Startup
     # checks complete, ready to download"). The per-channel "Loading\u2026
     # (18/103)" tick line and the yt-dlp download-percent lines are all
     # verbose-only telemetry.

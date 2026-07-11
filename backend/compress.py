@@ -297,7 +297,13 @@ def compress_video(input_path: str, stream: LogStreamer,
             "-multipass", "2",
             "-c:a", "aac", "-b:a", f"{audio_kbps}k",
             "-movflags", "+faststart",
-            "-metadata", "comment=ytarchiver_compressed=1",
+            # v80: the old `-metadata comment=ytarchiver_compressed=1`
+            # stamp is gone. Nothing ever read it (compressed-ness is
+            # verified by the codec probe below), and it clobbered the
+            # embedded provenance comment (the video's watch URL) that
+            # downloads/backfill now write. With no override, ffmpeg's
+            # default metadata mapping carries the input's title /
+            # artist / date / comment tags through the re-encode.
             temp_path,
         ]
 

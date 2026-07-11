@@ -67,8 +67,8 @@ class RecentMixin:
         except (TypeError, ValueError):
             _offset = 0
         try:
-            # Mark this as a foreground Browse query so the startup sweep +
-            # Browse preload yield the Z: pool to it — a cold Videos open
+            # Mark this as a foreground Browse query so the startup sweep
+            # yields the Z: pool to it — a cold Videos open
             # does up to 60 channel-wide thumbnail walks and must not run
             # head-to-head with the background walkers on the same disk.
             with index_backend.foreground_browse():

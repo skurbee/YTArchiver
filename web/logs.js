@@ -81,6 +81,11 @@
       // then the "[N/M] matched K so far..." match-loop counter.
       // Both cleared via clear_line when the final summary emits.
       if (t === "backfill_progress") return t;
+      // Embed file tags (v80 provenance) — both phases share one
+      // in-place counter line ("[N/M] ChannelName · X IDs added" /
+      // "[N/M] Embedding tags — X tagged ..."). Cleared via
+      // clear_line before each phase summary and on cancel.
+      if (t === "provenance_progress") return t;
       // Views/likes refresh per-channel transitional lines —
       // "Refreshing X...", "N video(s) have updated counts...",
       // and "[N/M] fetching metadata..." all share this kind so
@@ -172,17 +177,12 @@
     if (typeof window._mirrorMiniLogs === "function") window._mirrorMiniLogs();
   };
 
-  // Two-slot startup indicator — backend drives via
-  // window._setIndicator(slot, text|null) where slot is "sweep" or
-  // "preload". Sweep slot carries disk-scan / indexing progress;
-  // preload slot carries the browse-tab preload progress. They can
-  // both run in parallel, so both slots may be visible at once.
-  // Auto-dismiss timers keyed by slot, so a long-lived "Browse preload
-  // complete: …" doesn't stick on-screen forever. Cleared whenever new
-  // text comes in, so progress updates aren't pre-emptively hidden.
+  // Startup indicator — backend drives via
+  // window._setIndicator("sweep", text|null). Auto-dismiss timers are keyed
+  // by slot so terminal lines do not stick on-screen forever.
   const _indicatorTimers = {};
   window._setIndicator = function (slot, text) {
-    const el = document.getElementById("browse-preload-slot-" + slot);
+    const el = document.getElementById("startup-indicator-slot-" + slot);
     if (!el) return;
     if (_indicatorTimers[slot]) {
       clearTimeout(_indicatorTimers[slot]);
@@ -199,7 +199,7 @@
       if (/(?:^|\b)(?:complete|done)(?:[:.!-]|\s*$)/i.test(text)) {
         _indicatorTimers[slot] = setTimeout(() => {
           const current = document.getElementById(
-            "browse-preload-slot-" + slot);
+            "startup-indicator-slot-" + slot);
           if (!current) return;
           current.hidden = true;
           current.textContent = "";
@@ -208,11 +208,6 @@
       }
     }
   };
-  // Back-compat shim for any caller still using the pre-split name.
-  window._setPreloadIndicator = function (text) {
-    window._setIndicator("sweep", text);
-  };
-
   function tagClasses(tag) {
     if (!tag) return "";
     if (Array.isArray(tag)) {

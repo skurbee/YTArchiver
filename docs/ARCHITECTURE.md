@@ -67,15 +67,17 @@ without needing psutil child-scanning.
 |------|-------|--------|
 | Config | `%APPDATA%\YTArchiver\ytarchiver_config.json` | JSON |
 | Queue state | `%APPDATA%\YTArchiver\ytarchiver_queue.json` | JSON (debounced 2s) |
-| Index | `<archive_root>\.ytarchiver_index.db` | SQLite + FTS5 |
+| Index | `%APPDATA%\YTArchiver\transcription_index.db` | SQLite + FTS5 |
 | Per-video metadata | `<channel>\.<channel> Metadata.jsonl` | JSONL (hidden) |
-| Per-video transcripts | `<channel>\<year>\<month>\.<channel>.jsonl` | JSONL (hidden) |
-| Aggregated transcripts | `<channel>\<year>\<month>\<channel>.txt` | Plain text |
+| Per-segment transcripts | `<channel>\<year>\<month>\.<channel> Transcript.jsonl` | JSONL (hidden) |
+| Aggregated transcripts | `<channel>\<year>\<month>\<channel> Transcript.txt` | Plain text |
 | Thumbnails | `<channel>\.Thumbnails\<title> [<vid>].jpg` | JPEG (hidden) |
 | Auth token | `%APPDATA%\YTArchiver\cmd_token` | Random URL-safe token |
 | Config backups | `%APPDATA%\YTArchiver\backups\config_YYYY-MM-DD_HHMMSS.json` | JSON |
-| Window state | `%APPDATA%\YTArchiver\window_state.json` | JSON |
-| Channel cache | `%APPDATA%\YTArchiver\channel_id_cache.json` | JSON |
+| Window state | inside `ytarchiver_config.json` (`window_state` key) | JSON |
+| Channel cache | `%APPDATA%\YTArchiver\ytarchiver_channel_ids.json` | JSON |
+| Provenance ledger | `%APPDATA%\YTArchiver\provenance_ledger.jsonl` | JSONL (files already tagged by Embed File Tags) |
+| Archive info folder | `<archive root>\YTArchiver Info\` | ABOUT txt + exe copy + scheduled backup ZIPs |
 
 ## Sync pipeline (per video)
 
@@ -125,6 +127,12 @@ background thread or the UI freezes. See [`../backend/api_mixins/README.md`](../
 "Threading" section.
 
 ## Notable design decisions
+
+- **Generated frontend shell**: `web/index.html` is assembled from
+  `web/index.template.html` plus `web/partials/*.html` by
+  `backend/html_assembler.py`. Edit the template/partials first, then
+  regenerate. Browse > Videos is a grid-only, lazy-loaded archive view
+  owned by `web/videosView.js`.
 
 - **Atomic file writes**: every JSONL/config write goes through
   `.tmp` + `fsync` + `os.replace`. A crash mid-write never corrupts the

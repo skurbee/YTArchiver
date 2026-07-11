@@ -1,5 +1,5 @@
 /**
- * web/columnWidth.js — drag-to-resize column widths on Subs + Recent tables, persisted
+ * web/columnWidth.js — drag-to-resize column widths on Subs, persisted
  *
  * Exposed as window.initColumnWidth; app.js boot calls it once.
  */
@@ -22,13 +22,12 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
-  // ─── Column width persistence (Subs + Recent) ───────────────────────
+  // ─── Column width persistence (Subs) ─────────────────────────────────
   function persistColumnWidths() {
     // Wire resize handles immediately — these don't need the API.
     // Since HTML tables don't natively support col drag-resize, add a
     // simple mousedown-on-th-border handler that updates <col> width.
     _wireColResize(".subs-table", "subs");
-    _wireColResize(".recent-table", "recent");
 
     // Apply saved widths — needs pywebview.api, which may not be ready
     // at DOMContentLoaded. Retry on `pywebviewready` + poll fallback to
@@ -40,7 +39,6 @@
       bridgeCall("window_state_load").then((st) => {
         if (!st || !st.col_widths) return;
         _applyColWidths(".subs-table", st.col_widths.subs);
-        _applyColWidths(".recent-table", st.col_widths.recent);
       }).catch(() => {});
       return true;
     };

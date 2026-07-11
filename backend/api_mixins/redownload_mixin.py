@@ -249,33 +249,3 @@ class RedownloadMixin:
                 try: ev.set()
                 except Exception as e: _log.warning("redownload sample-confirm: ev.set() failed; worker will hang until 300s timeout: %s", e)
         return {"ok": True, "choice": c, "resolved": len(pending_list)}
-
-
-    def queue_pending_check(self):
-        """Count channels that likely have new videos by comparing archive
-        file cursor vs disk cache. Cheap sanity estimate — not exact."""
-        cfg = self._redownload_config()
-        channels = cfg.get("channels", [])
-        cache = archive_scan.load_disk_cache()
-        # scale the "pending" threshold to the user's
-        # autorun interval. If autorun runs every 30 min and the
-        # threshold is a hardcoded 2h, the badge always shows
-        # non-zero even when every channel was synced recently.
-        # Rule: threshold = max(autorun_interval, 2h) so the badge
-        # never flags a channel as pending until at least one
-        # scheduled autorun cycle has passed without it being
-        # touched. Falls back to 2h if no interval is configured.
-        import time as _t
-        _autorun_min = 0
-        try:
-            _autorun_min = int(cfg.get("autorun_interval_mins") or 0)
-        except (TypeError, ValueError):
-            _autorun_min = 0
-        _interval_secs = max(_autorun_min * 60, 2 * 3600)
-        threshold = _t.time() - _interval_secs
-        n_pending = 0
-        for ch in channels:
-            rec = cache.get(ch.get("url", ""))
-            if not rec or rec.get("last_updated", 0) < threshold:
-                n_pending += 1
-        return {"ok": True, "count": n_pending, "total": len(channels)}

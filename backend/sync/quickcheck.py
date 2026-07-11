@@ -192,7 +192,9 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
 
 
 def quick_check_new_uploads(ch_url: str, archived_ids,
-                            check_count: int = 5, timeout_sec: int = 30
+                            check_count: int = 5, timeout_sec: int = 30,
+                            min_duration: int = 0,
+                            max_duration: int = 0
                             ) -> dict[str, Any]:
     """Probe the first N videos of a channel to see if any are NOT in our
     archive already. Short-circuit for channels with nothing new.
@@ -212,11 +214,22 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
     if skipped is not None:
         return skipped
     qc_url = _ensure_videos_tab(ch_url)
+    def _clean_duration(value: object) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    min_dur = _clean_duration(min_duration)
+    max_dur = _clean_duration(max_duration)
+    use_duration_filter = bool(min_dur or max_dur)
+    print_expr = ("%(id)s|||%(duration)s|||%(live_status)s"
+                  if use_duration_filter else "id")
     cmd = [
         yt_dlp,
         "--flat-playlist", "--lazy-playlist",
         "--playlist-end", str(int(check_count)),
-        "--print", "id",
+        "--print", print_expr,
         "--no-warnings",
     ]
     cmd += _find_cookie_source() or []
@@ -227,6 +240,21 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
         archived_set = {x.strip() for x in (archived_ids or []) if x}
     checked: list[str] = []
     fresh: list[str] = []
+    filtered: list[str] = []
+    def _duration_filtered(duration_raw: str, live_status: str) -> bool:
+        status = (live_status or "").strip().lower()
+        if status in ("is_live", "is_upcoming"):
+            return True
+        try:
+            dur = float((duration_raw or "").strip())
+        except (TypeError, ValueError):
+            return False
+        if min_dur and dur <= min_dur:
+            return True
+        if max_dur and dur >= max_dur:
+            return True
+        return False
+
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=float(timeout_sec),
@@ -251,11 +279,26 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
         return {"ok": False, "error": str(e)}
     for raw in (proc.stdout or "").splitlines():
         raw = raw.strip()
-        if not raw or not re.fullmatch(r'[A-Za-z0-9_-]{11}', raw):
+        if not raw:
             continue
-        checked.append(raw)
-        if raw not in archived_set:
-            fresh.append(raw)
+        if use_duration_filter and "|||" in raw:
+            parts = raw.split("|||", 2)
+            vid = parts[0].strip()
+            duration_raw = parts[1] if len(parts) > 1 else ""
+            live_status = parts[2] if len(parts) > 2 else ""
+        else:
+            vid = raw
+            duration_raw = ""
+            live_status = ""
+        if not re.fullmatch(r'[A-Za-z0-9_-]{11}', vid):
+            continue
+        checked.append(vid)
+        if vid in archived_set:
+            continue
+        if use_duration_filter and _duration_filtered(duration_raw, live_status):
+            filtered.append(vid)
+            continue
+        fresh.append(vid)
     # Empty result = treat as "might have new" per OLD's behavior
     # (line 17980-17981: `if not ids: return True`).
     if not checked:
@@ -264,7 +307,8 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
                 "checked": 0, "fresh_ids": [], "empty_probe": True}
     _clear_quickcheck_bad(ch_url)
     return {"ok": True, "has_new": bool(fresh),
-            "checked": len(checked), "fresh_ids": fresh}
+            "checked": len(checked), "fresh_ids": fresh,
+            "filtered_ids": filtered}
 
 
 def _check_batch_cooldown(ch: dict[str, Any]) -> tuple[bool, str]:

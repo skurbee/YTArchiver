@@ -45,7 +45,7 @@ A tour of the UI is on the [**wiki**](https://github.com/skurbee/YTArchiver/wiki
 * **Embedded video player** — HTML5 video with a synced, scrolling transcript alongside
 * **Click-to-seek** — click any word in the transcript to jump the video to that moment
 * **Word frequency analysis** — frequency graphs (Year / Month / Week buckets) and word cloud visualizations
-* **Recent downloads** — list or thumbnail-grid view of recently-archived videos, filterable
+* **All videos grid** — sortable, lazy-loaded archive-wide video browser with title/channel filtering
 
 
 

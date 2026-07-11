@@ -7,7 +7,6 @@
 
    Includes:
      • initLastSyncTicker — "Last Full Sync: XX min ago" label, 60s tick
-     • initRecentFilter — Recent-tab live filter input
      • initSubsFilter — Subs-tab live filter input + clear button
      • persistSplitterOnResize — save the activity-log/main-log split
        height to window_state when the splitter is dragged
@@ -16,14 +15,13 @@
 
    Publishes:
      window.initLastSyncTicker
-     window.initRecentFilter
      window.initSubsFilter
      window.persistSplitterOnResize
      window._onArchiveRescanComplete
 
    Reads:
      window.pywebview.api.* (various)
-     window._browseState, window._applyRecentFilter, window._applySubsFilter
+      window._browseState, window._applySubsFilter
      window._showToast, window._reloadCurrentChannelVideos,
      window._reloadChannelsGrid
    ═══════════════════════════════════════════════════════════════════════ */
@@ -108,22 +106,6 @@
     }
   }
 
-  // Recent tab live filter — 100ms debounce, Esc clears.
-  function initRecentFilter() {
-    const input = document.getElementById("recent-filter");
-    if (!input) return;
-    let deb = null;
-    input.addEventListener("input", () => {
-      clearTimeout(deb);
-      deb = setTimeout(() => {
-        window._applyRecentFilter?.(input.value);
-      }, 100);
-    });
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { input.value = ""; window._applyRecentFilter?.(""); }
-    });
-  }
-
   // Subs tab live filter — 100ms debounce, Esc + clear-button both
   // wipe the input and re-apply the empty filter.
   function initSubsFilter() {
@@ -193,7 +175,6 @@
   };
 
   window.initLastSyncTicker = initLastSyncTicker;
-  window.initRecentFilter = initRecentFilter;
   window.initSubsFilter = initSubsFilter;
   window.persistSplitterOnResize = persistSplitterOnResize;
 })();

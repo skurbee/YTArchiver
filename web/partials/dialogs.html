@@ -146,6 +146,54 @@
     </div>
   </div>
 
+  <!-- Embed file tags dialog (v80 provenance backfill). Retrofits
+       existing files with the embedded identity new downloads get:
+       MP4 container tags + (youtu.be/<id>) Transcript.txt headers. -->
+  <div class="askq-backdrop" id="provenance-backdrop" hidden>
+    <div class="askq-dialog askq-dialog-narrow">
+      <div class="askq-header">
+        <span>Embed file tags</span>
+      </div>
+      <div class="askq-body askq-body-small-pad">
+        <div class="askq-help-text"
+             title="MP4 tags: each known-ID video is stream-copy remuxed (no re-encode, no quality change) to embed its title, channel, upload date, and watch URL inside the file container — visible in Explorer's Details pane and any media player, and it survives renames, moves, and copies. File modified-dates are preserved. Transcript headers: legacy header lines gain a (youtu.be/<id>) field when the hidden .jsonl sidecar knows the video's ID unambiguously. A ledger makes re-runs skip already-tagged files, so the pass is safe to pause, cancel, and resume any time.">
+          Writes each video's identity (title, channel, upload date,
+          watch URL) inside the MP4 file itself, and adds video IDs to
+          Transcript.txt headers. No re-encode; file dates are
+          preserved. Queues as a Sync Task.
+          <span class="askq-help-details">Details</span>
+        </div>
+        <div class="edit-grid askq-compact-grid">
+          <label class="edit-gl">Scope</label>
+          <select class="ctl-select askq-select-max" id="provenance-channel"></select>
+
+          <label class="edit-gl">Phases</label>
+          <label class="askq-small-label">
+            <input type="checkbox" id="provenance-do-txt" checked />
+            Add video IDs to Transcript.txt headers
+          </label>
+
+          <label class="edit-gl"></label>
+          <label class="askq-small-label">
+            <input type="checkbox" id="provenance-do-mp4" checked />
+            Embed tags in MP4 files (remux, no re-encode)
+          </label>
+
+          <label class="edit-gl">Dry-run</label>
+          <label class="askq-small-label">
+            <input type="checkbox" id="provenance-dryrun" />
+            Count what would change, write nothing
+          </label>
+        </div>
+      </div>
+      <div class="askq-buttons">
+        <button class="btn btn-primary" id="provenance-run"
+                title="Start the pass. Modal closes; progress shows in the main log.">Run</button>
+        <button class="btn btn-ghost" id="provenance-close">Close</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Diagnostics dialog -->
   <div class="askq-backdrop" id="diag-backdrop" hidden>
     <div class="askq-dialog askq-dialog-diagnostics">

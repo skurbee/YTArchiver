@@ -814,6 +814,31 @@
 .bookmark-remove:hover {
   background: rgba(123, 28, 28, 0.94);
 }
+/* Note editor (audit S2) — sits left of the × delete button. */
+.bookmark-note-btn {
+  position: absolute;
+  right: 32px;
+  top: 6px;
+  z-index: 3;
+  width: 22px;
+  height: 22px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 3px;
+  background: rgba(10, 12, 16, 0.78);
+  color: #fff;
+  font-size: var(--fs-md);
+  line-height: 18px;
+  cursor: pointer;
+}
+.bookmark-note-btn:hover {
+  background: rgba(28, 74, 123, 0.94);
+}
+/* Cards that already carry a note get an accent pencil so they read
+   as "annotated" at a glance. */
+.bookmark-note-btn.has-note {
+  color: var(--c-accent);
+  border-color: var(--c-accent);
+}
 .bookmark-card-body {
   padding: 10px 10px 11px;
   min-width: 0;

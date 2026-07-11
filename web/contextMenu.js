@@ -59,6 +59,16 @@
         sub.className = "ctx-submenu";
         sub.setAttribute("role", "menu");
         for (const sit of it.submenu) {
+          // Support { sep: true } inside submenus too — previously only
+          // the top-level loop handled separators, and a sep entry in a
+          // submenu rendered as a clickable "undefined" row.
+          if (sit.sep) {
+            const ssep = document.createElement("div");
+            ssep.className = "ctx-menu-sep";
+            ssep.setAttribute("role", "separator");
+            sub.appendChild(ssep);
+            continue;
+          }
           const srow = document.createElement("div");
           srow.className = "ctx-menu-item";
           srow.setAttribute("role", "menuitem");

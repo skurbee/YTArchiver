@@ -165,6 +165,7 @@ except Exception as _e:  # pragma: no cover - boot-time best effort
     print(f"[html_assembler] could not (re)build index.html: {_e}")
     _boot_trace("html assemble failed")
 
+from backend import auto_backup as auto_backup_backend
 from backend import autorun as autorun_backend
 from backend.archive_capacity import archive_capacity_status
 from backend import index as index_backend
@@ -490,6 +491,12 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             sync_busy_fn=lambda: (self.sync_is_running()
                                  or self.archive_single_is_running()),
         )
+        # v80 scheduled backups — daemon thread, no-op while the
+        # Settings > Auto-backup cadence is "off". First check fires
+        # ~2 min after boot so it never competes with startup work.
+        self._auto_backup = auto_backup_backend.AutoBackupScheduler(
+            stream=self._log_stream)
+        self._auto_backup.start()
         self._reload_config()
         # Blank-name scan: surface any channel whose folder would resolve to
         # `_unnamed/`. The add/update guards stop new blanks from being
@@ -665,8 +672,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                               → staleness-gated: if cache is newer than
                                 `disk_scan_staleness_hours`, skip the walk
                                 and just report from the cache (instant)
-            Stage 3 (mins) --- Browse tab preload complete (N \u00b7 M cached) ---
-                              → sweep + per-channel video-list cache warm
+            Stage 3 (background) --- newly-added files swept into the index
 
         Each stage runs on its own thread and emits its milestone the
         moment it finishes. The "Loading\u00b7" tick line animates in
@@ -712,21 +718,16 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             _flush_now()
 
         cfg = self._config or load_config()
-        # Per-slot startup status — two slots run in parallel during
-        # Stage 3 (sweep + preload). "sweep" slot is top of the UI
-        # stack (disk scan / indexing new files). "preload" slot is
-        # bottom (browse tab preload). Each has {phase, detail}.
-        # Animator iterates both and emits whichever are populated.
+        # Startup status for low-priority background indexing.
         dots_state = {
             "i": 0,
             "sweep": {"phase": "Starting up", "detail": ""},
-            "preload": {"phase": "", "detail": ""},
         }
         stage3_done = threading.Event()
 
         def _push_indicator(slot, text):
-            """Push text to the given UI slot ("sweep" or "preload"),
-            or `None`/`""` to hide it. Visible in Simple + Verbose.
+            """Push startup status text, or `None`/`""` to hide it.
+            Visible in Simple + Verbose.
 
             LOW FIX (audit 5.23 LOW-5): use json.dumps to encode the
             text argument. The previous manual replace-chain escaped
@@ -755,15 +756,14 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 _log.debug("swallowed: %s", e)
 
         def _animate_dots():
-            """Cycle dots on each active slot (sweep / preload). When a
+            """Cycle dots on each active status slot. When a
             slot's `phase` is empty, its UI indicator is hidden; when
-            populated, we emit `{phase}{dots} {detail}`. Both can be
-            active simultaneously (parallel Stage 3)."""
+            populated, we emit `{phase}{dots} {detail}`."""
             while not stage3_done.is_set():
                 dots_state["i"] = (dots_state["i"] + 1) % 3
                 d = ["\u00b7 ", "\u00b7\u00b7 ", "\u00b7\u00b7\u00b7"][dots_state["i"]]
                 log_parts = []
-                for slot in ("sweep", "preload"):
+                for slot in ("sweep",):
                     state = dots_state[slot]
                     phase = state.get("phase") or ""
                     detail = state.get("detail") or ""
@@ -774,18 +774,14 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                         log_parts.append(line.strip())
                     else:
                         _push_indicator(slot, None)
-                # Log mirror — join active slots with a separator so
-                # the verbose log still has a single representative
-                # "Loading" line even with two concurrent phases.
+                # Log mirror for the verbose startup "Loading" line.
                 if log_parts:
                     _loading(" \u00b7 ".join(log_parts))
                 _time.sleep(0.4)
             # NOTE: post-stage-3 indicator state is handled by the
-            # caller after stage3_done.set() — sweep slot is cleared
-            # and preload slot gets a persistent dim "Browse preload
-            # complete: ..." line. The animator deliberately doesn't
-            # touch the slots on exit so it can't race-overwrite that
-            # completion text.
+            # caller after stage3_done.set(). The animator deliberately
+            # doesn't touch the slot on exit so it can't race-overwrite
+            # cleanup.
         threading.Thread(target=_animate_dots, daemon=True).start()
 
         def _clear_loading():
@@ -809,14 +805,25 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # ── Stage 1: Startup checks (immediate — < 2s) ─────────────────
         # No heavy I/O at this stage. Emit the green milestone right away
         # so the user sees the app responded, and flip the Sync buttons
-        # active so they can kick off a sync without waiting for the
-        # multi-minute preload.
+        # active so they can kick off a sync without waiting for background
+        # indexing.
         try:
             s.emit_text("--- Startup checks complete, ready to download ---",
                         "simpleline_green")
             _flush_now()
         except Exception as e: _log.debug("swallowed: %s", e)
         _fire_ready_js()
+        # Paint the restored queue NOW. Items restored from last session
+        # in Api.__init__ were loaded before the window existed, so their
+        # listener pushes were silently dropped (self._window is None in
+        # _on_queue_changed). Without this explicit repaint, restored
+        # Sync/GPU tasks stayed invisible until the next incidental queue
+        # mutation — after a cold reboot that could be the end of the
+        # disk scan, ~45s later, which read as "my queue is gone."
+        try:
+            self._on_queue_changed()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
         # ── Stage 2: Disk walk (staleness-gated) ───────────────────────
         def _stage2_disk_walk():
@@ -916,21 +923,13 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 s.emit_error(f"Disk scan error: {e}")
                 _flush_now()
 
-        # ── Stage 3: Sweep + preload run IN PARALLEL ───────────────────
-        # Previously ran sequentially — user reported several-minute
-        # wait before Browse preload even started, because sweep had
-        # to walk every channel folder first. These two jobs are
-        # independent: sweep walks disk + writes new rows; preload
-        # only reads existing rows. SQLite WAL handles concurrent
-        # reader+writer. Worst-case race is a cache entry written
-        # before a new file's register_video invalidates it — the
-        # next click just does a fresh DB query. Safe.
-        def _stage3_sweep_and_preload():
-            """Run archive sweep and Browse preload after disk state is known."""
+        # Stage 3: low-priority background sweep.
+        def _stage3_sweep():
+            """Run the archive sweep after disk state is known."""
             output_dir = (cfg.get("output_dir") or "").strip()
             sweep_result = {"registered": 0, "ingested": 0}
 
-            # Startup maintenance (archive sweep + Browse preload) is the
+            # Startup maintenance is the
             # LOWEST-priority work in the app. It must fully yield to anything
             # the user (or autorun) kicks off and NEVER compete for the Z:
             # pool / SQLite writer / GIL while that runs.
@@ -942,7 +941,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             #       Stays True across ALL channels of a pass. The old gate used
             #       only is_any_sync_active(), which is set/cleared per channel
             #       and so flickers False in every gap BETWEEN channels — each
-            #       gap let the sweep/preload threads sneak a chunk of disk I/O
+            #       gap let the sweep thread sneak a chunk of disk I/O
             #       onto the slow pool mid-pass, stalling the active download.
             #   * archive_single_is_running() — a single ad-hoc download.
             #   * _transcribe._current_job    — a Whisper/GPU job finishing.
@@ -951,7 +950,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 try:
                     # User is actively loading a Browse view (Videos grid /
                     # channel grid). Cold opens do channel-wide thumbnail
-                    # walks on the slow Z: pool — park sweep + preload so the
+                    # walks on the slow Z: pool — park sweep so the
                     # foreground query isn't fighting them for the disk.
                     if index_backend.is_foreground_browse_busy():
                         return True
@@ -1006,8 +1005,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     s.emit_error(f"Sweep failed: {_se}")
                     _flush_now()
                 finally:
-                    # Clear the sweep slot so only preload's slot
-                    # remains visible if preload's still running.
+                    # Clear the sweep slot when indexing is done.
                     dots_state["sweep"]["phase"] = ""
                     dots_state["sweep"]["detail"] = ""
 
@@ -1050,15 +1048,10 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
 
             stage3_done.set()
             # Wait > the animator's 0.4s sleep cycle so its loop
-            # definitely sees stage3_done and exits BEFORE we push the
-            # persistent completion text. Without this, the animator's
-            # last in-flight iteration could race-overwrite our text
-            # with a stale "Preloading Browse..." line.
+            # definitely sees stage3_done and exits before cleanup.
             _time.sleep(0.5)
             _clear_loading()
-            # Replace the live "Preloading..." indicator with a persistent
-            # dim-italic completion line. Sweep slot cleared (indexing
-            # is done), preload slot gets the completion summary.
+            # Clear the live indexing indicator.
             try:
                 _push_indicator("sweep", None)
             except Exception as e:
@@ -1069,7 +1062,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         def _run_stages():
             """Run slow startup stages in order on the boot worker thread."""
             _stage2_disk_walk()
-            _stage3_sweep_and_preload()
+            _stage3_sweep()
         threading.Thread(target=_run_stages, daemon=True).start()
 
 
@@ -1861,14 +1854,6 @@ def main():
         except Exception as e:
             _log.debug("tray start failed (continuing window-only): %s", e)
     _boot_trace("tray started")
-
-    # Start the network-down monitor so sync workers can pause on outage.
-    # Cheap (single background thread, 30s TCP probe); no-op on full uptime.
-    try:
-        from backend import net as _net
-        _net.start_monitor()
-    except Exception as e:
-        _log.debug("swallowed: %s", e)
 
     # Startup sanity checks — dependency probe, missing folder scan, update
     # ping, leftover temp/partial file sweep. All run in background threads

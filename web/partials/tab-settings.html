@@ -64,13 +64,28 @@
             <option value="clock">Clock-aligned (fixed times)</option>
           </select>
 
+          <label class="edit-gl">Auto-backup</label>
+          <select class="ctl-select" id="settings-auto-backup"
+                  title="Automatically exports the app's full backup (settings, subscriptions, download history, queue) into the 'YTArchiver Info' folder inside the archive root — alongside a README describing the archive format and a copy of the app itself. The newest 4 backups are kept; older ones move to the archive trash.">
+            <option value="off" selected>Off</option>
+            <option value="daily">Daily</option>
+            <option value="weekly">Weekly</option>
+            <option value="monthly">Monthly</option>
+          </select>
+          <div class="edit-gh">
+            Saves the app's full backup (settings, subs, download
+            history) into <b>YTArchiver Info</b> in the archive root,
+            with a format README and a copy of the app &mdash; so the
+            archive folder is fully self-contained.
+          </div>
+
           <label class="edit-gl">Launch at boot</label>
           <div class="edit-gv-stack">
-            <label class="edit-gv-inline settings-preload-toggle">
+            <label class="edit-gv-inline settings-checkbox-row">
               <input type="checkbox" id="settings-launch-at-boot" />
               <span>Start YTArchiver when Windows signs in</span>
             </label>
-            <label class="edit-gv-inline settings-preload-toggle" id="settings-boot-minimized-wrap" hidden>
+            <label class="edit-gv-inline settings-checkbox-row" id="settings-boot-minimized-wrap" hidden>
               <input type="checkbox" id="settings-boot-minimized" />
               <span>Start minimized to tray</span>
             </label>
@@ -104,7 +119,7 @@
         <div class="edit-grid">
           <label class="edit-gl">Subs table</label>
           <div class="edit-gv-stack">
-            <label class="edit-gv-inline settings-preload-toggle">
+            <label class="edit-gv-inline settings-checkbox-row">
               <input type="checkbox" id="settings-show-avg-size" />
               <span>Show Avg filesize in subs tab</span>
             </label>

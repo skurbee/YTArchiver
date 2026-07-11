@@ -32,6 +32,7 @@ from .log_stream import LogStreamer
 from .net import block_if_down
 from .utils import sampled_files_equal
 from .utils import utf8_subprocess_env as _utf8_env
+from .utils import ytdlp_embed_tag_args
 
 _log = get_logger(__name__)
 
@@ -731,6 +732,9 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
         "-f", fmt,
         "--merge-output-format", "mp4",
         "--ppa", "Merger:-c copy",
+        # Same embedded provenance tags as the sync path, so a
+        # redownloaded file keeps its in-container identity.
+        *ytdlp_embed_tag_args(),
         "-o", dl_path,
         "--no-download-archive",
         *(_find_cookie_source() or []),

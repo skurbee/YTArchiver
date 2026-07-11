@@ -758,6 +758,13 @@
         flashError(res?.error || "Unknown error");
         return;
       }
+      const wasAdd = !_savedIdentity && !res.write_blocked;
+      const addedChannelName = (res.channel?.name || res.channel?.folder
+        || payload.folder || payload.name || "").trim();
+      const shouldReorgAfterSave = !!(
+        _savedIdentity && res.folder_org_changed && !res.write_blocked);
+      const reorgChannelName = (res.channel?.name || res.channel?.folder
+        || payload.folder || payload.name || "").trim();
       if (res.write_blocked) {
         flashError("Saved in memory but disk write is gated.");
       } else {
@@ -769,6 +776,44 @@
       }
       await refreshSubsTable();
       closePanel();
+      if (shouldReorgAfterSave && reorgChannelName) {
+        try {
+          const rr = await bridgeCall("reorg_channel_folder", {
+            name: reorgChannelName,
+          }, !!res.channel?.split_years, !!res.channel?.split_months, false);
+          if (!rr?.ok) {
+            window._showToast?.(
+              rr?.error || "Folder reorganization did not start.", "error");
+          } else {
+            window._showToast?.("Folder reorganization started.", "ok");
+          }
+        } catch (e) {
+          window._showToast?.("Reorg error: " + e, "error");
+        }
+      }
+      if (wasAdd && addedChannelName) {
+        const syncNow = await (window.askConfirm
+          ? window.askConfirm("Channel added", "Channel added. Sync now?", {
+              confirm: "Sync now",
+              cancel: "Later",
+            })
+          : Promise.resolve(confirm("Channel added. Sync now?")));
+        if (syncNow) {
+          try {
+            const syncRes = await bridgeCall("sync_one_channel", {
+              name: addedChannelName,
+            });
+            if (!syncRes?.ok) {
+              window._showToast?.(
+                syncRes?.error || "Sync failed to start.", "error");
+            } else {
+              window._showToast?.("Sync started.", "ok");
+            }
+          } catch (e) {
+            window._showToast?.("Error: " + e, "error");
+          }
+        }
+      }
       } finally {
         update.disabled = false;
       }

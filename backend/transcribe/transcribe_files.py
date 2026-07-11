@@ -189,12 +189,15 @@ def _write_transcript_entry(txt_path, *args, **kwargs):
 
 def _write_transcript_entry_unlocked(txt_path: str, title: str,
                             upload_date: str, duration_secs: float,
-                            source_tag: str, text: str) -> bool:
+                            source_tag: str, text: str,
+                            video_id: str = "") -> bool:
     """Append one formatted block to the aggregated Transcript.txt.
-    Format (YTArchiver.py:15458):
-      ===(title), (MM.DD.YYYY), (H:MM:SS), (SOURCE)===
+    Format (YTArchiver.py:15458, +v80 url field):
+      ===(title), (MM.DD.YYYY), (H:MM:SS), (SOURCE), (youtu.be/<id>)===
       {text}
       [triple newline]
+    The url field is omitted when `video_id` is empty/malformed, which
+    keeps the legacy 4-field shape for unknown-id videos.
 
     Atomic write: read existing content, append the new entry in memory,
     write to <path>.tmp with fsync, then os.replace onto the final path.
@@ -208,7 +211,8 @@ def _write_transcript_entry_unlocked(txt_path: str, title: str,
         dur_raw = _format_duration_hms(duration_secs or 0) or ""
         dur_fmt = f"({dur_raw})" if dur_raw else "(Unknown length)"
         src_fmt = source_tag if source_tag.startswith("(") else f"({source_tag})"
-        entry = f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}===\n{text}\n\n\n"
+        entry = (f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}"
+                 f"{_header_url_field(video_id)}===\n{text}\n\n\n")
         # Read existing content (file may not exist yet on first transcribe).
         # `errors="replace"` so a partially corrupt UTF-8 byte sequence
         # doesn't UnicodeDecodeError and leave the file broken for
@@ -239,17 +243,35 @@ def _write_transcript_entry_unlocked(txt_path: str, title: str,
         return False
 
 
-# Header pattern for the per-entry "===(title), (date), (duration), (source)==="
-# line in the aggregated Transcript.txt. Captures title (group 1), date
-# (group 2), duration (group 3), source tag (group 4). Matches OLD
-# YTArchiver.py:28997 `_HEADER_RE`.
+# Header pattern for the per-entry header line in the aggregated
+# Transcript.txt. Two on-disk generations exist:
+#   v1: ===(title), (date), (duration), (source)===
+#   v2: ===(title), (date), (duration), (source), (youtu.be/<id>)===
+# Captures title (group 1), date (group 2), duration (group 3), source
+# tag (group 4), bare video id (group 5, None on v1 headers).
 # Title uses `.*` greedily so YT titles containing the field-looking
 # delimiter `), (` are not truncated at the first apparent boundary.
-# Date/dur/src groups stay restrictive because they're emitted by our
-# own writers and won't contain `)`.
+# The (?!youtu\.be/) lookahead on the source group is what makes the
+# optional 5th field unambiguous: without it, greedy-title backtracking
+# parses a v2 line as a v1 line with `title), (date` glued into the
+# title and the URL misread as the source tag. Date/dur/src groups stay
+# restrictive because they're emitted by our own writers and won't
+# contain `)`.
 _HEADER_RE = re.compile(
-    r'^===\((.*)\),\s*(\([^)]*\)),\s*(\([^)]*\)),\s*(\([^)]*\))===',
+    r'^===\((.*)\),\s*(\([^)]*\)),\s*(\([^)]*\)),\s*'
+    r'(\((?!youtu\.be/)[^)]*\))'
+    r'(?:,\s*\(youtu\.be/([A-Za-z0-9_-]{11})\))?===',
     re.MULTILINE)
+
+_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
+
+
+def _header_url_field(video_id: str) -> str:
+    """Return the `, (youtu.be/<id>)` header suffix, or '' when the id
+    is absent/malformed. Central so the append and replace writers emit
+    byte-identical fields."""
+    vid = (video_id or "").strip()
+    return f", (youtu.be/{vid})" if _VIDEO_ID_RE.match(vid) else ""
 _BODY_WS_RE = re.compile(r"\s+")
 
 
@@ -450,7 +472,8 @@ def _replace_txt_entry(txt_path, *args, **kwargs):
 def _replace_txt_entry_unlocked(txt_path: str, title: str, new_text: str,
                        source_tag: str,
                        extra_titles_to_remove=None,
-                       old_text_candidates=None) -> bool:
+                       old_text_candidates=None,
+                       video_id: str = "") -> bool:
     """Surgically swap this video's `===(…)===\\n<body>\\n\\n\\n` block in
     the aggregated Transcript.txt. `_replace_txt_entry`.
 
@@ -519,22 +542,28 @@ def _replace_txt_entry_unlocked(txt_path: str, title: str, new_text: str,
 
     # Remove each matching entry (header line through the next header
     # or EOF). Iterate from the end so earlier match positions stay
-    # valid as we slice. Capture date+duration from the first removed
-    # entry so the new block inherits the provenance.
+    # valid as we slice. Capture date+duration (and, when the caller
+    # didn't supply one, the video id) from the first removed entry so
+    # the new block inherits the provenance.
     new_content = content
     date_fmt = "(Unknown date)"
     dur_fmt = "(Unknown length)"
+    vid = (video_id or "").strip()
     captured = False
     for start, end, m in sorted(removals, key=lambda x: x[0], reverse=True):
         if not captured:
-            # Matches group indices of _HEADER_RE: (title, date, dur, src)
+            # Matches group indices of _HEADER_RE:
+            # (title, date, dur, src, video_id?)
             date_fmt = m.group(2)
             dur_fmt = m.group(3)
+            if not vid:
+                vid = (m.group(5) or "").strip()
             captured = True
         new_content = new_content[:start] + new_content[end:]
 
     src_fmt = source_tag if source_tag.startswith("(") else f"({source_tag})"
-    new_entry = f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}===\n{new_text}\n\n\n"
+    new_entry = (f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}"
+                 f"{_header_url_field(vid)}===\n{new_text}\n\n\n")
 
     new_content = new_content.rstrip("\n") + "\n\n\n" if new_content.strip() else ""
     new_content += new_entry

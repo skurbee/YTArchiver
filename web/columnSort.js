@@ -1,5 +1,5 @@
 /**
- * web/columnSort.js — clickable column-header sort on Subs + Recent tables.
+ * web/columnSort.js — clickable column-header sort on the Subs table.
  *
  * Extracted from app.js. Each table's <thead> th becomes clickable; first
  * click sorts ascending by that column's type-aware comparator (string /
@@ -22,7 +22,7 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
-  // ─── Column sort on Subs + Recent tables ─────────────────────────────
+  // ─── Column sort on Subs table ───────────────────────────────────────
   function initColumnSort() {
     // Subs table
     const subsThead = document.querySelector(".subs-table thead");
@@ -36,11 +36,6 @@
                                    // jumping 10d → 5d → 18h instead of monotonic).
                                    last_sync: "age", n_vids: "num",
                                    size: "size", avg_size: "size" });
-    // Recent table
-    const recentThead = document.querySelector(".recent-table thead");
-    if (recentThead) wireTableSort(recentThead, "recent-table-body",
-                                   { title: "string", channel: "string",
-                                     time: "age", duration: "dur", size: "size" });
   }
 
   function wireTableSort(thead, tbodyId, kinds) {
@@ -512,6 +507,12 @@
               if (!ok) return;
               bridgeCall("chan_fix_file_dates", { name: chan });
             }},
+            { sep: true },
+            // Cancel affordance for the long passes above \u2014 both were
+            // previously unstoppable from the UI (audit S4). Helper is
+            // defined in browseContextMenus.js and shared here.
+            { label: "Cancel running reorg / date fix",
+              action: () => window._cancelFolderOps?.() },
           ]},
         // "Fetch channel art" used to live here but the user flagged it as
         // redundant — channel art is fetched automatically as part of the

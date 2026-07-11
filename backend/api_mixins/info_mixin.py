@@ -112,11 +112,6 @@ class InfoMixin:
             # info so the JS can apply the class BEFORE the first
             # renderSubsTable call and avoid a flash of the hidden column.
             "show_avg_size": bool(cfg.get("show_avg_size", False)),
-            # Recent tab view mode — "list" (legacy table) or "grid"
-            # (thumbnail cards). Piggybacked here so the JS can set the
-            # initial visibility of either view before the first render
-            # and avoid a flash of the wrong view.
-            "recent_view_mode": (cfg.get("recent_view_mode") or "grid"),
         }
 
 

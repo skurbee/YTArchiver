@@ -135,8 +135,6 @@
             leavingPanel.querySelectorAll("tr.row-selected, .row-selected")
               .forEach(r => r.classList.remove("row-selected"));
           }
-          const delBtn = document.getElementById("btn-delete-file");
-          if (delBtn) delBtn.hidden = true;
         } catch (_e) { /* non-fatal */ }
       });
     });

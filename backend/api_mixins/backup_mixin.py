@@ -22,28 +22,15 @@ from backend.ytarchiver_config import CONFIG_FILE, config_is_writable, load_conf
 from backend import subs as subs_backend
 
 
-_BACKUP_MANIFEST_NAME = "ytarchiver_backup_manifest.json"
-
-
-def _backup_file_entries():
-    from backend.ytarchiver_config import (
-        APP_DATA_DIR,
-        CHANNEL_ID_CACHE,
-        DISK_CACHE_FILE,
-        QUEUE_FILE,
-        SEEN_FILTER_TITLES,
-    )
-    return (
-        (CONFIG_FILE.name, CONFIG_FILE),
-        (QUEUE_FILE.name, QUEUE_FILE),
-        (DISK_CACHE_FILE.name, DISK_CACHE_FILE),
-        (SEEN_FILTER_TITLES.name, SEEN_FILTER_TITLES),
-        (CHANNEL_ID_CACHE.name, CHANNEL_ID_CACHE),
-        ("ytarchiver_livestream_defer.json",
-         APP_DATA_DIR / "ytarchiver_livestream_defer.json"),
-        ("ytarchiver_pending_transcribe.json",
-         APP_DATA_DIR / "ytarchiver_pending_transcribe.json"),
-    )
+# v80: the zip-writing core + file list moved to backend/auto_backup.py
+# so the scheduled auto-backup and this manual export share ONE
+# implementation. These aliases keep existing call sites and tests
+# working unchanged.
+from backend.auto_backup import (  # noqa: E402
+    BACKUP_MANIFEST_NAME as _BACKUP_MANIFEST_NAME,
+    backup_file_entries as _backup_file_entries,
+    build_backup_zip as _build_backup_zip,
+)
 
 
 def _allowed_backup_top_names() -> set[str]:
@@ -245,35 +232,8 @@ class BackupMixin:
         size warning so users can decide to export manually.
         """
         try:
-            import zipfile as _zf
-
             import webview as _wv
 
-            from backend.ytarchiver_config import (
-                APP_DATA_DIR,
-                TRANSCRIPTION_DB,
-            )
-            # opt-in include of the FTS DB if it fits. NOTE: the DB is
-            # NOT appended to `_backup_file_entries()` — it gets a safe sqlite3
-            # backup-API snapshot below instead of a raw file copy
-            # (raw copy of a live WAL-mode DB misses every transaction
-            # still in the -wal and can tear mid-read).
-            _fts_skipped_reason = ""
-            _fts_size = 0
-            _include_fts = False
-            try:
-                if TRANSCRIPTION_DB.exists():
-                    _fts_sz = TRANSCRIPTION_DB.stat().st_size
-                    _fts_size = int(_fts_sz)
-                    if _fts_sz < 2 * 1024 * 1024 * 1024:
-                        _include_fts = True
-                    else:
-                        _fts_skipped_reason = (
-                            f"FTS DB skipped — too large "
-                            f"({_fts_sz / (1024**3):.1f} GB > 2 GB). "
-                            f"Back up manually if needed.")
-            except OSError:
-                pass
             if self._window is None:
                 return {"ok": False, "error": "No window"}
             import datetime as _dt
@@ -290,69 +250,11 @@ class BackupMixin:
             out_path = normalize_dialog_paths(paths)
             if not out_path:
                 return {"ok": False, "cancelled": True}
-            n = 0
-            # Write to a .tmp file then os.replace into the final
-            # path. A crash / power loss / disk full mid-zip
-            # previously partially overwrote the user's previous
-            # backup ZIP at out_path, leaving them with no
-            # recoverable backup. With the tmp+replace pattern, the
-            # old file stays intact until the new zip closes cleanly.
-            tmp_path = out_path + ".tmp"
-            try:
-                with _zf.ZipFile(tmp_path, "w", _zf.ZIP_DEFLATED) as zf:
-                    for arcname, p in _backup_file_entries():
-                        if p.exists():
-                            zf.write(str(p), arcname=arcname)
-                            n += 1
-                    if _include_fts:
-                        # Consistent point-in-time snapshot of the live
-                        # WAL-mode DB via sqlite3's backup API. zipping
-                        # the .db file raw silently dropped the -wal's
-                        # committed transactions and could produce a
-                        # torn (unreadably corrupt) copy if a
-                        # checkpoint ran mid-read — discovered only at
-                        # restore time.
-                        import sqlite3 as _sq3
-                        import tempfile as _tf
-                        _fd, _snap = _tf.mkstemp(suffix=".db")
-                        os.close(_fd)
-                        try:
-                            _src = _sq3.connect(
-                                f"file:{TRANSCRIPTION_DB}?mode=ro",
-                                uri=True, timeout=60)
-                            try:
-                                _dst = _sq3.connect(_snap)
-                                try:
-                                    _src.backup(_dst)
-                                finally:
-                                    _dst.close()
-                            finally:
-                                _src.close()
-                            zf.write(_snap, arcname=TRANSCRIPTION_DB.name)
-                            n += 1
-                        finally:
-                            try: os.remove(_snap)
-                            except OSError: pass
-                    zf.writestr(_BACKUP_MANIFEST_NAME, json.dumps({
-                        "app": "YTArchiver",
-                        "backup_type": "app-state",
-                        "fts_db_included": bool(_include_fts),
-                        "fts_db_size": _fts_size,
-                        "fts_skipped_reason": _fts_skipped_reason,
-                    }, indent=2, sort_keys=True))
-                    n += 1
-                    backup_dir = APP_DATA_DIR / "backups"
-                    if backup_dir.is_dir():
-                        snaps = sorted(backup_dir.glob("config_*.json"),
-                                       key=lambda pp: pp.stat().st_mtime, reverse=True)
-                        if snaps:
-                            zf.write(str(snaps[0]), arcname=f"backups/{snaps[0].name}")
-                            n += 1
-                os.replace(tmp_path, out_path)
-            except Exception:
-                try: os.remove(tmp_path)
-                except OSError: pass
-                raise
+            # v80: the actual zip write (atomic tmp+replace, FTS
+            # snapshot via the sqlite3 backup API, manifest, latest
+            # config snapshot) lives in auto_backup.build_backup_zip —
+            # shared with the scheduled auto-backup.
+            _stats = _build_backup_zip(out_path)
             # Record backup timestamp so Settings can show staleness (T295).
             import time as _bk_time
             _backup_ts = _bk_time.time()
@@ -362,10 +264,11 @@ class BackupMixin:
                 save_config(_c2)
             except Exception:
                 pass
-            _resp = {"ok": True, "path": out_path, "files": n,
+            _resp = {"ok": True, "path": out_path,
+                     "files": _stats["files"],
                      "last_backup_ts": _backup_ts}
-            if _fts_skipped_reason:
-                _resp["fts_skipped"] = _fts_skipped_reason
+            if _stats["fts_skipped_reason"]:
+                _resp["fts_skipped"] = _stats["fts_skipped_reason"]
             return _resp
         except Exception as e:
             return _api_err("BACKUP_WRITE_FAILED", str(e))

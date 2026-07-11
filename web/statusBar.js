@@ -21,7 +21,7 @@
   // Last-known inputs, refreshed by the wrapped globals below.
   let _queues = { sync: [], gpu: [] };
   let _state = { sync: {}, gpu: {} };
-  const _indicator = { sweep: "", preload: "" };
+  const _indicator = { sweep: "" };
   let _errorCount = 0;
 
   function _runningItem(list) {
@@ -90,10 +90,10 @@
     _setSeg("gsb-sync", sSt.running || _runningItem(_queues.sync), sSt.paused);
     _setSeg("gsb-gpu", gSt.running || _runningItem(_queues.gpu), gSt.paused);
 
-    // Index / sweep indicator — whichever slot is populated.
+    // Index / sweep indicator.
     const idxEl = document.getElementById("gsb-index");
     if (idxEl) {
-      const txt = (_indicator.sweep || _indicator.preload || "").trim();
+      const txt = (_indicator.sweep || "").trim();
       if (txt) { idxEl.hidden = false; idxEl.textContent = _truncate(txt, 46); }
       else idxEl.hidden = true;
     }
@@ -156,7 +156,7 @@
     const origInd = window._setIndicator;
     window._setIndicator = function (slot, text) {
       if (origInd) { try { origInd(slot, text); } catch (e) { /* ignore */ } }
-      if (slot === "sweep" || slot === "preload") _indicator[slot] = text || "";
+      if (slot === "sweep") _indicator[slot] = text || "";
       _render();
     };
 

@@ -604,6 +604,67 @@ class MediaOpsMixin:
                 "scope": scope_name, "dry_run": dry_run}
 
 
+    # ─── Embed file tags (v80 provenance backfill) ─────────────────────
+
+    def provenance_embed(self, payload):
+        """Queue an Embed File Tags task on the sync queue.
+
+        Phase 1 upgrades legacy Transcript.txt headers with the
+        (youtu.be/<id>) field; Phase 2 remuxes known-ID MP4s (-c copy,
+        no re-encode) to embed title / channel / upload-date / watch-URL
+        tags inside the file container. Resumable via a ledger — files
+        already tagged are skipped on re-runs.
+
+        payload keys (all optional):
+          channel: channel folder name to limit scope; "" = all channels
+          do_txt: bool — run the Transcript.txt header phase (default on)
+          do_mp4: bool — run the MP4 tag phase (default on)
+          dry_run: bool — count what would change but write nothing
+        """
+        cfg = self._config or load_config()
+        output_dir = (cfg.get("output_dir") or "").strip()
+        if not output_dir:
+            return {"ok": False, "error": "output_dir is not configured"}
+        payload = payload or {}
+        channel = (payload.get("channel") or "").strip()
+        do_txt = bool(payload.get("do_txt", True))
+        do_mp4 = bool(payload.get("do_mp4", True))
+        dry_run = bool(payload.get("dry_run"))
+        if not do_txt and not do_mp4:
+            return {"ok": False,
+                    "error": "Nothing to do — enable at least one phase"}
+
+        if channel:
+            scope_name = channel
+            scope_url = f"provenance:channel:{channel}"
+        else:
+            scope_name = "All channels"
+            scope_url = "provenance:all"
+
+        task = {
+            "kind": "provenance",
+            "name": scope_name,
+            "folder": scope_name,
+            "url": scope_url,
+            "channel_folder": channel or None,
+            "do_txt": do_txt,
+            "do_mp4": do_mp4,
+            "dry_run": dry_run,
+        }
+        try:
+            queued = self._queues.sync_enqueue(task)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if not queued:
+            return {"ok": True, "queued": False, "duplicate": True,
+                    "reason": "Already queued for this scope"}
+        self._on_queue_changed()
+        started = self._maybe_autostart_sync()
+        return {"ok": True, "queued": True, "started": started,
+                "paused": bool(self._queues.sync_paused),
+                "scope": scope_name, "dry_run": dry_run}
+
+
     # ─── Compress dry-run (feature F8) ─────────────────────────────────
 
     def compress_dry_run(self, output_res="720"):

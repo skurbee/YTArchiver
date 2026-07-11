@@ -87,6 +87,18 @@
                       title="Scan the whole archive and hide any stray sidecar files (.info.json, leftover thumbnails, .jsonl, etc.) so each folder shows only the videos + the Transcript.txt. Only sets the Windows hidden attribute — nothing is moved or deleted.">Scan &amp; repair&hellip;</button>
             </div>
 
+            <!-- v80 provenance backfill: retrofit existing archive files
+                 with the same embedded identity new downloads now get —
+                 MP4 container tags (title / channel / upload date /
+                 watch URL) and (youtu.be/<id>) fields in the aggregated
+                 Transcript.txt headers. Stream-copy remux, no re-encode;
+                 file mtimes are preserved. -->
+            <label class="edit-gl">File provenance</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <button class="btn btn-ghost btn-thin" id="btn-provenance"
+                      title="Embed each video's identity (title, channel, upload date, watch URL) inside the MP4 file itself, and add video IDs to Transcript.txt headers. No re-encode — streams are byte-copied and file dates are preserved. Queues as a Sync Task.">Embed file tags&hellip;</button>
+            </div>
+
             <!-- bug W-3: About + Diagnostics dialogs existed in the
                  HTML + JS but had no UI buttons to trigger them. Both
                  handlers (app.js:6436 / 6471) use getElementById which

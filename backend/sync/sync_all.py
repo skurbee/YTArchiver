@@ -50,9 +50,48 @@ from .quickcheck import (
     quick_check_new_uploads,
     set_batch_cooldown,
 )
+from .options import normalize_channel_sync_options
 from .sync_helpers import _fmt_duration
 
 _log = get_logger(__name__)
+
+
+def _channel_folder_has_media(cfg: dict[str, Any], ch: dict[str, Any]) -> bool:
+    """[H1] Disk-evidence gate for the quick-check fast path.
+
+    True when the channel's folder holds at least one real media file
+    (first-hit probe — a handful of scandir calls on a populated
+    channel). False means the folder is MISSING or EMPTIED, and the
+    quick check must not skip this channel: sync_channel's
+    Entire-channel repopulate branch (sync/core.py — bypasses the
+    download archive when the folder is empty so the channel refills)
+    can only fire if sync_channel actually runs. Before this gate, an
+    emptied channel's first 5 upload IDs were still in
+    ytarchiver_archive.txt, so the quick check reported "no new
+    videos" forever and the repopulate fix was unreachable from a
+    normal Sync Subbed pass.
+
+    Fail-open: any unexpected error returns True (fast path allowed)
+    so a transient probe hiccup can't downgrade a whole pass into full
+    channel walks.
+    """
+    try:
+        base = (cfg.get("output_dir") or "").strip()
+        if not base:
+            return True
+        from .ytdlp_proc import channel_folder_name as _cfn
+        folder = os.path.join(base, _cfn(ch))
+        if not os.path.isdir(folder):
+            # Whole folder gone — same repopulate scenario as emptied.
+            return False
+        from ..fs_search import walk_channel_videos as _wcv
+        # First-hit generator probe — stops at the first media file.
+        # Same walker sync_channel's empty-folder detection uses, so
+        # this gate and the repopulate branch always agree on "empty".
+        return any(True for _ in _wcv(folder))
+    except Exception as e:
+        swallow("quick-check empty-folder probe", e)
+        return True
 
 
 def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
@@ -175,6 +214,8 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
             return "Repair YT auto-captions"
         if kinds == {"punct_restore"}:
             return "Restore transcript punctuation"
+        if kinds == {"provenance"}:
+            return "Embed file tags"
         if kinds == {"metadata"}:
             # All refresh=True → views/likes refresh; all refresh=False →
             # metadata download; mixed → generic metadata pass.
@@ -193,7 +234,8 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     _kinds_in_queue = {(c.get("kind") or "download").lower()
                        for c in (_queue_snapshot
                                  if queues is not None else channels)}
-    _archive_wide_kinds = {"repair_yt_captions", "punct_restore"}
+    _archive_wide_kinds = {"repair_yt_captions", "punct_restore",
+                           "provenance"}
     if _kinds_in_queue and _kinds_in_queue.issubset(_archive_wide_kinds):
         _unit = "task" if _starting_total == 1 else "tasks"
     else:
@@ -268,6 +310,20 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         except Exception:
             pass
 
+    def _known_ids_for_channel(ch: dict[str, Any]) -> set:
+        known = set(_known_ids)
+        try:
+            from .. import channel_cache as _cc
+            opts = normalize_channel_sync_options(ch)
+            known.update(_cc.get_filtered_ids(
+                (ch.get("url") or "").strip(),
+                opts.min_duration,
+                opts.max_duration,
+            ))
+        except Exception as e:
+            swallow("filtered-id quickcheck cache", e)
+        return known
+
     def _now_clock() -> str:
         # "1:03am" style, matching OLD's log format.
         now = datetime.now()
@@ -286,6 +342,13 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         """If pause_event is set, log pause + wait until resumed.
         Re-paints the last live row as PAUSED and back. Idempotent."""
         if pause_event is None or not pause_event.is_set():
+            return
+        # Pass already cancelled — skip the "Sync paused" theater.
+        # A paused-then-cancelled task (which announced its own pause
+        # in-run) used to hit this between-tasks handler with pause
+        # still set, emitting a SECOND paused line right before "Pass
+        # cancelled."
+        if cancel_event is not None and cancel_event.is_set():
             return
         # Re-paint the last live row (if any) in paused style.
         if _last_live["name"]:
@@ -514,7 +577,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         _is_meta_kind = _ch_kind in ("metadata", "metadata_comments",
                                      "videoid_backfill",
                                      "repair_yt_captions",
-                                     "punct_restore")
+                                     "punct_restore", "provenance")
         _row_bracket = "meta_bracket" if _is_meta_kind else "sync_bracket"
         _row_name_tag = ("simpleline_pink" if _is_meta_kind
                          else "simpleline_green")
@@ -539,7 +602,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         # `sync_running=true`). Cleared at the end of the iteration
         # below so the next channel doesn't inherit a stale row.
         if _ch_kind in ("metadata", "metadata_comments", "videoid_backfill",
-                        "repair_yt_captions", "punct_restore"):
+                        "repair_yt_captions", "punct_restore", "provenance"):
             if queues is not None:
                 try: queues.set_current_sync(ch)
                 except Exception as e: swallow("current-sync set", e)
@@ -936,6 +999,68 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                                bracket_tag=_row_bracket)
             _last_live["name"] = ""
             continue
+        # Embed file tags task (v80). Phase 1 upgrades legacy
+        # Transcript.txt headers with the (youtu.be/<id>) field; Phase 2
+        # remuxes known-ID MP4s (-c copy, no re-encode) to embed
+        # title / channel / date / watch-URL tags in the container.
+        # Pure local disk work — no YT calls — but serialized through
+        # the sync queue so it never remuxes a file a download or
+        # compress task is writing.
+        if _ch_kind == "provenance":
+            try:
+                from .. import provenance as _prov
+                _output_dir = (cfg.get("output_dir") or "").strip()
+                if not _output_dir:
+                    raise RuntimeError("output_dir not configured")
+                _res = _prov.embed_provenance_archive(
+                    output_dir=_output_dir,
+                    channel_folder=ch.get("channel_folder") or None,
+                    do_txt=bool(ch.get("do_txt", True)),
+                    do_mp4=bool(ch.get("do_mp4", True)),
+                    dry_run=bool(ch.get("dry_run")),
+                    log_stream=stream,
+                    cancel_event=cancel_event,
+                    pause_event=pause_event,
+                    queues=queues,
+                    scope_url=(ch.get("url") or "").strip() or None,
+                )
+                if queues is not None:
+                    try: queues.set_sync_pass_progress(0, 0)
+                    except Exception as e:
+                        swallow("provenance pass-progress reset", e)
+                _ok_n = int(_res.get("succeeded", 0) or 0)
+                _hdr_n = int(_res.get("txt_upgraded", 0) or 0)
+                _skip_n = int(_res.get("skipped", 0) or 0)
+                _fail_n = int(_res.get("failed", 0) or 0)
+                _was_cancelled = bool(_res.get("cancelled"))
+                # Phase order: headers first, then file tags — a run
+                # cancelled during the header phase reads naturally
+                # ("46,601 headers · 0 tagged") instead of implying
+                # the tagging failed.
+                _summary = (f"{_hdr_n:,} headers · "
+                            f"{_ok_n:,} tagged · "
+                            f"{_skip_n:,} skipped · "
+                            f"{_fail_n} failed")
+                if _was_cancelled:
+                    _summary = "cancelled — " + _summary
+                _sum_tag = ("red" if _fail_n > 0 and not _was_cancelled
+                            else "simpleline_pink"
+                            if (_ok_n > 0 or _hdr_n > 0)
+                            else "dim")
+                _sync_row_emit(stream, i, total, ch_name,
+                               summary=_summary,
+                               name_tag="simpleline",
+                               summary_tag=_sum_tag,
+                               bracket_tag=_row_bracket)
+            except Exception as _pve:
+                stream.emit_error(
+                    f"Embed file tags failed for {ch_name}: {_pve}\n")
+                _sync_row_emit(stream, i, total, ch_name,
+                               summary="failed",
+                               name_tag="dim", summary_tag="red",
+                               bracket_tag=_row_bracket)
+            _last_live["name"] = ""
+            continue
         # ── Quick-check fast path ────────────────────────────────────
         # Extra speedup on top of `--break-on-existing`: probe the first
         # 5 video IDs via `--flat-playlist --lazy-playlist --playlist-end
@@ -953,14 +1078,13 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         # fast enough — no need for the probe.
         _ch_url = (ch.get("url") or "").strip()
         _ch_mode = (ch.get("mode") or "full").lower()
-        _ch_is_init = bool(ch.get("initialized", False))
-        _ch_sync_ok = bool(ch.get("sync_complete", True))
+        _ch_sync_ok = bool(ch.get("sync_complete", False))
         if ch.get("init_complete", False):
             _ch_sync_ok = True
         _fast_path_eligible = (
             ch.get("init_complete", False) and
             _ch_sync_ok and
-            _ch_mode == "full" and
+            _ch_mode in ("full", "new", "fromdate") and
             # Channels with failed videos pending retry must run the
             # full sync_channel pass — retries are prepended only
             # there, so quick-checking "no new videos" starved them
@@ -968,9 +1092,36 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
             # reached the 3-strike give-up).
             not (ch.get("failed_video_ids") or {})
         )
-        if _known_ids and _ch_url and _fast_path_eligible:
+        # [H1] Disk-evidence check — only probed when the channel is
+        # otherwise eligible, so non-eligible channels never pay the
+        # (cheap) scandir. An emptied/missing folder must fall through
+        # to sync_channel so its repopulate branch can bypass the
+        # download archive and refill the channel; the quick check
+        # only consults the archive file and would skip it forever.
+        _known_for_channel = (_known_ids_for_channel(ch)
+                              if _fast_path_eligible and _ch_url else set())
+        if (_fast_path_eligible and _known_for_channel and _ch_url
+                and not _channel_folder_has_media(cfg, ch)):
+            _fast_path_eligible = False
+            stream.emit_dim(
+                f" {ch_name}: folder is empty or missing on disk — "
+                f"skipping the quick check so the full sync can "
+                f"repopulate it.")
+        if _known_for_channel and _ch_url and _fast_path_eligible:
+            _qc_opts = normalize_channel_sync_options(ch)
             _qc = quick_check_new_uploads(
-                _ch_url, _known_ids, check_count=5, timeout_sec=30)
+                _ch_url, _known_for_channel, check_count=5, timeout_sec=30,
+                min_duration=_qc_opts.min_duration,
+                max_duration=_qc_opts.max_duration)
+            if _qc.get("filtered_ids"):
+                try:
+                    from .. import channel_cache as _cc
+                    _cc.append_filtered_ids(
+                        _ch_url, _qc.get("filtered_ids") or [],
+                        _qc_opts.min_duration, _qc_opts.max_duration)
+                    _known_for_channel.update(_qc.get("filtered_ids") or [])
+                except Exception as e:
+                    swallow("quickcheck filtered-id append", e)
             if _qc.get("ok") and not _qc.get("has_new"):
                 _sync_row_emit(stream, i, total, ch_name,
                                summary="no new videos",

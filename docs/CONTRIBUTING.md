@@ -49,7 +49,7 @@ YTArchiver/
 │   │   ├── ytdlp_proc.py     # yt-dlp lookup/cookies/formats
 │   │   ├── ytdlp_events.py   # yt-dlp output parsing
 │   │   ├── ytdlp_session.py  # process launch/watchdog/finish
-│   │   ├── recent_track.py   # Recent-tab download tracking
+│   │   ├── recent_track.py   # Recent-download history tracking
 │   │   ├── active_state.py   # in-flight sync-channel tracking
 │   │   └── display_push.py   # sync-progress JSON for companion display
 │   ├── transcribe/         # Whisper transcription package
@@ -116,17 +116,18 @@ YTArchiver/
     ├── index.html             # Build artifact — assembled at boot
     ├── index.template.html    # Shell with @include markers
     ├── partials/              # Tab + dialog markup partials
-    │   ├── tab-download.html, tab-subs.html, tab-settings.html,
-    │   │   tab-browse.html, popovers.html, dialogs.html, modals.html
-    ├── app.js              # Bootstrap + tab init orchestrator (~150 lines)
-    ├── logs.js             # Log rendering (~900 lines)
+    │   ├── tab-download.html, tab-subs.html, tab-browse.html,
+    │   │   tab-health.html, tab-settings.html, onboarding.html,
+    │   │   popovers.html, dialogs.html, modals.html
+    ├── app.js              # Bootstrap + tab init orchestrator (~230 lines)
+    ├── logs.js             # Log rendering (~990 lines)
     ├── watchView.js        # Watch view + karaoke + captions
     ├── browseGrids.js      # Channel grid + Video grid + card builder
-    ├── tables.js           # Subs table + Recent list/grid
+    ├── tables.js           # Subs table
     ├── queueRender.js      # Sync/GPU task popover row builder
     ├── metadataTab.js      # Settings → Metadata refresh status
     ├── settingsTab.js, settingsInfra.js, indexControls.js
-    ├── …~40 feature modules (see docs/PROJECT_MAP.md for full list)
+    ├── …~55 more feature modules (see docs/PROJECT_MAP.md for full list)
     ├── styles.css             # vars + base (rest in styles-*.css)
     ├── styles-settings.css, styles-download-controls.css,
     │   styles-logs.css, styles-tabs-data.css, styles-browse.css,
@@ -165,11 +166,11 @@ documented in `backend/api_mixins/README.md`.
 ### Persistence
 
 - **Config**: `%APPDATA%\YTArchiver\ytarchiver_config.json` (single file).
-- **Index**: `<archive_root>\.ytarchiver_index.db` (SQLite + FTS5).
+- **Index**: `%APPDATA%\YTArchiver\transcription_index.db` (SQLite + FTS5).
 - **Queue state**: `%APPDATA%\YTArchiver\ytarchiver_queue.json` (debounced).
 - **Auth token**: `%APPDATA%\YTArchiver\cmd_token` (Patch 1; cmd-server auth).
-- **Transcripts**: `<channel>/{year}/{month}/<channel>.txt` (aggregated)
-  + `<channel>/{year}/{month}/.<channel>.jsonl` (hidden, per-segment).
+- **Transcripts**: `<channel>/{year}/{month}/<channel> Transcript.txt` (aggregated)
+  + `<channel>/{year}/{month}/.<channel> Transcript.jsonl` (hidden, per-segment).
 - **Thumbnails**: `<channel>/.Thumbnails/<title> [<vid>].jpg` (hidden).
 - **Metadata**: `<channel>/.<channel> Metadata.jsonl` (hidden, per-video).
 
@@ -204,8 +205,8 @@ always carry the ten: `v37.9 + 0.1 = v38.0` (never `v37.10`).
   sync helpers, generated HTML, frontend JS, or bridge-facing backend behavior.
 - End-to-end UI testing is still manual — run `python main.py` and exercise
   the flow you touched.
-- `web/app.js` modularization is complete (10,218 → ~150 lines across
-  ~50 focused modules). Remaining work is small-cleanup passes only.
+- `web/app.js` modularization is complete (10,218 → ~230 lines across
+  ~65 focused modules). Remaining work is small-cleanup passes only.
 
 ## Where to learn more
 

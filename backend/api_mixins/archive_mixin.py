@@ -44,27 +44,35 @@ def _probe_output_folder_writable(base: str) -> None:
 
 def _recent_scan_bind_is_corroborated(path: str, video_id: str,
                                       title: str) -> bool:
-    """Guard single-video recent-scan fallback against wrong-file binding."""
+    """Guard single-video recent-scan fallback against wrong-file binding.
+
+    Compares the on-disk stem to the DLTRACK title through the canonical
+    normalizer with ``strip_windows_illegal=True`` so yt-dlp's reserved-char
+    substitutions (`/` → ⧸, `:` → ：, etc.) don't defeat the match. The old
+    naive `[...]→_` sanitizer never agreed with yt-dlp's unicode glyphs, so
+    any title with a slash/colon failed to corroborate and the id was lost.
+    """
     if not path:
         return False
     import re as _re
+    from ..text_utils import normalize_title
     stem = os.path.splitext(os.path.basename(path))[0]
     stem_no_date = _re.sub(r"\s*\(\d{2}\.\d{2}\.\d{2}\)\s*$", "", stem)
     low_name = os.path.basename(path).lower()
     vid = (video_id or "").strip().lower()
     if vid and vid in low_name:
         return True
-    title_sane = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_",
-                         title or "").strip()
-    if not title_sane:
+    title_norm = normalize_title(
+        title or "", strip_windows_illegal=True, strip_trailing_punct=False)
+    if len(title_norm) < 12:
         return False
-    prefix = title_sane[:50].rstrip().lower()
-    if len(prefix) < 12:
+    stem_norm = normalize_title(
+        stem_no_date, strip_windows_illegal=True, strip_trailing_punct=False)
+    if not stem_norm:
         return False
-    stem_low = stem_no_date.lower()
-    title_low = title_sane.lower()
-    return stem_low.startswith(prefix) or (
-        len(stem_low) >= 12 and title_low.startswith(stem_low))
+    prefix = title_norm[:50].rstrip()
+    return stem_norm.startswith(prefix) or (
+        len(stem_norm) >= 12 and title_norm.startswith(stem_norm))
 
 
 _BINDABLE_MEDIA_EXTS = {
@@ -98,6 +106,59 @@ def _choose_existing_ytdlp_candidate(
                 and os.path.splitext(path)[1].lower() in _BINDABLE_MEDIA_EXTS
                 and _is_under_folder(path, folder)):
             return path
+    return ""
+
+
+def _bind_file_via_sidecar_id(base: str, video_id: str) -> str:
+    """Last-resort file bind by .info.json CONTENT (id → media file).
+
+    Finds the ``*.info.json`` under ``base`` whose recorded id equals
+    ``video_id`` and returns its sibling media file. Because the match is on
+    JSON content — not the filename — it is immune to EVERY class of
+    filename mismatch: yt-dlp's reserved-char glyphs (⧸ ／ ：),
+    ``--trim-filenames`` truncation, and any future sanitization change.
+    This mirrors the channel-sync path, which recovers orphans the same way
+    (sync/core.py `_resolve_id_from_sidecars`). Returns "" if nothing matches.
+    """
+    vid = (video_id or "").strip()
+    if not vid or not base:
+        return ""
+    import glob as _glob
+    import json as _json
+    try:
+        sidecars = _glob.glob(os.path.join(base, "*.info.json"))
+    except Exception:
+        return ""
+    for sc in sidecars:
+        try:
+            with open(sc, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+        except Exception:
+            continue
+        sc_id = str(data.get("id") or "").strip()
+        if sc_id != vid:
+            # Tolerate the id living only in the recorded source URLs.
+            if not any(vid in str(data.get(k) or "")
+                       for k in ("webpage_url", "original_url", "url")):
+                continue
+        # Content match confirmed. Resolve the sibling media file — prefer
+        # yt-dlp's own recorded output filename, then glob the stem.
+        rec = data.get("_filename") or data.get("filename") or ""
+        if not rec:
+            rd = data.get("requested_downloads")
+            if isinstance(rd, list) and rd and isinstance(rd[0], dict):
+                rec = rd[0].get("filepath") or rd[0].get("_filename") or ""
+        if rec:
+            rp = (rec if os.path.isabs(rec)
+                  else os.path.join(base, os.path.basename(str(rec))))
+            if (os.path.isfile(rp)
+                    and os.path.splitext(rp)[1].lower() in _BINDABLE_MEDIA_EXTS):
+                return rp
+        stem = os.path.basename(sc)[:-len(".info.json")]
+        for g in _glob.glob(os.path.join(base, _glob.escape(stem) + ".*")):
+            if (os.path.isfile(g)
+                    and os.path.splitext(g)[1].lower() in _BINDABLE_MEDIA_EXTS):
+                return g
     return ""
 
 
@@ -154,16 +215,27 @@ def resolve_final_path(base: str, video_id: str, title: str,
                 reverse=True)
             final_path = vid_candidates[0]
         if not final_path and title:
-            # Fallback: match by full sanitized title.
-            title_sane = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title)
+            # Fallback: match by full title through the canonical normalizer
+            # (strip_windows_illegal folds yt-dlp's reserved-char glyphs like
+            # `/`→⧸ and `:`→： so "Artist: 11/23/1996" matches the on-disk
+            # "Artist ⧸ 11⧸23⧸1996" stem). Requiring the FULL normalized
+            # title to equal the FULL normalized stem still keeps similar
+            # long-prefix titles ("Video 1:...", "Video 2:...") from colliding.
+            from ..text_utils import normalize_title
+            title_norm = normalize_title(
+                title, strip_windows_illegal=True, strip_trailing_punct=False)
             title_candidates = []
             for g in _glob.glob(os.path.join(base, "*")):
                 stem = os.path.splitext(os.path.basename(g))[0]
-                # Match if the stem EQUALS the full sanitized title
-                # (possibly with a " (MM.DD.YY)" date suffix stripped).
+                # Match if the stem EQUALS the full title (possibly with a
+                # trailing " (MM.DD.YY)" date suffix stripped) once both
+                # sides are normalized.
                 stem_no_date = re.sub(
                     r"\s*\(\d{2}\.\d{2}\.\d{2}\)\s*$", "", stem)
-                if stem == title_sane or stem_no_date == title_sane:
+                stem_norm = normalize_title(
+                    stem_no_date, strip_windows_illegal=True,
+                    strip_trailing_punct=False)
+                if title_norm and stem_norm == title_norm:
                     title_candidates.append(g)
             if title_candidates:
                 title_candidates.sort(
@@ -173,6 +245,21 @@ def resolve_final_path(base: str, video_id: str, title: str,
                 final_path = title_candidates[0]
     except Exception as e:
         swallow("final-path title match", e)
+    # Content-authoritative fallback: match the .info.json by its recorded
+    # id and bind the sibling media file. Immune to any filename mismatch,
+    # so it catches exactly the case that used to orphan ids (a title with a
+    # `/` or `:` that yt-dlp wrote with a unicode glyph). Runs BEFORE the
+    # newest-file heuristic below because a content match is authoritative.
+    if (not final_path or not os.path.isfile(final_path)) and video_id:
+        try:
+            sp = _bind_file_via_sidecar_id(base, video_id)
+            if sp:
+                final_path = sp
+                _log.info(
+                    "single-video bind via sidecar-id: vid=%s -> %s",
+                    video_id, sp)
+        except Exception as sie:
+            _log.debug("sidecar-id bind failed: %s", sie)
     # GUARANTEED binding fallback. The id was captured from DLTRACK but
     # neither id-in-filename nor the sanitized-title match found the file
     # (unicode / trim-filenames / punctuation oddities). A single-video
@@ -476,6 +563,18 @@ class ArchiveMixin:
             if grab_metadata:
                 cmd += ["--write-info-json", "--write-thumbnail",
                         "--convert-thumbnails", "jpg"]
+            # Same embedded provenance tags as the sync path (works for
+            # audio-only m4a containers too).
+            from backend.utils import ytdlp_embed_tag_args as _embed_args
+            cmd += _embed_args()
+            # Keep filenames clean. yt-dlp's default replaces title chars that
+            # are illegal on Windows (/ \ : ? * " < > |) with unicode
+            # look-alikes (⧸ ： ？ …) that Explorer can't render — it draws
+            # them as "?". Rewrite those chars to "." in the title BEFORE the
+            # output template runs, so the on-disk name (and the DLTRACK title
+            # we index) read "11.23.1996" instead of "11⧸23⧸1996". Runs on the
+            # title field only; the custom-name path has its own sanitizer.
+            cmd += ["--replace-in-metadata", "title", r'[\\/:*?"<>|]', "."]
             cmd += [
                 "--output", out_tpl,
                 # before_dl fires after extraction but BEFORE the first byte
@@ -666,6 +765,27 @@ class ArchiveMixin:
                         # ("Video 1:...", "Video 2:...") don't collide.
                         final_path = resolve_final_path(
                             base, _vid, _title, _candidate_paths)
+                        # file → id recovery: DLTRACK's %(id)s can come back
+                        # EMPTY for some videos. If we bound the file anyway,
+                        # yt-dlp wrote its real id into the .info.json beside
+                        # it — recover it by CONTENT so the video registers
+                        # WITH its id instead of a NULL-id row the sweep skips
+                        # forever. Mirrors sync/core.py's orphan recovery.
+                        if (not _vid and final_path
+                                and os.path.isfile(final_path)):
+                            try:
+                                from backend import index as _idx0
+                                _rid = _idx0._resolve_id_from_sidecars(
+                                    final_path)
+                                if _rid:
+                                    _vid = _rid
+                                    _log.info(
+                                        "single-video id recovered from "
+                                        "sidecar: %s -> %s", final_path, _rid)
+                            except Exception as _rie:
+                                _log.debug(
+                                    "single-video sidecar id recovery "
+                                    "failed: %s", _rie)
                         if _vid and (not final_path
                                      or not os.path.isfile(final_path)):
                             # Never silently drop an authoritative id.

@@ -37,6 +37,32 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
+  // Shared "Cancel reorg / date fix" action for the Reorg submenus here
+  // AND in the Subs table (columnSort.js references it via window).
+  // Both backend passes stop at their next file checkpoint; the toast
+  // reports whether anything was actually running so a stray click on
+  // an idle app doesn't look like it did something.
+  window._cancelFolderOps = async function () {
+    if (!nativeBridgeUp()) {
+      window._showToast?.("Native mode required.", "warn");
+      return;
+    }
+    try {
+      const [r1, r2] = await Promise.all([
+        bridgeCall("reorg_cancel"),
+        bridgeCall("chan_fix_dates_cancel"),
+      ]);
+      const anyRunning = !!(r1?.running || r2?.running);
+      window._showToast?.(
+        anyRunning
+          ? "Cancelling — stops at the next file. Progress so far is kept."
+          : "No reorganization or date fix is running.",
+        anyRunning ? "warn" : "ok");
+    } catch (err) {
+      window._showToast?.("Cancel failed: " + err, "error");
+    }
+  };
+
   // ─── Browse tab context menus ────────────────────────────────────────
   function initBrowseContextMenus() {
     // Channel grid cards
@@ -140,6 +166,11 @@
               { label: "Split by year + month", action: () => api?.reorg_channel_folder?.({ name }, true, true, false) },
               { label: "Re-check dates + year/month", action: () => api?.reorg_channel_folder?.({ name }, true, true, true) },
               { label: "Fix file dates only", action: () => api?.chan_fix_file_dates?.({ name }) },
+              { sep: true },
+              // Cancel affordance for the two long passes above — both
+              // were previously unstoppable from the UI (audit S4).
+              { label: "Cancel running reorg / date fix",
+                action: () => window._cancelFolderOps?.() },
             ]},
           // "Fetch channel art" removed — now bundled with the metadata sweep.
           { label: "Redownload at\u2026",

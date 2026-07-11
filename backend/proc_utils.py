@@ -95,22 +95,33 @@ def kill_process(proc: subprocess.Popen | None, timeout: float = 2.0) -> None:
 
 def ffprobe_is_compressed(filepath: str) -> bool:
     """Heuristic: True if the video was produced by this app's compress
-    pipeline. We stamp compressed files with `encoder=ytarchive_nvenc` in
-    the format metadata; ffprobe reads that tag.
+    pipeline.
+
+    v80 reality check: this docstring used to claim compressed files
+    are stamped `encoder=ytarchive_nvenc` — they never were (the MP4
+    muxer force-writes `encoder=Lavf...`, so an explicit encoder tag
+    can't survive). Files compressed before v80 carry
+    `comment=ytarchiver_compressed=1`; v80+ compressions carry no stamp
+    (the comment tag now holds the video's provenance URL instead, and
+    compressed-ness is verified by the codec probe at encode time).
+    Detects the legacy comment stamp plus the historical encoder
+    markers. No current call sites — kept as the documented public
+    helper for the question.
     """
     if not filepath or not os.path.isfile(filepath):
         return False
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error",
-             "-show_entries", "format_tags=encoder",
+             "-show_entries", "format_tags=encoder,comment",
              "-of", "default=noprint_wrappers=1:nokey=1",
              filepath],
             capture_output=True, text=True, timeout=10,
             creationflags=(0x08000000 if os.name == "nt" else 0),
         )
         tag = (r.stdout or "").strip().lower()
-        return "ytarchive_nvenc" in tag or "av1_nvenc" in tag
+        return ("ytarchive_nvenc" in tag or "av1_nvenc" in tag
+                or "ytarchiver_compressed" in tag)
     except Exception:
         return False
 

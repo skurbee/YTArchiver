@@ -84,11 +84,18 @@ def normalize_title(
     t = unicodedata.normalize("NFKC", s).strip().lower()
 
     if strip_windows_illegal:
-        # Unify common fullwidth substitutions yt-dlp writes when
-        # sanitizing filenames (so the playlist title with `?` matches
-        # the filename with `？`, etc.).
-        t = t.replace("：", ":").replace("？", "?").replace("｜", "|")
+        # yt-dlp replaces path-reserved chars with unicode lookalikes when
+        # it sanitizes filenames. The NFKC pass above already folds the
+        # FULLWIDTH forms (＂＊：＜＞？｜／) back to ASCII, but the two glyphs
+        # yt-dlp actually uses for `/` and `\` — BIG SOLIDUS (U+29F8 ⧸) and
+        # REVERSE BIG SOLIDUS (U+29F9 ⧹) — have NO compatibility
+        # decomposition and survive NFKC untouched. Without mapping them a
+        # title's "11/23/1996" never matches the on-disk "11⧸23⧸1996", so
+        # single-video binds silently failed on any title with a slash,
+        # colon, etc. Map them explicitly before stripping.
+        t = t.replace("⧸", "/").replace("⧹", "\\")
         t = t.replace("⁄", "/").replace("／", "/")
+        t = t.replace("：", ":").replace("？", "?").replace("｜", "|")
         t = _WIN_ILLEGAL_RE.sub("", t)
 
     if strip_id_bracket:

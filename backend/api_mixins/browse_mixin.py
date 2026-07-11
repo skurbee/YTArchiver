@@ -390,7 +390,7 @@ class BrowseMixin:
         renders the avatar in the channel-grid card background.
         """
         # Foreground Browse query (the Channels grid) — make the startup
-        # sweep + preload yield the Z: pool while this loads, and keep this
+        # sweep yield the Z: pool while this loads, and keep this
         # bridge call short so the window can close promptly if the user
         # quits mid-load. Without the guard this raced the sweep's thumbnail
         # backfill on the same disk and took minutes.
@@ -507,7 +507,7 @@ class BrowseMixin:
 
     def browse_list_videos(self, channel, sort="newest", limit=500):
         """List videos in a channel from the index DB."""
-        # Foreground Browse query — make the startup sweep + preload yield
+        # Foreground Browse query — make the startup sweep yield
         # the Z: pool while this user-initiated channel grid loads.
         with index_backend.foreground_browse():
             return index_backend.list_videos_for_channel(channel, sort=sort, limit=limit)
@@ -665,9 +665,14 @@ class BrowseMixin:
         # / SOURCE never contain commas, and let the title absorb
         # whatever comes before — title can contain commas or even
         # parens without breaking the match.
+        # v2 headers append an optional 5th `(youtu.be/<id>)` field. The
+        # (?!youtu\.be/) lookahead on the SOURCE group stops greedy-title
+        # backtracking from absorbing a field and misreading the URL as
+        # the source tag on v2 lines.
         _hdr_re = _re_cl.compile(
             r"^\((.*)\)\s*,\s*\(([^()]+)\)\s*,\s*\(([^()]+)\)\s*,"
-            r"\s*\(([^()]+)\)\s*$"
+            r"\s*\(((?!youtu\.be/)[^()]+)\)"
+            r"(?:\s*,\s*\(youtu\.be/[A-Za-z0-9_-]{11}\))?\s*$"
         )
         raw_tag = ""
         norm_title = _classify_norm(title)
@@ -707,6 +712,12 @@ class BrowseMixin:
                             continue
                         if len(parts) >= 2:
                             tail = parts[-1].strip()
+                            # v2 headers end with the (youtu.be/<id>)
+                            # url field — the source tag is one field
+                            # earlier.
+                            if (tail.lstrip("(").startswith("youtu.be/")
+                                    and len(parts) >= 3):
+                                tail = parts[-2].strip()
                             if tail.startswith("(") and tail.endswith(")"):
                                 _last_tag = tail[1:-1].strip()
                 except OSError:
@@ -1929,6 +1940,8 @@ class BrowseMixin:
                 badges.append({"label": "Metadata missing", "kind": "warn"})
             if tx in ("failed", "error"):
                 badges.append({"label": "Transcript failed", "kind": "bad"})
+            elif tx == "no_speech":
+                badges.append({"label": "No transcript", "kind": "neutral"})
             elif tx not in ("transcribed", "done"):
                 badges.append({"label": "No transcript", "kind": "bad"})
             if badges:

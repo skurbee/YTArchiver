@@ -627,13 +627,13 @@
         // After ~10s the call is unusually slow. Tell the user why
         // so they don't think the app is hung. After ~30s, escalate
         // — the DB is almost certainly contending with another op
-        // (most often a startup-time backfill / sweep / preload that
+        // (most often a startup-time metadata task or background sweep that
         // hasn't finished yet on a large archive).
         if (el > 30) {
           msg += " \u00b7 still waiting on the index DB \u2014 a startup "
-                + "task (backfill / sweep / preload) is likely holding "
-                + "the lock; this clears once the green "
-                + "\"Browse preload complete\" indicator appears";
+                + "metadata or maintenance task is likely holding "
+                + "the lock; this usually clears when that background work "
+                + "finishes";
         } else if (el > 10) {
           msg += " \u00b7 querying the index DB\u2026";
         }

@@ -1111,16 +1111,51 @@ class ChannelMixin:
                     "error": f"\"{ch_name}\" is currently being synced or "
                              f"transcribed; try again when that finishes."}
 
+        # Single-slot guard — two concurrent date-fix passes stamping
+        # mtimes (possibly on the same channel) would race each other.
+        if getattr(self, "_fixdates_running", False):
+            return {"ok": False,
+                    "error": "A file-date fix is already running. Wait for "
+                             "it to finish (or cancel it) first."}
+
         # Per-run event — _sync_cancel stays set after any stopped sync
         # until the next sync starts, which made Fix-file-dates abort
         # instantly in that window (same ghost-cancel Reorg had).
+        # Stored on self so chan_fix_dates_cancel can actually set it;
+        # before this the event was function-local and NOTHING could
+        # ever cancel a running date fix (audit S4).
         _fixdates_cancel = threading.Event()
+        self._fixdates_cancel = _fixdates_cancel
+        self._fixdates_running = True
         def _run():
             try:
                 reorg_backend.fix_file_dates(folder, self._log_stream,
                                              cancel_event=_fixdates_cancel)
             finally:
-                self._log_stream.flush()
+                try:
+                    self._log_stream.flush()
+                finally:
+                    # Identity-compared clear (mirrors reorg_channel_folder)
+                    # so a hypothetical newer run's event can't be wiped
+                    # by this older run's teardown.
+                    if getattr(self, "_fixdates_cancel", None) is _fixdates_cancel:
+                        self._fixdates_cancel = None
+                    self._fixdates_running = False
 
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "started": True}
+
+
+    def chan_fix_dates_cancel(self):
+        """Stop an in-progress Fix-file-dates pass at its next file.
+        Mirrors reorg_cancel — returns {ok, running} where `running`
+        reflects whether a pass was actually active when cancel fired,
+        so the UI can toast "cancelling" vs "nothing to cancel"."""
+        was_running = bool(getattr(self, "_fixdates_running", False))
+        ev = getattr(self, "_fixdates_cancel", None)
+        if ev is not None:
+            try:
+                ev.set()
+            except Exception as e:
+                _log.debug("fix-dates cancel set failed: %s", e)
+        return {"ok": True, "running": was_running}

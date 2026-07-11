@@ -323,6 +323,59 @@ def _cleanup_empty_dirs(root: Path):
 
 # ── Public entry points ────────────────────────────────────────────────
 
+def _flat_aggregate_target(root: Path, ch_name: str, p: Path) -> Path | None:
+    name = p.name
+    base = re.escape(ch_name)
+    bucket = r"(?:\d{4}|[A-Za-z]+ \d{2})"
+    if re.fullmatch(rf"{base} {bucket} Transcript\.txt", name):
+        return root / f"{ch_name} Transcript.txt"
+    if re.fullmatch(rf"\.{base} {bucket} Transcript\.jsonl", name):
+        return root / f".{ch_name} Transcript.jsonl"
+    if re.fullmatch(rf"\.{base} {bucket} Metadata\.jsonl", name):
+        return root / f".{ch_name} Metadata.jsonl"
+    return None
+
+
+def _relocate_flat_aggregate_files(root: Path, ch_name: str,
+                                   stream: LogStreamer,
+                                   dry_run: bool = False) -> int:
+    moved = 0
+    for dp, dns, fns in os.walk(root):
+        p_dir = Path(dp)
+        if p_dir == root:
+            continue
+        dns[:] = [d for d in dns if d not in _REORG_SKIP_DIRS]
+        for fn in fns:
+            src = p_dir / fn
+            target = _flat_aggregate_target(root, ch_name, src)
+            if target is None:
+                continue
+            if target.exists():
+                stream.emit_dim(
+                    f" [skip] aggregate file already exists at root: "
+                    f"{target.name}; left {src.name} in place.")
+                continue
+            if dry_run:
+                stream.emit_dim(
+                    f" [dry-run] would move aggregate {src.name} "
+                    f"to {target.name}.")
+                moved += 1
+                continue
+            try:
+                shutil.move(str(src), str(target))
+                if target.name.startswith("."):
+                    try:
+                        from .utils import hide_file_win
+                        hide_file_win(str(target))
+                    except Exception as _he:
+                        _log.debug("swallowed: %s", _he)
+                moved += 1
+            except OSError as e:
+                stream.emit_error(
+                    f"Move failed for aggregate file {src.name}: {e}")
+    return moved
+
+
 def _date_from_info_json(video: Path) -> datetime | None:
     """Read `.info.json` sidecar and pull the YouTube upload_date field."""
     candidates = [
@@ -425,11 +478,23 @@ def fix_file_dates(channel_folder: str, stream: LogStreamer,
                 [f"{p.name} · OSError: {_oe}\n", ["dim"]],
             ])
 
-    stream.emit([["  \u2014 \u2713 ", "simpleline_green"],
-                 [f"Date fix complete: {updated} updated \u00b7 "
-                  f"{skipped} already correct \u00b7 {missing} missing info\n",
-                  "simpleline"]])
-    return {"ok": True, "updated": updated, "skipped": skipped, "missing": missing}
+    _was_cancelled = bool(cancel_event is not None and cancel_event.is_set())
+    if _was_cancelled:
+        # Honest summary \u2014 the old unconditional "complete" line made a
+        # cancelled pass look finished. Files stamped so far are kept;
+        # re-running resumes (already-correct files are skipped cheaply).
+        stream.emit([["  \u26d4 ", "red"],
+                     [f"Date fix cancelled: {updated} updated \u00b7 "
+                      f"{skipped} already correct \u00b7 {missing} missing info "
+                      f"\u2014 re-run to finish the rest.\n",
+                      "simpleline"]])
+    else:
+        stream.emit([["  \u2014 \u2713 ", "simpleline_green"],
+                     [f"Date fix complete: {updated} updated \u00b7 "
+                      f"{skipped} already correct \u00b7 {missing} missing info\n",
+                      "simpleline"]])
+    return {"ok": True, "updated": updated, "skipped": skipped,
+            "missing": missing, "cancelled": _was_cancelled}
 
 
 def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
@@ -472,6 +537,7 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
     skipped = 0
     errors = 0
     redated = 0
+    aggregate_moved = 0
     t0 = time.time()
     _ch_name = root.name
 
@@ -643,9 +709,15 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
     if cancel_event is not None and cancel_event.is_set():
         stream.emit_dim(" \u2014 cancel: skipping empty-folder cleanup.")
     elif dry_run:
+        if not split_years and not split_months:
+            aggregate_moved = _relocate_flat_aggregate_files(
+                root, _ch_name, stream, dry_run=True)
         stream.emit_dim(" \u2014 [dry-run] would sweep empty folders under "
                         f"{root.name}/")
     else:
+        if not split_years and not split_months:
+            aggregate_moved = _relocate_flat_aggregate_files(
+                root, _ch_name, stream, dry_run=False)
         _cleanup_empty_dirs(root)
 
     # Drop the sticky active-status line before the done-summary.
@@ -653,6 +725,8 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
 
     took = time.time() - t0
     sec_bits = [f"{moved} moved \u00b7 {skipped} already in place"]
+    if aggregate_moved:
+        sec_bits.append(f"{aggregate_moved} aggregate files moved")
     if recheck_dates:
         sec_bits.append(f"{redated} dates fixed")
     sec_bits.append(f"{errors} errors \u00b7 took {took:.1f}s")
@@ -661,4 +735,5 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
                  [" \u00b7 ".join(sec_bits) + "\n", "simpleline"]])
 
     return {"ok": True, "moved": moved, "skipped": skipped, "errors": errors,
-            "redated": redated, "took": took}
+            "redated": redated, "aggregate_moved": aggregate_moved,
+            "took": took}

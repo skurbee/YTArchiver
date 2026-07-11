@@ -437,7 +437,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
             stream.emit_dim(f" (punctuation skipped: {_pe})")
 
     if not _write_transcript_entry(txt_path, title, upload_date, duration,
-                                   src_tag, full_text):
+                                   src_tag, full_text, video_id=vid_id):
         try:
             stream.emit_error(f"Could not write transcript to {txt_path}")
         except Exception as e:
@@ -792,41 +792,3 @@ def _parse_vtt(path: str) -> list:
             capped.append({"start": cs, "end": ce, "text": ct})
     segments = capped
     return _attach_words_to_segments(segments, all_words)
-
-    # ── Step 3: Attach per-word timestamps back onto the merged segments ──
-    out = []
-    if all_words:
-        word_starts = [w["s"] for w in all_words]
-        for seg in segments:
-            seg_words = []
-            # Strict partitioning: each word belongs to the segment whose
-            # [start, end) range contains its timestamp. Previously used a
-            # ±0.5s buffer which pulled the next segment's first 1-3 words
-            # into the prior segment, producing visible "heading to heading
-            # to" duplications at segment boundaries.
-            widx = bisect.bisect_left(word_starts, seg["start"])
-            scan = widx
-            while scan < len(all_words) and all_words[scan]["s"] < seg["end"]:
-                seg_words.append(all_words[scan])
-                scan += 1
-            if not seg_words:
-                seg_words = _generate_distributed_words(
-                    seg["text"], seg["start"], seg["end"])
-            out.append({
-                "s": round(seg["start"], 2),
-                "e": round(seg["end"], 2),
-                "t": seg["text"],
-                "w": seg_words,
-            })
-    else:
-        for seg in segments:
-            out.append({
-                "s": round(seg["start"], 2),
-                "e": round(seg["end"], 2),
-                "t": seg["text"],
-                "w": _generate_distributed_words(
-                    seg["text"], seg["start"], seg["end"]),
-            })
-    return out
-
-

@@ -99,6 +99,14 @@ DEFAULT_CONFIG = {
     # Timestamp of the last successful full backup export (epoch float).
     # Surfaced in Settings so the user knows how stale their backup is.
     "last_backup_ts": 0.0,
+    # v80 auto-backup: "off" | "daily" | "weekly" | "monthly". When on,
+    # the AutoBackupScheduler writes the full-state export into
+    # `<archive root>\YTArchiver Info\` on that cadence.
+    "auto_backup_interval": "off",
+    # Timestamp of the last SCHEDULED backup (manual exports don't
+    # touch this — the schedule stays honest even if the user also
+    # exports by hand).
+    "last_auto_backup_ts": 0.0,
 }
 
 _config_lock = threading.RLock()  # reentrant so nested

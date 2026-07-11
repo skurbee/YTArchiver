@@ -273,6 +273,7 @@ class SubsMixin:
     def subs_update_channel(self, identity, payload):
         """Update an existing channel matched by identity (url/name/folder)."""
         try:
+            old_ch = subs_backend.get_channel(identity or {}) or {}
             ch = subs_backend.update_channel(identity or {}, payload or {})
             self._reload_config()
             # surface folder-rename failures so the user
@@ -280,6 +281,15 @@ class SubsMixin:
             # the old name (subs.py rollback).
             resp = {"ok": True, "channel": ch,
                     "write_blocked": ch.get("_write_blocked", False)}
+            if (
+                "folder_org" in (payload or {})
+                and not ch.get("_write_blocked", False)
+                and (
+                    bool(old_ch.get("split_years")) != bool(ch.get("split_years"))
+                    or bool(old_ch.get("split_months")) != bool(ch.get("split_months"))
+                )
+            ):
+                resp["folder_org_changed"] = True
             if ch.get("_folder_rename_error"):
                 resp["folder_rename_error"] = ch["_folder_rename_error"]
             return resp

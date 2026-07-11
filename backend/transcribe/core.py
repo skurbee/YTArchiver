@@ -2671,7 +2671,8 @@ class TranscribeManager:
                     _jsonl_backup, title, vid_id)
                 _replace_txt_entry(txt_path, title, text, source_tag,
                                    extra_titles_to_remove=extra_titles,
-                                   old_text_candidates=_old_txt_candidates)
+                                   old_text_candidates=_old_txt_candidates,
+                                   video_id=vid_id)
             except Exception as _te:
                 self._stream.emit_error(
                     f"Could not update {os.path.basename(txt_path)}: {_te}"
@@ -2724,7 +2725,8 @@ class TranscribeManager:
             _hide_per_video_transcript_txt_if_needed(video_path, txt_path)
         else:
             if not _write_transcript_entry(txt_path, title, upload_date,
-                                           duration, source_tag, text):
+                                           duration, source_tag, text,
+                                           video_id=vid_id):
                 self._stream.emit_error(f"Could not write transcript to {txt_path}")
                 return
             _hide_per_video_transcript_txt_if_needed(video_path, txt_path)

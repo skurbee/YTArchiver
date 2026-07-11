@@ -203,13 +203,12 @@ class SettingsMixin:
             "archive_capacity_warning_free_gb": cap["free_gb"],
             "last_disk_scan_ts": float(cfg.get("last_disk_scan_ts", 0) or 0),
             "last_backup_ts": float(cfg.get("last_backup_ts", 0) or 0),
+            # v80 auto-backup cadence (Settings > General).
+            "auto_backup_interval": (cfg.get("auto_backup_interval")
+                                     or "off"),
             # Subs table column visibility toggles. Default False for
             # new users — the column is optional polish, not core info.
             "show_avg_size": bool(cfg.get("show_avg_size", False)),
-            # Recent tab view mode — "list" (legacy) or "grid" (thumbnail
-            # cards). Default "grid" for new users — the thumbnail view
-            # reads more naturally at a glance.
-            "recent_view_mode": (cfg.get("recent_view_mode") or "grid"),
             # X-button behavior — "ask" (default modal), "tray"
             # (minimize silently), or "quit" (exit silently). Read by
             # _on_closing at main.py:7552; also written by the close
@@ -272,6 +271,10 @@ class SettingsMixin:
                 cfg["disk_scan_staleness_hours"] = max(0, min(10_000,
                     int(data["disk_scan_staleness_hours"])))
             except Exception as e: _log.debug("swallowed: %s", e)
+        # v80 auto-backup cadence — only the four known values.
+        if data.get("auto_backup_interval") in ("off", "daily", "weekly",
+                                                "monthly"):
+            cfg["auto_backup_interval"] = data["auto_backup_interval"]
         if data.get("archive_capacity_warning_mode") in ("percent", "free_gb"):
             cfg["archive_capacity_warning_mode"] = data["archive_capacity_warning_mode"]
         if "archive_capacity_warning_percent" in data:
@@ -287,9 +290,6 @@ class SettingsMixin:
         # Subs table column visibility
         if "show_avg_size" in data:
             cfg["show_avg_size"] = bool(data["show_avg_size"])
-        # Recent tab view mode — only accept known values.
-        if data.get("recent_view_mode") in ("list", "grid"):
-            cfg["recent_view_mode"] = data["recent_view_mode"]
         # .txt: transcript viewer text size (px). Bounded so a bad
         # value (e.g. NaN) can't render the Watch view unreadable.
         if "transcript_font_size" in data:

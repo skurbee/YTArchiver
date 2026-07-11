@@ -107,6 +107,10 @@ def _scan_existing_transcript_titles(folder_path: str, ch_name: str) -> dict:
                     im = id_pattern.search(raw)
                     if im:
                         vid_id = im.group(1)
+                    elif m.group(5):
+                        # v2 headers carry the id in the trailing
+                        # (youtu.be/<id>) field.
+                        vid_id = m.group(5)
                     # Store TWO variants so callers can match either:
                     # title-with-[id] OR title-without-[id].
                     raw_plain = id_pattern.sub("", raw).strip() or raw

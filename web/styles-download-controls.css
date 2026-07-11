@@ -453,13 +453,11 @@
   margin-left: 8px;
 }
 
-/* Startup status stack — two slots (sweep on top, preload on bottom)
-   that render stacked so parallel phases are both visible at once.
-   Individual slots inherit the dim/italic style; the stack container
-   handles layout. Right-aligned in the Auto-sync controls row. */
-.preload-indicator-stack {
-  /* Hidden: the global bottom status bar now carries indexing / sweep /
-     preload progress, so this Download-tab top-right copy is redundant.
+/* Startup status stack. Hidden because the global bottom status bar carries
+   indexing / sweep progress. */
+.startup-indicator-stack {
+  /* Hidden: the global bottom status bar now carries indexing / sweep
+     progress, so this Download-tab top-right copy is redundant.
      Kept in the DOM (just hidden) so window._setIndicator's targets still
      exist and the status-bar mirror keeps working. */
   display: none;
@@ -468,7 +466,7 @@
   gap: 0;
   line-height: 1.25;
 }
-.preload-indicator {
+.startup-indicator {
   font-size: var(--fs-sm);
   font-style: italic;
   color: var(--c-dim);

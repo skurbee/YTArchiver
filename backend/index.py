@@ -1532,11 +1532,10 @@ def list_recent_videos(limit: int = 200, channel: str | None = None
 
 
 # ── Browse-tab per-channel video-list cache ───────────────────────────
-# Ports YTArchiver.py's _grid_cache (27572 _grid_preload_all). Clicking a
+# Ports YTArchiver.py's _grid_cache. Clicking a
 # channel in the Browse grid used to be slow because every visit rebuilt
 # the video list from scratch — DB query + metadata JSONL parse +
-# thumbnail lookup per video. The cache pre-computes this at startup so
-# the second channel click onward is instant.
+# thumbnail lookup per video. The cache keeps repeated channel opens fast.
 # Keyed by (channel_name, sort, limit, include_thumbs). Invalidated by
 # `invalidate_channel_videos(channel)` whenever a video is added / deleted
 # / re-transcribed for that channel.
@@ -1552,7 +1551,7 @@ _browse_cache_lock = threading.Lock()
 # cross-channel query + per-row thumbnail resolution — and that thumbnail
 # pass is the ~10s cost on a cold open. Unlike the per-channel grids
 # (cached above), the Videos view had no result cache, so it re-paid that
-# cost every open even after the Browse preload finished. Cache the
+# cost every open. Cache the
 # fully-resolved page (incl. thumbnail URLs) keyed by
 # (sort, limit, offset, include_thumbs) so re-opening is instant and
 # survives OS file-cache eviction. Cleared wholesale by
@@ -1573,22 +1572,19 @@ _thumb_index_cache_lock = threading.Lock()
 
 
 class _LowPriorityInterrupted(Exception):
-    """Raised when startup preload should yield to user-visible work."""
+    """Raised when low-priority Browse cache work should yield."""
 
 
 # ── Foreground-browse guard ────────────────────────────────────────────
-# The startup sweep + Browse preload both walk the (slow, ~16 MB/s) Z:
-# DrivePool to resolve thumbnails. Before this guard there was NO signal
-# telling them that the USER is actively loading a Browse view, so a
-# cold "Videos" open (up to 60 channel-wide thumbnail walks) ran head-to-
-# head with the preload walking the same disk — turning a ~10s open into
-# minutes. The fix: the API entry points that serve the Browse tab
+# The startup sweep and cold Browse views both walk the (slow, ~16 MB/s)
+# Z: DrivePool to resolve thumbnails. Before this guard there was NO signal
+# telling startup work that the USER is actively loading a Browse view, so a
+# cold "Videos" open could run head-to-head with background indexing. The fix:
+# the API entry points that serve the Browse tab
 # (list_all_videos, list_videos_for_channel) bump this counter for the
 # duration of the user's query via `foreground_browse()`, and the
-# startup low-priority gate treats a non-zero count as "busy" so sweep +
-# preload park and hand the disk to the user. Preload's OWN internal
-# calls go straight to the index functions (not the API mixin), so they
-# never trip this — no self-deadlock.
+# startup low-priority gate treats a non-zero count as "busy" so sweep
+# parks and hands the disk to the user.
 _fg_browse_lock = threading.Lock()
 _fg_browse_count = 0
 
@@ -1601,8 +1597,8 @@ def is_foreground_browse_busy() -> bool:
 
 @contextmanager
 def foreground_browse():
-    """Mark a user-initiated Browse query in flight so startup sweep +
-    preload yield the Z: pool to it. Re-entrant (counter, not flag)."""
+    """Mark a user-initiated Browse query in flight so startup sweep
+    yields the Z: pool to it. Re-entrant (counter, not flag)."""
     global _fg_browse_count
     with _fg_browse_lock:
         _fg_browse_count += 1
@@ -1693,45 +1689,6 @@ def invalidate_channel_videos(channel: str | None = None) -> None:
         _thumb_index_cache.clear()
 
 
-def preload_channel_videos(channel: str,
-                           sort: str = "newest",
-                           limit: int = 500,
-                           low_priority_busy_fn: Any | None = None) -> int:
-    """Warm `list_videos_for_channel` into the cache. Returns row count."""
-    _raise_if_low_priority_busy(low_priority_busy_fn)
-    rows = list_videos_for_channel(channel, sort=sort, limit=limit,
-                                    include_thumbs=True,
-                                    low_priority_busy_fn=low_priority_busy_fn)
-    with _browse_cache_lock:
-        _browse_videos_cache_put((channel, sort, limit, True), rows)
-    return len(rows)
-
-
-def preload_all_channels(channels,
-                         sort: str = "newest",
-                         limit: int = 500,
-                         low_priority_busy_fn: Any | None = None) -> dict:
-    """Warm per-channel Browse caches, yielding to foreground work."""
-    out: dict[str, int] = {}
-    for channel in channels or []:
-        if not channel:
-            continue
-        while True:
-            while _low_priority_busy(low_priority_busy_fn):
-                time.sleep(0.25)
-            try:
-                out[channel] = preload_channel_videos(
-                    channel,
-                    sort=sort,
-                    limit=limit,
-                    low_priority_busy_fn=low_priority_busy_fn,
-                )
-                break
-            except _LowPriorityInterrupted:
-                time.sleep(0.25)
-    return out
-
-
 def list_videos_for_channel(channel: str, sort: str = "newest",
                             limit: int = 50000, include_thumbs: bool = True,
                             *,
@@ -1746,9 +1703,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     DB-insertion time was what made every video look like "15d ago".
 
     Results are cached per (channel, sort, limit, include_thumbs) tuple
-    so the preloader at startup fills the cache, and runtime clicks on
-    channels are instant. See `preload_channel_videos` +
-    `invalidate_channel_videos`.
+    so repeated channel opens are instant. See `invalidate_channel_videos`.
     """
     cache_key = (channel, sort, limit, bool(include_thumbs))
     with _browse_cache_lock:
@@ -1759,11 +1714,8 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
             # the cache for the next reader.
             return list(hit)
         # Fallback: look for any cached entry with the same (channel,
-        # sort, include_thumbs) but a larger limit — a 100k-limit
-        # preload satisfies any smaller runtime request. Without
-        # this, "preload every video" setting didn't deliver
-        # the promised instant-click behavior because preload keyed
-        # on 100_000 while the frontend requested 50_000.
+        # sort, include_thumbs) but a larger limit. A larger previous
+        # request satisfies any smaller runtime request.
         fallback_key = None
         fallback_rows = None
         for key, rows in _browse_videos_cache.items():

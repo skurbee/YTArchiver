@@ -322,6 +322,15 @@ class QueueMixin:
             # so the two popover Pause buttons are independent (audit r2: a
             # sync resume was secretly un-pausing a deliberately-paused GPU).
             self._queue_transcribe().pause()
+        if which in ("gpu", "both"):
+            try:
+                from backend.pause_helpers import emit_paused
+                emit_paused(
+                    self._queue_log_stream(),
+                    label="Processing queue — current job will finish",
+                )
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         self._on_queue_changed()
         return {"ok": True, "paused": which}
 
@@ -335,20 +344,11 @@ class QueueMixin:
             queues.set_sync_paused(False)
         if which in ("gpu", "both"):
             queues.set_gpu_paused(False)
-            # request_drain() (not plain resume()) so the backlog that
-            # accumulated while paused actually drains AND its completion
-            # lines land at the live log tail. Two reasons resume() alone
-            # was wrong here:
-            #   1. Visibility — a job drained long after its download emits
-            #      its "Transcribed …" line in-place over the sync-reserved
-            #      tx_done_<vid> placeholder, which by now has scrolled far
-            #      up (or been trimmed), so the user saw the [Trnscr]
-            #      activity row appear with NO matching log lines. The
-            #      manual-drain path emits a fresh tail line instead.
-            #   2. Auto-off — resume() only clears the pause Event; with the
-            #      Auto checkbox off the worker re-parks on the Auto gate
-            #      and never drains. request_drain() arms a one-shot drain
-            #      that empties the backlog regardless, then re-parks.
+            # request_drain() (not plain resume()) so a backlog accumulated
+            # while Auto is off actually drains. resume() only clears the
+            # pause Event; the worker would immediately re-park on the Auto
+            # gate. request_drain() arms a one-shot drain that empties the
+            # backlog regardless, then re-parks.
             self._queue_transcribe().request_drain()
             try:
                 self._queue_log_stream().emit_text(

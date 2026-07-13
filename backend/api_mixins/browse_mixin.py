@@ -1915,11 +1915,31 @@ class BrowseMixin:
         has_more = len(page) > lim
         page = page[:lim]
 
-        # Return the page before touching media files. ffprobe has a 10-second
-        # per-file timeout and local-thumbnail generation can make several
-        # 25-second ffmpeg attempts. On slow pooled storage, doing that work in
-        # this bridge request held the skeleton screen open for several minutes.
-        # Indexed values render now; missing values patch into the cards later.
+        # Never run ffprobe or generate thumbnails in this bridge request.
+        # Those operations can take tens of seconds per file on pooled storage.
+        # Looking up an ALREADY-EXISTING sidecar is cheap, though, and returning
+        # it with the page is much more reliable than racing one evaluate_js
+        # callback per card against the frontend render. Resolve ready sidecars
+        # synchronously; only true misses go to the background generator below.
+        try:
+            from backend import index as _idx
+            for r in page:
+                if r.get("thumbnail_url"):
+                    continue
+                fp = r.get("filepath") or ""
+                if not fp:
+                    continue
+                tp = _idx.find_thumbnail(fp, r.get("video_id") or "")
+                if not tp:
+                    continue
+                r["thumbnail_url"] = _idx._file_url(tp)
+                if ".local." in os.path.basename(tp).lower():
+                    r["thumbnail_source"] = "local"
+        except Exception as e:
+            _log.debug("manual ready-thumbnail lookup failed: %s", e)
+
+        # Indexed values and ready sidecars render now; only missing durations
+        # and thumbnails patch into the cards later.
         duration_candidates = []
         for r in page:
             if r.get("duration"):

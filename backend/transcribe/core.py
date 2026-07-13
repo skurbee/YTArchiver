@@ -746,9 +746,13 @@ class TranscribeManager:
                     "title": _job_title,
                     "path": path,
                     "channel": channel,
+                    "combined_override": combined,
+                    "retranscribe": bool(retranscribe),
+                    "video_id": (video_id or "").strip(),
                     "bulk_id": bulk_id,
                     "bulk_total": int(bulk_total or 0),
                     "bulk_index": int(bulk_index or 0),
+                    "from_download": bool(from_download),
                 })
             except Exception as e:
                 _log.debug("swallowed: %s", e)
@@ -840,6 +844,8 @@ class TranscribeManager:
                     "title": _job_title,
                     "path": path,
                     "channel": channel,
+                    "quality": quality,
+                    "output_res": str(output_res),
                 })
             except Exception as e:
                 _log.debug("swallowed: %s", e)
@@ -879,6 +885,8 @@ class TranscribeManager:
                     "bulk_index": int(j.get("bulk_index", 0) or 0),
                     "kind": j.get("kind", "transcribe"),
                     "from_download": bool(j.get("from_download")),
+                    "quality": j.get("quality", "Average"),
+                    "output_res": str(j.get("output_res", "720")),
                 }
             with self._jobs_lock:
                 snapshot = [_snap(j) for j in self._jobs]
@@ -1048,15 +1056,17 @@ class TranscribeManager:
                 path = j.get("path") or ""
                 if not path or not os.path.isfile(path):
                     continue
+                kind = (j.get("kind") or "transcribe").lower()
                 # A RE-transcribe job intentionally targets an
                 # already-transcribed video, so the "already transcribed?"
                 # skip must NOT drop it — otherwise a channel re-transcribe
                 # paused-and-restarted lost every remaining job on reload
                 # (they showed in the popover but never ran on Start).
                 # Only plain transcribe jobs skip when the transcript exists.
-                if not j.get("retranscribe") and _already_transcribed(
-                        path, j.get("title", ""), j.get("channel", ""),
-                        j.get("video_id", "")):
+                if (kind == "transcribe" and not j.get("retranscribe")
+                        and _already_transcribed(
+                            path, j.get("title", ""), j.get("channel", ""),
+                            j.get("video_id", ""))):
                     if self._queues is not None:
                         try:
                             self._queues.gpu_remove(path)
@@ -1067,27 +1077,34 @@ class TranscribeManager:
                 # video_id, combined_override, bulk_*) so a restarted
                 # retranscribe stays a retranscribe and title-drifted
                 # stale entries get caught via video_id lookup.
-                self.enqueue(
-                    path,
-                    title=j.get("title", ""),
-                    channel=j.get("channel", ""),
-                    combined=j.get("combined_override"),
-                    retranscribe=bool(j.get("retranscribe")),
-                    video_id=j.get("video_id", ""),
-                    bulk_id=j.get("bulk_id", ""),
-                    bulk_total=int(j.get("bulk_total", 0) or 0),
-                    bulk_index=int(j.get("bulk_index", 0) or 0),
-                    from_download=bool(j.get("from_download")),
-                )
-                recovered += 1
-            # Recovery succeeded — drop the journal file. The next
-            # _persist_pending() call will rewrite it from current
-            # state. Without this, a second crash before the next
-            # persist would re-enqueue the same jobs a second time.
-            try:
-                p.unlink()
-            except OSError:
-                pass
+                if kind == "compress":
+                    added = self.compress_enqueue(
+                        path,
+                        title=j.get("title", ""),
+                        channel=j.get("channel", ""),
+                        quality=j.get("quality", "Average"),
+                        output_res=str(j.get("output_res", "720")),
+                    )
+                else:
+                    added = self.enqueue(
+                        path,
+                        title=j.get("title", ""),
+                        channel=j.get("channel", ""),
+                        combined=j.get("combined_override"),
+                        retranscribe=bool(j.get("retranscribe")),
+                        video_id=j.get("video_id", ""),
+                        bulk_id=j.get("bulk_id", ""),
+                        bulk_total=int(j.get("bulk_total", 0) or 0),
+                        bulk_index=int(j.get("bulk_index", 0) or 0),
+                        from_download=bool(j.get("from_download")),
+                    )
+                if added:
+                    recovered += 1
+            # Keep the recovery journal synchronized with the runtime list.
+            # Previously this unlinked the file after enqueue() had just
+            # rewritten it, recreating the split state the journal is meant
+            # to prevent.
+            self._persist_pending()
             return recovered
         except Exception:
             return 0
@@ -1208,27 +1225,88 @@ class TranscribeManager:
     def resume(self):
         self._paused.clear()
 
+    @staticmethod
+    def _job_path_key(path: str) -> str:
+        if not path:
+            return ""
+        return os.path.normcase(
+            os.path.normpath(os.path.abspath(str(path))))
+
+    def _restore_runtime_jobs_from_queue(self) -> int:
+        """Merge persisted GPU tasks into the worker's runtime queue.
+
+        QueueState survives app restarts and supplies the Tasks UI. The worker
+        also has an in-memory list, which can be empty after a crash or when an
+        older pending journal is missing. Reconcile both before manual Start
+        so the worker cannot exit while persisted tasks remain visible.
+        """
+        if self._queues is None:
+            return 0
+        try:
+            persisted = self._queues.gpu_snapshot()
+        except Exception as e:
+            _log.warning("could not snapshot persisted GPU queue: %s", e)
+            return 0
+
+        restored = 0
+        with self._jobs_lock:
+            known = {
+                self._job_path_key(job.get("path") or "")
+                for job in self._jobs
+                if job.get("path")
+            }
+            if self._current_job and self._current_job.get("path"):
+                known.add(self._job_path_key(self._current_job["path"]))
+
+            for item in persisted:
+                path = str(item.get("path") or "")
+                key = self._job_path_key(path)
+                if not key or key in known or not os.path.isfile(path):
+                    continue
+                kind = (item.get("kind") or "transcribe").lower()
+                job: dict[str, Any] = {
+                    "kind": kind,
+                    "path": path,
+                    "title": item.get("title") or os.path.basename(path),
+                    "channel": item.get("channel", ""),
+                    "cb": None,
+                    "cancel": threading.Event(),
+                }
+                if kind == "compress":
+                    job.update({
+                        "quality": item.get("quality", "Average"),
+                        "output_res": str(item.get("output_res", "720")),
+                    })
+                else:
+                    job.update({
+                        "kind": "transcribe",
+                        "combined_override": item.get("combined_override"),
+                        "retranscribe": bool(item.get("retranscribe")),
+                        "video_id": (item.get("video_id") or "").strip(),
+                        "bulk_id": item.get("bulk_id", "") or "",
+                        "bulk_total": int(item.get("bulk_total", 0) or 0),
+                        "bulk_index": int(item.get("bulk_index", 0) or 0),
+                        "from_download": bool(item.get("from_download")),
+                    })
+                self._jobs.append(job)
+                known.add(key)
+                restored += 1
+
+        if restored:
+            self._persist_pending()
+            _log.info("restored %d GPU task(s) into runtime queue", restored)
+        return restored
+
     def request_drain(self):
         """One-shot 'Start': drain the queued jobs now even though the Auto
         checkbox is off, WITHOUT turning Auto back on. Clears any lingering
         pause, arms the manual-drain gate, and (re)starts the worker. The
         worker self-clears the gate the instant the queue empties, so future
         arrivals keep queuing until the user clicks Start again."""
+        self._restore_runtime_jobs_from_queue()
         self._paused.clear()
         self._manual_drain.set()
         self._ensure_worker()
-
-    def _emit_manual_processing_done(self, job: dict[str, Any],
-                                     kind: str = "transcribe"):
-        title = (job.get("title") or "").strip()
-        if not title:
-            title = os.path.basename(job.get("path") or "video")
-        channel = (job.get("channel") or "").strip()
-        suffix = f" ({channel})" if channel else ""
-        verb = "Transcribed" if kind == "transcribe" else "Processed"
-        self._stream.emit_text(
-            f" - {verb}: {title}{suffix}",
-            "simpleline_blue")
 
     def is_active(self) -> bool:
         """True if a GPU job is currently running OR jobs remain queued.
@@ -1366,9 +1444,6 @@ class TranscribeManager:
             # "Transcribing X" / "Compressing X" while the rest shrink
             # upward. Label verb comes from the job's `kind`.
             _job_kind = job.get("kind") or "transcribe"
-            _tail_log_on_done = (
-                _job_kind == "transcribe" and self._manual_drain.is_set()
-            )
             if self._queues is not None:
                 try:
                     self._queues.gpu_pop_matching(
@@ -1517,13 +1592,6 @@ class TranscribeManager:
                 if self._queues is not None:
                     try:
                         self._queues.set_current_gpu(None)
-                    except Exception as e:
-                        _log.debug("swallowed: %s", e)
-                if (_tail_log_on_done and not _requeued_no_tally
-                        and not crashed and not job["cancel"].is_set()
-                        and not self._cancel_all.is_set()):
-                    try:
-                        self._emit_manual_processing_done(job, _job_kind)
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
                 self._persist_pending()
@@ -1953,6 +2021,16 @@ class TranscribeManager:
                 return
             if status == "ok":
                 result = msg
+                # Recognition is complete, but punctuation, transcript writes,
+                # and FTS indexing still remain. Do not leave the last 99% tick
+                # on screen during that work -- it makes a healthy finalization
+                # phase look like Whisper itself has hung.
+                self._stream.emit([
+                    [f"{_prog_lead}\u2014 ", _tag("whisper_bracket")],
+                    ["Finalizing transcript", _tag()],
+                    [f' "{_disp_title}"', _tag()],
+                    ["...\n", _tag()],
+                ])
                 break
             if status == "error":
                 err = msg.get('text', 'unknown')
@@ -2743,8 +2821,24 @@ class TranscribeManager:
         # the .jsonl are untouched and get re-inserted as-is).
         try:
             from .. import index as _idx
-            _idx.ingest_jsonl(video_path, jsonl_path, title, channel)
-            _idx.mark_video_transcribed(video_path)
+            # Use a dedicated writer connection. The shared ingest path first
+            # waits for the process-wide `_db_lock`; a long maintenance query
+            # can hold that Python lock indefinitely even when SQLite itself is
+            # ready to accept this tiny per-video ingest. That left completed
+            # transcript files on disk while the queue stayed at 99% forever.
+            # The independent connection bypasses unrelated Python lock holders;
+            # WAL/busy_timeout still serializes actual SQLite writers safely.
+            _ingest_conn = _idx._open_independent()
+            if _ingest_conn is None:
+                raise RuntimeError("could not open an independent index connection")
+            try:
+                _ingested = _idx.ingest_jsonl(
+                    video_path, jsonl_path, title, channel,
+                    _conn_override=_ingest_conn)
+            finally:
+                _ingest_conn.close()
+            if not _ingested:
+                raise RuntimeError("index ingest returned no transcript segments")
         except Exception as e:
             # Bug [101]: was emit_dim — invisible in Simple log mode. The
             # transcript file IS on disk but FTS is out of sync (search

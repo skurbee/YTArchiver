@@ -461,13 +461,17 @@
     const svg = btn.querySelector("svg");
     const span = btn.querySelector("span");
     if (span) span.textContent = startable ? "Start" : (isPaused ? "Resume" : "Pause");
-    btn.title = isPending
+    const tip = isPending
       ? `Pause queued — ${label.toLowerCase()} job finishing first. Click to cancel pause.`
       : (startable
           ? `Start the ${label.toLowerCase()} queue now (Auto stays off)`
           : (isPaused
               ? `Resume ${label.toLowerCase()} queue`
               : `Pause ${label.toLowerCase()} queue (current job finishes first)`));
+    // The custom tooltip system owns this button. Rewriting `title` during
+    // the blink repaint can resurrect a native tooltip underneath it.
+    btn.setAttribute("data-tooltip", tip);
+    btn.removeAttribute("title");
     btn.dataset.pauseState = isPending
       ? "pending"
       : (startable ? "start" : (isPaused ? "paused" : "running"));

@@ -2696,6 +2696,42 @@ class BrowseMixinTests(unittest.TestCase):
             ("generate", "Needs Generation.mp4"),
         ])
 
+    def test_manual_videos_returns_existing_thumbnail_with_initial_page(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "Already Ready.mp4"
+            thumb = root / "Already Ready.jpg"
+            video.write_bytes(b"video")
+            thumb.write_bytes(b"jpg")
+
+            class Api(BrowseMixin):
+                def __init__(self):
+                    self._config = {"video_out_dir": str(root)}
+                    self._log_stream = mock.Mock()
+
+            row = {
+                "filepath": str(video), "title": video.stem,
+                "channel": "Single Videos", "video_id": "",
+                "thumbnail_url": "", "duration": "1:00",
+                "tx_status": "transcribed", "upload_ts": 1,
+            }
+            with mock.patch("backend.index.list_manual_videos",
+                            return_value=[row]), \
+                    mock.patch("backend.index.list_manual_duplicate_filepaths",
+                               return_value=[]), \
+                    mock.patch("backend.index._file_url",
+                               return_value="http://local/thumb.jpg"), \
+                    mock.patch.object(
+                        Api, "_queue_manual_duration_backfill"), \
+                    mock.patch.object(
+                        Api, "_queue_manual_local_thumbnail_backfill") as queue_thumb:
+                result = Api().list_manual_videos(sort="newest")
+
+        self.assertEqual(
+            result["rows"][0]["thumbnail_url"], "http://local/thumb.jpg")
+        queue_thumb.assert_called_once_with([])
+
     def test_manual_videos_badges_transcript_from_local_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4033,6 +4069,108 @@ class PunctRestoreTests(unittest.TestCase):
 
 
 class TranscribeManagerQueueTests(unittest.TestCase):
+    def test_request_drain_restores_runtime_jobs_from_persisted_queue(self) -> None:
+        stream = mock.Mock()
+        mgr = transcribe_core.TranscribeManager(stream)
+        q = queues.QueueState()
+        mgr.attach_queues(q)
+        with tempfile.TemporaryDirectory() as td:
+            video = Path(td) / "Queued.mp4"
+            video.write_bytes(b"video")
+            q.gpu = [{
+                "kind": "transcribe",
+                "path": str(video),
+                "title": "Queued",
+                "channel": "Manual",
+                "retranscribe": True,
+                "video_id": "abc123def45",
+            }]
+
+            with mock.patch.object(mgr, "_persist_pending") as persist, \
+                    mock.patch.object(mgr, "_ensure_worker") as ensure:
+                mgr.request_drain()
+
+        self.assertEqual(len(mgr._jobs), 1)
+        self.assertEqual(mgr._jobs[0]["path"], str(video))
+        self.assertTrue(mgr._jobs[0]["retranscribe"])
+        self.assertEqual(mgr._jobs[0]["video_id"], "abc123def45")
+        self.assertTrue(mgr._manual_drain.is_set())
+        self.assertFalse(mgr._paused.is_set())
+        persist.assert_called_once_with()
+        ensure.assert_called_once_with()
+        q.mark_orphan()
+
+    def test_request_drain_does_not_duplicate_existing_runtime_job(self) -> None:
+        stream = mock.Mock()
+        mgr = transcribe_core.TranscribeManager(stream)
+        q = queues.QueueState()
+        mgr.attach_queues(q)
+        with tempfile.TemporaryDirectory() as td:
+            video = Path(td) / "Queued.mp4"
+            video.write_bytes(b"video")
+            existing = {
+                "kind": "transcribe",
+                "path": str(video),
+                "cancel": threading.Event(),
+            }
+            mgr._jobs = [existing]
+            q.gpu = [{"kind": "transcribe", "path": str(video)}]
+
+            with mock.patch.object(mgr, "_persist_pending") as persist, \
+                    mock.patch.object(mgr, "_ensure_worker"):
+                mgr.request_drain()
+
+        self.assertEqual(mgr._jobs, [existing])
+        persist.assert_not_called()
+        q.mark_orphan()
+
+    def test_whisper_output_ingest_uses_independent_connection(self) -> None:
+        stream = mock.Mock()
+        mgr = transcribe_core.TranscribeManager(stream)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            video = root / "Video.mp4"
+            txt = root / "Video Transcript.txt"
+            jsonl = root / ".Video Transcript.jsonl"
+            video.write_bytes(b"video")
+            conn = mock.Mock()
+            result = {
+                "text": "hello world",
+                "segments": [{"s": 0.0, "e": 1.0,
+                              "t": "hello world", "w": []}],
+            }
+
+            with mock.patch.object(
+                    transcribe_core, "_resolve_transcript_paths",
+                    return_value=(str(txt), str(jsonl), 2026, 7,
+                                  "07.13.2026")), \
+                    mock.patch.object(
+                        transcribe_core, "_write_transcript_entry",
+                        return_value=True), \
+                    mock.patch.object(
+                        transcribe_core, "_write_jsonl_entry",
+                        return_value=True), \
+                    mock.patch.object(
+                        transcribe_core,
+                        "_hide_per_video_transcript_txt_if_needed"), \
+                    mock.patch.object(
+                        transcribe_core, "_bump_transcription_pending"), \
+                    mock.patch(
+                        "backend.ytarchiver_config.remove_pending_tx_id"), \
+                    mock.patch("backend.index._open_independent",
+                               return_value=conn) as open_independent, \
+                    mock.patch("backend.index.ingest_jsonl",
+                               return_value=1) as ingest, \
+                    mock.patch("backend.index.mark_video_transcribed") as mark:
+                mgr._write_outputs(
+                    str(video), result, title="Video",
+                    channel="Single Videos", video_id_hint="abc123def45")
+
+        open_independent.assert_called_once_with()
+        self.assertIs(ingest.call_args.kwargs["_conn_override"], conn)
+        conn.close.assert_called_once_with()
+        mark.assert_not_called()
+
     def test_compress_enqueue_rejects_outside_archive_root(self) -> None:
         stream = mock.Mock()
         mgr = transcribe_core.TranscribeManager(stream)
@@ -4298,20 +4436,6 @@ class TranscribeManagerQueueTests(unittest.TestCase):
         proc.stdin.write.assert_called_once_with(
             json.dumps({"command": "cancel"}) + "\n")
         proc.stdin.flush.assert_called_once()
-
-    def test_manual_processing_done_emits_tail_log_line(self) -> None:
-        stream = mock.Mock()
-        mgr = transcribe_core.TranscribeManager(stream)
-
-        mgr._emit_manual_processing_done({
-            "title": "Finished Video",
-            "channel": "Channel Name",
-            "path": r"C:\Archive\Finished Video.mp4",
-        })
-
-        stream.emit_text.assert_called_once_with(
-            " - Transcribed: Finished Video (Channel Name)",
-            "simpleline_blue")
 
     def test_start_subprocess_waits_for_concurrent_start(self) -> None:
         stream = mock.Mock()
@@ -6029,6 +6153,17 @@ class OnboardingMixinServicesTests(unittest.TestCase):
 
 
 class QueueMixinServicesTests(unittest.TestCase):
+    def test_popover_pause_button_uses_only_custom_tooltip(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1] / "web" / "queueBlink.js"
+        ).read_text(encoding="utf-8")
+        helper = source[source.index("function _paintPopoverPauseBtn"):
+                        source.index("// Publish the public surface")]
+
+        self.assertIn('btn.setAttribute("data-tooltip", tip)', helper)
+        self.assertIn('btn.removeAttribute("title")', helper)
+        self.assertNotIn("btn.title =", helper)
+
     def test_queue_mixin_prefers_app_services_dependencies(self) -> None:
         saved: list[dict] = []
         service_queues = mock.Mock()
@@ -6068,7 +6203,12 @@ class QueueMixinServicesTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(saved[-1]["autorun_gpu"], True)
         service_transcribe._ensure_worker.assert_called_once()
-        service_log.emit_text.assert_called_once()
+        pause_line = service_log.emit.call_args.args[0]
+        self.assertEqual(pause_line[0], ["⏸ Paused at ", "simpleline"])
+        self.assertEqual(
+            pause_line[2],
+            [" — Processing queue — current job will finish — click Resume.\n",
+             "dim"])
         self.assertEqual(pause_result, {"ok": True, "paused": "both"})
         service_queues.set_sync_paused.assert_called_once_with(True)
         service_queues.set_gpu_paused.assert_called_once_with(True)
@@ -6120,6 +6260,36 @@ class QueueMixinServicesTests(unittest.TestCase):
         service_log.emit_text.assert_any_call(
             " - Processing queue resumed - draining 2 queued tasks.",
             "simpleline_green")
+
+    def test_gpu_pause_emits_main_log_feedback(self) -> None:
+        service_queues = mock.Mock()
+        service_log = mock.Mock()
+        service_transcribe = mock.Mock()
+
+        class Api(QueueMixin):
+            def __init__(self):
+                self._sync_pause = threading.Event()
+                self._on_queue_changed = mock.Mock()
+                self.services = AppServices(
+                    load_config=lambda: {},
+                    save_config=lambda cfg: True,
+                    queues=service_queues,
+                    log_stream=service_log,
+                    transcribe=service_transcribe,
+                    event_bus=mock.Mock(),
+                )
+
+        result = Api().queue_pause("gpu")
+
+        self.assertEqual(result, {"ok": True, "paused": "gpu"})
+        service_queues.set_gpu_paused.assert_called_once_with(True)
+        service_transcribe.pause.assert_called_once_with()
+        pause_line = service_log.emit.call_args.args[0]
+        self.assertEqual(pause_line[0], ["⏸ Paused at ", "simpleline"])
+        self.assertEqual(
+            pause_line[2],
+            [" — Processing queue — current job will finish — click Resume.\n",
+             "dim"])
 
 
 class WindowMixinServicesTests(unittest.TestCase):
@@ -6376,6 +6546,19 @@ class BridgeEventBusTests(unittest.TestCase):
 
 
 class QueueStateTests(unittest.TestCase):
+    def test_gpu_snapshot_is_isolated_from_persisted_queue(self) -> None:
+        q = queues.QueueState()
+        q.gpu = [{"path": "video.mp4", "nested": {"value": 1}}]
+
+        snapshot = q.gpu_snapshot()
+        snapshot[0]["nested"]["value"] = 2
+        snapshot.append({"path": "other.mp4"})
+
+        self.assertEqual(q.gpu, [
+            {"path": "video.mp4", "nested": {"value": 1}},
+        ])
+        q.mark_orphan()
+
     def test_queue_save_load_and_resuming_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             queue_file = Path(td) / "queue.json"

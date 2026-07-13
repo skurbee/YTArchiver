@@ -798,6 +798,11 @@ class QueueState:
         self.save_debounced()
         return True
 
+    def gpu_snapshot(self) -> list[dict[str, Any]]:
+        """Return a lock-protected copy of the pending GPU queue."""
+        with self._lock:
+            return copy.deepcopy(self.gpu)
+
     def gpu_pop(self) -> dict[str, Any] | None:
         with self._lock:
             if not self.gpu:

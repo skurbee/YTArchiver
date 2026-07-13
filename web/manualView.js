@@ -280,7 +280,12 @@
         const img = document.createElement("img");
         img.className = "video-thumb-img";
         img.alt = "";
-        img.loading = "lazy";
+        // These callbacks are specifically for cards already rendered in the
+        // Manual grid. Marking the replacement image lazy can leave a visible
+        // card parked in Chromium's lazy queue until a tab/sort/scroll forces
+        // another intersection pass.
+        img.loading = "eager";
+        img.fetchPriority = "high";
         img.decoding = "async";
         img.addEventListener("load", () => {
           thumb.style.background = "";
@@ -331,6 +336,10 @@
         views: r.views || "",
         view_count: (r.view_count != null) ? r.view_count : null,
         thumbnail_url: r.thumbnail_url || "",
+        // Manual renders at most one 60-card page at a time and all URLs are
+        // local. Eager loading prevents visible cards from being stranded in
+        // Chromium's lazy-image scheduler after a sort or tab change.
+        eager_thumbnail: true,
         tx_status: r.tx_status || "",
         removed_from_yt: !!r.removed_from_yt,
         show_channel: true,

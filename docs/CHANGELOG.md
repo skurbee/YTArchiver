@@ -6,6 +6,20 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v81.9 - 2026-07-13
+
+### Fixed
+- **Manual thumbnails render reliably.** Existing local thumbnail sidecars now ship with the initial Manual page instead of racing later bridge callbacks, and visible Manual cards use eager local-image loading so tab and sort changes cannot strand thumbnails in Chromium's lazy queue.
+- **Persisted processing tasks start after restart.** Starting or resuming the Processing queue now reconstructs the worker's runtime list from the durable queue, preserves all transcription and compression execution fields, and keeps the recovery journal synchronized instead of deleting its newly restored state.
+- **Completed Whisper jobs no longer appear stuck at 99%.** The UI reports a finalization phase after recognition, and transcript indexing uses an independent SQLite writer so unrelated long index work cannot hold the completed job indefinitely.
+- **Processing feedback is consistent.** Finished transcriptions emit one completion row, popover buttons show one tooltip, and pausing uses the app's standard timestamped pause-log style.
+
+### Validation
+- Backend smoke suite passed: 370 tests.
+- Frontend JavaScript syntax and generated HTML freshness checks passed.
+- Live testing covered Manual thumbnail rendering, persisted queue recovery, Whisper processing, completion logging, pause logging, and popover tooltips.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
 ## v81.8 - 2026-07-13
 
 ### Fixed

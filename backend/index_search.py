@@ -249,8 +249,9 @@ def search_video_titles(query: str,
                     f" COALESCE(v.upload_ts, v.added_ts, 0) AS ts"
                     f" FROM videos_fts"
                     f" JOIN videos v ON videos_fts.rowid = v.id"
-                    f" WHERE videos_fts MATCH ?"
-                    f" AND v.is_duplicate_of IS NULL"
+                     f" WHERE videos_fts MATCH ?"
+                     f" AND v.is_duplicate_of IS NULL"
+                     f" AND COALESCE(v.availability, 'available')='available'"
                     f"{chan_sql}{year_sql}"
                     f" ORDER BY {order_sql} LIMIT ?",
                     fts_args)
@@ -278,8 +279,9 @@ def search_video_titles(query: str,
                     f"SELECT video_id, title, channel, filepath, year,"
                     f" COALESCE(upload_ts, added_ts, 0) AS ts"
                     f" FROM videos WHERE {like_clauses}"
-                    f"{like_chan_sql}{like_year_sql}"
-                    f" AND is_duplicate_of IS NULL"
+                     f"{like_chan_sql}{like_year_sql}"
+                     f" AND is_duplicate_of IS NULL"
+                     f" AND COALESCE(availability, 'available')='available'"
                     f" ORDER BY {order_sql.replace('v.channel', 'channel').replace('v.title', 'title')}"
                     f" LIMIT ?",
                     like_args)

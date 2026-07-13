@@ -29,6 +29,7 @@ import sqlite3
 from typing import Any
 
 from . import index as _idx
+from .fs_search import is_partial_artifact
 from .log import get_logger
 
 _log = get_logger(__name__)
@@ -250,6 +251,8 @@ def sweep_new_videos(output_dir: str, channels: list,
     registered = 0
     ingested = 0
     id_backfilled = 0
+    availability_missing = 0
+    availability_restored = 0
 
     # `existing` is built per-channel inside the loop below — was
     # previously a single SELECT-fetchall across the entire videos
@@ -352,6 +355,7 @@ def sweep_new_videos(output_dir: str, channels: list,
         # across the entire sweep. Uses idx_vid_channel.
         existing = set()
         noid = set()
+        existing_paths: dict[str, str] = {}
         for _er in sweep_conn.execute(
                 "SELECT filepath, video_id FROM videos "
                 "WHERE channel=? COLLATE NOCASE", (ch_name,)).fetchall():
@@ -359,8 +363,13 @@ def sweep_new_videos(output_dir: str, channels: list,
                 continue
             _efpl = _er[0].lower()
             existing.add(_efpl)
+            existing_paths[_efpl] = _er[0]
             if not (_er[1] or "").strip():
                 noid.add(_efpl)
+        # Reconciliation only applies to rows that existed before this walk.
+        # Newly registered files are already available by definition and do
+        # not need a second UPDATE (this also keeps empty/new channels cheap).
+        _catalog_existing = set(existing)
         # Use scandir directly so we get DirEntry objects with cached
         # stat info — avoids a separate `os.path.getsize` disk round
         # trip per file. Walk recursively by yielding directories
@@ -370,12 +379,18 @@ def sweep_new_videos(output_dir: str, channels: list,
         import re as _re
         _strip_id = _re.compile(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$")
         stack = [str(folder)]
+        _walk_complete = True
+        _seen_existing: set[str] = set()
         while stack:
             _wait_while_busy()
             dp = stack.pop()
             try:
                 it = _os.scandir(dp)
             except OSError:
+                # Never infer "missing" from an incomplete DrivePool/network
+                # walk. Registration can continue in readable directories,
+                # but reconciliation for this entire channel is skipped.
+                _walk_complete = False
                 continue
             with it:
                 _entry_count = 0
@@ -388,22 +403,18 @@ def sweep_new_videos(output_dir: str, channels: list,
                             stack.append(entry.path)
                             continue
                     except OSError:
+                        _walk_complete = False
                         continue
                     fn = entry.name
                     low = fn.lower()
                     if not low.endswith(_VIDEO_EXTS):
                         continue
-                    if "_temp_compress" in low or low.endswith(".part"):
+                    # One canonical final-file classifier for every archive
+                    # walker. The old local copy missed `.temp.mp4`, which is
+                    # how a 488 MB yt-dlp intermediate became a permanent
+                    # Browse card even after the file disappeared.
+                    if is_partial_artifact(fn, dp):
                         continue
-                    # yt-dlp intermediate track suffix check (`.f140-7.m4a`)
-                    _stem = _os.path.splitext(fn)[0]
-                    _dot = _stem.rfind(".")
-                    if _dot >= 0:
-                        _tail = _stem[_dot + 1:]
-                        if (_tail and _tail[0].lower() == "f"
-                                and len(_tail) >= 2
-                                and _tail[1:].replace("-", "").isdigit()):
-                            continue
                     # Check EXISTING-IN-DB first — most files in a
                     # normal launch are already registered. No stat
                     # call needed for them. Previously the sweep
@@ -413,6 +424,7 @@ def sweep_new_videos(output_dir: str, channels: list,
                     fp = _os.path.normpath(entry.path)
                     fp_lower = fp.lower()
                     if fp_lower in existing:
+                        _seen_existing.add(fp_lower)
                         # Already registered but with NO video_id — re-register
                         # so register_video's direct .info.json read backfills
                         # the id. The sweep would otherwise skip this row
@@ -458,6 +470,7 @@ def sweep_new_videos(output_dir: str, channels: list,
                         continue
                     registered += 1
                     existing.add(fp_lower)
+                    existing_paths[fp_lower] = fp
                     # Ingest .jsonl sidecar if present.
                     base = _os.path.splitext(fp)[0]
                     jp = base + ".jsonl"
@@ -465,8 +478,53 @@ def sweep_new_videos(output_dir: str, channels: list,
                         title = _strip_id.sub("", _os.path.basename(base)) or _os.path.basename(base)
                         _wait_while_busy()
                         if _idx.ingest_jsonl(fp, jp, title, ch_name,
-                                        _conn_override=sweep_conn):
+                                            _conn_override=sweep_conn):
                             ingested += 1
+        # The complete channel walk is the cheapest reliable source of file
+        # availability: no extra 100k-file stat pass is needed. Mark catalog
+        # rows seen in this folder available, and rows formerly under this
+        # folder but not seen missing. If *any* scandir failed above, make no
+        # missing judgments so transient Z:\\/DrivePool errors cannot hide a
+        # channel. Partial rows retain their quarantined state.
+        if _walk_complete:
+            _folder_abs = _os.path.normcase(_os.path.abspath(str(folder)))
+
+            def _under_folder(_path: str) -> bool:
+                try:
+                    _p = _os.path.normcase(_os.path.abspath(_path))
+                    return _os.path.commonpath([_folder_abs, _p]) == _folder_abs
+                except (OSError, ValueError):
+                    return False
+
+            _scoped_existing = {
+                low for low, original in existing_paths.items()
+                if low in _catalog_existing
+                if _under_folder(original)
+            }
+            _missing = _scoped_existing - _seen_existing
+            _restored_here = 0
+            _missing_here = 0
+            if _seen_existing:
+                _restored_cur = sweep_conn.executemany(
+                    "UPDATE videos SET availability='available' "
+                    "WHERE filepath=? COLLATE NOCASE AND "
+                    "availability='missing'",
+                    [(existing_paths[p],) for p in _seen_existing
+                     if p in existing_paths])
+                _restored_here = max(0, _restored_cur.rowcount or 0)
+                availability_restored += _restored_here
+            if _missing:
+                _missing_cur = sweep_conn.executemany(
+                    "UPDATE videos SET availability='missing' "
+                    "WHERE filepath=? COLLATE NOCASE AND "
+                    "COALESCE(availability, 'available')='available'",
+                    [(existing_paths[p],) for p in _missing])
+                _missing_here = max(0, _missing_cur.rowcount or 0)
+                availability_missing += _missing_here
+            if _seen_existing or _missing:
+                sweep_conn.commit()
+            if _restored_here or _missing_here:
+                _idx.invalidate_channel_videos(ch_name)
         # Channel walk completed — stamp the fingerprint so next
         # sweep can skip if unchanged. Stamp AFTER the walk so a
         # crash mid-walk doesn't leave a stale "skip me" flag.
@@ -602,6 +660,8 @@ def sweep_new_videos(output_dir: str, channels: list,
     return {"registered": registered, "ingested": ingested,
             "agg_ingested": agg_ingested,
             "id_backfilled": id_backfilled,
+            "availability_missing": availability_missing,
+            "availability_restored": availability_restored,
             "tx_reconciled": reconciled + title_reconciled,
             "tx_reconciled_by_id": reconciled,
             "tx_reconciled_by_title": title_reconciled,

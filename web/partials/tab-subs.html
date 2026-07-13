@@ -161,8 +161,8 @@
                 <option value="240">240p</option>
                 <option value="360">360p</option>
                 <option value="480">480p</option>
-                <option value="720" selected>720p</option>
-                <option value="1080">1080p</option>
+                <option value="720">720p</option>
+                <option value="1080" selected>1080p</option>
                 <option value="1440">1440p</option>
                 <option value="2160">2160p (4K)</option>
                 <option value="best">Best available</option>
@@ -187,7 +187,7 @@
             </div>
             <div class="edit-field">
               <label class="edit-gl">Duration</label>
-              <input type="text" class="ctl-input edit-num" id="edit-min-dur" value="3" placeholder="Min" />
+              <input type="text" class="ctl-input edit-num" id="edit-min-dur" placeholder="Min" />
               <span class="edit-dim">&ndash;</span>
               <input type="text" class="ctl-input edit-num" id="edit-max-dur" placeholder="Max" />
               <span class="edit-dim">min</span>
@@ -199,11 +199,11 @@
             <div class="edit-field edit-field-full" id="edit-range-group">
               <label class="edit-gl">Range</label>
               <label class="radio-label-inline">
-                <input type="radio" name="edit-range" value="subscribe" checked />
+                <input type="radio" name="edit-range" value="subscribe" />
                 <span class="radio-circle"></span>Subscribe only
               </label>
               <label class="radio-label-inline">
-                <input type="radio" name="edit-range" value="all" />
+                <input type="radio" name="edit-range" value="all" checked />
                 <span class="radio-circle"></span>Entire channel
               </label>
               <label class="radio-label-inline">
@@ -227,8 +227,8 @@
             <div class="edit-field">
               <label class="edit-gl">Folder Org</label>
               <select class="ctl-select edit-res" id="edit-folder-org">
-                <option value="flat">None (flat)</option>
-                <option value="years" selected>Years</option>
+                <option value="flat" selected>None (flat)</option>
+                <option value="years">Years</option>
                 <option value="months">Years/Months</option>
               </select>
             </div>
@@ -239,7 +239,7 @@
                 <span>Auto-metadata</span>
               </label>
               <label class="checkbox-label">
-                <input type="checkbox" id="edit-transcribe" />
+                <input type="checkbox" id="edit-transcribe" checked />
                 <span>Auto-transcribe</span>
               </label>
               <label class="checkbox-label">

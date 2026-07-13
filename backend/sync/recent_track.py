@@ -63,6 +63,15 @@ def _backfill_recent_duration(filepath: str) -> None:
     duration_s = _probe_duration_seconds(filepath)
     if not duration_s:
         return
+    # Keep the authoritative Browse catalog in sync with the legacy Recent
+    # config. Previously this background probe repaired only the Download-tab
+    # card, so the same video could show a duration there and remain blank in
+    # Browse forever.
+    try:
+        from .. import index as _idx
+        _idx.set_video_duration(filepath, float(duration_s))
+    except Exception as e:
+        swallow("catalog duration backfill", e)
     try:
         from ..ytarchiver_config import (
             config_is_writable,
@@ -199,6 +208,7 @@ def _record_recent_download(filepath: str, channel: str, title: str,
                             and e.get("channel") == channel)
 
                 entries = [e for e in entries if not _same_recent_entry(e)]
+                _completed_ts = time.time()
                 entries.insert(0, {
                     "title": title or "",
                     "channel": channel or "",
@@ -214,7 +224,7 @@ def _record_recent_download(filepath: str, channel: str, title: str,
                     # of video_url. The fallback parse still works, but the
                     # explicit field is cheaper and avoids URL-format coupling.
                     "video_id": video_id or "",
-                    "download_ts": time.time(),     # unix float
+                    "download_ts": _completed_ts,  # unix float
                 })
                 cfg["recent_downloads"] = entries[:500]
                 # Auto-index counter bump (was a separate second lock+
@@ -230,6 +240,21 @@ def _record_recent_download(filepath: str, channel: str, title: str,
                         cfg["downloads_since_last_index"] = 0
                     else:
                         cfg["downloads_since_last_index"] = counter
+
+        # Persist the same completion timestamp in the Browse catalog. This
+        # is the semantic bridge from the legacy config list to the canonical
+        # video row; rescans never call it, so discovered old files cannot
+        # masquerade as recent downloads.
+        try:
+            from .. import index as _idx
+            if not _idx.record_video_download(
+                    filepath, video_id=video_id,
+                    downloaded_ts=_completed_ts,
+                    duration_secs=duration_secs):
+                swallow("catalog download completion",
+                        RuntimeError(f"catalog row not found for {filepath}"))
+        except Exception as e:
+            swallow("catalog download completion", e)
 
         # Live refresh push to the Recent tab so a download shows up
         # immediately without needing a restart. Hook set by main.py's

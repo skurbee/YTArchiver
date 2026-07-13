@@ -241,6 +241,15 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
             invalidate_thumb_cache_entry(name)
         except Exception as e:
             _log.debug("swallowed: %s", e)
+        # The persisted percentage cache above is separate from Browse's
+        # resolved-card and channel thumbnail indexes. Invalidate both after
+        # the files commit so newly fetched thumbnails appear immediately,
+        # not only after process restart.
+        try:
+            from .. import index as _idx
+            _idx.invalidate_channel_videos(name or None)
+        except Exception as e:
+            _log.debug("Browse thumbnail invalidation failed: %s", e)
     return {"checked": checked, "fetched": fetched,
             "missing": still_missing}
 

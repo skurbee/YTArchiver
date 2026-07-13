@@ -44,6 +44,12 @@ _tx_retry_set: set = set()
 _tx_retry_lock = threading.Lock()
 _tx_retry_thread: threading.Thread | None = None
 
+# Avoid replaying up to 500 legacy recent-download rows on every Browse open.
+# Signature changes whenever the list length or newest completion changes;
+# live downloads update the catalog directly and also change that signature.
+_download_backfill_lock = threading.Lock()
+_download_backfill_signature: tuple[int, float] | None = None
+
 
 def _sqlite_is_busy(exc: BaseException) -> bool:
     msg = str(exc).lower()
@@ -359,13 +365,18 @@ def _open() -> sqlite3.Connection | None:
                 _current_v = _conn.execute("PRAGMA user_version").fetchone()[0]
             except Exception:
                 _current_v = 0
-            _SCHEMA_VERSION = 2
+            _SCHEMA_VERSION = 3
             _MIGRATIONS: dict = {
                 # Populate videos_fts from the existing videos table so
                 # title search can use FTS5 MATCH instead of LIKE '%term%'.
                 2: lambda c: c.execute(
                     "INSERT INTO videos_fts(videos_fts) VALUES('rebuild')"
                 ),
+                # Schema marker for the downloaded_ts / availability catalog
+                # lifecycle fields added by the idempotent ALTER loop below.
+                # The data invariant itself is enforced on every open by the
+                # partial-row quarantine after index creation.
+                3: lambda c: c.execute("SELECT 1"),
             }
             for stmt in (
                 "ALTER TABLE segments ADD COLUMN words TEXT DEFAULT ''",
@@ -425,6 +436,17 @@ def _open() -> sqlite3.Connection | None:
                 # backfill (backfill_video_stats). NULL = not yet known.
                 "ALTER TABLE videos ADD COLUMN view_count INTEGER",
                 "ALTER TABLE videos ADD COLUMN like_count INTEGER",
+                # Catalog lifecycle fields. `added_ts` historically means
+                # "first discovered by the index", NOT "downloaded". Keep it
+                # for import/discovery ordering and track real completed
+                # downloads separately so Browse > Recently Downloaded cannot
+                # be polluted by an old file found during a rescan.
+                "ALTER TABLE videos ADD COLUMN downloaded_ts REAL",
+                # Availability is catalog state, not a filesystem operation.
+                # NULL is treated as available for legacy rows; new writes set
+                # an explicit value. Partial artifacts are quarantined here so
+                # Browse can hide them without stat'ing 100k files on Z:\\.
+                "ALTER TABLE videos ADD COLUMN availability TEXT DEFAULT 'available'",
             ):
                 try:
                     _conn.execute(stmt)
@@ -465,6 +487,7 @@ def _open() -> sqlite3.Connection | None:
                 # ORDER BY ... LIMIT/OFFSET pagination off a full table scan.
                 "CREATE INDEX IF NOT EXISTS idx_vid_added_ts ON videos(added_ts)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_upload_ts ON videos(upload_ts)",
+                "CREATE INDEX IF NOT EXISTS idx_vid_downloaded_ts ON videos(downloaded_ts)",
                 # Covering index for the search year-filter's (channel, title)
                 # upload-date fallback: segments with an empty video_id resolve
                 # their year via MIN(upload_ts) grouped by (channel, title).
@@ -473,8 +496,9 @@ def _open() -> sqlite3.Connection | None:
                 "ON videos(channel, title, upload_ts)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_view_count ON videos(view_count)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_like_count ON videos(like_count)",
-                # PARTIAL COVERING index for the Browse Channels grid's
-                # per-channel "last added" query
+                # Partial covering index for catalog discovery-time queries.
+                # This is intentionally NOT download recency: added_ts records
+                # when a row entered SQLite, including during later rescans.
                 #   SELECT channel, MAX(added_ts) FROM videos
                 #   WHERE is_duplicate_of IS NULL GROUP BY channel
                 # Measured at 689s (!) on a 104k-row / 20GB DB before this:
@@ -487,6 +511,10 @@ def _open() -> sqlite3.Connection | None:
                 # (they group/scan the same live-rows-by-channel/added_ts set).
                 "CREATE INDEX IF NOT EXISTS idx_vid_chan_added_live "
                 "ON videos(channel, added_ts) WHERE is_duplicate_of IS NULL",
+                "CREATE INDEX IF NOT EXISTS idx_vid_chan_downloaded_live "
+                "ON videos(channel, downloaded_ts) "
+                "WHERE is_duplicate_of IS NULL "
+                "AND COALESCE(availability, 'available') = 'available'",
                 # Per-channel Browse paging. These keep the default newest/
                 # oldest and most-viewed page loads from scanning/sorting a
                 # whole large channel before the first cards can paint.
@@ -503,6 +531,20 @@ def _open() -> sqlite3.Connection | None:
                     _log.warning("schema index creation failed: %s; stmt=%s",
                                  exc, stmt)
                     raise
+            # Quarantine legacy partial rows using filename-only evidence.
+            # This is deliberately a DB-only migration: it never deletes or
+            # even stats anything on Z:\\. Future partials are rejected by
+            # register_video() before they can enter the catalog.
+            try:
+                _conn.execute(
+                    "UPDATE videos SET availability='partial' "
+                    "WHERE COALESCE(availability, 'available')='available' "
+                    "AND (lower(filepath) LIKE '%.temp.%' "
+                    " OR lower(filepath) LIKE '%.part.%' "
+                    " OR lower(filepath) LIKE '%_temp_compress%' "
+                    " OR lower(filepath) LIKE '%.ytdl')")
+            except sqlite3.Error as exc:
+                _log.warning("partial-row quarantine failed: %s", exc)
             # run pending migrations (none currently — framework
             # only) and bump user_version once we're at the target. Wrapped
             # in try/except so a future migration bug can't brick startup.
@@ -786,6 +828,25 @@ def register_video(filepath: str, channel: str, title: str | None = None,
     if conn is None:
         return False
     fp = os.path.normpath(filepath)
+    # Registration is the catalog trust boundary. Every caller (sync,
+    # startup sweep, manual import, metadata repair) passes through here, so
+    # reject non-final artifacts once instead of relying on each walker to
+    # remember an ever-growing list of yt-dlp/ffmpeg suffixes.
+    try:
+        from .fs_search import is_partial_artifact as _is_partial_artifact
+        if _is_partial_artifact(os.path.basename(fp), os.path.dirname(fp)):
+            _log.warning("refusing to register partial artifact: %s", fp)
+            return False
+    except Exception as exc:
+        # A classifier bug must not admit a suspicious filename. Only swallow
+        # errors for ordinary final-looking names; fail closed for the known
+        # partial markers.
+        _low_fp = os.path.basename(fp).lower()
+        if (".temp." in _low_fp or ".part." in _low_fp
+                or "_temp_compress" in _low_fp
+                or _low_fp.endswith((".part", ".temp", ".ytdl"))):
+            _log.warning("partial classifier failed closed for %s: %s", fp, exc)
+            return False
     if not title:
         stem = Path(fp).stem
         # Strip " [ID]" suffix if present
@@ -818,9 +879,13 @@ def register_video(filepath: str, channel: str, title: str | None = None,
         st = os.stat(fp)
         size = st.st_size
         upload_ts = st.st_mtime
-    except OSError:
-        size = 0
-        upload_ts = None
+    except OSError as exc:
+        _log.warning("refusing to register missing/unreadable video %s: %s",
+                     fp, exc)
+        return False
+    if size <= 0:
+        _log.warning("refusing to register zero-byte video: %s", fp)
+        return False
     try:
         # When the caller provided their own connection, skip _db_lock
         # entirely — SQLite's WAL handles cross-connection serialization,
@@ -867,13 +932,14 @@ def register_video(filepath: str, channel: str, title: str | None = None,
             conn.execute(
                 """INSERT INTO videos
                    (title, channel, year, month, filepath, video_id, video_url,
-                    size_bytes, duration_s, tx_status, added_ts, upload_ts)
+                    size_bytes, duration_s, tx_status, added_ts, upload_ts,
+                    availability)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           COALESCE(
-                             (SELECT added_ts FROM videos
-                              WHERE filepath=? COLLATE NOCASE),
-                             ?),
-                           ?)
+                            COALESCE(
+                              (SELECT added_ts FROM videos
+                               WHERE filepath=? COLLATE NOCASE),
+                              ?),
+                            ?, 'available')
                    ON CONFLICT(filepath) DO UPDATE SET
                      title=excluded.title,
                      channel=excluded.channel,
@@ -911,7 +977,8 @@ def register_video(filepath: str, channel: str, title: str | None = None,
                          THEN videos.tx_status
                        ELSE excluded.tx_status
                      END,
-                     upload_ts=excluded.upload_ts
+                     upload_ts=excluded.upload_ts,
+                     availability='available'
                      /* added_ts deliberately omitted from UPDATE — preserves
                         the original registration timestamp.
                         duration_s uses COALESCE so a re-register with
@@ -1020,6 +1087,142 @@ def register_video(filepath: str, channel: str, title: str | None = None,
         _rollback_quietly(conn, "register_video final error")
         _log.error("register_video failed for %s: %s", filepath, e)
         return False
+
+
+def record_video_download(filepath: str, *, video_id: str | None = None,
+                          downloaded_ts: float | None = None,
+                          duration_secs: float | None = None) -> bool:
+    """Record a *completed download* on an existing catalog row.
+
+    This is intentionally separate from ``added_ts``. A startup scan may
+    discover a 15-year-old file today, while a redownload may update a row
+    first discovered months ago. Neither operation can be represented
+    correctly by the legacy insertion timestamp.
+    """
+    fp = os.path.normpath(filepath or "")
+    if not fp:
+        return False
+    try:
+        from .fs_search import is_partial_artifact as _is_partial_artifact
+        if _is_partial_artifact(os.path.basename(fp), os.path.dirname(fp)):
+            return False
+    except Exception:
+        return False
+    try:
+        if not os.path.isfile(fp) or os.path.getsize(fp) <= 0:
+            return False
+    except OSError:
+        return False
+    try:
+        ts = float(downloaded_ts if downloaded_ts is not None else time.time())
+        if ts <= 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    dur = None
+    try:
+        if duration_secs is not None and float(duration_secs) > 0:
+            dur = float(duration_secs)
+    except (TypeError, ValueError):
+        dur = None
+
+    conn = _open()
+    if conn is None:
+        return False
+    channel = ""
+    try:
+        with _db_lock:
+            row = conn.execute(
+                "SELECT id, channel FROM videos "
+                "WHERE filepath=? COLLATE NOCASE LIMIT 1", (fp,)).fetchone()
+            if row is None and video_id:
+                matches = conn.execute(
+                    "SELECT id, channel FROM videos WHERE video_id=? "
+                    "AND is_duplicate_of IS NULL LIMIT 2",
+                    ((video_id or "").strip(),)).fetchall()
+                if len(matches) == 1:
+                    row = matches[0]
+            if row is None:
+                return False
+            channel = row[1] or ""
+            conn.execute(
+                "UPDATE videos SET downloaded_ts=?, availability='available', "
+                "duration_s=COALESCE(?, duration_s) WHERE id=?",
+                (ts, dur, row[0]))
+            conn.commit()
+        invalidate_channel_videos(channel or None)
+        return True
+    except sqlite3.Error as exc:
+        _rollback_quietly(conn, "record_video_download")
+        _log.warning("download timestamp update failed for %s: %s", fp, exc)
+        return False
+
+
+def backfill_downloaded_ts_from_recent(entries: list[dict[str, Any]] | None
+                                       ) -> dict[str, int]:
+    """Seed catalog download timestamps from legacy config history.
+
+    ``recent_downloads`` is capped, but it is authoritative for the recent
+    window users actually see. This migration is idempotent and never creates
+    rows or touches archive files.
+    """
+    global _download_backfill_signature
+    source = entries or []
+    _latest = 0.0
+    for _entry in source:
+        try:
+            _latest = max(_latest, float(_entry.get("download_ts") or 0))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    _signature = (len(source), _latest)
+    with _download_backfill_lock:
+        if _download_backfill_signature == _signature:
+            return {"updated": 0, "unmatched": 0}
+
+    conn = _open()
+    if conn is None:
+        return {"updated": 0, "unmatched": 0}
+    updated = unmatched = 0
+    try:
+        with _db_lock:
+            for entry in source:
+                try:
+                    ts = float(entry.get("download_ts") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if ts <= 0:
+                    continue
+                fp = os.path.normpath(str(entry.get("filepath") or ""))
+                vid = str(entry.get("video_id") or "").strip()
+                row = None
+                if fp:
+                    row = conn.execute(
+                        "SELECT id FROM videos WHERE filepath=? COLLATE NOCASE "
+                        "LIMIT 1", (fp,)).fetchone()
+                if row is None and vid:
+                    matches = conn.execute(
+                        "SELECT id FROM videos WHERE video_id=? "
+                        "AND is_duplicate_of IS NULL LIMIT 2", (vid,)).fetchall()
+                    if len(matches) == 1:
+                        row = matches[0]
+                if row is None:
+                    unmatched += 1
+                    continue
+                cur = conn.execute(
+                    "UPDATE videos SET downloaded_ts=? WHERE id=? AND "
+                    "(downloaded_ts IS NULL OR downloaded_ts < ?)",
+                    (ts, row[0], ts))
+                updated += cur.rowcount or 0
+            conn.commit()
+        if updated:
+            invalidate_channel_videos(None)
+        with _download_backfill_lock:
+            _download_backfill_signature = _signature
+        return {"updated": updated, "unmatched": unmatched}
+    except sqlite3.Error as exc:
+        _rollback_quietly(conn, "backfill_downloaded_ts")
+        _log.warning("download timestamp backfill failed: %s", exc)
+        return {"updated": updated, "unmatched": unmatched}
 
 
 def mark_video_transcribed(filepath: str,
@@ -1392,6 +1595,34 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
             # Clear any existing segments for this jsonl (re-ingest)
             conn.execute("DELETE FROM segments WHERE jsonl_path=?", (jp,))
             rows = []
+            # Aggregated per-year transcript files (".<Channel> <Year>
+            # Transcript.jsonl") carry a per-segment title but, in the OLD
+            # long-form, no video_id — and the aggregate filename has no
+            # "[id]" tag, so vid_id is empty too. That orphaned ~20% of all
+            # segments (empty video_id -> can't join videos -> Graph months,
+            # channel-scoped search, upload-date bucketing all degrade).
+            # Self-heal by recovering the video_id from (channel, title) when
+            # it's otherwise empty, cached per title. Only a UNIQUE
+            # (channel, title) -> video_id match is trusted.
+            _title_vid_cache: dict[str, str] = {}
+            def _resolve_title_vid(seg_t: str) -> str:
+                if not seg_t:
+                    return ""
+                hit = _title_vid_cache.get(seg_t)
+                if hit is not None:
+                    return hit
+                v = ""
+                try:
+                    _rs = conn.execute(
+                        "SELECT video_id FROM videos WHERE channel=? AND title=? "
+                        "AND video_id IS NOT NULL AND video_id<>'' GROUP BY video_id",
+                        (channel, seg_t)).fetchall()
+                    if len(_rs) == 1:
+                        v = _rs[0][0] or ""
+                except sqlite3.Error:
+                    v = ""
+                _title_vid_cache[seg_t] = v
+                return v
             for seg in segments:
                 # Accept both key shapes so the FTS DB can ingest OLD's
                 # long-form JSONLs (they match now) AS WELL AS any stale
@@ -1414,6 +1645,11 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
                 # them (OLD-compat long-form). Falls back to path-derived.
                 seg_vid = (seg.get("video_id") or vid_id or "").strip()
                 seg_title = (seg.get("title") or title or "").strip() or title
+                # OLD aggregated JSONLs lack per-entry video_id: recover it
+                # from the videos table by (channel, title) so the segment
+                # links to its real upload date instead of orphaning.
+                if not seg_vid and seg_title:
+                    seg_vid = _resolve_title_vid(seg_title)
                 rows.append((
                     seg_vid,
                     seg_title,
@@ -1513,8 +1749,9 @@ def list_recent_videos(limit: int = 200, channel: str | None = None
     q = ("SELECT title, channel, filepath, video_id, size_bytes, year, month, "
          "tx_status, added_ts FROM videos ")
     args: list[Any] = []
+    q += "WHERE COALESCE(availability, 'available')='available' "
     if channel:
-        q += "WHERE channel=? "
+        q += "AND channel=? "
         args.append(channel)
     q += "ORDER BY added_ts DESC LIMIT ?"
     args.append(limit)
@@ -1762,6 +1999,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
                 f"tx_status, added_ts, removed_from_yt_ts, upload_ts, "
                 f"view_count, like_count FROM videos "
                 f"WHERE channel=? COLLATE NOCASE AND is_duplicate_of IS NULL "
+                f"AND COALESCE(availability, 'available')='available' "
                 f"ORDER BY {order} LIMIT ?",
                 (channel, limit),
             )
@@ -1779,6 +2017,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
                 f"SELECT title, channel, filepath, video_id, size_bytes, year, month, "
                 f"tx_status, added_ts FROM videos "
                 f"WHERE channel=? COLLATE NOCASE AND is_duplicate_of IS NULL "
+                f"AND COALESCE(availability, 'available')='available' "
                 f"ORDER BY {order} LIMIT ?",
                 (channel, limit),
             )
@@ -2056,7 +2295,8 @@ def list_videos_for_channel_page(
     }.get((sort or "newest").lower(),
           "upload_ts DESC, added_ts DESC")
     where = ("WHERE channel=? COLLATE NOCASE "
-             "AND is_duplicate_of IS NULL")
+             "AND is_duplicate_of IS NULL "
+             "AND COALESCE(availability, 'available')='available'")
     params: list[Any] = [channel]
     q = (query or "").strip()
     if q:
@@ -2113,10 +2353,10 @@ def _file_url(path: str) -> str:
 
 
 def new_videos_in_last_n_days(days: int = 7) -> dict[str, Any]:
-    """Return {videos: N, channels: M} for videos added in the last N days.
+    """Return completed-download counts for the last N days.
 
-    Uses the FTS DB's videos.added_ts column (Unix epoch). Silent-returns zeros
-    on any DB error so the caller can show a bar with dashes gracefully.
+    Uses videos.downloaded_ts, not catalog discovery time. Silent-returns
+    zeros on any DB error so the caller can show a bar with dashes gracefully.
     """
     out = {"videos": 0, "channels": 0, "channel_list": []}
     try:
@@ -2132,11 +2372,14 @@ def new_videos_in_last_n_days(days: int = 7) -> dict[str, Any]:
         cutoff = _t.time() - (max(1, int(days)) * 86400.0)
         with _reader_lock:
             row = conn.execute(
-                "SELECT COUNT(*) FROM videos WHERE added_ts >= ?", (cutoff,),
+                "SELECT COUNT(*) FROM videos WHERE downloaded_ts >= ? "
+                "AND COALESCE(availability, 'available')='available'", (cutoff,),
             ).fetchone()
             out["videos"] = int(row[0] or 0) if row else 0
             rows = conn.execute(
-                "SELECT DISTINCT channel FROM videos WHERE added_ts >= ? ORDER BY channel",
+                "SELECT DISTINCT channel FROM videos WHERE downloaded_ts >= ? "
+                "AND COALESCE(availability, 'available')='available' "
+                "ORDER BY channel",
                 (cutoff,),
             ).fetchall()
         out["channel_list"] = [r[0] for r in rows if r[0]]
@@ -2186,7 +2429,8 @@ def channel_transcription_stats(channel: str) -> dict[str, int]:
                               THEN 1 ELSE 0 END) AS no_speech
                    FROM videos
                    WHERE channel = ? COLLATE NOCASE
-                     AND is_duplicate_of IS NULL""",
+                     AND is_duplicate_of IS NULL
+                     AND COALESCE(availability, 'available')='available'""",
                 (channel,),
             ).fetchone()
         if row:
@@ -2287,6 +2531,34 @@ def find_thumbnail(video_filepath: str,
             p = os.path.join(tf, stem + ".local" + ext)
             if os.path.isfile(p):
                 return os.path.normpath(p)
+
+    # 5. Normalized-stem fallback. A video file and its thumbnail can sanitize
+    #    Windows-reserved chars DIFFERENTLY — e.g. a ':' becomes fullwidth '：'
+    #    in the .mp4 name but '_' in the .jpg (downloaded under different
+    #    yt-dlp/app versions), so every exact/stem match above misses even
+    #    though the thumbnail sits right there. Compare on an alphanumerics-only
+    #    normalization of the stem (ignoring the trailing "[id]" + extension).
+    #    Only accept a UNIQUE match within a folder so two titles that collide
+    #    after normalization (e.g. two different videos both "Cold Opening_/-
+    #    Dick Cheney") never resolve to a wrong thumbnail.
+    def _alnum_stem(fn: str) -> str:
+        st = os.path.splitext(fn)[0]
+        st = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", st)
+        return re.sub(r"[^a-z0-9]", "", st.lower())
+    want = _alnum_stem(os.path.basename(video_filepath))
+    if want:
+        for tf in search_dirs:
+            cands = []
+            try:
+                for fn in os.listdir(tf):
+                    if not fn.lower().endswith((".jpg", ".jpeg", ".webp", ".png")):
+                        continue
+                    if _alnum_stem(fn) == want:
+                        cands.append(os.path.join(tf, fn))
+            except OSError:
+                continue
+            if len(cands) == 1:
+                return os.path.normpath(cands[0])
 
     return None
 
@@ -2540,11 +2812,18 @@ def backfill_video_durations_if_needed() -> dict:
         if conn is None:
             return {"ok": False, "skipped": True}
         with _reader_lock:
+            # A gap is any transcribed video with no duration that we can
+            # recover from its segments. Match by (channel, title): id-linked
+            # segments carry those too, so this single probe covers BOTH
+            # normal rows AND id-less ones (older imports / aggregated
+            # transcript ingests that never captured a video_id — which
+            # otherwise show blank durations, and blank thumbnails, forever).
             row = conn.execute(
                 "SELECT 1 FROM videos v "
-                "WHERE v.duration_s IS NULL AND v.video_id IS NOT NULL "
+                "WHERE (v.duration_s IS NULL OR v.duration_s <= 0) "
                 "AND EXISTS (SELECT 1 FROM segments s "
-                "            WHERE s.video_id = v.video_id) LIMIT 1"
+                "            WHERE s.channel = v.channel AND s.title = v.title "
+                "            AND s.end_time > 0) LIMIT 1"
             ).fetchone()
         if not row:
             return {"ok": True, "skipped": True, "reason": "no gaps"}
@@ -2555,17 +2834,32 @@ def backfill_video_durations_if_needed() -> dict:
             c = _open()
             if c is None:
                 return {"ok": False, "error": "no db", "filled": 0}
+            # Pass 1 — fast id-keyed fill (indexed on segments.video_id).
             cur = c.execute(
                 "UPDATE videos SET duration_s = ("
                 "  SELECT MAX(s.end_time) FROM segments s "
                 "  WHERE s.video_id = videos.video_id) "
-                "WHERE duration_s IS NULL AND video_id IS NOT NULL "
+                "WHERE (duration_s IS NULL OR duration_s <= 0) "
+                "AND video_id IS NOT NULL AND video_id <> '' "
                 "AND EXISTS (SELECT 1 FROM segments s2 "
                 "            WHERE s2.video_id = videos.video_id)"
             )
-            filled = cur.rowcount
+            filled = cur.rowcount or 0
+            # Pass 2 — recover id-less videos by (channel, title) so blank
+            # durations don't persist for rows that never got a video_id.
+            cur2 = c.execute(
+                "UPDATE videos SET duration_s = ("
+                "  SELECT MAX(s.end_time) FROM segments s "
+                "  WHERE s.channel = videos.channel AND s.title = videos.title "
+                "  AND s.end_time > 0) "
+                "WHERE (duration_s IS NULL OR duration_s <= 0) "
+                "AND EXISTS (SELECT 1 FROM segments s2 "
+                "            WHERE s2.channel = videos.channel "
+                "            AND s2.title = videos.title AND s2.end_time > 0)"
+            )
+            filled += cur2.rowcount or 0
             c.commit()
-        return {"ok": True, "filled": int(filled or 0)}
+        return {"ok": True, "filled": int(filled)}
     except sqlite3.Error as e:
         _log.debug("duration backfill failed: %s", e)
         return {"ok": False, "error": str(e), "filled": 0}
@@ -2782,7 +3076,8 @@ def _manual_where_and_params() -> tuple[str, list]:
     roots.extend(str(r) for r in (cfg.get("tp_archive_roots") or []) if r)
     if not roots:
         return ("", [])
-    where = "WHERE is_duplicate_of IS NULL"
+    where = ("WHERE is_duplicate_of IS NULL AND "
+             "COALESCE(availability, 'available')='available'")
     params: list = []
     for r in roots:
         where += " AND filepath NOT LIKE ? ESCAPE '\\'"
@@ -3078,7 +3373,8 @@ def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
     if conn is None:
         return {"rows": [], "has_more": False, "offset": offset}
     order = {
-        "recent":  "COALESCE(added_ts, 0) DESC, id DESC",
+        "recent":  "(downloaded_ts IS NULL) ASC, downloaded_ts DESC, "
+                   "COALESCE(added_ts, 0) DESC, id DESC",
         "newest":  "(upload_ts IS NULL) ASC, upload_ts DESC, COALESCE(added_ts, 0) DESC",
         "oldest":  "(upload_ts IS NULL) ASC, upload_ts ASC, COALESCE(added_ts, 0) ASC",
         "title":   "title COLLATE NOCASE ASC",
@@ -3086,7 +3382,9 @@ def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
         "views":   "(view_count IS NULL) ASC, view_count DESC, COALESCE(added_ts, 0) DESC",
         "likes":   "(like_count IS NULL) ASC, like_count DESC, COALESCE(added_ts, 0) DESC",
         "largest": "COALESCE(size_bytes, 0) DESC",
-    }.get((sort or "recent").lower(), "COALESCE(added_ts, 0) DESC, id DESC")
+    }.get((sort or "recent").lower(),
+          "(downloaded_ts IS NULL) ASC, downloaded_ts DESC, "
+          "COALESCE(added_ts, 0) DESC, id DESC")
     try:
         lim = max(1, int(limit)); off = max(0, int(offset))
     except (TypeError, ValueError):
@@ -3104,7 +3402,8 @@ def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
         return {"rows": [dict(r) for r in _hit["rows"]],
                 "has_more": _hit["has_more"], "offset": _hit["offset"]}
     try:
-        where = "WHERE is_duplicate_of IS NULL"
+        where = ("WHERE is_duplicate_of IS NULL AND "
+                 "COALESCE(availability, 'available')='available'")
         params: list[Any] = []
         if _q:
             # Filter by title OR channel (substring, case-insensitive via
@@ -3555,10 +3854,14 @@ def summary() -> dict[str, Any]:
         return {"segments": 0, "videos": 0, "channels": 0, "bookmarks": 0}
     try:
         seg = conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
-        vid = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+        vid = conn.execute(
+            "SELECT COUNT(*) FROM videos WHERE is_duplicate_of IS NULL AND "
+            "COALESCE(availability, 'available')='available'").fetchone()[0]
         ch = conn.execute(
             "SELECT COUNT(*) FROM ("
-            "SELECT 1 FROM videos WHERE channel IS NOT NULL GROUP BY channel"
+            "SELECT 1 FROM videos WHERE channel IS NOT NULL "
+            "AND is_duplicate_of IS NULL AND "
+            "COALESCE(availability, 'available')='available' GROUP BY channel"
             ")"
         ).fetchone()[0]
         bm = conn.execute("SELECT COUNT(*) FROM bookmarks").fetchone()[0]

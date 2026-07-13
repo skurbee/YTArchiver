@@ -371,8 +371,15 @@
             window._showToast?.(`Redownload queued at ${_res}.`, "ok");
           }},
           { sep: true },
-          { label: "Delete file", cls: "dim",
-            action: () => bridgeCall("video_delete_file", filepath) },
+          { label: "Delete file", cls: "dim", action: async () => {
+            const res = await bridgeCall("video_delete_file", filepath);
+            if (res?.ok) {
+              card.remove();
+              window._showToast?.(res.message || "Video moved to app trash.", "ok");
+            } else {
+              window._showToast?.(res?.error || "Delete failed.", "error");
+            }
+          }},
         ]);
       });
     }
@@ -481,8 +488,15 @@
             window._showToast?.(`Redownload queued at ${_res}.`, "ok");
           }}] : []),
           { sep: true },
-          { label: "Delete file", cls: "dim",
-            action: () => bridgeCall("video_delete_file", filepath) },
+          { label: "Delete file", cls: "dim", action: async () => {
+            const res = await bridgeCall("video_delete_file", filepath);
+            if (res?.ok) {
+              card.remove();
+              window._showToast?.(res.message || "Video moved to app trash.", "ok");
+            } else {
+              window._showToast?.(res?.error || "Delete failed.", "error");
+            }
+          }},
         ];
         showContextMenu(e.clientX, e.clientY, items);
       });
@@ -564,8 +578,15 @@
             else window._showToast?.(res?.error || "Re-transcribe failed.", "error");
           }},
           { sep: true },
-          { label: "Delete file", cls: "dim",
-            action: () => bridgeCall("video_delete_file", filepath) },
+          { label: "Delete file", cls: "dim", action: async () => {
+            const res = await bridgeCall("video_delete_file", filepath);
+            if (res?.ok) {
+              card.remove();
+              window._showToast?.(res.message || "Video moved to app trash.", "ok");
+            } else {
+              window._showToast?.(res?.error || "Delete failed.", "error");
+            }
+          }},
         ];
         showContextMenu(e.clientX, e.clientY, items);
       });

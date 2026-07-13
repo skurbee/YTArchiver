@@ -61,7 +61,45 @@ class VideoMixin:
         if not fp:
             return {"ok": False, "error": "Missing filepath"}
         if not os.path.isfile(fp):
-            return {"ok": False, "error": f"File not found: {fp}"}
+            # The file is already gone, so there is nothing destructive to do
+            # on disk. Treat Delete as "remove stale catalog entry" instead of
+            # trapping the user with an undeletable ghost card forever.
+            try:
+                from backend import index as _idx
+                _conn = _idx._open()
+                if _conn is None:
+                    return {"ok": False, "error": "Index database unavailable"}
+                _channel = ""
+                with _idx._db_lock:
+                    _row = _conn.execute(
+                        "SELECT channel FROM videos WHERE filepath=? "
+                        "COLLATE NOCASE LIMIT 1", (fp,)).fetchone()
+                if _row is None:
+                    return {"ok": True, "stale_entry_removed": False,
+                            "message": "File and catalog entry are already gone."}
+                _channel = _row[0] or ""
+                _idx.delete_segments_for_video(fp)
+                with _idx._db_lock:
+                    _conn.execute(
+                        "DELETE FROM videos WHERE filepath=? COLLATE NOCASE",
+                        (fp,))
+                    _conn.commit()
+                _idx.invalidate_channel_videos(_channel or None)
+            except Exception as _e:
+                return {"ok": False,
+                        "error": f"Could not remove stale catalog entry: {_e}"}
+            if config_is_writable():
+                try:
+                    cfg = self._video_config()
+                    cfg["recent_downloads"] = [
+                        r for r in cfg.get("recent_downloads", []) or []
+                        if (r.get("filepath") or "").lower() != fp.lower()
+                    ]
+                    self._video_save_config(cfg)
+                except Exception as e:
+                    _log.debug("stale recent cleanup failed: %s", e)
+            return {"ok": True, "stale_entry_removed": True,
+                    "message": "Stale Browse entry removed; no file existed on disk."}
         # Defense-in-depth: the JS bridge is the trust boundary, so refuse to
         # os.remove a path resolving OUTSIDE the archive roots this app
         # manages — a crafted/compromised filepath must not delete arbitrary

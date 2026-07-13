@@ -30,6 +30,11 @@
   let _seq = 0;
   let _wired = false;
   let _firstPageSig = "";
+  // Background metadata can finish before the bridge promise that started it
+  // resolves. Keep those early completions so the fresh render cannot erase
+  // them when it replaces the cached/skeleton cards.
+  const _pendingThumbPatches = new Map();
+  const _pendingDurationPatches = new Map();
 
   const $ = (id) => document.getElementById(id);
   const grid = () => $("manual-grid");
@@ -261,6 +266,12 @@
       const fp = item?.filepath || "";
       const url = item?.thumbnail_url || "";
       if (!fp || !url) continue;
+      const patch = {
+        thumbnail_url: url,
+        thumbnail_source: item?.thumbnail_source || "",
+      };
+      if (_loading) _pendingThumbPatches.set(fp, patch);
+      _patchCachedPage1(fp, patch);
       for (const card of cards) {
         if ((card.dataset.filepath || "") !== fp) continue;
         const thumb = card.querySelector(".video-thumb");
@@ -291,6 +302,8 @@
       const fp = item?.filepath || "";
       const duration = item?.duration || "";
       if (!fp || !duration) continue;
+      if (_loading) _pendingDurationPatches.set(fp, { duration });
+      _patchCachedPage1(fp, { duration });
       for (const card of cards) {
         if ((card.dataset.filepath || "") !== fp) continue;
         const badge = card.querySelector(".video-duration-badge");
@@ -373,8 +386,26 @@
   }
   function _saveCachedPage1(rows) {
     _cachedPage1 = rows;
-    try { localStorage.setItem(_CACHE_KEY, JSON.stringify(rows.slice(0, 24))); }
+    try {
+      // Local thumbnail URLs contain the current fileserver's random port and
+      // session token. Persisting them made the next app launch paint dead
+      // image URLs; keep the URLs in the in-memory cache only.
+      const persisted = rows.slice(0, 24).map(r => ({
+        ...r,
+        thumbnail_url: "",
+      }));
+      localStorage.setItem(_CACHE_KEY, JSON.stringify(persisted));
+    }
     catch (e) { /* quota / unavailable */ }
+  }
+  function _patchCachedPage1(filepath, patch) {
+    if (!filepath || !patch) return;
+    const rows = _loadCachedPage1();
+    if (!rows) return;
+    const row = rows.find(r => (r?.filepath || "") === filepath);
+    if (!row) return;
+    Object.assign(row, patch);
+    _saveCachedPage1(rows);
   }
   function _skeletonHtml(n) {
     let s = "";
@@ -394,6 +425,23 @@
     const frag = document.createDocumentFragment();
     for (const r of rows) { const c = _cardFor(r); if (c) frag.appendChild(c); }
     g.appendChild(frag);
+  }
+
+  function _mergeEarlyBackgroundPatches(rows) {
+    for (const row of rows || []) {
+      const fp = row?.filepath || "";
+      if (!fp) continue;
+      const thumb = _pendingThumbPatches.get(fp);
+      if (thumb) {
+        Object.assign(row, thumb);
+        _pendingThumbPatches.delete(fp);
+      }
+      const duration = _pendingDurationPatches.get(fp);
+      if (duration) {
+        Object.assign(row, duration);
+        _pendingDurationPatches.delete(fp);
+      }
+    }
   }
 
   async function loadPage(reset) {
@@ -416,6 +464,7 @@
       const res = await bridgeCall("list_manual_videos", _sort, PAGE, _offset);
       if (myId !== _seq) return;
       const rows = (res && res.rows) || [];
+      _mergeEarlyBackgroundPatches(rows);
       if (reset) {
         _firstPageSig = _pageSig(rows);
         _saveCachedPage1(rows);

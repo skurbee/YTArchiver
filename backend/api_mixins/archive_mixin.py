@@ -190,6 +190,15 @@ def parse_dltrack(line: str) -> Optional[dict]:
     }
 
 
+def dltrack_duration_seconds(fields: Optional[dict]) -> float | None:
+    """Return a trustworthy positive duration from a parsed DLTRACK row."""
+    try:
+        value = float((fields or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def resolve_final_path(base: str, video_id: str, title: str,
                        candidate_paths: list[str]) -> str:
     """Reconstruct the on-disk path of a freshly single-downloaded video.
@@ -756,6 +765,7 @@ class ArchiveMixin:
                         _uploader = _dt["uploader"]
                         _vid = _dt["video_id"]
                         _title = _dt["title"]
+                        _duration_secs = dltrack_duration_seconds(_dt)
                         # Resolve the final filepath on disk via the shared
                         # id-glob / title-match / recent-scan fallbacks
                         # (T326 extraction — see resolve_final_path). When
@@ -812,14 +822,17 @@ class ArchiveMixin:
                                 _state["registered"] = bool(_idx.register_video(
                                     final_path, _channel_name, _title,
                                     tx_status="no_captions",
-                                    video_id=_vid))
+                                    video_id=_vid,
+                                    duration_secs=_duration_secs))
                             except Exception as _re_err:
                                 self._log_stream.emit_dim(
                                     f" (index register failed: {_re_err})")
                             try:
                                 _state["recorded"] = bool(
                                     sync_backend._record_recent_download(
-                                        final_path, _channel_name, _title, _vid))
+                                        final_path, _channel_name, _title, _vid,
+                                        size_bytes=_state.get("final_size") or None,
+                                        duration_secs=_duration_secs))
                             except Exception as _re_err:
                                 self._log_stream.emit_dim(
                                     f" (recent downloads write failed: {_re_err})")

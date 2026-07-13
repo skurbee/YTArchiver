@@ -269,39 +269,54 @@ class BrowseMixin:
             stream = None
 
         def _run():
-            ready: list[dict[str, str]] = []
             try:
                 from backend import index as _idx
                 from backend.thumbnails import (
                     _ensure_thumbnails_dir,
                     _generate_local_thumbnail,
                 )
+
+                def _push_ready(item, tp, source=""):
+                    ready = {
+                        "filepath": item["filepath"],
+                        "thumbnail_url": _idx._file_url(tp),
+                        "thumbnail_source": source,
+                    }
+                    try:
+                        import json as _json
+                        payload = _json.dumps([ready])
+                        win.evaluate_js(
+                            "window._manualThumbsReady && "
+                            f"window._manualThumbsReady({payload});")
+                    except Exception as e:
+                        _log.debug("manual thumbnail push failed: %s", e)
+
+                # Pass 1 is lookup-only. Do not let one expensive local
+                # generation block later cards whose sidecars already exist.
+                missing = []
                 for item in todo:
                     fp = item["filepath"]
                     if not os.path.isfile(fp):
                         continue
                     video_id = item["video_id"]
                     tp = _idx.find_thumbnail(fp, video_id)
-                    if not tp:
-                        thumb_dir = _ensure_thumbnails_dir(os.path.dirname(fp))
-                        tp = _generate_local_thumbnail(
-                            fp, thumb_dir, item["title"], video_id,
-                            stream=stream)
                     if tp:
-                        ready.append({
-                            "filepath": fp,
-                            "thumbnail_url": _idx._file_url(tp),
-                            "thumbnail_source": "local",
-                        })
-                if ready:
-                    try:
-                        import json as _json
-                        payload = _json.dumps(ready)
-                        win.evaluate_js(
-                            "window._manualThumbsReady && "
-                            f"window._manualThumbsReady({payload});")
-                    except Exception as e:
-                        _log.debug("manual thumbnail push failed: %s", e)
+                        source = ("local" if ".local." in
+                                  os.path.basename(tp).lower() else "")
+                        _push_ready(item, tp, source)
+                    else:
+                        missing.append(item)
+
+                # Pass 2 handles true misses. Generation can be slow, but all
+                # ready sidecars above are already visible by this point.
+                for item in missing:
+                    fp = item["filepath"]
+                    thumb_dir = _ensure_thumbnails_dir(os.path.dirname(fp))
+                    tp = _generate_local_thumbnail(
+                        fp, thumb_dir, item["title"], item["video_id"],
+                        stream=stream)
+                    if tp:
+                        _push_ready(item, tp, "local")
             finally:
                 with _MANUAL_THUMB_BACKFILL_LOCK:
                     for item in todo:
@@ -310,28 +325,12 @@ class BrowseMixin:
         threading.Thread(target=_run, name="manual-local-thumbs",
                          daemon=True).start()
 
-    def _apply_manual_duration(self, row: dict[str, Any]) -> bool:
-        if row.get("duration"):
-            return True
-        fp = row.get("filepath") or ""
-        dur = _probe_manual_duration_seconds(fp)
-        label = _fmt_manual_duration(dur)
-        if not label:
-            return False
-        row["duration"] = label
-        try:
-            from backend import index as _idx
-            _idx.set_video_duration(fp, dur)
-        except Exception as e:
-            _log.debug("manual duration persist failed for %r: %s", fp, e)
-        return True
-
     def _queue_manual_duration_backfill(
             self, candidates: list[dict[str, Any]]) -> None:
         win = getattr(self, "_window", None)
         if win is None or not candidates:
             return
-        todo: list[dict[str, str]] = []
+        todo: list[dict[str, Any]] = []
         with _MANUAL_DURATION_BACKFILL_LOCK:
             for r in candidates:
                 fp = r.get("filepath") or ""
@@ -341,35 +340,85 @@ class BrowseMixin:
                 if key in _MANUAL_DURATION_BACKFILL_INFLIGHT:
                     continue
                 _MANUAL_DURATION_BACKFILL_INFLIGHT.add(key)
-                todo.append({"key": key, "filepath": fp})
+                todo.append({
+                    "key": key,
+                    "filepath": fp,
+                    "title": r.get("title") or "",
+                    "channel": r.get("channel") or "",
+                    "video_id": r.get("video_id") or "",
+                    "register_if_missing": bool(
+                        r.get("register_if_missing")),
+                })
         if not todo:
             return
 
         def _run():
-            ready: list[dict[str, str]] = []
             try:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
                 from backend import index as _idx
-                for item in todo:
+
+                # ffprobe mostly reads container headers. A small bounded pool
+                # repairs legacy/manual rows far faster than the old serial
+                # 10-second-per-file loop without flooding pooled storage.
+                def _probe(item):
                     fp = item["filepath"]
                     dur = _probe_manual_duration_seconds(fp)
-                    label = _fmt_manual_duration(dur)
-                    if not label:
-                        continue
-                    try:
-                        _idx.set_video_duration(fp, dur)
-                    except Exception as e:
-                        _log.debug(
-                            "manual duration persist failed for %r: %s", fp, e)
-                    ready.append({"filepath": fp, "duration": label})
-                if ready:
-                    try:
-                        import json as _json
-                        payload = _json.dumps(ready)
-                        win.evaluate_js(
-                            "window._manualDurationsReady && "
-                            f"window._manualDurationsReady({payload});")
-                    except Exception as e:
-                        _log.debug("manual duration push failed: %s", e)
+                    return item, dur
+
+                workers = min(4, len(todo))
+                with ThreadPoolExecutor(
+                        max_workers=workers,
+                        thread_name_prefix="manual-duration-probe") as pool:
+                    futures = [pool.submit(_probe, item) for item in todo]
+                    completed = as_completed(futures)
+                    for future in completed:
+                        try:
+                            item, dur = future.result()
+                        except Exception as e:
+                            _log.debug("manual duration worker failed: %s", e)
+                            continue
+                        fp = item["filepath"]
+                        label = _fmt_manual_duration(dur)
+                        if not label:
+                            continue
+                        persisted = False
+                        try:
+                            persisted = _idx.set_video_duration(fp, dur)
+                        except Exception as e:
+                            _log.debug(
+                                "manual duration persist failed for %r: %s",
+                                fp, e)
+                        # Root-folder discovery is the safety net for loose
+                        # manual videos absent from the catalog. Merely probing
+                        # those files left nowhere to retain duration_s, so
+                        # every launch forgot it and showed blanks again.
+                        if item.get("register_if_missing") and not persisted:
+                            try:
+                                _idx.register_video(
+                                    fp,
+                                    item.get("channel") or "Single Videos",
+                                    item.get("title") or os.path.splitext(
+                                        os.path.basename(fp))[0],
+                                    tx_status="pending",
+                                    video_id=item.get("video_id") or None,
+                                    duration_secs=dur,
+                                )
+                            except Exception as e:
+                                _log.debug(
+                                    "manual fallback registration failed for "
+                                    "%r: %s", fp, e)
+                        # Publish each result as soon as it is known instead of
+                        # waiting for the slowest ffprobe in the whole page.
+                        try:
+                            import json as _json
+                            payload = _json.dumps([
+                                {"filepath": fp, "duration": label}
+                            ])
+                            win.evaluate_js(
+                                "window._manualDurationsReady && "
+                                f"window._manualDurationsReady({payload});")
+                        except Exception as e:
+                            _log.debug("manual duration push failed: %s", e)
             finally:
                 with _MANUAL_DURATION_BACKFILL_LOCK:
                     for item in todo:
@@ -410,10 +459,16 @@ class BrowseMixin:
         )
         from backend.index import _file_url
         from backend.sync import channel_folder_name as _cfn
-        # Per-channel most-recent download timestamp, for the "recently
-        # downloaded" sort in the channel grid. One grouped query over the
-        # index, keyed by lowercased channel name. Served index-only by
-        # idx_vid_chan_added_live so it stays sub-millisecond on a large DB.
+        # Same first-use guarantee as the global Videos view: channel sort by
+        # Recently downloaded must not race the startup history migration.
+        try:
+            index_backend.backfill_downloaded_ts_from_recent(
+                cfg.get("recent_downloads", []))
+        except Exception as e:
+            _log.debug("download timestamp seed failed: %s", e)
+        # Per-channel most-recent *completed download* timestamp. `added_ts`
+        # is discovery/index time and can jump today when a rescan finds an
+        # old file, which made 15-year-old channels sort as freshly downloaded.
         last_added: dict[str, float] = {}
         try:
             from backend import index as _idx
@@ -421,8 +476,10 @@ class BrowseMixin:
             if _conn is not None:
                 with _idx._reader_lock:
                     for _cn, _mx in _conn.execute(
-                            "SELECT channel, MAX(added_ts) FROM videos "
-                            "WHERE is_duplicate_of IS NULL GROUP BY channel"):
+                            "SELECT channel, MAX(downloaded_ts) FROM videos "
+                            "WHERE is_duplicate_of IS NULL AND "
+                            "COALESCE(availability, 'available')='available' "
+                            "GROUP BY channel"):
                         if _cn:
                             last_added[_cn.strip().lower()] = float(_mx or 0)
         except Exception as e:
@@ -1782,6 +1839,7 @@ class BrowseMixin:
         rows: list[dict] = []
         seen: set[str] = set()
         duplicate_index_paths: set[str] = set()
+        folder_fallback_paths: set[str] = set()
 
         # 1. Index-registered single downloads (any location on disk).
         #    include_thumbs=False is CRITICAL: the per-row channel-wide
@@ -1826,6 +1884,7 @@ class BrowseMixin:
                     except OSError:
                         continue
                     seen.add(key)
+                    folder_fallback_paths.add(key)
                     rows.append({
                         "filepath": fp,
                         "title": os.path.splitext(os.path.basename(fp))[0],
@@ -1856,68 +1915,23 @@ class BrowseMixin:
         has_more = len(page) > lim
         page = page[:lim]
 
-        duration_attempts = 0
-        duration_cap = 8
-        background_duration_rows = []
+        # Return the page before touching media files. ffprobe has a 10-second
+        # per-file timeout and local-thumbnail generation can make several
+        # 25-second ffmpeg attempts. On slow pooled storage, doing that work in
+        # this bridge request held the skeleton screen open for several minutes.
+        # Indexed values render now; missing values patch into the cards later.
+        duration_candidates = []
         for r in page:
             if r.get("duration"):
                 continue
-            fp = r.get("filepath") or ""
-            if not fp:
-                continue
-            if duration_attempts < duration_cap:
-                duration_attempts += 1
-                if self._apply_manual_duration(r):
-                    continue
-            background_duration_rows.append(r)
-        self._queue_manual_duration_backfill(background_duration_rows)
+            candidate = dict(r)
+            key = os.path.normcase(os.path.normpath(r.get("filepath") or ""))
+            candidate["register_if_missing"] = key in folder_fallback_paths
+            duration_candidates.append(candidate)
+        self._queue_manual_duration_backfill(duration_candidates)
 
-        # Thumbnails: ONLY for this page, and ONLY via the cheap up-walk
-        # (find_thumbnail) — NEVER the channel-wide tree walk. A co-located
-        # sidecar (the common case) is a few stats; a miss just falls back to
-        # the gradient placeholder.
-        try:
-            from backend import index as _idx2
-            from backend.thumbnails import (
-                _ensure_thumbnails_dir,
-                _generate_local_thumbnail,
-            )
-            local_attempts = 0
-            generate_cap = 4
-            background_thumb_rows = []
-            for r in page:
-                if r.get("thumbnail_url"):
-                    continue
-                fp = r.get("filepath") or ""
-                if not fp:
-                    continue
-                try:
-                    tp = _idx2.find_thumbnail(fp, r.get("video_id") or "")
-                    if tp:
-                        r["thumbnail_url"] = _idx2._file_url(tp)
-                        if not r.get("video_id"):
-                            stem = os.path.splitext(os.path.basename(fp))[0]
-                            if os.path.basename(tp).lower() == (
-                                    stem + ".local.jpg").lower():
-                                r["thumbnail_source"] = "local"
-                        continue
-                    if local_attempts < generate_cap:
-                        local_attempts += 1
-                        thumb_dir = _ensure_thumbnails_dir(os.path.dirname(fp))
-                        tp = _generate_local_thumbnail(
-                            fp, thumb_dir, r.get("title") or "",
-                            r.get("video_id") or "",
-                            stream=self._browse_log_stream())
-                        if tp:
-                            r["thumbnail_url"] = _idx2._file_url(tp)
-                            r["thumbnail_source"] = "local"
-                            continue
-                    background_thumb_rows.append(r)
-                except Exception:
-                    pass
-            self._queue_manual_local_thumbnail_backfill(background_thumb_rows)
-        except Exception as e:
-            _log.debug("manual page thumbnail lookup failed: %s", e)
+        self._queue_manual_local_thumbnail_backfill(
+            [r for r in page if not r.get("thumbnail_url")])
 
         for r in page:
             if (r.get("tx_status") or "").lower() not in (

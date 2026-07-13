@@ -152,7 +152,8 @@ def update_disk_cache_for_channel(channel: dict[str, Any]) -> dict[str, Any]:
                         # with Browse (which filters is_duplicate_of IS NULL).
                         # Without this the Subs count flipped between runs
                         # depending on which path ran (audit r2).
-                        "AND is_duplicate_of IS NULL",
+                        "AND is_duplicate_of IS NULL AND "
+                        "COALESCE(availability, 'available')='available'",
                         (_nm,)).fetchone()
                 if _row and _row[0]:
                     n_vids, total_bytes = int(_row[0]), int(_row[1])

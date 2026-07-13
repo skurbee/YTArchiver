@@ -66,15 +66,17 @@
        "edit-date-year","edit-date-month","edit-date-day"].forEach(id => {
         const el = document.getElementById(id); if (el) el.value = "";
       });
-      ["edit-transcribe","edit-compress"].forEach(id => {
+      ["edit-compress"].forEach(id => {
         const el = document.getElementById(id); if (el) el.checked = false;
       });
       const _meta = document.getElementById("edit-metadata");
       if (_meta) _meta.checked = true;
+      const _tx = document.getElementById("edit-transcribe");
+      if (_tx) _tx.checked = true;
       const _res = document.getElementById("edit-resolution");
-      if (_res) _res.value = "720";
+      if (_res) _res.value = "1080";
       const _org = document.getElementById("edit-folder-org");
-      if (_org) _org.value = "years";
+      if (_org) _org.value = "flat";
       // Compress sub-fields back to defaults so the prior channel's
       // level / output-res / batch size don't linger.
       const _cq = document.getElementById("edit-compress-quality");
@@ -84,7 +86,7 @@
       if (_cr) _cr.value = "720";
       const _cb = document.getElementById("edit-compress-batch");
       if (_cb) _cb.value = "";
-      const subs = document.querySelector('input[name="edit-range"][value="subscribe"]');
+      const subs = document.querySelector('input[name="edit-range"][value="all"]');
       if (subs) { subs.checked = true; subs.dispatchEvent(new Event("change")); }
       document.getElementById("edit-compress")?.dispatchEvent(new Event("change"));
     };

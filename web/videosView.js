@@ -74,6 +74,12 @@
       upload_ts: _uploadTsMs(r.upload_ts), size_bytes: r.size_bytes || 0,
       views: r.views || "", view_count: r.view_count,
       thumbnail_url: r.thumbnail_url || "",
+      // This view is already server-paginated to 60 cards. WebView2's native
+      // loading="lazy" intermittently leaves *visible* images dormant inside
+      // the nested Browse scroller until the user scrolls away and back.
+      // Eager loading this bounded page fixes the blank-gray-card failure;
+      // large per-channel/grouped grids keep their lazy/batched behavior.
+      eager_thumbnail: true,
       tx_status: r.tx_status || "", removed_from_yt: !!r.removed_from_yt,
       // Cross-channel view — always show the channel line on each card.
       show_channel: true,

@@ -381,6 +381,15 @@ class ArchiveMixinTests(unittest.TestCase):
         self.assertIsNone(archive_mixin.parse_dltrack("DLTRACK:::only:::three"))
         self.assertIsNone(archive_mixin.parse_dltrack(""))
 
+    def test_dltrack_duration_seconds_requires_positive_number(self) -> None:
+        self.assertEqual(
+            archive_mixin.dltrack_duration_seconds({"duration": "600.5"}),
+            600.5)
+        self.assertIsNone(
+            archive_mixin.dltrack_duration_seconds({"duration": "NA"}))
+        self.assertIsNone(
+            archive_mixin.dltrack_duration_seconds({"duration": "0"}))
+
     def test_resolve_final_path_prefers_id_match_newest(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1959,6 +1968,8 @@ class ThumbnailMixinTests(unittest.TestCase):
         self.assertTrue(hasattr(_th, "invalidate_thumb_cache_entry"))
         self.assertIn("invalidate_thumb_cache_entry",
                       _ops.sweep_missing_thumbnails.__code__.co_names)
+        self.assertIn("invalidate_channel_videos",
+                      _ops.sweep_missing_thumbnails.__code__.co_names)
 
     def test_refetch_thumbnails_forwards_url_when_folder_blank(self) -> None:
         """Regression: a subscribed channel whose stored `folder` is
@@ -2560,7 +2571,7 @@ class BrowseMixinTests(unittest.TestCase):
         self.assertEqual(result["total"], 1)
         self.assertEqual([r["title"] for r in result["rows"]], ["Top Level"])
 
-    def test_manual_videos_probe_local_duration_for_folder_fallback(
+    def test_manual_videos_defer_local_duration_for_folder_fallback(
             self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2572,24 +2583,118 @@ class BrowseMixinTests(unittest.TestCase):
                     self._config = {"video_out_dir": str(root)}
                     self._log_stream = mock.Mock()
 
-            def fake_run(_cmd, **_kwargs):
-                return mock.Mock(stdout="125.4\n")
-
             with mock.patch("backend.index.list_manual_videos",
                             return_value=[]), \
                     mock.patch("backend.index.list_manual_duplicate_filepaths",
                                return_value=[]), \
-                    mock.patch("backend.process_runner.find_ffprobe",
-                               return_value="ffprobe"), \
                     mock.patch("backend.api_mixins.browse_mixin.subprocess.run",
-                               side_effect=fake_run), \
-                    mock.patch("backend.index.set_video_duration") as set_dur, \
-                    mock.patch("backend.thumbnails._generate_local_thumbnail",
-                               return_value=None):
+                               side_effect=AssertionError(
+                                   "initial list must not run ffprobe")), \
+                    mock.patch.object(
+                        Api, "_queue_manual_duration_backfill") as queue_dur, \
+                    mock.patch.object(
+                        Api, "_queue_manual_local_thumbnail_backfill"):
                 result = Api().list_manual_videos(sort="title")
 
-        self.assertEqual(result["rows"][0]["duration"], "2:05")
-        set_dur.assert_called_once_with(str(video), 125.4)
+        self.assertFalse(result["rows"][0].get("duration"))
+        queue_dur.assert_called_once()
+        self.assertEqual(queue_dur.call_args.args[0][0]["filepath"], str(video))
+        self.assertTrue(
+            queue_dur.call_args.args[0][0]["register_if_missing"])
+
+    def test_manual_duration_backfill_catalogs_folder_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "Loose Manual.mp4"
+            video.write_bytes(b"video")
+
+            class Api(BrowseMixin):
+                def __init__(self):
+                    self._window = mock.Mock()
+
+            registered = threading.Event()
+
+            def mark_registered(*_args, **_kwargs):
+                registered.set()
+                return True
+
+            with mock.patch.object(
+                    browse_mixin, "_probe_manual_duration_seconds",
+                    return_value=65.5), \
+                    mock.patch("backend.index.set_video_duration",
+                               return_value=False) as set_duration, \
+                    mock.patch("backend.index.register_video",
+                               side_effect=mark_registered) as register:
+                Api()._queue_manual_duration_backfill([{
+                    "filepath": str(video),
+                    "title": "Loose Manual",
+                    "channel": "",
+                    "video_id": "",
+                    "register_if_missing": True,
+                }])
+                self.assertTrue(registered.wait(5),
+                                "duration backfill did not finish")
+
+        set_duration.assert_called_once_with(str(video), 65.5)
+        register.assert_called_once_with(
+            str(video), "Single Videos", "Loose Manual",
+            tx_status="pending", video_id=None, duration_secs=65.5)
+
+    def test_manual_thumbnail_backfill_finds_ready_sidecars_before_generation(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            slow = root / "Needs Generation.mp4"
+            ready = root / "Already Ready.mp4"
+            generated = root / "Needs Generation.local.jpg"
+            sidecar = root / "Already Ready.jpg"
+            slow.write_bytes(b"video")
+            ready.write_bytes(b"video")
+            generated.write_bytes(b"jpg")
+            sidecar.write_bytes(b"jpg")
+
+            events = []
+
+            def find_thumb(filepath, _video_id):
+                events.append(("find", Path(filepath).name))
+                return str(sidecar) if filepath == str(ready) else None
+
+            def generate(filepath, *_args, **_kwargs):
+                events.append(("generate", Path(filepath).name))
+                return str(generated)
+
+            class ImmediateThread:
+                def __init__(self, target, **_kwargs):
+                    self.target = target
+                def start(self):
+                    self.target()
+
+            class Api(BrowseMixin):
+                def __init__(self):
+                    self._window = mock.Mock()
+                    self._log_stream = mock.Mock()
+
+            with mock.patch("backend.index.find_thumbnail",
+                            side_effect=find_thumb), \
+                    mock.patch("backend.index._file_url",
+                               side_effect=lambda p: f"file:///{p}"), \
+                    mock.patch("backend.thumbnails._ensure_thumbnails_dir",
+                               return_value=str(root)), \
+                    mock.patch("backend.thumbnails._generate_local_thumbnail",
+                               side_effect=generate), \
+                    mock.patch.object(browse_mixin.threading, "Thread",
+                                      side_effect=ImmediateThread):
+                Api()._queue_manual_local_thumbnail_backfill([
+                    {"filepath": str(slow), "title": slow.stem,
+                     "video_id": ""},
+                    {"filepath": str(ready), "title": ready.stem,
+                     "video_id": "abc123def45"},
+                ])
+
+        self.assertEqual(events, [
+            ("find", "Needs Generation.mp4"),
+            ("find", "Already Ready.mp4"),
+            ("generate", "Needs Generation.mp4"),
+        ])
 
     def test_manual_videos_badges_transcript_from_local_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2615,20 +2720,19 @@ class BrowseMixinTests(unittest.TestCase):
                             return_value=[]), \
                     mock.patch("backend.index.list_manual_duplicate_filepaths",
                                return_value=[]), \
-                    mock.patch("backend.index.find_thumbnail",
-                               return_value=str(thumb)), \
-                    mock.patch("backend.index._file_url",
-                               side_effect=lambda p: f"file:///{p}"), \
-                    mock.patch("backend.thumbnails._generate_local_thumbnail",
-                               return_value=None):
+                    mock.patch.object(
+                        Api, "_queue_manual_local_thumbnail_backfill") as queue_thumb, \
+                    mock.patch.object(
+                        Api, "_queue_manual_duration_backfill"):
                 result = Api().list_manual_videos(sort="title")
 
         row = result["rows"][0]
         labels = {b["label"] for b in row["manual_badges"]}
         self.assertEqual(row["tx_status"], "transcribed")
         self.assertIn("No ID", labels)
-        self.assertIn("Local thumb", labels)
         self.assertNotIn("Transcript", labels)
+        queue_thumb.assert_called_once()
+        self.assertEqual(queue_thumb.call_args.args[0][0]["filepath"], str(video))
 
     def test_manual_videos_badges_missing_transcript_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3121,7 +3225,9 @@ class RecentMixinTests(unittest.TestCase):
         with mock.patch("backend.api_mixins.recent_mixin.index_backend"
                         ".list_all_videos",
                         return_value={"rows": [], "has_more": False,
-                                      "offset": 0}) as list_all:
+                                      "offset": 0}) as list_all, \
+                mock.patch("backend.api_mixins.recent_mixin.index_backend"
+                           ".backfill_downloaded_ts_from_recent"):
             result = mixin.list_all_videos(limit="10000000",
                                            offset="-5")
 
@@ -3135,7 +3241,9 @@ class RecentMixinTests(unittest.TestCase):
 
         with mock.patch("backend.api_mixins.recent_mixin.index_backend"
                         ".list_all_videos",
-                        side_effect=RuntimeError("boom")):
+                        side_effect=RuntimeError("boom")), \
+                mock.patch("backend.api_mixins.recent_mixin.index_backend"
+                           ".backfill_downloaded_ts_from_recent"):
             result = mixin.list_all_videos(limit="bad", offset="bad")
 
         self.assertEqual(result["rows"], [])
@@ -3330,6 +3438,46 @@ class InfoMixinServicesTests(unittest.TestCase):
 
 
 class VideoMixinTests(unittest.TestCase):
+    def test_video_delete_removes_stale_catalog_row_when_file_is_gone(self) -> None:
+        mixin = VideoMixin()
+        missing = r"Z:\Archive\Gone.temp.mp4"
+
+        class Result:
+            def __init__(self, row=None):
+                self._row = row
+            def fetchone(self):
+                return self._row
+
+        class Conn:
+            def __init__(self):
+                self.sql = []
+                self.commits = 0
+            def execute(self, sql, _args=()):
+                self.sql.append(sql)
+                if sql.startswith("SELECT channel"):
+                    return Result(("Channel",))
+                return Result()
+            def commit(self):
+                self.commits += 1
+
+        conn = Conn()
+        with mock.patch("backend.api_mixins.video_mixin.os.path.isfile",
+                        return_value=False), \
+                mock.patch("backend.index._open", return_value=conn), \
+                mock.patch("backend.index.delete_segments_for_video") as delete_tx, \
+                mock.patch("backend.index.invalidate_channel_videos") as invalidate, \
+                mock.patch("backend.api_mixins.video_mixin.config_is_writable",
+                           return_value=False):
+            result = mixin.video_delete_file(missing)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["stale_entry_removed"])
+        self.assertTrue(any(sql.startswith("DELETE FROM videos")
+                            for sql in conn.sql))
+        self.assertEqual(conn.commits, 1)
+        delete_tx.assert_called_once_with(missing)
+        invalidate.assert_called_once_with("Channel")
+
     def test_video_delete_reports_partial_failure_when_index_cleanup_fails(self) -> None:
         mixin = VideoMixin()
         with tempfile.TemporaryDirectory() as td:
@@ -3622,7 +3770,9 @@ class RecentTrackTests(unittest.TestCase):
         with mock.patch("backend.ytarchiver_config.config_is_writable",
                         return_value=True), \
                 mock.patch("backend.ytarchiver_config.config_transaction",
-                           return_value=self._tx(cfg)):
+                           return_value=self._tx(cfg)), \
+                mock.patch("backend.index.record_video_download",
+                           return_value=True) as record_catalog:
             ok = recent_track._record_recent_download(
                 r"C:\new.mp4",
                 "Chan",
@@ -3635,6 +3785,9 @@ class RecentTrackTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(len(cfg["recent_downloads"]), 2)
         self.assertEqual(cfg["recent_downloads"][0]["video_id"],
+                         "BBBBBBBBBBB")
+        record_catalog.assert_called_once()
+        self.assertEqual(record_catalog.call_args.kwargs["video_id"],
                          "BBBBBBBBBBB")
 
     def test_record_recent_download_defers_ffprobe_duration(self) -> None:
@@ -6738,6 +6891,10 @@ class IndexIngestTests(unittest.TestCase):
             index._reader_conn = None
             index._schema_inited = False
             index._ingest_locks.clear()
+            index._browse_videos_cache.clear()
+            index._all_videos_cache.clear()
+            index._thumb_index_cache.clear()
+            index._download_backfill_signature = None
             index_search._title_search_cache.clear()
 
     def test_ingest_reingest_and_delete_keep_fts_in_sync(self) -> None:
@@ -7053,6 +7210,212 @@ class IndexIngestTests(unittest.TestCase):
                     (str(video_path),)).fetchone()[0], "transcribed")
                 self.assertEqual(conn.execute(
                     "SELECT COUNT(*) FROM segments").fetchone()[0], 1)
+                self._reset_index_module()
+
+    def test_register_video_rejects_partial_missing_and_zero_byte(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db_path = Path(td) / "transcription_index.db"
+            partial = Path(td) / "Interrupted.temp.mp4"
+            partial.write_bytes(b"partial")
+            empty = Path(td) / "Empty.mp4"
+            empty.write_bytes(b"")
+            missing = Path(td) / "Missing.mp4"
+
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                self._reset_index_module()
+                self.assertFalse(index.register_video(
+                    str(partial), "Channel", "Interrupted"))
+                self.assertFalse(index.register_video(
+                    str(empty), "Channel", "Empty"))
+                self.assertFalse(index.register_video(
+                    str(missing), "Channel", "Missing"))
+                conn = index._open()
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM videos").fetchone()[0], 0)
+                self._reset_index_module()
+
+    def test_recent_sort_uses_completed_download_not_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "transcription_index.db"
+            downloaded = Path(td) / "Actually Downloaded.mp4"
+            rescanned = Path(td) / "Old File Found Today.mp4"
+            downloaded.write_bytes(b"video")
+            rescanned.write_bytes(b"video")
+
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                self._reset_index_module()
+                self.assertTrue(index.register_video(
+                    str(downloaded), "New Channel", "Actually Downloaded",
+                    video_id="new12345678"))
+                self.assertTrue(index.register_video(
+                    str(rescanned), "Old Channel", "Old File Found Today",
+                    video_id="old12345678"))
+                conn = index._open()
+                conn.execute(
+                    "UPDATE videos SET added_ts=100 WHERE filepath=?",
+                    (str(downloaded),))
+                conn.execute(
+                    "UPDATE videos SET added_ts=1000 WHERE filepath=?",
+                    (str(rescanned),))
+                conn.commit()
+
+                self.assertTrue(index.record_video_download(
+                    str(downloaded), video_id="new12345678",
+                    downloaded_ts=500, duration_secs=125))
+                rows = index.list_all_videos(
+                    sort="recent", limit=10, include_thumbs=False)["rows"]
+
+                self.assertEqual([r["title"] for r in rows],
+                                 ["Actually Downloaded", "Old File Found Today"])
+                self.assertEqual(rows[0]["duration"], "2:05")
+                self._reset_index_module()
+
+    def test_recent_config_backfills_catalog_download_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "transcription_index.db"
+            video = Path(td) / "Legacy Recent.mp4"
+            video.write_bytes(b"video")
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                self._reset_index_module()
+                self.assertTrue(index.register_video(
+                    str(video), "Channel", "Legacy Recent",
+                    video_id="leg12345678"))
+                result = index.backfill_downloaded_ts_from_recent([{
+                    "filepath": str(video),
+                    "video_id": "leg12345678",
+                    "download_ts": 321.5,
+                }])
+                self.assertEqual(result, {"updated": 1, "unmatched": 0})
+                conn = index._open()
+                self.assertEqual(conn.execute(
+                    "SELECT downloaded_ts FROM videos WHERE filepath=?",
+                    (str(video),)).fetchone()[0], 321.5)
+                # Idempotent: an older replay cannot move recency backwards.
+                result = index.backfill_downloaded_ts_from_recent([{
+                    "filepath": str(video), "download_ts": 100,
+                }])
+                self.assertEqual(result["updated"], 0)
+                self._reset_index_module()
+
+    def test_partial_catalog_rows_are_hidden_from_browse(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "transcription_index.db"
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                self._reset_index_module()
+                conn = index._open()
+                conn.execute(
+                    "INSERT INTO videos(filepath,title,channel,availability) "
+                    "VALUES (?,?,?,'partial')",
+                    (str(Path(td) / "Ghost.temp.mp4"), "Ghost.temp", "Channel"))
+                conn.commit()
+                rows = index.list_all_videos(
+                    sort="newest", limit=10, include_thumbs=False)["rows"]
+                self.assertEqual(rows, [])
+                self._reset_index_module()
+
+    def test_schema_reopen_quarantines_legacy_temp_row(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db_path = Path(td) / "transcription_index.db"
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                self._reset_index_module()
+                conn = index._open()
+                conn.execute(
+                    "INSERT INTO videos(filepath,title,channel,availability) "
+                    "VALUES (?,?,?,'available')",
+                    (str(Path(td) / "Legacy.temp.mp4"),
+                     "Legacy.temp", "Channel"))
+                conn.commit()
+                self._reset_index_module()
+
+                conn = index._open()
+                availability = conn.execute(
+                    "SELECT availability FROM videos").fetchone()[0]
+                self.assertEqual(availability, "partial")
+                self.assertEqual(index.list_all_videos(
+                    include_thumbs=False)["rows"], [])
+                self._reset_index_module()
+
+    def test_sweep_reconciles_seen_and_missing_catalog_state(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "transcription_index.db"
+            output = Path(td) / "archive"
+            channel_dir = output / "Channel"
+            channel_dir.mkdir(parents=True)
+            present = channel_dir / "Present.mp4"
+            missing = channel_dir / "Missing.mp4"
+            present.write_bytes(b"present")
+            missing.write_bytes(b"missing")
+
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path), \
+                    mock.patch("backend.archive_scan.load_disk_cache",
+                               return_value={}), \
+                    mock.patch("backend.archive_scan.save_disk_cache",
+                               return_value=True):
+                self._reset_index_module()
+                self.assertTrue(index.register_video(
+                    str(present), "Channel", "Present",
+                    video_id="pre12345678"))
+                self.assertTrue(index.register_video(
+                    str(missing), "Channel", "Missing",
+                    video_id="mis12345678"))
+                conn = index._open()
+                conn.execute(
+                    "UPDATE videos SET availability='missing' WHERE filepath=?",
+                    (str(present),))
+                conn.commit()
+                missing.unlink()
+
+                result = index.sweep_new_videos(
+                    str(output), [{"name": "Channel", "url": "channel-url"}])
+                states = dict(conn.execute(
+                    "SELECT title, availability FROM videos").fetchall())
+
+                self.assertEqual(states["Present"], "available")
+                self.assertEqual(states["Missing"], "missing")
+                self.assertEqual(result["availability_restored"], 1)
+                self.assertEqual(result["availability_missing"], 1)
+                self.assertEqual([r["title"] for r in index.list_all_videos(
+                    include_thumbs=False)["rows"]], ["Present"])
+                self._reset_index_module()
+
+    def test_incomplete_sweep_does_not_mark_rows_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "transcription_index.db"
+            output = Path(td) / "archive"
+            channel_dir = output / "Channel"
+            blocked = channel_dir / "blocked"
+            blocked.mkdir(parents=True)
+            vanished = channel_dir / "Vanished.mp4"
+            vanished.write_bytes(b"video")
+
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path), \
+                    mock.patch("backend.archive_scan.load_disk_cache",
+                               return_value={}), \
+                    mock.patch("backend.archive_scan.save_disk_cache",
+                               return_value=True):
+                self._reset_index_module()
+                self.assertTrue(index.register_video(
+                    str(vanished), "Channel", "Vanished",
+                    video_id="van12345678"))
+                vanished.unlink()
+
+                real_scandir = os.scandir
+                def guarded_scandir(path):
+                    if os.path.normcase(os.fspath(path)) == os.path.normcase(str(blocked)):
+                        raise PermissionError("simulated DrivePool read failure")
+                    return real_scandir(path)
+
+                with mock.patch("backend.index_maintenance.os.scandir",
+                                side_effect=guarded_scandir):
+                    result = index.sweep_new_videos(
+                        str(output), [{"name": "Channel", "url": "channel-url"}])
+
+                conn = index._open()
+                availability = conn.execute(
+                    "SELECT availability FROM videos WHERE title='Vanished'"
+                ).fetchone()[0]
+                self.assertEqual(availability, "available")
+                self.assertEqual(result["availability_missing"], 0)
                 self._reset_index_module()
 
     def test_list_videos_for_channel_uses_index_without_per_row_file_stats(

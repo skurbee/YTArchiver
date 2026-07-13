@@ -6,6 +6,22 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v81.8 - 2026-07-13
+
+### Fixed
+- **Manual Downloads opens immediately without dropping thumbnails.** The initial Manual request no longer waits for ffprobe duration checks or local-thumbnail generation. Indexed cards render first, early background thumbnail/duration results are merged into the fresh page instead of being overwritten, and session-specific thumbnail URLs are no longer reused after restart.
+- **Manual video lengths are durable.** Loose folder-discovered videos are promoted into the catalog when their local duration is resolved, legacy probes run in a bounded four-worker backfill, and new one-off downloads persist yt-dlp's known duration during registration instead of discarding it.
+- **Tray Quit no longer leaves a hazed, unresponsive window.** Quit now hides the window before durable queue, subprocess, server, and index cleanup runs in the background; shutdown cleanup is also guarded against running twice.
+- **Browse recency reflects completed downloads.** Recently Downloaded ordering now uses a dedicated completed-download timestamp instead of index discovery time, so rescanning old files cannot make them look newly downloaded.
+- **Partial and stale catalog entries stay out of Browse.** Temporary, zero-byte, missing, and interrupted artifacts are rejected or quarantined, while delete and archive reconciliation paths clean up stale catalog state.
+- **Thumbnail and duration repairs refresh Browse correctly.** Metadata thumbnail operations invalidate the affected Browse cache, and local duration values remain available from the catalog while missing values backfill safely.
+
+### Validation
+- Manual first-page backend call returned 60 of 149 real archive rows in 0.669 seconds.
+- Backend smoke suite passed: 364 tests.
+- Frontend JavaScript syntax and generated HTML freshness checks passed.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
 ## v79.3 - 2026-06-29
 
 ### Fixed

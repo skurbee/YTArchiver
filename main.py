@@ -1525,6 +1525,12 @@ def main():
         Mirrors YTArchiver.py:34224 on_closing. Runs when the user closes
         the window (X / Ctrl+Q / tray Quit). Order matters — save before kill.
         """
+        # confirm_close performs cleanup before destroy(), and destroy then
+        # re-enters _on_closing. Without this guard the complete multi-second
+        # teardown ran twice in sequence. Mark it at entry so every real-close
+        # route shares one durable cleanup pass.
+        if _boot_state["shutdown_ran"]:
+            return
         # Neutralize the T087 boot safety net — the full teardown is running
         # now, so the atexit fallback must not also fire (it would be a no-op
         # under os._exit anyway, but make the intent explicit and defensive).
@@ -1743,61 +1749,26 @@ def main():
             _log.debug("swallowed: %s", e)
     def _tray_quit():
         """Request a real app shutdown from the tray menu."""
-        # Set the truly-quit flag first so the closing handler skips
-        # the modal and proceeds with shutdown.
-        _truly_quit["flag"] = True
-        # window.destroy() must run on the GUI thread on Windows. The
-        # pystray callback fires this on its own thread; calling
-        # window.destroy() directly from there is undefined behavior
-        # and was observed to occasionally fail to close the app
-        # (user had to click X again). Marshal via webview.windows[0]
-        # which schedules the call on the GUI thread. Falls back to
-        # direct destroy on platforms where webview.windows is empty.
-        def _do_destroy():
-            try:
-                import webview as _wv
-                wins = list(_wv.windows or [])
-                if wins:
-                    wins[0].destroy()
-                else:
-                    window.destroy()
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
+        # Use the same path as the in-app Quit button. It returns to pystray
+        # immediately, hides the window first, then performs queue/index/
+        # subprocess cleanup in a background thread. The previous path began
+        # by destroying WebView2, leaving a visible, hazed "Not responding"
+        # window while its closing event did synchronous cleanup.
         try:
-            threading.Thread(target=_do_destroy, daemon=True,
-                             name="tray-quit-marshal").start()
+            result = api.confirm_close("quit", False)
+            if not result or not result.get("ok"):
+                raise RuntimeError((result or {}).get("error") or
+                                   "quit request was rejected")
         except Exception as e:
-            _log.debug("swallowed: %s", e)
-        # Safety net: a Quit must never freeze the app. WebView2's
-        # destroy() blocks until any in-flight `js_api` bridge call
-        # returns, so a slow Browse load could stall the graceful
-        # close (which is what ends in os._exit). If the graceful path
-        # hasn't terminated the process within the timeout, do a
-        # best-effort flush + subprocess reap and hard-exit. This only
-        # ever runs after the user explicitly chose Quit, and is a no-op
-        # when the clean path exits first (process is already gone).
-        def _force_exit_watchdog():
-            try: time.sleep(10.0)
-            except Exception: pass
-            try: api._sync_cancel.set()
-            except Exception: pass
-            try: api._queues.save_now()
-            except Exception: pass
-            try:
-                from backend.process_runner import PROCESS_REGISTRY as _PR
-                _PR.kill_all(timeout=1.0)
-            except Exception: pass
-            try:
-                _log.warning("tray quit: graceful close exceeded 10s "
-                             "(likely a slow in-flight bridge call) — "
-                             "forcing hard exit")
-            except Exception: pass
-            os._exit(0)
-        try:
-            threading.Thread(target=_force_exit_watchdog, daemon=True,
-                             name="tray-quit-watchdog").start()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+            _log.warning("tray quit dispatch failed: %s", e)
+            # Last-resort exit is delayed briefly so this callback returns and
+            # any already-scheduled queue save gets a chance to finish.
+            def _fallback_exit():
+                try: time.sleep(0.25)
+                except Exception: pass
+                os._exit(0)
+            threading.Thread(target=_fallback_exit, daemon=True,
+                             name="tray-quit-fallback").start()
     _boot_trace("tray callbacks defined")
 
     # Tray is optional (pystray import or icon load can fail); wrap
@@ -1884,6 +1855,20 @@ def main():
             from backend.index import backfill_upload_ts as _backfill
             _backfill()
         except Exception as e: _log.debug("swallowed: %s", e)
+        # Seed the catalog's real completed-download timestamp from the legacy
+        # recent_downloads history. `added_ts` is only first discovery time;
+        # keeping the concepts separate prevents rescans of old archives from
+        # corrupting Browse > Recently Downloaded ordering.
+        try:
+            from backend.index import (
+                backfill_downloaded_ts_from_recent as _backfill_downloads)
+            from backend.ytarchiver_config import load_config as _load_dl_cfg
+            _dl_result = _backfill_downloads(
+                _load_dl_cfg().get("recent_downloads", []))
+            if _dl_result.get("updated"):
+                _log.info("download timestamp backfill: %s", _dl_result)
+        except Exception as e:
+            _log.debug("download timestamp backfill failed: %s", e)
         # View/like backfill for the global Videos view — materializes
         # view_count/like_count from the per-channel Metadata.jsonl sidecars
         # into the index DB so the whole archive can be sorted by views/

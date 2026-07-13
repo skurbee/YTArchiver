@@ -105,17 +105,34 @@ def bucket_totals(bucket: str = "month",
                 continue
             totals[key] = totals.get(key, 0) + int(cnt or 0)
         return totals
-    # month can be NULL (path had no month subfolder); printf('%02d', NULL)
-    # yields '00' -> an invalid 'YYYY-00' tick label. Fall back to year-only.
-    group_col = ("CASE WHEN month IS NULL THEN year "
-                 "ELSE year || '-' || printf('%02d', month) END"
-                 if bucket == "month" else "year")
-    sql = (f"SELECT {group_col} AS bucket, COUNT(*) "
-           " FROM segments")
+    # Mirror graph_word_frequency's month bucketing EXACTLY so the Normalize
+    # denominator keys line up: prefer the month from videos.upload_ts (the
+    # mtime = true upload date), LEFT JOIN so path-only legacy segments fall
+    # back to CAST(year AS TEXT) year/month. TEXT keys keep ORDER stable and
+    # NULL-safe (date-less segments drop out, never "0000"). See the long
+    # note in graph_word_frequency() for why the path month is unreliable.
     args: list[Any] = []
-    if channel:
-        sql += " WHERE channel=?"
-        args.append(channel)
+    if bucket == "month":
+        # Mirror graph_word_frequency: bucket by true upload_ts month, path
+        # fallback only for orphans, no folder-year sanity check.
+        bucket_expr = (
+            "COALESCE("
+            "strftime('%Y-%m', v.upload_ts, 'unixepoch', 'localtime'), "
+            "CASE WHEN s.year IS NOT NULL AND s.month IS NOT NULL "
+            "THEN CAST(s.year AS TEXT) || '-' || printf('%02d', s.month) "
+            "ELSE NULL END)")
+        sql = (f"SELECT {bucket_expr} AS bucket, COUNT(*) "
+               " FROM segments s "
+               " LEFT JOIN videos v "
+               "   ON s.video_id <> '' AND v.video_id = s.video_id")
+        if channel:
+            sql += " WHERE s.channel=?"
+            args.append(channel)
+    else:
+        sql = ("SELECT s.year AS bucket, COUNT(*) FROM segments s")
+        if channel:
+            sql += " WHERE s.channel=?"
+            args.append(channel)
     sql += " GROUP BY bucket"
     try:
         with _index()._reader_lock:
@@ -359,17 +376,55 @@ def graph_word_frequency(word: str, channel: str | None = None,
         # split across two labels.
         sql += " GROUP BY v.upload_ts"
     else:
-        # FTS5 MATCH to find segments containing the word
-        # Keep this label expression IDENTICAL to bucket_totals() above so the
-        # Normalize denominator keys match (NULL month -> year-only, never -00).
-        group_col = ("CASE WHEN month IS NULL THEN year "
-                     "ELSE year || '-' || printf('%02d', month) END"
-                     if bucket == "month" else "year")
-        sql = (f"SELECT {group_col} AS bucket, COUNT(*) "
-               f" FROM segments_fts fts "
-               f" JOIN segments s ON s.id = fts.rowid "
-               f" WHERE fts.text MATCH ?")
+        # FTS5 MATCH to find segments containing the word.
         args = [word]
+        if bucket == "month":
+            # Derive the month from videos.upload_ts (the file mtime, which
+            # yt-dlp set to the exact YouTube upload date via --mtime) rather
+            # than segments.year/month (which come from the FOLDER PATH via
+            # _parse_year_month_from_path). Channels stored in year-only
+            # folders ("Years" org, no month subfolder) have month=NULL in the
+            # path, so the old path-only bucketing lumped a whole year into one
+            # spike and forced a NULL-month "year" bucket. Prefer the real
+            # upload month; LEFT JOIN keeps segments whose video_id has no
+            # matching videos row (legacy / drop-in archives), which fall back
+            # to the path-parsed year/month. CAST(year AS TEXT) keeps every key
+            # TEXT so ORDER BY bucket sorts chronologically (a bare INTEGER year
+            # sorts before all "YYYY-MM" text keys) and stays NULL-safe so a
+            # truly date-less segment drops out instead of becoming "0000".
+            # Bucket by the TRUE upload month from videos.upload_ts (yt-dlp
+            # --mtime; the pipeline preserves it and the YouTube re-fetch
+            # repaired any corrupted dates, so it is authoritative). Fall back
+            # to the path-parsed year/month ONLY for orphan segments with no
+            # linked video. Deliberately NO folder-year sanity check: an
+            # aggregated transcript file can live under a folder whose year
+            # differs from the videos it covers (e.g. a re-transcription pass
+            # dropped many old videos' transcripts into one recent-year file),
+            # so the segment's path year is LESS reliable than the linked
+            # video's real upload date.
+            # In MONTH mode every bucket MUST be 'YYYY-MM'. Prefer the true
+            # upload month; else the path-parsed year+month. If NEITHER yields
+            # a month (orphan segment whose source video was removed, and no
+            # month subfolder in the path), emit NULL so the segment is
+            # DROPPED — never a bare-year bucket, which would put a monthless
+            # 'YYYY' tick on a month axis.
+            bucket_expr = (
+                "COALESCE("
+                "strftime('%Y-%m', v.upload_ts, 'unixepoch', 'localtime'), "
+                "CASE WHEN s.year IS NOT NULL AND s.month IS NOT NULL "
+                "THEN CAST(s.year AS TEXT) || '-' || printf('%02d', s.month) "
+                "ELSE NULL END)")
+            sql = (f"SELECT {bucket_expr} AS bucket, COUNT(*) "
+                   f" FROM segments_fts fts "
+                   f" JOIN segments s ON s.id = fts.rowid "
+                   f" LEFT JOIN videos v "
+                   f"   ON s.video_id <> '' AND v.video_id = s.video_id "
+                   f" WHERE fts.text MATCH ?")
+        else:
+            sql = ("SELECT s.year AS bucket, COUNT(*) "
+                   " FROM segments_fts fts "
+                   " JOIN segments s ON s.id = fts.rowid "
+                   " WHERE fts.text MATCH ?")
         if channel:
             sql += " AND s.channel=?"
             args.append(channel)

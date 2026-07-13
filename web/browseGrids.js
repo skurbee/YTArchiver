@@ -326,10 +326,13 @@
       if (thumbWrap) {
         const img = document.createElement("img");
         img.className = "video-thumb-img";
-        img.src = v.thumbnail_url;
         img.alt = "";
-        img.loading = "lazy";
+        // Set fetch policy BEFORE src. Chromium starts request scheduling as
+        // soon as src is assigned; changing loading afterward can leave a
+        // visible image stuck in the lazy queue until the user scrolls.
+        img.loading = v.eager_thumbnail ? "eager" : "lazy";
         img.decoding = "async";
+        img.src = v.thumbnail_url;
         thumbWrap.insertBefore(img, thumbWrap.firstChild);
       }
     }

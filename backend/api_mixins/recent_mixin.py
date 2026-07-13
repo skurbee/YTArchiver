@@ -67,6 +67,12 @@ class RecentMixin:
         except (TypeError, ValueError):
             _offset = 0
         try:
+            # Guarantee the very first Browse request sees the legacy download
+            # history even if the background startup backfill has not run yet.
+            # Idempotent; subsequent calls update zero rows.
+            if str(sort or "recent").lower() == "recent":
+                index_backend.backfill_downloaded_ts_from_recent(
+                    self._recent_config().get("recent_downloads", []))
             # Mark this as a foreground Browse query so the startup sweep
             # yields the Z: pool to it — a cold Videos open
             # does up to 60 channel-wide thumbnail walks and must not run

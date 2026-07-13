@@ -6,6 +6,19 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v82.0 - 2026-07-13
+
+### Fixed
+- **Archive sweeps no longer deadlock each other.** Startup, automatic, and manual sweep requests now share a single-flight gate, so two full-archive writers cannot race and exhaust SQLite's busy timeout.
+- **Stable channels no longer generate thousands of no-op writes.** Availability reconciliation updates only catalog rows whose missing/available state actually changed instead of rewriting every video seen during a channel walk.
+- **Download-history migration no longer monopolizes the index.** The one-time legacy recency migration runs off the Browse request path, commits in small batches, and records durable completion in SQLite.
+
+### Validation
+- Backend smoke suite passed: 371 tests.
+- Frontend JavaScript syntax and generated HTML freshness checks passed.
+- On the 36 GB production index, the first patched migration's longest writer hold was 0.9 seconds versus 91.7 seconds before the fix; a clean restart produced no writer-lock stalls during a 60-second probe.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
 ## v81.9 - 2026-07-13
 
 ### Fixed

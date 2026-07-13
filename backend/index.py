@@ -311,6 +311,10 @@ def _open() -> sqlite3.Connection | None:
                 mtime REAL,
                 segment_count INTEGER
             )""")
+            _conn.execute("""CREATE TABLE IF NOT EXISTS app_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )""")
             _conn.execute("""CREATE TABLE IF NOT EXISTS bookmarks (
                 id INTEGER PRIMARY KEY,
                 segment_id INTEGER,
@@ -1179,41 +1183,69 @@ def backfill_downloaded_ts_from_recent(entries: list[dict[str, Any]] | None
         if _download_backfill_signature == _signature:
             return {"updated": 0, "unmatched": 0}
 
-    conn = _open()
+    # Ensure schema initialization has completed, then use a private
+    # connection so this one-time legacy migration never monopolizes the
+    # shared connection used by Browse and sync.
+    if _open() is None:
+        return {"updated": 0, "unmatched": 0}
+    conn = _open_independent()
     if conn is None:
         return {"updated": 0, "unmatched": 0}
     updated = unmatched = 0
     try:
-        with _db_lock:
-            for entry in source:
-                try:
-                    ts = float(entry.get("download_ts") or 0)
-                except (TypeError, ValueError):
-                    continue
-                if ts <= 0:
-                    continue
-                fp = os.path.normpath(str(entry.get("filepath") or ""))
-                vid = str(entry.get("video_id") or "").strip()
-                row = None
-                if fp:
-                    row = conn.execute(
-                        "SELECT id FROM videos WHERE filepath=? COLLATE NOCASE "
-                        "LIMIT 1", (fp,)).fetchone()
-                if row is None and vid:
-                    matches = conn.execute(
-                        "SELECT id FROM videos WHERE video_id=? "
-                        "AND is_duplicate_of IS NULL LIMIT 2", (vid,)).fetchall()
-                    if len(matches) == 1:
-                        row = matches[0]
-                if row is None:
-                    unmatched += 1
-                    continue
+        # This is a one-time migration.  A durable completion marker is safer
+        # than inferring completion from MAX(downloaded_ts): live downloads may
+        # populate the newest row even when an interrupted legacy replay left
+        # older rows untouched.
+        _marker = conn.execute(
+            "SELECT value FROM app_state "
+            "WHERE key='recent_download_backfill_v1'").fetchone()
+        if _marker and _marker[0] == "done":
+            with _download_backfill_lock:
+                _download_backfill_signature = _signature
+            return {"updated": 0, "unmatched": 0}
+
+        processed = 0
+        for entry in source:
+            try:
+                ts = float(entry.get("download_ts") or 0)
+            except (TypeError, ValueError):
+                continue
+            if ts <= 0:
+                continue
+            fp = os.path.normpath(str(entry.get("filepath") or ""))
+            vid = str(entry.get("video_id") or "").strip()
+            row = None
+            if fp:
+                row = conn.execute(
+                    "SELECT id FROM videos WHERE filepath=? COLLATE NOCASE "
+                    "LIMIT 1", (fp,)).fetchone()
+            if row is None and vid:
+                matches = conn.execute(
+                    "SELECT id FROM videos WHERE video_id=? "
+                    "AND is_duplicate_of IS NULL LIMIT 2", (vid,)).fetchall()
+                if len(matches) == 1:
+                    row = matches[0]
+            if row is None:
+                unmatched += 1
+            else:
                 cur = conn.execute(
                     "UPDATE videos SET downloaded_ts=? WHERE id=? AND "
                     "(downloaded_ts IS NULL OR downloaded_ts < ?)",
                     (ts, row[0], ts))
                 updated += cur.rowcount or 0
+            processed += 1
+            # Bound the SQLite writer-lock window even on the first-ever
+            # migration.  The previous single 500-entry transaction held it
+            # for ~92 seconds on the production database.
+            if processed % 8 == 0:
+                conn.commit()
+        if processed % 8:
             conn.commit()
+        conn.execute(
+            "INSERT OR REPLACE INTO app_state(key, value) "
+            "VALUES('recent_download_backfill_v1', 'done')")
+        conn.commit()
         if updated:
             invalidate_channel_videos(None)
         with _download_backfill_lock:
@@ -1223,6 +1255,11 @@ def backfill_downloaded_ts_from_recent(entries: list[dict[str, Any]] | None
         _rollback_quietly(conn, "backfill_downloaded_ts")
         _log.warning("download timestamp backfill failed: %s", exc)
         return {"updated": updated, "unmatched": unmatched}
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
 
 
 def mark_video_transcribed(filepath: str,

@@ -459,13 +459,6 @@ class BrowseMixin:
         )
         from backend.index import _file_url
         from backend.sync import channel_folder_name as _cfn
-        # Same first-use guarantee as the global Videos view: channel sort by
-        # Recently downloaded must not race the startup history migration.
-        try:
-            index_backend.backfill_downloaded_ts_from_recent(
-                cfg.get("recent_downloads", []))
-        except Exception as e:
-            _log.debug("download timestamp seed failed: %s", e)
         # Per-channel most-recent *completed download* timestamp. `added_ts`
         # is discovery/index time and can jump today when a rescan finds an
         # old file, which made 15-year-old channels sort as freshly downloaded.

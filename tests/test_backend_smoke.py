@@ -8090,6 +8090,48 @@ class IndexMaintenanceTests(unittest.TestCase):
         sleep.assert_called()
         self.assertGreaterEqual(busy_calls["count"], 5)
 
+    def test_sweep_new_videos_coalesces_concurrent_callers(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        results = []
+
+        def fake_impl(*_args, **_kwargs):
+            calls.append(1)
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return {"registered": 3, "ingested": 1}
+
+        def run_sweep():
+            results.append(index_maintenance.sweep_new_videos(
+                "archive", [{"name": "Channel"}]))
+
+        with mock.patch.object(index_maintenance,
+                               "_sweep_new_videos_impl",
+                               side_effect=fake_impl):
+            first = threading.Thread(target=run_sweep)
+            second = threading.Thread(target=run_sweep)
+            first.start()
+            self.assertTrue(entered.wait(1))
+            second.start()
+            # Wait until the follower is actually parked on the condition;
+            # releasing earlier would make this a sequential-call test.
+            for _ in range(100):
+                with index_maintenance._sweep_singleflight:
+                    if index_maintenance._sweep_singleflight._waiters:
+                        break
+                threading.Event().wait(0.01)
+            else:
+                self.fail("concurrent sweep caller did not coalesce")
+            release.set()
+            first.join(2)
+            second.join(2)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sum(bool(r.get("coalesced")) for r in results), 1)
+        self.assertIn({"registered": 3, "ingested": 1}, results)
+
     def test_sweep_ingests_aggregated_transcript_jsonl(self) -> None:
         # The Search/Graph "unindexed" banner counts hidden aggregated
         # `.{name} ... Transcript.jsonl` files missing from indexed_files.

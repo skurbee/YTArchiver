@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 from typing import Any
 
 from . import index as _idx
@@ -33,6 +34,52 @@ from .fs_search import is_partial_artifact
 from .log import get_logger
 
 _log = get_logger(__name__)
+
+
+# Every sweep covers the same archive and performs the same reconciliation.
+# Startup, the post-download auto-index threshold, and the manual Rescan button
+# can all request one at nearly the same time.  Let exactly one caller do the
+# work; followers wait for it instead of opening a second SQLite writer and
+# fighting the first sweep for several minutes.
+_sweep_singleflight = threading.Condition()
+_sweep_running = False
+
+
+def _coalesced_sweep_result() -> dict[str, int | bool]:
+    return {
+        "registered": 0,
+        "ingested": 0,
+        "agg_ingested": 0,
+        "id_backfilled": 0,
+        "availability_missing": 0,
+        "availability_restored": 0,
+        "tx_reconciled": 0,
+        "tx_reconciled_by_id": 0,
+        "tx_reconciled_by_title": 0,
+        "skipped_unchanged": 0,
+        "walked": 0,
+        "coalesced": True,
+    }
+
+
+def sweep_new_videos(output_dir: str, channels: list,
+                     progress_cb=None, gpu_busy_fn=None) -> dict:
+    """Run one archive sweep process-wide and coalesce concurrent callers."""
+    global _sweep_running
+    with _sweep_singleflight:
+        if _sweep_running:
+            while _sweep_running:
+                _sweep_singleflight.wait()
+            return _coalesced_sweep_result()
+        _sweep_running = True
+    try:
+        return _sweep_new_videos_impl(
+            output_dir, channels, progress_cb=progress_cb,
+            gpu_busy_fn=gpu_busy_fn)
+    finally:
+        with _sweep_singleflight:
+            _sweep_running = False
+            _sweep_singleflight.notify_all()
 
 
 def _jsonl_needs_ingest(conn: sqlite3.Connection, jsonl_path: str) -> bool:
@@ -185,9 +232,9 @@ def _reconcile_tx_status_from_transcript_titles(
     return total_changed
 
 
-def sweep_new_videos(output_dir: str, channels: list,
-                     progress_cb=None,
-                     gpu_busy_fn=None) -> dict:
+def _sweep_new_videos_impl(output_dir: str, channels: list,
+                           progress_cb=None,
+                           gpu_busy_fn=None) -> dict:
     """Walk each channel folder under `output_dir`, register any video
     file not already in the videos table, and ingest any paired .jsonl
     that isn't in segments yet.
@@ -356,8 +403,9 @@ def sweep_new_videos(output_dir: str, channels: list,
         existing = set()
         noid = set()
         existing_paths: dict[str, str] = {}
+        known_missing = set()
         for _er in sweep_conn.execute(
-                "SELECT filepath, video_id FROM videos "
+                "SELECT filepath, video_id, availability FROM videos "
                 "WHERE channel=? COLLATE NOCASE", (ch_name,)).fetchall():
             if not _er[0]:
                 continue
@@ -366,6 +414,8 @@ def sweep_new_videos(output_dir: str, channels: list,
             existing_paths[_efpl] = _er[0]
             if not (_er[1] or "").strip():
                 noid.add(_efpl)
+            if (_er[2] or "available") == "missing":
+                known_missing.add(_efpl)
         # Reconciliation only applies to rows that existed before this walk.
         # Newly registered files are already available by definition and do
         # not need a second UPDATE (this also keeps empty/new channels cheap).
@@ -504,12 +554,17 @@ def sweep_new_videos(output_dir: str, channels: list,
             _missing = _scoped_existing - _seen_existing
             _restored_here = 0
             _missing_here = 0
-            if _seen_existing:
+            # Only rows that were previously marked missing need a restore
+            # write.  The old code issued one UPDATE for every seen file in a
+            # channel (usually thousands of no-ops), holding SQLite's sole
+            # writer slot for minutes on the 36 GB production index.
+            _restore = _seen_existing & known_missing
+            if _restore:
                 _restored_cur = sweep_conn.executemany(
                     "UPDATE videos SET availability='available' "
                     "WHERE filepath=? COLLATE NOCASE AND "
                     "availability='missing'",
-                    [(existing_paths[p],) for p in _seen_existing
+                    [(existing_paths[p],) for p in _restore
                      if p in existing_paths])
                 _restored_here = max(0, _restored_cur.rowcount or 0)
                 availability_restored += _restored_here
@@ -521,7 +576,7 @@ def sweep_new_videos(output_dir: str, channels: list,
                     [(existing_paths[p],) for p in _missing])
                 _missing_here = max(0, _missing_cur.rowcount or 0)
                 availability_missing += _missing_here
-            if _seen_existing or _missing:
+            if _restore or _missing:
                 sweep_conn.commit()
             if _restored_here or _missing_here:
                 _idx.invalidate_channel_videos(ch_name)

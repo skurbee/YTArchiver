@@ -265,6 +265,7 @@ class TranscribeManager:
         # _batch_stats they flushed as "N transcribed" rows and
         # inflated the consolidated [Dwnld] transcribe count.
         self._compress_stats: dict[str, dict[str, Any]] = {}
+        self._stats_lock = threading.Lock()
         # Reference to the shared QueueState. Attached by the app wrapper
         # after construction (main.py can't pass it in __init__ because
         # QueueState is constructed later). When None, the manager
@@ -371,9 +372,18 @@ class TranscribeManager:
         captions typically complete during the download so the count
         is accurate by sync_channel's exit. Whisper may still be running.
         """
-        s = self._batch_stats.get(channel_name) or {}
-        return {"done": int(s.get("done", 0) or 0),
-                "err": int(s.get("err", 0) or 0)}
+        with self._stats_lock:
+            s = self._batch_stats.get(channel_name) or {}
+            return {"done": int(s.get("done", 0) or 0),
+                    "err": int(s.get("err", 0) or 0)}
+
+    def record_inline_transcription(self, channel_name: str) -> None:
+        """Count a caption ingest completed synchronously by sync_channel."""
+        ch_name = (channel_name or "").strip() or "—"
+        with self._stats_lock:
+            stats = self._batch_stats.setdefault(
+                ch_name, {"start": time.time(), "done": 0, "err": 0})
+            stats["done"] = int(stats.get("done", 0) or 0) + 1
 
     def consume_channel_batch_stats(self, channel_name: str) -> None:
         """Mark this channel's batch stats as already consumed by a
@@ -381,8 +391,85 @@ class TranscribeManager:
         _flush_batch_stats will skip it so the user doesn't see a
         duplicate [Trnscr] row for the same transcriptions.
         """
-        try: self._batch_stats.pop(channel_name, None)
+        try:
+            with self._stats_lock:
+                self._batch_stats.pop(channel_name, None)
         except Exception as e: _log.debug("swallowed: %s", e)
+
+    def has_pending_transcription(self, channel_name: str) -> bool:
+        """Return whether this channel still has queued/running model work."""
+        wanted = (channel_name or "").strip().casefold()
+
+        def _matches(job: dict[str, Any] | None) -> bool:
+            if not job or (job.get("kind") or "transcribe") == "compress":
+                return False
+            return (job.get("channel") or "").strip().casefold() == wanted
+
+        with self._jobs_lock:
+            return _matches(self._current_job) or any(
+                _matches(job) for job in self._jobs)
+
+    def _finish_successful_job(self, job: dict[str, Any], result: Any) -> None:
+        """Run non-GPU completion hooks and queue a persisted compress follow-up."""
+        if job.get("cb"):
+            try:
+                job["cb"](result)
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+
+        followup = job.get("compress_after") or {}
+        if not followup:
+            return
+        try:
+            self.compress_enqueue(
+                job.get("path", ""),
+                title=job.get("title", ""),
+                channel=job.get("channel", ""),
+                quality=followup.get("quality", "Average"),
+                output_res=str(followup.get("output_res", "720")),
+            )
+        except Exception as e:
+            self._stream.emit_error(f"Couldn't queue video compression: {e}")
+
+    def route_download_transcription(
+            self, path: str, title: str, channel: str = "",
+            video_id: str = "", compress_after: dict[str, str] | None = None,
+            on_processing_queued: Callable | None = None) -> str:
+        """Finish cheap native captions in sync; queue model work in Processing.
+
+        Returns ``"inline"`` when already-punctuated local YouTube captions
+        were ingested immediately, ``"processing"`` when punctuation/Whisper
+        work was queued, or ``"duplicate"`` when that path was already queued.
+        """
+        completed_inline = _try_auto_captions(
+            path, title, channel, self._stream,
+            punct_mgr=None,
+            video_id_hint=video_id,
+            from_download=True,
+            allow_fetch=False,
+            prepunctuated_only=True,
+            update_pending=False,
+        )
+        followup = dict(compress_after or {})
+        if completed_inline:
+            self.record_inline_transcription(channel)
+            self._finish_successful_job({
+                "path": path,
+                "title": title,
+                "channel": channel,
+                "compress_after": followup,
+            }, {"auto_captions": True})
+            return "inline"
+
+        if on_processing_queued is not None:
+            try:
+                on_processing_queued()
+            except Exception as e:
+                _log.debug("processing-queued callback failed: %s", e)
+        queued = self.enqueue(
+            path, title, channel=channel, video_id=video_id,
+            from_download=True, compress_after=followup)
+        return "processing" if queued else "duplicate"
 
     def _auto_enabled(self) -> bool:
         """True if the GPU Auto checkbox says "go". When False, the
@@ -671,7 +758,8 @@ class TranscribeManager:
                 bulk_id: str = "",
                 bulk_total: int = 0,
                 bulk_index: int = 0,
-                from_download: bool = False) -> bool:
+                from_download: bool = False,
+                compress_after: dict[str, str] | None = None) -> bool:
         """Queue a video for transcription.
 
         `channel` is optional; if provided it's stored on the job so the
@@ -728,6 +816,7 @@ class TranscribeManager:
                 "bulk_total": int(bulk_total or 0),
                 "bulk_index": int(bulk_index or 0),
                 "from_download": bool(from_download),
+                "compress_after": dict(compress_after or {}),
             })
         # Mirror the job into the shared GPU queue so the Tasks popover
         # shows the pending work. this was flagged: auto-transcribe on
@@ -753,6 +842,7 @@ class TranscribeManager:
                     "bulk_total": int(bulk_total or 0),
                     "bulk_index": int(bulk_index or 0),
                     "from_download": bool(from_download),
+                    "compress_after": dict(compress_after or {}),
                 })
             except Exception as e:
                 _log.debug("swallowed: %s", e)
@@ -887,6 +977,7 @@ class TranscribeManager:
                     "from_download": bool(j.get("from_download")),
                     "quality": j.get("quality", "Average"),
                     "output_res": str(j.get("output_res", "720")),
+                    "compress_after": dict(j.get("compress_after") or {}),
                 }
             with self._jobs_lock:
                 snapshot = [_snap(j) for j in self._jobs]
@@ -943,6 +1034,9 @@ class TranscribeManager:
                     "bulk_index": int(j.get("bulk_index", 0) or 0),
                     "kind": j.get("kind", "transcribe"),
                     "from_download": bool(j.get("from_download")),
+                    "compress_after": dict(j.get("compress_after") or {}),
+                    "quality": j.get("quality", "Average"),
+                    "output_res": str(j.get("output_res", "720")),
                 }
             with self._jobs_lock:
                 snapshot = [_snap(j) for j in self._jobs]
@@ -1097,6 +1191,7 @@ class TranscribeManager:
                         bulk_total=int(j.get("bulk_total", 0) or 0),
                         bulk_index=int(j.get("bulk_index", 0) or 0),
                         from_download=bool(j.get("from_download")),
+                        compress_after=dict(j.get("compress_after") or {}),
                     )
                 if added:
                     recovered += 1
@@ -1287,6 +1382,7 @@ class TranscribeManager:
                         "bulk_total": int(item.get("bulk_total", 0) or 0),
                         "bulk_index": int(item.get("bulk_index", 0) or 0),
                         "from_download": bool(item.get("from_download")),
+                        "compress_after": dict(item.get("compress_after") or {}),
                     })
                 self._jobs.append(job)
                 known.add(key)
@@ -1464,12 +1560,13 @@ class TranscribeManager:
             # Track per-channel stats so we can emit a [Trnscr] history
             # row when the worker drains. Matches OLD's _record_transcription.
             ch_name = (job.get("channel") or "").strip() or "\u2014"
-            if _job_kind == "compress":
-                stats = self._compress_stats.setdefault(ch_name,
-                    {"start": time.time(), "done": 0, "err": 0})
-            else:
-                stats = self._batch_stats.setdefault(ch_name,
-                    {"start": time.time(), "done": 0, "err": 0})
+            with self._stats_lock:
+                if _job_kind == "compress":
+                    stats = self._compress_stats.setdefault(ch_name,
+                        {"start": time.time(), "done": 0, "err": 0})
+                else:
+                    stats = self._batch_stats.setdefault(ch_name,
+                        {"start": time.time(), "done": 0, "err": 0})
             crashed = False
             try:
                 if _job_kind == "compress":
@@ -1534,10 +1631,12 @@ class TranscribeManager:
                 _requeued_no_tally = bool(job.get("_requeued_no_tally"))
                 if _requeued_no_tally:
                     job.pop("_requeued_no_tally", None)
-                elif crashed:
-                    stats["err"] += 1
                 else:
-                    stats["done"] += 1
+                    with self._stats_lock:
+                        if crashed:
+                            stats["err"] += 1
+                        else:
+                            stats["done"] += 1
                 # if a transcribe job crashed or early-returned
                 # without reaching the success-path decrement, the pending
                 # counter would leak (-1, -2, -3 stuck on the Subs row
@@ -1827,11 +1926,7 @@ class TranscribeManager:
                                    video_id_hint=job.get("video_id", ""),
                                    from_download=bool(job.get("from_download")))):
             job["_pending_decremented"] = True
-            if job.get("cb"):
-                try:
-                    job["cb"]({"auto_captions": True})
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
+            self._finish_successful_job(job, {"auto_captions": True})
             return
 
         # Auto-captions path missed — either no .vtt available, yt-dlp
@@ -2186,11 +2281,7 @@ class TranscribeManager:
                 dim_tags=_dim_tags, em_tags=_em_tags, lbl_tags=_lbl_tags,
                 txt_tags=_txt_tags, detail_tags=_detail_tags)
             self._stream.emit(_segs)
-            if job.get("cb"):
-                try:
-                    job["cb"](result)
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
+            self._finish_successful_job(job, result)
 
     def _transcribe_chunked(self, job: dict[str, Any], total_duration: float):
         """Port of YTArchiver.py:11139 _whisper_transcribe_chunked.
@@ -2418,9 +2509,7 @@ class TranscribeManager:
                 dim_tags=_dim_tag, em_tags=_em_tag, lbl_tags=_lbl_tag,
                 txt_tags=_txt_tag, detail_tags=_dim_tag)
             self._stream.emit(_segs_c)
-            if job.get("cb"):
-                try: job["cb"](merged)
-                except Exception as e: _log.debug("swallowed: %s", e)
+            self._finish_successful_job(job, merged)
         finally:
             try: shutil.rmtree(chunk_dir, ignore_errors=True)
             except Exception as e: _log.debug("swallowed: %s", e)

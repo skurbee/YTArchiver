@@ -6,6 +6,19 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v82.1 - 2026-07-13
+
+### Changed
+- **Cheap YouTube captions stay in the sync queue.** Already-punctuated local captions are parsed, written, and indexed during download finalization instead of waiting behind Processing.
+- **Processing now receives only model-backed transcription work.** Captions that need punctuation restoration and videos that need Whisper are routed through the Processing queue and continue to honor its Auto and pause controls.
+- **Compression remains ordered and durable.** Automatic compression is queued only after transcription succeeds, is visible as its own Processing task, and retains its follow-up settings across app restarts.
+
+### Validation
+- Backend smoke suite passed: 378 tests.
+- Frontend JavaScript syntax and generated HTML freshness checks passed.
+- Caption routing, pending counters, activity counts, and compression follow-up persistence have focused regression coverage.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
 ## v82.0 - 2026-07-13
 
 ### Fixed

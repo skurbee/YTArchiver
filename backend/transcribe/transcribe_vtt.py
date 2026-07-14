@@ -252,7 +252,10 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
                         punct_mgr=None,
                         job_tag: str = "",
                         video_id_hint: str = "",
-                        from_download: bool = False) -> bool:
+                        from_download: bool = False,
+                        allow_fetch: bool = True,
+                        prepunctuated_only: bool = False,
+                        update_pending: bool = True) -> bool:
     """If yt-dlp wrote a .en.vtt (or similar) next to the video, parse it
     into the aggregated channel Transcript.txt + hidden JSONL sidecar,
     then ingest into FTS — skip Whisper entirely.
@@ -274,8 +277,16 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     in the .jsonl also get punctuated per-segment (matches NEW's
     Whisper punct pass for consistent .jsonl quality).
 
+    ``allow_fetch=False`` limits the attempt to caption sidecars already
+    downloaded beside the video. ``prepunctuated_only=True`` returns False
+    without writing when the caption text would need the punctuation model;
+    callers can then route that resource-sensitive work to Processing.
+    ``update_pending=False`` is used by the synchronous download path because
+    no Processing job (and therefore no pending-count increment) was created.
+
     Output matches YTArchiver.py:15449-15478 exactly. Returns True on
-    success; False if no usable auto-sub file exists."""
+    success; False if no usable auto-sub file exists or the caller requested
+    pre-punctuated captions and the text needs model processing."""
     base = os.path.splitext(video_path)[0]
     candidates = [
         f"{base}.en.vtt", f"{base}.en-US.vtt", f"{base}.en-GB.vtt",
@@ -289,7 +300,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     # directly here — matches OLD's `_fetch_auto_captions` (YTArchiver.py:11641)
     # which runs a cookieless probe first, then retries with cookies on 403.
     _fetched_temp: list[str] = []
-    if not vtt:
+    if not vtt and allow_fetch:
         vtt = _fetch_captions_via_ytdlp(video_path, stream, _fetched_temp)
         if vtt:
             candidates.append(vtt)
@@ -404,6 +415,16 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
         # Floor-half ceiling so 1/1, 1/2, 2/3, 2/4 = punctuated.
         import math as _math
         _already_punct = _punct_hits >= _math.ceil(len(_samples) / 2)
+    if prepunctuated_only and not _already_punct:
+        # The sync-side fast path must never start the punctuation model.
+        # Leave local yt-dlp sidecars untouched for the Processing worker.
+        # If a future caller combines this mode with allow_fetch=True, clean
+        # only the temporary probe files we created before deferring.
+        for _p in list(_fetched_temp):
+            if os.path.isfile(_p):
+                try: os.remove(_p)
+                except OSError: pass
+        return False
     if punct_mgr is not None and full_text and not _already_punct:
         try:
             # `job_tag` (e.g. `whisper_job_7`) makes this line
@@ -467,8 +488,11 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
         _idx.mark_video_transcribed(video_path)
     except Exception as e:
         _log.debug("swallowed: %s", e)
-    # Decrement transcription_pending / set transcription_complete on 0.
-    _bump_transcription_pending(channel, -1)
+    # Decrement transcription_pending / set transcription_complete on 0 only
+    # when this ingest belongs to a queued Processing job. The synchronous
+    # sync path never increments the counter in the first place.
+    if update_pending:
+        _bump_transcription_pending(channel, -1)
     # Drop this video's ID from the authoritative pending list so the
     # Subs "-X" indicator shrinks. `vid_id` was extracted earlier in
     # this function for jsonl + FTS writes.

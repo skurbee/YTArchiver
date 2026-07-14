@@ -4084,6 +4084,8 @@ class TranscribeManagerQueueTests(unittest.TestCase):
                 "channel": "Manual",
                 "retranscribe": True,
                 "video_id": "abc123def45",
+                "compress_after": {
+                    "quality": "High", "output_res": "1080"},
             }]
 
             with mock.patch.object(mgr, "_persist_pending") as persist, \
@@ -4094,6 +4096,8 @@ class TranscribeManagerQueueTests(unittest.TestCase):
         self.assertEqual(mgr._jobs[0]["path"], str(video))
         self.assertTrue(mgr._jobs[0]["retranscribe"])
         self.assertEqual(mgr._jobs[0]["video_id"], "abc123def45")
+        self.assertEqual(mgr._jobs[0]["compress_after"], {
+            "quality": "High", "output_res": "1080"})
         self.assertTrue(mgr._manual_drain.is_set())
         self.assertFalse(mgr._paused.is_set())
         persist.assert_called_once_with()
@@ -4249,6 +4253,119 @@ class TranscribeManagerQueueTests(unittest.TestCase):
             self.assertFalse(queued)
             self.assertEqual(len(mgr._jobs), 0)
             bump.assert_not_called()
+
+    def test_download_route_finishes_native_captions_without_processing(self) -> None:
+        stream = mock.Mock()
+        mgr = transcribe_core.TranscribeManager(stream)
+        followup = {"quality": "High", "output_res": "1080"}
+
+        with mock.patch.object(transcribe_core, "_try_auto_captions",
+                               return_value=True) as captions, \
+                mock.patch.object(mgr, "record_inline_transcription") as record, \
+                mock.patch.object(mgr, "compress_enqueue",
+                                  return_value=True) as compress, \
+                mock.patch.object(mgr, "enqueue") as enqueue:
+            route = mgr.route_download_transcription(
+                "Video.mp4", "Video", channel="Channel",
+                video_id="abc123_def4", compress_after=followup)
+
+        self.assertEqual(route, "inline")
+        captions.assert_called_once_with(
+            "Video.mp4", "Video", "Channel", stream,
+            punct_mgr=None,
+            video_id_hint="abc123_def4",
+            from_download=True,
+            allow_fetch=False,
+            prepunctuated_only=True,
+            update_pending=False,
+        )
+        record.assert_called_once_with("Channel")
+        enqueue.assert_not_called()
+        compress.assert_called_once_with(
+            "Video.mp4", title="Video", channel="Channel",
+            quality="High", output_res="1080")
+
+    def test_download_route_queues_model_work_before_followup_compression(self) -> None:
+        stream = mock.Mock()
+        mgr = transcribe_core.TranscribeManager(stream)
+        order: list[str] = []
+
+        def _queued_notice() -> None:
+            order.append("notice")
+
+        def _enqueue(*args, **kwargs) -> bool:
+            order.append("enqueue")
+            return True
+
+        with mock.patch.object(transcribe_core, "_try_auto_captions",
+                               return_value=False), \
+                mock.patch.object(mgr, "enqueue", side_effect=_enqueue) as enqueue, \
+                mock.patch.object(mgr, "compress_enqueue") as compress:
+            route = mgr.route_download_transcription(
+                "Video.mp4", "Video", channel="Channel",
+                video_id="abc123_def4",
+                compress_after={"quality": "Average", "output_res": "720"},
+                on_processing_queued=_queued_notice)
+
+        self.assertEqual(route, "processing")
+        self.assertEqual(order, ["notice", "enqueue"])
+        enqueue.assert_called_once_with(
+            "Video.mp4", "Video", channel="Channel",
+            video_id="abc123_def4", from_download=True,
+            compress_after={"quality": "Average", "output_res": "720"})
+        compress.assert_not_called()
+
+    def test_enqueue_persists_compression_followup_on_transcribe_job(self) -> None:
+        stream = mock.Mock()
+        mgr = transcribe_core.TranscribeManager(stream)
+        with tempfile.TemporaryDirectory() as td:
+            video = Path(td) / "Video.mp4"
+            video.write_bytes(b"video")
+            followup = {"quality": "High", "output_res": "1080"}
+
+            with mock.patch.object(transcribe_core,
+                                   "_bump_transcription_pending"), \
+                    mock.patch.object(mgr, "_persist_pending"), \
+                    mock.patch.object(mgr, "_ensure_worker"):
+                queued = mgr.enqueue(
+                    str(video), "Video", channel="Channel",
+                    compress_after=followup)
+
+        self.assertTrue(queued)
+        self.assertEqual(mgr._jobs[0]["compress_after"], followup)
+
+    def test_pending_journal_serializes_compression_followup(self) -> None:
+        stream = mock.Mock()
+        mgr = transcribe_core.TranscribeManager(stream)
+        mgr._jobs = [{
+            "kind": "transcribe",
+            "path": "Video.mp4",
+            "title": "Video",
+            "channel": "Channel",
+            "compress_after": {"quality": "High", "output_res": "1080"},
+        }]
+
+        with tempfile.TemporaryDirectory() as td:
+            journal = Path(td) / "pending.json"
+            with mock.patch.object(transcribe_core,
+                                   "_pending_journal_path",
+                                   return_value=journal):
+                mgr._persist_pending()
+            saved = json.loads(journal.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved[0]["compress_after"], {
+            "quality": "High", "output_res": "1080"})
+
+    def test_pending_transcription_ignores_compression_jobs(self) -> None:
+        mgr = transcribe_core.TranscribeManager(mock.Mock())
+        mgr._jobs = [{
+            "kind": "compress", "path": "A.mp4", "channel": "Channel"},
+        ]
+        self.assertFalse(mgr.has_pending_transcription("Channel"))
+
+        mgr._jobs.append({
+            "kind": "transcribe", "path": "B.mp4", "channel": "Channel"})
+        self.assertTrue(mgr.has_pending_transcription("channel"))
 
     def test_auto_caption_fast_path_marks_pending_decremented(self) -> None:
         stream = mock.Mock()
@@ -4642,6 +4759,82 @@ class TranscribeVttTests(unittest.TestCase):
             self.assertTrue(ok)
             self.assertTrue(user_vtt.exists())
             hide.assert_called_once_with(str(video), str(txt))
+
+    def test_sync_fast_path_defers_unpunctuated_captions_to_processing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            video = root / "Video [abc123_def4].mp4"
+            video.write_bytes(b"video")
+            vtt = root / "Video [abc123_def4].en.vtt"
+            vtt.write_text("WEBVTT", encoding="utf-8")
+            punct = mock.Mock()
+
+            with mock.patch.object(transcribe_vtt, "_parse_vtt",
+                                   return_value=[{
+                                       "s": 0.0, "e": 1.0,
+                                       "t": "hello world this needs punctuation",
+                                   }]), \
+                    mock.patch.object(transcribe_vtt,
+                                      "_write_transcript_entry") as write_txt, \
+                    mock.patch.object(transcribe_vtt,
+                                      "_write_jsonl_entry") as write_jsonl, \
+                    mock.patch.object(transcribe_vtt,
+                                      "_bump_transcription_pending") as bump:
+                ok = transcribe_vtt._try_auto_captions(
+                    str(video), "Video", "Channel", mock.Mock(), punct,
+                    allow_fetch=False,
+                    prepunctuated_only=True,
+                    update_pending=False)
+
+        self.assertFalse(ok)
+        punct.punctuate.assert_not_called()
+        write_txt.assert_not_called()
+        write_jsonl.assert_not_called()
+        bump.assert_not_called()
+
+    def test_sync_fast_path_writes_punctuated_captions_without_pending_count(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            video = root / "Video [abc123_def4].mp4"
+            video.write_bytes(b"video")
+            vtt = root / "Video [abc123_def4].en.vtt"
+            vtt.write_text("WEBVTT", encoding="utf-8")
+            txt = root / "Transcript.txt"
+            jsonl = root / ".Transcript.jsonl"
+
+            with mock.patch.object(transcribe_vtt, "_parse_vtt",
+                                   return_value=[{
+                                       "s": 0.0, "e": 1.0,
+                                       "t": "Hello world. This is ready!",
+                                   }]), \
+                    mock.patch.object(transcribe_vtt,
+                                      "_resolve_transcript_paths",
+                                      return_value=(str(txt), str(jsonl),
+                                                    2026, 7, "07.13.2026")), \
+                    mock.patch.object(transcribe_vtt,
+                                      "_write_transcript_entry",
+                                      return_value=True) as write_txt, \
+                    mock.patch.object(transcribe_vtt,
+                                      "_write_jsonl_entry",
+                                      return_value=True), \
+                    mock.patch.object(transcribe_vtt,
+                                      "_hide_per_video_transcript_txt_if_needed"), \
+                    mock.patch.object(transcribe_vtt,
+                                      "_bump_transcription_pending") as bump, \
+                    mock.patch("backend.index.ingest_jsonl"), \
+                    mock.patch("backend.index.mark_video_transcribed"), \
+                    mock.patch("backend.ytarchiver_config.remove_pending_tx_id"):
+                ok = transcribe_vtt._try_auto_captions(
+                    str(video), "Video", "Channel", mock.Mock(), None,
+                    video_id_hint="abc123_def4",
+                    from_download=True,
+                    allow_fetch=False,
+                    prepunctuated_only=True,
+                    update_pending=False)
+
+        self.assertTrue(ok)
+        write_txt.assert_called_once()
+        bump.assert_not_called()
 
     def test_auto_caption_standalone_done_line_includes_title(self) -> None:
         with tempfile.TemporaryDirectory() as td:

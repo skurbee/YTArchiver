@@ -589,7 +589,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     Sync one channel: fetch new videos via yt-dlp, stream progress.
 
     If `transcribe_mgr` is given and the channel has auto_transcribe=True,
-    each newly-downloaded video is enqueued for whisper transcription.
+    already-punctuated YouTube captions are ingested inline; only videos that
+    need punctuation-model or Whisper work are sent to Processing.
     If `queues` is given, the current_sync marker is updated.
     If `pause_event` is given, the yt-dlp subprocess is terminated the
     moment the event is set — so pausing during a download actually
@@ -2023,21 +2024,19 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                 # miss this video without knowing why.
                                 stream.emit_dim(
                                     f" (pending-transcribe list write failed: {_re3})")
-                        # Auto-transcribe: queue the completed video for whisper
+                        # Auto-transcribe: ingest already-punctuated YouTube
+                        # captions here in the sync queue. Only captions that
+                        # need the punctuation model (or videos that need
+                        # Whisper) are handed to Processing.
                         if auto_tx and transcribe_mgr is not None:
-                            cb = None
+                            _compress_after = None
                             if channel.get("compress_enabled"):
                                 _comp_lvl = channel.get("compress_level") or "Average"
                                 _comp_res = str(channel.get("compress_output_res") or "720")
-                                def _chain_compress(_result, _fp=final_path, _q=_comp_lvl,
-                                                    _r=_comp_res, _s=stream, _ce=cancel_event):
-                                    try:
-                                        from .. import compress as _cmp
-                                        _cmp.compress_video(_fp, _s, quality=_q, output_res=_r,
-                                                             cancel_event=_ce)
-                                    except Exception as _e:
-                                        _s.emit_error(f"Auto-compress failed: {_e}")
-                                cb = _chain_compress
+                                _compress_after = {
+                                    "quality": _comp_lvl,
+                                    "output_res": _comp_res,
+                                }
                             # Reserve a slot in the log for the transcription
                             # completion line so it renders under THIS channel's
                             # block when the async GPU job finishes — not
@@ -2069,7 +2068,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                             # finished line.
                             stream.emit([
                                 ["      \u2014 \u23F3 ", ["whisper_bracket", _tx_marker]],
-                                ["Transcription queued\u2026\n",
+                                ["Checking YouTube captions\u2026\n",
                                  ["simpleline", _tx_marker]],
                             ])
                             # Fall back to the filename stem if the
@@ -2083,11 +2082,27 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                             _title_for_tx = (
                                 t or os.path.splitext(
                                     os.path.basename(final_path))[0])
-                            transcribe_mgr.enqueue(final_path, _title_for_tx,
-                                                    channel=name,
-                                                    on_complete=cb,
-                                                    video_id=vid,
-                                                    from_download=True)
+                            def _emit_processing_queued(_m=_tx_marker):
+                                stream.emit([
+                                    ["      \u2014 \u23F3 ",
+                                     ["whisper_bracket", _m]],
+                                    ["Transcription queued in Processing\u2026\n",
+                                     ["simpleline", _m]],
+                                ])
+
+                            _tx_route = transcribe_mgr.route_download_transcription(
+                                final_path, _title_for_tx,
+                                channel=name,
+                                video_id=vid,
+                                compress_after=_compress_after,
+                                on_processing_queued=_emit_processing_queued,
+                            )
+                            if _tx_route == "duplicate":
+                                stream.emit([
+                                    ["      \u2014 ", ["dim", _tx_marker]],
+                                    ["Transcription already queued.\n",
+                                     ["dim", _tx_marker]],
+                                ])
                         # If auto_transcribe is off but compress_enabled is on,
                         # route the compress task through the SHARED GPU queue
                         # (rule: "every compress is a GPU task").
@@ -2887,6 +2902,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         _meta_fetched = _read_meta_count("fetched")
         _tx_done = 0
         _tx_err = 0
+        _tx_still_pending = False
         if auto_tx and transcribe_mgr is not None:
             try:
                 _stats = transcribe_mgr.get_channel_batch_stats(name)
@@ -2897,13 +2913,15 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 # later update this same row with the final transcribed
                 # count. If we consume now, we lose the updated stats
                 # and the row sticks at "0 transcribed" forever.
-                # Consume only when auto_tx is off OR the transcribe
-                # manager is idle by the time this row emits.
+                # Consume once this channel has no transcription work left.
+                # Compression and other channels' Processing jobs must not
+                # keep this channel's completed caption stats alive.
                 try:
-                    _is_idle = not bool(transcribe_mgr.is_active())
+                    _tx_still_pending = bool(
+                        transcribe_mgr.has_pending_transcription(name))
                 except Exception:
-                    _is_idle = False
-                if _is_idle:
+                    _tx_still_pending = True
+                if not _tx_still_pending:
                     transcribe_mgr.consume_channel_batch_stats(name)
             except Exception as e:
                 swallow("transcribe batch-stats consume", e)
@@ -2917,7 +2935,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             kind="Dwnld")
         # Stash this row so a late transcribe-complete can patch it
         # in place (retroactive update of the transcribed cell).
-        if auto_tx and transcribe_mgr is not None:
+        if (auto_tx and transcribe_mgr is not None
+                and _tx_still_pending):
             try:
                 register_pending_dwnld_row(
                     name, _row_id,

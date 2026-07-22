@@ -796,7 +796,12 @@ class ChannelMixin:
                                 creationflags=(0x08000000 if os.name == "nt" else 0))
                             height = int((r.stdout or "0").strip() or 0)
                             scanned += 1
-                            if height > 0 and height < (target_h - 8):
+                            # Redownload supports intentional downsizing, so a
+                            # 720p file is also a mismatch for a selected 360p
+                            # target. The old one-sided `< target` check only
+                            # detected upgrades and reported the whole archive
+                            # as "already at 360p or higher."
+                            if height > 0 and abs(height - target_h) > 8:
                                 mismatch += 1
                         except Exception:
                             continue

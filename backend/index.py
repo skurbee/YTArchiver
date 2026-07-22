@@ -24,7 +24,7 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +49,25 @@ _tx_retry_thread: threading.Thread | None = None
 # live downloads update the catalog directly and also change that signature.
 _download_backfill_lock = threading.Lock()
 _download_backfill_signature: tuple[int, float] | None = None
+
+
+def _upload_date_to_epoch(value: Any) -> float:
+    """Convert yt-dlp's YYYYMMDD upload date to a stable display epoch.
+
+    ``upload_date`` is a calendar date, not a precise timestamp.  Noon UTC
+    keeps that date stable when the UI formats it in local time while avoiding
+    the previous-day rollover that midnight UTC causes in western timezones.
+    """
+    raw = str(value or "").strip()
+    if len(raw) != 8 or not raw.isdigit():
+        return 0.0
+    try:
+        return datetime(
+            int(raw[0:4]), int(raw[4:6]), int(raw[6:8]), 12,
+            tzinfo=UTC,
+        ).timestamp()
+    except (ValueError, OSError):
+        return 0.0
 
 
 def _sqlite_is_busy(exc: BaseException) -> bool:
@@ -397,11 +416,12 @@ def _open() -> sqlite3.Connection | None:
                 # Browse grid query filters these out so the grid
                 # shows exactly what YouTube shows.
                 "ALTER TABLE videos ADD COLUMN is_duplicate_of TEXT",
-                # Upload timestamp (unix epoch). Populated from the
-                # video file's mtime, which YTArchiver sets to the
-                # YouTube upload date via `--mtime` during download
-                # (confirmed by memory: "file dates = upload
-                # dates"). Used by the Graph tab's Week bucket —
+                # Upload timestamp (unix epoch). New downloads populate this
+                # from yt-dlp's authoritative `upload_date`; legacy/imported
+                # rows fall back to file mtime. yt-dlp's `--mtime` uses the
+                # media server's Last-Modified header, which can predate public
+                # release by days for scheduled videos. Used by the Graph tab's
+                # Week bucket —
                 # segments only carry year+month so bucketing weeks
                 # requires joining videos for full-date resolution.
                 "ALTER TABLE videos ADD COLUMN upload_ts REAL",
@@ -809,6 +829,7 @@ def register_video(filepath: str, channel: str, title: str | None = None,
                    tx_status: str = "pending",
                    video_id: str | None = None,
                    duration_secs: float | None = None,
+                   upload_date: str | None = None,
                    _conn_override: sqlite3.Connection | None = None,
                    _busy_retry_deadline_sec: float = 300.0,
                    _busy_retry_sleep_base: float = 0.5) -> bool:
@@ -820,6 +841,11 @@ def register_video(filepath: str, channel: str, title: str | None = None,
     If `video_id` is provided (e.g. from yt-dlp's DLTRACK line), it takes
     priority over trying to parse it out of the filename — necessary for
     drop-in-compatible filenames that don't embed `[videoID]`.
+
+    If `upload_date` is a valid yt-dlp YYYYMMDD value, it is authoritative.
+    File mtime is only the fallback for imports and legacy callers because
+    yt-dlp's `--mtime` reflects an HTTP Last-Modified header, not necessarily
+    the video's public YouTube date.
 
     `_conn_override`: caller may supply its OWN sqlite3 connection (from
     `_open_independent()`) to bypass the shared `_db_lock` — used by
@@ -882,7 +908,7 @@ def register_video(filepath: str, channel: str, title: str | None = None,
     try:
         st = os.stat(fp)
         size = st.st_size
-        upload_ts = st.st_mtime
+        upload_ts = _upload_date_to_epoch(upload_date) or st.st_mtime
     except OSError as exc:
         _log.warning("refusing to register missing/unreadable video %s: %s",
                      fp, exc)
@@ -1199,7 +1225,7 @@ def backfill_downloaded_ts_from_recent(entries: list[dict[str, Any]] | None
         # older rows untouched.
         _marker = conn.execute(
             "SELECT value FROM app_state "
-            "WHERE key='recent_download_backfill_v1'").fetchone()
+            "WHERE key='recent_download_backfill_v2'").fetchone()
         if _marker and _marker[0] == "done":
             with _download_backfill_lock:
                 _download_backfill_signature = _signature
@@ -1218,22 +1244,44 @@ def backfill_downloaded_ts_from_recent(entries: list[dict[str, Any]] | None
             row = None
             if fp:
                 row = conn.execute(
-                    "SELECT id FROM videos WHERE filepath=? COLLATE NOCASE "
+                    "SELECT id, downloaded_ts, upload_ts FROM videos "
+                    "WHERE filepath=? COLLATE NOCASE "
                     "LIMIT 1", (fp,)).fetchone()
             if row is None and vid:
                 matches = conn.execute(
-                    "SELECT id FROM videos WHERE video_id=? "
+                    "SELECT id, downloaded_ts, upload_ts FROM videos "
+                    "WHERE video_id=? "
                     "AND is_duplicate_of IS NULL LIMIT 2", (vid,)).fetchall()
                 if len(matches) == 1:
                     row = matches[0]
             if row is None:
                 unmatched += 1
             else:
-                cur = conn.execute(
-                    "UPDATE videos SET downloaded_ts=? WHERE id=? AND "
-                    "(downloaded_ts IS NULL OR downloaded_ts < ?)",
-                    (ts, row[0], ts))
-                updated += cur.rowcount or 0
+                current_downloaded = row[1]
+                current_upload = row[2]
+                upload_date = str(entry.get("date") or "").strip()
+                authoritative_upload = _upload_date_to_epoch(upload_date)
+                current_display_date = ""
+                if current_upload:
+                    try:
+                        current_display_date = datetime.fromtimestamp(
+                            float(current_upload)).strftime("%Y%m%d")
+                    except (TypeError, ValueError, OSError, OverflowError):
+                        pass
+                repair_downloaded = (
+                    current_downloaded is None or current_downloaded < ts)
+                repair_upload = bool(
+                    authoritative_upload
+                    and current_display_date != upload_date)
+                if repair_downloaded or repair_upload:
+                    conn.execute(
+                        "UPDATE videos SET downloaded_ts=?, upload_ts=? "
+                        "WHERE id=?",
+                        (ts if repair_downloaded else current_downloaded,
+                         authoritative_upload if repair_upload
+                         else current_upload,
+                         row[0]))
+                    updated += 1
             processed += 1
             # Bound the SQLite writer-lock window even on the first-ever
             # migration.  The previous single 500-entry transaction held it
@@ -1244,7 +1292,7 @@ def backfill_downloaded_ts_from_recent(entries: list[dict[str, Any]] | None
             conn.commit()
         conn.execute(
             "INSERT OR REPLACE INTO app_state(key, value) "
-            "VALUES('recent_download_backfill_v1', 'done')")
+            "VALUES('recent_download_backfill_v2', 'done')")
         conn.commit()
         if updated:
             invalidate_channel_videos(None)
@@ -1971,10 +2019,10 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     """Videos in a channel, sorted by requested key.
 
     Returns both `added_ts` (when we registered the video in the DB) and
-    `upload_ts` (the file's mtime, which equals the YouTube upload date
-    since sync runs yt-dlp with `--mtime`). Sort keys "newest"/"oldest"
-    use `upload_ts` first so the grid actually matches upload order; the
-    DB-insertion time was what made every video look like "15d ago".
+    `upload_ts` (yt-dlp's upload_date when available, file mtime only for
+    legacy/imported rows). Sort keys "newest"/"oldest" use `upload_ts` first
+    so the grid actually matches upload order; the DB-insertion time was what
+    made every video look like "15d ago".
 
     Results are cached per (channel, sort, limit, include_thumbs) tuple
     so repeated channel opens are instant. See `invalidate_channel_videos`.
@@ -2192,22 +2240,6 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
             _thumb_by_vid = _build_channel_thumb_index(
                 _ch_root, low_priority_busy_fn=low_priority_busy_fn)
 
-    # Helper: parse yt-dlp's YYYYMMDD upload_date string into a Unix
-    # epoch. Returns 0 on anything unparseable. The aggregated metadata
-    # JSONL stores dates in this format (it's what YouTube's API returns).
-    def _yyyymmdd_to_epoch(s: str) -> float:
-        if not s:
-            return 0.0
-        s = str(s).strip()
-        if len(s) != 8 or not s.isdigit():
-            return 0.0
-        try:
-            from datetime import datetime as _dt
-            return _dt(int(s[0:4]), int(s[4:6]), int(s[6:8]),
-                      tzinfo=UTC).timestamp()
-        except (ValueError, OSError):
-            return 0.0
-
     for i, row in enumerate(out):
         if i % 25 == 0:
             _raise_if_low_priority_busy(low_priority_busy_fn)
@@ -2241,7 +2273,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
             if _t_row:
                 meta = _fetch_meta_by_title(os.path.dirname(fp), _t_row)
         if meta:
-            ep = _yyyymmdd_to_epoch(meta.get("upload_date", ""))
+            ep = _upload_date_to_epoch(meta.get("upload_date", ""))
             if ep > 0:
                 row["upload_ts"] = ep
         # Avoid per-row mtime probes here; the DB's added_ts is the
@@ -2725,11 +2757,12 @@ def find_thumbnail_channelwide(video_filepath: str,
 # ── Global "Videos" view: materialized view/like stats + paginated list ──
 
 def update_video_stats(updates) -> int:
-    """Batch-write view_count/like_count into the videos table.
+    """Batch-write metadata fields into the videos table.
 
-    `updates`: iterable of (video_id, view_count, like_count). None counts
-    are skipped for that field. Called by the metadata-refresh pass (so the
-    DB stays current) and by backfill_video_stats. Returns rows updated.
+    `updates`: iterable of (video_id, view_count, like_count[, upload_date]).
+    None counts and invalid dates preserve the existing field. Called by the
+    metadata-refresh pass (so Browse stays current) and by
+    backfill_video_stats. Returns rows updated.
     """
     rows = [u for u in (updates or []) if u and u[0]]
     if not rows:
@@ -2740,18 +2773,24 @@ def update_video_stats(updates) -> int:
             if conn is None:
                 return 0
             n = 0
-            for vid, vc, lc in rows:
+            for update in rows:
                 try:
+                    vid, vc, lc = update[:3]
+                    upload_date = update[3] if len(update) > 3 else None
+                    upload_ts = _upload_date_to_epoch(upload_date)
                     cur = conn.execute(
                         "UPDATE videos SET "
                         "view_count = COALESCE(?, view_count), "
-                        "like_count = COALESCE(?, like_count) "
+                        "like_count = COALESCE(?, like_count), "
+                        "upload_ts = COALESCE(?, upload_ts) "
                         "WHERE video_id = ?",
-                        (vc, lc, vid))
+                        (vc, lc, upload_ts or None, vid))
                     n += cur.rowcount or 0
                 except sqlite3.Error:
                     continue
             conn.commit()
+            if n:
+                invalidate_channel_videos(None)
             return n
     except sqlite3.Error:
         return 0
@@ -2792,18 +2831,21 @@ def backfill_video_stats(progress=None) -> dict:
                             continue
                         vc = entry.get("view_count")
                         lc = entry.get("like_count")
-                        if vc is None and lc is None:
+                        upload_date = entry.get("upload_date")
+                        if (vc is None and lc is None
+                                and not _upload_date_to_epoch(upload_date)):
                             continue
                         try: vc = int(vc) if vc is not None else None
                         except (TypeError, ValueError): vc = None
                         try: lc = int(lc) if lc is not None else None
                         except (TypeError, ValueError): lc = None
-                        seen[vid] = (vc, lc)
+                        seen[vid] = (vc, lc, upload_date)
         except Exception as e:
             _log.debug("backfill walk failed (%s): %s", folder, e)
         if seen:
             total_updated += update_video_stats(
-                [(vid, vc, lc) for vid, (vc, lc) in seen.items()])
+                [(vid, vc, lc, upload_date)
+                 for vid, (vc, lc, upload_date) in seen.items()])
         if progress:
             try:
                 progress({"done": i + 1, "total": n_ch, "updated": total_updated})
@@ -3924,6 +3966,7 @@ from .index_bookmarks import (  # noqa: F401
 )
 from .index_maintenance import (  # noqa: F401
     prune_missing_videos,
+    refresh_channel_file_sizes,
     rebuild_fts_index,
     sweep_new_videos,
 )

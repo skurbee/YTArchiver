@@ -6,6 +6,26 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v82.2 - 2026-07-22
+
+### Fixed
+- **Resolution redownloads identify every archive file safely.** Exact index paths are used only when a video ID maps to one file; ambiguous duplicate-ID rows fall back to unique catalog, metadata, filename, and embedded-provenance matches instead of replacing a filename with another video's content.
+- **Interrupted resolution changes resume correctly.** Progress records are revalidated against the selected resolution and embedded video ID, so stale “done” entries and wrong-content files are repaired while already-correct files remain skipped.
+- **Ultrawide and portrait downloads honor YouTube resolution rungs.** Dimension checks accept formats such as 640x290 and 360x640 as valid 360p outputs while retaining downgrade and identity guards.
+- **Channel sizes reflect in-place replacements.** Redownload completion and the explicit folder-size rescan restat existing media, refresh indexed byte sizes, repair stale duplicate markers, and update the Subs cache from current disk state.
+- **Single-channel Sync now work survives pause and restart.** Context-menu sync requests always enter the durable sync queue and use the same worker, recovery journal, pause, and resume behavior as full sync passes.
+- **Browse dates use YouTube's upload date.** New downloads and metadata refreshes prefer yt-dlp's authoritative `upload_date`; HTTP Last-Modified file times remain only a compatibility fallback.
+- **Graph initialization recovers from a missed startup script.** A bounded cache-busting retry reloads `graphTab.js` without blocking the rest of the app when WebView2 misses its initializer during cold startup.
+
+### Changed
+- **The session error badge now opens useful details.** Clicking the bottom-right error count shows a compact newest-first popup of red log messages. Opening it preserves the list; Clear explicitly dismisses the records and resets the count.
+
+### Validation
+- Backend smoke suite passed: 393 tests.
+- Frontend JavaScript syntax and generated HTML freshness checks passed.
+- The live GamersNexus catalog matched all 3,080 local videos; the repair plan isolated 16 identity mismatches plus two unfinished resolution conversions.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
 ## v82.1 - 2026-07-13
 
 ### Changed

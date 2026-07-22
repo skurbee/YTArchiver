@@ -1846,9 +1846,10 @@ def main():
             from backend.temp_cleanup import startup_cleanup_temps
             startup_cleanup_temps(api._log_stream)
         except Exception as e: _log.debug("swallowed: %s", e)
-        # Upload-timestamp backfill — needed for the Graph tab's Week
-        # bucket. Populates videos.upload_ts from each file's mtime
-        # (which yt-dlp set to the YouTube upload date via --mtime).
+        # Legacy upload-timestamp fallback — needed for the Graph tab's Week
+        # bucket. Populates only NULL rows from file mtime. New downloads and
+        # metadata refreshes use yt-dlp's authoritative upload_date instead;
+        # `--mtime` is an HTTP Last-Modified value and can predate publication.
         # Runs once per launch; idempotent (only fills NULL rows).
         # Background thread so a large archive doesn't slow boot.
         try:

@@ -724,6 +724,79 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
             "walked": total_ch - skipped_unchanged}
 
 
+def refresh_channel_file_sizes(channel: str, folder: str = "") -> dict[str, int]:
+    """Restat one channel's indexed files and persist their real byte sizes.
+
+    Normal startup sweeps deliberately skip stat calls for known files.  This
+    explicit maintenance path is used after in-place redownloads and by the
+    user's folder-size rescan, where accuracy is more important than the
+    steady-state startup optimization.  It never deletes or moves media.
+    """
+    import os as _os
+
+    conn = _idx._open()
+    if conn is None or not channel:
+        return {"checked": 0, "updated": 0, "bytes": 0,
+                "duplicate_markers_cleared": 0}
+    root = _os.path.normcase(_os.path.abspath(folder)) if folder else ""
+
+    def _under_root(path: str) -> bool:
+        if not root:
+            return True
+        try:
+            resolved = _os.path.normcase(_os.path.abspath(path))
+            return _os.path.commonpath([root, resolved]) == root
+        except (OSError, ValueError):
+            return False
+
+    with _idx._db_lock:
+        rows = conn.execute(
+            "SELECT filepath, COALESCE(size_bytes, 0) FROM videos "
+            "WHERE channel=? COLLATE NOCASE", (channel,)).fetchall()
+
+    checked = 0
+    total_bytes = 0
+    updates = []
+    for filepath, old_size in rows:
+        filepath = (filepath or "").strip()
+        if not filepath or not _under_root(filepath):
+            continue
+        try:
+            size = int(_os.stat(filepath).st_size)
+        except OSError:
+            continue
+        checked += 1
+        total_bytes += size
+        if size != int(old_size or 0):
+            updates.append((size, filepath))
+
+    cleared = 0
+    with _idx._db_lock:
+        if updates:
+            conn.executemany(
+                "UPDATE videos SET size_bytes=? "
+                "WHERE filepath=? COLLATE NOCASE", updates)
+        # A repaired bad ID can leave its formerly paired row carrying an
+        # obsolete duplicate marker. Clear only IDs now represented by one
+        # row; genuine duplicate downloads remain flagged.
+        cur = conn.execute(
+            "UPDATE videos SET is_duplicate_of=NULL "
+            "WHERE channel=? COLLATE NOCASE "
+            "AND is_duplicate_of IS NOT NULL "
+            "AND video_id IS NOT NULL AND video_id != '' "
+            "AND (SELECT COUNT(*) FROM videos AS siblings "
+            "     WHERE siblings.video_id=videos.video_id)=1",
+            (channel,))
+        cleared = max(0, cur.rowcount or 0)
+        if updates or cleared:
+            conn.commit()
+    if updates or cleared:
+        _idx.invalidate_channel_videos(channel)
+    return {"checked": checked, "updated": len(updates),
+            "bytes": total_bytes,
+            "duplicate_markers_cleared": cleared}
+
+
 def prune_missing_videos() -> dict[str, int]:
     """Delete stale/phantom video rows from the DB. Cleanup categories:
 

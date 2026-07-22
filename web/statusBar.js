@@ -23,6 +23,7 @@
   let _state = { sync: {}, gpu: {} };
   const _indicator = { sweep: "" };
   let _errorCount = 0;
+  let _errorItems = [];
 
   function _runningItem(list) {
     for (const t of (list || [])) {
@@ -105,6 +106,77 @@
     if (errCount) errCount.textContent = String(_errorCount);
   }
 
+  function _renderErrorsPopover() {
+    const body = document.getElementById("gsb-errors-body");
+    if (!body) return;
+    body.replaceChildren();
+    if (!_errorItems.length) {
+      const empty = document.createElement("div");
+      empty.className = "queue-empty";
+      empty.textContent = "No errors this session.";
+      body.appendChild(empty);
+      return;
+    }
+    for (const item of [..._errorItems].reverse()) {
+      const row = document.createElement("div");
+      row.className = "gsb-error-item";
+      const dot = document.createElement("span");
+      dot.className = "gsb-error-item-dot";
+      dot.textContent = "!";
+      const text = document.createElement("span");
+      text.className = "gsb-error-item-text";
+      text.textContent = item;
+      row.append(dot, text);
+      body.appendChild(row);
+    }
+  }
+
+  function _positionErrorsPopover(pop, anchor) {
+    const br = anchor.getBoundingClientRect();
+    pop.style.visibility = "hidden";
+    pop.style.display = "flex";
+    const pr = pop.getBoundingClientRect();
+    pop.style.display = "";
+    pop.style.visibility = "";
+    let left = Math.max(8, br.right - pr.width);
+    if (left + pr.width > window.innerWidth - 8) {
+      left = Math.max(8, window.innerWidth - pr.width - 8);
+    }
+    let top = br.top - pr.height - 6;
+    if (top < 8) {
+      top = Math.min(window.innerHeight - pr.height - 8, br.bottom + 6);
+    }
+    pop.style.left = left + "px";
+    pop.style.top = Math.max(8, top) + "px";
+  }
+
+  function _closeErrorsPopover() {
+    document.getElementById("popover-session-errors")
+      ?.classList.remove("open");
+    document.getElementById("gsb-errors")
+      ?.setAttribute("aria-expanded", "false");
+  }
+
+  function _toggleErrorsPopover(anchor) {
+    const pop = document.getElementById("popover-session-errors");
+    if (!pop || !anchor) return;
+    const wasOpen = pop.classList.contains("open");
+    document.querySelectorAll(".queue-popover.open")
+      .forEach(p => p.classList.remove("open"));
+    document.getElementById("btn-sync-tasks")
+      ?.setAttribute("aria-expanded", "false");
+    document.getElementById("btn-gpu-tasks")
+      ?.setAttribute("aria-expanded", "false");
+    if (wasOpen) {
+      anchor.setAttribute("aria-expanded", "false");
+      return;
+    }
+    _renderErrorsPopover();
+    _positionErrorsPopover(pop, anchor);
+    pop.classList.add("open");
+    anchor.setAttribute("aria-expanded", "true");
+  }
+
   // Count newly-appended error lines in the main log. Decoupled from
   // logs.js internals via a MutationObserver so nothing there changes.
   // Gated: counting only goes live ~2.5s after init so the initial log
@@ -126,7 +198,20 @@
       for (const m of muts) {
         for (const n of m.addedNodes) if (isErr(n)) added++;
       }
-      if (added) { _errorCount += added; _render(); }
+      if (added) {
+        for (const m of muts) {
+          for (const n of m.addedNodes) {
+            if (!isErr(n)) continue;
+            const text = String(n.textContent || "").trim();
+            if (text) _errorItems.push(text);
+          }
+        }
+        // Bound session-only UI memory without changing the visible count.
+        if (_errorItems.length > 500) _errorItems = _errorItems.slice(-500);
+        _errorCount += added;
+        _renderErrorsPopover();
+        _render();
+      }
     });
     obs.observe(log, { childList: true });
     if (window._trackBootObserver) window._trackBootObserver(obs);
@@ -173,22 +258,45 @@
       e.stopPropagation();
       window.toggleQueuePopover?.("gpu", e.currentTarget);
     });
-    // Log button + error segment jump to the Download tab (home of the
-    // full activity log) and scroll it to the newest line.
+    // Log button jumps to the full log. The error segment opens a compact
+    // session list; opening it does not acknowledge or erase anything.
     const gotoLog = () => {
       document.querySelector('.tab[data-tab="download"]')?.click();
       const log = document.getElementById("main-log");
       if (log) log.scrollTop = log.scrollHeight;
     };
     document.getElementById("gsb-log-btn")?.addEventListener("click", gotoLog);
-    document.getElementById("gsb-errors")?.addEventListener("click", () => {
-      // Viewing the log "acknowledges" the errors — reset the counter.
+    const errorBtn = document.getElementById("gsb-errors");
+    errorBtn?.setAttribute("aria-expanded", "false");
+    errorBtn?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      _toggleErrorsPopover(e.currentTarget);
+    });
+    document.getElementById("gsb-errors-clear")?.addEventListener("click", () => {
       _errorCount = 0;
-      gotoLog();
+      _errorItems = [];
+      _renderErrorsPopover();
       _render();
+      _closeErrorsPopover();
+    });
+    document.addEventListener("click", () => {
+      if (!document.getElementById("popover-session-errors")
+          ?.classList.contains("open")) {
+        errorBtn?.setAttribute("aria-expanded", "false");
+      }
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") _closeErrorsPopover();
+    });
+    window.addEventListener("resize", () => {
+      const pop = document.getElementById("popover-session-errors");
+      if (pop?.classList.contains("open") && errorBtn) {
+        _positionErrorsPopover(pop, errorBtn);
+      }
     });
 
     _wireErrorCounter();
+    _renderErrorsPopover();
     _render();
   }
 

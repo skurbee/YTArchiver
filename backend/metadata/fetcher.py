@@ -388,6 +388,7 @@ def fetch_single_video_metadata(channel: dict[str, Any],
             video_id,
             entry.get("view_count"),
             entry.get("like_count"),
+            entry.get("upload_date"),
         )])
     except Exception as e:
         swallow("single metadata stats update", e)

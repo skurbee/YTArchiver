@@ -566,7 +566,7 @@
         const mismatch = res.mismatch || 0;
         const total = res.total || 0;
         if (mismatch === 0) {
-          window._showToast?.(`All ${total} video(s) already at ${target}p or higher.`, "ok");
+          window._showToast?.(`All ${total} video(s) already at ${target}p.`, "ok");
           return;
         }
         const lab = target === "best" ? "Best quality" : `${target}p`;

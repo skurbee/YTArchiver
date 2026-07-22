@@ -668,6 +668,48 @@
   font-family: var(--font-ui);
 }
 .queue-popover.open { display: flex; }
+.gsb-errors-popover {
+  width: min(560px, calc(100vw - 16px));
+  min-width: min(420px, calc(100vw - 16px));
+}
+.gsb-errors-body {
+  max-height: 300px;
+  padding: 0;
+}
+.gsb-error-item {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 7px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--c-border);
+  font-family: var(--font-log);
+  font-size: var(--fs-sm);
+  line-height: 1.35;
+}
+.gsb-error-item:last-child { border-bottom: none; }
+.gsb-error-item-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  margin-top: 1px;
+  border-radius: 50%;
+  background: var(--c-cancel);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+}
+.gsb-error-item-text {
+  min-width: 0;
+  color: var(--c-log-red);
+  white-space: normal;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.gsb-errors-popover .queue-popover-footer {
+  justify-content: flex-end;
+}
 .queue-popover-header {
   display: flex;
   align-items: center;

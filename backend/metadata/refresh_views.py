@@ -756,7 +756,8 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 try:
                     from .. import index as _idx_db
                     _idx_db.update_video_stats(
-                        [(vid, e.get("view_count"), e.get("like_count"))
+                        [(vid, e.get("view_count"), e.get("like_count"),
+                          e.get("upload_date"))
                          for vid, e in entries.items() if vid])
                 except Exception as _se:
                     _log.debug("index stats mirror failed: %s", _se)

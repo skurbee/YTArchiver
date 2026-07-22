@@ -746,7 +746,10 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         # instead).
         "--retries", "3",
         "--socket-timeout", "15",
-        "--mtime", # file mtime = YT upload date (matches original)
+        # Preserve the server's Last-Modified time for archive compatibility.
+        # This is not necessarily the public upload date; DLTRACK's
+        # `upload_date` is what the Browse catalog uses.
+        "--mtime",
         # --continue lets yt-dlp resume a partial .part
         # file if the app crashes or is restarted mid-download.
         # Without this flag, a restart discards the partial and
@@ -1937,7 +1940,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                 final_path, name, t,
                                 tx_status="pending" if auto_tx else "no_captions",
                                 video_id=vid,
-                                duration_secs=_dur_val)
+                                duration_secs=_dur_val,
+                                upload_date=(ud or "").strip())
                         except Exception as _re:
                             errors += 1
                             stream.emit([

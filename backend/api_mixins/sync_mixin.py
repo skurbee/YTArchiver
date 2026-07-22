@@ -787,140 +787,44 @@ class SyncMixin:
     def sync_one_channel(self, identity):
         """Sync just one channel (used by context-menu 'Sync now').
 
-        if a sync is already running, enqueue this channel
-        on the existing sync worker rather than erroring out. The user
-        expects right-click → Sync now to "just add it to the queue"
-        whether or not sync is idle.
+        Always enqueue the channel and drain it through sync_all so the same
+        pause, restart, and recovery semantics apply whether the lane is idle
+        or already running.
         """
         ch = subs_backend.get_channel(identity or {})
         if not ch:
             return {"ok": False, "error": "Channel not found"}
-        if self.sync_is_running():
-            # Hand off to the live sync worker as a queued item. The
-            # worker picks up new channels off self._queues.sync between
-            # current passes.
-            try:
-                added = bool(self._queues.sync_enqueue(ch))
-            except Exception as e:
-                return {"ok": False, "error": f"Could not queue: {e}"}
-            try: self._on_queue_changed()
-            except Exception as e: _log.debug("swallowed: %s", e)
-            ch_name = ch.get("name") or ch.get("folder", "")
-            return {"ok": True, "queued": added, "name": ch_name}
-        if not sync_backend.find_yt_dlp():
+        # Always put single-channel work through QueueState + sync_all.  The
+        # former idle fast path below launched sync_channel directly, so a
+        # pause-interrupted new-channel bootstrap had no pending queue entry
+        # to persist and restore after an app/computer restart.
+        already_running = self.sync_is_running()
+        if not already_running and not sync_backend.find_yt_dlp():
             return {"ok": False, "error": "yt-dlp not found"}
-        self._sync_cancel.clear()
-        self._sync_pause.clear()
         ch_name = ch.get("name") or ch.get("folder", "")
         try:
-            if getattr(self, "_tray", None):
-                self._tray.start_spin("blue")
-                self._tray.set_tooltip(f"YTArchiver \u2014 Syncing {ch_name}")
+            added = bool(self._queues.sync_enqueue(ch))
         except Exception as e:
-            _log.debug("swallowed: %s", e)
-        def _run():
-            # Mirror sync_start_all's visual framing for single-channel
-            # syncs: start-of-pass header, [1/1] live row, sync_channel
-            # call, [1/1] done row, end-of-pass footer. Without this the
-            # manual "Sync now" flow silently ran and the user never saw
-            # the usual "[1/1] Name — no new videos" line they expected.
-            import time as _t
+            return {"ok": False, "error": f"Could not queue: {e}"}
+        try: self._on_queue_changed()
+        except Exception as e: _log.debug("swallowed: %s", e)
 
-            from backend.sync import (
-                _ROW_EMIT_PASS_ID,
-                _fmt_duration,
-                _new_pass_id,
-                _short_summary,
-                _sync_row_emit,
-            )
-            # Unique pass id so this channel's [1/1] row doesn't replace
-            # a prior pass's [1/1] row in the scrollback (same bug class
-            # as the autorun sync_all collision).
-            _ROW_EMIT_PASS_ID.id = _new_pass_id()
-            t0 = _t.time()
-            try:
-                self._log_stream.emit([
-                    ["=== Sync pass starting ", "header"],
-                    ["(1 channel) ===\n", "header"],
-                ])
-                _sync_row_emit(self._log_stream, 1, 1, ch_name)
-                quick_no_new = self._sync_quick_check_no_new_channel(ch)
-                if quick_no_new:
-                    res = {"downloaded": 0, "errors": 0}
-                else:
-                    res = sync_backend.sync_channel(
-                        ch, self._log_stream, self._sync_cancel,
-                        queues=self._queues,
-                        transcribe_mgr=self._transcribe,
-                        pause_event=self._sync_pause,
-                        pass_idx=1, pass_total=1,
-                    ) or {}
-                _dl = int(res.get("downloaded", 0) or 0)
-                _err = int(res.get("errors", 0) or 0)
-                _sync_row_emit(
-                    self._log_stream, 1, 1, ch_name,
-                    summary=("no new videos" if quick_no_new
-                             else _short_summary(_dl, _err)),
-                    name_tag="simpleline_green" if _dl > 0 else "simpleline",
-                    summary_tag="simpleline_green" if _dl > 0 else "dim",
-                )
-                self._log_stream.emit([
-                    ["\n=== Pass complete: ", "header"],
-                    [f"{_dl} downloaded \u00b7 {_err} errors \u00b7 took "
-                     f"{_fmt_duration(_t.time() - t0)} ===\n", "header"],
-                ])
-            except Exception as e:
-                self._log_stream.emit_error(f"Sync crashed: {e}")
-            finally:
-                try: _ROW_EMIT_PASS_ID.id = ""
-                except Exception as e: _log.debug("swallowed: %s", e)
-                try:
-                    if getattr(self, "_tray", None):
-                        self._tray.stop_spin()
-                        self._tray.set_tooltip("YTArchiver \u2014 Idle")
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-                # Clear stale sync-progress. Single-channel sync was the
-                # bug path — sync_channel writes progress but never cleared
-                # on its own, leaving a companion display stuck on the
-                # Sync screen. (OLD's _clear_sync_progress; YTArchiver.py:19671)
-                try: sync_backend.clear_sync_progress()
-                except Exception as e: _log.debug("swallowed: %s", e)
-                self._log_stream.flush()
-                self._on_queue_changed()
-                # Refresh the in-memory config snapshot + the Subs table so the
-                # just-synced channel's row shows the fresh last_sync / # Vids
-                # instead of staying "Never" / "—". Mirrors sync_start_all,
-                # which reloads config at completion (line ~206); single-channel
-                # "Sync now" previously skipped this, leaving the row stale
-                # until a full Sync Subbed or an app restart.
-                try: self._reload_config()
-                except Exception as e: _log.debug("swallowed: %s", e)
-                try:
-                    if self._window is not None:
-                        self._window.evaluate_js(
-                            "if (window.refreshSubsTable) "
-                            "window.refreshSubsTable();")
-                except Exception as e: _log.debug("swallowed: %s", e)
-                # Reset autorun countdown so it doesn't keep showing
-                # "Syncing..." now that this single-channel sync finished.
-                try: self._autorun.notify_sync_done()
-                except Exception as e: _log.debug("swallowed: %s", e)
-                # Delayed second push so the Sync Tasks icon stops
-                # blinking after a single-channel sync finishes
-                # (same rationale as sync_start_all's fix).
-                try: threading.Timer(0.5, self._on_queue_changed).start()
-                except Exception as e: _log.debug("swallowed: %s", e)
-        if not self._start_sync_thread_locked(_run):
-            # Another start path won the race after our optimistic
-            # is-running check. Queue this channel on the live worker
-            # instead of overwriting _sync_thread with a second thread.
-            try:
-                added = bool(self._queues.sync_enqueue(ch))
-            except Exception as e:
-                return {"ok": False, "error": f"Could not queue: {e}"}
-            try: self._on_queue_changed()
-            except Exception as e: _log.debug("swallowed: %s", e)
-            return {"ok": True, "queued": added, "name": ch_name}
-        self._on_queue_changed()
-        return {"ok": True, "started": True}
+        # A live worker will pick the task up between queue iterations.
+        if already_running or self.sync_is_running():
+            return {"ok": True, "queued": added, "started": False,
+                    "name": ch_name}
+
+        # Respect a deliberately paused/restored queue. The task is now
+        # durable and remains visible until the user resumes it.
+        if bool(self._queues.sync_paused):
+            return {"ok": True, "queued": added, "started": False,
+                    "paused": True, "name": ch_name}
+
+        started = self.sync_start_all(add_downloads_from_config=False)
+        if not started or not started.get("ok"):
+            return {"ok": False,
+                    "error": ((started or {}).get("error")
+                              or "Sync could not be started"),
+                    "queued": added, "name": ch_name}
+        return {"ok": True, "queued": added, "started": True,
+                "name": ch_name}

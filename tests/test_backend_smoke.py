@@ -4957,6 +4957,140 @@ class RedownloadTests(unittest.TestCase):
         self.assertIn("720p", reason)
         self.assertIn("1080p", reason)
 
+    def test_refusal_allows_intentional_downsize_to_selected_target(self) -> None:
+        self.assertEqual(
+            redownload._redownload_refusal_reason(720, 360, 360), "")
+        reason = redownload._redownload_refusal_reason(720, 240, 360)
+        self.assertIn("selected target is 360p", reason)
+
+    def test_already_at_target_requires_selected_rung(self) -> None:
+        with mock.patch.object(redownload, "_ffprobe_media_info",
+                               return_value=(1280, 720, None)):
+            self.assertFalse(redownload._already_at_target("video.mp4", "360"))
+        with mock.patch.object(redownload, "_ffprobe_media_info",
+                               return_value=(640, 358, None)):
+            self.assertTrue(redownload._already_at_target("video.mp4", "360"))
+
+    def test_already_at_target_rejects_wrong_embedded_identity(self) -> None:
+        with mock.patch.object(redownload, "_ffprobe_media_info",
+                               return_value=(640, 360, "wrong_id001")):
+            self.assertFalse(redownload._already_at_target(
+                "video.mp4", "360", "right_id001"))
+
+    def test_resolution_rung_accepts_ultrawide_360p(self) -> None:
+        self.assertTrue(redownload._dimensions_match_target(640, 290, 360))
+        self.assertEqual(
+            redownload._redownload_refusal_reason(580, 290, 360, 640), "")
+
+    def test_match_handles_windows_sanitized_title_without_probe(self) -> None:
+        video_id = "LCQPEIDgVoQ"
+        local = {
+            "Ask GN 3： Cable Management？.mp4": "C:/archive/video.mp4",
+        }
+        meta = {
+            "by_title": {},
+            "by_date": {},
+            "by_id": {video_id: {
+                "title": "Ask GN 3: Cable Management?",
+                "upload_date": "20150907",
+            }},
+        }
+        with mock.patch.object(
+                redownload, "_ffprobe_embedded_video_id") as probe:
+            matched = redownload._match_files_to_ids(local, {}, meta)
+        self.assertEqual([row["video_id"] for row in matched], [video_id])
+        probe.assert_not_called()
+
+    def test_match_prefers_exact_archive_index_filepath(self) -> None:
+        video_id = "LCQPEIDgVoQ"
+        path = "C:/archive/Renamed locally.mp4"
+        local = {"Renamed locally.mp4": path}
+        filepath_ids = {redownload._path_key(path): video_id}
+        with mock.patch.object(
+                redownload, "_ffprobe_embedded_video_id") as probe:
+            matched = redownload._match_files_to_ids(
+                local, {}, filepath_to_id=filepath_ids)
+        self.assertEqual([row["video_id"] for row in matched], [video_id])
+        probe.assert_not_called()
+
+    def test_index_filepath_map_omits_one_id_bound_to_two_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            first = root / "First.mp4"
+            second = root / "Second.mp4"
+            db = root / "index.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE videos(filepath TEXT, video_id TEXT)")
+            conn.executemany(
+                "INSERT INTO videos(filepath, video_id) VALUES(?, ?)",
+                [(str(first), "abc123_def4"),
+                 (str(second), "abc123_def4")])
+            conn.commit()
+            conn.close()
+            with mock.patch("backend.ytarchiver_config.TRANSCRIPTION_DB", db):
+                result = redownload._build_index_filepath_map(str(root))
+        self.assertEqual(result, {})
+
+    def test_match_tolerates_dash_pipe_title_change(self) -> None:
+        local = {
+            "DOA： Pre-Built PC - Review.mp4": "C:/archive/video.mp4",
+        }
+        yt = {"DOA: Pre-Built PC | Review": "abc123_def4"}
+        with mock.patch.object(redownload, "_ffprobe_embedded_video_id") \
+                as probe:
+            matched = redownload._match_files_to_ids(local, yt)
+        self.assertEqual([row["video_id"] for row in matched],
+                         ["abc123_def4"])
+        probe.assert_not_called()
+
+    def test_redownload_size_refresh_restats_and_clears_stale_dup(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            video = root / "Video.mp4"
+            video.write_bytes(b"new-size")
+            conn = sqlite3.connect(":memory:")
+            conn.execute(
+                "CREATE TABLE videos(filepath TEXT, size_bytes INTEGER, "
+                "channel TEXT, is_duplicate_of TEXT, video_id TEXT)")
+            conn.execute(
+                "INSERT INTO videos VALUES(?, ?, ?, ?, ?)",
+                (str(video), 999, "Channel", "old-primary.mp4",
+                 "abc123_def4"))
+            conn.commit()
+            with mock.patch.object(index, "_open", return_value=conn), \
+                    mock.patch.object(index, "invalidate_channel_videos"):
+                result = index_maintenance.refresh_channel_file_sizes(
+                    "Channel", str(root))
+            row = conn.execute(
+                "SELECT size_bytes, is_duplicate_of FROM videos").fetchone()
+            conn.close()
+        self.assertEqual(row, (8, None))
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["duplicate_markers_cleared"], 1)
+
+    def test_scan_ignores_ytdlp_format_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "Video.mp4").write_bytes(b"video")
+            (root / "Video.f140.m4a").write_bytes(b"audio")
+            (root / "Video.f248.webm").write_bytes(b"video fragment")
+            scanned = redownload._scan_local_files(str(root))
+        self.assertEqual(set(scanned), {"Video.mp4"})
+
+    def test_match_uses_embedded_id_for_renamed_clean_filename(self) -> None:
+        video_id = "LCQPEIDgVoQ"
+        local = {"Completely renamed.mp4": "C:/archive/video.mp4"}
+        meta = {
+            "by_title": {}, "by_date": {},
+            "by_id": {video_id: {
+                "title": "Original title", "upload_date": "20150907",
+            }},
+        }
+        with mock.patch.object(redownload, "_ffprobe_embedded_video_id",
+                               return_value=video_id):
+            matched = redownload._match_files_to_ids(local, {}, meta)
+        self.assertEqual([row["video_id"] for row in matched], [video_id])
+
     def test_refusal_blocks_unprobeable_new_copy(self) -> None:
         reason = redownload._redownload_refusal_reason(1080, 0, 1080)
         self.assertIn("can't probe the new copy", reason)
@@ -5020,6 +5154,20 @@ class RedownloadTests(unittest.TestCase):
         self.assertEqual(done, {"done_video"})
         self.assertEqual(broken, {"broken_video": 2})
         self.assertFalse(legacy_exists)
+
+    def test_legacy_threshold_done_ids_are_revalidated(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "_redownload_progress.json").write_text(json.dumps({
+                "ch_url": "https://youtube.com/@example",
+                "resolution": "360",
+                "done_ids": ["falsely_skipped"],
+                "broken_counts": {"broken_video": 2},
+            }), encoding="utf-8")
+            done, broken = redownload._load_progress_state(
+                str(root), "https://youtube.com/@example", "360")
+        self.assertEqual(done, set())
+        self.assertEqual(broken, {"broken_video": 2})
 
     def test_progress_load_keeps_done_ids_after_resolution_switch(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -7113,6 +7261,53 @@ class DiskWatchTests(unittest.TestCase):
 
 
 class SyncMixinQueueTests(unittest.TestCase):
+    def test_sync_one_channel_routes_idle_work_through_persistent_queue(self) -> None:
+        api = sync_mixin.SyncMixin()
+        api._queues = mock.Mock(sync_paused=False)
+        api._queues.sync_enqueue.return_value = True
+        api._on_queue_changed = mock.Mock()
+        api.sync_is_running = mock.Mock(return_value=False)
+        api.sync_start_all = mock.Mock(return_value={"ok": True,
+                                                     "started": True})
+        channel = {"name": "Channel", "url": "https://example.test/ch"}
+
+        with mock.patch.object(sync_mixin.subs_backend, "get_channel",
+                               return_value=channel), \
+                mock.patch.object(sync_mixin.sync_backend, "find_yt_dlp",
+                                  return_value="yt-dlp"), \
+                mock.patch.object(sync_mixin.sync_backend, "sync_channel") as direct:
+            result = api.sync_one_channel({"name": "Channel"})
+
+        self.assertEqual(result, {
+            "ok": True, "queued": True, "started": True, "name": "Channel",
+        })
+        api._queues.sync_enqueue.assert_called_once_with(channel)
+        api.sync_start_all.assert_called_once_with(
+            add_downloads_from_config=False)
+        direct.assert_not_called()
+
+    def test_sync_one_channel_stays_queued_when_lane_is_paused(self) -> None:
+        api = sync_mixin.SyncMixin()
+        api._queues = mock.Mock(sync_paused=True)
+        api._queues.sync_enqueue.return_value = True
+        api._on_queue_changed = mock.Mock()
+        api.sync_is_running = mock.Mock(return_value=False)
+        api.sync_start_all = mock.Mock()
+        channel = {"name": "Channel", "url": "https://example.test/ch"}
+
+        with mock.patch.object(sync_mixin.subs_backend, "get_channel",
+                               return_value=channel), \
+                mock.patch.object(sync_mixin.sync_backend, "find_yt_dlp",
+                                  return_value="yt-dlp"):
+            result = api.sync_one_channel({"name": "Channel"})
+
+        self.assertEqual(result, {
+            "ok": True, "queued": True, "started": False,
+            "paused": True, "name": "Channel",
+        })
+        api._queues.sync_enqueue.assert_called_once_with(channel)
+        api.sync_start_all.assert_not_called()
+
     def test_gpu_clear_queue_clears_visible_pending_and_resume_state(self) -> None:
         api = sync_mixin.SyncMixin()
         api._queues = mock.Mock()
@@ -7646,6 +7841,39 @@ class IndexIngestTests(unittest.TestCase):
                 self.assertEqual(rows[0]["duration"], "2:05")
                 self._reset_index_module()
 
+    def test_register_video_prefers_upload_date_over_file_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "transcription_index.db"
+            video = Path(td) / "Scheduled Video.mp4"
+            video.write_bytes(b"video")
+            stale_mtime = datetime(2026, 7, 17, 21, 38).timestamp()
+            os.utime(video, (stale_mtime, stale_mtime))
+
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                self._reset_index_module()
+                self.assertTrue(index.register_video(
+                    str(video), "Channel", "Scheduled Video",
+                    video_id="sched123456", upload_date="20260719"))
+                row = index.list_all_videos(
+                    limit=1, include_thumbs=False)["rows"][0]
+
+                self.assertEqual(row["uploaded"], "2026-07-19")
+                self.assertNotEqual(row["upload_ts"], stale_mtime)
+
+                # Metadata refreshes also repair legacy/stale mtime-derived
+                # dates and invalidate the already-populated Browse cache.
+                conn = index._open()
+                conn.execute(
+                    "UPDATE videos SET upload_ts=? WHERE video_id=?",
+                    (stale_mtime, "sched123456"))
+                conn.commit()
+                self.assertEqual(index.update_video_stats([(
+                    "sched123456", None, None, "20260719")]), 1)
+                refreshed = index.list_all_videos(
+                    limit=1, include_thumbs=False)["rows"][0]
+                self.assertEqual(refreshed["uploaded"], "2026-07-19")
+                self._reset_index_module()
+
     def test_recent_config_backfills_catalog_download_timestamp(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "transcription_index.db"
@@ -7660,12 +7888,19 @@ class IndexIngestTests(unittest.TestCase):
                     "filepath": str(video),
                     "video_id": "leg12345678",
                     "download_ts": 321.5,
+                    "date": "20260719",
                 }])
                 self.assertEqual(result, {"updated": 1, "unmatched": 0})
                 conn = index._open()
                 self.assertEqual(conn.execute(
                     "SELECT downloaded_ts FROM videos WHERE filepath=?",
                     (str(video),)).fetchone()[0], 321.5)
+                repaired_upload = conn.execute(
+                    "SELECT upload_ts FROM videos WHERE filepath=?",
+                    (str(video),)).fetchone()[0]
+                self.assertEqual(
+                    datetime.fromtimestamp(repaired_upload).strftime("%Y%m%d"),
+                    "20260719")
                 # Idempotent: an older replay cannot move recency backwards.
                 result = index.backfill_downloaded_ts_from_recent([{
                     "filepath": str(video), "download_ts": 100,

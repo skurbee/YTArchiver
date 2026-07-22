@@ -1765,7 +1765,8 @@
     <span class="gsb-seg gsb-index" id="gsb-index" hidden></span>
     <div class="gsb-spacer"></div>
     <button type="button" class="gsb-seg gsb-errors" id="gsb-errors" hidden
-            title="Errors this session — click to view the log">
+            aria-haspopup="dialog" aria-controls="popover-session-errors"
+            title="Errors this session — click for details">
       <span id="gsb-errors-count">0</span> errors
     </button>
     <button type="button" class="gsb-seg gsb-log-btn" id="gsb-log-btn"
@@ -1830,6 +1831,21 @@
       <div class="spacer"></div>
       <button class="icon-btn-slim" id="btn-manual-transcribe"
               title="Manual Transcription">&#128193;</button>
+    </div>
+  </div>
+
+  <!-- Session errors popover, opened from the global bottom status bar. -->
+  <div class="queue-popover gsb-errors-popover" id="popover-session-errors"
+       role="dialog" aria-label="Session errors">
+    <div class="queue-popover-header">
+      <span class="queue-popover-title">Session errors</span>
+    </div>
+    <div class="queue-popover-body gsb-errors-body" id="gsb-errors-body">
+      <div class="queue-empty">No errors this session.</div>
+    </div>
+    <div class="queue-popover-footer">
+      <button type="button" class="queue-btn queue-btn-cancel"
+              id="gsb-errors-clear">Clear</button>
     </div>
   </div>
   <!-- Settings moved to a top-level tab (#panel-settings). The old modal

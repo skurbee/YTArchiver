@@ -65,6 +65,42 @@
         }
       }
     };
+
+    // A cold Windows sign-in occasionally leaves graphTab.js unloaded even
+    // though its classic <script> tag appears before app.js.  Do not leave the
+    // Graph controls dead for the whole session: retry that one self-contained
+    // module with a unique URL, then initialize it as soon as it publishes its
+    // back-compat global.  The retry is asynchronous so the rest of boot stays
+    // usable; a warning is shown only if recovery itself fails.
+    let _graphRetryPending = false;
+    if (typeof window.initGraphView !== "function") {
+      _graphRetryPending = true;
+      const retry = document.createElement("script");
+      const retryUrl = new URL("graphTab.js?v=1", document.baseURI);
+      retryUrl.searchParams.set("boot-retry", String(Date.now()));
+      retry.src = retryUrl.href;
+      retry.dataset.bootRetry = "graphTab";
+      retry.onload = () => {
+        _graphRetryPending = false;
+        if (typeof window.initGraphView === "function") {
+          _safe("initGraphView", () => window.initGraphView());
+        } else {
+          window._reportBootIssue?.(
+            "initGraphView",
+            "graphTab.js loaded on retry but did not publish initGraphView.",
+          );
+        }
+      };
+      retry.onerror = () => {
+        _graphRetryPending = false;
+        window._reportBootIssue?.(
+          "initGraphView",
+          "graphTab.js failed to load, including the automatic startup retry; related UI controls may not work.",
+        );
+      };
+      document.head.appendChild(retry);
+    }
+
     const _expectedBootFns = [
       "initTabs",
       "initGlobalDefocus",
@@ -119,6 +155,7 @@
     ];
     for (const fnName of _expectedBootFns) {
       if (typeof window[fnName] !== "function") {
+        if (fnName === "initGraphView" && _graphRetryPending) continue;
         window._reportBootIssue?.(
           fnName,
           `${fnName} is not loaded; related UI controls may not work.`,

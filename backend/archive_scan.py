@@ -119,7 +119,9 @@ def save_disk_cache(cache: dict[str, dict[str, Any]]) -> bool:
         return False
 
 
-def update_disk_cache_for_channel(channel: dict[str, Any]) -> dict[str, Any]:
+def update_disk_cache_for_channel(channel: dict[str, Any],
+                                  force_filesystem: bool = False
+                                  ) -> dict[str, Any]:
     """Re-walk the channel folder, update its cache entry, save, and return
     the new stats. Mirrors YTArchiver.py:3136 _update_disk_cache_for_channel.
     """
@@ -138,6 +140,8 @@ def update_disk_cache_for_channel(channel: dict[str, Any]) -> dict[str, Any]:
     # has no rows for this channel yet (brand-new / unindexed) or is down.
     n_vids = total_bytes = None
     try:
+        if force_filesystem:
+            raise LookupError("filesystem refresh requested")
         from . import index as _idx
         _conn = _idx._reader_open()
         if _conn is not None:
@@ -157,6 +161,8 @@ def update_disk_cache_for_channel(channel: dict[str, Any]) -> dict[str, Any]:
                         (_nm,)).fetchone()
                 if _row and _row[0]:
                     n_vids, total_bytes = int(_row[0]), int(_row[1])
+    except LookupError:
+        n_vids = total_bytes = None
     except Exception as e:
         _log.warning(
             "archive disk-cache DB fast path failed for %r; falling back "

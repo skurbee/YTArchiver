@@ -18,6 +18,7 @@ from backend.log import swallow
 from backend.ytarchiver_config import load_config
 from backend import subs as subs_backend
 from backend import index as index_backend
+from backend import archive_scan as archive_scan_backend
 from backend import reorg as reorg_backend
 from backend.transcribe import TranscribeManager
 
@@ -74,6 +75,24 @@ class MediaOpsMixin:
                     f"for new files...", "simpleline_blue")
                 self._log_stream.flush()
                 sweep = index_backend.sweep_new_videos(output_dir, channels)
+                # The size button promises a real folder-size rescan. Startup
+                # sweep deliberately skips stat calls for known paths, so it
+                # cannot notice in-place redownload replacements by itself.
+                self._log_stream.emit_text(
+                    "Rescan: refreshing actual video file sizes...",
+                    "simpleline_blue")
+                self._log_stream.flush()
+                _sizes_updated = 0
+                for _ch in channels:
+                    _name = (_ch.get("name") or _ch.get("folder") or "").strip()
+                    if not _name:
+                        continue
+                    _folder = os.path.join(output_dir, _name)
+                    _sr = index_backend.refresh_channel_file_sizes(
+                        _name, _folder)
+                    _sizes_updated += int(_sr.get("updated", 0))
+                    archive_scan_backend.update_disk_cache_for_channel(
+                        _ch, force_filesystem=not bool(_sr.get("checked")))
                 _agg = sweep.get("agg_ingested", 0)
                 _rec = sweep.get("tx_reconciled", 0)
                 self._log_stream.emit_text(
@@ -84,6 +103,8 @@ class MediaOpsMixin:
                        if _agg else "")
                     + (f"; {_rec} video(s) reconciled to transcribed"
                        if _rec else "")
+                    + (f"; {_sizes_updated} stored size(s) corrected"
+                       if _sizes_updated else "; folder sizes verified")
                     + ".",
                     "simpleline_green")
                 # Push a refresh signal to the frontend so the Browse

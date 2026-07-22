@@ -551,8 +551,8 @@
   // used by _browseState.videos. Shared by loadVideosFor and the live
   // download refresh (_refreshChannelVideosIfLoaded) so both stay identical.
   function _mapVideoRow(r, name) {
-    // Prefer the YouTube upload time (file mtime — yt-dlp --mtime) over the
-    // DB-insertion time. Falls back to added_ts when the file is missing.
+    // Prefer the YouTube upload date materialized by the backend over the
+    // DB-insertion time. Legacy/imported rows may still use file mtime.
     const epoch = r.upload_ts || r.added_ts || 0;
     return {
       title: r.title || "",

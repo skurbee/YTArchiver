@@ -40,8 +40,18 @@
             "Rescan")
         : Promise.resolve(true));
       if (!ok) return;
-      await bridgeCall("archive_rescan");
-      window._showToast?.("Archive rescan started \u2014 check the log.", "ok");
+      try {
+        const result = await bridgeCall("archive_rescan");
+        if (result?.started) {
+          window._showToast?.("Archive rescan started.", "ok");
+        } else if (result?.already_running) {
+          window._showToast?.("Archive rescan is already running.", "warn");
+        } else {
+          window._showToast?.(result?.error || "Rescan could not start.", "warn");
+        }
+      } catch (e) {
+        window._showToast?.(`Rescan failed to start: ${e}`, "error");
+      }
     });
   }
 

@@ -22,6 +22,8 @@
   let _queues = { sync: [], gpu: [] };
   let _state = { sync: {}, gpu: {} };
   const _indicator = { sweep: "" };
+  let _rescan = null;
+  let _rescanHideTimer = null;
   let _errorCount = 0;
   let _errorItems = [];
 
@@ -93,10 +95,42 @@
 
     // Index / sweep indicator.
     const idxEl = document.getElementById("gsb-index");
+    const idxText = document.getElementById("gsb-index-text");
+    const progress = document.getElementById("gsb-progress-track");
+    const fill = document.getElementById("gsb-progress-fill");
     if (idxEl) {
-      const txt = (_indicator.sweep || "").trim();
-      if (txt) { idxEl.hidden = false; idxEl.textContent = _truncate(txt, 46); }
-      else idxEl.hidden = true;
+      const rescanVisible = !!(_rescan && _rescan.phase !== "idle" &&
+        (_rescan.running || _rescan.message));
+      const txt = rescanVisible
+        ? (_rescan.message || "Archive rescan…")
+        : (_indicator.sweep || "").trim();
+      idxEl.hidden = !txt;
+      if (idxText) idxText.textContent = _truncate(txt, 58);
+      const showProgress = rescanVisible && _rescan.phase !== "error";
+      if (progress) {
+        const pct = Math.max(0, Math.min(100, Number(_rescan?.percent) || 0));
+        progress.hidden = !showProgress;
+        progress.setAttribute("aria-valuenow", String(pct));
+        if (fill) fill.style.width = `${pct}%`;
+      }
+    }
+
+    const rescanRunning = !!_rescan?.running;
+    for (const id of ["btn-scan-archive", "btn-idx-build"]) {
+      const btn = document.getElementById(id);
+      if (!btn) continue;
+      if (!btn.dataset.rescanIdleText) {
+        btn.dataset.rescanIdleText = btn.textContent;
+      }
+      btn.disabled = rescanRunning;
+      btn.textContent = rescanRunning
+        ? `Rescanning ${Math.max(0, Number(_rescan?.percent) || 0)}%…`
+        : btn.dataset.rescanIdleText;
+    }
+    const totalSize = document.getElementById("subs-total-size");
+    if (totalSize) {
+      totalSize.setAttribute("aria-busy", rescanRunning ? "true" : "false");
+      totalSize.classList.toggle("rescan-busy", rescanRunning);
     }
 
     // Session error count.
@@ -298,7 +332,36 @@
     _wireErrorCounter();
     _renderErrorsPopover();
     _render();
+
+    const hydrateRescan = async () => {
+      if (!window.YT?.bridge?.isUp?.()) return;
+      try {
+        const state = await window.YT.bridge.bridgeCall("archive_rescan_state");
+        if (state) window._onArchiveRescanProgress(state);
+      } catch (e) { /* best-effort state recovery */ }
+    };
+    hydrateRescan();
+    window.addEventListener("pywebviewready", hydrateRescan, { once: true });
   }
+
+  // Python pushes this after each completed channel in the scan and folder-
+  // size phases. It is defined at module load (before app boot) so the first
+  // update cannot race status-bar initialization.
+  window._onArchiveRescanProgress = function (state) {
+    _rescan = state && typeof state === "object" ? { ...state } : null;
+    if (_rescanHideTimer) {
+      clearTimeout(_rescanHideTimer);
+      _rescanHideTimer = null;
+    }
+    _render();
+    if (_rescan && !_rescan.running &&
+        ["complete", "error"].includes(_rescan.phase)) {
+      _rescanHideTimer = setTimeout(() => {
+        _rescan = null;
+        _render();
+      }, 8000);
+    }
+  };
 
   window.initStatusBar = initStatusBar;
 })();

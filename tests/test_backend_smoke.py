@@ -3692,6 +3692,20 @@ class AutorunTests(unittest.TestCase):
             "simpleline_dim",
         )
 
+    def test_fire_reports_specific_maintenance_skip_reason(self) -> None:
+        stream = mock.Mock()
+        trigger = mock.Mock(return_value={"started": True})
+        scheduler = autorun_backend.AutorunScheduler(
+            trigger, stream=stream,
+            sync_busy_fn=lambda: "an archive rescan")
+
+        scheduler._fire()
+
+        trigger.assert_not_called()
+        message = stream.emit_text.call_args.args[0]
+        self.assertIn("an archive rescan is running", message)
+        self.assertIn("next scheduled time", message)
+
     def test_format_log_time_uses_lowercase_non_padded_12_hour_time(self) -> None:
         self.assertEqual(
             autorun_backend._format_log_time(datetime(2026, 6, 16, 19, 0)),
@@ -5300,6 +5314,85 @@ class RedownloadMixinTests(unittest.TestCase):
 
 
 class MediaOpsMixinTests(unittest.TestCase):
+    def test_archive_rescan_rejects_duplicate_run(self) -> None:
+        class Api(MediaOpsMixin):
+            pass
+
+        api = Api()
+        api._archive_rescan_lock = threading.Lock()
+        api._archive_rescan_running = True
+        api._archive_rescan_progress = {
+            "running": True, "phase": "scan", "percent": 42,
+        }
+
+        with mock.patch("backend.api_mixins.media_ops_mixin"
+                        ".index_backend.is_db_writer_busy",
+                        return_value=False):
+            result = api.archive_rescan()
+
+        self.assertTrue(result["already_running"])
+        self.assertFalse(result["started"])
+        self.assertEqual(result["state"]["percent"], 42)
+
+    def test_archive_rescan_reports_real_progress_and_completion(self) -> None:
+        class Api(MediaOpsMixin):
+            def sync_is_running(self):
+                return False
+
+            def archive_single_is_running(self):
+                return False
+
+        class ImmediateThread:
+            def __init__(self, target, daemon=False, name=None):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        api = Api()
+        api._config = {
+            "output_dir": "X:/Archive",
+            "channels": [{"name": "One"}, {"name": "Two"}],
+        }
+        api._log_stream = mock.Mock()
+        api._window = mock.Mock()
+
+        def fake_sweep(output_dir, channels, progress_cb=None):
+            progress_cb(1, 2, "One")
+            progress_cb(2, 2, "Two")
+            return {"registered": 0, "ingested": 0,
+                    "agg_ingested": 0, "tx_reconciled": 0}
+
+        with mock.patch("backend.api_mixins.media_ops_mixin"
+                        ".index_backend.is_db_writer_busy",
+                        return_value=False), \
+                mock.patch("backend.api_mixins.media_ops_mixin"
+                           ".index_backend.prune_missing_videos",
+                           return_value={}), \
+                mock.patch("backend.api_mixins.media_ops_mixin"
+                           ".index_backend.sweep_new_videos",
+                           side_effect=fake_sweep), \
+                mock.patch("backend.api_mixins.media_ops_mixin"
+                           ".index_backend.refresh_channel_file_sizes",
+                           return_value={"checked": 1, "updated": 0}) as sizes, \
+                mock.patch("backend.api_mixins.media_ops_mixin"
+                           ".archive_scan_backend.update_disk_cache_for_channel"), \
+                mock.patch("backend.api_mixins.media_ops_mixin.threading.Thread",
+                           ImmediateThread):
+            result = api.archive_rescan()
+
+        self.assertTrue(result["started"])
+        state = api.archive_rescan_state()
+        self.assertFalse(state["running"])
+        self.assertEqual(state["phase"], "complete")
+        self.assertEqual(state["percent"], 100)
+        self.assertEqual(sizes.call_count, 2)
+        js_calls = [call.args[0] for call in api._window.evaluate_js.call_args_list]
+        self.assertTrue(any("_onArchiveRescanProgress" in js
+                            for js in js_calls))
+        self.assertTrue(any("_onArchiveRescanComplete" in js
+                            for js in js_calls))
+
     def test_reorg_cancel_sets_active_reorg_event(self) -> None:
         class Api(MediaOpsMixin):
             pass
@@ -6631,6 +6724,55 @@ class QueueMixinServicesTests(unittest.TestCase):
             pause_line[2],
             [" — Processing queue — current job will finish — click Resume.\n",
              "dim"])
+
+
+    def test_global_pause_does_not_duplicate_active_sync_pause_line(self) -> None:
+        service_queues = mock.Mock()
+        service_log = mock.Mock()
+        service_transcribe = mock.Mock()
+
+        class Api(QueueMixin):
+            def __init__(self):
+                self._sync_pause = threading.Event()
+                self._on_queue_changed = mock.Mock()
+                self.sync_is_running = mock.Mock(return_value=True)
+                self.services = AppServices(
+                    load_config=lambda: {},
+                    save_config=lambda cfg: True,
+                    queues=service_queues,
+                    log_stream=service_log,
+                    transcribe=service_transcribe,
+                    event_bus=mock.Mock(),
+                )
+
+        result = Api().queue_pause("both")
+
+        self.assertEqual(result, {"ok": True, "paused": "both"})
+        service_queues.set_sync_paused.assert_called_once_with(True)
+        service_queues.set_gpu_paused.assert_called_once_with(True)
+        service_transcribe.pause.assert_called_once_with()
+        service_log.emit.assert_not_called()
+
+
+class IndexWriterBusyTests(unittest.TestCase):
+    def test_reports_lock_owned_by_another_thread(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_lock():
+            with index._db_lock:
+                entered.set()
+                release.wait(timeout=2.0)
+
+        worker = threading.Thread(target=hold_lock, daemon=True)
+        worker.start()
+        self.assertTrue(entered.wait(timeout=1.0))
+        try:
+            self.assertTrue(index.is_db_writer_busy())
+        finally:
+            release.set()
+            worker.join(timeout=1.0)
+        self.assertFalse(index.is_db_writer_busy())
 
 
 class WindowMixinServicesTests(unittest.TestCase):

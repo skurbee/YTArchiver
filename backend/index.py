@@ -48,6 +48,31 @@ _tx_retry_thread: threading.Thread | None = None
 # Signature changes whenever the list length or newest completion changes;
 # live downloads update the catalog directly and also change that signature.
 _download_backfill_lock = threading.Lock()
+
+
+def is_db_writer_busy() -> bool:
+    """Return True when another thread currently owns the shared DB lock.
+
+    Autorun uses this as a last-moment safety gate.  A scheduled sync should
+    skip its interval instead of starting while maintenance is in a catalog
+    write/commit section and then appearing frozen behind ``_db_lock``.
+    Explicit long-running maintenance (for example archive rescan) also has
+    its own running flag because it may temporarily release this lock between
+    channel writes.
+    """
+    try:
+        acquired = _db_lock.acquire(blocking=False)
+    except Exception:
+        # If lock state cannot be established, fail safe for background work.
+        return True
+    if not acquired:
+        return True
+    try:
+        return False
+    finally:
+        _db_lock.release()
+
+
 _download_backfill_signature: tuple[int, float] | None = None
 
 

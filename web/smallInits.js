@@ -153,24 +153,47 @@
   // so the currently-open Browse grid refreshes to reflect pruned /
   // newly-registered rows. "I click Rescan, wait 5 minutes,
   // nothing changes in the program."
-  window._onArchiveRescanComplete = function () {
+  window._onArchiveRescanComplete = async function () {
     try {
       const _browseState = window._browseState || {};
+      let refreshedGrid = false;
       // If we're viewing a channel's video grid right now, re-query it.
       const ch = (_browseState.currentChannel) || null;
       if (ch && _browseState.view === "videos" &&
           typeof window._reloadCurrentChannelVideos === "function") {
-        window._reloadCurrentChannelVideos();
-        window._showToast?.("Archive rescan complete — grid refreshed.", "ok");
-        return;
+        try {
+          await window._reloadCurrentChannelVideos();
+          refreshedGrid = true;
+        } catch (e) { /* continue with the Subs refresh */ }
       }
       // Channel list view — reload the channel cards so per-channel
       // counts update.
       if (_browseState.view === "channels" &&
           typeof window._reloadChannelsGrid === "function") {
-        window._reloadChannelsGrid();
+        try {
+          await window._reloadChannelsGrid();
+          refreshedGrid = true;
+        } catch (e) { /* continue with the Subs refresh */ }
       }
-      window._showToast?.("Archive rescan complete.", "ok");
+      // Refresh Subs only after the worker has actually completed. The old
+      // size-click path refreshed immediately after launching the background
+      // thread, which simply repainted the stale cached total.
+      const bridgeCall = window.YT?.bridge?.bridgeCall;
+      if (bridgeCall) {
+        try {
+          const subsData = await bridgeCall("get_subs_channels");
+          if (Array.isArray(subsData) && subsData.length === 2 &&
+              typeof window.renderSubsTable === "function") {
+            window.renderSubsTable(subsData[0], subsData[1]);
+          }
+        } catch (e) { /* completion still needs to be surfaced */ }
+      }
+      const idxProgress = document.getElementById("idx-progress");
+      if (idxProgress) idxProgress.textContent = "Done.";
+      try { window._refreshIndexStats?.(); } catch (e) { /* noop */ }
+      window._showToast?.(refreshedGrid
+        ? "Archive rescan complete — view refreshed."
+        : "Archive rescan complete.", "ok");
     } catch (e) { /* noop */ }
   };
 

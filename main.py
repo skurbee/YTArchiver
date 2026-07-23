@@ -293,6 +293,24 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # below — read-modify-write under contention from multiple log
         # scanner threads (audit: HIGH H14).
         self._session_dl_count_lock = threading.Lock()
+        # Archive-rescan single-flight + live progress state.  The rescan
+        # mixin also lazy-initializes these for narrow test doubles, but the
+        # real Api owns them up front so simultaneous first bridge calls can
+        # never create competing locks.
+        self._archive_rescan_lock = threading.Lock()
+        self._archive_rescan_running = False
+        self._archive_rescan_progress = {
+            "running": False,
+            "phase": "idle",
+            "current": 0,
+            "total": 0,
+            "phase_current": 0,
+            "phase_total": 0,
+            "percent": 0,
+            "message": "",
+            "started_at": None,
+            "error": "",
+        }
         # Reentrant close-dialog guard — _on_closing's ask-path used
         # to spawn an unbounded thread per X click; flag here so
         # additional clicks while a dialog is pending no-op (audit:
@@ -485,11 +503,22 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # when sync is already running and (b) hold the countdown visible
         # at "Syncing..." until the current sync completes, matching
         # classic's _run_autorun + _schedule_autorun behavior.
+        def _autorun_busy_reason():
+            # Background autorun never competes with user-visible work or a
+            # catalog writer.  A rescan remains busy even while it temporarily
+            # releases _db_lock between channels.
+            if self.sync_is_running() or self.archive_single_is_running():
+                return "a download or sync"
+            if self.archive_rescan_is_running():
+                return "an archive rescan"
+            if index_backend.is_db_writer_busy():
+                return "database maintenance"
+            return ""
+
         self._autorun = autorun_backend.AutorunScheduler(
             sync_trigger=lambda: self.sync_start_all(),
             stream=self._log_stream,
-            sync_busy_fn=lambda: (self.sync_is_running()
-                                 or self.archive_single_is_running()),
+            sync_busy_fn=_autorun_busy_reason,
         )
         # v80 scheduled backups — daemon thread, no-op while the
         # Settings > Auto-backup cadence is "off". First check fires

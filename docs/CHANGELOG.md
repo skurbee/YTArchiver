@@ -6,6 +6,20 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v82.3 - 2026-07-22
+
+### Fixed
+- **Scheduled syncs no longer collide with archive maintenance.** Auto-sync skips the current interval when a rescan or another shared database writer is active, reports the reason, and tries again at the next normal interval instead of appearing frozen behind the database lock.
+- **Archive rescans are now single-flight and conflict-aware.** A second rescan is rejected cleanly, and manual rescans wait for active sync, download, or database work to finish before they can start.
+- **Archive rescans show real progress and refresh at the correct time.** The bottom status bar reports the current prune, channel-scan, and folder-size phase with a percentage; Browse, Subs totals, and Index stats refresh only after the background worker actually completes.
+- **Global Pause emits one clear status line.** When sync is active, the sync worker owns the pause announcement instead of also logging a duplicate Processing-queue pause line.
+
+### Validation
+- Backend smoke suite passed: 398 tests.
+- Focused autorun, database-lock, rescan-progress, and pause-log tests passed.
+- Frontend JavaScript syntax and generated HTML freshness checks passed.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
 ## v82.2 - 2026-07-22
 
 ### Fixed

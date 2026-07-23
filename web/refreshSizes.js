@@ -38,15 +38,18 @@
             { confirm: "Rescan" })
         : Promise.resolve(confirm("Rescan all channel folder sizes?")));
       if (!ok) return;
-      window._showToast?.("Rescanning archive folder sizes…", "ok");
       try {
-        await bridgeCall("archive_rescan");
-        // After rescan completes, refresh the Subs table so totals update.
-        const subsData = await bridgeCall("get_subs_channels");
-        if (Array.isArray(subsData) && subsData.length === 2) {
-          window.renderSubsTable(subsData[0], subsData[1]);
+        const result = await bridgeCall("archive_rescan");
+        if (result?.started) {
+          window._showToast?.("Rescanning archive folder sizes…", "ok");
+        } else if (result?.already_running) {
+          window._showToast?.("Archive rescan is already running.", "warn");
+        } else {
+          window._showToast?.(result?.error || "Rescan could not start.", "warn");
         }
-      } catch (e) { window._showToast?.("Rescan failed.", "error"); }
+      } catch (e) {
+        window._showToast?.(`Rescan failed to start: ${e}`, "error");
+      }
     });
   }
 

@@ -58,10 +58,11 @@ class AutorunScheduler:
     def __init__(self,
                  sync_trigger: Callable[[], None],
                  stream=None,
-                 sync_busy_fn: Callable[[], bool] | None = None):
+                 sync_busy_fn: Callable[[], bool | str] | None = None):
         self._sync_trigger = sync_trigger
         self._stream = stream
-        # Optional callable: returns True if a sync is currently running.
+        # Optional callable: returns True (or a short reason string) if work
+        # that must not overlap an autorun sync is currently running.
         # Used to postpone a fire (classic _sync_pipeline_busy) AND to
         # hold the countdown visible-but-paused via get_state().
         self._sync_busy_fn = sync_busy_fn
@@ -230,28 +231,34 @@ class AutorunScheduler:
         self._timer = t
 
     def _fire(self):
-        """Interval timer fired. Postpone 60s if sync is already running,
-        otherwise kick a sync and enter "waiting for completion" state
-        (countdown held until notify_sync_done() is called).
+        """Interval timer fired. Skip to the next interval if conflicting
+        work is active; otherwise kick a sync and enter the
+        "waiting for completion" state (held until notify_sync_done()).
         """
-        # If a sync is already running, defer 60s. Classic's
+        # If conflicting work is already running, skip this interval. Classic's
         # `_sync_pipeline_busy()` check at YTArchiver.py:22769 — without
         # this, autorun calls sync_start_all which errors out and the
         # timer never re-arms correctly.
         # if no busy-fn was wired, treat as "busy" (safer
         # default than "not busy", which could double-launch Sync
         # Subbed if autorun fires while a manual pass is still running).
+        busy_reason = ""
         if self._sync_busy_fn is None:
             busy = True
         elif self._sync_busy_fn:
-            try: busy = bool(self._sync_busy_fn())
+            try:
+                _busy_value = self._sync_busy_fn()
+                busy = bool(_busy_value)
+                if isinstance(_busy_value, str):
+                    busy_reason = _busy_value.strip()
             except Exception: busy = False
         else:
             busy = False
         if busy:
             if self._stream:
+                subject = busy_reason or "a download or sync"
                 self._stream.emit_text(
-                    "\u2014 Autorun: a download or sync is running \u2014 skipping "
+                    f"\u2014 Autorun: {subject} is running \u2014 skipping "
                     "this run; will run at the next scheduled time.",
                     "simpleline_dim")
             with self._lock:

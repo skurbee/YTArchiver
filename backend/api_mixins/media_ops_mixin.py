@@ -25,6 +25,80 @@ from backend.transcribe import TranscribeManager
 
 class MediaOpsMixin:
 
+    def _ensure_archive_rescan_state(self):
+        """Initialize rescan state for narrow mixin-only test doubles."""
+        if not hasattr(self, "_archive_rescan_lock"):
+            self._archive_rescan_lock = threading.Lock()
+        if not hasattr(self, "_archive_rescan_running"):
+            self._archive_rescan_running = False
+        if not hasattr(self, "_archive_rescan_progress"):
+            self._archive_rescan_progress = {
+                "running": False,
+                "phase": "idle",
+                "current": 0,
+                "total": 0,
+                "phase_current": 0,
+                "phase_total": 0,
+                "percent": 0,
+                "message": "",
+                "started_at": None,
+            }
+
+    def archive_rescan_state(self):
+        """Return a thread-safe snapshot for the status bar / diagnostics."""
+        self._ensure_archive_rescan_state()
+        with self._archive_rescan_lock:
+            return dict(self._archive_rescan_progress)
+
+    def archive_rescan_is_running(self):
+        self._ensure_archive_rescan_state()
+        with self._archive_rescan_lock:
+            return bool(self._archive_rescan_running)
+
+    def _push_archive_rescan_progress(self, state):
+        window = getattr(self, "_window", None)
+        if window is None:
+            return
+        try:
+            payload = json.dumps(state, ensure_ascii=False)
+            window.evaluate_js(
+                "if (window._onArchiveRescanProgress) "
+                f"window._onArchiveRescanProgress({payload});")
+        except Exception as e:
+            swallow("rescan-progress JS callback", e)
+
+    def _set_archive_rescan_progress(
+            self, *, running=None, phase=None, current=None, total=None,
+            phase_current=None, phase_total=None, message=None,
+            started_at=None, error=None):
+        self._ensure_archive_rescan_state()
+        with self._archive_rescan_lock:
+            state = self._archive_rescan_progress
+            updates = {
+                "running": running,
+                "phase": phase,
+                "current": current,
+                "total": total,
+                "phase_current": phase_current,
+                "phase_total": phase_total,
+                "message": message,
+                "started_at": started_at,
+                "error": error,
+            }
+            for key, value in updates.items():
+                if value is not None:
+                    state[key] = value
+            try:
+                cur = max(0, int(state.get("current") or 0))
+                tot = max(0, int(state.get("total") or 0))
+                state["percent"] = min(100, round(cur * 100 / tot)) \
+                    if tot else 0
+            except Exception:
+                state["percent"] = 0
+            snapshot = dict(state)
+        self._push_archive_rescan_progress(snapshot)
+        return snapshot
+
     def archive_rescan(self):
         """Run the startup disk-sweep on demand — picks up files added
         manually or while the app was offline. Also prunes DB entries
@@ -32,13 +106,74 @@ class MediaOpsMixin:
         any yt-dlp intermediate rows that got indexed before the
         `.fNNN-X` filter landed).
         """
+        self._ensure_archive_rescan_state()
+
+        # Manual maintenance should not be allowed to create the reverse of
+        # the autorun collision: if a sync/download or another catalog writer
+        # is active, leave it alone and ask the user to retry later.
+        for method_name in ("sync_is_running", "archive_single_is_running"):
+            try:
+                method = getattr(self, method_name, None)
+                if callable(method) and method():
+                    return {"ok": False, "started": False, "busy": True,
+                            "error": "A sync or download is running. "
+                                     "Wait for it to finish before rescanning."}
+            except Exception:
+                pass
+        try:
+            if index_backend.is_db_writer_busy():
+                return {"ok": False, "started": False, "busy": True,
+                        "error": "Database maintenance is active. "
+                                 "Try the rescan again when it finishes."}
+        except Exception:
+            # Old/test index shims may not expose the advisory helper.
+            pass
+
+        with self._archive_rescan_lock:
+            if self._archive_rescan_running:
+                return {"ok": True, "started": False,
+                        "already_running": True,
+                        "state": dict(self._archive_rescan_progress)}
+            self._archive_rescan_running = True
+            _started_at = time.time()
+            self._archive_rescan_progress = {
+                "running": True,
+                "phase": "starting",
+                "current": 0,
+                "total": 0,
+                "phase_current": 0,
+                "phase_total": 0,
+                "percent": 0,
+                "message": "Rescan: starting…",
+                "started_at": _started_at,
+                "error": "",
+            }
+            _initial_state = dict(self._archive_rescan_progress)
+        self._push_archive_rescan_progress(_initial_state)
+
         def _run():
+            _success = False
+            _failure = ""
+            _work_total = 1
+            _channel_total = 0
             try:
                 cfg = self._config or load_config()
                 output_dir = (cfg.get("output_dir") or "").strip()
                 if not output_dir:
-                    self._log_stream.emit_error("No output_dir configured.")
+                    _failure = "No output_dir configured."
+                    self._log_stream.emit_error(_failure)
                     return
+                channels = cfg.get("channels", [])
+                _channel_total = len(channels)
+                # One unit for prune, then one per channel for sweep and size
+                # verification.  This keeps the visible bar monotonic across
+                # all three phases rather than resetting to 0% twice.
+                _work_total = max(1, 1 + (2 * _channel_total))
+                self._set_archive_rescan_progress(
+                    running=True, phase="prune", current=0,
+                    total=_work_total, phase_current=0, phase_total=1,
+                    message="Rescan: pruning stale catalog entries…",
+                    started_at=_started_at, error="")
                 # Step 1: prune DB entries for files no longer on disk
                 # / 0-byte phantoms / duplicate-id rows. Emit before and
                 # after so the user sees it's doing something — # "I click Rescan, nothing happens, then 5 min later
@@ -69,12 +204,27 @@ class MediaOpsMixin:
                         " \u2014 No stale entries to prune.", "dim")
                 self._log_stream.flush()
                 # Step 2: sweep for new files.
-                channels = cfg.get("channels", [])
                 self._log_stream.emit_text(
                     f"Rescan: scanning {len(channels)} channel folder(s) "
                     f"for new files...", "simpleline_blue")
                 self._log_stream.flush()
-                sweep = index_backend.sweep_new_videos(output_dir, channels)
+                self._set_archive_rescan_progress(
+                    running=True, phase="scan", current=1,
+                    total=_work_total, phase_current=0,
+                    phase_total=_channel_total,
+                    message=f"Rescan: scanning 0/{_channel_total} channels…")
+
+                def _scan_progress(idx, total, channel_name):
+                    self._set_archive_rescan_progress(
+                        running=True, phase="scan",
+                        current=min(_work_total, 1 + int(idx or 0)),
+                        total=_work_total, phase_current=int(idx or 0),
+                        phase_total=int(total or _channel_total),
+                        message=(f"Rescan: scanning {idx}/{total} — "
+                                 f"{channel_name}"))
+
+                sweep = index_backend.sweep_new_videos(
+                    output_dir, channels, progress_cb=_scan_progress)
                 # The size button promises a real folder-size rescan. Startup
                 # sweep deliberately skips stat calls for known paths, so it
                 # cannot notice in-place redownload replacements by itself.
@@ -83,9 +233,22 @@ class MediaOpsMixin:
                     "simpleline_blue")
                 self._log_stream.flush()
                 _sizes_updated = 0
-                for _ch in channels:
+                self._set_archive_rescan_progress(
+                    running=True, phase="sizes",
+                    current=1 + _channel_total, total=_work_total,
+                    phase_current=0, phase_total=_channel_total,
+                    message=(f"Rescan: refreshing sizes 0/"
+                             f"{_channel_total}…"))
+                for _idx, _ch in enumerate(channels, 1):
                     _name = (_ch.get("name") or _ch.get("folder") or "").strip()
                     if not _name:
+                        self._set_archive_rescan_progress(
+                            running=True, phase="sizes",
+                            current=1 + _channel_total + _idx,
+                            total=_work_total, phase_current=_idx,
+                            phase_total=_channel_total,
+                            message=(f"Rescan: refreshing sizes {_idx}/"
+                                     f"{_channel_total}"))
                         continue
                     _folder = os.path.join(output_dir, _name)
                     _sr = index_backend.refresh_channel_file_sizes(
@@ -93,6 +256,13 @@ class MediaOpsMixin:
                     _sizes_updated += int(_sr.get("updated", 0))
                     archive_scan_backend.update_disk_cache_for_channel(
                         _ch, force_filesystem=not bool(_sr.get("checked")))
+                    self._set_archive_rescan_progress(
+                        running=True, phase="sizes",
+                        current=1 + _channel_total + _idx,
+                        total=_work_total, phase_current=_idx,
+                        phase_total=_channel_total,
+                        message=(f"Rescan: refreshing sizes {_idx}/"
+                                 f"{_channel_total} — {_name}"))
                 _agg = sweep.get("agg_ingested", 0)
                 _rec = sweep.get("tx_reconciled", 0)
                 self._log_stream.emit_text(
@@ -107,23 +277,49 @@ class MediaOpsMixin:
                        if _sizes_updated else "; folder sizes verified")
                     + ".",
                     "simpleline_green")
+                _success = True
                 # Push a refresh signal to the frontend so the Browse
                 # grid re-queries — the backend-side cache is already
                 # invalidated but the currently-rendered grid is still
                 # HTML from the last fetch. "the videos are
                 # still there after rescan."
-                if self._window is not None:
-                    try:
-                        self._window.evaluate_js(
-                            "if (window._onArchiveRescanComplete) "
-                            "window._onArchiveRescanComplete();")
-                    except Exception as e:
-                        swallow("rescan-complete JS callback", e)
             except Exception as e:
-                self._log_stream.emit_error(f"Rescan failed: {e}")
+                _failure = str(e)
+                self._log_stream.emit_error(f"Rescan failed: {_failure}")
             finally:
+                with self._archive_rescan_lock:
+                    self._archive_rescan_running = False
+                if _success:
+                    self._set_archive_rescan_progress(
+                        running=False, phase="complete",
+                        current=_work_total, total=_work_total,
+                        phase_current=_channel_total,
+                        phase_total=_channel_total,
+                        message="Rescan complete.", error="")
+                    window = getattr(self, "_window", None)
+                    if window is not None:
+                        try:
+                            window.evaluate_js(
+                                "if (window._onArchiveRescanComplete) "
+                                "void window._onArchiveRescanComplete();")
+                        except Exception as e:
+                            swallow("rescan-complete JS callback", e)
+                else:
+                    self._set_archive_rescan_progress(
+                        running=False, phase="error",
+                        message=f"Rescan failed: {_failure or 'unknown error'}",
+                        error=_failure or "unknown error")
                 self._log_stream.flush()
-        threading.Thread(target=_run, daemon=True).start()
+        try:
+            threading.Thread(
+                target=_run, daemon=True, name="archive-rescan").start()
+        except Exception as e:
+            with self._archive_rescan_lock:
+                self._archive_rescan_running = False
+            self._set_archive_rescan_progress(
+                running=False, phase="error",
+                message=f"Rescan failed to start: {e}", error=str(e))
+            return {"ok": False, "started": False, "error": str(e)}
         return {"ok": True, "started": True}
 
 

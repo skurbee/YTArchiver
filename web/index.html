@@ -1762,7 +1762,14 @@
     <button type="button" class="gsb-seg" id="gsb-gpu" title="Processing queue — click for details">
       <span class="gsb-dot gsb-dot-gpu"></span><span class="gsb-text" id="gsb-gpu-text">Processing idle</span>
     </button>
-    <span class="gsb-seg gsb-index" id="gsb-index" hidden></span>
+    <span class="gsb-seg gsb-index" id="gsb-index" hidden>
+      <span class="gsb-index-text" id="gsb-index-text"></span>
+      <span class="gsb-progress-track" id="gsb-progress-track" hidden
+            role="progressbar" aria-label="Archive rescan progress"
+            aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <span class="gsb-progress-fill" id="gsb-progress-fill"></span>
+      </span>
+    </span>
     <div class="gsb-spacer"></div>
     <button type="button" class="gsb-seg gsb-errors" id="gsb-errors" hidden
             aria-haspopup="dialog" aria-controls="popover-session-errors"
@@ -2455,7 +2462,7 @@
   <script src="liveDrawer.js?v=1"></script>
   <script src="columnWidth.js?v=1"></script>
   <script src="syncSubbed.js?v=1"></script>
-  <script src="indexControls.js?v=2"></script>
+  <script src="indexControls.js?v=3"></script>
   <script src="settingsInfra.js?v=1"></script>
   <script src="metadataTab.js?v=1"></script>
   <script src="settingsTab.js?v=2"></script>
@@ -2472,7 +2479,7 @@
   <script src="browseContent.js?v=1"></script>
   <script src="autorunHistory.js?v=1"></script>
   <script src="logMode.js?v=1"></script>
-  <script src="scanArchive.js?v=1"></script>
+  <script src="scanArchive.js?v=2"></script>
   <script src="activityLogVis.js?v=1"></script>
   <script src="bookmarks.js?v=1"></script>
   <script src="onboarding.js?v=1"></script>
@@ -2491,9 +2498,9 @@
   <script src="uxPolish.js?v=1"></script>
   <script src="removeChannel.js?v=1"></script>
   <script src="queuePending.js?v=1"></script>
-  <script src="refreshSizes.js?v=1"></script>
-  <script src="smallInits.js?v=1"></script>
-  <script src="statusBar.js?v=1"></script>
+  <script src="refreshSizes.js?v=2"></script>
+  <script src="smallInits.js?v=2"></script>
+  <script src="statusBar.js?v=2"></script>
   <script src="commandPalette.js?v=1"></script>
   <script src="app.js?v=79"></script>
 </body>

@@ -142,13 +142,22 @@
       if (progEl) progEl.textContent = "Building…";
       appendLog("Building / updating index…");
       try {
-        await bridgeCall("archive_rescan");
-        appendLog("Build complete.");
-        if (progEl) progEl.textContent = "Done.";
-        await refreshStats();
+        const result = await bridgeCall("archive_rescan");
+        if (result?.started) {
+          appendLog("Archive rescan started; progress is shown below.");
+          if (progEl) progEl.textContent = "Rescan running…";
+        } else if (result?.already_running) {
+          appendLog("Archive rescan is already running.");
+          if (progEl) progEl.textContent = "Already running…";
+        } else {
+          const msg = result?.error || "Rescan could not start.";
+          appendLog(`Build not started: ${msg}`);
+          if (progEl) progEl.textContent = "Not started.";
+          window._showToast?.(msg, "warn");
+        }
       } catch (e) {
-        appendLog(`Build failed: ${e}`);
-        if (progEl) progEl.textContent = "Failed.";
+        appendLog(`Build failed to start: ${e}`);
+        if (progEl) progEl.textContent = "Failed to start.";
       }
     });
 

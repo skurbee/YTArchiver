@@ -427,7 +427,29 @@ body {
   font-style: italic;
   cursor: default;
   overflow: hidden;
+  gap: 8px;
+}
+.gsb-index-text {
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gsb-progress-track {
+  flex: 0 0 72px;
+  width: 72px;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--c-border);
+}
+.gsb-progress-fill {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--c-accent);
+  transition: width 0.2s ease;
 }
 .gsb-index:hover { background: transparent; color: var(--c-dim); }
 .gsb-errors { color: var(--c-log-red); }

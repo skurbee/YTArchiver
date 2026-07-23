@@ -322,7 +322,20 @@ class QueueMixin:
             # so the two popover Pause buttons are independent (audit r2: a
             # sync resume was secretly un-pausing a deliberately-paused GPU).
             self._queue_transcribe().pause()
-        if which in ("gpu", "both"):
+        # A global Pause while sync is active is announced by sync_all when
+        # the current channel actually reaches its pause point.  Emitting the
+        # Processing notice here as well produced two adjacent pause lines for
+        # one click.  Keep immediate feedback for GPU-only pauses (and for a
+        # global pause when no sync worker exists), but let the active sync own
+        # the single combined log announcement otherwise.
+        _sync_running = False
+        try:
+            _is_running = getattr(self, "sync_is_running", None)
+            if callable(_is_running):
+                _sync_running = bool(_is_running())
+        except Exception:
+            _sync_running = False
+        if which == "gpu" or (which == "both" and not _sync_running):
             try:
                 from backend.pause_helpers import emit_paused
                 emit_paused(

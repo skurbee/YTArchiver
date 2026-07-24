@@ -2,6 +2,12 @@
 
 Download, organize, transcribe, search, compress, and browse entire channels.
 
+Designed with 2 things in mind:
+
+-Avoid ratelimiting at all costs
+
+-Clean and simple output folder structure, so the archive can outlive the program itself.
+
 A tour of the UI is on the [**wiki**](https://github.com/skurbee/YTArchiver/wiki).
 
 

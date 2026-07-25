@@ -163,7 +163,7 @@ def _resolve_ids_by_title(yt: str, url: str,
              "--print", "%(id)s\t%(title)s",
              *_find_cookie_source(), url],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             encoding="utf-8", errors="replace",
             bufsize=1, startupinfo=_startupinfo,
             env=_utf8_env(),
@@ -180,6 +180,17 @@ def _resolve_ids_by_title(yt: str, url: str,
     try:
         with proc.stdout:
             for line in proc.stdout:
+                try:
+                    from ..youtube_session import (
+                        handle_youtube_failure_text)
+                    if handle_youtube_failure_text(
+                            line,
+                            context="matching local files to YouTube"):
+                        try: proc.terminate()
+                        except Exception: pass
+                        break
+                except Exception as e:
+                    _log.debug("title-match YouTube guard failed: %s", e)
                 if cancel_event is not None and cancel_event.is_set():
                     try: proc.terminate()
                     except Exception as e: _log.debug("swallowed: %s", e)
@@ -468,6 +479,29 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
             try: proc.wait(timeout=5)
             except Exception: pass
         except Exception as e: _log.debug("swallowed: %s", e)
+    # Always finish collecting stderr before classifying the result.  A
+    # channel walk can return hundreds of valid rows and then hit a cookie
+    # failure or 429; treating that partial dict as success made the refresh
+    # continue hammering YouTube.
+    try:
+        _stderr_thread.join(timeout=1.0)
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
+    _stderr_text = "\n".join(_stderr_buf)
+    _failure_kind = ""
+    if _stderr_text:
+        try:
+            from ..youtube_session import handle_youtube_failure_text
+            _failure_kind = handle_youtube_failure_text(
+                _stderr_text,
+                context="fetching a channel catalog",
+                stream=stream,
+                pause_event=pause_event,
+                queues=queues,
+            )
+        except Exception as e:
+            _log.debug("catalog YouTube-failure classification failed: %s", e)
+
     # If the call returned nothing useful, surface whatever yt-dlp put
     # on stderr as a verbose-only line so users in Verbose mode can
     # actually debug the failure. Simple mode users still just see the
@@ -476,10 +510,6 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
     # log; if the user needs more they can re-run with Verbose mode and
     # check the streamed stderr in the terminal.
     if not out and _stderr_buf:
-        try:
-            _stderr_thread.join(timeout=0.5)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
         _trimmed = [ln for ln in _stderr_buf if ln.strip()][:6]
         for _ln in _trimmed:
             stream.emit([
@@ -499,7 +529,7 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
     # the bulk-stats call against /channel/UC.../videos. Saves the
     # 25+ minute per-video fallback for ColdFusion (and any other
     # channel where the handle path fails).
-    if not out and "/@" in (ch_url or ""):
+    if not out and not _failure_kind and "/@" in (ch_url or ""):
         canonical = _resolve_channel_id_url(yt, ch_url)
         if canonical and canonical != ch_url:
             stream.emit([
@@ -519,11 +549,15 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
         """Bulk stats mapping with an attached completion flag."""
 
         complete = False
+        cookie_auth_required = False
+        rate_limited = False
     _res = _BulkResult(out)
     try:
         _res.complete = bool(_walk_complete and proc.returncode == 0)
     except Exception:
         _res.complete = False
+    _res.cookie_auth_required = _failure_kind == "cookie"
+    _res.rate_limited = _failure_kind == "rate_limit"
     return _res
 
 
@@ -549,6 +583,14 @@ def _resolve_channel_id_url(yt: str, handle_url: str) -> str:
             encoding="utf-8", errors="replace",
             startupinfo=_startupinfo, env=_utf8_env(),
         )
+        try:
+            from ..youtube_session import handle_youtube_failure_text
+            if handle_youtube_failure_text(
+                    proc.stderr or "",
+                    context="resolving a YouTube channel"):
+                return ""
+        except Exception as e:
+            _log.debug("channel resolve YouTube guard failed: %s", e)
         cid = (proc.stdout or "").strip().split("\n", 1)[0].strip()
         if cid and cid.startswith("UC") and len(cid) >= 20:
             return f"https://www.youtube.com/channel/{cid}/videos"
@@ -792,11 +834,19 @@ def _fetch_per_video_upload_dates(yt: str, vids: list[str],
                *_find_cookie_source(), url]
         try:
             proc = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 startupinfo=_startupinfo, env=_utf8_env(),
                 timeout=30, encoding="utf-8", errors="replace")
         except Exception:
             return (vid, "")
+        try:
+            from ..youtube_session import handle_youtube_failure_text
+            if handle_youtube_failure_text(
+                    proc.stderr or "",
+                    context="fetching a YouTube upload date"):
+                return (vid, "")
+        except Exception as e:
+            _log.debug("upload-date YouTube guard failed: %s", e)
         raw = (proc.stdout or "").strip()
         # Accept first valid YYYYMMDD on any line (yt-dlp may emit
         # multiple lines for live/upcoming videos).

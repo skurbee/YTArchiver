@@ -1039,7 +1039,7 @@
             <!-- Bulk row -->
             <div class="metadata-bulk-row">
               <button class="btn btn-ghost btn-thin" id="btn-md-refresh-all-views"
-                      title="Queue a fast views/likes refresh for every subscribed channel">
+                      title="Choose a recent-upload time range, then queue a views/likes refresh for every subscribed channel">
                 Refresh views/likes &mdash; all channels
               </button>
               <button class="btn btn-ghost btn-thin" id="btn-md-refresh-all-comments"
@@ -1851,6 +1851,9 @@
       <div class="queue-empty">No errors this session.</div>
     </div>
     <div class="queue-popover-footer">
+      <button type="button" class="queue-btn" id="gsb-errors-open-log">
+        Open full log
+      </button>
       <button type="button" class="queue-btn queue-btn-cancel"
               id="gsb-errors-clear">Clear</button>
     </div>
@@ -2464,7 +2467,7 @@
   <script src="syncSubbed.js?v=1"></script>
   <script src="indexControls.js?v=3"></script>
   <script src="settingsInfra.js?v=1"></script>
-  <script src="metadataTab.js?v=1"></script>
+  <script src="metadataTab.js?v=2"></script>
   <script src="settingsTab.js?v=2"></script>
   <script src="driftScanDialog.js?v=1"></script>
   <script src="compressDryRunDialog.js?v=1"></script>
@@ -2500,7 +2503,7 @@
   <script src="queuePending.js?v=1"></script>
   <script src="refreshSizes.js?v=2"></script>
   <script src="smallInits.js?v=2"></script>
-  <script src="statusBar.js?v=2"></script>
+  <script src="statusBar.js?v=3"></script>
   <script src="commandPalette.js?v=1"></script>
   <script src="app.js?v=79"></script>
 </body>

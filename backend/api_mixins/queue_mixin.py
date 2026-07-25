@@ -315,6 +315,15 @@ class QueueMixin:
         if which in ("sync", "both"):
             self._sync_pause.set()
             queues.set_sync_paused(True)
+            # Pausing is also a cheap checkpoint for the Firefox session.
+            # If cookies expired while a long non-YouTube phase was running,
+            # surface the alarm now instead of waiting for the next request.
+            try:
+                from backend.youtube_session import (
+                    check_configured_cookie_session)
+                check_configured_cookie_session(context="Pause")
+            except Exception as e:
+                _log.debug("pause YouTube-session check failed: %s", e)
         if which in ("gpu", "both"):
             queues.set_gpu_paused(True)
             # The TranscribeManager worker (transcribe + compress jobs) is the
@@ -353,6 +362,24 @@ class QueueMixin:
         queues = self._queue_state()
         gpu_count = self._queue_gpu_count() if which in ("gpu", "both") else 0
         if which in ("sync", "both"):
+            # Never release queued YouTube work into a known-expired Firefox
+            # session.  A successful re-check also re-arms the cookie alarm
+            # for a future expiry.
+            try:
+                from backend.youtube_session import (
+                    check_configured_cookie_session,
+                    reset_rate_limit_alert,
+                )
+                if not check_configured_cookie_session(context="Resume"):
+                    self._on_queue_changed()
+                    return {
+                        "ok": False,
+                        "paused": True,
+                        "error": "Firefox YouTube sign-in expired",
+                    }
+                reset_rate_limit_alert()
+            except Exception as e:
+                _log.debug("resume YouTube-session check failed: %s", e)
             self._sync_pause.clear()
             queues.set_sync_paused(False)
         if which in ("gpu", "both"):

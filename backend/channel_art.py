@@ -18,10 +18,12 @@ import urllib.request
 from urllib.parse import urlparse
 from typing import Any
 
+from .log import get_logger
 from .sync import _find_cookie_source, find_yt_dlp
 from .utils import hide_file_win
 
 _CHANNEL_ART_REFRESH_DAYS = 30 # YTArchiver refreshes monthly
+_log = get_logger(__name__)
 
 
 def _pick_by_prefix(thumbs, prefix: str) -> dict[str, Any] | None:
@@ -199,6 +201,23 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
         return {"ok": False, "error": "yt-dlp not found"}
     except Exception as e:
         return {"ok": False, "error": f"yt-dlp failed: {e}"}
+
+    try:
+        from .youtube_session import handle_youtube_failure_text
+        _yt_failure = handle_youtube_failure_text(
+            proc.stderr or "", context="fetching channel artwork")
+    except Exception as e:
+        _log.debug("channel-art YouTube guard failed: %s", e)
+        _yt_failure = ""
+    if _yt_failure:
+        return {
+            "ok": False,
+            "error": ("Firefox YouTube sign-in expired"
+                      if _yt_failure == "cookie"
+                      else "YouTube rate limited"),
+            "cookie_auth_required": _yt_failure == "cookie",
+            "rate_limited": _yt_failure == "rate_limit",
+        }
 
     if proc.returncode != 0 or not (proc.stdout or "").strip():
         # Patch C: include stderr excerpt so the user can see WHY

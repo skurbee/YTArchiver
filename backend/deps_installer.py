@@ -34,6 +34,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import time
 import urllib.request
 import zipfile
 from collections.abc import Callable
@@ -214,7 +215,7 @@ def firefox_cookie_status() -> dict:
     Returns {installed, has_yt_cookies, signed_in, profile, detail}.
     """
     res = {"installed": False, "has_yt_cookies": False, "signed_in": False,
-           "profile": "", "detail": ""}
+           "expired_auth_cookies": False, "profile": "", "detail": ""}
     try:
         appdata = os.environ.get("APPDATA") or ""
         prof_dir = Path(appdata) / "Mozilla" / "Firefox" / "Profiles"
@@ -242,14 +243,23 @@ def firefox_cookie_status() -> dict:
                         "SELECT COUNT(*) FROM moz_cookies "
                         "WHERE host LIKE '%youtube.com%'").fetchone()[0]
                     ph = ",".join("?" * len(AUTH))
-                    auth_n = con.execute(
+                    auth_total = con.execute(
                         "SELECT COUNT(*) FROM moz_cookies WHERE "
                         "(host LIKE '%youtube.com%' OR host LIKE '%google.com%') "
                         f"AND name IN ({ph})", AUTH).fetchone()[0]
+                    auth_n = con.execute(
+                        "SELECT COUNT(*) FROM moz_cookies WHERE "
+                        "(host LIKE '%youtube.com%' OR host LIKE '%google.com%') "
+                        f"AND name IN ({ph}) "
+                        "AND (expiry=0 OR expiry>?)",
+                        (*AUTH, int(time.time()))).fetchone()[0]
                 finally:
                     con.close()
                 if yt_n > 0:
                     res["has_yt_cookies"] = True
+                    res["profile"] = db.parent.name
+                if auth_total > 0 and auth_n == 0:
+                    res["expired_auth_cookies"] = True
                     res["profile"] = db.parent.name
                 if auth_n > 0:
                     res["signed_in"] = True
@@ -261,6 +271,9 @@ def firefox_cookie_status() -> dict:
                 continue
         if res["signed_in"]:
             res["detail"] = "signed into YouTube in Firefox"
+        elif res["expired_auth_cookies"]:
+            res["detail"] = (
+                "Firefox YouTube sign-in cookies expired - sign in again")
         elif res["has_yt_cookies"]:
             res["detail"] = "Firefox has YouTube cookies (sign-in not detected)"
         else:

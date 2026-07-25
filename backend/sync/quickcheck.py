@@ -110,7 +110,7 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
     upcoming = 0
     try:
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             creationflags=(0x08000000 if os.name == "nt" else 0),
             env=_utils.utf8_subprocess_env(),
@@ -136,6 +136,15 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
         timer.start()
         deadline = time.time() + float(timeout_sec)
         for line in proc.stdout:
+            try:
+                from ..youtube_session import handle_youtube_failure_text
+                if handle_youtube_failure_text(
+                        line, context="checking a channel for uploads"):
+                    try: proc.terminate()
+                    except Exception: pass
+                    break
+            except Exception as e:
+                _log.debug("quick-check YouTube guard failed: %s", e)
             if time.time() > deadline:
                 # Drain stdout in a background thread before terminate
                 # so a full pipe doesn't deadlock the subsequent wait
@@ -277,6 +286,20 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
                 "checked": 0, "fresh_ids": [], "timed_out": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+    try:
+        from ..youtube_session import handle_youtube_failure_text
+        _yt_failure = handle_youtube_failure_text(
+            proc.stderr or "", context="checking recent channel uploads")
+    except Exception as e:
+        _log.debug("recent quick-check YouTube guard failed: %s", e)
+        _yt_failure = ""
+    if _yt_failure:
+        return {
+            "ok": False,
+            "error": _yt_failure,
+            "cookie_auth_required": _yt_failure == "cookie",
+            "rate_limited": _yt_failure == "rate_limit",
+        }
     for raw in (proc.stdout or "").splitlines():
         raw = raw.strip()
         if not raw:

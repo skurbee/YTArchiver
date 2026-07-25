@@ -433,9 +433,34 @@
           "YTArchiver detected that your browser’s YouTube session " +
           "has expired.\n\n" +
           "The sync has been ⏸ paused automatically.\n\n" +
-          "Sign back in to YouTube in Firefox (or your default browser), " +
+          "Sign back in to YouTube in Firefox, " +
           "then click “Resume” in the queue controls to continue " +
           "the sync.",
+          { confirm: "Got it", danger: false }
+        );
+      } finally {
+        _pending = false;
+      }
+    });
+  })();
+
+  // Rate-limit alarm uses the same always-wired control channel.  The
+  // backend pauses before emitting this, so no further channel/video calls
+  // can compound the block while the dialog is open.
+  (function wireYouTubeRateLimitListener() {
+    let _pending = false;
+    window.addEventListener("yt-control", async (ev) => {
+      if (!ev.detail || ev.detail.kind !== "youtube_rate_limit_alert") return;
+      if (_pending) return;
+      _pending = true;
+      try {
+        await window.askConfirm?.(
+          "\u26a0\ufe0f YouTube rate limit",
+          "YouTube has temporarily rate-limited YTArchiver.\n\n" +
+          "The sync has been \u23f8 paused automatically so it does not " +
+          "keep hammering YouTube.\n\n" +
+          "Wait about one hour, then click \u201cResume\u201d. The interrupted " +
+          "task will be retried first.",
           { confirm: "Got it", danger: false }
         );
       } finally {

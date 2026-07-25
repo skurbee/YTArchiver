@@ -311,6 +311,22 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
                 except Exception: pass
                 break
             line = raw.strip()
+            try:
+                from .youtube_session import handle_youtube_failure_text
+                _yt_failure = handle_youtube_failure_text(
+                    line,
+                    context="fetching a redownload catalog",
+                    stream=stream,
+                    pause_event=pause_ev,
+                    queues=queues,
+                )
+            except Exception as _guard_error:
+                _log.debug("redownload catalog guard failed: %s", _guard_error)
+                _yt_failure = ""
+            if _yt_failure:
+                try: proc.terminate()
+                except Exception: pass
+                break
             if "|||" in line:
                 vid_id, title = line.split("|||", 1)
                 vid_id = vid_id.strip()
@@ -958,7 +974,8 @@ def _redownload_refusal_reason(orig_h: int, new_h: int, target_h: int,
 
 
 def _download_one(video_id: str, new_res: str, out_dir: str,
-                  stream: LogStreamer, cancel_ev: threading.Event) -> str | None:
+                  stream: LogStreamer, cancel_ev: threading.Event,
+                  pause_ev: threading.Event | None = None) -> str | None:
     """Download a single video ID at the target resolution into a temp dir
     keyed by `video_id`. Returns the temp filepath on success, None on
     failure/cancel. The caller `os.replace`s it onto the original filename
@@ -1056,6 +1073,21 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
             _cancelled = True
             break
         line = raw.rstrip()
+        try:
+            from .youtube_session import handle_youtube_failure_text
+            _yt_failure = handle_youtube_failure_text(
+                line,
+                context=f"redownloading {video_id}",
+                stream=stream,
+                pause_event=pause_ev,
+            )
+        except Exception as _guard_error:
+            _log.debug("redownload guard failed: %s", _guard_error)
+            _yt_failure = ""
+        if _yt_failure:
+            try: proc.terminate()
+            except Exception: pass
+            break
         if "[Merger]" in line and "Merging formats into" in line:
             m = re.search(r'"([^"]+)"', line)
             if m: dest = m.group(1)
@@ -1490,7 +1522,8 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
         except OSError:
             pass
         out_dir = os.path.dirname(fp) or folder
-        new_fp = _download_one(vid, cur_res[0], out_dir, stream, cancel_ev)
+        new_fp = _download_one(
+            vid, cur_res[0], out_dir, stream, cancel_ev, pause_ev)
         if not new_fp or not os.path.isfile(new_fp):
             # Emit a visible error line so the [N/total] sequence
             # doesn't have unexplained gaps — same root-cause fix as

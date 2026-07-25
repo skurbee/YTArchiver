@@ -45,6 +45,78 @@ def _utc_fetched_at_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _clear_views_refresh_progress(stream: LogStreamer) -> None:
+    """Remove the shared in-place views-refresh status line.
+
+    Every exit after the initial ``Refreshing ...`` emit must call this.
+    Otherwise a scoped channel with no recent videos leaves the shared
+    marker behind, and the next channel replaces that old DOM row instead
+    of rendering beneath its own sync row.
+    """
+    try:
+        import json as _json
+        stream.emit([[_json.dumps({
+            "kind": "clear_line", "marker": "views_refresh_progress"}),
+            "__control__"]])
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
+
+
+def _filter_recent_on_disk(
+        on_disk: list[tuple[str, str, int | None, int | None, str]],
+        channel_name: str,
+        cutoff_epoch: float,
+        ) -> list[tuple[str, str, int | None, int | None, str]]:
+    """Keep local videos uploaded on/after ``cutoff_epoch``.
+
+    yt-dlp's fast flat-playlist response currently reports ``upload_date=NA``
+    for YouTube channel rows, so a recent-range filter cannot use the remote
+    catalog date. Prefer the index's materialized upload timestamp, then fall
+    back to the video file mtime (YTArchiver downloads with ``--mtime`` and
+    preserves that timestamp through redownload/compression).
+
+    If both timestamps are unavailable, include the file rather than silently
+    excluding a possibly recent video.
+    """
+    indexed_ts: dict[str, float] = {}
+    try:
+        from .. import index as _idx
+        conn = _idx._reader_open()
+        if conn is not None:
+            with _idx._reader_lock:
+                rows = conn.execute(
+                    "SELECT filepath, upload_ts FROM videos "
+                    "WHERE channel = ? COLLATE NOCASE "
+                    "AND upload_ts IS NOT NULL",
+                    (channel_name,),
+                ).fetchall()
+            for filepath, upload_ts in rows:
+                if not filepath or not upload_ts:
+                    continue
+                try:
+                    key = os.path.normcase(os.path.normpath(filepath))
+                    indexed_ts[key] = float(upload_ts)
+                except (TypeError, ValueError):
+                    continue
+    except Exception as e:
+        _log.debug("recent-scope upload timestamp lookup failed: %s", e)
+
+    recent = []
+    for video in on_disk:
+        filepath = video[4]
+        key = os.path.normcase(os.path.normpath(filepath))
+        upload_ts = indexed_ts.get(key)
+        if not upload_ts:
+            try:
+                upload_ts = os.path.getmtime(filepath)
+            except OSError:
+                recent.append(video)
+                continue
+        if upload_ts >= cutoff_epoch:
+            recent.append(video)
+    return recent
+
+
 def _build_refresh_summary_segments(
     *,
     name: str,
@@ -305,14 +377,31 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     def _catalog_progress(n):
         _hb_catalog_count[0] = int(n)
 
-    bulk = _flat_playlist_bulk_stats(yt, ch_url, stream,
-                                     cancel_event, pause_event,
-                                     queues=queues,
-                                     progress_cb=_catalog_progress)
+    bulk = _flat_playlist_bulk_stats(
+        yt, ch_url, stream, cancel_event, pause_event,
+        queues=queues, progress_cb=_catalog_progress)
     bulk_all = bulk
+    cookie_auth_required = bool(
+        getattr(bulk, "cookie_auth_required", False))
+    rate_limited = bool(getattr(bulk, "rate_limited", False))
     # Lock in the final catalog count once the walk completes.
     _hb_catalog_count[0] = max(_hb_catalog_count[0], len(bulk))
     _hb_phase[0] = "matching local files"
+    if cookie_auth_required or rate_limited:
+        _hb_guard.stop()
+        _clear_views_refresh_progress(stream)
+        return {
+            "ok": False,
+            "error": ("cookie_auth_required" if cookie_auth_required
+                      else "youtube_rate_limited"),
+            "cookie_auth_required": cookie_auth_required,
+            "rate_limited": rate_limited,
+            "fetched": 0,
+            "refreshed": 0,
+            "errors": 1,
+            "skipped": 0,
+            "bulk_fetched": len(bulk),
+        }
     if not bulk:
         _hb_guard.stop()
         # Replace the in-place "Refreshing X..." line with this warning
@@ -336,33 +425,10 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
              f"hit a transient YouTube block.\n",
              ["dim", "views_refresh_progress"]],
         ])
+        _clear_views_refresh_progress(stream)
         return {"ok": False, "error": "bulk_empty",
                 "fetched": 0, "refreshed": 0, "errors": 0, "skipped": 0,
                 "bulk_fetched": 0}
-    if _scope_days is not None:
-        cutoff = datetime.now(UTC) - timedelta(days=_scope_days)
-
-        def _is_recent_upload(stats: dict[str, Any]) -> bool:
-            raw = str((stats or {}).get("upload_date") or "").strip()
-            if len(raw) != 8 or not raw.isdigit():
-                return False
-            try:
-                return datetime.strptime(raw, "%Y%m%d").replace(tzinfo=UTC) >= cutoff
-            except ValueError:
-                return False
-
-        bulk = {vid: stats for vid, stats in bulk.items()
-                if _is_recent_upload(stats)}
-        if not bulk:
-            _hb_guard.stop()
-            stream.emit([
-                [" \u2014 ", ["meta_bracket", "views_refresh_progress"]],
-                [f"{name}: no videos in last {_scope_days}d.\n",
-                 ["simpleline", "views_refresh_progress"]],
-            ])
-            return {"ok": True, "fetched": 0, "refreshed": 0,
-                    "errors": 0, "skipped": 0, "bulk_fetched": 0}
-
     # Verbose-only: announce the bulk-stats walk landed and how many
     # videos it found. Helps the user follow the multi-phase flow.
     stream.emit([
@@ -378,6 +444,24 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     on_disk = _scan_channel_videos(folder)
     if _scope_year is not None:
         on_disk = [v for v in on_disk if v[2] == _scope_year]
+    if _scope_days is not None:
+        cutoff_epoch = (
+            datetime.now(UTC) - timedelta(days=_scope_days)
+        ).timestamp()
+        on_disk = _filter_recent_on_disk(
+            on_disk, name, cutoff_epoch)
+        if not on_disk:
+            _hb_guard.stop()
+            stream.emit([
+                [" \u2014 ", ["meta_bracket", "views_refresh_progress"]],
+                [f"{name}: no local videos uploaded in the last "
+                 f"{_scope_days}d.\n",
+                 ["simpleline", "views_refresh_progress"]],
+            ])
+            _clear_views_refresh_progress(stream)
+            return {"ok": True, "fetched": 0, "refreshed": 0,
+                    "errors": 0, "skipped": 0,
+                    "bulk_fetched": len(bulk)}
 
     # Title-fallback resolution. The default archive layout has NO
     # `[video_id]` bracket in filenames AND many legacy-tkinter-era
@@ -849,9 +933,53 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 if res.get("ok") and not res.get("skipped"):
                     full_fetched += 1
                 elif not res.get("ok") and not res.get("transient"):
+                    reason = str(res.get("error") or "unknown yt-dlp error")
+                    label = (title_hint or vid).strip()
+                    try:
+                        from ..youtube_session import (
+                            handle_youtube_failure_text)
+                        failure_kind = handle_youtube_failure_text(
+                            reason,
+                            context=f"refreshing views/likes for {name}",
+                            stream=stream,
+                            pause_event=pause_event,
+                            queues=queues,
+                        )
+                    except Exception as _classify_error:
+                        _log.debug(
+                            "views refresh failure classification failed: %s",
+                            _classify_error)
+                        failure_kind = ""
+                    if failure_kind:
+                        cookie_auth_required = failure_kind == "cookie"
+                        rate_limited = failure_kind == "rate_limit"
+                        full_errors += 1
+                        break
+                    stream.emit_error(
+                        f"Views/likes refresh failed — {name} — "
+                        f"{label} [{vid}]: {reason}")
                     full_errors += 1
             except Exception as _e:
-                stream.emit_dim(f" (full fetch failed for {vid}: {_e})")
+                label = (title_hint or vid).strip()
+                try:
+                    from ..youtube_session import handle_youtube_failure_text
+                    failure_kind = handle_youtube_failure_text(
+                        str(_e),
+                        context=f"refreshing views/likes for {name}",
+                        stream=stream,
+                        pause_event=pause_event,
+                        queues=queues,
+                    )
+                except Exception:
+                    failure_kind = ""
+                if failure_kind:
+                    cookie_auth_required = failure_kind == "cookie"
+                    rate_limited = failure_kind == "rate_limit"
+                    full_errors += 1
+                    break
+                stream.emit_error(
+                    f"Views/likes refresh failed — {name} — "
+                    f"{label} [{vid}]: {_e}")
                 full_errors += 1
             _processed += 1
             # Update the heartbeat phase with [N/total] so the
@@ -862,24 +990,25 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     # Stamp last-refresh timestamp on the channel config. Separate
     # from per-video fetched_at so the Subs UI can say "refreshed
     # N minutes ago" for the whole channel.
-    try:
-        from .. import ytarchiver_config as _cfg
-        with _cfg.config_transaction() as cfg:
-            ch_url_norm = ch_url.rstrip("/")
-            now_ts = time.time()
-            matched = False
-            for ch in cfg.get("channels", []):
-                if (ch.get("url") or "").rstrip("/") == ch_url_norm:
-                    ch["last_views_refresh_ts"] = now_ts
-                    matched = True
-                    break
-            if not matched:
-                raise _cfg.ConfigUnchanged()
-    except ConfigUnchanged:
-        pass
-    except Exception as e:
-        _log.warning("views refresh timestamp stamp failed for %r: %s",
-                     name, e)
+    if not cookie_auth_required and not rate_limited:
+        try:
+            from .. import ytarchiver_config as _cfg
+            with _cfg.config_transaction() as cfg:
+                ch_url_norm = ch_url.rstrip("/")
+                now_ts = time.time()
+                matched = False
+                for ch in cfg.get("channels", []):
+                    if (ch.get("url") or "").rstrip("/") == ch_url_norm:
+                        ch["last_views_refresh_ts"] = now_ts
+                        matched = True
+                        break
+                if not matched:
+                    raise _cfg.ConfigUnchanged()
+        except ConfigUnchanged:
+            pass
+        except Exception as e:
+            _log.warning("views refresh timestamp stamp failed for %r: %s",
+                         name, e)
 
     # Stop the heartbeat thread BEFORE the clear_line + summary so
     # the in-place line doesn't get re-painted on top of the summary.
@@ -892,13 +1021,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     # the catalog-walk counter (which uses `backfill_progress` and
     # is preserved). Mirrors the same clear_line pattern used by
     # backfill_video_ids' final summary.
-    try:
-        import json as _json
-        stream.emit([[_json.dumps({
-            "kind": "clear_line", "marker": "views_refresh_progress"}),
-            "__control__"]])
-    except Exception as e:
-        _log.debug("swallowed: %s", e)
+    _clear_views_refresh_progress(stream)
     # Tagged emit: channel name + labels render white, counts render
     # pink, errors red. Previously the whole line was one pink blob
     # which users called out as visual noise ("channel name should be
@@ -917,13 +1040,15 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         took=took,
     ))
     return {
-        "ok": True,
+        "ok": not (cookie_auth_required or rate_limited),
         "fetched": no_meta_entry,
         "refreshed": full_fetched + updated_in_place,
         "errors": full_errors,
         "skipped": skipped_same,
         "bulk_fetched": len(bulk),
         "took": took,
+        "cookie_auth_required": cookie_auth_required,
+        "rate_limited": rate_limited,
     }
 
 

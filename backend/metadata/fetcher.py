@@ -98,6 +98,7 @@ def _exit_pause_wait(stream: LogStreamer, label: str, queues) -> None:
 def _fetch_video_metadata(yt: str, video_id: str,
                           title_hint: str = "",
                           proc_registry: "set[subprocess.Popen] | None" = None,
+                          error_out: "list[str] | None" = None,
                           ) -> dict[str, Any] | None:
     """Fetch metadata for a single video via yt-dlp --dump-json.
     Returns the OLD-schema dict, or None on failure.
@@ -106,6 +107,9 @@ def _fetch_video_metadata(yt: str, video_id: str,
     proc_registry: if supplied, this proc's Popen is registered there instead
     of the module-global _inflight_procs — so a bulk-cancel only kills procs
     from its own operation, leaving DLTRACK per-video fetches untouched.
+
+    error_out: optional one-item sink for a concise yt-dlp stderr reason.
+    The legacy return type remains metadata-or-None for existing callers.
     """
     _reg = proc_registry if proc_registry is not None else _inflight_procs
     cmd = [
@@ -124,6 +128,7 @@ def _fetch_video_metadata(yt: str, video_id: str,
     # between. Total worst-case still ~210s (down from a fail-then-
     # retry on next pass which could be hours later).
     stdout = ""
+    stderr = ""
     _rc: int | None = None
     _attempts = (60, 60, 90)
     for _attempt_idx, _attempt_timeout in enumerate(_attempts):
@@ -140,13 +145,15 @@ def _fetch_video_metadata(yt: str, video_id: str,
                 _creationflags = 0x00000200  # CREATE_NEW_PROCESS_GROUP
             proc = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 encoding="utf-8", errors="replace",
                 startupinfo=_startupinfo,
                 env=_utf8_env(),
                 creationflags=_creationflags,
             )
-        except OSError:
+        except OSError as e:
+            if error_out is not None:
+                error_out.append(f"could not start yt-dlp: {e}")
             return None
         # Register this yt-dlp Popen in a module-scoped set so a
         # cancel-during-bulk-fetch can forcibly kill in-flight metadata
@@ -158,7 +165,7 @@ def _fetch_video_metadata(yt: str, video_id: str,
             _reg.add(proc)
         try:
             try:
-                stdout, _ = proc.communicate(timeout=_attempt_timeout)
+                stdout, stderr = proc.communicate(timeout=_attempt_timeout)
                 _rc = proc.returncode
                 break
             except subprocess.TimeoutExpired:
@@ -191,7 +198,30 @@ def _fetch_video_metadata(yt: str, video_id: str,
         finally:
             with _inflight_procs_lock:
                 _reg.discard(proc)
+    _youtube_failure = ""
+    if stderr:
+        try:
+            from ..youtube_session import handle_youtube_failure_text
+            _youtube_failure = handle_youtube_failure_text(
+                stderr, context="fetching video metadata")
+        except Exception as e:
+            _log.debug("metadata YouTube-failure classification failed: %s", e)
+    if _youtube_failure:
+        return {"_youtube_failure": _youtube_failure}
     if _rc is None or _rc != 0:
+        if error_out is not None:
+            lines = [
+                line.strip() for line in (stderr or "").splitlines()
+                if line.strip()
+            ]
+            detail = next(
+                (line for line in reversed(lines)
+                 if line.lower().startswith("error:")),
+                lines[-1] if lines else f"yt-dlp exited with code {_rc}",
+            )
+            if detail.lower().startswith("error:"):
+                detail = detail[6:].strip()
+            error_out.append(detail[:500])
         return None
 
     # yt-dlp --dump-json writes exactly one JSON object on stdout.
@@ -227,6 +257,8 @@ def _fetch_video_metadata(yt: str, video_id: str,
         # `{` — kept for back-compat but the whole-stdout path above
         # should win in normal operation.
         # Disabled: fail closed instead of risking a wrong sliced object.
+        if error_out is not None:
+            error_out.append("yt-dlp returned unreadable metadata")
         return None
 
     comments = []
@@ -326,7 +358,18 @@ def fetch_single_video_metadata(channel: dict[str, Any],
         # gets re-fetched with current comments/views/likes.
         return {"ok": True, "skipped": True}
 
-    entry = _fetch_video_metadata(yt, video_id, title_hint)
+    _fetch_errors: list[str] = []
+    entry = _fetch_video_metadata(
+        yt, video_id, title_hint, error_out=_fetch_errors)
+    if isinstance(entry, dict) and entry.get("_youtube_failure"):
+        kind = str(entry["_youtube_failure"])
+        return {
+            "ok": False,
+            "error": ("Firefox YouTube sign-in expired"
+                      if kind == "cookie" else "YouTube rate limited"),
+            "cookie_auth_required": kind == "cookie",
+            "rate_limited": kind == "rate_limit",
+        }
     # `{"_timeout": True}` sentinel signals a transient
     # 120s fetch timeout (slow network) rather than a true failure.
     # Return without marking anything; caller can retry later.
@@ -346,7 +389,11 @@ def fetch_single_video_metadata(channel: dict[str, Any],
                 ["      — ", "dim"],
                 ["Metadata fetch failed\n", "red"],
             ])
-        return {"ok": False, "error": "yt-dlp dump-json failed"}
+        return {
+            "ok": False,
+            "error": (_fetch_errors[-1] if _fetch_errors
+                      else "yt-dlp dump-json failed"),
+        }
 
     _jsonl_write_failed = False
     try:
@@ -720,6 +767,29 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                     "to sequential fetch in the existing loop", _pf_err)
                 _prefetched = {}
 
+        # Any worker that saw expired cookies or a rate limit already paused
+        # the shared queue.  Stop this channel before entering the normal
+        # pause-wait/merge loop; otherwise the remaining prefetched failures
+        # would be counted (and potentially persisted) one video at a time.
+        _pf_youtube_failure = next(
+            (str(_entry.get("_youtube_failure"))
+             for _entry in _prefetched.values()
+             if isinstance(_entry, dict)
+             and _entry.get("_youtube_failure")),
+            "",
+        )
+        if _pf_youtube_failure:
+            _clear_active()
+            return {
+                "ok": False,
+                "fetched": fetched,
+                "refreshed": refreshed,
+                "skipped": skipped,
+                "errors": 1,
+                "cookie_auth_required": _pf_youtube_failure == "cookie",
+                "rate_limited": _pf_youtube_failure == "rate_limit",
+            }
+
         for vid_id, title, _y, _m, _fp in g["videos"]:
             if cancel_event is not None and cancel_event.is_set():
                 break
@@ -790,6 +860,18 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                 entry = _prefetched[vid_id]
             else:
                 entry = _fetch_video_metadata(yt, vid_id, title)
+            if isinstance(entry, dict) and entry.get("_youtube_failure"):
+                kind = str(entry["_youtube_failure"])
+                _clear_active()
+                return {
+                    "ok": False,
+                    "fetched": fetched,
+                    "refreshed": refreshed,
+                    "skipped": skipped,
+                    "errors": errors + 1,
+                    "cookie_auth_required": kind == "cookie",
+                    "rate_limited": kind == "rate_limit",
+                }
             # transient timeout sentinel — count as "will
             # retry" rather than a permanent failure so future rechecks
             # still try this video. No persistent flag set.
@@ -807,7 +889,7 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                 # knows WHICH titles failed (previously only the
                 # summary count emerged, making diagnosis impossible).
                 stream.emit([
-                    [" ✗ ", "red"],
+                    [" ✗ ", ["red", "error_detail"]],
                     ["Metadata failed — ", "red"],
                     [f"{title[:90]}\n", "simpleline"],
                 ])

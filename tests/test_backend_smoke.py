@@ -45,6 +45,7 @@ from backend import (
     thumbnails,
     tray as tray_backend,
     utils,
+    youtube_session,
     ytarchiver_config,
 )
 from backend.services import AppServices, BridgeEventBus, file_ops
@@ -95,7 +96,9 @@ from backend.sync.ytdlp_events import (
     is_verbose_chatter_line,
 )
 from backend.metadata import fetcher as metadata_fetcher
+from backend.metadata import core as metadata_core
 from backend.metadata import refresh_views
+from backend.metadata import refresh_fetch
 from backend.transcribe.punct_manager import PunctuationManager
 from backend.transcribe import core as transcribe_core
 from backend.transcribe import helpers as transcribe_helpers
@@ -611,6 +614,16 @@ class LogStreamerTests(unittest.TestCase):
         stored = stream._buffer[0][0][0]
         self.assertLessEqual(len(stored), stream.MAX_SEGMENT_TEXT_CHARS)
         self.assertTrue(stored.endswith("[truncated]\n"))
+
+    def test_emit_error_marks_actionable_error_detail(self) -> None:
+        stream = log_stream.LogStreamer()
+
+        stream.emit_error("Specific failure")
+
+        self.assertEqual(
+            stream._buffer[0],
+            [["Specific failure\n", ["red", "error_detail"]]],
+        )
 
 
 class NetMonitorTests(unittest.TestCase):
@@ -1144,6 +1157,62 @@ class ArchiveScanTests(unittest.TestCase):
             self.assertEqual((count, size), (1, 5))
 
 
+class YouTubeSessionGuardTests(unittest.TestCase):
+    def setUp(self) -> None:
+        youtube_session._stream = None
+        youtube_session._pause_event = None
+        youtube_session._queues = None
+        youtube_session._cookie_alert_fired = False
+        youtube_session._rate_limit_alert_ts = 0.0
+
+    def tearDown(self) -> None:
+        self.setUp()
+
+    def test_cookie_error_auto_pauses_and_emits_modal_control(self) -> None:
+        stream = mock.Mock()
+        pause_event = threading.Event()
+        queue_state = mock.Mock()
+        youtube_session.configure(stream, pause_event, queue_state)
+
+        kind = youtube_session.handle_youtube_failure_text(
+            "ERROR: Sign in to confirm your age. "
+            "Use --cookies-from-browser for authentication.",
+            context="refreshing metadata",
+        )
+
+        self.assertEqual(kind, "cookie")
+        self.assertTrue(pause_event.is_set())
+        queue_state.set_sync_paused.assert_called_with(True)
+        controls = [
+            json.loads(call.args[0][0][0])
+            for call in stream.emit.call_args_list
+            if call.args[0][0][1] == "__control__"
+        ]
+        self.assertIn({"kind": "cookie_alert",
+                       "context": "refreshing metadata"}, controls)
+
+    def test_rate_limit_auto_pauses_without_generic_false_positive(self) -> None:
+        stream = mock.Mock()
+        pause_event = threading.Event()
+        queue_state = mock.Mock()
+        youtube_session.configure(stream, pause_event, queue_state)
+
+        self.assertEqual(
+            youtube_session.handle_youtube_failure_text(
+                "possible rate-limit - waiting 10s"),
+            "",
+        )
+        kind = youtube_session.handle_youtube_failure_text(
+            "The current session has been rate-limited by YouTube "
+            "for up to an hour.",
+            context="refreshing views",
+        )
+
+        self.assertEqual(kind, "rate_limit")
+        self.assertTrue(pause_event.is_set())
+        stream.emit_error.assert_called_once()
+
+
 class MetadataJsonlTests(unittest.TestCase):
     def test_metadata_jsonl_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1198,6 +1267,74 @@ class MetadataJsonlTests(unittest.TestCase):
 
         self.assertIn("+00:00", fetched_at)
         self.assertIsNotNone(metadata_io._fetched_at_epoch(fetched_at))
+
+    def test_scoped_views_refresh_clears_progress_when_nothing_is_recent(
+            self) -> None:
+        emitted = []
+        stream = mock.Mock()
+        stream.emit.side_effect = emitted.append
+
+        class NoopThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        old_catalog = {
+            "abcdefghijk": {
+                "upload_date": "20000101",
+                "view_count": 1,
+            },
+        }
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(refresh_views, "_folder_for_channel",
+                                  return_value=Path(td)), \
+                mock.patch.object(refresh_views, "find_yt_dlp",
+                                  return_value="yt-dlp"), \
+                mock.patch.object(refresh_views, "_flat_playlist_bulk_stats",
+                                  return_value=old_catalog), \
+                mock.patch.object(refresh_views, "_filter_recent_on_disk",
+                                  return_value=[]), \
+                mock.patch.object(refresh_views.threading, "Thread",
+                                  NoopThread):
+            result = refresh_views.bulk_refresh_views_likes(
+                {"name": "Old Channel", "url": "https://example.test/channel"},
+                stream,
+                scope={"days": 365},
+            )
+
+        controls = []
+        for segments in emitted:
+            if len(segments) == 1 and segments[0][1] == "__control__":
+                controls.append(json.loads(segments[0][0]))
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            controls,
+            [{"kind": "clear_line", "marker": "views_refresh_progress"}],
+        )
+
+    def test_recent_views_scope_uses_local_upload_time_when_catalog_date_missing(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            recent_path = Path(td) / "Recent.mp4"
+            old_path = Path(td) / "Old.mp4"
+            recent_path.write_bytes(b"x")
+            old_path.write_bytes(b"x")
+            cutoff = datetime.now().timestamp() - (365 * 86400)
+            os.utime(recent_path, (cutoff + 60, cutoff + 60))
+            os.utime(old_path, (cutoff - 60, cutoff - 60))
+            on_disk = [
+                ("abcdefghijk", "Recent", 2026, 1, str(recent_path)),
+                ("lmnopqrstuv", "Old", 2025, 1, str(old_path)),
+            ]
+
+            with mock.patch("backend.index._reader_open",
+                            return_value=None):
+                result = refresh_views._filter_recent_on_disk(
+                    on_disk, "Channel", cutoff)
+
+        self.assertEqual([video[0] for video in result], ["abcdefghijk"])
 
     def test_views_refresh_summary_segments_split_labels_and_counts(self) -> None:
         segments = refresh_views._build_refresh_summary_segments(
@@ -1304,6 +1441,121 @@ class MetadataJsonlTests(unittest.TestCase):
 
 
 class MetadataFetcherTests(unittest.TestCase):
+    def test_flat_catalog_keeps_entries_when_upload_date_is_missing(self) -> None:
+        captured = {}
+
+        class FakeProc:
+            returncode = 0
+            stdout = iter([
+                "abc123_def4\t100\t5\t2\tVideo\tNA\t60\n",
+            ])
+            stderr = iter([])
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 1
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            return FakeProc()
+
+        with mock.patch.object(metadata_core, "_find_cookie_source",
+                               return_value=[]), \
+                mock.patch.object(metadata_core.subprocess, "Popen",
+                                  side_effect=fake_popen):
+            result = metadata_core._flat_playlist_bulk_stats(
+                "yt-dlp", "https://example.test/channel", mock.Mock())
+
+        self.assertNotIn("--break-match-filters", captured["cmd"])
+        self.assertIn("abc123_def4", result)
+        self.assertEqual(result["abc123_def4"]["upload_date"], "NA")
+        self.assertTrue(result.complete)
+
+    def test_flat_catalog_marks_rate_limit_even_after_partial_output(self) -> None:
+        class FakeProc:
+            returncode = 1
+            stdout = iter([
+                "abc123_def4\t100\t5\t2\tVideo\t20260101\t60\n",
+            ])
+            stderr = iter([
+                "ERROR: The current session has been rate-limited by "
+                "YouTube for up to an hour.\n",
+            ])
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 1
+
+        with mock.patch.object(metadata_core, "_find_cookie_source",
+                               return_value=[]), \
+                mock.patch.object(metadata_core.subprocess, "Popen",
+                                  return_value=FakeProc()), \
+                mock.patch.object(
+                    youtube_session, "handle_youtube_failure_text",
+                    return_value="rate_limit"):
+            result = metadata_core._flat_playlist_bulk_stats(
+                "yt-dlp", "https://example.test/channel", mock.Mock())
+
+        self.assertIn("abc123_def4", result)
+        self.assertTrue(result.rate_limited)
+        self.assertFalse(result.cookie_auth_required)
+        self.assertFalse(result.complete)
+
+    def test_views_likes_refresh_never_full_fetches_changed_entries(self) -> None:
+        bulk_result = {
+            "ok": True,
+            "bulk_fetched": 12,
+            "refreshed": 12,
+            "errors": 0,
+        }
+        with mock.patch.object(
+                refresh_fetch, "bulk_refresh_views_likes",
+                return_value=bulk_result) as bulk:
+            result = refresh_fetch.fetch_channel_metadata(
+                {"name": "Channel"}, mock.Mock(), refresh=True)
+
+        self.assertIs(result, bulk_result)
+        self.assertFalse(bulk.call_args.kwargs["full_fetch_on_change"])
+
+    def test_auth_or_rate_limit_result_never_uses_legacy_fallback(self) -> None:
+        blocked = {
+            "ok": False,
+            "bulk_fetched": 0,
+            "rate_limited": True,
+        }
+        with mock.patch.object(
+                refresh_fetch, "bulk_refresh_views_likes",
+                return_value=blocked), \
+                mock.patch.object(
+                    refresh_fetch, "_folder_for_channel") as folder:
+            result = refresh_fetch.fetch_channel_metadata(
+                {"name": "Channel"}, mock.Mock(), refresh=True)
+
+        self.assertIs(result, blocked)
+        folder.assert_not_called()
+
+    def test_fetch_video_metadata_returns_ytdlp_stderr_detail(self) -> None:
+        class FakeProc:
+            returncode = 1
+
+            def communicate(self, timeout=None):
+                return ("", "ERROR: [youtube] abc: Video unavailable")
+
+        errors = []
+        with mock.patch.object(metadata_fetcher, "_find_cookie_source",
+                               return_value=[]), \
+                mock.patch.object(metadata_fetcher.subprocess, "Popen",
+                                  return_value=FakeProc()):
+            result = metadata_fetcher._fetch_video_metadata(
+                "yt-dlp", "abc123_def4", "Hint", error_out=errors)
+
+        self.assertIsNone(result)
+        self.assertEqual(errors, ["[youtube] abc: Video unavailable"])
+
     def test_fetch_video_metadata_does_not_brace_slice_warning_text(self) -> None:
         class FakeProc:
             returncode = 0
@@ -2346,6 +2598,44 @@ class MetadataMixinTests(unittest.TestCase):
         api._log_stream.emit_text.assert_not_called()
         api._on_queue_changed.assert_called_once()
         api._maybe_autostart_sync.assert_called_once()
+
+    def test_metadata_queue_all_applies_recent_scope_to_every_task(self) -> None:
+        service_queues = mock.Mock()
+        service_queues.sync_paused = False
+        service_queues.sync_enqueue.return_value = True
+        service_log = mock.Mock()
+
+        class Api(metadata_mixin.MetadataMixin):
+            def __init__(self):
+                self._on_queue_changed = mock.Mock()
+                self._maybe_autostart_sync = mock.Mock(return_value=True)
+                self.services = AppServices(
+                    load_config=lambda: {
+                        "channels": [
+                            {"name": "One", "url": "one"},
+                            {"name": "Two", "url": "two"},
+                        ],
+                    },
+                    save_config=lambda cfg: True,
+                    queues=service_queues,
+                    log_stream=service_log,
+                    transcribe=mock.Mock(),
+                    event_bus=mock.Mock(),
+                )
+
+        result = Api().metadata_queue_all(
+            refresh=True, only_recent_days=365)
+
+        self.assertTrue(result["ok"])
+        tasks = [call.args[0]
+                 for call in service_queues.sync_enqueue.call_args_list]
+        self.assertEqual([task["scope"] for task in tasks],
+                         [{"days": 365}, {"days": 365}])
+        self.assertTrue(all(task["refresh"] for task in tasks))
+        self.assertIn(
+            "last 365d",
+            service_log.emit_text.call_args.args[0],
+        )
 
     def test_metadata_queue_year_prefers_app_services_dependencies(self) -> None:
         service_queues = mock.Mock()
@@ -5470,11 +5760,12 @@ class SyncCoreTests(unittest.TestCase):
             self.assertEqual(result["reason"], "write blocked")
             self.assertFalse((root / "New Channel").exists())
 
-    def test_429_backoff_uses_locked_process_wide_cooldown(self) -> None:
+    def test_429_auto_pause_uses_locked_process_wide_cooldown(self) -> None:
         stream = mock.Mock()
         cancel = threading.Event()
         pause = threading.Event()
         sync_core._LAST_429_BACKOFF_TS = 0.0
+        youtube_session._rate_limit_alert_ts = 0.0
 
         with mock.patch.object(sync_core.time, "time",
                                side_effect=[100.0, 120.0, 161.0]), \
@@ -5486,8 +5777,10 @@ class SyncCoreTests(unittest.TestCase):
         self.assertTrue(first)
         self.assertFalse(second)
         self.assertTrue(third)
-        self.assertEqual(sleep.call_count, 60)
-        self.assertEqual(stream.emit_text.call_count, 4)
+        sleep.assert_not_called()
+        stream.emit_text.assert_not_called()
+        self.assertTrue(pause.is_set())
+        stream.emit_error.assert_called_once()
 
     def test_failed_video_merge_does_not_resurrect_timeout_giveup(self) -> None:
         video_id = "abc123def45"

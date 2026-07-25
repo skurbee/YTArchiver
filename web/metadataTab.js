@@ -798,12 +798,17 @@
         if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
+        const pickN = parseInt(rowRefs, 10);
+        const days = (Number.isFinite(pickN) && pickN > 0) ? pickN : null;
         try {
-          const res = await bridgeCall("metadata_refresh_views_channel", ident);
+          const res = await bridgeCall(
+            "metadata_refresh_views_channel", ident, days);
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
-            window._showToast?.("Queued views/likes refresh." + _pausedTail(res),
+            const scope = days ? ` (last ${days}d)` : " (all videos)";
+            window._showToast?.(
+              `Queued views/likes refresh${scope}.` + _pausedTail(res),
               res?.paused ? "warn" : "ok");
           }
         } catch (err) {
@@ -971,8 +976,24 @@
                              { warn: needsFix });
       const transcribeItem = mkItem("Transcribe missing", "transcribe",
                                     { warn: needsTranscribe });
-      const viewsItem = mkItem("Refresh views/likes", "views");
       const thumbsItem = mkItem("Refetch missing thumbnails", "thumbs");
+      // Views/likes supports the same recent-upload scoping as the Browse
+      // channel menu. This keeps a large archive from defaulting to a full
+      // historical pass when only current counts matter.
+      const viewsWrap = document.createElement("div");
+      viewsWrap.className = "md-cm-sub-wrap";
+      const viewsHead = document.createElement("button");
+      viewsHead.type = "button";
+      viewsHead.className = "md-cm-item md-cm-has-sub";
+      viewsHead.innerHTML = "Refresh views/likes<span class=\"md-cm-chev\">›</span>";
+      const viewsSub = document.createElement("div");
+      viewsSub.className = "md-cm-sub";
+      viewsSub.appendChild(mkItem("Last week", "views", { days: 7 }));
+      viewsSub.appendChild(mkItem("Last month", "views", { days: 30 }));
+      viewsSub.appendChild(mkItem("Last year", "views", { days: 365 }));
+      viewsSub.appendChild(mkItem("All videos", "views", { days: 0 }));
+      viewsWrap.appendChild(viewsHead);
+      viewsWrap.appendChild(viewsSub);
       // "Refresh comments" carries a hover-submenu with day-scope picks.
       const commentsWrap = document.createElement("div");
       commentsWrap.className = "md-cm-sub-wrap";
@@ -995,10 +1016,10 @@
       if (needsFix) {
         menu.appendChild(fixItem);
         if (needsTranscribe) menu.appendChild(transcribeItem);
-        menu.appendChild(viewsItem);
+        menu.appendChild(viewsWrap);
       } else {
         if (needsTranscribe) menu.appendChild(transcribeItem);
-        menu.appendChild(viewsItem);
+        menu.appendChild(viewsWrap);
         menu.appendChild(fixItem);
       }
       menu.appendChild(commentsWrap);
@@ -1083,22 +1104,28 @@
         if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
-        const ok = await (window.askChoice ? window.askChoice({
-          title: "Refresh all views/likes?",
-          message: "This will queue a views/likes refresh for every saved channel. Uses the fast bulk path — most channels finish in under a minute.",
-          choices: [{ label: "Queue all", value: "go", kind: "primary" }],
-        }) : Promise.resolve("go"));
-        // askChoice resolves to a string from dataset.value, or null on
-        // cancel. Any non-null string means the user clicked the
-        // primary button, so proceed.
-        if (!ok) return;
+        const pick = await (window.askChoice ? window.askChoice({
+          title: "Refresh views/likes — all channels",
+          message: "Choose videos by upload date. A shorter range is much faster on a large archive.",
+          choices: [
+            { label: "Last week", value: "7" },
+            { label: "Last month", value: "30" },
+            { label: "Last year", value: "365", kind: "primary" },
+            { label: "All videos", value: "0" },
+          ],
+        }) : Promise.resolve("365"));
+        if (pick === null) return;
+        const parsed = parseInt(pick, 10);
+        const days = (Number.isFinite(parsed) && parsed > 0) ? parsed : null;
         try {
-          const res = await bridgeCall("metadata_queue_all", true);
+          const res = await bridgeCall("metadata_queue_all", true, days);
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
+            const scope = days ? `last ${days}d` : "all videos";
             window._showToast?.(
-              `Queued for ${res.queued} channel(s).` + _pausedTail(res),
+              `Queued ${scope} for ${res.queued} channel(s).`
+                + _pausedTail(res),
               res?.paused ? "warn" : "ok");
           }
         } catch (err) {

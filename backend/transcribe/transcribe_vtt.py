@@ -170,6 +170,17 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
                     "utf-8", errors="replace")
             except Exception:
                 err_text = ""
+            if err_text:
+                try:
+                    from ..youtube_session import (
+                        handle_youtube_failure_text)
+                    if handle_youtube_failure_text(
+                            err_text,
+                            context="fetching captions for transcription",
+                            stream=stream):
+                        return False
+                except Exception as e:
+                    _log.debug("caption-fetch YouTube guard failed: %s", e)
             if err_text and use_cookies:
                 _lower = err_text.lower()
                 if any(p in _lower for p in (

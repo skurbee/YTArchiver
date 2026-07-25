@@ -61,13 +61,25 @@ _cookie_source_cached: list[str] | None = None
 _cookie_source_lock = threading.Lock()
 
 
-def _find_cookie_source() -> list[str]:
+def _check_cookie_args(result: list[str], skip: bool) -> list[str]:
+    """Run the process-wide Firefox session guard for a cookie source."""
+    if not skip:
+        try:
+            from ..youtube_session import check_cookie_source
+            check_cookie_source(result, context="a YouTube operation")
+        except Exception as e:
+            swallow("YouTube cookie-session check", e)
+    return list(result)
+
+
+def _find_cookie_source(*, _skip_session_check: bool = False) -> list[str]:
     """Return the yt-dlp cookie args to use (the '--cookies-from-browser X'
     pair or '--cookies /path/to/cookies.txt' pair, or an empty list)."""
     global _cookie_source_cached
     with _cookie_source_lock:
         if _cookie_source_cached is not None:
-            return list(_cookie_source_cached)
+            return _check_cookie_args(
+                list(_cookie_source_cached), _skip_session_check)
 
         # Manual override — user can drop cookies.txt in APPDATA\YTArchiver\
         try:
@@ -75,7 +87,8 @@ def _find_cookie_source() -> list[str]:
             manual = APP_DATA_DIR / "cookies.txt"
             if manual.exists():
                 _cookie_source_cached = ["--cookies", str(manual)]
-                return list(_cookie_source_cached)
+                return _check_cookie_args(
+                    list(_cookie_source_cached), _skip_session_check)
         except Exception as e:
             swallow("cookie-source probe", e)
 
@@ -89,11 +102,13 @@ def _find_cookie_source() -> list[str]:
             p = known_paths.get(browser)
             if p and os.path.isdir(p):
                 _cookie_source_cached = ["--cookies-from-browser", browser]
-                return list(_cookie_source_cached)
+                return _check_cookie_args(
+                    list(_cookie_source_cached), _skip_session_check)
 
         # No Firefox + no cookies.txt — run unauthenticated (public content).
         _cookie_source_cached = []
-        return list(_cookie_source_cached)
+        return _check_cookie_args(
+            list(_cookie_source_cached), _skip_session_check)
 
 
 def reset_cookie_cache():

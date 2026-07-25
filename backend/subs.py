@@ -293,6 +293,17 @@ def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> str | None:
             try:
                 try:
                     out, _err = proc.communicate(timeout=timeout)
+                    try:
+                        from .youtube_session import (
+                            handle_youtube_failure_text)
+                        if handle_youtube_failure_text(
+                                _err or "",
+                                context="resolving a channel name"):
+                            return ""
+                    except Exception as _guard_error:
+                        _log.debug(
+                            "channel-name YouTube guard failed: %s",
+                            _guard_error)
                 except _sp.TimeoutExpired:
                     try: proc.kill()
                     except Exception: pass

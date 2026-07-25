@@ -573,13 +573,14 @@ class MetadataMixin:
                 "paused": bool(self._metadata_queues().sync_paused)}
 
 
-    def metadata_queue_all(self, refresh=False):
+    def metadata_queue_all(self, refresh=False, only_recent_days=None):
         """Enqueue every saved channel as a `kind: "metadata"` sync
         task — each one becomes its own row in the Sync Tasks popover
         so the user can see, pause, and cancel. Matches rule
         that background work must always be represented in a task
-        list. `refresh=True` triggers the refresh variant (re-hits
-        every video) instead of skip-existing.
+        list. `refresh=True` triggers the refresh variant instead of
+        skip-existing. `only_recent_days` limits refresh work to videos
+        uploaded in the last N days; None means the whole archive.
 
         Mirrors YTArchiver.py:28296 _secret_download_all_metadata (new metadata)
         and :28326 _secret_refresh_all_metadata (views/likes refresh only).
@@ -589,12 +590,22 @@ class MetadataMixin:
                           key=lambda c: (c.get("name") or "").lower())
         if not channels:
             return {"ok": False, "error": "No channels configured"}
+        scope_days = None
+        if refresh and only_recent_days is not None:
+            try:
+                parsed_days = int(only_recent_days)
+                if parsed_days > 0:
+                    scope_days = parsed_days
+            except (TypeError, ValueError):
+                pass
         queued = 0
         for ch in channels:
             try:
                 task = dict(ch)
                 task["kind"] = "metadata"
                 task["refresh"] = bool(refresh)
+                if scope_days is not None:
+                    task["scope"] = {"days": scope_days}
                 if self._metadata_queues().sync_enqueue(task):
                     queued += 1
             except Exception as e:
@@ -602,9 +613,11 @@ class MetadataMixin:
                     f"Metadata enqueue failed for {ch.get('name')}: {e}")
         self._on_queue_changed()
         label = "refresh" if refresh else "download"
+        scope_label = f" (last {scope_days}d)" if scope_days else ""
         log_stream = self._metadata_log_stream()
         log_stream.emit_text(
-            f" \u2014 Queued metadata {label} for {queued} channel(s) "
+            f" \u2014 Queued metadata {label}{scope_label} "
+            f"for {queued} channel(s) "
             f"on Sync Tasks.", "simpleline_pink")
         log_stream.flush()
         # always auto-fire the worker when the user explicitly

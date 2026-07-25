@@ -378,6 +378,17 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         )
         # Hook the monitor into the log stream so it sees every line.
         self._log_stream.add_line_scanner(self._disk_mon.scan_line)
+        # One process-wide YouTube guard covers every yt-dlp feature.  Direct
+        # callers proactively validate Firefox cookies through the shared
+        # cookie-source helper; this scanner is the final safety net for any
+        # YouTube error that reaches the log.
+        try:
+            from backend import youtube_session as _yt_session
+            _yt_session.configure(
+                self._log_stream, self._sync_pause, self._queues)
+            self._log_stream.add_line_scanner(_yt_session.scan_log_line)
+        except Exception as e:
+            _log.debug("YouTube session guard setup failed: %s", e)
         # Session download counter → tray badge overlay. Bumps on each
         # "Downloading <title>" line emitted by sync.py; resets when sync
         # idles. _tray_set_badge.
@@ -1867,6 +1878,14 @@ def main():
         except Exception as e: _log.debug("swallowed: %s", e)
         try: api.check_ytdlp_freshness()
         except Exception as e: _log.debug("swallowed: %s", e)
+        # Proactive sign-in check.  This runs after the DOM/log bridge is ready
+        # so an expired Firefox session produces the modal immediately instead
+        # of waiting for the first scheduled YouTube job.
+        try:
+            from backend.youtube_session import check_configured_cookie_session
+            check_configured_cookie_session(context="startup")
+        except Exception as e:
+            _log.debug("startup YouTube-session check failed: %s", e)
         try: api.check_channel_folders()
         except Exception as e: _log.debug("swallowed: %s", e)
         try: api.check_app_update()

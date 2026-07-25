@@ -118,8 +118,14 @@ def fetch_channel_metadata(channel: dict[str, Any],
                                         cancel_event=cancel_event,
                                         pause_event=pause_event,
                                         scope=scope,
-                                        full_fetch_on_change=True,
+                                        full_fetch_on_change=False,
                                         queues=queues)
+        # Authentication and throttling failures already auto-paused the
+        # queue.  Never fall through into the legacy per-video path: that
+        # would immediately issue hundreds/thousands more doomed requests.
+        if (_res.get("cookie_auth_required")
+                or _res.get("rate_limited")):
+            return _res
         # Fall through to the old path ONLY if the bulk path couldn't
         # get any data at all (e.g. channel URL stripped, yt-dlp
         # returned empty, private channel). That path is still

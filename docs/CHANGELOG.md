@@ -6,6 +6,26 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v82.4 - 2026-07-24
+
+### Fixed
+- **Expired Firefox sessions now stop YouTube work visibly.** A shared process-wide session guard validates the configured Firefox cookies before yt-dlp operations, performs authenticated checks at startup and Resume, pauses the app when YouTube authentication expires, and raises the same prominent sign-in warning across sync, metadata, captions, channel artwork, redownload, and repair tools.
+- **YouTube rate limits now pause work instead of compounding the block.** HTTP 429 and related throttling responses trigger one persistent warning, suppress duplicate alarms, and leave interrupted work ready to retry after the user waits and resumes instead of blindly restarting after a short fixed delay.
+- **Recent views/likes refresh scopes use archive dates correctly.** Last-week, last-month, and last-year passes preserve catalog rows whose remote dates are incomplete, fall back to indexed local upload times, and no longer report active channels as up to date simply because the catalog response omitted a usable date.
+- **Views/likes refresh failures stop cleanly and explain the actual problem.** Authentication and rate-limit errors bypass legacy fallbacks, incomplete passes are not stamped current, progress rows clear correctly, and failed videos now include useful channel, title, video-ID, and yt-dlp error detail.
+- **Views/likes refresh output stays in queue order.** Per-channel progress and refresh notices are emitted together so later channel rows no longer appear before an earlier channel's detail line.
+- **The session error popup now lists real errors.** Semantic error markers exclude red-colored summaries and cancellation notices from the count, while an **Open full log** action provides the surrounding context without discarding the saved error list.
+
+### Changed
+- **Views/likes refreshes can be scoped before queueing.** The Health tab and single-channel actions now offer Last week, Last month, Last year, or All videos; archive-wide refreshes default to the practical one-year window rather than silently processing the entire archive.
+- **Firefox cookie status distinguishes expiration from mere cookie presence.** The app checks the relevant YouTube authentication cookie expiry instead of treating any Firefox YouTube cookie as proof that the session is still usable.
+
+### Validation
+- Backend smoke suite passed: 409 tests.
+- Focused session-guard, rate-limit, recent-scope, metadata-failure, and error-detail regression coverage passed.
+- Frontend JavaScript syntax and generated HTML freshness checks passed.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
 ## v82.3 - 2026-07-22
 
 ### Fixed

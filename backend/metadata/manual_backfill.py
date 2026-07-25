@@ -167,13 +167,23 @@ def _ytsearch(yt: str, query: str, n: int,
     try:
         proc = subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+            stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
             creationflags=_CREATE_NO_WINDOW)
     except OSError:
         return out
     try:
         with proc.stdout:
             for line in proc.stdout:
+                try:
+                    from ..youtube_session import (
+                        handle_youtube_failure_text)
+                    if handle_youtube_failure_text(
+                            line, context="searching YouTube for a video ID"):
+                        try: proc.terminate()
+                        except Exception: pass
+                        break
+                except Exception as e:
+                    _log.debug("manual backfill YouTube guard failed: %s", e)
                 if cancel_event is not None and cancel_event.is_set():
                     try: proc.terminate()
                     except Exception as e: swallow("ytsearch cancel terminate", e)

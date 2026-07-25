@@ -384,6 +384,14 @@ class YtDlpRunner:
                 return -1, "", "timeout"
         finally:
             self._registry.unregister(proc)
+        try:
+            from .youtube_session import handle_youtube_failure_text
+            handle_youtube_failure_text(
+                "\n".join((stdout or "", stderr or "")),
+                context="running yt-dlp",
+            )
+        except Exception as e:
+            _log.debug("YtDlpRunner session guard failed: %s", e)
         return proc.returncode, stdout or "", stderr or ""
 
     def run_streaming(self, argv: Iterable[str],
@@ -493,7 +501,15 @@ class YtDlpRunner:
             except Exception as e:
                 _log.debug("swallowed: %s", e)
         rc = proc.returncode if proc.returncode is not None else -1
-        return StreamingRunResult(rc, list(stderr_tail), cancelled=cancelled)
+        _stderr_result = list(stderr_tail)
+        try:
+            from .youtube_session import handle_youtube_failure_text
+            handle_youtube_failure_text(
+                "\n".join(_stderr_result), context="running yt-dlp")
+        except Exception as e:
+            _log.debug("YtDlpRunner streaming session guard failed: %s", e)
+        return StreamingRunResult(
+            rc, _stderr_result, cancelled=cancelled)
 
 
 # ── FfmpegRunner ─────────────────────────────────────────────────────

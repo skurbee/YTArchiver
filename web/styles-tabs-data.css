@@ -708,7 +708,7 @@
   user-select: text;
 }
 .gsb-errors-popover .queue-popover-footer {
-  justify-content: flex-end;
+  justify-content: space-between;
 }
 .queue-popover-header {
   display: flex;

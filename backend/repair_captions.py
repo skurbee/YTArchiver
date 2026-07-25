@@ -299,6 +299,18 @@ def _fetch_vtt(yt_dlp: str, video_id: str,
     except Exception:
         _stderr_text = ""
         _stdout_text = ""
+    try:
+        from .youtube_session import handle_youtube_failure_text
+        _yt_failure = handle_youtube_failure_text(
+            "\n".join((_stderr_text, _stdout_text)),
+            context="fetching YouTube captions")
+    except Exception as e:
+        _log.debug("caption-repair YouTube guard failed: %s", e)
+        _yt_failure = ""
+    if _yt_failure:
+        return None, (
+            "Firefox YouTube sign-in expired"
+            if _yt_failure == "cookie" else "YouTube rate limited")
     if r_code != 0:
         msg = (_stderr_text or _stdout_text or "").splitlines()
         tail = msg[-1] if msg else "yt-dlp failed"

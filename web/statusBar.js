@@ -222,10 +222,20 @@
     const log = document.getElementById("main-log");
     if (!log || log._gsbErrObserved) return;
     log._gsbErrObserved = true;
-    const isErr = (node) =>
-      node && node.nodeType === 1 && node.classList &&
-      node.classList.contains("log-line") &&
-      !!node.querySelector(".t-red");
+    const isErr = (node) => {
+      if (!(node && node.nodeType === 1 && node.classList &&
+            node.classList.contains("log-line"))) return false;
+      // Preferred path: LogStreamer.emit_error marks actionable failures.
+      if (node.querySelector(".t-error_detail")) return true;
+      // Compatibility for older/manual emitters: accept an all-red line,
+      // but not red count fragments in summaries or a user cancellation.
+      const text = String(node.textContent || "").trim();
+      if (!text || /pass cancelled/i.test(text)) return false;
+      const meaningful = [...node.querySelectorAll("span")]
+        .filter(span => String(span.textContent || "").trim());
+      return meaningful.length > 0 &&
+        meaningful.every(span => span.classList.contains("t-red"));
+    };
     const obs = new MutationObserver((muts) => {
       if (!_countLive) return;
       let added = 0;
@@ -312,6 +322,10 @@
       _renderErrorsPopover();
       _render();
       _closeErrorsPopover();
+    });
+    document.getElementById("gsb-errors-open-log")?.addEventListener("click", () => {
+      _closeErrorsPopover();
+      gotoLog();
     });
     document.addEventListener("click", () => {
       if (!document.getElementById("popover-session-errors")

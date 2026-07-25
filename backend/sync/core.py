@@ -277,23 +277,30 @@ def _line_is_network_suspicious(line_lower: str) -> bool:
 def _maybe_429_backoff(stream: LogStreamer,
                        cancel_event: threading.Event | None,
                        pause_event: threading.Event | None) -> bool:
-    """Run the process-wide 429 cooldown once per 60-second storm."""
+    """Auto-pause immediately on a YouTube 429 storm.
+
+    The old 30-second sleep then blindly resumed, which let a metadata pass
+    generate thousands of failures during YouTube's stated one-hour block.
+    """
     global _LAST_429_BACKOFF_TS
     now = time.time()
     with _backoff_lock:
         if now - _LAST_429_BACKOFF_TS < 60.0:
             return False
         _LAST_429_BACKOFF_TS = now
-    stream.emit_text(
-        " \u23F8 Rate-limited by YouTube \u2014 backing off 30s...",
-        "red")
-    for _ in range(30):
-        if cancel_event is not None and cancel_event.is_set():
-            break
-        if pause_event is not None and pause_event.is_set():
-            break
-        time.sleep(1)
-    stream.emit_text(" \u25B6 Resuming.", "simpleline_green")
+    try:
+        from ..youtube_session import trigger_rate_limit_alert
+        trigger_rate_limit_alert(
+            reason="HTTP 429: Too Many Requests",
+            context="downloading from YouTube",
+            stream=stream,
+            pause_event=pause_event,
+            now=now,
+        )
+    except Exception as e:
+        _log.debug("429 auto-pause failed: %s", e)
+        if pause_event is not None:
+            pause_event.set()
     return True
 
 
@@ -1459,95 +1466,21 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 except Exception as _ne:
                     swallow("net-outage guard", _ne)
 
-            # ── Cookie / sign-in error detection ───────────────────────
-            # yt-dlp surfaces stale-cookie / signed-out-of-YouTube
-            # failures in a few ways, all caught here:
-            # "ERROR: [youtube] <id>: Sign in to confirm you're not a bot"
-            # "ERROR: unable to extract cookies from firefox"
-            # "WARNING: cookies are missing/invalid"
-            # Classic YTArchiver flagged these with a big red block
-            # telling the user to sign back in; overhaul was silent,
-            # so the user could run stale-cookie syncs for days with
-            # no visible feedback. Fires ONCE per sync pass
-            # (`_COOKIE_ALERT_FIRED`) — subsequent channels don't
-            # re-emit the same banner. Does NOT set cancel_event:
-            # public videos still download without auth, so letting
-            # the pass continue is strictly better than aborting.
-            global _COOKIE_ALERT_FIRED
-            # Per-pass guard so a second sync_all pass that overlaps
-            # the first doesn't reset the flag mid-pass and let the
-            # first pass's remaining channels re-emit the banner
-            # (audit: sync/core.py H25). Use the pass-id from
-            # _ROW_EMIT_PASS_ID which sync_all set at the start; if
-            # we've already alerted for this pass, skip even if the
-            # module-level flag was reset by a concurrent pass.
+            # Shared guard covers downloads, metadata, comments, thumbnails,
+            # redownloads, and every other yt-dlp operation with one alarm.
+            # It also handles 429/rate-limit text and persists the auto-pause.
             try:
-                _my_pass_id = getattr(_ROW_EMIT_PASS_ID, "id", "") or ""
-            except Exception:
-                _my_pass_id = ""
-            # Patch A: atomic check-and-set under _cookie_alert_lock so
-            # concurrent channel-syncs don't both fire the banner.
-            with _cookie_alert_lock:
-                _should_emit_cookie_alert = False
-                if _my_pass_id and _my_pass_id in _COOKIE_ALERT_PASSES_FIRED:
-                    _COOKIE_ALERT_FIRED = True
-                if not _COOKIE_ALERT_FIRED:
-                    _sl = s.lower()
-                    if (("sign in to confirm" in _sl)
-                        or ("cookies are missing" in _sl)
-                        or ("cookies are invalid" in _sl)
-                        or ("failed to extract any player response" in _sl
-                            and "sign in" in _sl)
-                        or ("error:" in _sl and "cookie" in _sl
-                            and ("extract" in _sl or "sign in" in _sl))):
-                        _COOKIE_ALERT_FIRED = True
-                        if _my_pass_id:
-                            _COOKIE_ALERT_PASSES_FIRED.add(_my_pass_id)
-                            # Cap the set so it can't grow unbounded
-                            # across thousands of passes in a long-
-                            # running session.
-                            if len(_COOKIE_ALERT_PASSES_FIRED) > 200:
-                                try:
-                                    _COOKIE_ALERT_PASSES_FIRED.pop()
-                                except KeyError:
-                                    pass
-                        _should_emit_cookie_alert = True
-            if _should_emit_cookie_alert:
-                _bar = "\u2588" * 65
-                stream.emit([["\n" + _bar + "\n", "red"]])
-                stream.emit([["\u2588  ", "red"],
-                             ["Browser is signed out of YouTube.",
-                              "red"],
-                             ["\n", "red"]])
-                stream.emit([["\u2588  ", "red"],
-                             ["Sign in to YouTube in Firefox (or your "
-                              "default browser) so YTArchiver can",
-                              "red"],
-                             ["\n", "red"]])
-                stream.emit([["\u2588  ", "red"],
-                             ["reuse the session cookie. "
-                              "\u23f8 Sync paused \u2014 click Resume to continue.",
-                              "red"],
-                             ["\n", "red"]])
-                stream.emit([[_bar + "\n\n", "red"]])
-                # Auto-pause so the user must re-sign in before more
-                # channels run. Setting pause_event here terminates the
-                # current yt-dlp subprocess; sync_all._wait_if_paused()
-                # blocks the loop until the user clicks Resume.
-                if pause_event is not None:
-                    try:
-                        pause_event.set()
-                    except Exception as _cpe:
-                        _log.debug("cookie alert: pause_event.set() failed: %s",
-                                   _cpe)
-                # Notify the frontend to show a prominent modal dialog so
-                # the user doesn't miss the cookie-expired warning buried
-                # in the log text.
-                import json as _json
-                stream.emit([[
-                    _json.dumps({"kind": "cookie_alert"}),
-                    "__control__",
-                ]])
+                from ..youtube_session import handle_youtube_failure_text
+                handle_youtube_failure_text(
+                    s,
+                    context=f"downloading {name}",
+                    stream=stream,
+                    pause_event=pause_event,
+                    queues=queues,
+                )
+            except Exception as _yt_guard_error:
+                _log.debug(
+                    "YouTube failure guard failed: %s", _yt_guard_error)
 
             # DLTRACK:::Title:::Uploader:::YYYYMMDD:::bytes:::secs:::videoID
             # Emitted by yt-dlp's --print after_video:... directive ONLY

@@ -506,6 +506,21 @@
   border-radius: 2px;
 }
 .controls-row-thin .yt-dd-trigger { padding: 0 6px; }
+.autorun-clock-time {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 6px;
+}
+.autorun-clock-time[hidden] { display: none !important; }
+.autorun-clock-time-prefix {
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+}
+#auto-sync-clock-time.yt-dd-enhanced { display: none !important; }
+.controls-row-thin .autorun-clock-time .yt-dd {
+  min-width: 144px;
+}
 
 .spacer { flex: 1; }
 

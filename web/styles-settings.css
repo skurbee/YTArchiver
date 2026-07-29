@@ -51,9 +51,9 @@
      narrows — the path inputs ellipsis/scroll instead of labels
      getting clipped. */
   grid-template-columns: max-content minmax(0, 1fr);
-  column-gap: 24px;
+  column-gap: 0;
   row-gap: 0;
-  align-items: center;
+  align-items: stretch;
   /* width: 100% is CRITICAL — without it the grid sizes to content
      only and leaves enormous empty gutters when the main area is
      wider than the grid's intrinsic width. max-width then caps the
@@ -76,6 +76,7 @@
    so the content sits inside the card's interior margins. */
 .settings-view .edit-grid > .edit-gl {
   padding: 16px 0 16px 22px;
+  box-sizing: border-box;
   font-size: var(--fs-lg);
   font-weight: 500;
   color: var(--c-text);
@@ -85,23 +86,25 @@
 }
 .settings-view .edit-grid > .edit-gv-inline,
 .settings-view .edit-grid > .edit-gv-stack,
+.settings-view .edit-grid > .edit-gv-cell,
 .settings-view .edit-grid > select,
 .settings-view .edit-grid > input {
   padding-top: 12px;
   padding-bottom: 12px;
   padding-right: 22px;
+  padding-left: 24px;
+  box-sizing: border-box;
   min-width: 0;
 }
-/* Hint paragraph that spans both grid columns under a settings field.
-   Used for fields where the semantics aren't obvious (e.g. Archive
-   root only affecting NEW downloads). Audit U-14. */
+/* Legacy helper copy. New settings should keep descriptions inside the value
+   cell with .settings-field-with-help so each row remains one visual unit. */
 .settings-view .edit-grid > .edit-gh {
-  grid-column: 1 / -1;
-  font-size: var(--fs-xs);
+  grid-column: 2;
+  font-size: var(--fs-sm);
   color: var(--c-dim);
-  line-height: 1.4;
-  padding: 0 22px 14px 0;
-  margin-top: -8px;
+  line-height: 1.45;
+  padding: 0 22px 14px 10px;
+  margin-top: -10px;
   border-top: none;  /* override the row-divider rule above */
 }
 /* Thin horizontal dividers between rows. The label and value cells
@@ -122,6 +125,12 @@
   justify-content: flex-end;
   align-items: center;
   flex-wrap: nowrap;
+}
+.settings-view .edit-gv-cell {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  min-width: 0;
 }
 .settings-view .edit-gap-6 {
   gap: 6px;
@@ -150,6 +159,182 @@
 .settings-view .edit-gv-stack > .edit-gv-inline {
   width: 100%;
   justify-content: flex-end;
+}
+
+.settings-view .settings-field-with-help {
+  align-items: stretch;
+  gap: 8px;
+  padding-left: 20px;
+}
+.settings-view .settings-field-with-help > .edit-gv-inline {
+  width: 100%;
+}
+.settings-view .settings-field-with-help > .yt-dd,
+.settings-view .settings-field-with-help > select {
+  align-self: flex-end;
+}
+.settings-field-help {
+  align-self: stretch;
+  max-width: 680px;
+  padding-left: 10px;
+  border-left: 2px solid var(--c-border);
+  border-left-color: color-mix(in srgb, var(--c-accent) 28%, var(--c-border));
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+  text-align: left;
+}
+
+.settings-view .settings-traffic-controls {
+  align-items: stretch;
+  padding-left: 20px;
+}
+.settings-view .settings-traffic-controls > .yt-dd,
+.settings-view .settings-traffic-controls > select {
+  align-self: flex-end;
+  min-width: 230px;
+}
+.settings-traffic-custom {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(155px, 1fr));
+  gap: 7px 12px;
+  padding: 10px;
+  margin-top: 4px;
+  border: 1px solid var(--c-border);
+  border-radius: 7px;
+  background: var(--c-bg);
+}
+.settings-traffic-custom[hidden] { display: none; }
+.settings-traffic-custom label {
+  display: grid;
+  grid-template-columns: 1fr 78px auto;
+  gap: 5px;
+  align-items: center;
+  color: var(--c-dim);
+  font-size: var(--fs-xs);
+}
+.settings-traffic-custom .ctl-input {
+  width: 78px;
+  height: 30px;
+  padding: 4px 6px;
+  font-size: var(--fs-sm);
+}
+.settings-traffic-meter {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 1px;
+}
+.settings-traffic-usage {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 3px 8px;
+  border: 1px solid var(--c-border);
+  border-radius: 999px;
+  background: var(--c-bg);
+  color: var(--c-dim);
+  line-height: 1.35;
+}
+.settings-traffic-usage strong {
+  color: var(--c-text);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.settings-traffic-usage small {
+  color: var(--c-dim);
+  font-size: var(--fs-xs);
+}
+.settings-traffic-cooldown {
+  flex-basis: 100%;
+  color: var(--c-warn, #d7a252);
+  font-size: var(--fs-xs);
+  text-align: right;
+}
+.settings-traffic-cooldown[hidden] {
+  display: none;
+}
+.settings-traffic-meter.is-warning .settings-traffic-usage {
+  border-color: var(--c-warn, #d7a252);
+  border-color: color-mix(in srgb, var(--c-warn, #d7a252) 45%, var(--c-border));
+}
+.settings-traffic-insight {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 10px;
+  align-self: flex-end;
+  width: 100%;
+  max-width: 560px;
+  margin-top: 5px;
+  padding: 11px 13px;
+  border: 1px solid var(--c-border);
+  border: 1px solid color-mix(in srgb, var(--c-accent) 28%, var(--c-border));
+  border-radius: 8px;
+  background: var(--c-bg);
+  background: color-mix(in srgb, var(--c-accent) 6%, var(--c-bg));
+  box-sizing: border-box;
+  text-align: left;
+}
+.settings-traffic-insight-icon {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  margin-top: 1px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--c-accent) 18%, transparent);
+  color: var(--c-accent);
+  font-size: 12px;
+  font-weight: 700;
+}
+.settings-traffic-insight-copy {
+  min-width: 0;
+}
+.settings-traffic-insight-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--c-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.35;
+}
+.settings-traffic-insight-heading > span {
+  text-transform: uppercase;
+  letter-spacing: .045em;
+  white-space: nowrap;
+}
+.settings-traffic-insight-heading > strong {
+  color: var(--c-text);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  text-align: right;
+}
+.settings-traffic-insight-detail,
+.settings-traffic-insight-note {
+  margin-top: 4px;
+  color: var(--c-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.45;
+}
+.settings-traffic-insight-note {
+  padding-top: 5px;
+  border-top: 1px solid var(--c-border);
+}
+.settings-traffic-insight-note[hidden] {
+  display: none;
+}
+.settings-traffic-insight.is-warning {
+  border-color: var(--c-warn, #d7a252);
+  border-color: color-mix(in srgb, var(--c-warn, #d7a252) 45%, var(--c-border));
+  background: var(--c-bg);
+  background: color-mix(in srgb, var(--c-warn, #d7a252) 7%, var(--c-bg));
+}
+.settings-traffic-insight.is-warning .settings-traffic-insight-icon {
+  background: color-mix(in srgb, var(--c-warn, #d7a252) 18%, transparent);
+  color: var(--c-warn, #d7a252);
 }
 
 /* Standalone <select> / <input> / custom dropdowns in the grid:
@@ -270,6 +455,41 @@
   white-space: nowrap;
 }
 .yt-dd-option:hover { background: rgba(255, 255, 255, 0.05); }
+.yt-dd-option[data-tooltip] {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.yt-dd-option[data-tooltip]::after {
+  content: "ⓘ";
+  flex: 0 0 auto;
+  color: var(--c-dim);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+}
+.yt-dd-option.featured {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  font-weight: 600;
+}
+.yt-dd-option.featured::after {
+  content: attr(data-featured);
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid rgba(125, 166, 214, 0.28);
+  border-radius: 999px;
+  color: #93b6dc;
+  background: rgba(74, 117, 168, 0.1);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.yt-dd-option.disabled { opacity: 0.45; cursor: default; }
+.yt-dd-option.disabled:hover { background: transparent; }
 .yt-dd-option.selected {
   background: rgba(160, 170, 187, 0.1);
   color: var(--c-text);
@@ -323,6 +543,26 @@
   white-space: normal;
   line-height: 1.4;
 }
+.settings-control-caption,
+.settings-control-unit {
+  min-width: 0;
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+  line-height: 1.4;
+}
+.settings-control-unit {
+  white-space: nowrap;
+}
+.settings-inline-note {
+  padding: 3px 7px;
+  border: 1px solid var(--c-border);
+  border-radius: 999px;
+  background: var(--c-bg);
+  color: var(--c-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.2;
+  white-space: nowrap;
+}
 /* Inside a vertical stack (e.g. checkbox + hint),
    the hint row should naturally wrap and not try to right-align. */
 .settings-view .edit-gv-stack > .edit-gv-inline:not(:first-child) {
@@ -354,7 +594,6 @@
   display: inline-block;
   font-size: var(--fs-md);
   color: var(--c-dim);
-  font-style: italic;
   transition: color 0.15s ease;
 }
 .settings-autosave-note.is-saved {

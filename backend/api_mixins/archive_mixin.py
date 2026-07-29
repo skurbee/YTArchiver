@@ -22,6 +22,7 @@ from ._shared import _log
 from backend.log import swallow
 from backend.ytarchiver_config import load_config
 from backend import sync as sync_backend
+from backend import youtube_traffic
 
 # Module-level init lock — the bridge attribute (_archive_single_lock)
 # is created lazily on first call, and without an outer lock two near-
@@ -597,6 +598,14 @@ class ArchiveMixin:
                 *sync_backend._find_cookie_source(),
                 url,
             ]
+            if youtube_traffic.is_youtube_url(url):
+                permission = youtube_traffic.acquire(
+                    "single_video_download", stream=self._log_stream)
+                if not permission.get("ok"):
+                    self._log_stream.emit_error(
+                        permission.get("error")
+                        or "YouTube traffic governor cancelled")
+                    return
             try:
                 proc = _sp.Popen(cmd, stdin=_sp.DEVNULL,
                                  stdout=_sp.PIPE, stderr=_sp.STDOUT,

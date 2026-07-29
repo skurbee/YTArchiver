@@ -4,8 +4,9 @@
  * Restores the onboarding lost in the tkinter -> pywebview migration:
  *   Step 1  Welcome
  *   Step 2  Pick archive folder   (api.pick_folder + api.set_parent_folder)
- *   Step 3  Install dependencies  (api.onboarding_install_core / _whisper)
- *   Step 4  Done                  (api.onboarding_finish)
+ *   Step 3  Choose traffic safety (api.onboarding_set_traffic)
+ *   Step 4  Install dependencies  (api.onboarding_install_core / _whisper)
+ *   Step 5  Done                  (api.onboarding_finish)
  *
  * Exposes:
  *   window._startOnboarding({force})  — show the wizard. seedLogs.js calls
@@ -35,12 +36,71 @@
   let _whisperBusy = false;
   let _whisperChecking = false; // auto import-verify in flight
   let _deps = null;           // last probe snapshot
+  let _traffic = null;        // live traffic status + projection
+  let _trafficMode = "conservative";
   let _force = false;         // true when re-opened from Settings (dismissable)
   const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
   let _coreWatchdog = null;
   let _whisperWatchdog = null;
 
-  const STEP_NEXT_LABEL = { 1: "Get started", 2: "Continue", 3: "Continue", 4: "Finish" };
+  const STEP_NEXT_LABEL = {
+    1: "Get started", 2: "Continue", 3: "Continue", 4: "Continue", 5: "Finish"
+  };
+
+  function renderTraffic(traffic) {
+    if (traffic) _traffic = traffic;
+    _trafficMode = _traffic?.mode || _trafficMode || "conservative";
+    document.querySelectorAll("#onb-traffic-grid .onb-traffic-card").forEach((card) => {
+      const selected = card.dataset.trafficMode === _trafficMode;
+      card.classList.toggle("selected", selected);
+      card.setAttribute("aria-pressed", selected ? "true" : "false");
+    });
+    const custom = $("onb-traffic-custom");
+    if (custom) custom.hidden = _trafficMode !== "custom";
+    window._setBudgetAutosyncAvailable?.(_trafficMode !== "unlimited");
+    const p = _traffic?.projection;
+    const summary = $("onb-traffic-summary");
+    if (summary) {
+      let text = p?.recommendation || "Conservative is the safest starting point.";
+      if (_trafficMode === "unlimited") {
+        text = "Unlimited removes the rolling ceilings. Launch spacing and the emergency rate-limit stop remain active, but budget-based auto-sync is unavailable.";
+      } else if (p?.sweep?.channels) {
+        text += ` One complete sweep is estimated at about ${p.sweep.units} operations.`;
+      }
+      summary.textContent = text;
+      summary.classList.toggle("is-warning", _trafficMode === "unlimited" || p?.fits_complete_sweep === false);
+    }
+  }
+
+  function customTrafficValues() {
+    const number = (id, fallback) => {
+      const value = parseInt($(id)?.value, 10);
+      return Number.isFinite(value) ? value : fallback;
+    };
+    return {
+      daily: number("onb-traffic-daily", 750),
+      hourly: number("onb-traffic-hourly", 90),
+      min_gap: number("onb-traffic-min-gap", 10),
+      max_gap: number("onb-traffic-max-gap", 20),
+    };
+  }
+
+  async function saveTraffic(mode) {
+    _trafficMode = mode || _trafficMode;
+    renderTraffic();
+    if (!nativeBridgeUp()) return;
+    try {
+      const result = await bridgeCall(
+        "onboarding_set_traffic", _trafficMode, customTrafficValues());
+      if (result?.ok && result.youtube_traffic) {
+        renderTraffic(result.youtube_traffic);
+      } else if (result?.error) {
+        window._showToast?.(result.error, "error");
+      }
+    } catch (e) {
+      window._showToast?.("Could not save traffic safety setting: " + e, "error");
+    }
+  }
 
   // ── dep-row rendering ─────────────────────────────────────────────────
   // state: true → ✓, false → ✕, "pending" → spinner,
@@ -182,6 +242,8 @@
                  : (d.cookies && d.cookies.installed
                     ? "Firefox found — sign into YouTube"
                     : "install Firefox + sign into YouTube")),
+        depRow("Traffic safety", _trafficMode !== "unlimited",
+               _trafficMode.charAt(0).toUpperCase() + _trafficMode.slice(1)),
       ].join("");
     }
     const warn = $("onb-done-warn");
@@ -213,10 +275,10 @@
       // Gate: step 2 needs a folder before moving on.
       next.disabled = (n === 2 && !_folder);
     }
-    if (n === 4) renderDoneSummary();
+    if (n === 5) renderDoneSummary();
     // Auto-verify the whisper stack when the deps step opens so its row
     // resolves to a real ✓/✗ without the user clicking Re-check.
-    if (n === 3) autoVerifyWhisper();
+    if (n === 4) autoVerifyWhisper();
   }
 
   // ── progress sink (called from Python) ────────────────────────────────
@@ -409,9 +471,18 @@
     $("onb-install-core")?.addEventListener("click", installCore);
     $("onb-install-whisper")?.addEventListener("click", installWhisper);
     $("onb-recheck")?.addEventListener("click", recheck);
+    document.querySelectorAll("#onb-traffic-grid .onb-traffic-card").forEach((card) => {
+      card.addEventListener("click", () => saveTraffic(card.dataset.trafficMode));
+    });
+    ["onb-traffic-daily", "onb-traffic-hourly", "onb-traffic-min-gap",
+      "onb-traffic-max-gap"].forEach((id) => {
+      $(id)?.addEventListener("change", () => {
+        if (_trafficMode === "custom") saveTraffic("custom");
+      });
+    });
     $("onb-back")?.addEventListener("click", () => { if (_step > 1) gotoStep(_step - 1); });
     $("onb-next")?.addEventListener("click", () => {
-      if (_step < 4) gotoStep(_step + 1);
+      if (_step < 5) gotoStep(_step + 1);
       else finish();
     });
     $("onb-close")?.addEventListener("click", dismiss);
@@ -437,6 +508,20 @@
           _folder = (st.output_dir || "");
           const pe = $("onb-folder-path"); if (pe) pe.value = _folder;
           renderDeps(st.deps || {});
+          if (st.youtube_traffic) {
+            _trafficMode = st.youtube_traffic.mode || "conservative";
+            const cfg = st.youtube_traffic;
+            const values = {
+              "onb-traffic-daily": cfg.daily_limit,
+              "onb-traffic-hourly": cfg.hourly_limit,
+              "onb-traffic-min-gap": cfg.min_gap,
+              "onb-traffic-max-gap": cfg.max_gap,
+            };
+            Object.entries(values).forEach(([id, value]) => {
+              if ($(id) && value != null) $(id).value = String(value);
+            });
+            renderTraffic(st.youtube_traffic);
+          }
         }
       }
     } catch (e) {

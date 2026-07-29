@@ -157,9 +157,17 @@
           <option value="2 hr">2 hours</option>
           <option value="4 hr">4 hours</option>
           <option value="6 hr">6 hours</option>
-          <option value="12 hr">12 hours</option>
-          <option value="24 hr">24 hours</option>
+          <option value="12 hr" data-featured="clock time">12 hours</option>
+          <option value="24 hr" data-featured="clock time">24 hours</option>
+          <option value="When budget allows"
+                  data-tooltip="Waits until your rolling YouTube traffic budget can fit one complete sync, then runs it automatically. It never starts a partial sync.">When budget allows</option>
         </select>
+
+        <span class="autorun-clock-time" id="autorun-clock-time-wrap" hidden>
+          <span class="autorun-clock-time-prefix">at</span>
+          <select class="ctl-select" id="auto-sync-clock-time"
+                  aria-label="Auto-sync clock time"></select>
+        </span>
 
         <span class="status-text autorun-countdown" id="autorun-countdown"
               role="status" aria-live="polite" aria-atomic="true"></span>

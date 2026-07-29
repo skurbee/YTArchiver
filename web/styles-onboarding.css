@@ -101,6 +101,80 @@
   font-size: var(--fs-md);
 }
 
+/* Traffic-safety preset step */
+.onb-traffic-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.onb-traffic-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-height: 92px;
+  padding: 13px 14px;
+  text-align: left;
+  color: var(--c-text, #e6e6e6);
+  background: rgba(255, 255, 255, 0.015);
+  border: 1px solid var(--c-border, #3a3a3d);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.onb-traffic-card:hover { background: rgba(255, 255, 255, 0.04); }
+.onb-traffic-card.selected {
+  border-color: var(--c-accent, #3ea06a);
+  box-shadow: 0 0 0 1px var(--c-accent, #3ea06a) inset;
+  background: rgba(62, 160, 106, 0.08);
+}
+.onb-traffic-card b { font-size: var(--fs-lg); }
+.onb-traffic-card span {
+  color: var(--c-dim, #9a9a9e);
+  font-size: var(--fs-xs);
+  line-height: 1.35;
+}
+.onb-traffic-card em {
+  color: var(--c-accent, #3ea06a);
+  font-size: var(--fs-2xs);
+  font-style: normal;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.onb-traffic-custom {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--c-border, #3a3a3d);
+  border-radius: 8px;
+}
+.onb-traffic-custom[hidden] { display: none; }
+.onb-traffic-custom label {
+  display: grid;
+  grid-template-columns: 1fr 82px auto;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--fs-sm);
+}
+.onb-traffic-custom input {
+  width: 82px;
+  box-sizing: border-box;
+  padding: 5px 7px;
+  color: var(--c-text, #e6e6e6);
+  background: var(--c-input, #2a2a2d);
+  border: 1px solid var(--c-border, #3a3a3d);
+  border-radius: 5px;
+}
+.onb-traffic-summary {
+  margin-top: 12px;
+  min-height: 34px;
+  color: var(--c-dim, #9a9a9e);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+}
+.onb-traffic-summary.is-warning { color: #e0a05f; }
+
 /* Dependency groups */
 .onb-dep-group {
   border: 1px solid var(--c-border, #3a3a3d);

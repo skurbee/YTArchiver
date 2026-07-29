@@ -15,9 +15,10 @@ import json
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
+from . import youtube_traffic
 from .log import get_logger
 from .ytarchiver_config import (
     APP_DATA_DIR,
@@ -33,11 +34,16 @@ _log = get_logger(__name__)
 AUTORUN_OPTIONS = {
     "Off": 0, "30 min": 30, "1 hr": 60, "2 hr": 120,
     "4 hr": 240, "6 hr": 360, "12 hr": 720, "24 hr": 1440,
+    "When budget allows": -1,
 }
 AUTORUN_LABELS = list(AUTORUN_OPTIONS.keys())
 
 AUTORUN_HISTORY_MAX = 10000  # was 100. UI activity-log displays everything (audit 2026-05-14)
 AUTORUN_HISTORY_FILE = APP_DATA_DIR / "autorun_history.jsonl"
+RATE_LIMIT_MIN_RETRY_SECONDS = 6 * 3600
+BUDGET_STARTUP_GRACE_SECONDS = 3 * 60
+BUDGET_BUSY_RETRY_SECONDS = 60
+AUTORUN_CLOCK_INTERVALS = (720, 1440)
 
 
 def _format_log_time(now: datetime | None = None) -> str:
@@ -56,9 +62,11 @@ class AutorunScheduler:
     """
 
     def __init__(self,
-                 sync_trigger: Callable[[], None],
+                 sync_trigger: Callable[..., None],
                  stream=None,
-                 sync_busy_fn: Callable[[], bool | str] | None = None):
+                 sync_busy_fn: Callable[[], bool | str] | None = None,
+                 startup_grace_seconds: int = 0,
+                 startup_required_signals: tuple[str, ...] = ()):
         self._sync_trigger = sync_trigger
         self._stream = stream
         # Optional callable: returns True (or a short reason string) if work
@@ -71,9 +79,15 @@ class AutorunScheduler:
         # next fire snaps to a wall-clock boundary aligned from midnight
         # (30 min → :00/:30, 1 hr → top of hour, 6 hr → 00/06/12/18, …).
         try:
-            self._clock_mode = (load_config().get("autorun_mode") == "clock")
+            _initial_config = load_config()
         except Exception:
-            self._clock_mode = False
+            _initial_config = {}
+        self._clock_mode = (
+            _initial_config.get("autorun_mode", "clock") == "clock")
+        self._clock_anchor_12 = self._validated_clock_anchor(
+            _initial_config.get("autorun_clock_time_12"), 720)
+        self._clock_anchor_24 = self._validated_clock_anchor(
+            _initial_config.get("autorun_clock_time_24"), 1440)
         self._lock = threading.RLock()
         self._timer: threading.Timer | None = None
         self._next_fire_ts: float | None = None
@@ -81,20 +95,71 @@ class AutorunScheduler:
         # While set, get_state() surfaces seconds_remaining=None so the UI
         # shows "Syncing..." and the timer isn't rearmed until completion.
         self._waiting_for_sync_done = False
+        self._budget_impossible = False
+        self._budget_message = ""
+        self._startup_grace_seconds = max(0, int(startup_grace_seconds or 0))
+        self._startup_pending_signals = {
+            str(signal).strip()
+            for signal in startup_required_signals
+            if str(signal).strip()
+        }
+        if (self._startup_grace_seconds > 0
+                and not self._startup_pending_signals):
+            self._startup_pending_signals = {"startup"}
+        self._startup_ready = not self._startup_pending_signals
+        self._budget_waiting_for_startup = False
+        self._timer_waiting_for_startup = False
+        self._startup_grace_until: float | None = None
 
     # ── interval management ─────────────────────────────────────────
+
+    @staticmethod
+    def _validated_clock_anchor(value: Any, span: int) -> int:
+        try:
+            anchor = int(value)
+        except (TypeError, ValueError):
+            return 0
+        if anchor < 0 or anchor >= span:
+            return 0
+        return anchor
+
+    def _clock_anchor_for_interval(self, interval_mins: int) -> int:
+        if interval_mins == 720:
+            return self._clock_anchor_12
+        if interval_mins == 1440:
+            return self._clock_anchor_24
+        return 0
 
     def set_interval_label(self, label: str) -> dict[str, Any]:
         mins = AUTORUN_OPTIONS.get(label, 0)
         return self.set_interval_mins(mins)
 
     def set_interval_mins(self, mins: int) -> dict[str, Any]:
+        requested = int(mins or 0)
+        adjusted_reason = ""
+        if requested == -1:
+            traffic = youtube_traffic.effective_settings()
+            if int(traffic["daily"]) <= 0:
+                requested = 0
+                adjusted_reason = (
+                    '"When budget allows" requires a finite YouTube traffic '
+                    "budget, so auto-sync was turned Off.")
         with self._lock:
-            self._interval_mins = int(mins or 0)
+            self._interval_mins = requested
             self._cancel_timer_locked()
             self._waiting_for_sync_done = False
-            if self._interval_mins > 0:
-                self._schedule_next_locked()
+            self._budget_waiting_for_startup = False
+            self._timer_waiting_for_startup = False
+            self._startup_grace_until = None
+            if self._interval_mins != 0:
+                if self._interval_mins == -1 and not self._startup_ready:
+                    self._budget_waiting_for_startup = True
+                    self._budget_impossible = False
+                    self._budget_message = (
+                        "Waiting for startup checks and archive indexing "
+                        "to finish.")
+                else:
+                    self._schedule_next_locked()
         # Persist to config (gated).
         # check save_config return so a write-gate failure
         # surfaces to the caller instead of silently keeping the old
@@ -105,12 +170,71 @@ class AutorunScheduler:
             try:
                 with config_transaction() as cfg:
                     cfg["autorun_interval"] = self._interval_mins
+                    if self._clock_mode or self._interval_mins <= 0:
+                        cfg.pop("autorun_next_fire_ts", None)
+                        cfg.pop("autorun_next_fire_interval", None)
+                    elif self._next_fire_ts is not None:
+                        cfg["autorun_next_fire_ts"] = self._next_fire_ts
+                        cfg["autorun_next_fire_interval"] = (
+                            self._interval_mins)
             except Exception as e:
                 _log.warning("autorun interval save failed: %s", e)
                 persisted = False
         else:
             persisted = False
-        return {"ok": True, "mins": self._interval_mins, "persisted": persisted}
+        result = {
+            "ok": not adjusted_reason,
+            "mins": self._interval_mins,
+            "persisted": persisted,
+        }
+        if adjusted_reason:
+            result["error"] = adjusted_reason
+            result["adjusted"] = True
+        return result
+
+    def restore_interval_mins(self, mins: int) -> dict[str, Any]:
+        """Restore a saved interval without resetting its timer deadline."""
+        requested = int(mins or 0)
+        if requested <= 0 or self._clock_mode:
+            return self.set_interval_mins(requested)
+        try:
+            cfg = load_config()
+            saved_interval = int(
+                cfg.get("autorun_next_fire_interval", 0) or 0)
+            saved_deadline = float(
+                cfg.get("autorun_next_fire_ts", 0) or 0)
+        except (TypeError, ValueError, OSError):
+            saved_interval = 0
+            saved_deadline = 0
+        if saved_interval != requested or saved_deadline <= 0:
+            return self.set_interval_mins(requested)
+
+        now = time.time()
+        with self._lock:
+            self._interval_mins = requested
+            self._cancel_timer_locked()
+            self._waiting_for_sync_done = False
+            self._budget_waiting_for_startup = False
+            self._timer_waiting_for_startup = False
+            if saved_deadline <= now:
+                if self._startup_ready:
+                    self._schedule_next_locked(
+                        sec=max(1, self._startup_grace_seconds))
+                    self._startup_grace_until = self._next_fire_ts
+                else:
+                    self._timer_waiting_for_startup = True
+            else:
+                self._schedule_next_locked(
+                    target_ts=saved_deadline,
+                    persist_deadline=False,
+                )
+        return {
+            "ok": True,
+            "mins": self._interval_mins,
+            "persisted": True,
+            "restored_deadline": saved_deadline,
+            "overdue": saved_deadline <= now,
+        }
 
     def set_mode(self, mode: str) -> dict[str, Any]:
         """Switch between 'timer' (countdown) and 'clock' (wall-clock
@@ -118,6 +242,7 @@ class AutorunScheduler:
         clock = (str(mode).lower() == "clock")
         with self._lock:
             self._clock_mode = clock
+            self._timer_waiting_for_startup = False
             if self._interval_mins > 0:
                 self._cancel_timer_locked()
                 self._waiting_for_sync_done = False
@@ -127,6 +252,13 @@ class AutorunScheduler:
             try:
                 with config_transaction() as cfg:
                     cfg["autorun_mode"] = "clock" if clock else "timer"
+                    if clock or self._interval_mins <= 0:
+                        cfg.pop("autorun_next_fire_ts", None)
+                        cfg.pop("autorun_next_fire_interval", None)
+                    elif self._next_fire_ts is not None:
+                        cfg["autorun_next_fire_ts"] = self._next_fire_ts
+                        cfg["autorun_next_fire_interval"] = (
+                            self._interval_mins)
             except Exception as e:
                 _log.warning("autorun mode save failed: %s", e)
                 persisted = False
@@ -134,6 +266,53 @@ class AutorunScheduler:
             persisted = False
         return {"ok": True, "mode": "clock" if clock else "timer",
                 "persisted": persisted}
+
+    def set_clock_anchor(self, minutes: int) -> dict[str, Any]:
+        """Set the wall-clock anchor for a 12h or 24h schedule."""
+        try:
+            anchor = int(minutes)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Clock time must be minutes."}
+        with self._lock:
+            interval = self._interval_mins
+            if interval not in AUTORUN_CLOCK_INTERVALS:
+                return {
+                    "ok": False,
+                    "error": "A custom time is available for 12- or "
+                             "24-hour auto-sync.",
+                }
+            if anchor < 0 or anchor >= interval or anchor % 30:
+                return {
+                    "ok": False,
+                    "error": "Choose a time in 30-minute increments.",
+                }
+            if interval == 720:
+                self._clock_anchor_12 = anchor
+                config_key = "autorun_clock_time_12"
+            else:
+                self._clock_anchor_24 = anchor
+                config_key = "autorun_clock_time_24"
+            if self._clock_mode:
+                self._cancel_timer_locked()
+                self._waiting_for_sync_done = False
+                self._schedule_next_locked()
+            next_fire_ts = self._next_fire_ts
+        persisted = True
+        if config_is_writable():
+            try:
+                with config_transaction() as cfg:
+                    cfg[config_key] = anchor
+            except Exception as e:
+                _log.warning("autorun clock time save failed: %s", e)
+                persisted = False
+        else:
+            persisted = False
+        return {
+            "ok": True,
+            "minutes": anchor,
+            "next_fire_ts": next_fire_ts,
+            "persisted": persisted,
+        }
 
     def get_state(self) -> dict[str, Any]:
         # Check sync busy state OUTSIDE the lock — the callback may
@@ -176,6 +355,21 @@ class AutorunScheduler:
                 # next_fire_ts (epoch seconds) instead of a countdown.
                 "mode": "clock" if self._clock_mode else "timer",
                 "next_fire_ts": self._next_fire_ts,
+                "budget_mode": self._interval_mins == -1,
+                "budget_impossible": self._budget_impossible,
+                "budget_message": self._budget_message,
+                "startup_waiting": (
+                    self._budget_waiting_for_startup
+                    or self._timer_waiting_for_startup),
+                "startup_grace_active": bool(
+                    self._startup_grace_until
+                    and self._next_fire_ts
+                    and time.time() < self._startup_grace_until + 0.05),
+                "clock_time_available": (
+                    self._clock_mode
+                    and self._interval_mins in AUTORUN_CLOCK_INTERVALS),
+                "clock_anchor_minutes": self._clock_anchor_for_interval(
+                    self._interval_mins),
             }
 
     # ── scheduling ──────────────────────────────────────────────────
@@ -188,22 +382,50 @@ class AutorunScheduler:
                 _log.debug("swallowed: %s", e)
             self._timer = None
         self._next_fire_ts = None
+        self._startup_grace_until = None
+
+    def _persist_timer_deadline_locked(self) -> None:
+        if (self._clock_mode or self._interval_mins <= 0
+                or self._next_fire_ts is None
+                or not config_is_writable()):
+            return
+        try:
+            with config_transaction() as cfg:
+                cfg["autorun_interval"] = self._interval_mins
+                cfg["autorun_next_fire_ts"] = self._next_fire_ts
+                cfg["autorun_next_fire_interval"] = self._interval_mins
+        except Exception as e:
+            _log.warning("autorun deadline save failed: %s", e)
 
     def _next_clock_aligned(self, now_ts: float, interval_mins: int) -> float:
         """Next wall-clock boundary that is a multiple of `interval_mins`,
         aligned from local midnight, strictly after `now_ts`. All the
         AUTORUN_OPTIONS intervals divide 1440 evenly so boundaries land
         cleanly (e.g. 30→:00/:30, 60→top of hour, 360→00/06/12/18)."""
-        import math
         if interval_mins <= 0:
             return now_ts
-        dt = datetime.fromtimestamp(now_ts)
-        midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-        mins_since = (now_ts - midnight) / 60.0
-        next_mult = (math.floor(mins_since / interval_mins) + 1) * interval_mins
-        return midnight + next_mult * 60
+        now_dt = datetime.fromtimestamp(now_ts)
+        anchor = self._clock_anchor_for_interval(interval_mins)
+        # Build local datetimes instead of adding 86,400 timestamp seconds,
+        # so a daily 8:00pm anchor remains 8:00pm across DST.
+        for day_offset in range(3):
+            midnight = (
+                now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                + timedelta(days=day_offset)
+            )
+            minute = anchor
+            while minute < 1440:
+                candidate_ts = (
+                    midnight + timedelta(minutes=minute)).timestamp()
+                if candidate_ts > now_ts + 0.001:
+                    return candidate_ts
+                minute += interval_mins
+        return now_ts + max(60, interval_mins * 60)
 
-    def _schedule_next_locked(self, sec: int | None = None):
+    def _schedule_next_locked(self, sec: int | None = None,
+                              *, not_before_ts: float | None = None,
+                              target_ts: float | None = None,
+                              persist_deadline: bool = True):
         """Schedule the next _fire(). `sec` defaults to the configured
         interval; callers pass an explicit value (e.g. 60) to postpone a
         fire without changing the interval the user configured.
@@ -211,12 +433,48 @@ class AutorunScheduler:
         With `sec=None` and clock mode on, the next fire snaps to the next
         wall-clock boundary instead of `now + interval`. Explicit `sec`
         (the 60s busy-retry) always counts from now regardless of mode."""
-        if sec is None:
-            if self._clock_mode and self._interval_mins > 0:
+        if target_ts is not None:
+            self._budget_impossible = False
+            self._budget_message = ""
+            self._next_fire_ts = float(target_ts)
+            sec = max(1, int(round(self._next_fire_ts - time.time())))
+        elif sec is None:
+            if self._interval_mins == -1:
+                check = youtube_traffic.sweep_eligibility()
+                daily = int(check["settings"]["daily"])
+                self._budget_impossible = bool(
+                    daily <= 0 or check["impossible"])
+                if daily <= 0:
+                    self._budget_message = (
+                        "Budget scheduling is unavailable in Unlimited mode.")
+                elif check["estimate"]["channels"] <= 0:
+                    self._budget_message = (
+                        "Add at least one channel before using budget "
+                        "auto-sync.")
+                elif check["impossible"]:
+                    self._budget_message = (
+                        f"A complete sweep needs about {check['requested']} "
+                        f"operations, above the {daily}-operation daily "
+                        "budget.")
+                else:
+                    self._budget_message = ""
+                if self._budget_impossible:
+                    self._next_fire_ts = None
+                    return
+                target = float(check["next_ts"] or time.time())
+                if not_before_ts is not None:
+                    target = max(target, float(not_before_ts))
+                self._next_fire_ts = target
+                sec = max(1, int(round(target - time.time())))
+            elif self._clock_mode and self._interval_mins > 0:
+                self._budget_impossible = False
+                self._budget_message = ""
                 target = self._next_clock_aligned(time.time(), self._interval_mins)
                 self._next_fire_ts = target
                 sec = max(1, int(round(target - time.time())))
             else:
+                self._budget_impossible = False
+                self._budget_message = ""
                 sec = self._interval_mins * 60
                 if sec <= 0:
                     return
@@ -229,12 +487,120 @@ class AutorunScheduler:
         t.daemon = True
         t.start()
         self._timer = t
+        if persist_deadline:
+            self._persist_timer_deadline_locked()
+
+    def notify_startup_ready(
+            self, signal: str | None = None) -> dict[str, Any]:
+        """Release the boot-only gate for budget-based auto-sync.
+
+        Fixed intervals are intentionally unaffected.  When budget mode was
+        restored from config, the scheduler waits for startup checks and local
+        archive indexing to finish, then applies a short grace period so a
+        remote sync never quickfires during application launch.
+        """
+        log_message = ""
+        with self._lock:
+            if self._startup_ready:
+                return {"ok": True, "already_ready": True}
+
+            normalized_signal = str(signal or "").strip()
+            if normalized_signal:
+                self._startup_pending_signals.discard(normalized_signal)
+            elif len(self._startup_pending_signals) == 1:
+                # Backward-compatible convenience for callers/tests that use
+                # one unnamed startup milestone.
+                self._startup_pending_signals.clear()
+
+            if self._startup_pending_signals:
+                self._budget_waiting_for_startup = (
+                    self._interval_mins == -1)
+                self._timer_waiting_for_startup = (
+                    self._timer_waiting_for_startup
+                    and self._interval_mins > 0)
+                if self._budget_waiting_for_startup:
+                    self._budget_message = (
+                        "Waiting for startup checks and archive indexing "
+                        "to finish.")
+                return {
+                    "ok": True,
+                    "armed": False,
+                    "waiting_for": sorted(self._startup_pending_signals),
+                }
+
+            timer_was_overdue = self._timer_waiting_for_startup
+            self._startup_ready = True
+            self._budget_waiting_for_startup = False
+            self._timer_waiting_for_startup = False
+            self._budget_message = ""
+            if timer_was_overdue and self._interval_mins > 0:
+                self._cancel_timer_locked()
+                grace_seconds = max(1, self._startup_grace_seconds)
+                self._schedule_next_locked(sec=grace_seconds)
+                self._startup_grace_until = self._next_fire_ts
+                mins = max(1, int(round(grace_seconds / 60)))
+                unit = "minute" if mins == 1 else "minutes"
+                log_message = (
+                    "\u2014 Auto-sync: saved timer elapsed while the app "
+                    "was closed \u2014 "
+                    f"Sync Subbed scheduled in {mins} {unit}.")
+                result = {
+                    "ok": True,
+                    "armed": True,
+                    "next_fire_ts": self._next_fire_ts,
+                    "startup_grace_active": True,
+                }
+                if self._stream:
+                    self._stream.emit_text(
+                        log_message, "simpleline_blue")
+                return result
+            if self._interval_mins != -1:
+                return {"ok": True, "armed": False}
+
+            self._cancel_timer_locked()
+            now = time.time()
+            grace_until = now + self._startup_grace_seconds
+            self._schedule_next_locked(not_before_ts=grace_until)
+            if self._next_fire_ts is not None:
+                # Only call this a startup grace when the grace itself is the
+                # limiting factor. If the rolling budget becomes available
+                # later, the ordinary budget countdown remains more accurate.
+                if self._next_fire_ts <= grace_until + 0.5:
+                    self._startup_grace_until = grace_until
+                    mins = max(
+                        1, int(round(self._startup_grace_seconds / 60)))
+                    unit = "minute" if mins == 1 else "minutes"
+                    log_message = (
+                        "— Auto-sync: startup complete; budget available — "
+                        f"Sync Subbed scheduled in {mins} {unit}.")
+                else:
+                    self._startup_grace_until = None
+
+            result = {
+                "ok": True,
+                "armed": self._next_fire_ts is not None,
+                "next_fire_ts": self._next_fire_ts,
+                "startup_grace_active": self._startup_grace_until is not None,
+            }
+        if log_message and self._stream:
+            self._stream.emit_text(log_message, "simpleline_blue")
+        return result
 
     def _fire(self):
         """Interval timer fired. Skip to the next interval if conflicting
         work is active; otherwise kick a sync and enter the
         "waiting for completion" state (held until notify_sync_done()).
         """
+        # A restored countdown can become due while startup indexing is still
+        # running. Never let that turn into an immediate launch-time request;
+        # convert it into the same post-startup grace used for an overdue
+        # deadline restored from disk.
+        with self._lock:
+            if self._interval_mins > 0 and not self._startup_ready:
+                self._cancel_timer_locked()
+                self._waiting_for_sync_done = False
+                self._timer_waiting_for_startup = True
+                return
         # If conflicting work is already running, skip this interval. Classic's
         # `_sync_pipeline_busy()` check at YTArchiver.py:22769 — without
         # this, autorun calls sync_start_all which errors out and the
@@ -257,17 +623,30 @@ class AutorunScheduler:
         if busy:
             if self._stream:
                 subject = busy_reason or "a download or sync"
-                self._stream.emit_text(
-                    f"\u2014 Autorun: {subject} is running \u2014 skipping "
-                    "this run; will run at the next scheduled time.",
-                    "simpleline_dim")
+                if self._interval_mins == -1:
+                    self._stream.emit_text(
+                        f"\u2014 Auto-sync: {subject} is running \u2014 "
+                        "postponing budget sync; retrying in 1 minute.",
+                        "simpleline_dim")
+                else:
+                    self._stream.emit_text(
+                        f"\u2014 Autorun: {subject} is running \u2014 skipping "
+                        "this run; will run at the next scheduled time.",
+                        "simpleline_dim")
             with self._lock:
                 self._waiting_for_sync_done = False
-                if self._interval_mins > 0:
-                    # Skip to the NEXT scheduled fire (next clock boundary /
-                    # full interval) instead of nagging every 60s while the
-                    # current work runs.
-                    self._schedule_next_locked()
+                self._startup_grace_until = None
+                if self._interval_mins != 0:
+                    if self._interval_mins == -1:
+                        # Budget mode has no fixed "next interval". Retrying
+                        # its eligible-now target directly would create a
+                        # one-second loop while startup/user work is busy.
+                        self._schedule_next_locked(
+                            sec=BUDGET_BUSY_RETRY_SECONDS)
+                    else:
+                        # Skip to the NEXT scheduled fire (next clock
+                        # boundary / full interval).
+                        self._schedule_next_locked()
             return
         # Path A: interval elapsed + sync idle → kick the sync. Entering
         # waiting-for-completion state means the countdown holds at
@@ -279,11 +658,24 @@ class AutorunScheduler:
                     f"\u2014 Autorun: interval reached at {_format_log_time()}, "
                     "kicking Sync Subbed\u2026",
                     "simpleline_green")
+            reservation_id = None
+            if self._interval_mins == -1:
+                reservation = youtube_traffic.reserve_sweep()
+                if not reservation.get("ok"):
+                    with self._lock:
+                        self._waiting_for_sync_done = False
+                        self._schedule_next_locked()
+                    return
+                reservation_id = reservation["reservation_id"]
             with self._lock:
                 self._waiting_for_sync_done = True
                 self._next_fire_ts = None
                 self._timer = None
-            _ret = self._sync_trigger()
+                self._startup_grace_until = None
+            _ret = (
+                self._sync_trigger(reservation_id)
+                if reservation_id else self._sync_trigger()
+            )
             # sync_start_all can REFUSE without raising (already
             # starting / already running / yt-dlp missing / Auto
             # checkbox off → enqueue-only with started:False). In all
@@ -301,7 +693,9 @@ class AutorunScheduler:
                         "— rearming timer.", "dim")
                 with self._lock:
                     self._waiting_for_sync_done = False
-                    if self._interval_mins > 0:
+                    if reservation_id:
+                        youtube_traffic.finish_reservation(reservation_id)
+                    if self._interval_mins != 0:
                         self._schedule_next_locked()
         except Exception as e:
             # If trigger itself blew up, unblock the wait so the scheduler
@@ -310,7 +704,9 @@ class AutorunScheduler:
                 self._stream.emit_error(f"Autorun trigger failed: {e}")
             with self._lock:
                 self._waiting_for_sync_done = False
-                if self._interval_mins > 0:
+                if "reservation_id" in locals() and reservation_id:
+                    youtube_traffic.finish_reservation(reservation_id)
+                if self._interval_mins != 0:
                     self._schedule_next_locked()
 
     def notify_sync_done(self):
@@ -322,19 +718,54 @@ class AutorunScheduler:
         resets from now rather than finishing its mid-sync countdown.
         """
         with self._lock:
-            if self._interval_mins <= 0:
+            if self._interval_mins == 0:
                 self._waiting_for_sync_done = False
                 return
             # Cancel any pending timer (e.g. the 60s retry if a prior fire
             # bailed on busy) and start a fresh full-interval countdown.
             self._cancel_timer_locked()
             self._waiting_for_sync_done = False
-            self._schedule_next_locked()
+            if self._interval_mins == -1 and not self._startup_ready:
+                self._budget_waiting_for_startup = True
+                self._budget_message = (
+                    "Waiting for startup checks and archive indexing "
+                    "to finish.")
+            elif (self._interval_mins > 0
+                  and not self._startup_ready
+                  and self._timer_waiting_for_startup):
+                pass
+            else:
+                self._schedule_next_locked()
+
+    def defer_after_rate_limit(self) -> int:
+        """Rearm after a throttle with the persistent circuit-breaker delay.
+
+        Clock-aligned schedules deliberately use a one-off relative delay here:
+        retrying at the next wall-clock boundary could be only a few seconds
+        away and extend YouTube's rolling account cooldown.  After the retry,
+        normal clock alignment resumes through ``notify_sync_done``.
+        """
+        with self._lock:
+            if self._interval_mins == 0:
+                self._waiting_for_sync_done = False
+                return 0
+            delay = max(
+                RATE_LIMIT_MIN_RETRY_SECONDS,
+                max(0, self._interval_mins) * 60,
+                int(youtube_traffic.circuit_state().get(
+                    "remaining_seconds") or 0),
+            )
+            self._cancel_timer_locked()
+            self._waiting_for_sync_done = False
+            self._schedule_next_locked(sec=delay)
+            return delay
 
     def cancel(self):
         with self._lock:
             self._cancel_timer_locked()
             self._waiting_for_sync_done = False
+            self._budget_waiting_for_startup = False
+            self._timer_waiting_for_startup = False
 
 
 # ── Activity-log history append ────────────────────────────────────────

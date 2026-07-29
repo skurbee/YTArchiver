@@ -33,6 +33,7 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from ..log import get_logger, swallow
+from .. import youtube_traffic
 from ..ytarchiver_config import APP_DATA_DIR
 from .normalize import _normalize_title_for_match
 
@@ -164,6 +165,10 @@ def _ytsearch(yt: str, query: str, n: int,
            "--print", "%(id)s\t%(title)s\t%(duration)s\t%(channel)s\t%(view_count)s",
            *_find_cookie_source()]
     out: list[dict[str, Any]] = []
+    permission = youtube_traffic.acquire(
+        "manual_id_search", cancel_event=cancel_event)
+    if not permission.get("ok"):
+        return out
     try:
         proc = subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,

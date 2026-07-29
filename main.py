@@ -527,9 +527,15 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             return ""
 
         self._autorun = autorun_backend.AutorunScheduler(
-            sync_trigger=lambda: self.sync_start_all(),
+            sync_trigger=lambda reservation_id=None: self.sync_start_all(
+                scheduled=True,
+                traffic_reservation_id=reservation_id,
+            ),
             stream=self._log_stream,
             sync_busy_fn=_autorun_busy_reason,
+            startup_grace_seconds=(
+                autorun_backend.BUDGET_STARTUP_GRACE_SECONDS),
+            startup_required_signals=("checks", "indexing"),
         )
         # v80 scheduled backups — daemon thread, no-op while the
         # Settings > Auto-backup cadence is "off". First check fires
@@ -687,7 +693,8 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             print(f" autorun_history: {len(self._config.get('autorun_history', []))}")
             # Push saved autorun interval into the scheduler
             try:
-                self._autorun.set_interval_mins(int(self._config.get("autorun_interval", 0) or 0))
+                self._autorun.restore_interval_mins(
+                    int(self._config.get("autorun_interval", 0) or 0))
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             # Apply saved log_mode to the LogStreamer so Verbose-mode users
@@ -1101,8 +1108,19 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # fires the moment its stage finishes.
         def _run_stages():
             """Run slow startup stages in order on the boot worker thread."""
-            _stage2_disk_walk()
-            _stage3_sweep()
+            try:
+                _stage2_disk_walk()
+                _stage3_sweep()
+            finally:
+                # Budget-based auto-sync is restored from config before the
+                # window exists. Release its boot gate only after local
+                # startup work is finished, then let the scheduler apply its
+                # three-minute remote-sync grace period.
+                try:
+                    self._autorun.notify_startup_ready("indexing")
+                except Exception as e:
+                    _log.debug(
+                        "autorun startup-ready notification failed: %s", e)
         threading.Thread(target=_run_stages, daemon=True).start()
 
 
@@ -1878,14 +1896,9 @@ def main():
         except Exception as e: _log.debug("swallowed: %s", e)
         try: api.check_ytdlp_freshness()
         except Exception as e: _log.debug("swallowed: %s", e)
-        # Proactive sign-in check.  This runs after the DOM/log bridge is ready
-        # so an expired Firefox session produces the modal immediately instead
-        # of waiting for the first scheduled YouTube job.
-        try:
-            from backend.youtube_session import check_configured_cookie_session
-            check_configured_cookie_session(context="startup")
-        except Exception as e:
-            _log.debug("startup YouTube-session check failed: %s", e)
+        # Do not touch YouTube merely because the app opened.  Session health
+        # is checked lazily by operations that actually need the network, so
+        # Browse remains a local-only archive viewer.
         try: api.check_channel_folders()
         except Exception as e: _log.debug("swallowed: %s", e)
         try: api.check_app_update()
@@ -1956,9 +1969,10 @@ def main():
                                 config_transaction as _ctx)
                             with _ctx() as _cfg:
                                 _cfg["video_id_seg_backfill_done"] = True
-                            _log.info("video_id seg-backfill: filled %s, "
-                                      "reconciled %s",
-                                      r.get("filled"), r.get("reconciled"))
+                            _log.debug(
+                                "video_id seg-backfill: filled %s, "
+                                "reconciled %s",
+                                r.get("filled"), r.get("reconciled"))
                     except Exception as _e:
                         _log.debug("video_id seg-backfill thread: %s", _e)
                 threading.Thread(target=_vid_seg_backfill, daemon=True).start()
@@ -1970,6 +1984,11 @@ def main():
                 window.hide()
             except Exception as e:
                 _log.debug("start-minimized hide failed: %s", e)
+        try:
+            api._autorun.notify_startup_ready("checks")
+        except Exception as e:
+            _log.debug(
+                "autorun startup-check notification failed: %s", e)
         _boot_trace("startup callback end")
     # Defer startup checks until pywebview has actually rendered the
     # window. Previously this thread started BEFORE webview.start(), so

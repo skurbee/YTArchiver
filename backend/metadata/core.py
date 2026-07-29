@@ -33,6 +33,7 @@ from typing import Any
 
 from ..log_stream import LogStreamer
 from ..sync import _find_cookie_source, _startupinfo, find_yt_dlp
+from .. import youtube_traffic
 
 # YouTube IDs are 11 chars of [A-Za-z0-9_-]
 
@@ -156,6 +157,10 @@ def _resolve_ids_by_title(yt: str, url: str,
     we only fire it when there's at least one unmatched file.
     """
     if not url or not unmatched_files:
+        return {}
+    permission = youtube_traffic.acquire(
+        "metadata_title_resolve", cancel_event=cancel_event, stream=stream)
+    if not permission.get("ok"):
         return {}
     try:
         proc = subprocess.Popen(
@@ -323,6 +328,10 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
     # can see the real yt-dlp error.
     out: dict[str, dict[str, Any]] = {}
     _stderr_buf: list[str] = []
+    permission = youtube_traffic.acquire(
+        "metadata_channel_catalog", cancel_event=cancel_event, stream=stream)
+    if not permission.get("ok"):
+        return {}
     try:
         proc = subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL,
@@ -571,6 +580,9 @@ def _resolve_channel_id_url(yt: str, handle_url: str) -> str:
     this path because their @handle resolves cleanly.
     """
     if not handle_url or not yt:
+        return ""
+    permission = youtube_traffic.acquire("channel_id_resolve")
+    if not permission.get("ok"):
         return ""
     try:
         proc = subprocess.run(
@@ -832,6 +844,10 @@ def _fetch_per_video_upload_dates(yt: str, vids: list[str],
         cmd = [yt, "--skip-download", "--no-warnings",
                "--print", "%(upload_date)s",
                *_find_cookie_source(), url]
+        permission = youtube_traffic.acquire(
+            "upload_date", cancel_event=cancel_event, stream=stream)
+        if not permission.get("ok"):
+            return (vid, "")
         try:
             proc = subprocess.run(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

@@ -39,6 +39,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .log import get_logger
+from . import youtube_traffic
 from .sync import _find_cookie_source, _startupinfo, find_yt_dlp
 from .transcribe import _parse_vtt, _replace_jsonl_entry
 from .transcribe.transcribe_files import parse_transcript_header
@@ -266,6 +267,11 @@ def _fetch_vtt(yt_dlp: str, video_id: str,
         "-o", str(out_dir / f"{video_id}.%(ext)s"),
         f"https://www.youtube.com/watch?v={video_id}",
     ]
+    permission = youtube_traffic.acquire(
+        "caption_repair", cancel_event=cancel_event)
+    if not permission.get("ok"):
+        return None, (
+            permission.get("error") or "traffic governor cancelled")
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

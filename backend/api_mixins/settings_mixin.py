@@ -16,6 +16,7 @@ import threading
 
 from ._shared import _api_err, _log
 from backend.archive_capacity import normalize_archive_capacity_warning
+from backend import youtube_traffic
 from backend.ytarchiver_config import config_is_writable, load_config, save_config
 from backend import sync as sync_backend
 from backend.log_stream import LogStreamer
@@ -136,6 +137,15 @@ class SettingsMixin:
 
     # ─── Launch at boot (Windows Registry) ────────────────────────────
 
+    def autorun_set_clock_time(self, minutes):
+        """Set a 12h/24h clock schedule in minutes after midnight."""
+        try:
+            return self._autorun.set_clock_anchor(int(minutes))
+        except (TypeError, ValueError) as e:
+            return _api_err("INVALID_CLOCK_TIME", str(e))
+        except Exception as e:
+            return _api_err("CONFIG_SAVE_FAILED", str(e))
+
     _BOOT_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
     _BOOT_REG_NAME = "YTArchiver"
 
@@ -183,6 +193,7 @@ class SettingsMixin:
     def settings_load(self):
         cfg = self._settings_config()
         cap = normalize_archive_capacity_warning(cfg)
+        traffic = youtube_traffic.status(cfg)
         return {
             "output_dir": cfg.get("output_dir", ""),
             "video_out_dir": cfg.get("video_out_dir", ""),
@@ -223,6 +234,16 @@ class SettingsMixin:
             "transcript_pane_width": cfg.get("transcript_pane_width"),
             "caption_overlay_size": (cfg.get("caption_overlay_size") or ""),
             "caption_overlay_bg": (cfg.get("caption_overlay_bg") or ""),
+            "youtube_traffic_mode": traffic["mode"],
+            "youtube_traffic_custom_daily": int(
+                cfg.get("youtube_traffic_custom_daily", 750) or 750),
+            "youtube_traffic_custom_hourly": int(
+                cfg.get("youtube_traffic_custom_hourly", 90) or 90),
+            "youtube_traffic_custom_min_gap": int(
+                cfg.get("youtube_traffic_custom_min_gap", 10) or 0),
+            "youtube_traffic_custom_max_gap": int(
+                cfg.get("youtube_traffic_custom_max_gap", 20) or 0),
+            "youtube_traffic": traffic,
         }
 
 
@@ -320,6 +341,31 @@ class SettingsMixin:
         # "quit" (exit immediately), or "tray" (minimize to tray).
         if data.get("close_behavior") in ("ask", "quit", "tray"):
             cfg["close_behavior"] = data["close_behavior"]
+        if data.get("youtube_traffic_mode") in (
+                "conservative", "balanced", "custom", "unlimited"):
+            cfg["youtube_traffic_mode"] = data["youtube_traffic_mode"]
+        _budget_autosync_disabled = False
+        if (cfg.get("youtube_traffic_mode") == "unlimited"
+                and int(cfg.get("autorun_interval", 0) or 0) == -1):
+            cfg["autorun_interval"] = 0
+            _budget_autosync_disabled = True
+        _traffic_bounds = {
+            "youtube_traffic_custom_daily": (1, 100_000),
+            "youtube_traffic_custom_hourly": (1, 10_000),
+            "youtube_traffic_custom_min_gap": (0, 3600),
+            "youtube_traffic_custom_max_gap": (0, 3600),
+        }
+        for _key, (_low, _high) in _traffic_bounds.items():
+            if _key not in data:
+                continue
+            try:
+                cfg[_key] = max(_low, min(_high, int(data[_key])))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"Invalid {_key} value"}
+        if (cfg.get("youtube_traffic_custom_max_gap", 20)
+                < cfg.get("youtube_traffic_custom_min_gap", 10)):
+            cfg["youtube_traffic_custom_max_gap"] = int(
+                cfg.get("youtube_traffic_custom_min_gap", 10))
         if not self._settings_save_config(cfg):
             return {"ok": False, "error": "Save failed"}
         self._reload_config()
@@ -343,7 +389,17 @@ class SettingsMixin:
                         f" (whisper model swap deferred until restart: {_e})")
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
-        return {"ok": True}
+        return {
+            "ok": True,
+            "budget_autosync_disabled": _budget_autosync_disabled,
+        }
+
+    def youtube_traffic_status(self):
+        """Live rolling usage and autosync recommendation for Settings."""
+        try:
+            return youtube_traffic.status(self._settings_fresh_config())
+        except Exception as e:
+            return _api_err("INTERNAL_ERROR", str(e))
 
 
     # ─── yt-dlp version / update ───────────────────────────────────────

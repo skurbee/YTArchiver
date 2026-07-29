@@ -24,6 +24,7 @@ from typing import Any
 from .log import get_logger
 from .log_stream import LogStreamer
 from .net import block_if_down
+from . import youtube_traffic
 from .sync import (
     _find_cookie_source,
     find_yt_dlp,
@@ -265,6 +266,12 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
     ]
     enum_cmd += _find_cookie_source() or []
     enum_cmd.append(ch_url)
+    permission = youtube_traffic.acquire(
+        "redownload_catalog", cancel_event=cancel_ev, stream=stream)
+    if not permission.get("ok"):
+        stream.emit_error(
+            permission.get("error") or "YouTube traffic governor cancelled")
+        return {}
     try:
         proc = subprocess.Popen(
             enum_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1052,6 +1059,12 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
         ["    \u2014 ", ["dim"]],
         [f"yt-dlp cmd: {_cmd_str}\n", ["dim"]],
     ])
+    permission = youtube_traffic.acquire(
+        "redownload_video", cancel_event=cancel_ev, stream=stream)
+    if not permission.get("ok"):
+        stream.emit_error(
+            permission.get("error") or "YouTube traffic governor cancelled")
+        return None
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

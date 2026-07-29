@@ -767,7 +767,13 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         "--format", fmt,
         "--merge-output-format", "mp4",
         "--ppa", "Merger:-c copy",
-        "--sleep-requests", "0.25", # match original's throttle
+        # Match yt-dlp's built-in conservative sleep template.  The app-level
+        # traffic governor spaces extractor launches; these flags also pace
+        # requests and individual downloads made inside a long-lived launch.
+        "--sleep-requests", "0.75",
+        "--sleep-subtitles", "5",
+        "--sleep-interval", "10",
+        "--max-sleep-interval", "20",
         "--output", output_template,
         *_find_cookie_source(),
         "--ignore-errors",
@@ -1287,7 +1293,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 # PYTHONIOENCODING, so we try UTF-8 first and fall back
                 # to cp1252 via `_utils.decode_subprocess_line` below.
                 proc = popen_ytdlp_process(
-                    cmd_this, startupinfo=_startupinfo)
+                    cmd_this, startupinfo=_startupinfo,
+                    cancel_event=cancel_event, stream=stream)
                     # honors in TEXT mode — in binary mode it falls
                     # back to block buffering with a DeprecationWarning,
                 break

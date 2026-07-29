@@ -8,6 +8,8 @@ fallbacks only for partial test doubles / transitional callers.
 """
 from __future__ import annotations
 
+import time
+
 from ._shared import _log
 from backend.ytarchiver_config import load_config, save_config
 
@@ -315,15 +317,8 @@ class QueueMixin:
         if which in ("sync", "both"):
             self._sync_pause.set()
             queues.set_sync_paused(True)
-            # Pausing is also a cheap checkpoint for the Firefox session.
-            # If cookies expired while a long non-YouTube phase was running,
-            # surface the alarm now instead of waiting for the next request.
-            try:
-                from backend.youtube_session import (
-                    check_configured_cookie_session)
-                check_configured_cookie_session(context="Pause")
-            except Exception as e:
-                _log.debug("pause YouTube-session check failed: %s", e)
+            # Pausing is local state only. Do not spend a YouTube request to
+            # verify a session when the user is explicitly stopping work.
         if which in ("gpu", "both"):
             queues.set_gpu_paused(True)
             # The TranscribeManager worker (transcribe + compress jobs) is the
@@ -362,6 +357,25 @@ class QueueMixin:
         queues = self._queue_state()
         gpu_count = self._queue_gpu_count() if which in ("gpu", "both") else 0
         if which in ("sync", "both"):
+            try:
+                from backend import youtube_traffic
+                circuit = youtube_traffic.circuit_state()
+                if circuit.get("active"):
+                    resume = time.strftime(
+                        "%I:%M%p",
+                        time.localtime(float(circuit["cooldown_until"])),
+                    ).lstrip("0").lower()
+                    self._on_queue_changed()
+                    return {
+                        "ok": False,
+                        "paused": True,
+                        "rate_limited": True,
+                        "error": (
+                            "YouTube rate-limit cooldown is active until "
+                            f"{resume}."),
+                    }
+            except Exception as e:
+                _log.debug("resume rate-limit check failed: %s", e)
             # Never release queued YouTube work into a known-expired Firefox
             # session.  A successful re-check also re-arms the cookie alarm
             # for a future expiry.

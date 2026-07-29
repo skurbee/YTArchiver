@@ -81,6 +81,143 @@
     let _diskLastGood = "24";
     let _archiveCapacity = { mode: "percent", percent: 90, free_gb: 100 };
     let _archiveCapacityLastGood = "90";
+    let _trafficStatus = null;
+
+    function renderTraffic(status) {
+      if (status) _trafficStatus = status;
+      const t = _trafficStatus;
+      if (!t) return;
+      const modeEl = document.getElementById("settings-youtube-traffic-mode");
+      if (modeEl) {
+        modeEl.value = t.mode || "conservative";
+        modeEl._ytddRepaint?.();
+      }
+      const custom = document.getElementById("settings-traffic-custom");
+      if (custom) custom.hidden = t.mode !== "custom";
+      if (t.mode === "custom") {
+        const effectiveValues = {
+          "settings-traffic-daily": t.daily_limit,
+          "settings-traffic-hourly": t.hourly_limit,
+          "settings-traffic-min-gap": t.min_gap,
+          "settings-traffic-max-gap": t.max_gap,
+        };
+        Object.entries(effectiveValues).forEach(([id, value]) => {
+          const el = document.getElementById(id);
+          if (el && value != null) el.value = String(value);
+        });
+      }
+      const finite = Number(t.daily_limit) > 0;
+      window._setBudgetAutosyncAvailable?.(finite);
+      const used = document.getElementById("settings-traffic-meter");
+      if (used) {
+        const hourlyUsage =
+          document.getElementById("settings-traffic-hourly-usage");
+        const dailyUsage =
+          document.getElementById("settings-traffic-daily-usage");
+        const cooldown =
+          document.getElementById("settings-traffic-cooldown");
+        if (hourlyUsage) {
+          hourlyUsage.textContent = finite
+            ? `${Number(t.hourly_used).toLocaleString()} / ${Number(t.hourly_limit).toLocaleString()}`
+            : `${Number(t.hourly_used).toLocaleString()} / \u221e`;
+        }
+        if (dailyUsage) {
+          dailyUsage.textContent = finite
+            ? `${Number(t.daily_used).toLocaleString()} / ${Number(t.daily_limit).toLocaleString()}`
+            : `${Number(t.daily_used).toLocaleString()} / \u221e`;
+        }
+        if (cooldown && t.circuit?.active) {
+          const until = new Date(t.circuit.cooldown_until * 1000);
+          cooldown.textContent =
+            `Emergency cooldown until ${until.toLocaleString()}`;
+          cooldown.hidden = false;
+        } else if (cooldown) {
+          cooldown.textContent = "";
+          cooldown.hidden = true;
+        }
+        used.classList.toggle("is-warning",
+          !!t.circuit?.active
+          || (finite && (t.hourly_remaining === 0 || t.daily_remaining === 0)));
+      }
+      const recommendation = document.getElementById("settings-traffic-recommendation");
+      if (recommendation) {
+        const p = t.projection || {};
+        const cadence = document.getElementById("settings-traffic-cadence");
+        const detail = document.getElementById("settings-traffic-recommendation-detail");
+        const note = document.getElementById("settings-traffic-recommendation-note");
+        const channels = Number(p.sweep?.channels) || 0;
+        const units = Number(p.sweep?.units) || 0;
+        const low = Number(p.recommended_hours_low) || 0;
+        const high = Number(p.recommended_hours_high) || 0;
+        const fits = p.fits_complete_sweep !== false;
+
+        if (cadence) {
+          if (!finite) {
+            cadence.textContent = "Manual scheduling";
+          } else if (!channels) {
+            cadence.textContent = "Add channels to calculate";
+          } else if (!fits) {
+            cadence.textContent = "Increase the daily budget";
+          } else if (low === high) {
+            cadence.textContent = `About every ${low} hour${low === 1 ? "" : "s"}`;
+          } else {
+            cadence.textContent = `Every ${low}\u2013${high} hours`;
+          }
+        }
+        if (detail) {
+          if (!channels) {
+            detail.textContent =
+              "We\u2019ll estimate a safe auto-sync schedule from your archive.";
+          } else if (!fits) {
+            detail.textContent =
+              `A complete sync needs about ${units.toLocaleString()} operations, ` +
+              `more than the current ${Number(t.daily_limit).toLocaleString()}-operation daily budget.`;
+          } else {
+            detail.textContent =
+              `Calculated from ${channels.toLocaleString()} channels and about ` +
+              `${units.toLocaleString()} operations per complete sync.`;
+          }
+        }
+        if (note) {
+          note.hidden = finite;
+          note.textContent = finite
+            ? ""
+            : "\u201cWhen budget allows\u201d is unavailable because Unlimited has no budget ceiling.";
+        }
+        recommendation.classList.toggle(
+          "is-warning", !finite || !fits);
+      }
+    }
+
+    async function refreshTraffic() {
+      if (!nativeBridgeUp()) return;
+      try {
+        const status = await bridgeCall("youtube_traffic_status");
+        if (status?.ok) renderTraffic(status);
+      } catch (_e) { /* non-fatal */ }
+    }
+
+    async function saveTraffic(payload) {
+      if (!nativeBridgeUp()) return;
+      try {
+        const res = await bridgeCall("settings_save", payload);
+        if (!res?.ok) {
+          flashSaved(false);
+          window._showToast?.(res?.error || "Save failed.", "error");
+          return;
+        }
+        flashSaved(true);
+        if (res.budget_autosync_disabled) {
+          window._showToast?.(
+            'Auto-sync was turned Off because "When budget allows" is unavailable in Unlimited mode.',
+            "warn");
+        }
+        await refreshTraffic();
+      } catch (e) {
+        flashSaved(false);
+        window._showToast?.("Save failed: " + e, "error");
+      }
+    }
 
     function _capMode() {
       const mode = document.getElementById("settings-archive-capacity-mode")?.value;
@@ -166,6 +303,21 @@
           abEl.value = ["off","daily","weekly","monthly"].includes(ab)
             ? ab : "off";
         }
+        const trafficMode = document.getElementById("settings-youtube-traffic-mode");
+        if (trafficMode) {
+          trafficMode.value = s.youtube_traffic_mode || "conservative";
+        }
+        const trafficValues = {
+          "settings-traffic-daily": s.youtube_traffic_custom_daily ?? 750,
+          "settings-traffic-hourly": s.youtube_traffic_custom_hourly ?? 90,
+          "settings-traffic-min-gap": s.youtube_traffic_custom_min_gap ?? 10,
+          "settings-traffic-max-gap": s.youtube_traffic_custom_max_gap ?? 20,
+        };
+        Object.entries(trafficValues).forEach(([id, value]) => {
+          const el = document.getElementById(id);
+          if (el) el.value = String(value);
+        });
+        if (s.youtube_traffic) renderTraffic(s.youtube_traffic);
         // Auto-sync timing mode — read from the live scheduler state
         // (not the settings blob, since it's applied immediately).
         try {
@@ -231,6 +383,32 @@
       ?.addEventListener("change", (e) => saveField("close_behavior", e.target.value));
     document.getElementById("settings-auto-backup")
       ?.addEventListener("change", (e) => saveField("auto_backup_interval", e.target.value));
+    document.getElementById("settings-youtube-traffic-mode")
+      ?.addEventListener("change", (e) => {
+        const mode = e.target.value;
+        window._setBudgetAutosyncAvailable?.(mode !== "unlimited");
+        saveTraffic({ youtube_traffic_mode: mode });
+      });
+    const trafficInputMap = {
+      "settings-traffic-daily": "youtube_traffic_custom_daily",
+      "settings-traffic-hourly": "youtube_traffic_custom_hourly",
+      "settings-traffic-min-gap": "youtube_traffic_custom_min_gap",
+      "settings-traffic-max-gap": "youtube_traffic_custom_max_gap",
+    };
+    Object.entries(trafficInputMap).forEach(([id, key]) => {
+      const el = document.getElementById(id);
+      el?.addEventListener("change", () => {
+        const value = parseInt(el.value, 10);
+        if (!Number.isFinite(value)) {
+          window._showToast?.("Enter a whole number.", "error");
+          return;
+        }
+        saveTraffic({ [key]: value });
+      });
+      el?.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); el.blur(); }
+      });
+    });
 
     // Avg-size toggle: live-apply to the Subs table AND persist.
     document.getElementById("settings-show-avg-size")
@@ -323,6 +501,7 @@
     document.getElementById("settings-autorun-mode")?.addEventListener("change", async (e) => {
       try {
         await bridgeCall("autorun_set_mode", e.target.value);
+        window.dispatchEvent(new Event("autorun-state-changed"));
         flashSaved(true);
       } catch (err) {
         flashSaved(false);
@@ -335,6 +514,15 @@
     settingsTab?.addEventListener("click", () => { setTimeout(load, 50); });
     // Also load once on boot so values are ready if the user switches fast.
     setTimeout(load, 200);
+    const _trafficRefreshIv = setInterval(() => {
+      if (document.visibilityState === "visible"
+          && panel.classList.contains("active")) {
+        refreshTraffic();
+      }
+    }, 60_000);
+    window.addEventListener("beforeunload", () => {
+      clearInterval(_trafficRefreshIv);
+    });
 
     // Bulk metadata buttons (formerly the hidden right-click on "All Channels"
     // in Browse — YTArchiver.py:24840). Both prompt for confirmation because

@@ -22,6 +22,7 @@ import threading
 import time
 from typing import Any
 
+from . import youtube_traffic
 from .log import get_logger
 
 _log = get_logger(__name__)
@@ -32,6 +33,9 @@ _pause_event: threading.Event | None = None
 _queues = None
 _cookie_alert_fired = False
 _rate_limit_alert_ts = 0.0
+_rate_limit_detected = threading.Event()
+_background_rate_limit_scope = False
+_background_cancel_event: threading.Event | None = None
 
 
 def is_cookie_auth_error(text: str) -> bool:
@@ -158,6 +162,23 @@ def trigger_rate_limit_alert(*, reason: str = "", context: str = "",
     global _rate_limit_alert_ts
     target_stream, event, queue_state = _targets(
         stream=stream, pause_event=pause_event, queues=queues)
+    _rate_limit_detected.set()
+    circuit = youtube_traffic.record_rate_limit(now=now)
+    with _lock:
+        background_scope = _background_rate_limit_scope
+        background_cancel = _background_cancel_event
+    # Scheduled syncs terminate and report their next retry after the
+    # scheduler has been rearmed.  Suppress the manual "click Resume"
+    # instruction here; it is both wrong for an unattended run and would
+    # leave a parked queue that resumes at an arbitrary later time.
+    if background_scope:
+        if background_cancel is not None:
+            try:
+                background_cancel.set()
+            except Exception as exc:
+                _log.debug(
+                    "YouTube guard background cancel failed: %s", exc)
+        return True
     _pause(event, queue_state)
     now = time.time() if now is None else float(now)
     with _lock:
@@ -166,10 +187,14 @@ def trigger_rate_limit_alert(*, reason: str = "", context: str = "",
         _rate_limit_alert_ts = now
     if target_stream is not None:
         where = f" during {context}" if context else ""
+        cooldown_until = float(circuit.get("cooldown_until") or 0)
+        resume = time.strftime(
+            "%I:%M%p", time.localtime(cooldown_until)
+        ).lstrip("0").lower() if cooldown_until else "after the cooldown"
         target_stream.emit_error(
             "YouTube rate limit detected"
-            f"{where}. YTArchiver auto-paused immediately. Wait about one "
-            "hour, then click Resume; the interrupted task will retry first.")
+            f"{where}. YTArchiver auto-paused immediately. Do not resume "
+            f"before {resume}; the interrupted task will retry first.")
     _emit_control(target_stream, "youtube_rate_limit_alert", context=context)
     return True
 
@@ -263,8 +288,14 @@ def check_configured_cookie_session(*, context: str) -> bool:
     yt = find_yt_dlp()
     if not yt:
         return True
+    permission = youtube_traffic.acquire("session_probe")
+    if not permission.get("ok"):
+        if permission.get("cooldown"):
+            return False
+        return True
     try:
         import subprocess
+
         from .proc_utils import utf8_subprocess_env
         from .subprocess_util import make_startupinfo
         proc = subprocess.run(
@@ -321,3 +352,27 @@ def reset_rate_limit_alert() -> None:
     global _rate_limit_alert_ts
     with _lock:
         _rate_limit_alert_ts = 0.0
+
+
+def begin_sync_scope(*, background: bool = False,
+                     cancel_event: threading.Event | None = None) -> None:
+    """Reset per-run detection and select manual/background alert wording."""
+    global _background_rate_limit_scope, _background_cancel_event
+    with _lock:
+        _background_rate_limit_scope = bool(background)
+        _background_cancel_event = cancel_event if background else None
+        _rate_limit_detected.clear()
+
+
+def end_sync_scope() -> None:
+    """Restore the default manual policy after a sync worker exits."""
+    global _background_rate_limit_scope, _background_cancel_event
+    with _lock:
+        _background_rate_limit_scope = False
+        _background_cancel_event = None
+        _rate_limit_detected.clear()
+
+
+def rate_limit_detected() -> bool:
+    """Return whether the active sync scope observed a YouTube throttle."""
+    return _rate_limit_detected.is_set()

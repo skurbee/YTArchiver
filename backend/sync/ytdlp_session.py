@@ -11,6 +11,7 @@ from typing import Any
 from .. import utils as _utils
 from ..log import get_logger, swallow
 from ..process_runner import PROCESS_REGISTRY
+from .. import youtube_traffic
 
 _log = get_logger(__name__)
 
@@ -39,9 +40,15 @@ class DownloadWatchdog:
             self.thread.join(timeout=timeout)
 
 
-def popen_ytdlp_process(cmd: list[str], *, startupinfo: Any = None
+def popen_ytdlp_process(cmd: list[str], *, startupinfo: Any = None,
+                        cancel_event=None, stream=None,
                         ) -> subprocess.Popen:
     """Start one yt-dlp process in binary stdout mode and register it."""
+    permission = youtube_traffic.acquire(
+        "channel_sync", cancel_event=cancel_event, stream=stream)
+    if not permission.get("ok"):
+        raise OSError(
+            permission.get("error") or "YouTube traffic governor cancelled")
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,

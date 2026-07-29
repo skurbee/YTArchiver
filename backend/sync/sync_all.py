@@ -23,6 +23,7 @@ import time
 from datetime import datetime
 from typing import Any
 
+from .. import youtube_session
 from ..log import get_logger, swallow
 from ..log_stream import LogStreamer
 from ..ytarchiver_config import ARCHIVE_FILE, config_transaction, load_config
@@ -44,13 +45,13 @@ from .log_rows import (
     _sync_row_emit,
     emit_metadata_activity_row,
 )
+from .options import normalize_channel_sync_options
 from .quickcheck import (
     _check_batch_cooldown,
     _should_batch_limit,
     quick_check_new_uploads,
     set_batch_cooldown,
 )
-from .options import normalize_channel_sync_options
 from .sync_helpers import _fmt_duration
 
 _log = get_logger(__name__)
@@ -98,7 +99,8 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
              only_with_new: bool = True, queues=None, transcribe_mgr=None,
              pause_event: threading.Event | None = None,
              skip_event: threading.Event | None = None,
-             add_downloads_from_config: bool = True) -> dict[str, Any]:
+             add_downloads_from_config: bool = True,
+             autosync: bool = False) -> dict[str, Any]:
     """
     Sync every channel in config["channels"] sequentially.
 
@@ -440,12 +442,20 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     # whole end-of-pass cleanup.
     total = _initial_total
 
+    def _autosync_rate_limited() -> bool:
+        return bool(autosync and youtube_session.rate_limit_detected())
+
     def _requeue_paused_task(ch: dict[str, Any], ch_name: str,
                              i: int, total: int, *,
                              reason: str,
                              bracket_tag=None) -> bool:
         """Handle a task that stopped because the sync queue was paused."""
         nonlocal _processed
+        # A scheduled pass does not park work after a YouTube throttle.
+        # Its cleanup below clears the scheduled queue and lets the normal
+        # autorun timer build a fresh pass later.
+        if _autosync_rate_limited():
+            return False
         if (pause_event is None or not pause_event.is_set()
                 or queues is None):
             return False
@@ -481,6 +491,10 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
             green=False)
 
     while True:
+        # Background rate limits end the pass instead of entering the normal
+        # user-facing pause wait.  Manual runs retain pause/resume semantics.
+        if _autosync_rate_limited():
+            break
         # Clear a stale skip flag left over from the previous channel.
         # sync_skip_current now only sets _sync_skip (no longer overloads
         # _sync_cancel), so we just need to drain the skip event here so
@@ -1112,7 +1126,11 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
             _qc = quick_check_new_uploads(
                 _ch_url, _known_for_channel, check_count=5, timeout_sec=30,
                 min_duration=_qc_opts.min_duration,
-                max_duration=_qc_opts.max_duration)
+                max_duration=_qc_opts.max_duration,
+                cancel_event=cancel_event)
+            if _autosync_rate_limited():
+                _last_live["name"] = ""
+                break
             if _qc.get("filtered_ids"):
                 try:
                     from .. import channel_cache as _cc
@@ -1160,6 +1178,9 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                 _clear_active(ch_name)
             except Exception as _ce:
                 swallow("clear-sync-active", _ce)
+        if _autosync_rate_limited():
+            _last_live["name"] = ""
+            break
         _dl = int(res.get("downloaded", 0) or 0)
         _err = int(res.get("errors", 0) or 0)
         sum_dl += _dl
@@ -1193,6 +1214,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         if _should_batch_limit(ch, res.get("total", 0)):
             set_batch_cooldown(ch.get("url", ""))
 
+    rate_limited = _autosync_rate_limited()
     elapsed = time.time() - t_start
     # Per-kind summary: the action verb on the Pass complete line
     # now reflects what the pass actually did. Previously it always
@@ -1257,7 +1279,8 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     emit_parts.append([" \u00b7 ", "simpleline"])
     emit_parts.append([f"took {_fmt_duration(elapsed)} ", "simpleline"])
     emit_parts.append(["===\n", "simplestatus_green"])
-    stream.emit(emit_parts)
+    if not rate_limited:
+        stream.emit(emit_parts)
     # Global "Last Full Sync" timestamp \u2014 written here at pass
     # completion (and only for a download-kind pass, and only when not
     # cancelled) so the UI's "Last Full Sync: \u2026" label genuinely means
@@ -1267,7 +1290,8 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     # videos \u2014 making it look like a sync "completed" at the moment the
     # FIRST channel finished a download, not at the actual end of pass.
     _cancelled_for_ts = (cancel_event is not None and cancel_event.is_set())
-    if _label == "Sync pass" and not _cancelled_for_ts:
+    if (_label == "Sync pass" and not _cancelled_for_ts
+            and not rate_limited):
         try:
             with config_transaction() as _cfg_end:
                 _cfg_end["last_sync"] = datetime.now().strftime(
@@ -1282,7 +1306,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     # user to resume (audit: sync/sync_all.py:1018).
     _cancelled = (cancel_event is not None and cancel_event.is_set())
     if queues is not None:
-        if not _cancelled:
+        if not _cancelled or rate_limited:
             try: queues.sync_clear()
             except Exception as e: swallow("queue clear on pass end", e)
         # Don't drop the in-flight item from `current_sync` on cancel
@@ -1290,9 +1314,19 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         # so the next app launch can pick it back up. Clearing it
         # here meant a cancelled-mid-channel run lost the in-flight
         # channel from the resume entry-point (audit: sync_all H27).
-        if not _cancelled:
+        if not _cancelled or rate_limited:
             try: queues.set_current_sync(None)
             except Exception as e: swallow("current-sync clear", e)
+        if rate_limited:
+            if pause_event is not None:
+                try: pause_event.clear()
+                except Exception as e: swallow("rate-limit pause clear", e)
+            if cancel_event is not None:
+                try: cancel_event.clear()
+                except Exception as e: swallow("rate-limit cancel clear", e)
+            try: queues.set_sync_paused(False)
+            except Exception as e:
+                swallow("rate-limit queue pause clear", e)
         try: queues.set_sync_pass_progress(0, 0)
         except Exception as e: swallow("pass-progress reset", e)
     # Clear the sync-progress file so any companion display goes idle.
@@ -1302,6 +1336,9 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     # after this function returns don't tag rows with a dead pass.
     try: _ROW_EMIT_PASS_ID.id = ""
     except Exception as e: swallow("pass-id clear", e)
-    return {"ok": True, "downloaded": sum_dl, "errors": sum_err,
+    return {"ok": not rate_limited,
+            "reason": "youtube_rate_limit" if rate_limited else "",
+            "rate_limited": rate_limited,
+            "downloaded": sum_dl, "errors": sum_err,
             "skipped": skipped,
             "took": _fmt_duration(elapsed), "total": total}

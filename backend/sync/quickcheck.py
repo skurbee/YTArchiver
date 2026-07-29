@@ -30,6 +30,7 @@ from typing import Any
 from .. import utils as _utils
 from ..log import get_logger, swallow
 from ..process_runner import PROCESS_REGISTRY
+from .. import youtube_traffic
 from ..ytarchiver_config import config_transaction, load_config
 from .ytdlp_proc import _ensure_videos_tab, _find_cookie_source, find_yt_dlp
 
@@ -108,6 +109,12 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
     total = 0
     lives = 0
     upcoming = 0
+    permission = youtube_traffic.acquire("channel_total_probe")
+    if not permission.get("ok"):
+        return {
+            "ok": False,
+            "error": permission.get("error") or "traffic governor cancelled",
+        }
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -203,7 +210,8 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
 def quick_check_new_uploads(ch_url: str, archived_ids,
                             check_count: int = 5, timeout_sec: int = 30,
                             min_duration: int = 0,
-                            max_duration: int = 0
+                            max_duration: int = 0,
+                            cancel_event=None,
                             ) -> dict[str, Any]:
     """Probe the first N videos of a channel to see if any are NOT in our
     archive already. Short-circuit for channels with nothing new.
@@ -264,6 +272,15 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
             return True
         return False
 
+    permission = youtube_traffic.acquire(
+        "channel_quick_check", cancel_event=cancel_event)
+    if not permission.get("ok"):
+        return {
+            "ok": False,
+            "has_new": True,
+            "error": permission.get("error") or "traffic governor cancelled",
+            "cancelled": bool(permission.get("cancelled")),
+        }
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=float(timeout_sec),

@@ -59,9 +59,19 @@ DEFAULT_CONFIG = {
     "channels": [],
     "recent_downloads": [],
     "autorun_interval": 0,
-    # Auto-sync firing mode: "timer" (countdown from now) or "clock"
-    # (snap to wall-clock boundaries aligned from midnight).
-    "autorun_mode": "timer",
+    # Auto-sync firing mode: "timer" (persistent countdown) or "clock"
+    # (wall-clock boundaries; 12h/24h schedules can choose an anchor time).
+    "autorun_mode": "clock",
+    "autorun_clock_time_12": 0,
+    "autorun_clock_time_24": 0,
+    # Persistent global YouTube traffic governor.  Presets intentionally use
+    # app-level yt-dlp operation units rather than claiming exact HTTP request
+    # counts (one extractor launch can make several internal requests).
+    "youtube_traffic_mode": "conservative",
+    "youtube_traffic_custom_daily": 750,
+    "youtube_traffic_custom_hourly": 90,
+    "youtube_traffic_custom_min_gap": 10,
+    "youtube_traffic_custom_max_gap": 20,
     "autorun_history": [],
     "log_mode": "Simple",
     # yt-dlp release channel the in-app updater targets. "stable" (the

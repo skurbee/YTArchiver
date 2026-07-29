@@ -6,6 +6,32 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v82.5 - 2026-07-29
+
+### Added
+- **A persistent YouTube traffic governor now keeps long-running archives low and slow.** Conservative, Balanced, Custom, and Unlimited profiles enforce rolling hourly and 24-hour operation budgets, randomized request spacing, reservation-aware full sweeps, and a durable ledger that survives restarts.
+- **Traffic safety is available during first-run setup and in Settings.** The app estimates the cost of a complete sweep from the archive's channels and enabled features, recommends a safe cadence, shows live hourly/daily usage, and explains when a configured sweep cannot fit its budget.
+- **Auto-sync can run “When budget allows.”** This mode waits until one complete sweep fits the selected traffic budget, never starts a partial sweep, and is unavailable when traffic limits are disabled.
+- **Daily and twice-daily clock schedules can use a custom time.** Clock-aligned 24-hour schedules offer individual times in 30-minute increments; 12-hour schedules offer paired choices such as `1:00 AM / 1:00 PM`. The enhanced intervals are marked with a **CLOCK TIME** badge in the menu.
+
+### Fixed
+- **Background rate limits now end the scheduled sync cleanly.** Auto-sync clears the remaining queue, preserves interrupted work for the next pass, opens a persistent cooldown circuit, and reports when scheduling can safely resume instead of asking an unattended user to retry manually.
+- **Budget auto-sync no longer quickfires during launch.** It waits for startup checks and archive indexing, announces a three-minute grace countdown, and retries later if downloads, rescans, or database maintenance are still active.
+- **Timer-based auto-sync deadlines survive restarts.** A future deadline resumes exactly where it left off; an elapsed deadline waits for startup to finish and receives the same three-minute grace instead of firing immediately.
+- **Opening the app does not probe YouTube.** Session validation remains lazy until an operation actually needs the network, keeping Browse and other local archive work independent of account cooldowns.
+- **Internal no-op backfill output stays out of Simple logs.** The startup `video_id seg-backfill` result is now Verbose-only.
+
+### Changed
+- **Fresh installs default to clock-aligned auto-sync timing.** Existing users retain their saved timer/clock preference.
+- **Settings explanations use consistent, aligned help treatments.** Traffic recommendations, archive paths, backups, and performance controls now read as intentional supporting UI rather than detached text.
+- **12-hour and 24-hour options advertise their clock-time capability.** The additional time selector appears only when one of those intervals is selected in clock-aligned mode.
+
+### Validation
+- Backend smoke suite passed: 426 tests.
+- Python compile checks, frontend JavaScript syntax checks, generated HTML freshness, and `git diff --check` passed.
+- Clock-time menus, traffic settings, startup logs, and timer/countdown states were visually inspected in the packaged application.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
 ## v82.4 - 2026-07-24
 
 ### Fixed

@@ -43,15 +43,29 @@
       menu.innerHTML = "";
       const curIdx = sel.selectedIndex;
       Array.from(sel.options).forEach((opt, idx) => {
+        if (opt.hidden) return;
         const row = document.createElement("div");
         row.className = "yt-dd-option";
+        if (opt.disabled) row.classList.add("disabled");
         if (idx === curIdx) {
           row.classList.add("selected");
         }
-        row.textContent = opt.text || opt.value;
+        const label = opt.text || opt.value;
+        const tooltip = opt.dataset.tooltip || opt.title || "";
+        const featured = opt.dataset.featured || "";
+        row.textContent = label;
+        if (featured) {
+          row.classList.add("featured");
+          row.dataset.featured = featured;
+        }
+        if (tooltip) {
+          row.dataset.tooltip = tooltip;
+          row.setAttribute("aria-label", `${label}. ${tooltip}`);
+        }
         row.dataset.idx = String(idx);
         row.addEventListener("click", (e) => {
           e.stopPropagation();
+          if (opt.disabled) return;
           const nextIdx = Number(row.dataset.idx);
           if (Number.isInteger(nextIdx)
               && nextIdx >= 0

@@ -132,6 +132,13 @@ def _fetch_video_metadata(yt: str, video_id: str,
     _rc: int | None = None
     _attempts = (60, 60, 90)
     for _attempt_idx, _attempt_timeout in enumerate(_attempts):
+        from .. import youtube_traffic
+        permission = youtube_traffic.acquire("video_metadata")
+        if not permission.get("ok"):
+            if error_out is not None:
+                error_out.append(
+                    permission.get("error") or "traffic governor cancelled")
+            return None
         try:
             # CREATE_NEW_PROCESS_GROUP so taskkill /T /F on cancel/timeout
             # also reaps spawned ffmpeg/curl children. Without it,

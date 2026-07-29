@@ -12,6 +12,7 @@
         <span class="onb-dot" data-step="2"></span>
         <span class="onb-dot" data-step="3"></span>
         <span class="onb-dot" data-step="4"></span>
+        <span class="onb-dot" data-step="5"></span>
       </div>
       <!-- Close (X): only shown when the wizard is re-opened from
            Settings > Tools ("Run setup again"). Genuine first-run keeps
@@ -48,8 +49,40 @@
         <div class="onb-hint" id="onb-folder-hint"></div>
       </section>
 
-      <!-- Step 3: Dependencies -->
+      <!-- Step 3: YouTube traffic safety -->
       <section class="onb-step" data-step="3" hidden>
+        <h1 class="onb-title">Choose a traffic safety level</h1>
+        <p class="onb-text">YTArchiver stays deliberately low and slow to
+          protect your YouTube session. You can change this later in Settings.</p>
+        <div class="onb-traffic-grid" id="onb-traffic-grid">
+          <button type="button" class="onb-traffic-card" data-traffic-mode="conservative">
+            <b>Conservative</b><span>750 operations/day · 90/hour · 10–20s spacing</span>
+            <em>Recommended</em>
+          </button>
+          <button type="button" class="onb-traffic-card" data-traffic-mode="balanced">
+            <b>Balanced</b><span>1,500 operations/day · 180/hour · 8–15s spacing</span>
+            <em>For larger, busier archives</em>
+          </button>
+          <button type="button" class="onb-traffic-card" data-traffic-mode="custom">
+            <b>Custom</b><span>Set your own rolling limits and spacing</span>
+            <em>Advanced</em>
+          </button>
+          <button type="button" class="onb-traffic-card" data-traffic-mode="unlimited">
+            <b>Unlimited</b><span>No numeric ceiling · 5–10s spacing remains</span>
+            <em>Not recommended</em>
+          </button>
+        </div>
+        <div class="onb-traffic-custom" id="onb-traffic-custom" hidden>
+          <label>Per 24 hours <input type="number" id="onb-traffic-daily" min="1" max="100000" value="750" /></label>
+          <label>Per hour <input type="number" id="onb-traffic-hourly" min="1" max="10000" value="90" /></label>
+          <label>Minimum gap <input type="number" id="onb-traffic-min-gap" min="0" max="3600" value="10" /><span>sec</span></label>
+          <label>Maximum gap <input type="number" id="onb-traffic-max-gap" min="0" max="3600" value="20" /><span>sec</span></label>
+        </div>
+        <div class="onb-traffic-summary" id="onb-traffic-summary"></div>
+      </section>
+
+      <!-- Step 4: Dependencies -->
+      <section class="onb-step" data-step="4" hidden>
         <h1 class="onb-title">Install dependencies</h1>
 
         <div class="onb-dep-group">
@@ -103,8 +136,8 @@
         <button class="onb-link" id="onb-recheck">Re-check installed tools</button>
       </section>
 
-      <!-- Step 4: Done -->
-      <section class="onb-step" data-step="4" hidden>
+      <!-- Step 5: Done -->
+      <section class="onb-step" data-step="5" hidden>
         <h1 class="onb-title">You're all set</h1>
         <p class="onb-text">YTArchiver is ready. Add channels on the <b>Subs</b> tab,
           or paste a video URL on the <b>Download</b> tab to grab a single video.</p>

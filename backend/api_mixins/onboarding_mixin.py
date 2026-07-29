@@ -13,6 +13,7 @@ the wizard can re-render final state.
 from __future__ import annotations
 
 from backend import deps_installer as _deps
+from backend import youtube_traffic
 
 import re
 import threading
@@ -55,7 +56,37 @@ class OnboardingMixin:
             "output_dir": (cfg.get("output_dir") or "").strip(),
             "version": APP_VERSION,
             "deps": deps,
+            "youtube_traffic": youtube_traffic.status(cfg),
         }
+
+    def onboarding_set_traffic(self, mode, custom=None):
+        """Persist the first-run YouTube traffic-safety choice."""
+        mode = youtube_traffic.normalize_mode(mode)
+        try:
+            cfg = self._onboarding_config()
+            cfg["youtube_traffic_mode"] = mode
+            if mode == "custom" and isinstance(custom, dict):
+                bounds = {
+                    "daily": ("youtube_traffic_custom_daily", 1, 100_000),
+                    "hourly": ("youtube_traffic_custom_hourly", 1, 10_000),
+                    "min_gap": ("youtube_traffic_custom_min_gap", 0, 3600),
+                    "max_gap": ("youtube_traffic_custom_max_gap", 0, 3600),
+                }
+                for source, (target, low, high) in bounds.items():
+                    if source in custom:
+                        cfg[target] = max(
+                            low, min(high, int(custom[source])))
+                cfg["youtube_traffic_custom_max_gap"] = max(
+                    int(cfg.get("youtube_traffic_custom_min_gap", 10)),
+                    int(cfg.get("youtube_traffic_custom_max_gap", 20)),
+                )
+            if not self._onboarding_save_config(cfg):
+                return {"ok": False, "error": "config save failed"}
+            self._reload_config()
+            return {"ok": True, "youtube_traffic": youtube_traffic.status(cfg)}
+        except Exception as e:
+            _log.warning("onboarding traffic save failed: %s", e)
+            return {"ok": False, "error": str(e)}
 
     def onboarding_probe(self, check_whisper=False):
         """Re-probe dependency state on demand (e.g. after the user installs

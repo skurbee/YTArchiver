@@ -272,6 +272,7 @@ def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> str | None:
         import subprocess as _sp
 
         from . import sync as _sync
+        from . import youtube_traffic
         from .process_runner import PROCESS_REGISTRY
         yt = _sync.find_yt_dlp()
         if not yt:
@@ -282,6 +283,9 @@ def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> str | None:
         # shutting down while adding a channel left yt-dlp.exe running
         # for up to 30s (audit: subs.py:280-296).
         def _run_registered(argv, timeout):
+            permission = youtube_traffic.acquire("channel_name_probe")
+            if not permission.get("ok"):
+                return ""
             proc = _sp.Popen(
                 argv, stdout=_sp.PIPE, stderr=_sp.PIPE,
                 text=True, encoding="utf-8", errors="replace",

@@ -40,6 +40,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from .log import get_logger
+from . import youtube_traffic
 from .subprocess_util import (
     make_startupinfo,
     subprocess_creationflags,
@@ -334,7 +335,8 @@ class YtDlpRunner:
 
     def run_capture(self, argv: Iterable[str],
                     *, timeout: float = 30.0,
-                    extra_env: dict | None = None
+                    extra_env: dict | None = None,
+                    traffic_kind: str = "yt_dlp_probe",
                     ) -> tuple[int, str, str]:
         """Run yt-dlp synchronously, capture stdout+stderr. Returns
         (returncode, stdout_str, stderr_str).
@@ -346,6 +348,13 @@ class YtDlpRunner:
         argv = list(argv)
         if not argv:
             return -1, "", "yt-dlp not found"
+        permission = youtube_traffic.acquire(traffic_kind)
+        if not permission.get("ok"):
+            reason = (
+                "cancelled" if permission.get("cancelled")
+                else permission.get("error") or "YouTube traffic budget blocked"
+            )
+            return -1, "", str(reason)
         try:
             proc = subprocess.Popen(
                 argv,
@@ -397,7 +406,8 @@ class YtDlpRunner:
     def run_streaming(self, argv: Iterable[str],
                       *, on_stdout_line: Callable[[str], None] | None = None,
                       cancel_event: threading.Event | None = None,
-                      extra_env: dict | None = None
+                      extra_env: dict | None = None,
+                      traffic_kind: str = "yt_dlp_download",
                       ) -> StreamingRunResult:
         """Run yt-dlp and stream stdout line by line via `on_stdout_line`.
 
@@ -415,6 +425,16 @@ class YtDlpRunner:
         argv = list(argv)
         if not argv:
             return StreamingRunResult(-1, ["yt-dlp not found"])
+        permission = youtube_traffic.acquire(
+            traffic_kind, cancel_event=cancel_event)
+        if not permission.get("ok"):
+            reason = (
+                "cancelled" if permission.get("cancelled")
+                else permission.get("error") or "YouTube traffic budget blocked"
+            )
+            return StreamingRunResult(
+                -1, [str(reason)], cancelled=bool(
+                    permission.get("cancelled")))
         try:
             proc = subprocess.Popen(
                 argv,

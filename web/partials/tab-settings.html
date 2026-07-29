@@ -8,75 +8,129 @@
         <label class="subs-section-label">General</label>
         <div class="edit-grid">
           <label class="edit-gl">Archive root</label>
-          <div class="edit-gv-inline">
-            <input type="text" class="ctl-input" id="settings-output-dir" readonly />
-            <button class="btn btn-ghost btn-thin" id="settings-browse-output">Browse&hellip;</button>
-          </div>
-          <div class="edit-gh">
-            Where new channel downloads land. Changing this only affects
-            <b>new</b> downloads &mdash; existing videos stay where they are.
-            Move them manually if you want everything in one place.
+          <div class="edit-gv-stack settings-field-with-help">
+            <div class="edit-gv-inline">
+              <input type="text" class="ctl-input" id="settings-output-dir" readonly />
+              <button class="btn btn-ghost btn-thin" id="settings-browse-output">Browse&hellip;</button>
+            </div>
+            <div class="settings-field-help">
+              New channel downloads are stored here. Existing videos are
+              never moved automatically.
+            </div>
           </div>
 
           <label class="edit-gl">Video downloads</label>
-          <div class="edit-gv-inline">
-            <input type="text" class="ctl-input" id="settings-video-dir" readonly />
-            <button class="btn btn-ghost btn-thin" id="settings-browse-video">Browse&hellip;</button>
-          </div>
-          <div class="edit-gh">
-            Default save location for single-video downloads (URL bar
-            on the Download tab).
+          <div class="edit-gv-stack settings-field-with-help">
+            <div class="edit-gv-inline">
+              <input type="text" class="ctl-input" id="settings-video-dir" readonly />
+              <button class="btn btn-ghost btn-thin" id="settings-browse-video">Browse&hellip;</button>
+            </div>
+            <div class="settings-field-help">
+              Default location for individual URLs downloaded from the
+              Download tab.
+            </div>
           </div>
 
           <label class="edit-gl">Default resolution</label>
-          <select class="ctl-select" id="settings-default-res">
-            <option value="audio">Audio only</option>
-            <option value="144">144p</option>
-            <option value="240">240p</option>
-            <option value="360">360p</option>
-            <option value="480">480p</option>
-            <option value="720" selected>720p</option>
-            <option value="1080">1080p</option>
-            <option value="1440">1440p</option>
-            <option value="2160">2160p (4K)</option>
-            <option value="best">Best available</option>
-          </select>
+          <div class="edit-gv-cell">
+            <select class="ctl-select" id="settings-default-res">
+              <option value="audio">Audio only</option>
+              <option value="144">144p</option>
+              <option value="240">240p</option>
+              <option value="360">360p</option>
+              <option value="480">480p</option>
+              <option value="720" selected>720p</option>
+              <option value="1080">1080p</option>
+              <option value="1440">1440p</option>
+              <option value="2160">2160p (4K)</option>
+              <option value="best">Best available</option>
+            </select>
+          </div>
 
           <label class="edit-gl">Auto-transcribe model</label>
-          <select class="ctl-select" id="settings-whisper-model">
-            <option value="tiny">tiny (fastest)</option>
-            <option value="small" selected>small</option>
-            <option value="medium">medium</option>
-            <option value="large-v3">large-v3 (best)</option>
-          </select>
+          <div class="edit-gv-cell">
+            <select class="ctl-select" id="settings-whisper-model">
+              <option value="tiny">tiny (fastest)</option>
+              <option value="small" selected>small</option>
+              <option value="medium">medium</option>
+              <option value="large-v3">large-v3 (best)</option>
+            </select>
+          </div>
 
           <label class="edit-gl">When closing window</label>
-          <select class="ctl-select" id="settings-close-behavior">
-            <option value="ask" selected>Ask each time</option>
-            <option value="tray">Minimize to tray</option>
-            <option value="quit">Quit immediately</option>
-          </select>
+          <div class="edit-gv-cell">
+            <select class="ctl-select" id="settings-close-behavior">
+              <option value="ask" selected>Ask each time</option>
+              <option value="tray">Minimize to tray</option>
+              <option value="quit">Quit immediately</option>
+            </select>
+          </div>
 
           <label class="edit-gl">Auto-sync timing</label>
-          <select class="ctl-select" id="settings-autorun-mode"
-                  title="Timer counts down a fixed interval from now; Clock-aligned fires at wall-clock boundaries (e.g. every :00/:30)">
-            <option value="timer">Timer (countdown)</option>
-            <option value="clock">Clock-aligned (fixed times)</option>
-          </select>
+          <div class="edit-gv-cell">
+            <select class="ctl-select" id="settings-autorun-mode"
+                    title="Timer resumes its saved countdown after restarts; Clock-aligned uses fixed wall-clock times, with a custom time available for 12- and 24-hour schedules">
+              <option value="timer">Timer (countdown)</option>
+              <option value="clock">Clock-aligned (fixed times)</option>
+            </select>
+          </div>
+
+          <label class="edit-gl">YouTube traffic safety</label>
+          <div class="edit-gv-stack settings-traffic-controls">
+            <select class="ctl-select" id="settings-youtube-traffic-mode">
+              <option value="conservative">Conservative (recommended)</option>
+              <option value="balanced">Balanced</option>
+              <option value="custom">Custom</option>
+              <option value="unlimited">Unlimited</option>
+            </select>
+            <div class="settings-traffic-custom" id="settings-traffic-custom" hidden>
+              <label>24-hour limit <input type="number" class="ctl-input" id="settings-traffic-daily" min="1" max="100000" /></label>
+              <label>Hourly limit <input type="number" class="ctl-input" id="settings-traffic-hourly" min="1" max="10000" /></label>
+              <label>Min gap <input type="number" class="ctl-input" id="settings-traffic-min-gap" min="0" max="3600" /><span>sec</span></label>
+              <label>Max gap <input type="number" class="ctl-input" id="settings-traffic-max-gap" min="0" max="3600" /><span>sec</span></label>
+            </div>
+            <div class="settings-traffic-meter" id="settings-traffic-meter">
+              <span class="settings-traffic-usage">
+                <strong id="settings-traffic-hourly-usage">&mdash;</strong>
+                <small>This hour</small>
+              </span>
+              <span class="settings-traffic-usage">
+                <strong id="settings-traffic-daily-usage">&mdash;</strong>
+                <small>Last 24 hours</small>
+              </span>
+              <span class="settings-traffic-cooldown"
+                    id="settings-traffic-cooldown" hidden></span>
+            </div>
+            <div class="settings-traffic-insight" id="settings-traffic-recommendation">
+              <span class="settings-traffic-insight-icon" aria-hidden="true">&#10003;</span>
+              <div class="settings-traffic-insight-copy">
+                <div class="settings-traffic-insight-heading">
+                  <span>Recommended cadence</span>
+                  <strong id="settings-traffic-cadence">Calculating&hellip;</strong>
+                </div>
+                <div class="settings-traffic-insight-detail"
+                     id="settings-traffic-recommendation-detail">
+                  Checking your channels and enabled features.
+                </div>
+                <div class="settings-traffic-insight-note"
+                     id="settings-traffic-recommendation-note" hidden></div>
+              </div>
+            </div>
+          </div>
 
           <label class="edit-gl">Auto-backup</label>
-          <select class="ctl-select" id="settings-auto-backup"
-                  title="Automatically exports the app's full backup (settings, subscriptions, download history, queue) into the 'YTArchiver Info' folder inside the archive root — alongside a README describing the archive format and a copy of the app itself. The newest 4 backups are kept; older ones move to the archive trash.">
-            <option value="off" selected>Off</option>
-            <option value="daily">Daily</option>
-            <option value="weekly">Weekly</option>
-            <option value="monthly">Monthly</option>
-          </select>
-          <div class="edit-gh">
-            Saves the app's full backup (settings, subs, download
-            history) into <b>YTArchiver Info</b> in the archive root,
-            with a format README and a copy of the app &mdash; so the
-            archive folder is fully self-contained.
+          <div class="edit-gv-stack settings-field-with-help">
+            <select class="ctl-select" id="settings-auto-backup"
+                    title="Automatically exports the app's full backup (settings, subscriptions, download history, queue) into the 'YTArchiver Info' folder inside the archive root — alongside a README describing the archive format and a copy of the app itself. The newest 4 backups are kept; older ones move to the archive trash.">
+              <option value="off" selected>Off</option>
+              <option value="daily">Daily</option>
+              <option value="weekly">Weekly</option>
+              <option value="monthly">Monthly</option>
+            </select>
+            <div class="settings-field-help">
+              Keeps the archive self-contained with settings, subscriptions,
+              download history, a format README, and a copy of YTArchiver.
+            </div>
           </div>
 
           <label class="edit-gl">Launch at boot</label>
@@ -96,22 +150,23 @@
         <div class="edit-grid">
           <label class="edit-gl">Disk scan</label>
           <div class="edit-gv-inline edit-gap-6">
-            <span class="edit-dim">rescan archive if cache older than</span>
+            <span class="settings-control-caption">Rescan when cache is older than</span>
             <input type="text" class="ctl-input edit-num settings-disk-staleness-input"
                    id="settings-disk-staleness" value="24" />
-            <span class="edit-dim">hours &nbsp;&middot;&nbsp; 0 = always rescan</span>
+            <span class="settings-control-unit">hours</span>
+            <span class="settings-inline-note">0 always rescans</span>
           </div>
 
           <label class="edit-gl">Archive drive warning</label>
           <div class="edit-gv-inline edit-gap-6 settings-archive-capacity-row">
-            <span class="edit-dim">warning type</span>
+            <span class="settings-control-caption">Measure by</span>
             <select class="ctl-select" id="settings-archive-capacity-mode">
               <option value="percent" selected>Percent full</option>
               <option value="free_gb">GB free</option>
             </select>
             <input type="text" class="ctl-input edit-num settings-archive-capacity-input"
                    id="settings-archive-capacity-threshold" value="90" />
-            <span class="edit-dim" id="settings-archive-capacity-unit">% full</span>
+            <span class="settings-control-unit" id="settings-archive-capacity-unit">% full</span>
           </div>
         </div>
 
@@ -126,10 +181,12 @@
           </div>
 
           <label class="edit-gl">Log mode</label>
-          <select class="ctl-select" id="settings-log-mode">
-            <option value="Simple" selected>Simple</option>
-            <option value="Verbose">Verbose</option>
-          </select>
+          <div class="edit-gv-cell">
+            <select class="ctl-select" id="settings-log-mode">
+              <option value="Simple" selected>Simple</option>
+              <option value="Verbose">Verbose</option>
+            </select>
+          </div>
         </div>
 
         <div class="settings-actions" id="settings-actions-footer">

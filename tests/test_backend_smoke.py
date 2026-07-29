@@ -46,6 +46,7 @@ from backend import (
     tray as tray_backend,
     utils,
     youtube_session,
+    youtube_traffic,
     ytarchiver_config,
 )
 from backend.services import AppServices, BridgeEventBus, file_ops
@@ -104,6 +105,39 @@ from backend.transcribe import core as transcribe_core
 from backend.transcribe import helpers as transcribe_helpers
 from backend.transcribe import transcribe_vtt
 from backend.transcribe import transcribe_files
+
+_TEST_TRAFFIC_TMP = None
+_TEST_TRAFFIC_PRESETS = None
+_TEST_TRAFFIC_FILES = None
+
+
+def setUpModule() -> None:
+    """Keep traffic-governor tests isolated from the user's live ledger."""
+    global _TEST_TRAFFIC_TMP, _TEST_TRAFFIC_PRESETS, _TEST_TRAFFIC_FILES
+    _TEST_TRAFFIC_TMP = tempfile.TemporaryDirectory()
+    _TEST_TRAFFIC_PRESETS = {
+        key: dict(value)
+        for key, value in youtube_traffic.TRAFFIC_PRESETS.items()
+    }
+    _TEST_TRAFFIC_FILES = (
+        youtube_traffic.TRAFFIC_FILE, youtube_traffic.CIRCUIT_FILE)
+    youtube_traffic._reset_for_tests(
+        Path(_TEST_TRAFFIC_TMP.name) / "traffic.jsonl",
+        Path(_TEST_TRAFFIC_TMP.name) / "rate_limit.json",
+    )
+    for preset in youtube_traffic.TRAFFIC_PRESETS.values():
+        preset.update(
+            daily=1_000_000, hourly=1_000_000, min_gap=0, max_gap=0)
+
+
+def tearDownModule() -> None:
+    if _TEST_TRAFFIC_PRESETS is not None:
+        youtube_traffic.TRAFFIC_PRESETS.clear()
+        youtube_traffic.TRAFFIC_PRESETS.update(_TEST_TRAFFIC_PRESETS)
+    if _TEST_TRAFFIC_FILES is not None:
+        youtube_traffic._reset_for_tests(*_TEST_TRAFFIC_FILES)
+    if _TEST_TRAFFIC_TMP is not None:
+        _TEST_TRAFFIC_TMP.cleanup()
 
 
 class LocalFileServerAllowlistTests(unittest.TestCase):
@@ -1159,14 +1193,26 @@ class ArchiveScanTests(unittest.TestCase):
 
 class YouTubeSessionGuardTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._traffic_tmp = tempfile.TemporaryDirectory()
+        self._old_circuit_file = youtube_traffic.CIRCUIT_FILE
+        youtube_traffic.CIRCUIT_FILE = (
+            Path(self._traffic_tmp.name) / "rate_limit.json")
         youtube_session._stream = None
         youtube_session._pause_event = None
         youtube_session._queues = None
         youtube_session._cookie_alert_fired = False
         youtube_session._rate_limit_alert_ts = 0.0
+        youtube_session.end_sync_scope()
 
     def tearDown(self) -> None:
-        self.setUp()
+        youtube_session._stream = None
+        youtube_session._pause_event = None
+        youtube_session._queues = None
+        youtube_session._cookie_alert_fired = False
+        youtube_session._rate_limit_alert_ts = 0.0
+        youtube_session.end_sync_scope()
+        youtube_traffic.CIRCUIT_FILE = self._old_circuit_file
+        self._traffic_tmp.cleanup()
 
     def test_cookie_error_auto_pauses_and_emits_modal_control(self) -> None:
         stream = mock.Mock()
@@ -1211,6 +1257,30 @@ class YouTubeSessionGuardTests(unittest.TestCase):
         self.assertEqual(kind, "rate_limit")
         self.assertTrue(pause_event.is_set())
         stream.emit_error.assert_called_once()
+
+    def test_background_rate_limit_cancels_without_resume_message(
+            self) -> None:
+        stream = mock.Mock()
+        pause_event = threading.Event()
+        cancel_event = threading.Event()
+        queue_state = mock.Mock()
+        youtube_session.configure(stream, pause_event, queue_state)
+        youtube_session.begin_sync_scope(
+            background=True, cancel_event=cancel_event)
+
+        kind = youtube_session.handle_youtube_failure_text(
+            "The current session has been rate-limited by YouTube "
+            "for up to an hour.",
+            context="checking recent channel uploads",
+        )
+
+        self.assertEqual(kind, "rate_limit")
+        self.assertTrue(youtube_session.rate_limit_detected())
+        self.assertTrue(cancel_event.is_set())
+        self.assertFalse(pause_event.is_set())
+        queue_state.set_sync_paused.assert_not_called()
+        stream.emit_error.assert_not_called()
+        stream.emit.assert_not_called()
 
 
 class MetadataJsonlTests(unittest.TestCase):
@@ -3937,7 +4007,108 @@ class LogRowsTests(unittest.TestCase):
         self.assertIn("ok", log_rows._HIST_INDEX_BY_ROW_ID)
 
 
+class YouTubeTrafficGovernorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_traffic_file = youtube_traffic.TRAFFIC_FILE
+        self._old_circuit_file = youtube_traffic.CIRCUIT_FILE
+        youtube_traffic._reset_for_tests(
+            Path(self._tmp.name) / "traffic.jsonl",
+            Path(self._tmp.name) / "rate_limit.json",
+        )
+
+    def tearDown(self) -> None:
+        youtube_traffic._reset_for_tests(
+            self._old_traffic_file, self._old_circuit_file)
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _cfg(**updates):
+        cfg = {
+            "youtube_traffic_mode": "custom",
+            "youtube_traffic_custom_daily": 10,
+            "youtube_traffic_custom_hourly": 2,
+            "youtube_traffic_custom_min_gap": 0,
+            "youtube_traffic_custom_max_gap": 0,
+            "autorun_interval": -1,
+            "channels": [
+                {"name": f"Channel {i}", "url": f"https://example/{i}",
+                 "mode": "full", "init_complete": True}
+                for i in range(4)
+            ],
+        }
+        cfg.update(updates)
+        return cfg
+
+    def test_reservation_charges_daily_but_launches_charge_hourly(self) -> None:
+        cfg = self._cfg()
+        with mock.patch.object(youtube_traffic, "load_config",
+                               return_value=cfg), \
+                mock.patch.object(youtube_traffic.time, "time",
+                                  return_value=1000.0):
+            reservation = youtube_traffic.reserve_sweep(cfg)
+            self.assertTrue(reservation["ok"])
+            with youtube_traffic.reservation_scope(
+                    reservation["reservation_id"]):
+                launch = youtube_traffic.acquire("channel_sync")
+            self.assertTrue(launch["reserved"])
+            before_refund = youtube_traffic.status(cfg)
+            youtube_traffic.finish_reservation(
+                reservation["reservation_id"])
+            after_refund = youtube_traffic.status(cfg)
+
+        self.assertEqual(before_refund["daily_used"], 5)
+        self.assertEqual(before_refund["hourly_used"], 1)
+        self.assertEqual(after_refund["daily_used"], 1)
+        self.assertEqual(after_refund["hourly_used"], 1)
+
+    def test_sweep_can_exceed_hourly_limit_and_still_reserve(self) -> None:
+        cfg = self._cfg(youtube_traffic_custom_hourly=2)
+        with mock.patch.object(youtube_traffic.time, "time",
+                               return_value=1000.0):
+            check = youtube_traffic.sweep_eligibility(cfg)
+            reservation = youtube_traffic.reserve_sweep(cfg)
+
+        self.assertEqual(check["requested"], 5)
+        self.assertTrue(check["allowed"])
+        self.assertTrue(reservation["ok"])
+
+    def test_rate_limit_circuit_escalates_and_deduplicates(self) -> None:
+        first = youtube_traffic.record_rate_limit(now=1000.0)
+        duplicate = youtube_traffic.record_rate_limit(now=1100.0)
+        second = youtube_traffic.record_rate_limit(
+            now=first["cooldown_until"] + 1)
+        third = youtube_traffic.record_rate_limit(
+            now=second["cooldown_until"] + 1)
+
+        self.assertEqual(first["cooldown_hours"], 6)
+        self.assertEqual(duplicate["cooldown_until"], first["cooldown_until"])
+        self.assertEqual(second["cooldown_hours"], 24)
+        self.assertEqual(third["cooldown_hours"], 72)
+
+    def test_projection_recommends_from_channel_count(self) -> None:
+        cfg = self._cfg(
+            youtube_traffic_custom_daily=20,
+            channels=self._cfg()["channels"] * 3,
+        )
+        projected = youtube_traffic.projection(cfg)
+
+        self.assertEqual(projected["sweep"]["channels"], 12)
+        self.assertIn("recommend auto-sync", projected["recommendation"])
+        self.assertGreater(projected["recommended_hours"], 0)
+
+
 class AutorunTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._traffic_tmp = tempfile.TemporaryDirectory()
+        self._old_circuit_file = youtube_traffic.CIRCUIT_FILE
+        youtube_traffic.CIRCUIT_FILE = (
+            Path(self._traffic_tmp.name) / "rate_limit.json")
+
+    def tearDown(self) -> None:
+        youtube_traffic.CIRCUIT_FILE = self._old_circuit_file
+        self._traffic_tmp.cleanup()
+
     @staticmethod
     def _tx(cfg):
         class Tx:
@@ -4015,6 +4186,249 @@ class AutorunTests(unittest.TestCase):
         self.assertTrue(result["persisted"])
         self.assertEqual(cfg["autorun_interval"], 15)
 
+    def test_budget_mode_is_disabled_for_unlimited_traffic(self) -> None:
+        scheduler = autorun_backend.AutorunScheduler(
+            lambda: {"started": True})
+        with mock.patch.object(
+                autorun_backend.youtube_traffic, "effective_settings",
+                return_value={"daily": 0}), \
+                mock.patch.object(autorun_backend, "config_is_writable",
+                                  return_value=False):
+            result = scheduler.set_interval_mins(-1)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["adjusted"])
+        self.assertEqual(scheduler.get_state()["label"], "Off")
+
+    def test_fresh_scheduler_defaults_to_clock_aligned_mode(self) -> None:
+        with mock.patch.object(autorun_backend, "load_config",
+                               return_value={}):
+            scheduler = autorun_backend.AutorunScheduler(
+                lambda: {"started": True})
+
+        self.assertEqual(scheduler.get_state()["mode"], "clock")
+
+    def test_clock_anchor_supports_daily_and_am_pm_pair_times(self) -> None:
+        cfg = {
+            "autorun_mode": "clock",
+            "autorun_clock_time_12": 60,
+            "autorun_clock_time_24": 20 * 60,
+        }
+        with mock.patch.object(autorun_backend, "load_config",
+                               return_value=cfg):
+            scheduler = autorun_backend.AutorunScheduler(
+                lambda: {"started": True})
+
+        evening = datetime(2026, 7, 28, 18, 45).timestamp()
+        scheduler._interval_mins = 1440
+        self.assertEqual(
+            scheduler._next_clock_aligned(evening, 1440),
+            datetime(2026, 7, 28, 20, 0).timestamp(),
+        )
+
+        morning = datetime(2026, 7, 28, 10, 0).timestamp()
+        scheduler._interval_mins = 720
+        self.assertEqual(
+            scheduler._next_clock_aligned(morning, 720),
+            datetime(2026, 7, 28, 13, 0).timestamp(),
+        )
+
+    def test_setting_clock_anchor_persists_and_reschedules(self) -> None:
+        cfg = {"autorun_mode": "clock"}
+        now = datetime(2026, 7, 28, 18, 45).timestamp()
+        with mock.patch.object(autorun_backend, "load_config",
+                               return_value=cfg), \
+                mock.patch.object(autorun_backend, "config_is_writable",
+                                  return_value=True), \
+                mock.patch.object(autorun_backend, "config_transaction",
+                                  return_value=self._tx(cfg)), \
+                mock.patch.object(autorun_backend.time, "time",
+                                  return_value=now), \
+                mock.patch.object(autorun_backend.threading, "Timer"):
+            scheduler = autorun_backend.AutorunScheduler(
+                lambda: {"started": True})
+            scheduler._interval_mins = 1440
+            result = scheduler.set_clock_anchor(20 * 60)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(cfg["autorun_clock_time_24"], 20 * 60)
+        self.assertEqual(
+            result["next_fire_ts"],
+            datetime(2026, 7, 28, 20, 0).timestamp(),
+        )
+        self.assertEqual(
+            scheduler.get_state()["clock_anchor_minutes"], 20 * 60)
+
+    def test_timer_mode_restores_future_deadline_after_restart(self) -> None:
+        cfg = {
+            "autorun_mode": "timer",
+            "autorun_interval": 1440,
+            "autorun_next_fire_ts": 2000.0,
+            "autorun_next_fire_interval": 1440,
+        }
+        with mock.patch.object(autorun_backend, "load_config",
+                               return_value=cfg), \
+                mock.patch.object(autorun_backend.time, "time",
+                                  return_value=1000.0), \
+                mock.patch.object(autorun_backend, "config_is_writable",
+                                  return_value=False), \
+                mock.patch.object(
+                    autorun_backend.threading, "Timer") as timer:
+            scheduler = autorun_backend.AutorunScheduler(
+                lambda: {"started": True},
+                startup_grace_seconds=180,
+                startup_required_signals=("checks", "indexing"),
+            )
+            result = scheduler.restore_interval_mins(1440)
+
+        timer.assert_called_once_with(1000, scheduler._fire)
+        timer.return_value.start.assert_called_once_with()
+        self.assertEqual(result["restored_deadline"], 2000.0)
+        self.assertFalse(result["overdue"])
+        self.assertEqual(scheduler.get_state()["next_fire_ts"], 2000.0)
+
+    def test_overdue_saved_timer_waits_for_startup_then_three_minutes(
+            self) -> None:
+        cfg = {
+            "autorun_mode": "timer",
+            "autorun_interval": 1440,
+            "autorun_next_fire_ts": 900.0,
+            "autorun_next_fire_interval": 1440,
+        }
+        stream = mock.Mock()
+        with mock.patch.object(autorun_backend, "load_config",
+                               return_value=cfg), \
+                mock.patch.object(autorun_backend.time, "time",
+                                  return_value=1000.0), \
+                mock.patch.object(autorun_backend, "config_is_writable",
+                                  return_value=False), \
+                mock.patch.object(
+                    autorun_backend.threading, "Timer") as timer:
+            scheduler = autorun_backend.AutorunScheduler(
+                lambda: {"started": True},
+                stream=stream,
+                startup_grace_seconds=180,
+                startup_required_signals=("checks", "indexing"),
+            )
+            restored = scheduler.restore_interval_mins(1440)
+            first = scheduler.notify_startup_ready("checks")
+            ready = scheduler.notify_startup_ready("indexing")
+
+        self.assertTrue(restored["overdue"])
+        self.assertEqual(first["waiting_for"], ["indexing"])
+        timer.assert_called_once_with(180, scheduler._fire)
+        self.assertTrue(ready["startup_grace_active"])
+        self.assertEqual(ready["next_fire_ts"], 1180.0)
+        stream.emit_text.assert_called_once_with(
+            "\u2014 Auto-sync: saved timer elapsed while the app was "
+            "closed \u2014 Sync Subbed scheduled in 3 minutes.",
+            "simpleline_blue",
+        )
+
+    def test_budget_mode_waits_for_all_startup_signals_then_grace(self) -> None:
+        stream = mock.Mock()
+        scheduler = autorun_backend.AutorunScheduler(
+            lambda: {"started": True},
+            stream=stream,
+            sync_busy_fn=lambda: False,
+            startup_grace_seconds=180,
+            startup_required_signals=("checks", "indexing"),
+        )
+        eligibility = {
+            "settings": {"daily": 750},
+            "estimate": {"channels": 111},
+            "impossible": False,
+            "requested": 193,
+            "next_ts": 1000.0,
+        }
+
+        with mock.patch.object(
+                autorun_backend.youtube_traffic, "effective_settings",
+                return_value={"daily": 750}), \
+                mock.patch.object(
+                    autorun_backend.youtube_traffic, "sweep_eligibility",
+                    return_value=eligibility), \
+                mock.patch.object(autorun_backend, "config_is_writable",
+                                  return_value=False), \
+                mock.patch.object(autorun_backend.time, "time",
+                                  return_value=1000.0), \
+                mock.patch.object(
+                    autorun_backend.threading, "Timer") as timer:
+            scheduler.set_interval_mins(-1)
+            waiting = scheduler.get_state()
+            checks_done = scheduler.notify_startup_ready("checks")
+            duplicate = scheduler.notify_startup_ready("checks")
+            ready = scheduler.notify_startup_ready("indexing")
+
+        self.assertTrue(waiting["startup_waiting"])
+        self.assertIsNone(waiting["next_fire_ts"])
+        self.assertEqual(checks_done["waiting_for"], ["indexing"])
+        self.assertEqual(duplicate["waiting_for"], ["indexing"])
+        timer.assert_called_once_with(180, scheduler._fire)
+        timer.return_value.start.assert_called_once_with()
+        self.assertTrue(ready["armed"])
+        self.assertTrue(ready["startup_grace_active"])
+        self.assertEqual(ready["next_fire_ts"], 1180.0)
+        stream.emit_text.assert_called_once_with(
+            "\u2014 Auto-sync: startup complete; budget available \u2014 "
+            "Sync Subbed scheduled in 3 minutes.",
+            "simpleline_blue",
+        )
+
+    def test_budget_fire_retries_in_one_minute_when_app_is_busy(self) -> None:
+        stream = mock.Mock()
+        trigger = mock.Mock(return_value={"started": True})
+        scheduler = autorun_backend.AutorunScheduler(
+            trigger,
+            stream=stream,
+            sync_busy_fn=lambda: "an archive rescan",
+        )
+        scheduler._interval_mins = -1
+
+        with mock.patch.object(
+                scheduler, "_schedule_next_locked") as schedule:
+            scheduler._fire()
+
+        trigger.assert_not_called()
+        schedule.assert_called_once_with(
+            sec=autorun_backend.BUDGET_BUSY_RETRY_SECONDS)
+        stream.emit_text.assert_called_once_with(
+            "\u2014 Auto-sync: an archive rescan is running \u2014 "
+            "postponing budget sync; retrying in 1 minute.",
+            "simpleline_dim",
+        )
+
+    def test_budget_sync_completion_does_not_bypass_startup_gate(self) -> None:
+        scheduler = autorun_backend.AutorunScheduler(
+            lambda: {"started": True},
+            startup_grace_seconds=180,
+            startup_required_signals=("checks", "indexing"),
+        )
+        scheduler._interval_mins = -1
+        scheduler._waiting_for_sync_done = True
+
+        with mock.patch.object(
+                scheduler, "_schedule_next_locked") as schedule:
+            scheduler.notify_sync_done()
+
+        schedule.assert_not_called()
+        state = scheduler.get_state()
+        self.assertTrue(state["startup_waiting"])
+        self.assertFalse(state["waiting_for_sync"])
+
+    def test_budget_fire_passes_sweep_reservation_to_trigger(self) -> None:
+        trigger = mock.Mock(return_value={"started": True})
+        scheduler = autorun_backend.AutorunScheduler(
+            trigger, sync_busy_fn=lambda: False)
+        scheduler._interval_mins = -1
+        with mock.patch.object(
+                autorun_backend.youtube_traffic, "reserve_sweep",
+                return_value={"ok": True, "reservation_id": "sweep-1"}):
+            scheduler._fire()
+
+        trigger.assert_called_once_with("sweep-1")
+        self.assertTrue(scheduler.get_state()["waiting_for_sync"])
+
     def test_set_mode_reports_unpersisted_on_transaction_failure(self) -> None:
         scheduler = autorun_backend.AutorunScheduler(lambda: {"started": True})
 
@@ -4026,6 +4440,33 @@ class AutorunTests(unittest.TestCase):
 
         self.assertFalse(result["persisted"])
         self.assertEqual(result["mode"], "clock")
+
+    def test_rate_limit_retry_uses_full_interval_with_six_hour_floor(
+            self) -> None:
+        scheduler = autorun_backend.AutorunScheduler(
+            lambda: {"started": True})
+        scheduler._interval_mins = 30
+
+        with mock.patch.object(scheduler, "_cancel_timer_locked"), \
+                mock.patch.object(scheduler,
+                                  "_schedule_next_locked") as schedule:
+            delay = scheduler.defer_after_rate_limit()
+
+        self.assertEqual(
+            delay, autorun_backend.RATE_LIMIT_MIN_RETRY_SECONDS)
+        schedule.assert_called_once_with(
+            sec=autorun_backend.RATE_LIMIT_MIN_RETRY_SECONDS)
+
+        scheduler._interval_mins = 120
+        with mock.patch.object(scheduler, "_cancel_timer_locked"), \
+                mock.patch.object(scheduler,
+                                  "_schedule_next_locked") as schedule:
+            delay = scheduler.defer_after_rate_limit()
+
+        self.assertEqual(
+            delay, autorun_backend.RATE_LIMIT_MIN_RETRY_SECONDS)
+        schedule.assert_called_once_with(
+            sec=autorun_backend.RATE_LIMIT_MIN_RETRY_SECONDS)
 
     def test_append_history_writes_jsonl_and_seeds_old_config(self) -> None:
         cfg = {"autorun_history": ["old"]}
@@ -5734,8 +6175,16 @@ class MediaOpsMixinTests(unittest.TestCase):
 
 
 class SyncCoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._traffic_tmp = tempfile.TemporaryDirectory()
+        self._old_circuit_file = youtube_traffic.CIRCUIT_FILE
+        youtube_traffic.CIRCUIT_FILE = (
+            Path(self._traffic_tmp.name) / "rate_limit.json")
+
     def tearDown(self) -> None:
         sync_core._LAST_429_BACKOFF_TS = 0.0
+        youtube_traffic.CIRCUIT_FILE = self._old_circuit_file
+        self._traffic_tmp.cleanup()
 
     def test_sync_channel_preflight_does_not_create_channel_folder_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -5883,6 +6332,83 @@ class SyncCoreTests(unittest.TestCase):
                 payload["sync"][0]["name"], "Download New Channel")
             self.assertEqual(payload["sync"][0]["status"], "queued")
         finally:
+            q.mark_orphan()
+
+    def test_autosync_rate_limit_clears_queue_without_waiting_for_resume(
+            self) -> None:
+        sync_all_module = __import__(
+            "backend.sync.sync_all", fromlist=["sync_all"])
+        q = queues.QueueState()
+        first = {
+            "name": "First Channel",
+            "url": "https://www.youtube.com/@first",
+        }
+        second = {
+            "name": "Second Channel",
+            "url": "https://www.youtube.com/@second",
+        }
+        pause = threading.Event()
+        cancel = threading.Event()
+        stream = mock.Mock()
+        calls = {"count": 0}
+
+        def fake_sync_channel(ch, *args, **kwargs):
+            calls["count"] += 1
+            q.set_current_sync(ch)
+            youtube_session.handle_youtube_failure_text(
+                "The current session has been rate-limited by YouTube "
+                "for up to an hour.",
+                context=f"downloading {ch['name']}",
+                stream=stream,
+                pause_event=pause,
+                queues=q,
+            )
+            return sync_core.SyncResult(ok=False, downloaded=0, errors=1)
+
+        try:
+            youtube_session.configure(stream, pause, q)
+            youtube_session.begin_sync_scope(
+                background=True, cancel_event=cancel)
+            with mock.patch.object(q, "save_debounced",
+                                   return_value=None), \
+                    mock.patch.object(sync_all_module, "load_config",
+                                      return_value={
+                                          "channels": [first, second]}), \
+                    mock.patch.object(sync_all_module, "ARCHIVE_FILE",
+                                      "__missing_archive__.txt"), \
+                    mock.patch.object(sync_all_module,
+                                      "clear_sync_progress"), \
+                    mock.patch.object(sync_all_module, "sync_channel",
+                                      side_effect=fake_sync_channel), \
+                    mock.patch.object(sync_all_module,
+                                      "_should_batch_limit",
+                                      return_value=False), \
+                    mock.patch("backend.pause_helpers.wait_for_resume") as wait:
+                self.assertTrue(q.sync_enqueue(first))
+                self.assertTrue(q.sync_enqueue(second))
+
+                result = sync_all_module.sync_all(
+                    stream,
+                    cancel_event=cancel,
+                    queues=q,
+                    pause_event=pause,
+                    add_downloads_from_config=False,
+                    autosync=True,
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["rate_limited"])
+            self.assertEqual(result["reason"], "youtube_rate_limit")
+            self.assertEqual(calls["count"], 1)
+            self.assertEqual(q.sync_snapshot(), [])
+            self.assertIsNone(q.current_sync)
+            self.assertFalse(q.sync_paused)
+            self.assertFalse(pause.is_set())
+            self.assertFalse(cancel.is_set())
+            wait.assert_not_called()
+            stream.emit_error.assert_not_called()
+        finally:
+            youtube_session.end_sync_scope()
             q.mark_orphan()
 
     def test_channel_folder_has_media_probe(self) -> None:

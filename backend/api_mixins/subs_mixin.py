@@ -21,6 +21,7 @@ from backend.ytarchiver_config import channels_for_subs_ui, config_is_writable, 
 from backend import archive_scan
 from backend import subs as subs_backend
 from backend import sync as sync_backend
+from backend import youtube_traffic
 from backend.queues import QueueState
 
 _SUBS_PROBE_TIMEOUT_SEC = 15
@@ -184,6 +185,12 @@ class SubsMixin:
                     *sync_backend._find_cookie_source(),
                     "--playlist-end", "1", url,
                 ]
+                permission = youtube_traffic.acquire(
+                    "channel_preview")
+                if not permission.get("ok"):
+                    raise RuntimeError(
+                        permission.get("error")
+                        or "YouTube traffic governor cancelled")
                 r = _sp.run(cmd, capture_output=True, text=True,
                             timeout=_SUBS_PROBE_TIMEOUT_SEC,
                             startupinfo=sync_backend._startupinfo,
@@ -545,6 +552,13 @@ class SubsMixin:
         try:
             cookies = sync_backend._find_cookie_source()
             # Get channel name (from first video)
+            permission = youtube_traffic.acquire("channel_url_test")
+            if not permission.get("ok"):
+                return {
+                    "ok": False,
+                    "error": permission.get("error")
+                    or "YouTube traffic governor cancelled",
+                }
             r1 = _sp.run([yt, "--flat-playlist", "--playlist-end", "1",
                          "--print", "channel", "--no-warnings", "--quiet",
                          *cookies, normalized],
@@ -553,6 +567,13 @@ class SubsMixin:
                         startupinfo=sync_backend._startupinfo)
             name = (r1.stdout or "").strip().split("\n")[0] or ""
             # Get total count (best-effort)
+            permission = youtube_traffic.acquire("channel_url_test")
+            if not permission.get("ok"):
+                return {
+                    "ok": False,
+                    "error": permission.get("error")
+                    or "YouTube traffic governor cancelled",
+                }
             r2 = _sp.run([yt, "--flat-playlist", "--print", "%(playlist_count)s",
                          "--playlist-end", "1", "--no-warnings", "--quiet",
                          *cookies, normalized],

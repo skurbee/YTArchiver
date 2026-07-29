@@ -25,6 +25,8 @@
   function initAutorun() {
     const sel = document.getElementById("auto-sync-select");
     const cd = document.getElementById("autorun-countdown");
+    const clockWrap = document.getElementById("autorun-clock-time-wrap");
+    const clockSel = document.getElementById("auto-sync-clock-time");
     if (!sel) return;
     // Enhance the native <select> into the custom yt-dd widget. Styled
     // native selects in pywebview/Chromium don't repaint their closed
@@ -35,6 +37,42 @@
     // this one (in the download controls row) was missed. Enhance it here
     // and repaint after fetchAnchor sets the value below.
     try { window.enhanceSelect?.(sel); } catch (e) { /* non-fatal */ }
+    let _clockInterval = 0;
+    const _clockLabel = (minutes, interval) => {
+      const one = (value) => {
+        const h24 = Math.floor(value / 60);
+        const min = value % 60;
+        const ap = h24 >= 12 ? "PM" : "AM";
+        let hour = h24 % 12;
+        if (hour === 0) hour = 12;
+        return `${hour}:${String(min).padStart(2, "0")} ${ap}`;
+      };
+      if (interval === 720) {
+        return `${one(minutes)} / ${one(minutes + 720)}`;
+      }
+      return one(minutes);
+    };
+    const _syncClockControl = (st) => {
+      if (!clockWrap || !clockSel) return;
+      const interval = Number(st?.mins || 0);
+      const available = !!st?.clock_time_available
+        && (interval === 720 || interval === 1440);
+      clockWrap.hidden = !available;
+      if (!available) return;
+      if (_clockInterval !== interval) {
+        clockSel.innerHTML = "";
+        for (let minutes = 0; minutes < interval; minutes += 30) {
+          const option = document.createElement("option");
+          option.value = String(minutes);
+          option.textContent = _clockLabel(minutes, interval);
+          clockSel.appendChild(option);
+        }
+        _clockInterval = interval;
+        try { window.enhanceSelect?.(clockSel); } catch (e) { /* non-fatal */ }
+      }
+      clockSel.value = String(Number(st.clock_anchor_minutes || 0));
+      try { clockSel._ytddRepaint?.(); } catch (e) { /* non-fatal */ }
+    };
     // When Auto-sync is enabled, the Sync Tasks "Auto" checkbox MUST stay
     // checked — otherwise the timer fires, items get queued, and nothing
     // runs them (reported quirk). Lock the checkbox on (and reflect the
@@ -89,9 +127,17 @@
           seconds_remaining: st.seconds_remaining,
           mode: st.mode || "timer",
           next_fire_ts: st.next_fire_ts || null,
+          budget_mode: !!st.budget_mode,
+          budget_impossible: !!st.budget_impossible,
+          budget_message: st.budget_message || "",
+          startup_waiting: !!st.startup_waiting,
+          startup_grace_active: !!st.startup_grace_active,
+          clock_time_available: !!st.clock_time_available,
+          clock_anchor_minutes: Number(st.clock_anchor_minutes || 0),
           anchored_at_ms: Date.now(),
         };
         if (sel.value !== st.label) sel.value = st.label;
+        _syncClockControl(st);
         // Force the yt-dd trigger label to match the just-set value —
         // programmatic `.value` changes don't emit `change`, so the
         // widget's own listener never fires and the label would stay
@@ -113,9 +159,35 @@
     const paint = () => {
       if (!cd || !_anchor) { if (cd) cd.textContent = ""; return; }
       const st = _anchor;
-      if (st.mins > 0 && st.waiting_for_sync) {
+      const enabled = st.mins !== 0;
+      if (enabled && st.waiting_for_sync) {
         cd.textContent = "waiting for queue\u2026";
-      } else if (st.mins > 0 && st.mode === "clock" && st.next_fire_ts) {
+      } else if (st.startup_waiting) {
+        cd.textContent = "waiting for startup to finish\u2026";
+      } else if (st.budget_mode && st.budget_impossible) {
+        cd.textContent = st.budget_message || "complete sweep exceeds budget";
+      } else if (st.startup_grace_active && st.next_fire_ts) {
+        const sec = Math.max(0, Math.floor(st.next_fire_ts - Date.now() / 1000));
+        const reason = st.budget_mode ? "budget available" : "overdue timer";
+        cd.textContent = sec > 0
+          ? `${reason} \u00b7 starts in ${_fmtRemain(sec)}`
+          : `${reason} \u00b7 starting\u2026`;
+        if (sec === 0 && !_fetchInFlight) {
+          _fetchInFlight = true;
+          fetchAnchor().finally(() => { _fetchInFlight = false; });
+        }
+      } else if (st.budget_mode && st.next_fire_ts) {
+        const sec = Math.max(0, Math.floor(st.next_fire_ts - Date.now() / 1000));
+        cd.textContent = sec > 0
+          ? `budget available in ${_fmtRemain(sec)}`
+          : "budget available — starting…";
+        if (sec === 0 && !_fetchInFlight) {
+          _fetchInFlight = true;
+          fetchAnchor().finally(() => { _fetchInFlight = false; });
+        }
+      } else if (st.budget_mode) {
+        cd.textContent = "waiting for a complete sweep budget";
+      } else if (enabled && st.mode === "clock" && st.next_fire_ts) {
         // Clock-aligned mode: keep the absolute fire time, but include
         // a live relative suffix so the label does not look frozen.
         const sec = Math.max(0, Math.floor(st.next_fire_ts - Date.now() / 1000));
@@ -126,7 +198,7 @@
           _fetchInFlight = true;
           fetchAnchor().finally(() => { _fetchInFlight = false; });
         }
-      } else if (st.mins > 0 && st.seconds_remaining != null) {
+      } else if (enabled && st.seconds_remaining != null) {
         const elapsed = Math.floor((Date.now() - st.anchored_at_ms) / 1000);
         const sec = Math.max(0, st.seconds_remaining - elapsed);
         cd.textContent = `next in ${_fmtRemain(sec)}`;
@@ -148,12 +220,39 @@
       if (!nativeBridgeUp()) return;
       _selChangeInFlight = true;
       try {
-        await bridgeCall("autorun_set", sel.value);
-        window._showToast?.(sel.value === "Off" ? "Auto-sync off." : `Auto-sync every ${sel.value}.`, "ok");
+        const result = await bridgeCall("autorun_set", sel.value);
+        if (result?.ok === false) {
+          window._showToast?.(result.error || "Could not change auto-sync.", "warn");
+        } else {
+          const msg = sel.value === "Off" ? "Auto-sync off."
+            : sel.value === "When budget allows"
+              ? "Auto-sync will run when a complete sweep fits the traffic budget."
+              : `Auto-sync every ${sel.value}.`;
+          window._showToast?.(msg, "ok");
+        }
         await fetchAnchor();
         paint();
       } catch (e) { window._showToast?.("Error: " + e, "error"); }
       finally { _selChangeInFlight = false; }
+    });
+    clockSel?.addEventListener("change", async () => {
+      if (!nativeBridgeUp()) return;
+      try {
+        const result = await bridgeCall(
+          "autorun_set_clock_time", Number(clockSel.value));
+        if (result?.ok === false) {
+          window._showToast?.(
+            result.error || "Could not save auto-sync time.", "warn");
+        } else {
+          window._showToast?.(
+            `Auto-sync time set to ${clockSel.options[clockSel.selectedIndex]?.text || ""}.`,
+            "ok");
+        }
+        await fetchAnchor();
+        paint();
+      } catch (e) {
+        window._showToast?.("Error: " + e, "error");
+      }
     });
     // Initial load. initAutorun runs at DOMContentLoaded, which can be
     // BEFORE pywebview injects window.pywebview.api — in that case
@@ -188,6 +287,9 @@
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") fetchAnchor().then(paint);
     });
+    window.addEventListener("autorun-state-changed", () => {
+      fetchAnchor().then(paint);
+    });
   }
 
   function _fmtRemain(sec) {
@@ -207,4 +309,20 @@
   }
 
   window.initAutorun = initAutorun;
+  window._setBudgetAutosyncAvailable = function (available) {
+    const sel = document.getElementById("auto-sync-select");
+    if (!sel) return;
+    const option = Array.from(sel.options)
+      .find((opt) => opt.value === "When budget allows");
+    if (!option) return;
+    option.hidden = !available;
+    option.disabled = !available;
+    if (!available && sel.value === "When budget allows") {
+      sel.value = "Off";
+      sel._ytddRepaint?.();
+      if (nativeBridgeUp()) {
+        bridgeCall("autorun_set", "Off").catch(() => {});
+      }
+    }
+  };
 })();

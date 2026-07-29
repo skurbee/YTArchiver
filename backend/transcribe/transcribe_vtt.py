@@ -33,6 +33,7 @@ import time
 from ..log import get_logger
 from ..log_stream import LogStreamer
 from ..subprocess_util import make_startupinfo as _make_startupinfo
+from .. import youtube_traffic
 from .paths import (
     _generate_distributed_words,
     _hide_per_video_transcript_txt_if_needed,
@@ -152,6 +153,13 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
             except Exception:
                 cmd += ["--cookies-from-browser", "firefox"]
         cmd.append(video_url)
+        permission = youtube_traffic.acquire(
+            "caption_fetch", stream=stream)
+        if not permission.get("ok"):
+            stream.emit_dim(
+                " Auto-caption fetch deferred by YouTube traffic safety: "
+                + str(permission.get("error") or "unavailable"))
+            return False
         try:
             # Capture stderr instead of /dev/nulling it so yt-dlp's
             # explanation for a failed caption fetch (cookies expired,

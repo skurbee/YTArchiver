@@ -10,16 +10,17 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 import threading
 import time
 
-from ._shared import _api_err, _log
-from backend.log import swallow
-from backend.ytarchiver_config import ARCHIVE_FILE, load_config
 from backend import subs as subs_backend
 from backend import sync as sync_backend
-from backend.queues import QueueState
+from backend import youtube_session
+from backend import youtube_traffic
+from backend.log import swallow
+from backend.ytarchiver_config import ARCHIVE_FILE, load_config
+
+from ._shared import _api_err, _log
 
 
 class SyncMixin:
@@ -66,7 +67,8 @@ class SyncMixin:
             return False
 
 
-    def sync_start_all(self, add_downloads_from_config=True):
+    def sync_start_all(self, add_downloads_from_config=True, scheduled=False,
+                       traffic_reservation_id=None):
         """Kick off the sync worker thread.
 
         `add_downloads_from_config=True` (default, for Sync Subbed):
@@ -102,13 +104,17 @@ class SyncMixin:
                         "error": "Folder reorganization is running. Wait for it to finish before syncing."}
             if not sync_backend.find_yt_dlp():
                 return {"ok": False, "error": "yt-dlp not found. Install yt-dlp or place yt-dlp.exe next to the app."}
-            return self._sync_start_all_inner(add_downloads_from_config)
+            return self._sync_start_all_inner(
+                add_downloads_from_config, scheduled=scheduled,
+                traffic_reservation_id=traffic_reservation_id)
         finally:
             try: self._sync_start_lock.release()
             except Exception: pass
 
 
-    def _sync_start_all_inner(self, add_downloads_from_config=True):
+    def _sync_start_all_inner(self, add_downloads_from_config=True,
+                              scheduled=False,
+                              traffic_reservation_id=None):
         """Inner body of sync_start_all. Caller must hold
         _sync_start_lock. Encapsulates the original logic so the
         atomic check-and-spawn wrapper stays small.
@@ -194,17 +200,30 @@ class SyncMixin:
         except Exception as e:
             _log.debug("swallowed: %s", e)
         def _run():
+            sync_result = {}
             try:
-                sync_backend.sync_all(self._log_stream, self._sync_cancel,
-                                      queues=self._queues,
-                                      transcribe_mgr=self._transcribe,
-                                      pause_event=self._sync_pause,
-                                      skip_event=self._sync_skip,
-                                      add_downloads_from_config=bool(
-                                          add_downloads_from_config))
+                youtube_session.begin_sync_scope(
+                    background=bool(scheduled),
+                    cancel_event=self._sync_cancel,
+                )
+                with youtube_traffic.reservation_scope(
+                        traffic_reservation_id):
+                    sync_result = sync_backend.sync_all(
+                        self._log_stream, self._sync_cancel,
+                        queues=self._queues,
+                        transcribe_mgr=self._transcribe,
+                        pause_event=self._sync_pause,
+                        skip_event=self._sync_skip,
+                        add_downloads_from_config=bool(
+                            add_downloads_from_config),
+                        autosync=bool(scheduled),
+                    )
             except Exception as e:
                 self._log_stream.emit_error(f"Sync crashed: {e}")
             finally:
+                youtube_session.end_sync_scope()
+                youtube_traffic.finish_reservation(
+                    traffic_reservation_id)
                 # Stop the tray spin + restore idle tooltip.
                 try:
                     if getattr(self, "_tray", None):
@@ -227,8 +246,37 @@ class SyncMixin:
                 # counting down from a full interval. Matches classic's
                 # `_schedule_autorun(iv)` inside the sync finally
                 # (YTArchiver.py:23380).
-                try: self._autorun.notify_sync_done()
-                except Exception as e: _log.warning("notify_sync_done failed; autorun countdown may not reset: %s", e)
+                rate_limited_run = (
+                    scheduled
+                    and isinstance(sync_result, dict)
+                    and bool(sync_result.get("rate_limited"))
+                )
+                try:
+                    if rate_limited_run:
+                        self._autorun.defer_after_rate_limit()
+                    else:
+                        self._autorun.notify_sync_done()
+                except Exception as e:
+                    _log.warning(
+                        "autorun rearm failed; countdown may not reset: %s", e)
+                if rate_limited_run:
+                    retry_when = "at the next scheduled run"
+                    try:
+                        _state = self._autorun.get_state()
+                        _next_ts = _state.get("next_fire_ts")
+                        if _next_ts:
+                            _clock = time.strftime(
+                                "%I:%M%p", time.localtime(float(_next_ts)))
+                            retry_when = f"at {_clock.lstrip('0').lower()}"
+                        elif _state.get("label") not in (None, "", "Off"):
+                            retry_when = f"in {_state['label']}"
+                    except Exception as e:
+                        _log.debug(
+                            "autosync rate-limit retry label failed: %s", e)
+                    self._log_stream.emit_error(
+                        "Auto-sync ended because YouTube rate-limited the "
+                        "account. The scheduled sync queue was cleared; "
+                        f"auto-sync will try again {retry_when}.")
                 # Refresh the in-memory config snapshot so consumers that
                 # read self._config (Last Full Sync label, channel
                 # listing, etc.) see the new last_sync timestamp + any

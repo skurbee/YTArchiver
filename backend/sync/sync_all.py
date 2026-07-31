@@ -1127,10 +1127,19 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                 _ch_url, _known_for_channel, check_count=5, timeout_sec=30,
                 min_duration=_qc_opts.min_duration,
                 max_duration=_qc_opts.max_duration,
-                cancel_event=cancel_event)
+                cancel_event=cancel_event, pause_event=pause_event,
+                stream=stream)
             if _autosync_rate_limited():
                 _last_live["name"] = ""
                 break
+            # The traffic governor may be parked for most of an hour.  A
+            # Pause request now interrupts that wait; requeue this channel
+            # before entering the normal pause handshake so Resume retries
+            # the same item instead of silently skipping it.
+            if _requeue_paused_task(
+                    ch, ch_name, i, total, reason="quick check",
+                    bracket_tag=_row_bracket):
+                continue
             if _qc.get("filtered_ids"):
                 try:
                     from .. import channel_cache as _cc

@@ -76,6 +76,9 @@
       if (t === "metadata_active") return t;
       if (t === "compress_active") return t;
       if (t === "reorg_active") return t;
+      // One process-wide rolling-budget notice. Re-checks replace this
+      // line instead of accumulating a new "waiting" row every few minutes.
+      if (t === "traffic_wait") return t;
       // Video ID backfill — two progress phases that replace in-
       // place: "Fetched N videos from YouTube catalog..." counter,
       // then the "[N/M] matched K so far..." match-loop counter.
@@ -125,6 +128,15 @@
   // the progress line with its video.
   function _isPinToBottom(segments) {
     if (!Array.isArray(segments)) return false;
+    // Traffic waiting is a global sync state, not a per-video row. Keep its
+    // single in-place notice at the bottom even while the sync thread is
+    // alive so newly completed channel rows never bury it.
+    for (const seg of segments) {
+      if (!Array.isArray(seg) || seg.length < 2) continue;
+      const tag = seg[1];
+      const tags = Array.isArray(tag) ? tag : [tag];
+      if (tags.includes("traffic_wait")) return true;
+    }
     // Sync running → never pin transcribe progress. Keep it inline so
     // it stays with its channel + video context in the log. Read the
     // batch-cached result first (set in _logBatch) to avoid an O(M)

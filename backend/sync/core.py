@@ -1294,11 +1294,19 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 # to cp1252 via `_utils.decode_subprocess_line` below.
                 proc = popen_ytdlp_process(
                     cmd_this, startupinfo=_startupinfo,
-                    cancel_event=cancel_event, stream=stream)
+                    cancel_event=cancel_event, pause_event=pause_event,
+                    stream=stream)
                     # honors in TEXT mode — in binary mode it falls
                     # back to block buffering with a DeprecationWarning,
                 break
             except OSError as e:
+                # A traffic-window wait now cooperates with Pause.  Return
+                # without retry noise; sync_all will requeue this channel
+                # and enter its normal active-pause handshake.
+                if pause_event is not None and pause_event.is_set():
+                    return SyncResult(
+                        ok=False, reason="paused",
+                        downloaded=downloaded, errors=errors)
                 if attempt == 2:
                     stream.emit([["ERROR: ", "red"], [f"Couldn't start the download tool after 3 tries: {e}\n", "red"]])
                     # Main pass failed — can't continue; /streams pass skipped
@@ -2527,7 +2535,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                         stream.emit([
                             [" ⚠ Couldn't reach YouTube (network "
                              "timeout) — will retry on the next "
-                             "sync.\n", "red"],
+                             "sync.\n", ["red", "error_detail"]],
+                            [s, "error_raw"],
                         ])
                 elif "error" in low and low.strip() not in ("error:", "error"):
                     # Any other real ERROR line. Simple mode must ALWAYS be
@@ -2541,9 +2550,17 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                         _reason = _humanize_ytdlp_error(low)
                         _who = (current_title or "").strip()
                         if _who:
-                            stream.emit([[f" ⚠ {_who} — {_reason}\n", "red"]])
+                            stream.emit([
+                                [f" ⚠ {_who} — {_reason}\n",
+                                 ["red", "error_detail"]],
+                                [s, "error_raw"],
+                            ])
                         else:
-                            stream.emit([[f" ⚠ {_reason}\n", "red"]])
+                            stream.emit([
+                                [f" ⚠ {_reason}\n",
+                                 ["red", "error_detail"]],
+                                [s, "error_raw"],
+                            ])
                 # else: bare "ERROR:" header or a WARNING line — suppressed in
                 # Simple mode (raw text stays Verbose-only).
                 if "error" in low:

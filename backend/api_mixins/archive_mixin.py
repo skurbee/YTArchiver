@@ -640,6 +640,7 @@ class ArchiveMixin:
             # on disk invisible to the Browse grid / Recent / Search.
             _dltrack = None
             _stderr_errors = []
+            _raw_errors = []
             _candidate_paths = []
             # Regexes for parsing yt-dlp progress + destination lines.
             _dest_re = _re.compile(r"^\[download\]\s+Destination:\s+(.+)$")
@@ -703,6 +704,7 @@ class ArchiveMixin:
                     # stdout with no actionable info.
                     _ll = _line.lower()
                     if "error" in _ll:
+                        _raw_errors.append(_line)
                         if "members-only" in _ll or "join this channel" in _ll:
                             _stderr_errors.append("members-only content")
                         elif "private video" in _ll:
@@ -926,7 +928,8 @@ class ArchiveMixin:
                     self._log_stream.emit([
                         ["[Dwnld] ", ["red", _marker_tag]],
                         [f"{_state['fname']} \u2014 failed ({_reason}).\n",
-                         ["red", _marker_tag]],
+                         ["red", _marker_tag, "error_detail"]],
+                        ["\n".join(_raw_errors[-20:]), "error_raw"],
                     ])
                     try:
                         if self._window is not None:

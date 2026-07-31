@@ -121,8 +121,13 @@
             title="Errors this session — click for details">
       <span id="gsb-errors-count">0</span> errors
     </button>
-    <button type="button" class="gsb-seg gsb-log-btn" id="gsb-log-btn"
-            title="Open the full activity log">Log</button>
+    <span class="gsb-traffic" id="gsb-traffic" hidden
+          title="YouTube safety limits. If either limit is reached, YTArchiver waits and continues automatically.">
+      <span class="gsb-traffic-label">YT Limits</span>
+      <span id="gsb-traffic-hourly"></span>
+      <span class="gsb-traffic-sep">·</span>
+      <span id="gsb-traffic-daily"></span>
+    </span>
   </div>
 
   <!-- @include partials/popovers.html -->

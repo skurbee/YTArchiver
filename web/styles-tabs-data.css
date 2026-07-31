@@ -707,6 +707,11 @@
   overflow-wrap: anywhere;
   user-select: text;
 }
+.gsb-error-item-text.has-detail {
+  cursor: help;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
 .gsb-errors-popover .queue-popover-footer {
   justify-content: space-between;
 }

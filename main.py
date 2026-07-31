@@ -389,10 +389,12 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             self._log_stream.add_line_scanner(_yt_session.scan_log_line)
         except Exception as e:
             _log.debug("YouTube session guard setup failed: %s", e)
-        # Session download counter → tray badge overlay. Bumps on each
-        # "Downloading <title>" line emitted by sync.py; resets when sync
-        # idles. _tray_set_badge.
+        # Unseen-download counter → tray + taskbar badge overlay. Downloads
+        # completed while the window is focused are already visible to the
+        # user, so only count activity after the app loses focus. Focusing the
+        # app again clears the badge through app_window_focus_changed().
         self._session_dl_count = 0
+        self._window_focused = True
         def _dl_scan(text: str) -> None:
             try:
                 # Match only the exact sync-emitted "Downloading <title>" prefix;
@@ -404,6 +406,8 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     # pre-increment value and emit duplicate badge
                     # counts (audit: main.py H14).
                     with self._session_dl_count_lock:
+                        if self._window_focused:
+                            return
                         self._session_dl_count += 1
                         _badge_val = self._session_dl_count
                     tray = getattr(self, "_tray", None)
@@ -489,6 +493,16 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     _log.debug("swallowed: %s", e)
             threading.Timer(0.5, _emit_restore_notice).start()
         self._queues.add_listener(self._on_queue_changed)
+        # Rolling-budget waits are process-wide state, not QueueState
+        # mutations. Push them through the same UI state channel so the
+        # global Pause button and footer update immediately when a worker
+        # parks for (or leaves) an hourly/24-hour slot.
+        try:
+            from backend import youtube_traffic as _yt_traffic
+            _yt_traffic.add_wait_listener(
+                lambda _state: self._on_queue_changed())
+        except Exception as e:
+            _log.debug("YouTube traffic wait listener setup failed: %s", e)
         # Recent-tab live refresh — every download triggers this via
         # sync._record_recent_download so the Recent grid/list updates
         # without needing an app restart.
@@ -634,11 +648,18 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                                         payload.get('sync_paused')))
             _gpu_pa = bool(payload.get('gpu_paused_active',
                                        payload.get('gpu_paused')))
+            try:
+                from backend import youtube_traffic as _yt_traffic
+                _traffic_wait = _yt_traffic.wait_status()
+            except Exception:
+                _traffic_wait = {"active": False}
             self.services.event_bus.update_queues(payload, {
                 "sync": {
                     "running": sync_running,
                     "paused": bool(payload["sync_paused"]),
                     "pausedActive": _sync_pa,
+                    "trafficWaiting": bool(_traffic_wait.get("active")),
+                    "trafficWait": _traffic_wait,
                 },
                 "gpu": {
                     "running": gpu_running,
@@ -1879,6 +1900,19 @@ def main():
     if tray is not None:
         try:
             tray.start()
+            if os.name == "nt":
+                try:
+                    import ctypes as _tray_ctypes
+                    from ctypes import wintypes as _tray_wintypes
+                    _find_window = _tray_ctypes.windll.user32.FindWindowW
+                    _find_window.argtypes = [
+                        _tray_wintypes.LPCWSTR, _tray_wintypes.LPCWSTR]
+                    _find_window.restype = _tray_wintypes.HWND
+                    _tray_hwnd = _find_window(
+                        None, "YTArchiver")
+                    tray.set_window_handle(_tray_hwnd)
+                except Exception as e:
+                    _log.debug("taskbar overlay HWND setup failed: %s", e)
             api.attach_tray(tray)
         except Exception as e:
             _log.debug("tray start failed (continuing window-only): %s", e)

@@ -352,6 +352,34 @@ class QueueMixin:
         return {"ok": True, "paused": which}
 
 
+    def youtube_traffic_override(self):
+        """Force the current sync past configured rolling traffic ceilings."""
+        try:
+            from backend import youtube_traffic
+            waiting = youtube_traffic.wait_status()
+            if not waiting.get("active"):
+                self._on_queue_changed()
+                return {
+                    "ok": False,
+                    "error": "The sync is no longer waiting for a traffic slot.",
+                }
+            result = youtube_traffic.override_budget_limits()
+            try:
+                self._queue_log_stream().emit([[
+                    "\u25b6 YouTube traffic safety override enabled for this "
+                    "sync pass. Hourly and 24-hour ceilings will be ignored; "
+                    "emergency rate-limit protection remains active.\n",
+                    "simpleline",
+                ]])
+            except Exception as e:
+                _log.debug("traffic override log failed: %s", e)
+            self._on_queue_changed()
+            return result
+        except Exception as e:
+            _log.warning("traffic override failed: %s", e)
+            return {"ok": False, "error": str(e)}
+
+
     def queue_resume(self, which="both"):
         """Resume a paused queue."""
         queues = self._queue_state()

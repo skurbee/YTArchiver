@@ -212,6 +212,8 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
                             min_duration: int = 0,
                             max_duration: int = 0,
                             cancel_event=None,
+                            pause_event=None,
+                            stream=None,
                             ) -> dict[str, Any]:
     """Probe the first N videos of a channel to see if any are NOT in our
     archive already. Short-circuit for channels with nothing new.
@@ -273,13 +275,15 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
         return False
 
     permission = youtube_traffic.acquire(
-        "channel_quick_check", cancel_event=cancel_event)
+        "channel_quick_check", cancel_event=cancel_event,
+        pause_event=pause_event, stream=stream)
     if not permission.get("ok"):
         return {
             "ok": False,
             "has_new": True,
             "error": permission.get("error") or "traffic governor cancelled",
             "cancelled": bool(permission.get("cancelled")),
+            "paused": bool(permission.get("paused")),
         }
     try:
         proc = subprocess.run(

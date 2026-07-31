@@ -41,7 +41,7 @@
     // metadata refresh has to finish its current re-fetch loop before
     // pause takes hold — could be minutes).
     sync: { running: false, paused: false, pausedActive: false, count: 0,
-            pausedAtMs: 0 },
+            pausedAtMs: 0, trafficWaiting: false, trafficWait: null },
     gpu: { running: false, paused: false, pausedActive: false, count: 0,
            pausedAtMs: 0 },
   };
@@ -206,7 +206,7 @@
     const anyAlive = s.running || g.running;
     const pausedWithItems =
       (s.paused && s.count > 0) || (g.paused && g.count > 0);
-    const enable = anyAlive || pausedWithItems;
+    const enable = anyAlive || pausedWithItems || !!s.trafficWaiting;
     const btn = document.getElementById("btn-pause");
     if (btn) {
       btn.disabled = !enable;
@@ -356,6 +356,7 @@
       const gpuPausedWithItems = !g.running && g.paused && g.count > 0;
       const anyPaused = syncActive || gpuActive ||
                         syncPausedWithItems || gpuPausedWithItems;
+      const trafficWaiting = !!s.trafficWaiting;
       // Pause-pending: the user clicked Pause but the worker is still
       // mid-operation (e.g. metadata refresh's long re-fetch loop).
       // Surface a third visual state so the click is acknowledged
@@ -363,7 +364,9 @@
       // Also held for a minimum visible window after the click so a
       // fast pause-handshake doesn't skip the blink entirely.
       const anyPending = _isPipelinePending(s) || _isPipelinePending(g);
-      let visState = anyPaused ? "paused" : "running";
+      let visState = trafficWaiting
+        ? "traffic-wait"
+        : (anyPaused ? "paused" : "running");
       if (anyPending) visState = "pending";
       pauseBtn.dataset.pauseState = visState;
       pauseBtn.classList.toggle("pause-pending", anyPending);
@@ -373,17 +376,19 @@
       // the migration step by setting data-tooltip directly here.
       const _pauseTip = anyPending
         ? "Pause queued — current job will finish first. Click to cancel pause."
-        : (anyPaused
+        : (trafficWaiting
+            ? "Waiting for a YouTube traffic slot — click to override"
+            : anyPaused
             ? "Resume all queues"
             : "Pause all queues (current jobs finish first)");
       pauseBtn.setAttribute("data-tooltip", _pauseTip);
       pauseBtn.removeAttribute("title");
       const svg = pauseBtn.querySelector("svg");
       if (svg) {
-        const want = anyPaused ? "play" : "bars";
+        const want = (anyPaused || trafficWaiting) ? "play" : "bars";
         if (svg.dataset.icon !== want) {
           svg.dataset.icon = want;
-          svg.innerHTML = anyPaused
+          svg.innerHTML = want === "play"
             ? '<path d="M4 3v10l9-5z"/>'
             : '<rect x="4" y="3" width="3" height="10" rx="0.5"/>' +
               '<rect x="9" y="3" width="3" height="10" rx="0.5"/>';

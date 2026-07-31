@@ -420,6 +420,24 @@ body {
   background: var(--c-border);
 }
 .gsb-spacer { flex: 1 1 auto; }
+.gsb-traffic {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 3px;
+  color: var(--c-dim);
+  font-variant-numeric: tabular-nums;
+}
+.gsb-traffic[hidden] { display: none; }
+.gsb-traffic-label {
+  margin-right: 2px;
+  color: var(--c-text-muted);
+  font-weight: 600;
+}
+.gsb-traffic-sep { opacity: 0.55; }
+.gsb-traffic.at-limit { color: var(--c-log-sum); }
+.t-error_raw { display: none !important; }
 /* Index/sweep segment is informational, not clickable. */
 .gsb-index {
   max-width: 32%;
@@ -454,7 +472,6 @@ body {
 .gsb-index:hover { background: transparent; color: var(--c-dim); }
 .gsb-errors { color: var(--c-log-red); }
 .gsb-errors:hover { background: var(--c-cancel); color: #fff; }
-.gsb-log-btn { color: var(--c-dim); }
 
 /* Clickable Total: X TB label in Subs header */
 .status-text.clickable-total {

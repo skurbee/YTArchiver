@@ -52,6 +52,35 @@ class WindowMixin:
         return queues if queues is not None else self._queues
 
 
+    def app_window_focus_changed(self, focused=True):
+        """Track whether downloads should count as unseen.
+
+        The frontend reports native WebView focus/blur. Returning focus clears
+        both notification-area and taskbar badges; losing focus merely arms
+        the counter for subsequent downloads.
+        """
+        is_focused = bool(focused)
+        try:
+            lock = getattr(self, "_session_dl_count_lock", None)
+            if lock is None:
+                self._window_focused = is_focused
+                if is_focused:
+                    self._session_dl_count = 0
+            else:
+                with lock:
+                    self._window_focused = is_focused
+                    if is_focused:
+                        self._session_dl_count = 0
+            if is_focused:
+                tray = getattr(self, "_tray", None)
+                if tray is not None:
+                    tray.set_badge(0)
+            return {"ok": True, "focused": is_focused}
+        except Exception as e:
+            _log.debug("window focus badge reset failed: %s", e)
+            return {"ok": False, "error": str(e)}
+
+
     def confirm_close(self, choice, remember=False):
         """Frontend hook for the close-to-tray dialog. `choice` is
         either "quit" (destroy window + run shutdown) or "tray" (hide).

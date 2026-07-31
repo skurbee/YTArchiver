@@ -168,6 +168,9 @@ class SyncMixin:
         # the "\u23F8 Sync paused at ..." wait loop with no way
         # to resume via the UI because the dialog-Pause button
         # is meant for mid-pass pausing, not from a cold start.
+        # Overrides are scoped to one sync pass. A fresh pass always starts
+        # with the configured rolling ceilings armed.
+        youtube_traffic.clear_budget_override()
         self._sync_cancel.clear()
         self._sync_skip.clear()
         self._sync_pause.clear()
@@ -224,17 +227,14 @@ class SyncMixin:
                 youtube_session.end_sync_scope()
                 youtube_traffic.finish_reservation(
                     traffic_reservation_id)
+                youtube_traffic.clear_budget_override()
                 # Stop the tray spin + restore idle tooltip.
                 try:
                     if getattr(self, "_tray", None):
                         self._tray.stop_spin()
                         self._tray.set_tooltip("YTArchiver \u2014 Idle")
-                        # Clear session download badge — fresh pass next time
-                        try: self._tray.set_badge(0)
-                        except Exception as e: _log.debug("swallowed: %s", e)
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
-                self._session_dl_count = 0
                 # Clear stale sync-progress so a companion display leaves
                 # the Sync source. Mirrors OLD's
                 # _clear_sync_progress() call at the end of every sync path

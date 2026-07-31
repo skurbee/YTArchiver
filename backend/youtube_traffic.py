@@ -69,6 +69,92 @@ _last_launch_ts = 0.0
 _next_gap_seconds = 0.0
 _reservations: dict[str, dict[str, Any]] = {}
 _scope = threading.local()
+_active_waits: dict[int, dict[str, Any]] = {}
+_wait_listeners: list[Any] = []
+_budget_override_active = False
+_override_wakeup = threading.Event()
+
+
+def _notify_wait_listeners(state: dict[str, Any]) -> None:
+    for callback in list(_wait_listeners):
+        try:
+            callback(dict(state))
+        except Exception as exc:
+            _log.debug("YouTube traffic wait listener failed: %s", exc)
+
+
+def add_wait_listener(callback) -> None:
+    """Notify ``callback`` whenever rolling-budget waiting starts or ends."""
+    if not callable(callback):
+        return
+    with _lock:
+        if callback not in _wait_listeners:
+            _wait_listeners.append(callback)
+
+
+def wait_status() -> dict[str, Any]:
+    """Return the process-wide rolling-budget wait shown by the UI."""
+    with _lock:
+        waits = list(_active_waits.values())
+        override = bool(_budget_override_active)
+    if not waits:
+        return {"active": False, "override_active": override}
+    # The latest release time is the one that governs the whole process when
+    # more than one YouTube worker reaches a rolling window simultaneously.
+    current = max(
+        waits, key=lambda item: float(item.get("until") or 0))
+    return {
+        "active": True,
+        "override_active": override,
+        **current,
+    }
+
+
+def _set_wait_state(state: dict[str, Any] | None) -> None:
+    ident = threading.get_ident()
+    changed = False
+    with _lock:
+        previous = _active_waits.get(ident)
+        if state is None:
+            changed = _active_waits.pop(ident, None) is not None
+        else:
+            normalized = dict(state)
+            changed = previous != normalized
+            _active_waits[ident] = normalized
+        snapshot = wait_status()
+    if changed:
+        _notify_wait_listeners(snapshot)
+
+
+def override_budget_limits() -> dict[str, Any]:
+    """Ignore configured rolling ceilings until the current sync ends.
+
+    The emergency YouTube rate-limit circuit and launch spacing remain active.
+    """
+    global _budget_override_active
+    before = wait_status()
+    with _lock:
+        _budget_override_active = True
+        _override_wakeup.set()
+        snapshot = wait_status()
+    _notify_wait_listeners(snapshot)
+    return {"ok": True, "wait": before, "override_active": True}
+
+
+def clear_budget_override() -> None:
+    global _budget_override_active
+    with _lock:
+        changed = _budget_override_active
+        _budget_override_active = False
+        _override_wakeup.clear()
+        snapshot = wait_status()
+    if changed:
+        _notify_wait_listeners(snapshot)
+
+
+def budget_override_active() -> bool:
+    with _lock:
+        return bool(_budget_override_active)
 
 
 def _load_circuit_locked(now: float | None = None) -> dict[str, Any]:
@@ -422,6 +508,7 @@ def _expiry_for_units_locked(now: float, seconds: int, limit: int,
 
 def eligibility(units: int = 1, cfg: dict[str, Any] | None = None,
                 *, include_gap: bool = True,
+                ignore_limits: bool = False,
                 now: float | None = None) -> dict[str, Any]:
     """Return whether units can launch now and the earliest eligible time."""
     if cfg is None:
@@ -432,10 +519,10 @@ def eligibility(units: int = 1, cfg: dict[str, Any] | None = None,
     with _lock:
         _read_events_locked()
         _prune_locked(now)
-        day_ts = _expiry_for_units_locked(
+        day_ts = now if ignore_limits else _expiry_for_units_locked(
             now, DAY_SECONDS, int(settings["daily"]), requested,
             "daily_units")
-        hour_ts = _expiry_for_units_locked(
+        hour_ts = now if ignore_limits else _expiry_for_units_locked(
             now, HOUR_SECONDS, int(settings["hourly"]), requested,
             "hourly_units")
         gap_ts = now
@@ -450,7 +537,18 @@ def eligibility(units: int = 1, cfg: dict[str, Any] | None = None,
         circuit = _load_circuit_locked(now)
         if circuit["active"]:
             next_ts = max(next_ts, float(circuit["cooldown_until"]))
-    impossible = bool(
+    wait_candidates = [
+        ("daily_limit", day_ts),
+        ("hourly_limit", hour_ts),
+        ("spacing", gap_ts),
+    ]
+    if circuit["active"]:
+        wait_candidates.append(
+            ("cooldown", float(circuit["cooldown_until"])))
+    wait_reason = None
+    if next_ts > now + 0.05:
+        wait_reason = max(wait_candidates, key=lambda item: item[1])[0]
+    impossible = not ignore_limits and bool(
         (settings["daily"] > 0 and requested > settings["daily"])
         or (settings["hourly"] > 0 and requested > settings["hourly"])
     )
@@ -459,6 +557,7 @@ def eligibility(units: int = 1, cfg: dict[str, Any] | None = None,
         "impossible": impossible,
         "next_ts": None if impossible else next_ts,
         "wait_seconds": None if impossible else max(0, next_ts - now),
+        "wait_reason": wait_reason,
         "requested": requested,
         "daily_used": daily_used,
         "hourly_used": hourly_used,
@@ -540,123 +639,202 @@ def _current_reservation() -> str:
 
 
 def acquire(kind: str, *, units: int = 1, cancel_event=None,
-            stream=None) -> dict[str, Any]:
+            pause_event=None, stream=None) -> dict[str, Any]:
     """Wait for and consume permission for one YouTube operation."""
     global _last_launch_ts, _next_gap_seconds
     requested = max(1, int(units or 1))
     reservation_id = _current_reservation()
     announced = False
-    while True:
-        if cancel_event is not None and cancel_event.is_set():
-            return {"ok": False, "cancelled": True}
-        now = time.time()
-        cfg = load_config()
-        circuit = circuit_state(now)
-        if circuit["active"]:
-            resume = time.strftime(
-                "%I:%M%p", time.localtime(circuit["cooldown_until"])
-            ).lstrip("0").lower()
-            return {
-                "ok": False,
-                "cooldown": True,
-                "cooldown_until": circuit["cooldown_until"],
-                "error": (
-                    "YouTube traffic is in an emergency rate-limit cooldown "
-                    f"until {resume}."),
-            }
-        check = eligibility(
-            requested, cfg, include_gap=True, now=now)
-        if check["impossible"]:
-            return {
-                "ok": False,
-                "budget_blocked": True,
-                "error": (
-                    f"{requested} operations cannot fit inside the configured "
-                    "YouTube traffic budget."),
-            }
-
-        with _lock:
-            _read_events_locked()
-            reservation = _reservations.get(reservation_id)
-            reserved_available = (
-                reservation is not None
-                and int(reservation.get("remaining") or 0) >= requested
-            )
-            # A reservation already consumed daily capacity up front.  Each
-            # launch still consumes and obeys the hourly window plus spacing.
-            if reserved_available:
-                settings = effective_settings(cfg)
-                hour_at = _expiry_for_units_locked(
-                    now, HOUR_SECONDS, int(settings["hourly"]), requested,
-                    "hourly_units")
-                gap_at = (
-                    _last_launch_ts
-                    + max(float(settings["min_gap"]), _next_gap_seconds)
-                    if _last_launch_ts else now)
-                next_at = max(hour_at, gap_at)
-                allowed = next_at <= now + 0.05
-                wait_seconds = max(0.0, next_at - now)
-            else:
-                # Another worker may have consumed the final slot after the
-                # optimistic check above. Re-check while holding the same
-                # lock that guards the append so concurrent metadata workers
-                # cannot oversubscribe a window or launch through the gap.
-                check = eligibility(
-                    requested, cfg, include_gap=True, now=now)
-                allowed = bool(check["allowed"])
-                wait_seconds = float(check["wait_seconds"] or 0)
-
-            if allowed:
-                settings = effective_settings(cfg)
-                if reserved_available:
-                    reservation["remaining"] = (
-                        int(reservation["remaining"]) - requested)
-                    _append_locked({
-                        "ts": now,
-                        "daily_units": 0,
-                        "hourly_units": requested,
-                        "kind": str(kind or "youtube"),
-                        "reservation_id": reservation_id,
-                    })
-                else:
-                    _append_locked({
-                        "ts": now,
-                        "daily_units": requested,
-                        "hourly_units": requested,
-                        "kind": str(kind or "youtube"),
-                        "reservation_id": "",
-                    })
-                _last_launch_ts = now
-                _next_gap_seconds = random.uniform(
-                    float(settings["min_gap"]),
-                    float(settings["max_gap"]),
-                )
+    try:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return {"ok": False, "cancelled": True}
+            if pause_event is not None and pause_event.is_set():
+                return {"ok": False, "paused": True}
+            now = time.time()
+            cfg = load_config()
+            override = budget_override_active()
+            circuit = circuit_state(now)
+            if circuit["active"]:
+                resume = time.strftime(
+                    "%I:%M%p", time.localtime(circuit["cooldown_until"])
+                ).lstrip("0").lower()
                 return {
-                    "ok": True,
-                    "units": requested,
-                    "kind": kind,
-                    "reserved": reserved_available,
-                    "daily_used": check["daily_used"],
-                    "hourly_used": check["hourly_used"],
+                    "ok": False,
+                    "cooldown": True,
+                    "cooldown_until": circuit["cooldown_until"],
+                    "error": (
+                        "YouTube traffic is in an emergency rate-limit "
+                        f"cooldown until {resume}."),
+                }
+            check = eligibility(
+                requested, cfg, include_gap=True, ignore_limits=override,
+                now=now)
+            if check["impossible"]:
+                return {
+                    "ok": False,
+                    "budget_blocked": True,
+                    "error": (
+                        f"{requested} operations cannot fit inside the "
+                        "configured YouTube traffic budget."),
                 }
 
-        if not announced and stream is not None and wait_seconds >= 5:
-            announced = True
+            with _lock:
+                _read_events_locked()
+                reservation = _reservations.get(reservation_id)
+                reserved_available = (
+                    reservation is not None
+                    and int(reservation.get("remaining") or 0) >= requested
+                )
+                # A reservation already consumed daily capacity up front.
+                # Each launch still consumes the hourly window plus spacing.
+                if reserved_available:
+                    settings = effective_settings(cfg)
+                    hour_at = now if override else _expiry_for_units_locked(
+                        now, HOUR_SECONDS, int(settings["hourly"]), requested,
+                        "hourly_units")
+                    gap_at = (
+                        _last_launch_ts
+                        + max(float(settings["min_gap"]), _next_gap_seconds)
+                        if _last_launch_ts else now)
+                    next_at = max(hour_at, gap_at)
+                    allowed = next_at <= now + 0.05
+                    wait_seconds = max(0.0, next_at - now)
+                    wait_reason = (
+                        "hourly_limit"
+                        if hour_at > now + 0.05 and hour_at >= gap_at
+                        else "spacing"
+                    )
+                else:
+                    # Re-check while holding the append lock so concurrent
+                    # workers cannot oversubscribe a window or the gap.
+                    check = eligibility(
+                        requested, cfg, include_gap=True,
+                        ignore_limits=override, now=now)
+                    allowed = bool(check["allowed"])
+                    wait_seconds = float(check["wait_seconds"] or 0)
+                    wait_reason = check.get("wait_reason")
+
+                if allowed:
+                    settings = effective_settings(cfg)
+                    if reserved_available:
+                        reservation["remaining"] = (
+                            int(reservation["remaining"]) - requested)
+                        _append_locked({
+                            "ts": now,
+                            "daily_units": 0,
+                            "hourly_units": requested,
+                            "kind": str(kind or "youtube"),
+                            "reservation_id": reservation_id,
+                        })
+                    else:
+                        _append_locked({
+                            "ts": now,
+                            "daily_units": requested,
+                            "hourly_units": requested,
+                            "kind": str(kind or "youtube"),
+                            "reservation_id": "",
+                        })
+                    _last_launch_ts = now
+                    _next_gap_seconds = random.uniform(
+                        float(settings["min_gap"]),
+                        float(settings["max_gap"]),
+                    )
+                    return {
+                        "ok": True,
+                        "units": requested,
+                        "kind": kind,
+                        "reserved": reserved_available,
+                        "daily_used": check["daily_used"],
+                        "hourly_used": check["hourly_used"],
+                        "override": override,
+                    }
+
+            if wait_reason in ("hourly_limit", "daily_limit"):
+                _set_wait_state({
+                    "reason": wait_reason,
+                    "until": now + wait_seconds,
+                    "hourly_used": int(check["hourly_used"]),
+                    "hourly_limit": int(check["settings"]["hourly"]),
+                    "daily_used": int(check["daily_used"]),
+                    "daily_limit": int(check["settings"]["daily"]),
+                })
+            else:
+                _set_wait_state(None)
+
+            if not announced and stream is not None and wait_seconds >= 5:
+                announced = True
+                try:
+                    resume = time.strftime(
+                        "%I:%M%p", time.localtime(now + wait_seconds)
+                    ).lstrip("0").lower()
+                    settings = check["settings"]
+                    if wait_reason == "hourly_limit":
+                        stream.emit([
+                            ["\u23f3 YouTube traffic safety: ",
+                             ["simpleline", "traffic_wait"]],
+                            [
+                                "hourly limit reached "
+                                f"({check['hourly_used']}/"
+                                f"{settings['hourly']}). ",
+                                ["dim", "traffic_wait"],
+                            ],
+                            [
+                                f"Waiting for the next rolling slot at "
+                                f"{resume}; sync will continue "
+                                "automatically.\n",
+                                ["dim", "traffic_wait"],
+                            ],
+                        ])
+                    elif wait_reason == "daily_limit":
+                        stream.emit([
+                            ["\u23f3 YouTube traffic safety: ",
+                             ["simpleline", "traffic_wait"]],
+                            [
+                                "24-hour limit reached "
+                                f"({check['daily_used']}/"
+                                f"{settings['daily']}). ",
+                                ["dim", "traffic_wait"],
+                            ],
+                            [
+                                f"Waiting for the next rolling slot at "
+                                f"{resume}; sync will continue "
+                                "automatically.\n",
+                                ["dim", "traffic_wait"],
+                            ],
+                        ])
+                    else:
+                        stream.emit_dim(
+                            f" YouTube traffic governor: waiting until "
+                            f"{resume} before the next remote operation.")
+                except Exception:
+                    pass
+            sleep_for = max(0.05, min(30.0, wait_seconds or 0.25))
+            # Poll fast while a pause can arrive so the global control never
+            # sits in "pause pending" for an hour-long budget wait.
+            if pause_event is not None:
+                sleep_for = min(sleep_for, 0.25)
+            if not override and _override_wakeup.wait(timeout=0):
+                continue
+            if cancel_event is not None:
+                if cancel_event.wait(timeout=sleep_for):
+                    return {"ok": False, "cancelled": True}
+            elif pause_event is not None:
+                if pause_event.wait(timeout=sleep_for):
+                    return {"ok": False, "paused": True}
+            elif not override:
+                _override_wakeup.wait(timeout=sleep_for)
+            else:
+                time.sleep(sleep_for)
+    finally:
+        _set_wait_state(None)
+        if announced and stream is not None and not wait_status()["active"]:
             try:
-                resume = time.strftime(
-                    "%I:%M%p", time.localtime(now + wait_seconds)
-                ).lstrip("0").lower()
-                stream.emit_dim(
-                    f" YouTube traffic governor: waiting until {resume} "
-                    "before the next remote operation.")
+                stream.emit([[json.dumps({
+                    "kind": "clear_line", "marker": "traffic_wait",
+                }), "__control__"]])
             except Exception:
                 pass
-        sleep_for = max(0.05, min(30.0, wait_seconds or 0.25))
-        if cancel_event is not None:
-            if cancel_event.wait(timeout=sleep_for):
-                return {"ok": False, "cancelled": True}
-        else:
-            time.sleep(sleep_for)
 
 
 def reserve_sweep(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -784,7 +962,7 @@ def _reset_for_tests(path: Path | None = None,
                      circuit_path: Path | None = None) -> None:
     """Reset process-local state; intentionally private test helper."""
     global _loaded, _events, _last_launch_ts, _next_gap_seconds
-    global TRAFFIC_FILE, CIRCUIT_FILE
+    global TRAFFIC_FILE, CIRCUIT_FILE, _budget_override_active
     with _lock:
         if path is not None:
             TRAFFIC_FILE = path
@@ -795,4 +973,8 @@ def _reset_for_tests(path: Path | None = None,
         _last_launch_ts = 0.0
         _next_gap_seconds = 0.0
         _reservations.clear()
+        _active_waits.clear()
+        _wait_listeners.clear()
+        _budget_override_active = False
+        _override_wakeup.clear()
         _scope.reservation_id = ""

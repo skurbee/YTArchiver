@@ -190,7 +190,45 @@
       const deadPausedWithItems =
         syncDeadPausedWithItems || gpuDeadPausedWithItems;
       try {
-        if (anyActivelyPaused) {
+        if (s.trafficWaiting) {
+          const wait = s.trafficWait || {};
+          const until = Number(wait.until);
+          const untilText = Number.isFinite(until)
+            ? new Date(until * 1000).toLocaleTimeString([], {
+                hour: "numeric", minute: "2-digit",
+              })
+            : "the next rolling slot";
+          const reason = wait.reason === "daily_limit"
+            ? "24-hour"
+            : "hourly";
+          const go = await (window.askConfirm
+            ? window.askConfirm(
+                "Override YouTube traffic limit?",
+                `The sync is waiting for a ${reason} rolling-window slot ` +
+                `until ${untilText}. Continuing now will ignore the ` +
+                "configured hourly and 24-hour ceilings for the rest of " +
+                "this sync pass. Emergency YouTube rate-limit protection " +
+                "and launch spacing remain active.",
+                {
+                  confirm: "Override and continue",
+                  cancel: "Keep waiting",
+                  danger: true,
+                })
+            : Promise.resolve(false));
+          if (!go) return;
+          if (typeof api.youtube_traffic_override === "function") {
+            const res = await api.youtube_traffic_override();
+            if (res?.ok) {
+              window._showToast?.(
+                "Traffic ceilings overridden for this sync pass.", "warn");
+            } else {
+              window._showToast?.(
+                res?.error || "Traffic override failed.", "error");
+            }
+          } else {
+            window._showToast?.("Traffic override is unavailable.", "error");
+          }
+        } else if (anyActivelyPaused) {
           await checkedQueueApi(
             api, "queue_resume", "both",
             "Resumed.", "ok", "Resume failed.");

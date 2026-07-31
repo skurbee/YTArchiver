@@ -1079,6 +1079,7 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
         return None
     dest: str | None = None
     _cancelled = False
+    _raw_output: list[str] = []
     for raw in proc.stdout:
         if cancel_ev.is_set():
             try: proc.terminate()
@@ -1086,6 +1087,10 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
             _cancelled = True
             break
         line = raw.rstrip()
+        if line:
+            _raw_output.append(line)
+            if len(_raw_output) > 60:
+                _raw_output = _raw_output[-60:]
         try:
             from .youtube_session import handle_youtube_failure_text
             _yt_failure = handle_youtube_failure_text(
@@ -1127,7 +1132,8 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
     if (not _cancelled) and proc.returncode is not None and proc.returncode != 0:
         stream.emit_error(
             f"yt-dlp exited with code {proc.returncode} for "
-            f"{video_id} — see lines above for details.")
+            f"{video_id} — see lines above for details.",
+            detail="\n".join(_raw_output[-40:]))
     # on cancel mid-download, the .part / intermediate files
     # sit in _REDOWNLOAD_TEMP/ forever because the end-of-run rmdir only
     # clears empty dirs. Sweep everything we might have written before

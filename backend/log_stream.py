@@ -236,13 +236,21 @@ class LogStreamer:
     def emit_dim(self, text: str):
         self.emit_text(text, "dim")
 
-    def emit_error(self, text: str):
+    def emit_error(self, text: str, *, detail: str | None = None):
         # `error_detail` is a semantic marker consumed by the session-error
         # popover. A red segment alone is not enough: pass summaries color
         # their numeric error count red too, which previously made the popup
         # collect several vague summary rows for one real failure.
         line = text if text.endswith("\n") else text + "\n"
-        self.emit([[line, ["red", "error_detail"]]])
+        segments = [[line, ["red", "error_detail"]]]
+        if detail:
+            # Hidden in the main log, but retained in the DOM so the
+            # session-error popover can expose raw diagnostics on hover.
+            segments.append([
+                str(detail).strip()[:self.MAX_SEGMENT_TEXT_CHARS],
+                "error_raw",
+            ])
+        self.emit(segments)
 
     def emit_header(self, text: str):
         self.emit_text(text, "header")

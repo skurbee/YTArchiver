@@ -124,6 +124,10 @@ class TrayController:
         # Badge overlay — downloaded-this-session count. 0 = no badge.
         # Mirrors OLD's _tray_set_badge (YTArchiver.py:3457).
         self._badge_count: int = 0
+        # The notification-area icon and the taskbar button are distinct
+        # Windows surfaces. pystray owns the former; ITaskbarList3 uses this
+        # HWND for the small spinner/count overlay on the latter.
+        self._taskbar_hwnd: int = 0
 
     def _build_menu(self):
         try:
@@ -311,7 +315,7 @@ class TrayController:
     # ── Spin animation (matches YTArchiver's tray busy indicator) ──
 
     def start_spin(self, color: str = "blue"):
-        """Start a rotating-dot overlay on the tray icon.
+        """Start a rotating-dot overlay on the tray and taskbar icons.
         `color` = "blue" (sync) or "red" (gpu)."""
         if not self._started or not self._icon:
             return
@@ -331,6 +335,15 @@ class TrayController:
         self._spin_thread = threading.Thread(
             target=self._spin_loop, args=(_epoch,), daemon=True)
         self._spin_thread.start()
+
+    def set_window_handle(self, hwnd: int) -> None:
+        """Attach the native app HWND used for Windows taskbar overlays."""
+        try:
+            self._taskbar_hwnd = max(0, int(hwnd or 0))
+        except Exception:
+            self._taskbar_hwnd = 0
+        if self._spin_thread is None:
+            self._refresh_taskbar_static()
 
     def stop_spin(self):
         # join the spin thread (short timeout) before
@@ -354,6 +367,7 @@ class TrayController:
                     self._icon.icon = self._static_icon_image()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
+        self._refresh_taskbar_static()
 
     def set_badge(self, count: int):
         """Overlay a small count badge on the tray icon (downloaded-this-session).
@@ -372,6 +386,8 @@ class TrayController:
                     self._icon.icon = self._static_icon_image()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
+        if self._spin_thread is None:
+            self._refresh_taskbar_static()
 
     def _compose_badge(self, img):
         """Draw `self._badge_count` into the bottom-right of an icon copy."""
@@ -404,9 +420,84 @@ class TrayController:
             _log.debug("swallowed: %s", e)
         return img
 
+    def _compose_taskbar_overlay(self, frame: int | None = None):
+        """Build a transparent spinner/badge for the taskbar button."""
+        if self._Image is None or self._ImageDraw is None:
+            return None
+        try:
+            img = self._Image.new("RGBA", (32, 32), (0, 0, 0, 0))
+            draw = self._ImageDraw.Draw(img)
+            if frame is not None:
+                import math
+                opacities = [255, 220, 180, 140, 100, 70, 40, 25]
+                base = self._spin_color
+                for i, alpha in enumerate(opacities):
+                    angle = (frame * 45 - i * 45) % 360
+                    x = 16 + 10 * math.cos(math.radians(angle))
+                    y = 16 + 10 * math.sin(math.radians(angle))
+                    draw.ellipse(
+                        [x - 3, y - 3, x + 3, y + 3],
+                        fill=(base[0], base[1], base[2], alpha),
+                    )
+            if self._badge_count:
+                radius = 8 if frame is not None else 12
+                cx = cy = 16
+                draw.ellipse(
+                    [cx - radius, cy - radius, cx + radius, cy + radius],
+                    fill=(220, 40, 40, 255),
+                )
+                text = (
+                    str(self._badge_count)
+                    if self._badge_count < 10 else "9+")
+                try:
+                    font = self._ImageDraw.ImageFont.truetype(
+                        "arial.ttf", 11 if frame is not None else 14)
+                except Exception:
+                    font = None
+                try:
+                    bbox = draw.textbbox((0, 0), text, font=font)
+                    tw = bbox[2] - bbox[0]
+                    th = bbox[3] - bbox[1]
+                    draw.text(
+                        (cx - tw // 2, cy - th // 2 - 1),
+                        text,
+                        fill=(255, 255, 255, 255),
+                        font=font,
+                    )
+                except Exception as exc:
+                    _log.debug("taskbar badge text failed: %s", exc)
+            return img
+        except Exception as exc:
+            _log.debug("taskbar overlay composition failed: %s", exc)
+            return None
+
+    def _refresh_taskbar_static(self) -> None:
+        """Show the unseen-download badge, or clear an idle overlay."""
+        if not self._taskbar_hwnd:
+            return
+        try:
+            from .taskbar_overlay import WindowsTaskbarOverlay
+            with WindowsTaskbarOverlay(self._taskbar_hwnd) as overlay:
+                if self._badge_count:
+                    overlay.set_pil_image(
+                        self._compose_taskbar_overlay(),
+                        f"{self._badge_count} new downloads",
+                    )
+                else:
+                    overlay.clear()
+        except Exception as exc:
+            _log.debug("taskbar static overlay failed: %s", exc)
+
     def _spin_loop(self, epoch: int = 0):
         import math
         frame = 0
+        taskbar = None
+        if self._taskbar_hwnd:
+            try:
+                from .taskbar_overlay import WindowsTaskbarOverlay
+                taskbar = WindowsTaskbarOverlay(self._taskbar_hwnd)
+            except Exception as exc:
+                _log.debug("taskbar spinner setup failed: %s", exc)
         # .txt issue: the spin animation was barely visible — a single
         # 4-pixel dot in a 32x32 icon at typical DPI. Draw a brighter
         # ring of fading dots so the animation reads at a glance even
@@ -420,7 +511,7 @@ class TrayController:
             # the epoch will have bumped — bail rather than fight the
             # new loop for the icon.
             if epoch != self._spin_epoch:
-                return
+                break
             try:
                 img = self._base_img.copy()
                 draw = self._ImageDraw.Draw(img)
@@ -445,10 +536,21 @@ class TrayController:
                 if self._icon:
                     with self._icon_lock:
                         self._icon.icon = img
+                if taskbar is not None and taskbar.available:
+                    taskbar.set_pil_image(
+                        self._compose_taskbar_overlay(frame),
+                        "YTArchiver is working",
+                    )
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             frame += 1
             self._spin_stop.wait(self._spin_interval)
+        if taskbar is not None:
+            try:
+                taskbar.clear()
+            except Exception:
+                pass
+            taskbar.close()
 
     def stop(self):
         self._keepalive_stop.set()

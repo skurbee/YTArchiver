@@ -26,6 +26,8 @@
   let _rescanHideTimer = null;
   let _errorCount = 0;
   let _errorItems = [];
+  let _traffic = null;
+  let _trafficRefreshInFlight = false;
 
   function _runningItem(list) {
     for (const t of (list || [])) {
@@ -56,6 +58,17 @@
     const list = _queues[kind] || [];
     const st = _state[kind] || {};
     const count = _queueCount(kind);
+    if (kind === "sync" && st.trafficWaiting) {
+      const wait = st.trafficWait || {};
+      const until = Number(wait.until);
+      const at = Number.isFinite(until)
+        ? new Date(until * 1000).toLocaleTimeString([], {
+            hour: "numeric", minute: "2-digit",
+          })
+        : "";
+      const windowName = wait.reason === "daily_limit" ? "24-hour" : "hourly";
+      return `Waiting for ${windowName} slot${at ? ` (${at})` : ""}`;
+    }
     if (st.paused) {
       return count ? `${idleLabel.split(" ")[0]} paused (${count})`
                    : `${idleLabel.split(" ")[0]} paused`;
@@ -138,6 +151,33 @@
     const errCount = document.getElementById("gsb-errors-count");
     if (errEl) errEl.hidden = _errorCount <= 0;
     if (errCount) errCount.textContent = String(_errorCount);
+
+    // Live rolling YouTube operation counters. Unlimited intentionally
+    // hides the whole segment because it has no configured ceiling.
+    const trafficEl = document.getElementById("gsb-traffic");
+    const trafficHourly = document.getElementById("gsb-traffic-hourly");
+    const trafficDaily = document.getElementById("gsb-traffic-daily");
+    const finiteTraffic = !!(_traffic && _traffic.ok &&
+      _traffic.mode !== "unlimited" &&
+      Number(_traffic.hourly_limit) > 0 &&
+      Number(_traffic.daily_limit) > 0);
+    if (trafficEl) {
+      trafficEl.hidden = !finiteTraffic;
+      if (finiteTraffic) {
+        const hourUsed = Math.max(0, Number(_traffic.hourly_used) || 0);
+        const dayUsed = Math.max(0, Number(_traffic.daily_used) || 0);
+        const hourLimit = Number(_traffic.hourly_limit);
+        const dayLimit = Number(_traffic.daily_limit);
+        if (trafficHourly) {
+          trafficHourly.textContent = `Hour ${hourUsed}/${hourLimit}`;
+        }
+        if (trafficDaily) {
+          trafficDaily.textContent = `24h ${dayUsed}/${dayLimit}`;
+        }
+        trafficEl.classList.toggle(
+          "at-limit", hourUsed >= hourLimit || dayUsed >= dayLimit);
+      }
+    }
   }
 
   function _renderErrorsPopover() {
@@ -159,7 +199,16 @@
       dot.textContent = "!";
       const text = document.createElement("span");
       text.className = "gsb-error-item-text";
-      text.textContent = item;
+      const entry = (item && typeof item === "object")
+        ? item
+        : { message: String(item || ""), detail: "" };
+      text.textContent = entry.message;
+      if (entry.detail) {
+        text.setAttribute("data-tooltip", entry.detail);
+        text.setAttribute(
+          "aria-label", `${entry.message}. Hover for technical details.`);
+        text.classList.add("has-detail");
+      }
       row.append(dot, text);
       body.appendChild(row);
     }
@@ -246,8 +295,12 @@
         for (const m of muts) {
           for (const n of m.addedNodes) {
             if (!isErr(n)) continue;
-            const text = String(n.textContent || "").trim();
-            if (text) _errorItems.push(text);
+            const raw = String(
+              n.querySelector(".t-error_raw")?.textContent || "").trim();
+            const clone = n.cloneNode(true);
+            clone.querySelectorAll(".t-error_raw").forEach(el => el.remove());
+            const message = String(clone.textContent || "").trim();
+            if (message) _errorItems.push({ message, detail: raw });
           }
         }
         // Bound session-only UI memory without changing the visible count.
@@ -266,6 +319,29 @@
     const bar = document.getElementById("global-status-bar");
     if (!bar || bar._inited) return;
     bar._inited = true;
+
+    // The native taskbar/tray badge means "downloads since you last looked".
+    // Report top-level window focus changes so the backend can arm/reset that
+    // counter without guessing from queue activity.
+    let lastReportedFocus = null;
+    const reportWindowFocus = async (focused) => {
+      focused = !!focused;
+      if (focused === lastReportedFocus ||
+          !window.YT?.bridge?.isUp?.()) return;
+      try {
+        const result = await window.YT.bridge.bridgeCall(
+          "app_window_focus_changed", { focused });
+        if (result?.ok) lastReportedFocus = focused;
+      } catch (e) { /* best-effort native badge state */ }
+    };
+    window.addEventListener("focus", () => reportWindowFocus(true));
+    window.addEventListener("blur", () => reportWindowFocus(false));
+    window.addEventListener(
+      "pywebviewready",
+      () => reportWindowFocus(document.hasFocus()),
+      { once: true },
+    );
+    reportWindowFocus(document.hasFocus());
 
     // Wrap the three globals the backend pushes to. Each wrapper calls the
     // previous implementation first (preserving any other wrappers, e.g.
@@ -309,7 +385,6 @@
       const log = document.getElementById("main-log");
       if (log) log.scrollTop = log.scrollHeight;
     };
-    document.getElementById("gsb-log-btn")?.addEventListener("click", gotoLog);
     const errorBtn = document.getElementById("gsb-errors");
     errorBtn?.setAttribute("aria-expanded", "false");
     errorBtn?.addEventListener("click", (e) => {
@@ -356,6 +431,24 @@
     };
     hydrateRescan();
     window.addEventListener("pywebviewready", hydrateRescan, { once: true });
+
+    const refreshTraffic = async () => {
+      if (_trafficRefreshInFlight || !window.YT?.bridge?.isUp?.()) return;
+      _trafficRefreshInFlight = true;
+      try {
+        const state = await window.YT.bridge.bridgeCall(
+          "youtube_traffic_status");
+        if (state && typeof state === "object") {
+          _traffic = state;
+          _render();
+        }
+      } catch (e) { /* best-effort footer telemetry */ }
+      finally { _trafficRefreshInFlight = false; }
+    };
+    refreshTraffic();
+    window.addEventListener("pywebviewready", refreshTraffic, { once: true });
+    const trafficTimer = setInterval(refreshTraffic, 15000);
+    if (window._trackBootInterval) window._trackBootInterval(trafficTimer);
   }
 
   // Python pushes this after each completed channel in the scan and folder-

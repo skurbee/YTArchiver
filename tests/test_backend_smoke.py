@@ -7,6 +7,7 @@ import queue
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -109,11 +110,13 @@ from backend.transcribe import transcribe_files
 _TEST_TRAFFIC_TMP = None
 _TEST_TRAFFIC_PRESETS = None
 _TEST_TRAFFIC_FILES = None
+_TEST_TRAFFIC_LOAD_CONFIG = None
 
 
 def setUpModule() -> None:
     """Keep traffic-governor tests isolated from the user's live ledger."""
     global _TEST_TRAFFIC_TMP, _TEST_TRAFFIC_PRESETS, _TEST_TRAFFIC_FILES
+    global _TEST_TRAFFIC_LOAD_CONFIG
     _TEST_TRAFFIC_TMP = tempfile.TemporaryDirectory()
     _TEST_TRAFFIC_PRESETS = {
         key: dict(value)
@@ -125,12 +128,34 @@ def setUpModule() -> None:
         Path(_TEST_TRAFFIC_TMP.name) / "traffic.jsonl",
         Path(_TEST_TRAFFIC_TMP.name) / "rate_limit.json",
     )
+    # The user's selected mode can be "custom", which does not read
+    # TRAFFIC_PRESETS. A large suite can otherwise consume the live custom
+    # ceiling inside the isolated ledger and then park for an hour midway
+    # through unrelated tests. Keep only youtube_traffic's implicit config
+    # reads unlimited; individual governor tests patch this function with
+    # their own exact limits.
+    _TEST_TRAFFIC_LOAD_CONFIG = youtube_traffic.load_config
+
+    def _isolated_traffic_config():
+        cfg = dict(_TEST_TRAFFIC_LOAD_CONFIG() or {})
+        cfg.update({
+            "youtube_traffic_mode": "custom",
+            "youtube_traffic_custom_daily": 1_000_000,
+            "youtube_traffic_custom_hourly": 1_000_000,
+            "youtube_traffic_custom_min_gap": 0,
+            "youtube_traffic_custom_max_gap": 0,
+        })
+        return cfg
+
+    youtube_traffic.load_config = _isolated_traffic_config
     for preset in youtube_traffic.TRAFFIC_PRESETS.values():
         preset.update(
             daily=1_000_000, hourly=1_000_000, min_gap=0, max_gap=0)
 
 
 def tearDownModule() -> None:
+    if _TEST_TRAFFIC_LOAD_CONFIG is not None:
+        youtube_traffic.load_config = _TEST_TRAFFIC_LOAD_CONFIG
     if _TEST_TRAFFIC_PRESETS is not None:
         youtube_traffic.TRAFFIC_PRESETS.clear()
         youtube_traffic.TRAFFIC_PRESETS.update(_TEST_TRAFFIC_PRESETS)
@@ -659,6 +684,19 @@ class LogStreamerTests(unittest.TestCase):
             [["Specific failure\n", ["red", "error_detail"]]],
         )
 
+    def test_emit_error_retains_hidden_raw_detail(self) -> None:
+        stream = log_stream.LogStreamer()
+
+        stream.emit_error("Friendly failure", detail="ERROR: raw yt-dlp text")
+
+        self.assertEqual(
+            stream._buffer[0],
+            [
+                ["Friendly failure\n", ["red", "error_detail"]],
+                ["ERROR: raw yt-dlp text", "error_raw"],
+            ],
+        )
+
 
 class NetMonitorTests(unittest.TestCase):
     def tearDown(self) -> None:
@@ -730,6 +768,15 @@ class TrayControllerTests(unittest.TestCase):
 
         self.assertIsNone(icon.icon)
         self.assertEqual(icon.show_calls, 1)
+
+    def test_badge_refreshes_idle_taskbar_overlay(self) -> None:
+        ctrl = tray_backend.TrayController(tooltip="YT Archiver")
+        ctrl._refresh_taskbar_static = mock.Mock()
+
+        ctrl.set_badge(3)
+
+        self.assertEqual(ctrl._badge_count, 3)
+        ctrl._refresh_taskbar_static.assert_called_once_with()
 
 
 class FileOpsTests(unittest.TestCase):
@@ -4072,6 +4119,87 @@ class YouTubeTrafficGovernorTests(unittest.TestCase):
         self.assertEqual(check["requested"], 5)
         self.assertTrue(check["allowed"])
         self.assertTrue(reservation["ok"])
+
+    def test_hourly_wait_is_logged_and_pause_interrupts_promptly(self) -> None:
+        cfg = self._cfg(
+            youtube_traffic_custom_hourly=1,
+            youtube_traffic_custom_min_gap=0,
+            youtube_traffic_custom_max_gap=0,
+        )
+        pause_event = threading.Event()
+        stream = mock.Mock()
+        result: dict[str, object] = {}
+
+        with mock.patch.object(youtube_traffic, "load_config",
+                               return_value=cfg):
+            first = youtube_traffic.acquire("channel_quick_check")
+            self.assertTrue(first["ok"])
+
+            def _wait_for_slot() -> None:
+                result.update(youtube_traffic.acquire(
+                    "channel_quick_check",
+                    pause_event=pause_event,
+                    stream=stream,
+                ))
+
+            worker = threading.Thread(target=_wait_for_slot)
+            worker.start()
+            deadline = time.time() + 2
+            while not stream.emit.called and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(stream.emit.called)
+            segments = stream.emit.call_args.args[0]
+            message = "".join(part[0] for part in segments)
+            self.assertIn("hourly limit reached (1/1)", message)
+            self.assertIn("sync will continue automatically", message)
+            self.assertEqual(segments[0][1], ["simpleline", "traffic_wait"])
+
+            pause_event.set()
+            worker.join(timeout=1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, {"ok": False, "paused": True})
+        self.assertFalse(youtube_traffic.wait_status()["active"])
+
+    def test_hourly_wait_can_be_overridden_for_current_pass(self) -> None:
+        cfg = self._cfg(
+            youtube_traffic_custom_hourly=1,
+            youtube_traffic_custom_min_gap=0,
+            youtube_traffic_custom_max_gap=0,
+        )
+        stream = mock.Mock()
+        result: dict[str, object] = {}
+        states: list[dict[str, object]] = []
+        youtube_traffic.add_wait_listener(
+            lambda state: states.append(dict(state)))
+
+        with mock.patch.object(youtube_traffic, "load_config",
+                               return_value=cfg):
+            self.assertTrue(
+                youtube_traffic.acquire("channel_quick_check")["ok"])
+
+            worker = threading.Thread(target=lambda: result.update(
+                youtube_traffic.acquire(
+                    "channel_quick_check", stream=stream)))
+            worker.start()
+            deadline = time.time() + 2
+            while (not youtube_traffic.wait_status()["active"]
+                   and time.time() < deadline):
+                time.sleep(0.01)
+
+            waiting = youtube_traffic.wait_status()
+            self.assertTrue(waiting["active"])
+            self.assertEqual(waiting["reason"], "hourly_limit")
+            override = youtube_traffic.override_budget_limits()
+            self.assertTrue(override["ok"])
+            worker.join(timeout=1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["override"])
+        self.assertFalse(youtube_traffic.wait_status()["active"])
+        self.assertTrue(any(state.get("active") for state in states))
+        self.assertTrue(any(not state.get("active") for state in states))
 
     def test_rate_limit_circuit_escalates_and_deduplicates(self) -> None:
         first = youtube_traffic.record_rate_limit(now=1000.0)
@@ -7595,6 +7723,25 @@ class IndexWriterBusyTests(unittest.TestCase):
 
 
 class WindowMixinServicesTests(unittest.TestCase):
+    def test_focus_clears_unseen_download_badge(self) -> None:
+        class Api(WindowMixin):
+            def __init__(self):
+                self._session_dl_count_lock = threading.Lock()
+                self._session_dl_count = 4
+                self._window_focused = False
+                self._tray = mock.Mock()
+
+        api = Api()
+
+        blurred = api.app_window_focus_changed(False)
+        focused = api.app_window_focus_changed(True)
+
+        self.assertTrue(blurred["ok"])
+        self.assertTrue(focused["ok"])
+        self.assertTrue(api._window_focused)
+        self.assertEqual(api._session_dl_count, 0)
+        api._tray.set_badge.assert_called_once_with(0)
+
     def test_confirm_close_remember_prefers_app_services_dependencies(self) -> None:
         saved: list[dict] = []
         service_log = mock.Mock()

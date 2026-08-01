@@ -339,10 +339,21 @@ class TrayController:
     def set_window_handle(self, hwnd: int) -> None:
         """Attach the native app HWND used for Windows taskbar overlays."""
         try:
-            self._taskbar_hwnd = max(0, int(hwnd or 0))
+            new_hwnd = max(0, int(hwnd or 0))
         except Exception:
-            self._taskbar_hwnd = 0
-        if self._spin_thread is None:
+            new_hwnd = 0
+        if new_hwnd == self._taskbar_hwnd:
+            return
+        self._taskbar_hwnd = new_hwnd
+        if self._spin_thread is not None:
+            # A restored queue can begin spinning before pywebview creates its
+            # native HWND. Restart only the lightweight animation thread so it
+            # binds ITaskbarList3 to the newly available window; sync work is
+            # completely independent and continues uninterrupted.
+            color = "blue" if self._spin_color == (80, 160, 240, 255) else "red"
+            self.stop_spin()
+            self.start_spin(color)
+        else:
             self._refresh_taskbar_static()
 
     def stop_spin(self):

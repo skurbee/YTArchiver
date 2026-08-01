@@ -436,7 +436,8 @@ body {
   font-weight: 600;
 }
 .gsb-traffic-sep { opacity: 0.55; }
-.gsb-traffic.at-limit { color: var(--c-log-sum); }
+.gsb-traffic-reading.near-limit { color: var(--c-log-sum); }
+.gsb-traffic-reading.at-limit { color: var(--c-log-red); }
 .t-error_raw { display: none !important; }
 /* Index/sweep segment is informational, not clickable. */
 .gsb-index {

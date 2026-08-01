@@ -778,6 +778,31 @@ class TrayControllerTests(unittest.TestCase):
         self.assertEqual(ctrl._badge_count, 3)
         ctrl._refresh_taskbar_static.assert_called_once_with()
 
+    def test_late_window_handle_rebinds_active_spinner(self) -> None:
+        ctrl = tray_backend.TrayController(tooltip="YT Archiver")
+        ctrl._spin_thread = object()
+        ctrl._spin_color = (80, 160, 240, 255)
+        ctrl.stop_spin = mock.Mock()
+        ctrl.start_spin = mock.Mock()
+
+        ctrl.set_window_handle(12345)
+
+        self.assertEqual(ctrl._taskbar_hwnd, 12345)
+        ctrl.stop_spin.assert_called_once_with()
+        ctrl.start_spin.assert_called_once_with("blue")
+
+    def test_same_window_handle_does_not_restart_spinner(self) -> None:
+        ctrl = tray_backend.TrayController(tooltip="YT Archiver")
+        ctrl._taskbar_hwnd = 12345
+        ctrl._spin_thread = object()
+        ctrl.stop_spin = mock.Mock()
+        ctrl.start_spin = mock.Mock()
+
+        ctrl.set_window_handle(12345)
+
+        ctrl.stop_spin.assert_not_called()
+        ctrl.start_spin.assert_not_called()
+
 
 class FileOpsTests(unittest.TestCase):
     def test_safe_remove_file_rejects_outside_archive_roots(self) -> None:

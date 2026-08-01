@@ -1429,6 +1429,29 @@ def main():
     _boot_trace("create_window done")
     api.set_window(window)
 
+    def _find_native_window_handle(timeout: float = 2.0) -> int:
+        """Return the pywebview HWND once Windows has actually created it."""
+        if os.name != "nt":
+            return 0
+        try:
+            import ctypes as _ct
+            from ctypes import wintypes as _wintypes
+            find_window = _ct.windll.user32.FindWindowW
+            find_window.argtypes = [
+                _wintypes.LPCWSTR, _wintypes.LPCWSTR]
+            find_window.restype = _wintypes.HWND
+            deadline = time.monotonic() + max(0.0, float(timeout))
+            while True:
+                hwnd = find_window(None, kwargs["title"])
+                if hwnd:
+                    return int(hwnd)
+                if time.monotonic() >= deadline:
+                    return 0
+                time.sleep(0.05)
+        except Exception as exc:
+            _log.debug("native window handle lookup failed: %s", exc)
+            return 0
+
     # Dark title bar via DWM (Windows 10 19041+ / Windows 11). Matches
     # OLD YTArchiver's `_apply_dark_title_bar` so the window chrome doesn't
     # flash white against the dark body during repaint. Best-effort — any
@@ -1436,16 +1459,8 @@ def main():
     def _apply_dark_titlebar_when_ready():
         try:
             import ctypes as _ct
-            # Wait for the native window handle to exist, up to ~2s
-            for _ in range(40):
-                try:
-                    hwnd = _ct.windll.user32.FindWindowW(None, kwargs["title"])
-                    if hwnd:
-                        break
-                except Exception:
-                    hwnd = 0
-                time.sleep(0.05)
-            else:
+            hwnd = _find_native_window_handle()
+            if not hwnd:
                 return
             # DWMWA_USE_IMMERSIVE_DARK_MODE = 20 on Win 10/11 (19041+);
             # fall back to attribute 19 for older builds.
@@ -1900,19 +1915,6 @@ def main():
     if tray is not None:
         try:
             tray.start()
-            if os.name == "nt":
-                try:
-                    import ctypes as _tray_ctypes
-                    from ctypes import wintypes as _tray_wintypes
-                    _find_window = _tray_ctypes.windll.user32.FindWindowW
-                    _find_window.argtypes = [
-                        _tray_wintypes.LPCWSTR, _tray_wintypes.LPCWSTR]
-                    _find_window.restype = _tray_wintypes.HWND
-                    _tray_hwnd = _find_window(
-                        None, "YTArchiver")
-                    tray.set_window_handle(_tray_hwnd)
-                except Exception as e:
-                    _log.debug("taskbar overlay HWND setup failed: %s", e)
             api.attach_tray(tray)
         except Exception as e:
             _log.debug("tray start failed (continuing window-only): %s", e)
@@ -1925,6 +1927,19 @@ def main():
         _boot_trace("startup callback begin")
         try: api._log_stream.mark_ready()
         except Exception as e: _log.debug("log stream ready failed: %s", e)
+        # create_window() only records pywebview's window description; the
+        # real Win32 HWND appears after webview.start().  Attach it here so
+        # ITaskbarList3 has a valid target.  TrayController also handles this
+        # arriving after a restored queue has already started its spinner.
+        if tray is not None and os.name == "nt":
+            try:
+                _tray_hwnd = _find_native_window_handle()
+                if _tray_hwnd:
+                    tray.set_window_handle(_tray_hwnd)
+                else:
+                    _log.debug("taskbar overlay HWND was not available")
+            except Exception as e:
+                _log.debug("taskbar overlay HWND setup failed: %s", e)
         _start_dark_titlebar_thread()
         try: api.check_dependencies()
         except Exception as e: _log.debug("swallowed: %s", e)

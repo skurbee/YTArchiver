@@ -174,8 +174,17 @@
         if (trafficDaily) {
           trafficDaily.textContent = `24h ${dayUsed}/${dayLimit}`;
         }
-        trafficEl.classList.toggle(
-          "at-limit", hourUsed >= hourLimit || dayUsed >= dayLimit);
+        const setLimitState = (el, used, limit) => {
+          if (!el) return;
+          const atLimit = used >= limit;
+          el.classList.toggle("near-limit", !atLimit && used / limit > 0.8);
+          el.classList.toggle("at-limit", atLimit);
+        };
+        setLimitState(trafficHourly, hourUsed, hourLimit);
+        setLimitState(trafficDaily, dayUsed, dayLimit);
+      } else {
+        trafficHourly?.classList.remove("near-limit", "at-limit");
+        trafficDaily?.classList.remove("near-limit", "at-limit");
       }
     }
   }

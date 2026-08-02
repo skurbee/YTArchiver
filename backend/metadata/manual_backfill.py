@@ -376,7 +376,8 @@ def backfill_manual_video_ids(stream, *,
                          "split_years": False, "split_months": False},
                         sidecar_id, fp, local_title, stream,
                         emit_inline_log=False, refresh=True,
-                        dest_folder=os.path.dirname(fp))
+                        dest_folder=os.path.dirname(fp),
+                        cancel_event=cancel_event)
                 except Exception as e:
                     _log.debug("manual sidecar metadata fetch failed: %s", e)
             if cancel_event is None or not cancel_event.is_set():
@@ -435,7 +436,8 @@ def backfill_manual_video_ids(stream, *,
                          "split_years": False, "split_months": False},
                         best["id"], fp, best.get("title") or local_title,
                         stream, emit_inline_log=False, refresh=True,
-                        dest_folder=os.path.dirname(fp))
+                        dest_folder=os.path.dirname(fp),
+                        cancel_event=cancel_event)
                 except Exception as e:
                     _log.debug("manual backfill metadata fetch failed: %s", e)
         elif decision == "review":

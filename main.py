@@ -178,7 +178,7 @@ from backend.log_stream import LogStreamer
 from backend.queues import QueueState
 from backend.services import AppServices, BridgeEventBus
 from backend.transcribe import TranscribeManager
-from backend.tray import TrayController
+from backend.tray import TrayController, activity_spin_color
 from backend.ytarchiver_config import (
     CONFIG_FILE,
     backup_config_on_start,
@@ -672,7 +672,13 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             # (not spinning) while a pass is paused between channels.
             tray = getattr(self, "_tray", None)
             if tray is not None:
-                if gpu_working:
+                _traffic_waiting = bool(_traffic_wait.get("active"))
+                _spin_color = activity_spin_color(
+                    sync_working=sync_working,
+                    gpu_working=gpu_working,
+                    traffic_waiting=_traffic_waiting,
+                )
+                if _spin_color == "red":
                     job = payload['gpu'][0] if payload['gpu'] else {}
                     label = (job.get("kind") or "").title() or "Processing"
                     target = job.get("name") or job.get("title") or ""
@@ -683,7 +689,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                         tip += f": {target}"
                     tray.start_spin("red")
                     tray.set_tooltip(tip)
-                elif sync_working:
+                elif _spin_color == "blue":
                     job = payload['sync'][0] if payload['sync'] else {}
                     target = job.get("name") or job.get("title") or ""
                     tip = "YTArchiver \u2014 Syncing"
@@ -695,7 +701,16 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     tray.set_tooltip(tip)
                 else:
                     tray.stop_spin()
-                    tray.set_tooltip("YTArchiver \u2014 Idle")
+                    if _traffic_waiting:
+                        _wait_label = (
+                            "24-hour" if _traffic_wait.get("reason")
+                            == "daily_limit" else "hourly"
+                        )
+                        tray.set_tooltip(
+                            "YTArchiver \u2014 Waiting for YouTube "
+                            f"{_wait_label} slot")
+                    else:
+                        tray.set_tooltip("YTArchiver \u2014 Idle")
         except Exception as e:
             _log.debug("swallowed: %s", e)
 

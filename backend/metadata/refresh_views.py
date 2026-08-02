@@ -929,7 +929,8 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 # claimed success.
                 res = fetch_single_video_metadata(
                     channel, vid, fp, title_hint, stream,
-                    emit_inline_log=False, refresh=True)
+                    emit_inline_log=False, refresh=True,
+                    cancel_event=cancel_event)
                 if res.get("ok") and not res.get("skipped"):
                     full_fetched += 1
                 elif not res.get("ok") and not res.get("transient"):

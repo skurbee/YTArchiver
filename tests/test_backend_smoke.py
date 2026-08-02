@@ -13,6 +13,14 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
+# Nothing in the test suite may resolve YTArchiver's persistence constants to
+# the user's real roaming profile.  QueueState writes its current-item sidecar
+# immediately, so mocking individual save calls is not a sufficient guard.
+# Set APPDATA before importing any backend module; the temporary directory
+# remains alive for the lifetime of this test process.
+_TEST_APPDATA = tempfile.TemporaryDirectory(prefix="ytarchiver-tests-")
+os.environ["APPDATA"] = _TEST_APPDATA.name
+
 from backend import (
     archive_capacity,
     archive_scan,
@@ -742,6 +750,16 @@ class TrayControllerTests(unittest.TestCase):
 
         def copy(self):
             return TrayControllerTests.FakeImage(self.name + "-copy")
+
+    def test_traffic_wait_parks_sync_spinner_but_not_active_gpu(self) -> None:
+        self.assertIsNone(tray_backend.activity_spin_color(
+            sync_working=True, gpu_working=False, traffic_waiting=True))
+        self.assertEqual(tray_backend.activity_spin_color(
+            sync_working=True, gpu_working=False, traffic_waiting=False),
+            "blue")
+        self.assertEqual(tray_backend.activity_spin_color(
+            sync_working=True, gpu_working=True, traffic_waiting=True),
+            "red")
 
     def test_tray_keepalive_reapplies_title_icon_and_reregisters(self) -> None:
         ctrl = tray_backend.TrayController(tooltip="YT Archiver")
@@ -1717,6 +1735,20 @@ class MetadataFetcherTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_fetch_video_metadata_passes_log_stream_to_traffic_wait(self) -> None:
+        stream = mock.Mock()
+        cancel_event = threading.Event()
+        with mock.patch.object(
+                youtube_traffic, "acquire",
+                return_value={"ok": False, "cancelled": True}) as acquire:
+            result = metadata_fetcher._fetch_video_metadata(
+                "yt-dlp", "abc123_def4", "Hint", stream=stream,
+                cancel_event=cancel_event)
+
+        self.assertIsNone(result)
+        acquire.assert_called_once_with(
+            "video_metadata", cancel_event=cancel_event, stream=stream)
+
     def test_fetch_single_metadata_invalidates_browse_cache_after_thumbnail(
             self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1743,7 +1775,7 @@ class MetadataFetcherTests(unittest.TestCase):
                                       "_write_metadata_jsonl"), \
                     mock.patch.object(metadata_fetcher,
                                       "_fetch_video_metadata",
-                                      return_value=entry), \
+                                      return_value=entry) as fetch, \
                     mock.patch.object(metadata_fetcher,
                                       "_ensure_thumbnails_dir",
                                       return_value=str(root / ".Thumbnails")), \
@@ -1761,6 +1793,7 @@ class MetadataFetcherTests(unittest.TestCase):
                 )
 
             self.assertTrue(result["ok"])
+            self.assertIs(fetch.call_args.kwargs["stream"], stream)
             invalidate.assert_called_once_with("Channel")
 
 
@@ -4134,6 +4167,85 @@ class YouTubeTrafficGovernorTests(unittest.TestCase):
         self.assertEqual(after_refund["daily_used"], 1)
         self.assertEqual(after_refund["hourly_used"], 1)
 
+    def test_reservation_refund_cannot_mask_later_daily_traffic(self) -> None:
+        cfg = self._cfg(
+            youtube_traffic_custom_hourly=10,
+            youtube_traffic_custom_min_gap=0,
+            youtube_traffic_custom_max_gap=0,
+        )
+        with mock.patch.object(youtube_traffic, "load_config",
+                               return_value=cfg):
+            with mock.patch.object(youtube_traffic.time, "time",
+                                   return_value=1000.0):
+                reservation = youtube_traffic.reserve_sweep(cfg)
+            with mock.patch.object(youtube_traffic.time, "time",
+                                   return_value=1100.0):
+                with youtube_traffic.reservation_scope(
+                        reservation["reservation_id"]):
+                    self.assertTrue(
+                        youtube_traffic.acquire("channel_sync")["ok"])
+            with mock.patch.object(youtube_traffic.time, "time",
+                                   return_value=1500.0):
+                self.assertTrue(youtube_traffic.acquire("manual")["ok"])
+            with mock.patch.object(youtube_traffic.time, "time",
+                                   return_value=2000.0):
+                refund = youtube_traffic.finish_reservation(
+                    reservation["reservation_id"])
+
+            # The reservation expires at t=87400.  Its old implementation's
+            # later negative refund remained until t=88400 and hid this
+            # unrelated manual operation during that one-hour gap.
+            check = youtube_traffic.eligibility(
+                cfg=cfg, now=87500.0, include_gap=False)
+
+        self.assertEqual(refund["refunded"], 4)
+        self.assertEqual(check["daily_used"], 1)
+        self.assertFalse(any(
+            row.get("kind") == "autosync_sweep_refund"
+            for row in youtube_traffic._events))
+
+    def test_legacy_negative_refund_is_folded_into_reservation(self) -> None:
+        cfg = self._cfg(youtube_traffic_custom_hourly=10)
+        rows = [
+            {"ts": 1000.0, "daily_units": 5, "hourly_units": 0,
+             "kind": "autosync_sweep_reservation", "reservation_id": "r1"},
+            {"ts": 1500.0, "daily_units": 1, "hourly_units": 1,
+             "kind": "manual", "reservation_id": ""},
+            {"ts": 2000.0, "daily_units": -4, "hourly_units": 0,
+             "kind": "autosync_sweep_refund", "reservation_id": "r1"},
+        ]
+        youtube_traffic.TRAFFIC_FILE.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8")
+
+        with mock.patch.object(youtube_traffic.time, "time",
+                               return_value=87500.0):
+            check = youtube_traffic.eligibility(
+                cfg=cfg, now=87500.0, include_gap=False)
+
+        persisted = youtube_traffic.TRAFFIC_FILE.read_text(encoding="utf-8")
+        self.assertEqual(check["daily_used"], 1)
+        self.assertNotIn("autosync_sweep_refund", persisted)
+
+    def test_traffic_launch_and_reservation_fail_closed_on_append_error(
+            self) -> None:
+        cfg = self._cfg(
+            youtube_traffic_custom_hourly=10,
+            youtube_traffic_custom_min_gap=0,
+            youtube_traffic_custom_max_gap=0,
+        )
+        with mock.patch.object(youtube_traffic, "load_config",
+                               return_value=cfg), \
+                mock.patch.object(youtube_traffic, "_append_locked",
+                                  return_value=False):
+            launch = youtube_traffic.acquire("video_metadata")
+            reservation = youtube_traffic.reserve_sweep(cfg)
+
+        self.assertFalse(launch["ok"])
+        self.assertTrue(launch["ledger_error"])
+        self.assertFalse(reservation["ok"])
+        self.assertTrue(reservation["ledger_error"])
+
     def test_sweep_can_exceed_hourly_limit_and_still_reserve(self) -> None:
         cfg = self._cfg(youtube_traffic_custom_hourly=2)
         with mock.patch.object(youtube_traffic.time, "time",
@@ -4185,6 +4297,43 @@ class YouTubeTrafficGovernorTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, {"ok": False, "paused": True})
         self.assertFalse(youtube_traffic.wait_status()["active"])
+
+    def test_short_hourly_wait_is_not_silenced(self) -> None:
+        blocked = {
+            "allowed": False,
+            "impossible": False,
+            "wait_seconds": 1.0,
+            "wait_reason": "hourly_limit",
+            "hourly_used": 1,
+            "daily_used": 1,
+            "settings": {"hourly": 1, "daily": 10},
+        }
+        pause_event = threading.Event()
+        stream = mock.Mock()
+        result: dict[str, object] = {}
+
+        with mock.patch.object(youtube_traffic, "load_config",
+                               return_value=self._cfg()), \
+                mock.patch.object(youtube_traffic, "eligibility",
+                                  return_value=blocked):
+            worker = threading.Thread(target=lambda: result.update(
+                youtube_traffic.acquire(
+                    "video_metadata", pause_event=pause_event,
+                    stream=stream)))
+            worker.start()
+            deadline = time.time() + 1
+            while not stream.emit.called and time.time() < deadline:
+                time.sleep(0.01)
+            segments = (stream.emit.call_args.args[0]
+                        if stream.emit.called else [])
+            pause_event.set()
+            worker.join(timeout=1)
+
+        self.assertTrue(stream.emit.called)
+        message = "".join(part[0] for part in segments)
+        self.assertIn("hourly limit reached (1/1)", message)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, {"ok": False, "paused": True})
 
     def test_hourly_wait_can_be_overridden_for_current_pass(self) -> None:
         cfg = self._cfg(

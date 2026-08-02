@@ -435,6 +435,37 @@ def _read_events_locked() -> None:
                     continue
     except Exception as exc:
         _log.warning("YouTube traffic ledger read failed: %s", exc)
+
+    # v82.5 originally refunded unused autosync capacity by appending a
+    # negative event at sweep completion.  Because rolling windows expire
+    # events by their own timestamp, the positive reservation could expire
+    # before its later negative refund.  During that gap the orphan refund
+    # masked unrelated YouTube operations and understated daily usage.
+    #
+    # Fold legacy refunds back into their original reservation timestamp.
+    # If an older build already pruned the matching reservation, discard the
+    # orphan negative row; it must never offset unrelated positive traffic.
+    legacy_refunds = False
+    reservations_by_id = {
+        str(row.get("reservation_id") or ""): row
+        for row in rows
+        if row.get("kind") == "autosync_sweep_reservation"
+        and row.get("reservation_id")
+    }
+    normalized_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("kind") != "autosync_sweep_refund":
+            normalized_rows.append(row)
+            continue
+        legacy_refunds = True
+        reservation = reservations_by_id.get(
+            str(row.get("reservation_id") or ""))
+        refund = max(0, -int(row.get("daily_units") or 0))
+        if reservation is not None and refund:
+            reservation["daily_units"] = max(
+                0, int(reservation.get("daily_units") or 0) - refund)
+    rows = normalized_rows
+
     _events = sorted(rows, key=lambda item: item["ts"])
     positive = [
         row["ts"] for row in _events
@@ -444,9 +475,11 @@ def _read_events_locked() -> None:
     _last_launch_ts = max(positive, default=0.0)
     _loaded = True
     _prune_locked(time.time())
+    if legacy_refunds:
+        _rewrite_locked()
 
 
-def _rewrite_locked() -> None:
+def _rewrite_locked() -> bool:
     try:
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
         temp = Path(str(TRAFFIC_FILE) + f".{os.getpid()}.tmp")
@@ -456,12 +489,19 @@ def _rewrite_locked() -> None:
         )
         temp.write_text(payload, encoding="utf-8")
         os.replace(temp, TRAFFIC_FILE)
+        return True
     except Exception as exc:
         _log.warning("YouTube traffic ledger rewrite failed: %s", exc)
+        return False
 
 
-def _append_locked(row: dict[str, Any]) -> None:
-    _events.append(row)
+def _append_locked(row: dict[str, Any]) -> bool:
+    """Persist and then register one traffic event.
+
+    Returning False lets callers fail closed before a YouTube launch.  The
+    in-memory ledger is updated only after the persistent append succeeds, so a
+    refused launch does not consume a phantom budget unit for this process.
+    """
     try:
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
         with TRAFFIC_FILE.open("a", encoding="utf-8") as handle:
@@ -469,6 +509,9 @@ def _append_locked(row: dict[str, Any]) -> None:
                 row, ensure_ascii=False, separators=(",", ":")) + "\n")
     except Exception as exc:
         _log.warning("YouTube traffic ledger append failed: %s", exc)
+        return False
+    _events.append(row)
+    return True
 
 
 def _prune_locked(now: float) -> None:
@@ -718,9 +761,7 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
                 if allowed:
                     settings = effective_settings(cfg)
                     if reserved_available:
-                        reservation["remaining"] = (
-                            int(reservation["remaining"]) - requested)
-                        _append_locked({
+                        persisted = _append_locked({
                             "ts": now,
                             "daily_units": 0,
                             "hourly_units": requested,
@@ -728,13 +769,24 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
                             "reservation_id": reservation_id,
                         })
                     else:
-                        _append_locked({
+                        persisted = _append_locked({
                             "ts": now,
                             "daily_units": requested,
                             "hourly_units": requested,
                             "kind": str(kind or "youtube"),
                             "reservation_id": "",
                         })
+                    if not persisted:
+                        return {
+                            "ok": False,
+                            "ledger_error": True,
+                            "error": (
+                                "YouTube traffic usage could not be saved, "
+                                "so the remote operation was not launched."),
+                        }
+                    if reserved_available:
+                        reservation["remaining"] = (
+                            int(reservation["remaining"]) - requested)
                     _last_launch_ts = now
                     _next_gap_seconds = random.uniform(
                         float(settings["min_gap"]),
@@ -762,7 +814,15 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
             else:
                 _set_wait_state(None)
 
-            if not announced and stream is not None and wait_seconds >= 5:
+            # A rolling-limit stop is meaningful even when the next event
+            # expires in only a few seconds: without this line the UI appears
+            # to stutter between requests with no explanation.  Keep the
+            # five-second noise filter only for ordinary spacing waits.
+            should_announce = (
+                wait_reason in ("hourly_limit", "daily_limit")
+                or wait_seconds >= 5
+            )
+            if not announced and stream is not None and should_announce:
                 announced = True
                 try:
                     resume = time.strftime(
@@ -870,13 +930,27 @@ def reserve_sweep(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
                 "units": units,
                 "estimate": estimate,
             }
-        _append_locked({
+        persisted = _append_locked({
             "ts": now,
             "daily_units": units,
             "hourly_units": 0,
             "kind": "autosync_sweep_reservation",
             "reservation_id": reservation_id,
         })
+        if not persisted:
+            return {
+                "ok": False,
+                "ledger_error": True,
+                "budget_blocked": True,
+                "impossible": False,
+                "next_ts": None,
+                "wait_seconds": None,
+                "units": units,
+                "estimate": estimate,
+                "error": (
+                    "YouTube traffic usage could not be saved, so the "
+                    "scheduled sync was not started."),
+            }
         _reservations[reservation_id] = {
             "reserved": units,
             "remaining": units,
@@ -901,7 +975,12 @@ def reservation_scope(reservation_id: str | None):
 
 
 def finish_reservation(reservation_id: str | None) -> dict[str, Any]:
-    """Refund unused reserved units after a cleanly-ended sweep."""
+    """Reduce a sweep's original reservation to its actual usage.
+
+    The adjustment stays at the reservation timestamp.  Appending a later
+    negative refund would let the positive row expire first and briefly mask
+    unrelated traffic near the rolling 24-hour boundary.
+    """
     rid = str(reservation_id or "")
     if not rid:
         return {"ok": True, "refunded": 0}
@@ -912,15 +991,27 @@ def finish_reservation(reservation_id: str | None) -> dict[str, Any]:
             # charged for the remainder of its rolling window.
             return {"ok": True, "refunded": 0}
         unused = max(0, int(reservation.get("remaining") or 0))
-        if unused:
-            _append_locked({
-                "ts": time.time(),
-                "daily_units": -unused,
-                "hourly_units": 0,
-                "kind": "autosync_sweep_refund",
-                "reservation_id": rid,
-            })
-        return {"ok": True, "refunded": unused}
+        if not unused:
+            return {"ok": True, "refunded": 0}
+        reservation_row = next((
+            row for row in _events
+            if row.get("kind") == "autosync_sweep_reservation"
+            and str(row.get("reservation_id") or "") == rid
+        ), None)
+        if reservation_row is None:
+            # A sweep lasting beyond the rolling window needs no refund: its
+            # original charge has already expired.  Never create an orphan
+            # negative event that could offset other operations.
+            return {"ok": True, "refunded": 0}
+        before = max(0, int(reservation_row.get("daily_units") or 0))
+        refunded = min(before, unused)
+        reservation_row["daily_units"] = before - refunded
+        persisted = _rewrite_locked()
+        return {
+            "ok": True,
+            "refunded": refunded,
+            "persisted": persisted,
+        }
 
 
 def status(cfg: dict[str, Any] | None = None) -> dict[str, Any]:

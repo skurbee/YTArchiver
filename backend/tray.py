@@ -29,6 +29,16 @@ ICON_CANDIDATES = [
 ]
 
 
+def activity_spin_color(*, sync_working: bool, gpu_working: bool,
+                        traffic_waiting: bool) -> str | None:
+    """Return the native activity-spinner color, or ``None`` when parked."""
+    if gpu_working:
+        return "red"
+    if sync_working and not traffic_waiting:
+        return "blue"
+    return None
+
+
 def _find_icon() -> Path | None:
     for p in ICON_CANDIDATES:
         if p.exists():

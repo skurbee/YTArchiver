@@ -99,6 +99,8 @@ def _fetch_video_metadata(yt: str, video_id: str,
                           title_hint: str = "",
                           proc_registry: "set[subprocess.Popen] | None" = None,
                           error_out: "list[str] | None" = None,
+                          stream: LogStreamer | None = None,
+                          cancel_event: threading.Event | None = None,
                           ) -> dict[str, Any] | None:
     """Fetch metadata for a single video via yt-dlp --dump-json.
     Returns the OLD-schema dict, or None on failure.
@@ -133,7 +135,8 @@ def _fetch_video_metadata(yt: str, video_id: str,
     _attempts = (60, 60, 90)
     for _attempt_idx, _attempt_timeout in enumerate(_attempts):
         from .. import youtube_traffic
-        permission = youtube_traffic.acquire("video_metadata")
+        permission = youtube_traffic.acquire(
+            "video_metadata", cancel_event=cancel_event, stream=stream)
         if not permission.get("ok"):
             if error_out is not None:
                 error_out.append(
@@ -307,6 +310,7 @@ def fetch_single_video_metadata(channel: dict[str, Any],
                                 emit_inline_log: bool = True,
                                 refresh: bool = False,
                                 dest_folder: str | None = None,
+                                cancel_event: threading.Event | None = None,
                                 ) -> dict[str, Any]:
     """Fetch metadata for ONE just-downloaded video, inline per-video.
 
@@ -367,7 +371,8 @@ def fetch_single_video_metadata(channel: dict[str, Any],
 
     _fetch_errors: list[str] = []
     entry = _fetch_video_metadata(
-        yt, video_id, title_hint, error_out=_fetch_errors)
+        yt, video_id, title_hint, error_out=_fetch_errors,
+        stream=stream, cancel_event=cancel_event)
     if isinstance(entry, dict) and entry.get("_youtube_failure"):
         kind = str(entry["_youtube_failure"])
         return {
@@ -722,7 +727,8 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                         time.sleep(_random.uniform(0, 0.2))
                         _fut = _pf_pool.submit(
                             _fetch_video_metadata, yt, _pf_vid, _pf_title,
-                            _local_procs)
+                            proc_registry=_local_procs, stream=stream,
+                            cancel_event=cancel_event)
                         _pf_futs[_fut] = _pf_vid
                     for _fut in _cf.as_completed(_pf_futs):
                         if cancel_event is not None and cancel_event.is_set():
@@ -866,7 +872,9 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
             elif vid_id in _prefetched:
                 entry = _prefetched[vid_id]
             else:
-                entry = _fetch_video_metadata(yt, vid_id, title)
+                entry = _fetch_video_metadata(
+                    yt, vid_id, title, stream=stream,
+                    cancel_event=cancel_event)
             if isinstance(entry, dict) and entry.get("_youtube_failure"):
                 kind = str(entry["_youtube_failure"])
                 _clear_active()

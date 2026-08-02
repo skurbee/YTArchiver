@@ -1194,7 +1194,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     time.sleep(0.5)
                 from .. import metadata as _meta
                 res = _meta.fetch_single_video_metadata(
-                    _ch_snapshot, vid_id, final_path, title, stream)
+                    _ch_snapshot, vid_id, final_path, title, stream,
+                    cancel_event=cancel_event)
                 if res.get("ok") and res.get("fetched"):
                     _bump_meta_counts("fetched")
                 elif res.get("ok") and res.get("skipped"):

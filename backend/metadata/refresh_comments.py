@@ -221,7 +221,8 @@ def refresh_channel_comments(channel: dict[str, Any],
         try:
             res = fetch_single_video_metadata(
                 channel, vid, fp, title_hint, stream,
-                emit_inline_log=False, refresh=True)
+                emit_inline_log=False, refresh=True,
+                cancel_event=cancel_event)
             if res.get("ok"):
                 fetched += 1
                 # Did the comments actually change? Python list-

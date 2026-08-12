@@ -1007,6 +1007,45 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 s.emit_error(f"Disk scan error: {e}")
                 _flush_now()
 
+        def _start_subscriber_backfill():
+            """Recover missing card counts without delaying app readiness."""
+            def _run():
+                try:
+                    from backend.subscriber_counts import (
+                        backfill_missing_counts,
+                    )
+                    current_cfg = self._config or load_config()
+                    result = backfill_missing_counts(
+                        list(current_cfg.get("channels", []) or []))
+                    updated = int(result.get("updated") or 0)
+                    failed = int(result.get("failed") or 0)
+                    excluded = int(result.get("excluded") or 0)
+                    deferred = int(result.get("deferred") or 0)
+                    if updated and self._window is not None:
+                        # refreshSubsTable fans into _primeBrowse, so visible
+                        # channel cards pick up the new counts immediately.
+                        self._window.evaluate_js(
+                            "window.refreshSubsTable && "
+                            "window.refreshSubsTable();")
+                    if updated or failed or excluded or deferred:
+                        summary = f" Subscriber counts: {updated} recovered"
+                        if failed:
+                            summary += f", {failed} still unavailable"
+                        if excluded:
+                            summary += f", {excluded} excluded after 3 attempts"
+                        if deferred:
+                            summary += f", {deferred} deferred"
+                        summary += "."
+                        s.emit_dim(summary)
+                        _flush_now()
+                except Exception as exc:
+                    _log.debug("subscriber-count launch backfill failed: %s",
+                               exc)
+
+            threading.Thread(
+                target=_run, daemon=True,
+                name="subscriber-count-backfill").start()
+
         # Stage 3: low-priority background sweep.
         def _stage3_sweep():
             """Run the archive sweep after disk state is known."""
@@ -1148,6 +1187,11 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             try:
                 _stage2_disk_walk()
                 _stage3_sweep()
+                # Start only after the local sweep finishes: it guarantees
+                # normal cache rows exist and avoids racing the sweep's final
+                # disk-cache merge. This remains independent background work,
+                # so traffic spacing never delays app readiness.
+                _start_subscriber_backfill()
             finally:
                 # Budget-based auto-sync is restored from config before the
                 # window exists. Release its boot gate only after local

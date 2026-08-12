@@ -49,9 +49,23 @@
     return `linear-gradient(135deg, hsl(${hue}, 55%, 28%) 0%, hsl(${hue2}, 60%, 18%) 100%)`;
   }
 
+  const compactCountFormatter = new Intl.NumberFormat(undefined, {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  });
+
+  function compactCount(value) {
+    const count = Number(value);
+    if (!Number.isFinite(count)) return "";
+    return compactCountFormatter.format(count);
+  }
+
   function _buildChannelCard(c, index) {
     const name = c.folder || c.name || "";
-    const vids = c.n_vids || c.video_count || "\u2014";
+    const rawVids = c.n_vids ?? c.video_count;
+    const vids = Number.isFinite(Number(rawVids))
+      ? Number(rawVids).toLocaleString()
+      : "\u2014";
     const size = c.size || "";
     const first = (name[0] || "?").toUpperCase();
 
@@ -128,8 +142,30 @@
       dot.title = `Unfinished redownload at ${savedLabel}`;
       nameEl.appendChild(dot);
     }
-    card.querySelector(".channel-card-meta").textContent =
-      `${vids}${vids && vids !== "\u2014" ? " videos" : ""}${size ? " \u00b7 " + size : ""}`;
+    const metaEl = card.querySelector(".channel-card-meta");
+    const addMetaLine = (parts) => {
+      const line = document.createElement("div");
+      line.className = "channel-card-meta-line";
+      for (const part of parts) {
+        const item = document.createElement("span");
+        item.textContent = part;
+        line.appendChild(item);
+      }
+      metaEl.appendChild(line);
+    };
+    if (c.subscriber_count !== null && c.subscriber_count !== undefined) {
+      const count = Number(c.subscriber_count);
+      const formatted = compactCount(count);
+      if (formatted) {
+        const label = count === 1 ? "subscriber" : "subscribers";
+        addMetaLine([`${formatted} ${label}`]);
+      }
+    }
+    const archiveParts = [
+      `${vids}${vids !== "\u2014" ? " videos" : ""}`,
+    ];
+    if (size) archiveParts.push(size);
+    addMetaLine(archiveParts);
 
     // Swap to gradient if the banner image fails to load.
     const bgEl = card.querySelector(".channel-card-bg");

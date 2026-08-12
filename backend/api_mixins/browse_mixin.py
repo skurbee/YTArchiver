@@ -463,24 +463,50 @@ class BrowseMixin:
         # is discovery/index time and can jump today when a rescan finds an
         # old file, which made 15-year-old channels sort as freshly downloaded.
         last_added: dict[str, float] = {}
+        latest_filepaths: dict[str, str] = {}
         try:
             from backend import index as _idx
             _conn = _idx._reader_open()
             if _conn is not None:
                 with _idx._reader_lock:
-                    for _cn, _mx in _conn.execute(
-                            "SELECT channel, MAX(downloaded_ts) FROM videos "
+                    for _cn, _mx, _fp in _conn.execute(
+                            "SELECT channel, MAX(downloaded_ts), filepath "
+                            "FROM videos "
                             "WHERE is_duplicate_of IS NULL AND "
                             "COALESCE(availability, 'available')='available' "
                             "GROUP BY channel"):
                         if _cn:
-                            last_added[_cn.strip().lower()] = float(_mx or 0)
+                            _key = _cn.strip().lower()
+                            last_added[_key] = float(_mx or 0)
+                            if _fp:
+                                latest_filepaths[_key] = _fp
         except Exception as e:
             _log.debug("last_added query failed: %s", e)
         out = []
+        subscriber_cache_updates: dict[str, int | None] = {}
         for ch in channels:
             st = archive_scan.stats_for_channel(ch, cache)
             name = ch.get("name") or ch.get("folder", "")
+            name_key = (name or "").strip().lower()
+            ch_url = (ch.get("url") or "").strip()
+            cache_rec = cache.get(ch_url) if ch_url else None
+            subscriber_count = None
+            if (isinstance(cache_rec, dict)
+                    and "subscriber_count_checked_at" in cache_rec):
+                raw_count = cache_rec.get("subscriber_count")
+                if raw_count is not None:
+                    try:
+                        subscriber_count = int(raw_count)
+                    except (TypeError, ValueError):
+                        subscriber_count = None
+            else:
+                # Existing installs already have the value in yt-dlp's raw
+                # sidecar metadata. Read one recent sidecar per channel once,
+                # then persist the tiny scalar in the normal disk cache.
+                subscriber_count = archive_scan.subscriber_count_from_media(
+                    latest_filepaths.get(name_key, ""))
+                if ch_url:
+                    subscriber_cache_updates[ch_url] = subscriber_count
             # Resolve the channel folder and prefer the cached small
             # thumbs (ensure_* creates them lazily if missing). The
             # full-resolution banners are 2+ MP / ~350 KB each; decoding
@@ -537,7 +563,8 @@ class BrowseMixin:
                 "size_bytes": st["size_bytes"],
                 "size_gb": st["size_gb"],
                 "size": archive_scan._fmt_size(st["size_bytes"]),
-                "last_added_ts": last_added.get((name or "").strip().lower(), 0),
+                "last_added_ts": last_added.get(name_key, 0),
+                "subscriber_count": subscriber_count,
                 "avatar_url": avatar_url,
                 "banner_url": banner_url,
                 # Pending counters for live-count context-menu labels.
@@ -547,6 +574,8 @@ class BrowseMixin:
                 "_pending_redownload": pending_redownload,
                 "_redownload_res": redownload_res,
             })
+        if subscriber_cache_updates:
+            archive_scan.cache_subscriber_counts(subscriber_cache_updates)
         out.sort(key=lambda c: (c["name"] or "").lower())
         return out
 

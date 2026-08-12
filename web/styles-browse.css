@@ -146,17 +146,32 @@
 .browse-add-channel-btn:active { transform: translateY(0); }
 .browse-add-channel-btn[hidden] { display: none !important; }
 .browse-add-channel-icon {
-  display: inline-grid;
-  place-items: center;
+  position: relative;
+  display: inline-block;
+  flex: 0 0 18px;
   width: 18px;
   height: 18px;
   border-radius: 50%;
   background: var(--c-accent);
   color: var(--c-bg);
-  font-size: 16px;
-  font-weight: 800;
-  line-height: 1;
+  font-size: 0;
   transition: background 0.14s;
+}
+.browse-add-channel-icon::before,
+.browse-add-channel-icon::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 8px;
+  height: 2px;
+  border-radius: 1px;
+  background: currentColor;
+  transform: translate(-50%, -50%);
+}
+.browse-add-channel-icon::after {
+  width: 2px;
+  height: 8px;
 }
 .browse-sort-wrap[hidden],
 .browse-find-wrap[hidden],

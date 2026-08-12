@@ -226,13 +226,21 @@
 
   // Browse > Channels grid sort. Default A–Z. Keys map to fields the
   // backend (browse_list_channels) returns: name/folder, last_added_ts,
-  // n_vids, size_bytes.
+  // subscriber_count, n_vids, size_bytes.
   let _channelSort = "name";
   function _sortChannels(list) {
     const arr = (list || []).slice();
     const by = _channelSort;
     arr.sort((a, b) => {
       if (by === "recent") return (b.last_added_ts || 0) - (a.last_added_ts || 0);
+      if (by === "subscribers") {
+        const aKnown = a.subscriber_count !== null && a.subscriber_count !== undefined;
+        const bKnown = b.subscriber_count !== null && b.subscriber_count !== undefined;
+        if (aKnown !== bKnown) return aKnown ? -1 : 1;
+        if (aKnown && Number(a.subscriber_count) !== Number(b.subscriber_count)) {
+          return Number(b.subscriber_count) - Number(a.subscriber_count);
+        }
+      }
       if (by === "videos") return (Number(b.n_vids) || 0) - (Number(a.n_vids) || 0);
       if (by === "size")   return (b.size_bytes || 0) - (a.size_bytes || 0);
       return String(a.folder || a.name || "").localeCompare(

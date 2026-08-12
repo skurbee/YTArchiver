@@ -183,12 +183,28 @@
   vertical-align: 1px;
 }
 .channel-card-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
   color: rgba(255, 255, 255, 0.82);
   font-size: var(--fs-sm);
+  line-height: 1.15;
   text-shadow: 0 1px 3px rgba(0,0,0,0.7);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+}
+.channel-card-meta-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  min-width: 0;
+  column-gap: 5px;
+}
+.channel-card-meta-line > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.channel-card-meta-line > span + span::before {
+  content: "\00b7";
+  margin-right: 5px;
 }
 /* Circular profile-picture overlay (bottom-left, YouTube-style). */
 .channel-avatar {

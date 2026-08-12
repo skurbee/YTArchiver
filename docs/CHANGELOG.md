@@ -6,6 +6,22 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v83.0 - 2026-08-12
+
+### Added
+- **Browse channel cards now show subscriber counts.** Counts use compact formatting, remain readable alongside video and storage totals, and support a new Most subscribed sort with unavailable values kept at the end.
+- **Missing subscriber counts recover automatically from configured channel URLs.** A traffic-governed launch worker reads channel-level metadata, falls back to recent video metadata when needed, and refreshes Browse after successful recovery.
+
+### Fixed
+- **Subscriber recovery avoids permanent failures from temporary conditions.** Network, traffic-budget, session, and tool failures defer the remaining pass without consuming a retry; genuinely unavailable counts are excluded only after three consecutive launches.
+- **Archive scans preserve subscriber metadata.** Full scans, per-channel stat refreshes, and newly downloaded sidecars retain or refresh counts without wiping retry state.
+- **Browse channel-card details no longer truncate stored totals.** Metadata wraps cleanly across dedicated lines, and the Add Channel plus is geometrically centered in its circular badge.
+
+### Validation
+- Backend smoke suite passed: 471 tests.
+- Frontend JavaScript syntax checks, generated HTML freshness, Python compile checks, and `git diff --check` passed.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
 ## v82.9 - 2026-08-11
 
 ### Added

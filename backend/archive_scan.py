@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,77 @@ from .log import get_logger
 from .ytarchiver_config import DISK_CACHE_FILE, load_config
 
 _log = get_logger(__name__)
+
+
+_CHANNEL_FOLLOWER_RE = re.compile(
+    br'"channel_follower_count"\s*:\s*([0-9]+)')
+_SUBSCRIBER_CACHE_FIELDS = (
+    "subscriber_count",
+    "subscriber_count_checked_at",
+    "subscriber_fetch_failures",
+    "subscriber_fetch_excluded",
+    "subscriber_fetch_last_attempt_ts",
+    "subscriber_fetch_last_error",
+)
+
+
+def subscriber_count_from_media(filepath: str) -> int | None:
+    """Read yt-dlp's captured channel follower count beside one video.
+
+    ``.info.json`` files can be several megabytes because they include every
+    format and subtitle URL. Scan them in chunks for the one scalar field
+    instead of loading the full JSON document into memory.
+    """
+    if not filepath:
+        return None
+    media = Path(filepath)
+    candidates = (
+        media.with_name(media.stem + ".info.json"),
+        Path(str(media) + ".info.json"),
+    )
+    for sidecar in dict.fromkeys(candidates):
+        try:
+            with sidecar.open("rb") as stream:
+                tail = b""
+                while chunk := stream.read(64 * 1024):
+                    buf = tail + chunk
+                    match = _CHANNEL_FOLLOWER_RE.search(buf)
+                    if match:
+                        return int(match.group(1))
+                    # Preserve enough overlap for a key split between chunks.
+                    tail = buf[-96:]
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _latest_subscriber_count(channel_name: str) -> int | None:
+    """Best-effort count from the three newest indexed videos in a channel."""
+    if not channel_name:
+        return None
+    try:
+        from . import index as _idx
+        conn = _idx._reader_open()
+        if conn is None:
+            return None
+        with _idx._reader_lock:
+            rows = conn.execute(
+                "SELECT filepath FROM videos "
+                "WHERE channel=? COLLATE NOCASE AND filepath IS NOT NULL "
+                "AND filepath != '' AND is_duplicate_of IS NULL AND "
+                "COALESCE(availability, 'available')='available' "
+                "ORDER BY COALESCE(downloaded_ts, added_ts, 0) DESC, id DESC "
+                "LIMIT 3",
+                (channel_name,),
+            ).fetchall()
+        for row in rows:
+            count = subscriber_count_from_media(row[0] or "")
+            if count is not None:
+                return count
+    except Exception as exc:
+        _log.debug("subscriber-count lookup failed for %r: %s",
+                   channel_name, exc)
+    return None
 
 
 # Single source of truth in backend.fs_search so the per-channel disk count
@@ -139,6 +211,7 @@ def update_disk_cache_for_channel(channel: dict[str, Any],
     # prune, so its totals match the walk. Fall back to the walk when the DB
     # has no rows for this channel yet (brand-new / unindexed) or is down.
     n_vids = total_bytes = None
+    latest_downloaded_ts = 0.0
     try:
         if force_filesystem:
             raise LookupError("filesystem refresh requested")
@@ -149,7 +222,8 @@ def update_disk_cache_for_channel(channel: dict[str, Any],
             if _nm:
                 with _idx._reader_lock:
                     _row = _conn.execute(
-                        "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) "
+                        "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0), "
+                        "MAX(downloaded_ts) "
                         "FROM videos WHERE channel=? COLLATE NOCASE "
                         # Exclude duplicate rows so this DB fast-path agrees
                         # with the filesystem walk (which subtracts dups) AND
@@ -161,6 +235,7 @@ def update_disk_cache_for_channel(channel: dict[str, Any],
                         (_nm,)).fetchone()
                 if _row and _row[0]:
                     n_vids, total_bytes = int(_row[0]), int(_row[1])
+                    latest_downloaded_ts = float(_row[2] or 0)
     except LookupError:
         n_vids = total_bytes = None
     except Exception as e:
@@ -174,6 +249,21 @@ def update_disk_cache_for_channel(channel: dict[str, Any],
         from pathlib import Path as _P
         n_vids, total_bytes = scan_channel_folder(_P(base), channel)
     url = channel.get("url", "").strip()
+    subscriber_count = None
+    subscriber_checked = False
+    if url and latest_downloaded_ts:
+        previous = load_disk_cache().get(url)
+        previous_checked_at = 0.0
+        if isinstance(previous, dict):
+            previous_checked_at = float(
+                previous.get("subscriber_count_checked_at") or 0)
+        # Re-read a sidecar only after a newer completed download. This keeps
+        # all-channel size rescans from repeatedly touching the archive pool.
+        if latest_downloaded_ts > previous_checked_at:
+            channel_name = (
+                channel.get("name") or channel.get("folder") or "").strip()
+            subscriber_count = _latest_subscriber_count(channel_name)
+            subscriber_checked = True
     if url:
         with _CACHE_LOCK:
             cache = load_disk_cache()
@@ -186,13 +276,96 @@ def update_disk_cache_for_channel(channel: dict[str, Any],
             # Preserve the sweep fingerprint across stat refreshes —
             # replacing the whole record dropped it and forced a full
             # fingerprint re-walk on the next sweep.
-            if isinstance(_prev, dict) and "sweep_fingerprint" in _prev:
-                _rec["sweep_fingerprint"] = _prev["sweep_fingerprint"]
+            if isinstance(_prev, dict):
+                for key in ("sweep_fingerprint", *_SUBSCRIBER_CACHE_FIELDS):
+                    if key in _prev:
+                        _rec[key] = _prev[key]
+            if subscriber_checked:
+                _rec["subscriber_count"] = subscriber_count
+                _rec["subscriber_count_checked_at"] = time.time()
+                if subscriber_count is not None:
+                    _rec["subscriber_fetch_failures"] = 0
+                    _rec["subscriber_fetch_excluded"] = False
+                    _rec.pop("subscriber_fetch_last_error", None)
             cache[url] = _rec
             save_disk_cache(cache)
     return {"n_vids": n_vids,
             "size_bytes": total_bytes,
             "size_gb": total_bytes / (1024 ** 3)}
+
+
+def cache_subscriber_counts(updates: dict[str, int | None]) -> bool:
+    """Merge Browse's one-time subscriber backfill into the disk cache."""
+    if not updates:
+        return True
+    changed = False
+    with _CACHE_LOCK:
+        cache = load_disk_cache()
+        checked_at = time.time()
+        for url, count in updates.items():
+            rec = cache.get(url)
+            # Never create a subscriber-only cache row: the startup sweep
+            # intentionally treats rows without the normal size fields as
+            # corrupt and would otherwise churn them on every launch.
+            if not isinstance(rec, dict) or "num_vids" not in rec:
+                continue
+            rec["subscriber_count"] = count
+            rec["subscriber_count_checked_at"] = checked_at
+            if count is not None:
+                rec["subscriber_fetch_failures"] = 0
+                rec["subscriber_fetch_excluded"] = False
+                rec.pop("subscriber_fetch_last_error", None)
+            changed = True
+        return save_disk_cache(cache) if changed else True
+
+
+def record_subscriber_fetch_success(url: str, count: int) -> bool:
+    """Persist a URL-probed subscriber count and clear its failure streak."""
+    if not url or count < 0:
+        return False
+    with _CACHE_LOCK:
+        cache = load_disk_cache()
+        rec = cache.get(url)
+        if not isinstance(rec, dict) or "num_vids" not in rec:
+            return False
+        now = time.time()
+        rec["subscriber_count"] = int(count)
+        rec["subscriber_count_checked_at"] = now
+        rec["subscriber_fetch_last_attempt_ts"] = now
+        rec["subscriber_fetch_failures"] = 0
+        rec["subscriber_fetch_excluded"] = False
+        rec.pop("subscriber_fetch_last_error", None)
+        return save_disk_cache(cache)
+
+
+def record_subscriber_fetch_failure(url: str, error: str = "",
+                                    max_failures: int = 3
+                                    ) -> dict[str, Any]:
+    """Increment a channel's consecutive URL-probe failures.
+
+    Once ``max_failures`` is reached the row is excluded from future launch
+    backfills. A later sidecar or successful URL probe clears the streak.
+    """
+    if not url:
+        return {"saved": False, "failures": 0, "excluded": False}
+    with _CACHE_LOCK:
+        cache = load_disk_cache()
+        rec = cache.get(url)
+        if not isinstance(rec, dict) or "num_vids" not in rec:
+            return {"saved": False, "failures": 0, "excluded": False}
+        failures = int(rec.get("subscriber_fetch_failures") or 0) + 1
+        excluded = failures >= max(1, int(max_failures or 3))
+        now = time.time()
+        rec.setdefault("subscriber_count", None)
+        rec["subscriber_count_checked_at"] = now
+        rec["subscriber_fetch_last_attempt_ts"] = now
+        rec["subscriber_fetch_failures"] = failures
+        rec["subscriber_fetch_excluded"] = excluded
+        if error:
+            rec["subscriber_fetch_last_error"] = str(error)[:240]
+        saved = save_disk_cache(cache)
+        return {"saved": saved, "failures": failures,
+                "excluded": excluded}
 
 
 def stats_for_channel(channel: dict[str, Any], cache: dict[str, Any] | None = None
@@ -448,6 +621,7 @@ def scan_all_channels(progress_cb=None) -> dict[str, dict[str, Any]]:
         return {}
     base_dir = Path(base_str)
     channels = cfg.get("channels", [])
+    previous = load_disk_cache()
     result: dict[str, dict[str, Any]] = {}
     now = time.time()
     total = len(channels)
@@ -460,11 +634,17 @@ def scan_all_channels(progress_cb=None) -> dict[str, dict[str, Any]]:
         n_vids, size_bytes = scan_channel_folder(base_dir, ch)
         url = ch.get("url", "").strip()
         if url:
-            result[url] = {
+            rec = {
                 "num_vids": n_vids,
                 "size_bytes": size_bytes,
                 "last_updated": now,
             }
+            old = previous.get(url)
+            if isinstance(old, dict):
+                for key in ("sweep_fingerprint", *_SUBSCRIBER_CACHE_FIELDS):
+                    if key in old:
+                        rec[key] = old[key]
+            result[url] = rec
     return result
 
 

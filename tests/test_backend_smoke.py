@@ -48,6 +48,7 @@ from backend import (
     redownload,
     reorg,
     repair_captions,
+    subscriber_counts,
     subs,
     text_utils,
     thumbnails,
@@ -1339,6 +1340,141 @@ class ArchiveScanTests(unittest.TestCase):
                 base, {"name": "Channel"})
 
             self.assertEqual((count, size), (1, 5))
+
+    def test_full_scan_preserves_subscriber_cache_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            channel_dir = base / "Channel"
+            channel_dir.mkdir()
+            (channel_dir / "Video.mp4").write_bytes(b"video")
+            url = "https://www.youtube.com/@channel"
+            previous = {
+                url: {
+                    "num_vids": 0,
+                    "size_bytes": 0,
+                    "subscriber_count": 1234,
+                    "subscriber_count_checked_at": 10,
+                    "subscriber_fetch_failures": 2,
+                    "subscriber_fetch_excluded": False,
+                }
+            }
+            with mock.patch.object(
+                    archive_scan, "load_config",
+                    return_value={"output_dir": td, "channels": [{
+                        "name": "Channel", "url": url,
+                    }]}), mock.patch.object(
+                        archive_scan, "load_disk_cache",
+                        return_value=previous):
+                result = archive_scan.scan_all_channels()
+
+            self.assertEqual(result[url]["subscriber_count"], 1234)
+            self.assertEqual(result[url]["subscriber_fetch_failures"], 2)
+            self.assertEqual(result[url]["num_vids"], 1)
+
+
+class SubscriberCountTests(unittest.TestCase):
+    class _Runner:
+        def __init__(self, responses, cookies=None):
+            self.responses = list(responses)
+            self.cookies = list(cookies or [])
+            self.calls = []
+
+        def binary(self):
+            return "yt-dlp"
+
+        def build_argv(self, *extra, include_cookies=True,
+                       include_quiet=True):
+            argv = ["yt-dlp"]
+            if include_cookies:
+                argv.extend(self.cookies)
+            argv.extend(extra)
+            return argv
+
+        def run_capture(self, argv, **_kwargs):
+            self.calls.append(list(argv))
+            return self.responses.pop(0)
+
+    def test_url_probe_reads_channel_level_follower_count(self) -> None:
+        runner = self._Runner([(0, "21100000\n", "")])
+
+        result = subscriber_counts.fetch_subscriber_count(
+            "https://www.youtube.com/@examplechannel/about", runner=runner)
+
+        self.assertEqual(result, {"ok": True, "count": 21100000})
+        self.assertIn("https://www.youtube.com/@examplechannel/videos",
+                      runner.calls[0])
+        self.assertIn("--flat-playlist", runner.calls[0])
+        self.assertIn("--playlist-end", runner.calls[0])
+
+    def test_url_probe_falls_back_when_channel_field_is_missing(self) -> None:
+        runner = self._Runner([
+            (0, "NA\n", ""),
+            (0, "140000\n", ""),
+        ])
+
+        result = subscriber_counts.fetch_subscriber_count(
+            "https://www.youtube.com/@fallbackchannel", runner=runner)
+
+        self.assertEqual(result, {"ok": True, "count": 140000})
+        self.assertEqual(len(runner.calls), 2)
+        self.assertIn("--flat-playlist", runner.calls[0])
+        self.assertNotIn("--flat-playlist", runner.calls[1])
+
+    def test_three_consecutive_misses_exclude_future_launches(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cache_file = Path(td) / "disk-cache.json"
+            url = "https://www.youtube.com/@hidden"
+            initial = {url: {
+                "num_vids": 1,
+                "size_bytes": 5,
+                "subscriber_count": None,
+                "subscriber_count_checked_at": 1,
+            }}
+            channel = [{"name": "Hidden", "url": url}]
+            with mock.patch.object(archive_scan, "DISK_CACHE_FILE",
+                                   cache_file):
+                archive_scan.save_disk_cache(initial)
+                miss = {"ok": False, "transient": False,
+                        "error": "subscriber count unavailable"}
+                with mock.patch.object(
+                        subscriber_counts, "fetch_subscriber_count",
+                        return_value=miss) as fetch:
+                    for _ in range(3):
+                        subscriber_counts.backfill_missing_counts(
+                            channel, runner=self._Runner([]))
+                    fourth = subscriber_counts.backfill_missing_counts(
+                        channel, runner=self._Runner([]))
+
+                rec = archive_scan.load_disk_cache()[url]
+
+            self.assertEqual(fetch.call_count, 3)
+            self.assertEqual(rec["subscriber_fetch_failures"], 3)
+            self.assertTrue(rec["subscriber_fetch_excluded"])
+            self.assertEqual(fourth["eligible"], 0)
+
+    def test_transient_failure_does_not_consume_strike(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cache_file = Path(td) / "disk-cache.json"
+            url = "https://www.youtube.com/@later"
+            initial = {url: {
+                "num_vids": 1,
+                "size_bytes": 5,
+                "subscriber_count": None,
+            }}
+            with mock.patch.object(archive_scan, "DISK_CACHE_FILE",
+                                   cache_file):
+                archive_scan.save_disk_cache(initial)
+                with mock.patch.object(
+                        subscriber_counts, "fetch_subscriber_count",
+                        return_value={"ok": False, "transient": True,
+                                      "error": "timeout"}):
+                    result = subscriber_counts.backfill_missing_counts(
+                        [{"name": "Later", "url": url}],
+                        runner=self._Runner([]))
+                rec = archive_scan.load_disk_cache()[url]
+
+            self.assertNotIn("subscriber_fetch_failures", rec)
+            self.assertEqual(result["deferred"], 1)
 
 
 class YouTubeSessionGuardTests(unittest.TestCase):

@@ -1,11 +1,10 @@
 /* ═══════════════════════════════════════════════════════════════════════
-   styles-settings.css — Settings page + Download tab controls
+   styles-settings.css — Settings page
 
-   Extracted from styles.css (Patch 18, v72.0). Contains:
+   Contains:
      • Settings page layout (centered column, sub-nav, save footer)
      • Form controls: inputs, selects, checkboxes, dropdowns
      • Buttons (primary / cancel / sync variants)
-     • Download tab controls area (URL field, format pickers, etc.)
 
    Loaded AFTER styles.css so it can reference CSS variables defined
    in :root there.
@@ -39,6 +38,11 @@
   margin: 0 auto !important;
   width: 100%;
   box-sizing: border-box;
+}
+
+.settings-appearance-choice .settings-inline-note {
+  margin-left: 20px;
+  max-width: 560px;
 }
 
 /* Override the global `.edit-grid { display: contents }` with a real

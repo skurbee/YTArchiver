@@ -28,7 +28,7 @@ Set by `main.py` `Api.__init__`. Every mixin can rely on these existing.
 
 | Attribute              | Owner       | Read by                                 | Notes |
 |------------------------|-------------|-----------------------------------------|-------|
-| `self._config`         | main        | almost every mixin                      | Cached config dict; may be stale — see Patch 4 `config_transaction` for atomic RMW |
+| `self._config`         | main        | almost every mixin                      | Cached config dict; use `config_transaction` for atomic read-modify-write operations |
 | `self._window`         | main        | every mixin that emits JS events        | pywebview window; `None` before `set_window` |
 | `self._log_stream`     | main        | most mixins                             | `LogStreamer` for tagged log emit |
 | `self._queues`         | main        | sync_mixin, queue_mixin, channel_mixin  | `QueueState` (in `backend/queues.py`) |
@@ -90,11 +90,3 @@ def my_long_method(self, payload):
     threading.Thread(target=_worker, daemon=True, name="yta-my-feature").start()
     return {"ok": True, "queued": True}  # tell the UI we started
 ```
-
-## Patch history
-
-- Patch 1: critical bug fixes across the codebase.
-- Patch 2: helper consolidation (`subprocess_util`, `fs_search`, `text_utils`).
-- Patch 3: `ProcessRegistry` + `YtDlpRunner` for subprocess lifecycle.
-- Patch 4: `config_transaction()` for atomic RMW on config.
-- Patch 8: this document. Mixin contracts made explicit (above).

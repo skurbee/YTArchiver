@@ -9,7 +9,7 @@ Lets us replace silent `except Exception: pass` blocks with
 Level → tag mapping (uses existing LogStreamer tag scheme):
     DEBUG    → "dim"  (already in VERBOSE_ONLY_TAGS → hidden in Simple mode)
     INFO     → None   (default style, visible in both modes)
-    WARNING  → None   (no dedicated yellow tag yet; Patch 1 stays minimal)
+    WARNING  → None   (no dedicated yellow tag)
     ERROR    → "red"
     CRITICAL → "red"
 
@@ -77,7 +77,7 @@ def install(stream) -> None:
     # Prefix DEBUG/WARNING/ERROR messages with the logger name (e.g.
     # `[ytarchiver.backend.sync]`) so silenced-but-logged swallows are
     # locatable. INFO messages are user-facing announcements (e.g. the
-    # startup line) and skip the prefix — Patch 3 only emits DEBUG/ERROR
+    # startup line) and skip the prefix — only DEBUG/ERROR records
     # from internal code paths.
     class _NamedFormatter(logging.Formatter):
         def format(self, record: logging.LogRecord) -> str:

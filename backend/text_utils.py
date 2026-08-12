@@ -159,16 +159,15 @@ def extract_video_id(
 ) -> str:
     """Extract an 11-char YouTube video id from an archive file path.
 
-    Patch 11 consolidation of four divergent inline implementations that
-    existed in transcribe.py (3 sites) and index.py:register_video.
+    Centralized implementation shared by transcription and index ingestion.
 
     Strategy (each step skipped if prior step succeeded):
       1. `hint` if it matches the 11-char id shape.
       2. Trailing `[Abc12345_-x]` 11-char bracket on the filename stem
          (this is yt-dlp's `%(id)s` output format).
       3. If `conn` is provided: SELECT video_id FROM videos
-         WHERE filepath=? COLLATE NOCASE LIMIT 1. Covers archives
-         written by the classic tkinter app, which omitted the bracket.
+         WHERE filepath=? COLLATE NOCASE LIMIT 1. Covers older archives
+         whose filenames omitted the bracket.
          (This is also the path the sync-side captions probe takes for
          drop-in mode where the filename has been sanitized.)
       4. If `info_json_fallback=True`: read the .info.json sidecar that
@@ -223,8 +222,8 @@ def extract_video_id(
     if conn is not None and path:
         try:
             # Try BOTH normpath AND raw path. Rows in DB may have been
-            # inserted with different slash direction (Z:\Foo/Bar vs
-            # Z:\Foo\Bar). COLLATE NOCASE handles case but not slash
+            # inserted with different slash direction (X:\Foo/Bar vs
+            # X:\Foo\Bar). COLLATE NOCASE handles case but not slash
             # mixing (audit: text_utils.py:191-198). Two cheap UNIQUE
             # lookups is faster than scanning + normalizing every row.
             _norm = os.path.normpath(path)

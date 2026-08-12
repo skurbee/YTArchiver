@@ -1,8 +1,7 @@
 """
 index_search — FTS5 search + video-title search over the SQLite index.
 
-Extracted from backend/index.py (Patch 17, v71.9). Owns the search
-endpoints the Browse > Search tab calls into:
+Search endpoints extracted from backend/index.py for the Browse > Search tab:
 
     search_video_titles(query, ...)  — LIKE-based title scan
     search_fts(query, ...)           — FTS5 MATCH over transcript segments
@@ -41,7 +40,7 @@ def _dedupe_segment_hits(rows: list[Any]) -> list[Any]:
     """Collapse duplicate segment rows while preserving query order.
 
     Some long-lived indexes contain the same transcript segment twice with
-    only path spelling changed (`Z:/...` vs `Z:\\...`). Search should show the
+    only path spelling changed (`X:/...` vs `X:\\...`). Search should show the
     hit once; the first row keeps its segment id for context loading.
     """
     seen: set[tuple[Any, ...]] = set()
@@ -298,7 +297,7 @@ def search_video_titles(query: str,
         "ts": r[5],
         # added_ts/upload_ts under the same key the transcript leg
         # uses so the JS merge-sort can apply newest/oldest ordering
-        # without a missing-field fall-back to 0 (audit: H148).
+        # without a missing-field fallback to 0.
         "added_ts": r[5] or 0,
         "upload_ts": r[5] or 0,
     } for r in rows]

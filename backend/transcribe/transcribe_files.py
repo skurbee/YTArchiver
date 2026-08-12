@@ -1,15 +1,13 @@
 """
 transcribe.transcribe_files — aggregated .txt / .jsonl writers.
 
-Patch 19 phase T1 (v68.9): extracted from transcribe/legacy.py.
-
 Functions write the per-entry blocks for the aggregated
 `<channel> Transcript.txt` and the hidden `.<channel> Transcript.jsonl`
-sidecars. These are the OLD-YTArchiver-compatible file formats — bytes
-on disk must match the legacy format exactly so existing archives
+sidecars. These are established on-disk formats; bytes must remain stable so
+existing archives
 remain readable.
 
-Public surface (re-imported into legacy.py for back-compat):
+Public surface (re-exported through the transcribe package):
     _write_jsonl_entry      append long-form JSONL entries
     _write_transcript_entry append a formatted .txt block
     _replace_jsonl_entry    surgically swap one video's entries
@@ -24,13 +22,13 @@ import re
 import threading as _threading
 
 from ..log import get_logger
+from ..utils import unhide_file_win as _unhide_file_win
 from .paths import (
     _format_duration_hms,
     _format_upload_date,
     _generate_distributed_words,
     _hide_file_win,
 )
-from ..utils import unhide_file_win as _unhide_file_win
 
 # Per-path locks for the aggregated Transcript.txt writers. drift_scan's
 # reconstruction does a read→append→os.replace of the SAME files from a

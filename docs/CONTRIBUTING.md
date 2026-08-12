@@ -55,12 +55,12 @@ YTArchiver/
 │   ├── transcribe/         # Whisper transcription package
 │   │   ├── core.py             # TranscribeManager + worker loop
 │   │   ├── helpers.py          # path/title/duration helpers
-│   │   ├── paths.py            # Path/format helpers (extracted Patch 6)
+│   │   ├── paths.py            # Path/format helpers
 │   │   ├── punct_manager.py    # punctuation subprocess wrapper
 │   │   ├── transcribe_vtt.py   # YT auto-captions fast-path
 │   │   └── transcribe_files.py # .jsonl + .txt sidecar writers
 │   ├── metadata/           # Metadata package
-│   │   ├── io.py               # JSONL I/O helpers (extracted Patch 5)
+│   │   ├── io.py               # JSONL I/O helpers
 │   │   ├── core.py             # title-match strategies + bulk pipeline
 │   │   ├── fetcher.py          # per-video metadata fetch
 │   │   ├── refresh.py          # re-export shim
@@ -74,11 +74,11 @@ YTArchiver/
 │   ├── services/           # AppServices + event bus + file ops
 │   ├── pause_helpers.py    # Shared pause/cancel guards
 │   ├── index.py            # SQLite index entry — schema + register + reads
-│   ├── index_search.py     # FTS5 + LIKE search (extracted Patch 17)
-│   ├── index_graph.py      # word-frequency graph queries (Patch 17)
-│   ├── index_bookmarks.py  # bookmark CRUD (Patch 20)
-│   ├── index_maintenance.py # archive sweep + prune + FTS rebuild (Patch 20)
-│   ├── html_assembler.py   # builds web/index.html from partials (Patch 19)
+│   ├── index_search.py     # FTS5 + LIKE search
+│   ├── index_graph.py      # word-frequency graph queries
+│   ├── index_bookmarks.py  # bookmark CRUD
+│   ├── index_maintenance.py # archive sweep + prune + FTS rebuild
+│   ├── html_assembler.py   # builds web/index.html from partials
 │   ├── queues.py           # Persistent multi-queue (sync/gpu/etc)
 │   ├── compress.py         # AV1 NVENC encode pipeline
 │   ├── redownload.py       # Resolution upgrade pipeline
@@ -92,11 +92,11 @@ YTArchiver/
 │   ├── thumbnails.py       # Thumbnail download + cache
 │   ├── channel_art.py      # Channel banner + avatar
 │   ├── ytarchiver_config.py # Config IO + view models
-│   ├── view_format.py      # UI formatters (extracted Patch 7)
-│   ├── text_utils.py       # Canonical normalize_title (Patch 1)
-│   ├── fs_search.py        # Canonical VIDEO_EXTS + file walker (Patch 2)
-│   ├── subprocess_util.py  # startupinfo + creationflags (Patch 2)
-│   ├── process_runner.py   # ProcessRegistry + YtDlpRunner (Patch 3)
+│   ├── view_format.py      # UI formatters
+│   ├── text_utils.py       # Canonical normalize_title
+│   ├── fs_search.py        # Canonical VIDEO_EXTS + file walker
+│   ├── subprocess_util.py  # startupinfo + creationflags
+│   ├── process_runner.py   # ProcessRegistry + YtDlpRunner
 │   ├── utils.py            # Misc helpers (legacy grab-bag)
 │   ├── log.py              # Logging bridge to LogStreamer
 │   ├── log_stream.py       # Batched log emit to JS
@@ -168,7 +168,7 @@ documented in `backend/api_mixins/README.md`.
 - **Config**: `%APPDATA%\YTArchiver\ytarchiver_config.json` (single file).
 - **Index**: `%APPDATA%\YTArchiver\transcription_index.db` (SQLite + FTS5).
 - **Queue state**: `%APPDATA%\YTArchiver\ytarchiver_queue.json` (debounced).
-- **Auth token**: `%APPDATA%\YTArchiver\cmd_token` (Patch 1; cmd-server auth).
+- **Auth token**: `%APPDATA%\YTArchiver\cmd_token` (cmd-server auth).
 - **Transcripts**: `<channel>/{year}/{month}/<channel> Transcript.txt` (aggregated)
   + `<channel>/{year}/{month}/.<channel> Transcript.jsonl` (hidden, per-segment).
 - **Thumbnails**: `<channel>/.Thumbnails/<title> [<vid>].jpg` (hidden).

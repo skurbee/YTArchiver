@@ -1,7 +1,7 @@
 """
 sync.quickcheck — pre-sync probes + per-channel batch-limit gating.
 
-Patch 18 phase 3 (v68.8): extracted from sync/legacy.py. Contains:
+Contains:
 
   - `prefetch_channel_total(url)` — fast yt-dlp flat-playlist enumeration
     to learn a channel's total + live + upcoming count BEFORE sync.
@@ -28,10 +28,10 @@ from datetime import timedelta as _td
 from typing import Any
 
 from .. import utils as _utils
+from .. import youtube_traffic
 from ..log import get_logger, swallow
 from ..process_runner import PROCESS_REGISTRY
-from .. import youtube_traffic
-from ..ytarchiver_config import config_transaction, load_config
+from ..ytarchiver_config import config_transaction
 from .ytdlp_proc import _ensure_videos_tab, _find_cookie_source, find_yt_dlp
 
 _log = get_logger(__name__)

@@ -68,7 +68,7 @@
         ? window._urlLooksLikeVideo(trimmed)
         : /(?:^|[./@])(?:music\.|m\.|www\.)?youtube\.com\/(?:watch\?v=|shorts\/|embed\/|live\/|clip\/)|(?:^|[./@])youtu\.be\/[\w-]{6,}/i.test(trimmed);
       if (!looksLikeVideo) {
-        window._showToast?.("Drop a single YouTube video URL here. Add channels on the Subs tab.", "warn");
+        window._showToast?.("Drop a single YouTube video URL here. Add channels from Browse.", "warn");
         return;
       }
       const input = document.querySelector("#panel-download .ctl-input");

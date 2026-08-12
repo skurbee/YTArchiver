@@ -1,9 +1,7 @@
 """
 metadata.scan — channel folder enumeration + .info.json reader.
 
-Patch 19 phase M2 (v69.1): extracted from metadata/legacy.py.
-
-Public surface (re-imported into legacy.py):
+Public surface (re-exported through the metadata package):
     _VIDEO_EXTS                  tuple of video file extensions we track
     _scan_videos_cache           per-folder fingerprint cache
     _scan_videos_cache_lock      its lock
@@ -11,9 +9,9 @@ Public surface (re-imported into legacy.py):
     _group_by_metadata_path(...) bucket scan results by JSONL path
     _read_info_json_vid(fp)      read .info.json sidecar → video_id
 
-The SQL ESCAPE fix from v68.7 lives in this module: `_scan_channel_videos`
+`_scan_channel_videos`
 queries the videos table with `LIKE ? ESCAPE '\\'` (proper escape).
-The earlier `'\'` form parsed to `ESCAPE ''` and silently 500'd every call,
+An unescaped `'\'` form parses to `ESCAPE ''` and breaks every call,
 which is what caused the Thumbnails 0% regression.
 """
 from __future__ import annotations
@@ -26,9 +24,9 @@ from pathlib import Path
 from typing import Any
 
 from ..log import get_logger
-from .io import _get_metadata_jsonl_path, _year_month_from_path
 from ..thumbnails import _channel_fingerprint
 from ..utils import sqlite_like_escape as _like_esc
+from .io import _get_metadata_jsonl_path, _year_month_from_path
 
 _log = get_logger(__name__)
 

@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════════
    styles-dialogs.css — Dark dialogs, toasts, redownload modal
 
-   Extracted from styles.css (Patch 18, v72.0). Contains:
+   Contains:
      • Dark askquestion-style dialog system (#ask-modal + variants)
      • Toast notifications (top-right popup queue)
      • Redownload-10-sample confirm modal
@@ -59,6 +59,159 @@
   min-width: 680px;
   max-width: 900px;
   width: 90vw;
+}
+
+/* Browse-first Add/Edit Channel dialog. The form itself remains the same
+   shared DOM node used by the legacy Subs tab; this shell gives it a modern,
+   focused presentation without duplicating any channel settings. */
+.channel-editor-backdrop {
+  padding: 28px;
+  background: rgba(4, 7, 12, 0.68);
+  backdrop-filter: blur(5px);
+}
+.channel-editor-dialog {
+  width: min(960px, calc(100vw - 56px));
+  max-height: calc(100vh - 56px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--c-accent) 34%, var(--c-border));
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 92% -8%,
+      color-mix(in srgb, var(--c-accent) 14%, transparent), transparent 35%),
+    linear-gradient(160deg,
+      color-mix(in srgb, var(--c-surface) 96%, #ffffff 4%),
+      color-mix(in srgb, var(--c-log-bg) 92%, var(--c-surface)));
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.72),
+              0 0 0 1px rgba(255, 255, 255, 0.025) inset;
+  animation: askq-scale 0.16s ease-out;
+}
+.channel-editor-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 20px;
+  padding: 20px 22px 17px;
+  border-bottom: 1px solid var(--c-border);
+  background: rgba(255, 255, 255, 0.018);
+}
+.channel-editor-heading { min-width: 0; }
+.channel-editor-eyebrow {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--c-accent);
+  font-size: var(--fs-2xs);
+  font-weight: 750;
+  letter-spacing: 0.13em;
+}
+.channel-editor-heading h2 {
+  margin: 0;
+  color: var(--c-text);
+  font-size: 21px;
+  font-weight: 680;
+  line-height: 1.2;
+}
+.channel-editor-heading p {
+  margin: 6px 0 0;
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+  line-height: 1.4;
+}
+.channel-editor-close {
+  margin-left: auto;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--c-dim);
+  cursor: pointer;
+  font-size: 25px;
+  line-height: 1;
+}
+.channel-editor-close:hover {
+  border-color: var(--c-border);
+  background: var(--c-hover);
+  color: var(--c-text);
+}
+.channel-editor-body {
+  min-height: 0;
+  padding: 18px 20px 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.channel-editor-body .edit-channel-box {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.channel-editor-body .edit-channel-box > .subs-section-label { display: none; }
+.channel-editor-body .edit-form { gap: 11px; }
+.channel-editor-body .edit-row {
+  gap: 12px 18px;
+  padding: 13px 14px;
+  border: 1px solid color-mix(in srgb, var(--c-border) 88%, transparent);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.022);
+}
+.channel-editor-body .edit-row:first-child {
+  border-color: color-mix(in srgb, var(--c-accent) 28%, var(--c-border));
+  background: color-mix(in srgb, var(--c-accent) 4%, transparent);
+}
+.channel-editor-body .edit-field > .edit-gl {
+  color: color-mix(in srgb, var(--c-accent) 72%, var(--c-text));
+  font-size: var(--fs-sm);
+  font-weight: 750;
+  letter-spacing: 0.01em;
+}
+.channel-editor-body .edit-field-grow {
+  align-items: stretch;
+  flex-direction: column;
+  gap: 6px;
+}
+.channel-editor-body .edit-field-grow > input.ctl-input {
+  width: 100%;
+  min-height: 31px;
+}
+.channel-editor-body .edit-compress-group {
+  margin-left: 0;
+  border-left: 0;
+}
+.channel-editor-body .edit-diskstats {
+  margin-top: 12px;
+  padding: 10px 13px;
+  border: 1px solid var(--c-border);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.14);
+}
+.channel-editor-body .edit-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  margin-top: 15px;
+  padding: 14px 2px 18px;
+  border-top: 1px solid var(--c-border);
+  background: linear-gradient(to bottom,
+    color-mix(in srgb, var(--c-log-bg) 90%, transparent),
+    var(--c-log-bg) 34%);
+  box-shadow: 0 -12px 22px rgba(0, 0, 0, 0.14);
+}
+body.channel-editor-open { overflow: hidden; }
+
+@media (max-width: 760px) {
+  .channel-editor-backdrop { padding: 12px; }
+  .channel-editor-dialog {
+    width: calc(100vw - 24px);
+    max-height: calc(100vh - 24px);
+    border-radius: 12px;
+  }
+  .channel-editor-header { padding: 16px; }
+  .channel-editor-body { padding: 14px 12px 0; }
+  .channel-editor-body .edit-row { align-items: stretch; }
 }
 .askq-header {
   padding: 12px 16px 8px;

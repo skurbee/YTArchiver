@@ -1,4 +1,4 @@
-// queueBlink.js — Patch 14 phase 1 (v69.5)
+// queueBlink.js — queue-state indicators and pause/resume feedback.
 //
 // Queue button blink animation, paint state, and pause-button paint
 // helpers. Extracted from app.js (was at lines 8285-8671).
@@ -41,7 +41,8 @@
     // metadata refresh has to finish its current re-fetch loop before
     // pause takes hold — could be minutes).
     sync: { running: false, paused: false, pausedActive: false, count: 0,
-            pausedAtMs: 0, trafficWaiting: false, trafficWait: null },
+            pausedAtMs: 0, trafficWaiting: false, trafficWait: null,
+            sessionLimited: false },
     gpu: { running: false, paused: false, pausedActive: false, count: 0,
            pausedAtMs: 0 },
   };
@@ -206,7 +207,7 @@
     const anyAlive = s.running || g.running;
     const pausedWithItems =
       (s.paused && s.count > 0) || (g.paused && g.count > 0);
-    const enable = anyAlive || pausedWithItems || !!s.trafficWaiting;
+    const enable = anyAlive || pausedWithItems || _isYouTubeLimitHold(s);
     const btn = document.getElementById("btn-pause");
     if (btn) {
       btn.disabled = !enable;
@@ -215,7 +216,14 @@
   }
 
   function ensureBlinkRunning() {
-    const anyActive = _blinkState.sync.running || _blinkState.gpu.running;
+    // An alive sync worker can be parked inside the rolling request governor
+    // or YouTube's emergency session-rate-limit pause. Neither is active
+    // work, so do not keep the ambient Sync Tasks blink clock running.
+    // Pause-pending feedback has its own timer below.
+    const syncActive = _blinkState.sync.running &&
+      !_blinkState.sync.paused && !_isYouTubeLimitHold(_blinkState.sync);
+    const gpuActive = _blinkState.gpu.running && !_blinkState.gpu.paused;
+    const anyActive = syncActive || gpuActive;
     if (anyActive && !_blinkState.timer) {
       _blinkState.clockOn = false;
       _blinkState.timer = setInterval(blinkTick, 700);
@@ -238,8 +246,15 @@
   // "Pending" = paused requested AND ( worker hasn't entered its
   // pause-wait yet OR we're still inside the minimum visible window
   // since the pause click ).
+  function _isYouTubeLimitHold(s) {
+    return !!(s && (s.trafficWaiting || s.sessionLimited));
+  }
+
   function _isPipelinePending(s) {
     if (_blinkState.stale) return false;
+    // Limit-driven pauses are already effective. They are not a user pause
+    // request waiting for the current operation to acknowledge it.
+    if (_isYouTubeLimitHold(s)) return false;
     if (!s.paused || !s.running) return false;
     if (!s.pausedActive) return true;
     // Clamp the elapsed delta to >=0 so a backwards clock skew (NTP
@@ -316,7 +331,11 @@
     if (syncBtn) {
       const s = _blinkState.sync;
       let state = "idle";
-      if (_isPipelinePending(s)) {
+      // A configured hourly/daily wait or YouTube session throttle is a
+      // parked pipeline even though the backend worker remains alive.
+      if (_isYouTubeLimitHold(s) && (s.running || s.count > 0)) {
+        state = "paused";
+      } else if (_isPipelinePending(s)) {
         state = _blinkState.pendingClockOn ? "paused" : "on";
       } else if (s.running && s.paused) {
         state = "paused";
@@ -357,6 +376,8 @@
       const anyPaused = syncActive || gpuActive ||
                         syncPausedWithItems || gpuPausedWithItems;
       const trafficWaiting = !!s.trafficWaiting;
+      const sessionLimited = !!s.sessionLimited;
+      const limitWaiting = trafficWaiting || sessionLimited;
       // Pause-pending: the user clicked Pause but the worker is still
       // mid-operation (e.g. metadata refresh's long re-fetch loop).
       // Surface a third visual state so the click is acknowledged
@@ -364,7 +385,7 @@
       // Also held for a minimum visible window after the click so a
       // fast pause-handshake doesn't skip the blink entirely.
       const anyPending = _isPipelinePending(s) || _isPipelinePending(g);
-      let visState = trafficWaiting
+      let visState = limitWaiting
         ? "traffic-wait"
         : (anyPaused ? "paused" : "running");
       if (anyPending) visState = "pending";
@@ -378,6 +399,8 @@
         ? "Pause queued — current job will finish first. Click to cancel pause."
         : (trafficWaiting
             ? "Waiting for a YouTube traffic slot — click to override"
+            : sessionLimited
+            ? "Paused by YouTube's session rate limit"
             : anyPaused
             ? "Resume all queues"
             : "Pause all queues (current jobs finish first)");
@@ -385,7 +408,7 @@
       pauseBtn.removeAttribute("title");
       const svg = pauseBtn.querySelector("svg");
       if (svg) {
-        const want = (anyPaused || trafficWaiting) ? "play" : "bars";
+        const want = (anyPaused || limitWaiting) ? "play" : "bars";
         if (svg.dataset.icon !== want) {
           svg.dataset.icon = want;
           svg.innerHTML = want === "play"

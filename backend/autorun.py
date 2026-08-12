@@ -38,7 +38,7 @@ AUTORUN_OPTIONS = {
 }
 AUTORUN_LABELS = list(AUTORUN_OPTIONS.keys())
 
-AUTORUN_HISTORY_MAX = 10000  # was 100. UI activity-log displays everything (audit 2026-05-14)
+AUTORUN_HISTORY_MAX = 10000  # UI activity log can display the full history.
 AUTORUN_HISTORY_FILE = APP_DATA_DIR / "autorun_history.jsonl"
 RATE_LIMIT_MIN_RETRY_SECONDS = 6 * 3600
 BUDGET_STARTUP_GRACE_SECONDS = 3 * 60

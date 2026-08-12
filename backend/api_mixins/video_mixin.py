@@ -8,11 +8,11 @@ private Api attributes kept as fallback state.
 from __future__ import annotations
 
 import os
-import re
 import threading
 
-from ._shared import _log
 from backend.ytarchiver_config import config_is_writable, load_config, save_config
+
+from ._shared import _log
 
 
 class VideoMixin:
@@ -238,15 +238,13 @@ class VideoMixin:
         # filters to this single file instead of re-downloading the WHOLE
         # channel (audit r2: this per-video button was a whole-channel redownload).
         try:
-            import threading as _th
-
             from backend import redownload as _rd
             log_stream = self._video_log_stream()
             queues = self._video_queues()
             # Per-run event — the shared _sync_cancel stays set after
             # any stopped sync, ghost-cancelling this single-video
             # redownload instantly in that window.
-            _vid_cancel = _th.Event()
+            _vid_cancel = threading.Event()
             def _run():
                 try:
                     _rd.redownload_channel(
@@ -262,7 +260,7 @@ class VideoMixin:
                 except Exception as e:
                     log_stream.emit_error(
                         f"Single-video redownload failed: {e}")
-            _th.Thread(target=_run, daemon=True).start()
+            threading.Thread(target=_run, daemon=True).start()
             return {"ok": True, "title": title, "resolution": res}
         except Exception as e:
             return {"ok": False, "error": str(e)}

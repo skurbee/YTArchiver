@@ -1,8 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════════
-   styles-browse.css — Browse tab + Watch view + everything in between
+   styles-browse.css — Browse tab and its data tools
 
-   Extracted from styles.css (Patch 18, v72.0). The biggest extracted
-   slice. Contains:
+   Contains:
      • Browse tab landing (channel grid)
      • Browse video grid (with year/month grouping)
      • Watch view (embedded player + transcript karaoke)
@@ -113,6 +112,52 @@
   align-items: center;
   gap: 6px;
 }
+
+/* Primary channel-management entry point. It sits with the Channels sort
+   and filter controls so adding a channel is available without leaving the
+   library view. */
+.browse-add-channel-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 30px;
+  padding: 5px 13px 5px 10px;
+  border: 1px solid color-mix(in srgb, var(--c-accent) 58%, var(--c-border));
+  border-radius: 7px;
+  background: linear-gradient(135deg,
+    color-mix(in srgb, var(--c-accent) 22%, var(--c-surface)),
+    color-mix(in srgb, var(--c-accent) 9%, var(--c-surface)));
+  color: var(--c-text);
+  font-weight: 650;
+  box-shadow: 0 5px 16px rgba(0, 0, 0, 0.2);
+  transition: border-color 0.14s, background 0.14s, transform 0.14s;
+}
+.browse-add-channel-btn:hover {
+  border-color: color-mix(in srgb, var(--c-log-green) 55%, var(--c-border));
+  background: linear-gradient(135deg,
+    color-mix(in srgb, var(--c-log-green) 19%, var(--c-surface)),
+    color-mix(in srgb, var(--c-log-green) 8%, var(--c-surface)));
+  transform: translateY(-1px);
+}
+.browse-add-channel-btn:hover .browse-add-channel-icon {
+  background: color-mix(in srgb, var(--c-log-green) 68%, var(--c-accent));
+}
+.browse-add-channel-btn:active { transform: translateY(0); }
+.browse-add-channel-btn[hidden] { display: none !important; }
+.browse-add-channel-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--c-accent);
+  color: var(--c-bg);
+  font-size: 16px;
+  font-weight: 800;
+  line-height: 1;
+  transition: background 0.14s;
+}
 .browse-sort-wrap[hidden],
 .browse-find-wrap[hidden],
 .back-btn[hidden],
@@ -164,8 +209,8 @@
 }
 .browse-find-wrap {
   position: relative;
-  /* Allow shrinking below the 220px ideal so the toolbar doesn't
-     horizontally overflow at narrow widths (audit: H257). */
+   /* Allow shrinking below the 220px ideal so the toolbar doesn't
+      horizontally overflow at narrow widths. */
   flex: 0 1 220px;
   min-width: 80px;
 }
@@ -307,9 +352,7 @@
   color: var(--c-accent);
   font-family: var(--font-log);
   font-size: var(--fs-xs);
-  /* Bumped padding so AND/OR/NOT/"exact phrase"/word* hit a comfy
-     click target. Previously ~18px tall; below mouse-friendly
-     guidelines and easy to misclick (UI audit). */
+  /* Give AND/OR/NOT/"exact phrase"/word* a comfortable click target. */
   padding: 5px 10px;
   border-radius: 2px;
   cursor: pointer;
@@ -324,7 +367,6 @@
   opacity: 0.4;
   pointer-events: none;
 }
-/* Patch 17: extracted from inline style="..." on the year inputs. */
 .search-year-input {
   width: 64px;
   font-size: var(--fs-xs);
@@ -994,9 +1036,8 @@
   background: var(--c-btn);
   border: 1px solid var(--c-border);
   color: var(--c-text);
-  /* Bumped from 22x22 to 26x26 so the reset / refresh micro-buttons
-     hit a comfortable click target (UI audit). Glyph stays the
-     same; visually still narrow next to the dropdown it sits on. */
+  /* Keep reset/refresh buttons comfortable to click while remaining
+     visually narrow beside their dropdowns. */
   width: 26px;
   height: 26px;
   padding: 0;

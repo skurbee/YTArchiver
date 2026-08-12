@@ -8,10 +8,7 @@ state.
 """
 from __future__ import annotations
 
-from collections import OrderedDict
-
-from backend.services import file_ops
-
+import json
 import os
 import re
 import subprocess
@@ -19,14 +16,16 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, List
+from collections import OrderedDict
+from typing import Any
 
-from ._shared import _log, webview
-from backend.log import swallow
-from backend.ytarchiver_config import load_config
 from backend import archive_scan
 from backend import index as index_backend
+from backend.log import swallow
+from backend.services import file_ops
+from backend.ytarchiver_config import load_config
 
+from ._shared import _log
 
 _METADATA_DRAWER_CACHE_LOCK = threading.Lock()
 _METADATA_DRAWER_CACHE: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
@@ -110,7 +109,7 @@ def _same_or_under(path: str, root: str) -> bool:
     r = _real_norm(root)
     if not p or not r:
         return False
-    return p == r or p.startswith(r + os.sep) or p.startswith(r + "/")
+    return p == r or p.startswith((r + os.sep, r + "/"))
 
 
 def _is_system_temp_path(path: str) -> bool:
@@ -355,6 +354,7 @@ class BrowseMixin:
         def _run():
             try:
                 from concurrent.futures import ThreadPoolExecutor, as_completed
+
                 from backend import index as _idx
 
                 # ffprobe mostly reads container headers. A small bounded pool
@@ -490,6 +490,8 @@ class BrowseMixin:
             # Pillow isn't available or the thumbnail write fails.
             avatar_url = None
             banner_url = None
+            pending_redownload = False
+            redownload_res = ""
             if base:
                 folder = os.path.join(base, _cfn(ch))
                 # ensure_* can raise on a transient I/O
@@ -511,6 +513,22 @@ class BrowseMixin:
                     ap = avatar_path_for(folder)
                 if ap: avatar_url = _file_url(ap)
                 if bp: banner_url = _file_url(bp)
+                # Keep the Browse-first channel grid at feature parity with
+                # the legacy Subs table. An interrupted resolution upgrade
+                # leaves this progress file behind; the frontend uses these
+                # fields for the chartreuse status dot and the direct
+                # "Continue redownload" context-menu action.
+                progress_path = os.path.join(
+                    folder, "_redownload_progress.json")
+                if os.path.isfile(progress_path):
+                    pending_redownload = True
+                    try:
+                        with open(progress_path, "r", encoding="utf-8") as f:
+                            progress = json.load(f)
+                        redownload_res = str(
+                            progress.get("resolution") or "").strip()
+                    except Exception as e:
+                        swallow("browse pending-redownload resolution read", e)
             out.append({
                 "name": name,
                 "folder": name,
@@ -526,6 +544,8 @@ class BrowseMixin:
                 # folder-menu labels.
                 "transcription_pending": int(ch.get("transcription_pending") or 0),
                 "metadata_pending": int(ch.get("metadata_pending") or 0),
+                "_pending_redownload": pending_redownload,
+                "_redownload_res": redownload_res,
             })
         out.sort(key=lambda c: (c["name"] or "").lower())
         return out
@@ -621,7 +641,8 @@ class BrowseMixin:
             try:
                 tx_status = index_backend.video_tx_status(
                     video_id=payload.get("video_id") or "",
-                    title=payload.get("title") or "")
+                    title=payload.get("title") or "",
+                    channel=payload.get("channel") or "")
             except Exception:
                 tx_status = ""
         return {"ok": True, "segments": segs, "source": src_info,

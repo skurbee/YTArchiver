@@ -304,24 +304,12 @@
       }
     });
 
-    // Channel-nudge button: swap to Subs tab + pre-fill the Add Channel URL
-    // field (edit-url — the new Subs panel collapses to edit-form, there's
-    // no separate "Add" form). Mirrors YTArchiver.py:4462 _go_to_add_channel.
+    // Channel-nudge button: open the shared Add Channel editor and pre-fill
+    // the URL, regardless of whether Browse-first or legacy Subs mode is on.
     const goToAddChannel = () => {
       const url = (input.value || "").trim();
       if (!url) return;
-      // Switch to Subs tab
-      document.querySelector('.tab[data-tab="subs"]')?.click();
-      // Seed the edit-url field + fire input so collapsed panel expands
-      setTimeout(() => {
-        const urlField = document.getElementById("edit-url");
-        if (urlField) {
-          urlField.value = url;
-          urlField.dispatchEvent(new Event("input", { bubbles: true }));
-          urlField.scrollIntoView({ behavior: "smooth", block: "center" });
-          urlField.focus();
-        }
-      }, 80);
+      window._openAddChannelEditor?.(url);
       // Clear the Download-tab URL so the nudge hides
       input.value = "";
       updateBtnVisibility();

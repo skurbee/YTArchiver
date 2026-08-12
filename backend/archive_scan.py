@@ -513,8 +513,7 @@ def index_summary() -> dict[str, Any]:
 
 
 def _fmt_size(b: int) -> str:
-    """Patch 2 (v66.6): delegates to utils.format_bytes (was an
-    identical inline copy)."""
+    """Delegate to the canonical byte formatter."""
     from .utils import format_bytes
     return format_bytes(b, dash_if_zero=True)
 
@@ -585,11 +584,17 @@ def index_db_stats() -> dict[str, Any]:
             # 'pending' are NOT counted as transcribed — they have no
             # transcript — so this reflects real coverage, not the
             # auto-transcribe channel setting (the old transcribed_pct_channels).
-            _row = _own.execute("SELECT COUNT(*) FROM videos").fetchone()
+            _row = _own.execute(
+                "SELECT COUNT(*) FROM videos "
+                "WHERE is_duplicate_of IS NULL "
+                "AND COALESCE(availability, 'available')='available'"
+            ).fetchone()
             if _row:
                 total_videos = int(_row[0] or 0)
             _row = _own.execute(
-                "SELECT COUNT(*) FROM videos WHERE tx_status='transcribed'"
+                "SELECT COUNT(*) FROM videos WHERE tx_status='transcribed' "
+                "AND is_duplicate_of IS NULL "
+                "AND COALESCE(availability, 'available')='available'"
             ).fetchone()
             if _row:
                 transcribed_videos = int(_row[0] or 0)

@@ -74,6 +74,11 @@ DEFAULT_CONFIG = {
     "youtube_traffic_custom_max_gap": 20,
     "autorun_history": [],
     "log_mode": "Simple",
+    # Fresh installs manage channels in Browse by default. load_config()
+    # overrides this to True exactly once for pre-existing config files that
+    # do not yet contain the key, preserving the established Subs workflow
+    # for users who upgrade from an earlier release.
+    "legacy_subs_tab": False,
     # yt-dlp release channel the in-app updater targets. "stable" (the
     # default, safest) or "nightly" (yt-dlp's beta channel — carries
     # YouTube fixes days-to-weeks ahead of stable; use it when stable is
@@ -338,12 +343,19 @@ def load_config() -> dict[str, Any]:
                 data = json.load(f)
         merged = copy.deepcopy(DEFAULT_CONFIG)
         merged.update(data)
-        # Run migrations exactly once per config, then stamp a flag so
+        # Existing installs predate the Browse-first preference. Preserve
+        # their established layout by enabling Dense Subs only when an
+        # on-disk config exists but has never stored this key. New installs
+        # take DEFAULT_CONFIG's False value, and explicit choices are kept.
+        _needs_dense_subs_default = "legacy_subs_tab" not in data
+
+        # Run migrations exactly once per config, then stamp a flag/key so
         # subsequent load_config calls skip the work. Previously
         # _migrate_pending_tx_ids ran on every load — idempotent but
         # wasteful, and any future migration accidentally breaking
         # idempotency would silently corrupt state.
-        if not merged.get("_migration_v2_pending_tx_ids"):
+        if (not merged.get("_migration_v2_pending_tx_ids")
+                or _needs_dense_subs_default):
             # Run the migration on a DEEP COPY first. If save_config
             # fails (antivirus lock, OneDrive sync, disk full), the
             # in-memory `merged` we return must NOT carry the migrated
@@ -355,8 +367,11 @@ def load_config() -> dict[str, Any]:
             # destructive zero-out of transcription_pending and flip of
             # transcription_complete makes this a real data-loss path.
             _candidate = copy.deepcopy(merged)
-            _migrate_pending_tx_ids(_candidate)
-            _candidate["_migration_v2_pending_tx_ids"] = True
+            if not merged.get("_migration_v2_pending_tx_ids"):
+                _migrate_pending_tx_ids(_candidate)
+                _candidate["_migration_v2_pending_tx_ids"] = True
+            if _needs_dense_subs_default:
+                _candidate["legacy_subs_tab"] = True
             if getattr(_in_tx, 'active', False):
                 # Inside a config_transaction: adopt migrated state now;
                 # the outer transaction's exit-save will persist it.
@@ -392,6 +407,11 @@ def load_config() -> dict[str, Any]:
                         _log.warning("recovered from snapshot: %s", snap.name)
                         merged = copy.deepcopy(DEFAULT_CONFIG)
                         merged.update(data)
+                        # A recovered snapshot is still an existing install.
+                        # Apply the same compatibility default while retaining
+                        # any explicit True/False value already stored.
+                        if "legacy_subs_tab" not in data:
+                            merged["legacy_subs_tab"] = True
                         # Sideline the corrupt file so the next launch uses the snapshot
                         try:
                             # Use a unique timestamp suffix so
@@ -572,7 +592,7 @@ def save_config(cfg: dict[str, Any]) -> bool:
     try:
         should_backup = False
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        # audit SM-8 + UI audit 2026-05-14: trim autorun_history on
+        # Trim autorun_history on
         # save so the config file can't grow unbounded across years.
         # UI shows the last 10,000 entries; on-disk cap matches so
         # nothing is silently dropped. At ~150 entries/day on a

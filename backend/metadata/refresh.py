@@ -1,7 +1,7 @@
 """
 metadata.refresh — package shim re-exporting the three refresh kinds.
 
-Patch 22 (v72.4): the original 1,368-line file got split into:
+Refresh behavior is split by operation:
 
     refresh_views.py    — bulk_refresh_views_likes (~640 lines)
     refresh_comments.py — refresh_channel_comments (~205 lines)

@@ -12,15 +12,14 @@ the wizard can re-render final state.
 """
 from __future__ import annotations
 
-from backend import deps_installer as _deps
-from backend import youtube_traffic
-
-import re
 import threading
 
-from ._shared import _log
-from backend.ytarchiver_config import load_config, save_config
+from backend import deps_installer as _deps
+from backend import youtube_traffic
 from backend.version import APP_VERSION
+from backend.ytarchiver_config import load_config, save_config
+
+from ._shared import _log
 
 
 class OnboardingMixin:

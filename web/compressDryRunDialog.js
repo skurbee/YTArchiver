@@ -1,8 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════════
    compressDryRunDialog.js — "Compress dry-run" results modal
 
-   Extracted from settingsTab.js (Patch 24, v72.6). The Settings →
-   Tools → "Compress dry-run" button opens this modal which queries
+   The Settings → Tools → "Compress dry-run" button opens this modal, which queries
    every channel and shows projected file-size savings if AV1
    compression were applied. No actual encode runs from this dialog —
    it's purely informational.

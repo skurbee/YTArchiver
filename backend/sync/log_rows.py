@@ -1,8 +1,6 @@
 """
 sync.log_rows — activity-log row emitters and pass-id state.
 
-Patch 18 phase 4 (v69.4): extracted from backend/sync/legacy.py.
-
 Public surface (re-exported via the sync package):
     _bracket_segments(label, ...)
         Build `[label]` log segments with the bracket/label tag split.

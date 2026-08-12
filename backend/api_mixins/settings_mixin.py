@@ -10,17 +10,15 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 import sys
 import threading
 
-from ._shared import _api_err, _log
-from backend.archive_capacity import normalize_archive_capacity_warning
-from backend import youtube_traffic
-from backend.ytarchiver_config import config_is_writable, load_config, save_config
 from backend import sync as sync_backend
-from backend.log_stream import LogStreamer
-from backend.transcribe import TranscribeManager
+from backend import youtube_traffic
+from backend.archive_capacity import normalize_archive_capacity_warning
+from backend.ytarchiver_config import config_is_writable, load_config
+
+from ._shared import _api_err, _log
 
 
 class SettingsMixin:
@@ -200,6 +198,7 @@ class SettingsMixin:
             "whisper_model": cfg.get("whisper_model", "small"),
             "default_resolution": cfg.get("default_resolution", "720"),
             "log_mode": cfg.get("log_mode", "Simple"),
+            "legacy_subs_tab": bool(cfg.get("legacy_subs_tab", False)),
             # yt-dlp release channel the updater targets: "stable" or
             # "nightly" (beta). Surfaced by the Health > Tools yt-dlp row.
             "ytdlp_channel": (cfg.get("ytdlp_channel") or "stable"),
@@ -234,6 +233,7 @@ class SettingsMixin:
             "transcript_pane_width": cfg.get("transcript_pane_width"),
             "caption_overlay_size": (cfg.get("caption_overlay_size") or ""),
             "caption_overlay_bg": (cfg.get("caption_overlay_bg") or ""),
+            "caption_overlay_mode": (cfg.get("caption_overlay_mode") or ""),
             "youtube_traffic_mode": traffic["mode"],
             "youtube_traffic_custom_daily": int(
                 cfg.get("youtube_traffic_custom_daily", 750) or 750),
@@ -274,6 +274,8 @@ class SettingsMixin:
         if data.get("default_resolution"): cfg["default_resolution"] = data["default_resolution"]
         if data.get("log_mode") in ("Simple", "Verbose"):
             cfg["log_mode"] = data["log_mode"]
+        if "legacy_subs_tab" in data:
+            cfg["legacy_subs_tab"] = bool(data["legacy_subs_tab"])
         # yt-dlp release channel — only accept the two known values.
         if data.get("ytdlp_channel") in ("stable", "nightly"):
             cfg["ytdlp_channel"] = data["ytdlp_channel"]
@@ -332,11 +334,13 @@ class SettingsMixin:
         # Watch view caption overlay preferences. The watchActions.js
         # toolbar selects write these keys via settings_save, but until
         # this audit they had no save clause and were silently dropped.
-        # Validated enums match the frontend's _CAP_SIZES / _CAP_BGS.
+        # Validated enums match the frontend's caption preference sets.
         if data.get("caption_overlay_size") in ("off", "small", "medium", "large"):
             cfg["caption_overlay_size"] = data["caption_overlay_size"]
         if data.get("caption_overlay_bg") in ("translucent", "outline", "none"):
             cfg["caption_overlay_bg"] = data["caption_overlay_bg"]
+        if data.get("caption_overlay_mode") in ("single", "phrase3", "default"):
+            cfg["caption_overlay_mode"] = data["caption_overlay_mode"]
         # .txt: close-button behavior — "ask" (default modal),
         # "quit" (exit immediately), or "tray" (minimize to tray).
         if data.get("close_behavior") in ("ask", "quit", "tray"):

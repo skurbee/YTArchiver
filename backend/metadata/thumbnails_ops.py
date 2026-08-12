@@ -1,9 +1,7 @@
 """
 metadata.thumbnails_ops — channel-scoped thumbnail + video-id status ops.
 
-Patch 19 phase M5 (v69.2): extracted from metadata/legacy.py.
-
-Public surface (re-imported into legacy.py):
+Public surface (re-exported through the metadata package):
     sweep_missing_thumbnails(channel, stream)
         Walk a channel folder for .mp4 files without thumbs and
         download missing ones from cached metadata.jsonl URLs.
@@ -38,11 +36,6 @@ from pathlib import Path
 from typing import Any
 
 from ..log import get_logger
-from .io import (
-    _folder_for_channel,
-    _get_metadata_jsonl_path,
-    _read_metadata_jsonl,
-)
 from ..thumbnails import (
     _channel_fingerprint,
     _download_thumbnail,
@@ -53,6 +46,11 @@ from ..thumbnails import (
 )
 from ..utils import sqlite_like_escape as _like_esc
 from ..ytarchiver_config import load_config
+from .io import (
+    _folder_for_channel,
+    _get_metadata_jsonl_path,
+    _read_metadata_jsonl,
+)
 from .scan import _scan_channel_videos
 
 _log = get_logger(__name__)
@@ -119,10 +117,9 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
     # Pre-walk every .Thumbnails dir under the channel root once and
     # collect the full vid-id set. This means we treat thumbs as
     # "exists" if ANY .Thumbnails dir in the channel has them — not
-    # just the one next to the mp4. Bug surfaced on The PrimeTime
-    # where most thumbs lived in 2025/.Thumbnails/ but their mp4s
-    # had been re-foldered to 2023/ and 2024/ — the refetcher kept
-    # re-downloading thumbs that already existed in a sibling year.
+    # just the one next to the mp4. Videos can be reorganized across year
+    # folders while their existing thumbnails remain in a sibling year;
+    # those files must not be downloaded again.
     _id_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
     _all_thumb_vids: set = set()
     try:
@@ -290,8 +287,8 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
     # narrow (typical case — single-channel realign), prefix-filter
     # the SQL with the channel folder so we don't os.path.isfile()
     # every row in the videos table. On a 92k-video archive this
-    # was the bottleneck: 92k isfile syscalls per call, all on Z:\
-    # DrivePool, which made realign take minutes to even start.
+    # was the bottleneck: tens of thousands of isfile calls against a pooled
+    # archive could make realignment take minutes to start.
     vid_to_mp4_parent: dict[str, str] = {}
     try:
         conn = _idx._reader_open() or _idx._open()
@@ -443,7 +440,7 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
                         _c2 = _idx2._open()
                         if _c2 is not None:
                             with _idx2._db_lock:
-                                # Channel-scoped UPDATE (audit: H78).
+                                # Scope the update to the current channel.
                                 _c2.execute(
                                     "UPDATE videos SET has_thumbnail=1 "
                                     "WHERE video_id=? AND channel=?",
@@ -615,14 +612,10 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
 
     # Pass 2: walk the stale/missing channels in parallel.
     #
-    # Bug fix (2026-05-14): the previous algorithm checked each mp4
-    # against the .Thumbnails dir SITTING NEXT TO IT, missing thumbs
-    # that lived elsewhere in the same channel (e.g. The PrimeTime
-    # had 2025/.Thumbnails/ containing thumbs for files now in 2023/
-    # and 2024/ after reorg — counter reported "42% thumbnails" when
-    # disk actually held a 1:1 thumb-for-mp4 match). Now we collect
-    # EVERY `[vid_id]` from EVERY .Thumbnails/ in the channel folder
-    # once, then check membership per-mp4.
+    # The previous algorithm checked only the .Thumbnails directory beside
+    # each video, missing thumbnails elsewhere in the same channel after a
+    # reorganization. Collect every `[video_id]` from every .Thumbnails
+    # directory once, then check membership per video.
     def _count_one(item):
         ch, folder, name, fp = item
         total = with_thumb = 0

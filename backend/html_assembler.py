@@ -12,8 +12,8 @@ bytes differ. This avoids stale output after git checkouts or copied files
 where mtimes no longer prove freshness.
 
 Why a build step at all?
-    Patch 19 (v72.1) split the previously 1,953-line `web/index.html` into a
-    small shell template plus per-tab and per-dialog partials, so contributors
+    The original `web/index.html` was split into a small shell template plus
+    per-tab and per-dialog partials, so contributors
     can read one section at a time. There's no Node or bundler in the project,
     so this Python helper takes the place of a build step.
 """

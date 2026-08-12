@@ -28,6 +28,8 @@
   let _errorItems = [];
   let _traffic = null;
   let _trafficRefreshInFlight = false;
+  let _trafficRefreshPending = false;
+  let _trafficRefreshTimer = null;
 
   function _runningItem(list) {
     for (const t of (list || [])) {
@@ -103,7 +105,10 @@
     if (gpuText) gpuText.textContent = _segText("gpu", "Processing", "Processing idle");
 
     const sSt = _state.sync || {}, gSt = _state.gpu || {};
-    _setSeg("gsb-sync", sSt.running || _runningItem(_queues.sync), sSt.paused);
+    const syncLimitHold = !!(sSt.trafficWaiting || sSt.sessionLimited);
+    _setSeg("gsb-sync",
+      !syncLimitHold && (sSt.running || _runningItem(_queues.sync)),
+      sSt.paused || syncLimitHold);
     _setSeg("gsb-gpu", gSt.running || _runningItem(_queues.gpu), gSt.paused);
 
     // Index / sweep indicator.
@@ -187,6 +192,40 @@
         trafficDaily?.classList.remove("near-limit", "at-limit");
       }
     }
+  }
+
+  async function _refreshTraffic() {
+    if (!window.YT?.bridge?.isUp?.()) return;
+    if (_trafficRefreshInFlight) {
+      // Preserve one trailing refresh when a limit transition lands while
+      // the previous bridge read is still in flight.
+      _trafficRefreshPending = true;
+      return;
+    }
+    _trafficRefreshInFlight = true;
+    try {
+      const state = await window.YT.bridge.bridgeCall(
+        "youtube_traffic_status");
+      if (state && typeof state === "object") {
+        _traffic = state;
+        _render();
+      }
+    } catch (e) { /* best-effort footer telemetry */ }
+    finally {
+      _trafficRefreshInFlight = false;
+      if (_trafficRefreshPending) {
+        _trafficRefreshPending = false;
+        _requestTrafficRefresh(0);
+      }
+    }
+  }
+
+  function _requestTrafficRefresh(delayMs = 40) {
+    if (_trafficRefreshTimer !== null) return;
+    _trafficRefreshTimer = setTimeout(() => {
+      _trafficRefreshTimer = null;
+      _refreshTraffic();
+    }, Math.max(0, Number(delayMs) || 0));
   }
 
   function _renderErrorsPopover() {
@@ -366,6 +405,10 @@
       if (origState) { try { origState(s); } catch (e) { /* ignore */ } }
       _state = s || { sync: {}, gpu: {} };
       _render();
+      // The backend pushes queue state immediately when a rolling YouTube
+      // limit starts or clears. Refresh the separately sourced counter on
+      // that same edge instead of leaving it behind until the poll timer.
+      _requestTrafficRefresh(0);
     };
     const origInd = window._setIndicator;
     window._setIndicator = function (slot, text) {
@@ -441,22 +484,13 @@
     hydrateRescan();
     window.addEventListener("pywebviewready", hydrateRescan, { once: true });
 
-    const refreshTraffic = async () => {
-      if (_trafficRefreshInFlight || !window.YT?.bridge?.isUp?.()) return;
-      _trafficRefreshInFlight = true;
-      try {
-        const state = await window.YT.bridge.bridgeCall(
-          "youtube_traffic_status");
-        if (state && typeof state === "object") {
-          _traffic = state;
-          _render();
-        }
-      } catch (e) { /* best-effort footer telemetry */ }
-      finally { _trafficRefreshInFlight = false; }
-    };
-    refreshTraffic();
-    window.addEventListener("pywebviewready", refreshTraffic, { once: true });
-    const trafficTimer = setInterval(refreshTraffic, 15000);
+    _refreshTraffic();
+    window.addEventListener("pywebviewready", _refreshTraffic, { once: true });
+    // Queue-state edges make limit stop/go transitions immediate. Keep a
+    // modest fallback poll for ordinary YouTube operations that do not alter
+    // queue state, and for rolling expirations while the app is otherwise
+    // idle.
+    const trafficTimer = setInterval(_refreshTraffic, 5000);
     if (window._trackBootInterval) window._trackBootInterval(trafficTimer);
   }
 

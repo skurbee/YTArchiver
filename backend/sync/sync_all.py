@@ -1,15 +1,13 @@
 """
 sync.sync_all — multi-channel sync orchestrator.
 
-Extracted from sync/core.py (Patch 14, v71.6).
-
 `sync_all` is the top-level entry point the worker thread invokes when
 the user hits Sync Subbed (or when an autorun pass fires, or when a
 queue-only worker is started just to drain queued metadata tasks). It
 walks the persistent sync queue, calls `sync_channel` for each item,
 and emits the start-of-pass / end-of-pass log decoration.
 
-Public surface (re-exported via sync/__init__.py for back-compat):
+Public surface (re-exported through the sync package):
     sync_all(stream, cancel_event=None, only_with_new=True,
              queues=None, transcribe_mgr=None,
              pause_event=None, skip_event=None,

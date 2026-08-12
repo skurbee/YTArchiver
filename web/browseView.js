@@ -70,6 +70,16 @@
         browseNavigate();
       });
     });
+    const channelsButton = document.querySelector(
+      '.submode-btn[data-submode="channels"]');
+    if (channelsButton) {
+      channelsButton.title = "Right-click for the dense Subs list";
+      channelsButton.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        const item = window._denseSubsContextMenuItem?.();
+        if (item) window.showContextMenu?.(e.clientX, e.clientY, [item]);
+      });
+    }
     syncSubmodeA11y();
 
     // Back button — channels → videos → watch unwind, with scroll-position
@@ -305,6 +315,8 @@
     // every submode here — showView("channels") re-shows it below.
     const chanSortWrap = document.getElementById("browse-channel-sort-wrap");
     if (chanSortWrap) chanSortWrap.hidden = true;
+    const addChannelBtn = document.getElementById("browse-add-channel");
+    if (addChannelBtn) addChannelBtn.hidden = true;
 
     if (mode === "channels") {
       // Restart in channel grid
@@ -488,6 +500,7 @@
     const backBtn = document.getElementById("browse-back-btn");
     const sortWrap = document.getElementById("browse-sort-wrap");
     const chanSortWrap = document.getElementById("browse-channel-sort-wrap");
+    const addChannelBtn = document.getElementById("browse-add-channel");
     const filter = document.getElementById("browse-filter");
     const findWrap = filter?.closest(".browse-find-wrap");
 
@@ -497,6 +510,7 @@
       backBtn.hidden = true;
       sortWrap.hidden = true;
       if (chanSortWrap) chanSortWrap.hidden = false;
+      if (addChannelBtn) addChannelBtn.hidden = false;
       if (filter) { filter.placeholder = "Filter channels\u2026"; filter.value = ""; }
       if (findWrap) findWrap.hidden = false;
       // Re-render the grid to match the just-cleared filter. Without this,
@@ -515,6 +529,7 @@
       backBtn.hidden = false;
       sortWrap.hidden = false;
       if (chanSortWrap) chanSortWrap.hidden = true;
+      if (addChannelBtn) addChannelBtn.hidden = true;
       if (filter) { filter.placeholder = "Filter videos\u2026"; filter.value = ""; }
       if (findWrap) findWrap.hidden = false;
     } else if (viewName === "watch") {
@@ -523,6 +538,7 @@
       backBtn.hidden = false;
       sortWrap.hidden = true;
       if (chanSortWrap) chanSortWrap.hidden = true;
+      if (addChannelBtn) addChannelBtn.hidden = true;
       // Hide the whole wrap (input + icon), not just the input —
       // otherwise a lone magnifying glass sits in the header with
       // nothing to filter.
@@ -591,9 +607,7 @@
   // Browse > Search sub-mode + viewer pane + un-indexed banner moved
   // to web/browseSearch.js (window.initSearchView).
 
-  // escapeHtml moved to web/util.js. Local alias kept so
-  // the existing call sites in this IIFE keep resolving — Patch 14
-  // migrates them to YT.util.escapeHtml.
+  // escapeHtml lives in web/util.js. Keep a local alias for this IIFE.
   const escapeHtml = window.YT?.util?.escapeHtml || ((s) => String(s ?? "")
     .replace(/[&<>"']/g, (ch) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",

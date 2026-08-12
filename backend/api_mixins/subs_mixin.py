@@ -8,21 +8,20 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-import json
 import os
-import re
-import subprocess
 import threading
-import time
-import urllib.request
 
-from ._shared import _log, webview
-from backend.ytarchiver_config import channels_for_subs_ui, config_is_writable, load_config, save_config
-from backend import archive_scan
+from backend import archive_scan, youtube_traffic
 from backend import subs as subs_backend
 from backend import sync as sync_backend
-from backend import youtube_traffic
-from backend.queues import QueueState
+from backend.ytarchiver_config import (
+    channels_for_subs_ui,
+    config_is_writable,
+    load_config,
+    save_config,
+)
+
+from ._shared import _log
 
 _SUBS_PROBE_TIMEOUT_SEC = 15
 

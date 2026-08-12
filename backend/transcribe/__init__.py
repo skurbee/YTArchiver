@@ -24,6 +24,7 @@ from .core import (  # noqa: F401
     _replace_jsonl_entry,
     _scan_existing_transcript_titles,
 )
+
 # _get_jsonl_sidecar / _get_transcript_filename live in .paths and are
 # re-exported from there below (importing them from .core too would just
 # shadow the identical object — see gate F811 check).

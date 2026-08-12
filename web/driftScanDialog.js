@@ -1,8 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════════
    driftScanDialog.js — Transcript drift scan + fix modal
 
-   Extracted from settingsTab.js (Patch 24, v72.6). Wires the
-   Settings → Tools → "Scan for transcript drift" button:
+   Wires the Settings → Tools → "Scan for transcript drift" button:
 
      • Open the dialog (channel picker + Scan / Fix buttons)
      • Scan button → call api.drift_scan(channel) → render three
@@ -226,7 +225,7 @@
               res, (t) => bridgeCall("drift_scan_channel_poll", t), 10 * 60 * 1000);
           }
           // Stash the identity we just scanned with so _fix uses
-          // the same one regardless of dropdown drift (audit H216).
+          // the same one even if the dropdown changes later.
           if (res && typeof res === "object") res._scan_identity = identity;
           _renderScan(res);
         } catch (e) {

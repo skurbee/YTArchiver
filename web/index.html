@@ -74,7 +74,7 @@
        Health and Settings are grouped on the right as app/admin tabs. -->
   <div class="tab-row">
     <div class="tab active" data-tab="download">Download</div>
-    <div class="tab" data-tab="subs">Subs</div>
+    <div class="tab legacy-subs-tab" data-tab="subs" hidden>Subs</div>
     <div class="tab browse-tab" data-tab="browse">Browse</div>
     <div class="tab health-tab" data-tab="health">Health</div>
     <div class="tab settings-tab" data-tab="settings">Settings</div>
@@ -164,12 +164,12 @@
       </fieldset>
 
       <!-- Channel nudge: when a channel URL is pasted but not in subs, show
-           a handoff button to pre-populate the Subs Add-Channel form.
+           a handoff button to pre-populate the shared Add-Channel form.
            Mirrors YTArchiver.py:4458 channel_nudge_panel. -->
       <div class="channel-nudge-panel" id="channel-nudge-panel" hidden>
         <span class="channel-nudge-icon">&#x1F4FA;</span>
-        <span class="channel-nudge-text">Add channels in the Subs tab.</span>
-        <button class="btn btn-primary btn-thin" id="btn-channel-nudge-add">&#8594; Add to sub list</button>
+        <span class="channel-nudge-text">Add channels from Browse.</span>
+        <button class="btn btn-primary btn-thin" id="btn-channel-nudge-add">&#8594; Add channel</button>
       </div>
 
       <!-- Row 2: Main actions + quick-action icons + status -->
@@ -413,6 +413,7 @@
              - Double-click a row or right-click → Edit: same panel, all fields visible,
                label changes to "Edit channel &mdash; <folder>".
            Matches YTArchiver.py:4997 add_outer + _set_add_details_visible. -->
+      <div id="legacy-channel-editor-home">
       <div class="edit-channel-box" id="edit-channel-box">
         <label class="subs-section-label" id="edit-channel-label">Add channel</label>
 
@@ -619,6 +620,7 @@
           </button>
         </div>
       </div>
+      </div>
 
     </div>
 
@@ -805,11 +807,20 @@
 
         <label class="subs-section-label">Appearance</label>
         <div class="edit-grid">
-          <label class="edit-gl">Subs table</label>
-          <div class="edit-gv-stack">
+          <label class="edit-gl">Dense Sub Tab</label>
+          <div class="edit-gv-stack settings-appearance-choice">
+            <label class="edit-gv-inline settings-checkbox-row">
+              <input type="checkbox" id="settings-legacy-subs-tab" />
+              <span>Show dense Subs tab</span>
+            </label>
+            <span class="settings-inline-note">Adds a dense-view &ldquo;Subs&rdquo; tab for easy channel editing.</span>
+          </div>
+
+          <label class="edit-gl" id="settings-subs-table-label" hidden>Legacy Subs table</label>
+          <div class="edit-gv-stack" id="settings-subs-table-options" hidden>
             <label class="edit-gv-inline settings-checkbox-row">
               <input type="checkbox" id="settings-show-avg-size" />
-              <span>Show Avg filesize in subs tab</span>
+              <span>Show Avg filesize in Subs tab</span>
             </label>
           </div>
 
@@ -1269,6 +1280,11 @@
           <button class="back-btn" id="browse-back-btn" hidden>&#8592; Back</button>
           <span class="browse-main-title" id="browse-main-title">Channels</span>
           <div class="spacer"></div>
+          <button class="btn browse-add-channel-btn" id="browse-add-channel" type="button"
+                  title="Add a YouTube channel to your archive">
+            <span class="browse-add-channel-icon" aria-hidden="true">+</span>
+            Add channel
+          </button>
           <!-- Channel-grid sort. Visible by default because Channels is the
                default Browse view; browseNavigate()/showView() hide it when
                switching to other submodes/views. -->
@@ -1445,12 +1461,13 @@
                       <option value="outline">Outline</option>
                       <option value="none">None</option>
                     </select>
-                    <label class="overlay-sublabel">words</label>
+                    <label class="overlay-sublabel">mode</label>
                     <select class="ctl-select" id="watch-cap-mode"
-                            aria-label="Words shown in overlay"
-                            title="1 word: just the spoken word.&#10;3 words: previous + current + next (neighbors dimmer).">
+                            aria-label="Caption overlay mode"
+                            title="1 word: just the spoken word.&#10;3 words: previous + current + next (neighbors dimmer).&#10;Default: YouTube-style phrases in up to two lines.">
                       <option value="single" selected>1 word</option>
                       <option value="phrase3">3 words</option>
+                      <option value="default">Default</option>
                     </select>
                   </span>
                 </div>
@@ -1964,8 +1981,8 @@
             <option value="1440">1440p</option>
             <option value="2160">2160p</option>
           </select>
-          <!-- Re-run action gets the primary (green) treatment so the
-               "do something" affordance is visually obvious (UI audit). -->
+           <!-- Re-run action gets the primary (green) treatment so the
+                primary action is visually obvious. -->
           <button class="btn btn-primary btn-thin" id="compress-dry-recalc">Recompute</button>
         </div>
         <div id="compress-dry-body" class="askq-scroll-body">
@@ -2198,6 +2215,26 @@
         <button class="btn btn-ghost" id="autorun-history-export">Export CSV</button>
       </div>
     </div>
+  </div>
+
+  <!-- Shared channel editor. In the default Browse-first experience the
+       existing add/edit form is mounted here as a modern dialog. Enabling
+       Settings > Appearance > legacy Subs moves that exact same form back
+       into #legacy-channel-editor-home, so both paths always stay in sync. -->
+  <div class="askq-backdrop channel-editor-backdrop" id="channel-editor-backdrop" hidden>
+    <section class="channel-editor-dialog" role="dialog" aria-modal="true"
+             aria-labelledby="channel-editor-title" aria-describedby="channel-editor-subtitle">
+      <header class="channel-editor-header">
+        <div class="channel-editor-heading">
+          <span class="channel-editor-eyebrow">CHANNEL MANAGEMENT</span>
+          <h2 id="channel-editor-title">Add channel</h2>
+          <p id="channel-editor-subtitle">Choose what to archive now and how future downloads should be handled.</p>
+        </div>
+        <button class="channel-editor-close" id="channel-editor-close" type="button"
+                title="Close" aria-label="Close channel editor">&times;</button>
+      </header>
+      <div class="channel-editor-body" id="channel-editor-mount"></div>
+    </section>
   </div>
 
   <!-- Global context menu mount point -->
@@ -2547,9 +2584,11 @@
 
           <h1 class="onb-title">You're all set</h1>
 
-          <p class="onb-text">YTArchiver is ready. Add channels on the <b>Subs</b> tab,
+          <p class="onb-text">YTArchiver is ready. Your empty <b>Browse &gt; Channels</b>
 
-            or paste a video URL on the <b>Download</b> tab to grab a single video.</p>
+            page will guide you to <b>Add your first channel</b>, or you can paste a
+
+            video URL on the <b>Download</b> tab to grab a single video.</p>
 
           <div class="onb-dep-rows" id="onb-done-summary"></div>
 

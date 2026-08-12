@@ -2,8 +2,7 @@
 transcribe.helpers — small pure helpers used by TranscribeManager +
 PunctuationManager.
 
-Extracted from transcribe/core.py (Patch 16, v71.8). Owns the
-path/title normalization, channel lookup, transcript-file scanning,
+Owns path/title normalization, channel lookup, transcript-file scanning,
 ffprobe duration probe, transcription-pending counter, output-dir
 resolver, and the Python 3.11 discovery for the Whisper subprocess.
 
@@ -31,7 +30,7 @@ _log = get_logger(__name__)
 
 
 def _norm_title(s: str) -> str:
-    """Patch 1 (v66.5): delegates to backend.text_utils.normalize_title.
+    """Delegate to backend.text_utils.normalize_title.
     Kept as a thin alias to avoid touching every internal caller in
     this file. New code should import from text_utils directly.
     """
@@ -40,9 +39,7 @@ def _norm_title(s: str) -> str:
 
 
 def _extract_video_id(video_path: str, hint: str = "") -> str:
-    """Patch 11 (v67.7): consolidates the three inline filename-regex +
-    videos-table-fallback blocks that lived in _fetch_captions_via_ytdlp,
-    _try_auto_captions, and _write_outputs.
+    """Resolve a video ID consistently for all transcription paths.
 
     Strategy: hint -> filename `[id]` suffix -> FTS DB lookup.
     Returns "" on no-match. Never raises.

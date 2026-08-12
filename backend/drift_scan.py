@@ -399,8 +399,7 @@ def _write_transcript_entry_plain(txt_path: str, title: str, date_str: str,
     except OSError:
         pass
     try:
-        from backend.transcribe.transcribe_files import (
-            _header_url_field as _hurl)
+        from backend.transcribe.transcribe_files import _header_url_field as _hurl
         _url_field = _hurl(video_id)
     except Exception:
         _url_field = ""

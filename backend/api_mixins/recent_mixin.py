@@ -7,15 +7,13 @@ private Api attributes kept as fallback state.
 """
 from __future__ import annotations
 
-import json
 import os
-import re
-import time
 
-from ._shared import _log
+from backend import index as index_backend
 from backend.log import swallow
 from backend.ytarchiver_config import config_is_writable, load_config, recent_for_ui, save_config
-from backend import index as index_backend
+
+from ._shared import _log
 
 
 class RecentMixin:

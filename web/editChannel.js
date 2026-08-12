@@ -1,5 +1,5 @@
 /**
- * web/editChannel.js — inline edit-channel panel for the Subs tab.
+ * web/editChannel.js — shared Browse dialog / legacy Subs channel editor.
  *
  * Loading a row populates the form fields; Update/Remove/Cancel dispatch
  * to the bridge. Handles add and edit modes, three-state Update button
@@ -26,6 +26,11 @@
 (function () {
   "use strict";
 
+  // Browse-first channel management is the default. Settings can flip this
+  // at runtime after its persisted config arrives.
+  if (typeof window._legacySubsTabEnabled !== "boolean") {
+    window._legacySubsTabEnabled = false;
+  }
   function bridgeCall(method, ...args) {
     const fn = window.YT?.bridge?.bridgeCall;
     if (fn) return fn(method, ...args);
@@ -56,6 +61,116 @@
     const remove = document.getElementById("btn-edit-remove");
     const cancel = document.getElementById("btn-edit-cancel");
     if (!box) return;
+
+    const legacyHome = document.getElementById("legacy-channel-editor-home");
+    const editorBackdrop = document.getElementById("channel-editor-backdrop");
+    const editorMount = document.getElementById("channel-editor-mount");
+    const editorTitle = document.getElementById("channel-editor-title");
+    const editorSubtitle = document.getElementById("channel-editor-subtitle");
+
+    const hideModernEditor = () => {
+      if (editorBackdrop) editorBackdrop.hidden = true;
+      document.body.classList.remove("channel-editor-open");
+    };
+
+    const syncModernHeading = (mode, channel) => {
+      const isEdit = mode === "edit" && channel;
+      const name = channel?.folder || channel?.name || "";
+      if (editorTitle) {
+        editorTitle.textContent = isEdit && name ? `Edit ${name}` : "Add channel";
+      }
+      if (editorSubtitle) {
+        editorSubtitle.textContent = isEdit
+          ? "Update how this channel is archived. Existing files stay in place unless you choose a reorganization action."
+          : "Choose what to archive now and how future downloads should be handled.";
+      }
+    };
+
+    const presentEditorShell = (mode, channel, open = true, options = {}) => {
+      // Dense mode controls edits launched from the Subs list. Browse owns
+      // the modern dialog regardless of that preference, so enabling the
+      // dense tab never pulls a Browse user out of their current context.
+      const useLegacy = !!window._legacySubsTabEnabled
+        && !options.forceModern;
+      if (useLegacy) {
+        if (legacyHome && box.parentElement !== legacyHome) legacyHome.appendChild(box);
+        hideModernEditor();
+        if (open) document.querySelector('.tab[data-tab="subs"]')?.click();
+        return;
+      }
+      if (editorMount && box.parentElement !== editorMount) editorMount.appendChild(box);
+      syncModernHeading(mode, channel);
+      if (!open || !editorBackdrop) return;
+      editorBackdrop.hidden = false;
+      document.body.classList.add("channel-editor-open");
+    };
+
+    const applyLegacySubsMode = (enabled) => {
+      const useLegacy = !!enabled;
+      window._legacySubsTabEnabled = useLegacy;
+      const tab = document.querySelector('.tab[data-tab="subs"]');
+      const panel = document.getElementById("panel-subs");
+      if (tab) tab.hidden = !useLegacy;
+      document.getElementById("settings-subs-table-label")
+        ?.toggleAttribute("hidden", !useLegacy);
+      document.getElementById("settings-subs-table-options")
+        ?.toggleAttribute("hidden", !useLegacy);
+      if (!useLegacy && (tab?.classList.contains("active") || panel?.classList.contains("active"))) {
+        document.querySelector('.tab[data-tab="browse"]')?.click();
+      }
+      presentEditorShell("add", null, false);
+      if (useLegacy) hideModernEditor();
+      window.dispatchEvent(new CustomEvent("legacy-subs-mode-changed", {
+        detail: { enabled: useLegacy },
+      }));
+    };
+    window._applyLegacySubsMode = applyLegacySubsMode;
+    applyLegacySubsMode(window._legacySubsTabEnabled);
+
+    window._setDenseSubsPreference = async (
+        enabled, { openWhenEnabled = false } = {}) => {
+      const useDense = !!enabled;
+      if (!nativeBridgeUp()) {
+        window._showToast?.("Native mode required to save this setting.", "warn");
+        return false;
+      }
+      try {
+        const result = await bridgeCall("settings_save", {
+          legacy_subs_tab: useDense,
+        });
+        if (!result?.ok) {
+          window._showToast?.(
+            result?.error || "Could not save Dense Sub Tab setting.", "error");
+          return false;
+        }
+      } catch (e) {
+        window._showToast?.("Could not save Dense Sub Tab setting: " + e, "error");
+        return false;
+      }
+      applyLegacySubsMode(useDense);
+      const settingsToggle = document.getElementById(
+        "settings-legacy-subs-tab");
+      if (settingsToggle) settingsToggle.checked = useDense;
+      if (useDense && openWhenEnabled) {
+        document.querySelector('.tab[data-tab="subs"]')?.click();
+        window.refreshSubsTable?.();
+      }
+      return true;
+    };
+    window._denseSubsContextMenuItem = () => ({
+      label: "View Dense Subs List",
+      checked: !!window._legacySubsTabEnabled,
+      title: "Show or hide the Dense Subs tab and remember the choice",
+      action: () => window._setDenseSubsPreference?.(
+        !window._legacySubsTabEnabled, { openWhenEnabled: true }),
+    });
+
+    const mainSubsTab = document.querySelector('.tab[data-tab="subs"]');
+    mainSubsTab?.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      const item = window._denseSubsContextMenuItem?.();
+      if (item) window.showContextMenu?.(e.clientX, e.clientY, [item]);
+    });
 
     const resetFields = () => {
       // Clear every text/number field — INCLUDING the YYYY/MM/DD date
@@ -100,7 +215,8 @@
       const nameVal = (document.getElementById("edit-folder")?.value || "").trim();
       const urlVal = (document.getElementById("edit-url")?.value || "").trim();
       const editing = !!_editingIdentity;
-      const shouldShow = Boolean(nameVal || urlVal || editing);
+      const shouldShow = !window._legacySubsTabEnabled
+        || Boolean(nameVal || urlVal || editing);
       box.classList.toggle("collapsed", !shouldShow);
     };
     document.getElementById("edit-folder")?.addEventListener("input", _updateCollapsed);
@@ -186,6 +302,7 @@
         _editUrlField.dispatchEvent(new Event("input", { bubbles: true }));
       }
       _updateEditUrlNudge();
+      hideModernEditor();
     });
 
     const openPanel = (mode, channel) => {
@@ -335,6 +452,14 @@
       _updateCollapsed();
       _folderUserEdited = false;   // a fresh add should auto-derive again
       window._editOriginalSnapshot = null;
+      hideModernEditor();
+      // A Browse-launched edit temporarily moves the shared form into the
+      // modern modal. Put it back after close so the enabled dense Subs tab
+      // still has its inline editor the next time the user visits it.
+      if (window._legacySubsTabEnabled && legacyHome
+          && box.parentElement !== legacyHome) {
+        legacyHome.appendChild(box);
+      }
     };
 
     // Dirty check before discarding edits. update.disabled === false
@@ -656,13 +781,20 @@
 
     let _editingIdentity = null;
     const _origOpenPanel = openPanel;
-    const wrappedOpenPanel = (mode, channel) => {
+    const wrappedOpenPanel = (mode, channel, options = {}) => {
+      presentEditorShell(mode, channel, true, options);
       _origOpenPanel(mode, channel);
       _editingIdentity = (mode === "edit" && channel)
         ? { url: channel.url, name: channel.folder || channel.name }
         : null;
+      requestAnimationFrame(() => {
+        const first = document.getElementById(
+          mode === "edit" ? "edit-folder" : "edit-url");
+        first?.focus();
+        if (mode === "add") first?.select?.();
+      });
     };
-    window._editChannelFromContext = (folder, urlGuess) => {
+    window._editChannelFromContext = (folder, urlGuess, options = {}) => {
       // No URL fallback construction here. Previously the fallback
       // built a guessed `youtube.com/@{folder-without-spaces}` URL
       // that was indistinguishable from a real URL when persisted —
@@ -672,18 +804,58 @@
       // edit panel surfaces the missing URL so the user pastes a
       // legitimate one before saving.
       const chan = { folder, url: urlGuess || "" };
+      // Give immediate visual feedback while the full channel record loads.
+      presentEditorShell("edit", chan, true, options);
       if (nativeBridgeUp()) {
         bridgeCall("subs_get_channel", { name: folder }).then(res => {
           const channel = (res && res.ok && res.channel) ? {
             ...res.channel,
             folder: res.channel.name || res.channel.folder,
           } : chan;
-          wrappedOpenPanel("edit", channel);
-        }).catch(() => wrappedOpenPanel("edit", chan));
+          wrappedOpenPanel("edit", channel, options);
+        }).catch(() => wrappedOpenPanel("edit", chan, options));
       } else {
-        wrappedOpenPanel("edit", chan);
+        wrappedOpenPanel("edit", chan, options);
       }
     };
+
+    window._editChannelFromBrowse = (folder, urlGuess) => {
+      window._editChannelFromContext?.(
+        folder, urlGuess, { forceModern: true });
+    };
+
+    window._openAddChannelEditor = (urlGuess = "") => {
+      // This entry point belongs to Browse and the first-run empty state;
+      // keep their new dialog even when the optional dense tab is enabled.
+      wrappedOpenPanel("add", null, { forceModern: true });
+      if (!urlGuess) return;
+      const urlField = document.getElementById("edit-url");
+      if (!urlField) return;
+      urlField.value = String(urlGuess).trim();
+      urlField.dispatchEvent(new Event("input", { bubbles: true }));
+      urlField.focus();
+      urlField.select?.();
+    };
+    document.getElementById("browse-add-channel")?.addEventListener("click", () => {
+      window._openAddChannelEditor?.();
+    });
+
+    const requestEditorClose = () => cancel?.click();
+    document.getElementById("channel-editor-close")
+      ?.addEventListener("click", requestEditorClose);
+    editorBackdrop?.addEventListener("click", (e) => {
+      if (e.target === editorBackdrop) requestEditorClose();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape" || editorBackdrop?.hidden) return;
+      const anotherDialogOpen = [...document.querySelectorAll(
+        '.askq-backdrop:not(#channel-editor-backdrop)')]
+        .some((el) => !el.hidden);
+      if (anotherDialogOpen) return;
+      e.preventDefault();
+      e.stopPropagation();
+      requestEditorClose();
+    }, true);
 
     const _subsTbody = document.getElementById("subs-table-body");
     if (_subsTbody) {
@@ -835,7 +1007,7 @@
         const data = await bridgeCall("get_subs_channels");
         if (Array.isArray(data) && data.length === 2) {
           window.renderSubsTable(data[0], data[1]);
-          window._primeBrowse(data[0]);
+          await window._primeBrowse(data[0]);
         }
       } catch (e) { console.warn("refresh failed", e); }
     }

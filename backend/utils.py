@@ -21,8 +21,6 @@ import os
 import re
 import unicodedata
 
-from .log import get_logger
-
 # Re-exports from concern-area sub-modules (backward-compat shims).  # noqa: E402
 from .fmt_utils import (  # noqa: F401
     fmt_time_ago,
@@ -48,6 +46,7 @@ from .fs_safety import (  # noqa: F401
     load_json_safe,
     sampled_files_equal,
 )
+from .log import get_logger
 from .proc_utils import (  # noqa: F401
     decode_subprocess_line,
     ffprobe_is_compressed,

@@ -9,10 +9,10 @@ when moving them out of main.py.
 from __future__ import annotations
 
 import os
-from datetime import datetime
 
-from ._shared import webview, normalize_dialog_paths
 from backend import index as index_backend
+
+from ._shared import normalize_dialog_paths
 
 
 class BookmarkMixin:

@@ -1,7 +1,7 @@
 """
 metadata.refresh_fetch — fetch missing metadata for a channel's videos.
 
-Extracted from metadata/refresh.py (Patch 22, v72.4).
+Channel metadata-fetch implementation.
 
 `fetch_channel_metadata(channel, stream, refresh=False, ...)` fills in
 missing metadata for a channel's on-disk videos. When `refresh=True`
@@ -20,15 +20,15 @@ from typing import Any
 
 from ..log import get_logger
 from ..log_stream import LogStreamer
-from .io import (
-    _folder_for_channel,
-    _read_metadata_jsonl,
-)
 from ..sync import find_yt_dlp
 from ._refresh_proxies import (
     _resolve_ids_by_title,
 )
 from .fetcher import fetch_metadata_for_videos
+from .io import (
+    _folder_for_channel,
+    _read_metadata_jsonl,
+)
 from .refresh_views import bulk_refresh_views_likes
 from .scan import _scan_channel_videos
 

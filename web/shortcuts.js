@@ -8,7 +8,7 @@
  *   F11       — Fullscreen toggle (native via pywebview, HTML5 fallback)
  *   Ctrl+L    — Focus URL field on Download tab
  *   Ctrl+S    — Sync Subbed
- *   Ctrl+K    — Jump to Subs tab + focus filter
+ *   Ctrl+K    — Open the command palette
  *   Ctrl+P    — Open Sync Tasks popover
  *   1-5       — Switch tabs by number
  *   Escape    — Close context menus + queue popovers
@@ -38,6 +38,8 @@
       const tag = e.target.tagName;
       const editing = tag === "INPUT" || tag === "TEXTAREA" ||
                       e.target.isContentEditable;
+      const key = (e.key && e.key.length === 1)
+        ? e.key.toLowerCase() : e.key;
 
       // When ANY modal is open (askq backdrop), every shortcut except
       // Esc/Enter is blocked. Modals own input focus — Ctrl+S firing
@@ -52,7 +54,7 @@
       // by losing unsaved input (audit: shortcuts.js H136, H145).
       if (editing) {
         if ((e.ctrlKey || e.metaKey)
-            && ["s", "f", "k", "p"].includes(e.key)) return;
+            && ["s", "f", "k", "p"].includes(key)) return;
         if (e.key === "F5") return;
       }
 
@@ -64,21 +66,31 @@
         return;
       }
       // Ctrl+Q: quit (close window via tray-quit path)
-      if ((e.ctrlKey || e.metaKey) && e.key === "q") {
+      if ((e.ctrlKey || e.metaKey) && key === "q") {
         e.preventDefault();
         if (nativeBridgeUp()) bridgeCall("window_quit");
         return;
       }
       // Ctrl+F: focus Browse > Search input. If Search view isn't
       // currently visible, SWITCH to it + focus.
-      if ((e.ctrlKey || e.metaKey) && e.key === "f") {
+      if ((e.ctrlKey || e.metaKey) && key === "f") {
         e.preventDefault();
+        const browsePanel = document.getElementById("panel-browse");
+        const viewWatch = document.getElementById("view-watch");
+        if (browsePanel && !browsePanel.hidden
+            && viewWatch && !viewWatch.hidden) {
+          const watchFind = document.getElementById("watch-find");
+          if (watchFind) { watchFind.focus(); watchFind.select(); }
+          return;
+        }
         const searchInput = document.getElementById("search-query");
         const browseTab = document.querySelector('.tab[data-tab="browse"]');
         const viewSearch = document.getElementById("view-search");
-        if (viewSearch && viewSearch.hidden) {
+        const searchVisible = !!(browsePanel && !browsePanel.hidden
+          && viewSearch && !viewSearch.hidden);
+        if (!searchVisible) {
           browseTab?.click();
-          document.querySelector('[data-browse-sub="search"]')?.click();
+          document.querySelector('[data-submode="search"]')?.click();
           setTimeout(() => {
             const si = document.getElementById("search-query");
             if (si) { si.focus(); si.select(); }
@@ -108,7 +120,7 @@
         return;
       }
       // Ctrl+L: focus the URL field on Download tab
-      if ((e.ctrlKey || e.metaKey) && e.key === "l") {
+      if ((e.ctrlKey || e.metaKey) && key === "l") {
         e.preventDefault();
         const tabs = document.querySelectorAll(".tab");
         tabs[0]?.click();
@@ -117,35 +129,39 @@
         return;
       }
       // Ctrl+S: Sync Subbed
-      if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+      if ((e.ctrlKey || e.metaKey) && key === "s") {
         e.preventDefault();
         document.getElementById("btn-sync-subbed")?.click();
         return;
       }
       // Ctrl+K: open the command palette (search actions + channels).
-      if ((e.ctrlKey || e.metaKey) && e.key === "k") {
+      if ((e.ctrlKey || e.metaKey) && key === "k") {
         e.preventDefault();
         if (typeof window.openCommandPalette === "function") {
           window.openCommandPalette();
         } else {
-          // Fallback to the old behavior if the palette isn't loaded.
-          document.querySelector('.tab[data-tab="subs"]')?.click();
+          const useLegacy = !!window._legacySubsTabEnabled;
+          document.querySelector(
+            `.tab[data-tab="${useLegacy ? "subs" : "browse"}"]`)?.click();
           setTimeout(() => {
-            const f = document.getElementById("subs-filter");
+            const f = document.getElementById(
+              useLegacy ? "subs-filter" : "browse-filter");
             if (f) { f.focus(); f.select?.(); }
           }, 60);
         }
         return;
       }
       // Ctrl+P: open Sync Tasks popover
-      if ((e.ctrlKey || e.metaKey) && e.key === "p") {
+      if ((e.ctrlKey || e.metaKey) && key === "p") {
         e.preventDefault();
         document.getElementById("btn-sync-tasks")?.click();
         return;
       }
-      // Number keys 1-5: switch tabs (Download / Subs / Browse / Health / Settings).
+      // Number keys 1-5: switch the currently visible tabs. The optional
+      // legacy Subs tab changes the count/order, so do not index hidden tabs.
       if (!editing && /^[1-5]$/.test(e.key)) {
-        const tabs = document.querySelectorAll(".tab");
+        const tabs = [...document.querySelectorAll(".tab")]
+          .filter((tab) => !tab.hidden);
         const idx = parseInt(e.key, 10) - 1;
         if (tabs[idx]) tabs[idx].click();
         return;
@@ -176,7 +192,7 @@
     ["Ctrl + F", "Search transcripts + titles"],
     ["Ctrl + K", "Command palette (search actions + channels)"],
     ["Ctrl + P", "Open the sync queue"],
-    ["1 - 5", "Switch tabs (Download / Subs / Browse / Health / Settings)"],
+    ["1 - 5", "Switch visible tabs"],
     ["F11", "Toggle fullscreen"],
     ["Ctrl + Q", "Quit YTArchiver"],
     ["Esc", "Close menus, popovers, and dialogs"],

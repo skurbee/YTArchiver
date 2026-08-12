@@ -1,8 +1,7 @@
 """
 sync.ytdlp_proc — yt-dlp invocation primitives.
 
-Patch 18 phase 2 (v68.8): extracted from sync/legacy.py. Contains the
-pure-helper layer of sync — no shared mutable sync state, no log
+Pure-helper layer of sync: no shared mutable sync state, no log
 emission, no row-tracking. Just:
 
   - cookie source discovery + cache (browser probe / cookies.txt)

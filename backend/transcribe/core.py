@@ -67,14 +67,8 @@ _log = get_logger(__name__)
 # path + format + hide helpers moved to
 # transcribe/paths.py. Re-imported here so internal calls and external
 # `from backend.transcribe import _foo` callers keep working.
-from .paths import (  # noqa: F401
-    _get_jsonl_sidecar,
-    _get_transcript_filename,
-    _hide_per_video_transcript_txt_if_needed,
-)
-
-# Patch 16 (v71.8): pure helpers + PunctuationManager extracted to
-# helpers.py + punct_manager.py. Re-imported here so this module's
+# Pure helpers and PunctuationManager live in helpers.py and
+# punct_manager.py. Re-imported here so this module's
 # namespace + the package __init__ surface keep the previously-public
 # names visible.
 from .helpers import (  # noqa: F401
@@ -91,9 +85,14 @@ from .helpers import (  # noqa: F401
     find_python311,
     ytarchiver_config_output_dir,
 )
+from .paths import (  # noqa: F401
+    _get_jsonl_sidecar,
+    _get_transcript_filename,
+    _hide_per_video_transcript_txt_if_needed,
+)
 from .punct_manager import PunctuationManager  # noqa: F401
 
-# ── Patch 19 phase T1 (v68.9): file writers moved to transcribe_files.py ─
+# ── Aggregated transcript writers ─────────────────────────────────────
 # Internal callers (_transcribe_one, _write_outputs, retranscribe flows)
 # expect these names in this module's namespace.
 from .transcribe_files import (
@@ -105,7 +104,7 @@ from .transcribe_files import (
     _write_transcript_entry,
 )
 
-# ── Patch 19 phase T2 (v68.9): VTT path moved to transcribe_vtt.py ───
+# ── VTT caption path ──────────────────────────────────────────────────
 from .transcribe_vtt import (  # noqa: F401  (re-exports for backend.transcribe surface)
     _parse_vtt,
     _try_auto_captions,
@@ -116,8 +115,7 @@ from .transcribe_vtt import (  # noqa: F401  (re-exports for backend.transcribe 
 def _pending_journal_path() -> Path:
     """Where the pending-transcribe journal lives.
 
-    Matches YTArchiver.py:14650 pattern: <channel_folder>/_whisper_pending.json.
-    We keep a global one at APPDATA/ytarchiver_pending_transcribe.json so
+    A global journal at APPDATA/ytarchiver_pending_transcribe.json lets
     the manager can recover ALL queued work across channels on restart.
     """
     from ..ytarchiver_config import APP_DATA_DIR
@@ -151,7 +149,7 @@ def _punct_align_segments(punct_text: str, segments: list) -> None:
     if total_raw != len(punct_words):
         return
     idx = 0
-    for seg, n in zip(segments, raw_counts):
+    for seg, n in zip(segments, raw_counts, strict=True):
         if n >= 3:
             seg["t"] = " ".join(punct_words[idx:idx + n])
         idx += n
@@ -216,15 +214,12 @@ class TranscribeManager:
         self._stderr_drain_thread: threading.Thread | None = None
         self._stderr_buffer = None
         self._python311 = find_python311()
-        # Patch 19 fix (v68.2): this file moved from backend/transcribe.py
-        # to backend/transcribe/legacy.py. The worker script is bundled
-        # at <bundle>/backend/whisper_worker.py per the PyInstaller spec,
-        # so go up one more level.
+        # The worker is bundled beside the transcribe package under backend/.
         self._worker_script = Path(__file__).resolve().parent.parent / "whisper_worker.py"
         # Optional punctuation model — lazy-loaded, reused across jobs.
         # Routed through the process-singleton getter so the
         # Restore-Punctuation pass and the live transcribe worker
-        # share one subprocess + VRAM allocation (audit: H44).
+        # share one subprocess and VRAM allocation.
         try:
             from .punct_manager import get_shared_punct_manager
             self._punct = get_shared_punct_manager(stream)
@@ -550,8 +545,8 @@ class TranscribeManager:
 
             env = os.environ.copy()
             env["WHISPER_MODEL"] = m
-            # Honor a one-shot CPU-fallback on this instance instead
-            # of mutating os.environ globally (audit: H51). The OOM
+            # Honor a one-shot CPU fallback on this instance instead
+            # of mutating os.environ globally. The OOM
             # handler sets `self._cpu_fallback_active`; we read it
             # here so the next subprocess starts in CPU mode without
             # polluting process-wide env that any sibling subprocess
@@ -728,7 +723,7 @@ class TranscribeManager:
             # Drain the old reader thread before nulling proc + queue.
             # Without this, a subprocess restart left the old reader
             # alive reading from a dead pipe — a zombie thread until
-            # daemon cleanup at process exit (audit: H48 + H64). 2s
+            # daemon cleanup at process exit. The two-second
             # join cap so a wedged reader can't block the next start.
             try:
                 _rt = self._reader_thread
@@ -1082,6 +1077,7 @@ class TranscribeManager:
                     tx_status = _idx.video_tx_status(
                         video_id=vid or None,
                         title=(title or None),
+                        channel=(channel or None),
                     ).lower()
                     if tx_status == "no_speech":
                         return True
@@ -1674,7 +1670,7 @@ class TranscribeManager:
                         # No global env pop needed any more — the
                         # next _start_subprocess reads the instance
                         # flag (now False) and rebuilds env on GPU
-                        # automatically (audit: H51).
+                        # automatically.
                         self._stop_subprocess(force=True)
                         _reset_label = (
                             "\u21A9 Resetting to GPU mode for next job."
@@ -2178,8 +2174,7 @@ class TranscribeManager:
                 # Only mark `_punct_attempted = True` when we ACTUALLY
                 # call punctuate(). For silent videos with empty text
                 # the prior code set attempted=True but never made the
-                # call, so the source tag wrongly read "+NO-PUNCT"
-                # (audit: H73).
+                # call, so the source tag wrongly read "+NO-PUNCT".
                 result["_punct_success"] = False
                 result["_punct_timeout"] = False  # bug [43]
                 result.setdefault("_punct_attempted", False)
@@ -2237,7 +2232,7 @@ class TranscribeManager:
             # Only emit a realtime ratio when we have a real ffprobe
             # duration — otherwise the displayed "Nx realtime" is
             # derived from a chunking-routing sentinel, not the actual
-            # video length (audit: H70).
+            # video length.
             _realtime_str = (f"{duration / _elapsed:.1f}x realtime"
                              if _elapsed > 0 and duration > 0
                              and job.get("_duration_is_real", True) else "")
@@ -2348,7 +2343,7 @@ class TranscribeManager:
                 ]
                 # Scale the ffmpeg-split timeout with chunk_dur — old
                 # hard-coded 600s could expire mid-split on slow disks
-                # (Z: DrivePool + AV) for a 2h chunk, dropping that
+                # (pooled archive + antivirus) for a long chunk, dropping that
                 # whole section from the merged transcript (audit:
                 # transcribe/core.py:1564-1581). Allow at least 3x
                 # realtime per second of chunk audio, with a 1200s
@@ -2499,8 +2494,7 @@ class TranscribeManager:
             # at 1624: 6 spaces when this transcribe was triggered by a
             # download (so it threads under the [Dwnld] row), one
             # space otherwise. Without this the chunked path produced
-            # a single-space line that visually misaligned in sync logs
-            # (audit: H62).
+            # a single-space line that visually misaligned in sync logs.
             # Shared done-line builder (T167); chunked uses the job_tag tag
             # families and a dim trailing detail with the "chunked, took\u2026"
             # text instead of the single-pass model/realtime detail.

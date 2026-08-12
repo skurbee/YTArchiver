@@ -21,7 +21,7 @@
 (function () {
   "use strict";
 
-  // UI audit #37: sanitize raw exception strings before showing them
+  // Sanitize raw exception strings before showing them
   // to the user. Strip Python traceback prefixes, drop wrapping quotes,
   // collapse whitespace, and cap length. Raw text still gets
   // console.warn'd for developer debugging.

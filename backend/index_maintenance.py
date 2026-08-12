@@ -1,8 +1,7 @@
 """
 index_maintenance — archive sweep + prune + FTS rebuild.
 
-Extracted from backend/index.py (Patch 20, v72.2). Three top-level
-maintenance entry points:
+Archive and index maintenance operations extracted from backend/index.py:
 
     sweep_new_videos(output_dir, channels, progress_cb=None,
                      gpu_busy_fn=None) -> dict
@@ -115,6 +114,7 @@ def _reconcile_tx_status_from_transcript_titles(
         return 0
 
     import re as _re
+
     from .transcribe.helpers import (
         _norm_title,
         _scan_existing_transcript_titles,
@@ -313,7 +313,7 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
     # Per-channel folder fingerprint — lets us skip channels whose
     # folder tree hasn't been touched since the last successful sweep.
     # Matters because the enumeration itself (scandir of 100k entries
-    # across Z:\ DrivePool) is the slow part; even the stat-free walk
+    # across a pooled archive) is the slow part; even the stat-free walk
     # takes minutes on archive. Fingerprint = recursive mtime
     # max across the channel root + all subdirectories (year, month).
     # Windows updates a folder's mtime when its entries change, so if
@@ -338,9 +338,8 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
             return 0.0
         # Use scandir as a context manager so the underlying directory
         # handle is released promptly. Without `with`, the generator
-        # holds the handle until GC, which on Z: DrivePool + antivirus
-        # can produce transient access failures (audit:
-        # index_maintenance.py:122).
+        # holds the handle until GC, which on a pooled archive plus antivirus
+        # can produce transient access failures.
         try:
             with _os.scandir(ch_folder) as _it:
                 for entry in _it:
@@ -423,8 +422,8 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
         # Use scandir directly so we get DirEntry objects with cached
         # stat info — avoids a separate `os.path.getsize` disk round
         # trip per file. Walk recursively by yielding directories
-        # from the parent scan. On a 100k-file archive across Z:\
-        # (DrivePool, network-ish latency per stat), this is the
+        # from the parent scan. On a large pooled or network-backed archive,
+        # per-file stat latency is the
         # difference between a ~30s sweep and a multi-minute one.
         import re as _re
         _strip_id = _re.compile(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$")
@@ -437,7 +436,7 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
             try:
                 it = _os.scandir(dp)
             except OSError:
-                # Never infer "missing" from an incomplete DrivePool/network
+                # Never infer "missing" from an incomplete pooled/network
                 # walk. Registration can continue in readable directories,
                 # but reconciliation for this entire channel is skipped.
                 _walk_complete = False
@@ -534,15 +533,15 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
         # availability: no extra 100k-file stat pass is needed. Mark catalog
         # rows seen in this folder available, and rows formerly under this
         # folder but not seen missing. If *any* scandir failed above, make no
-        # missing judgments so transient Z:\\/DrivePool errors cannot hide a
+        # missing judgments so transient archive-filesystem errors cannot hide a
         # channel. Partial rows retain their quarantined state.
         if _walk_complete:
             _folder_abs = _os.path.normcase(_os.path.abspath(str(folder)))
 
-            def _under_folder(_path: str) -> bool:
+            def _under_folder(_path: str, _root: str = _folder_abs) -> bool:
                 try:
                     _p = _os.path.normcase(_os.path.abspath(_path))
-                    return _os.path.commonpath([_folder_abs, _p]) == _folder_abs
+                    return _os.path.commonpath([_root, _p]) == _root
                 except (OSError, ValueError):
                     return False
 
@@ -844,7 +843,27 @@ def prune_missing_videos() -> dict[str, int]:
                 if _os.path.getsize(fp) == 0:
                     to_delete_fps.append((fp, "zero_byte"))
             except OSError:
-                to_delete_fps.append((fp, "missing"))
+                # An I/O failure is not evidence that the file was deleted.
+                # A transient filesystem/device error must never turn into a
+                # destructive catalog prune.
+                continue
+
+        total_rows = len(rows)
+        if (total_rows >= 50 and to_delete_fps
+                and len(to_delete_fps) / total_rows > 0.20):
+            _log.warning(
+                "prune aborted: %d of %d files look missing (>20%%) — "
+                "archive drive may be offline; nothing was deleted.",
+                len(to_delete_fps), total_rows)
+            return {
+                "videos_removed": 0,
+                "segments_removed": 0,
+                "missing": 0,
+                "zero_byte": 0,
+                "duplicate_id": 0,
+                "fake_id_cleared": 0,
+                "aborted_suspicious": len(to_delete_fps),
+            }
 
         with _idx._db_lock:
             # Category 0: null out all-alphabetic video_ids. These are
@@ -953,7 +972,7 @@ def prune_missing_videos() -> dict[str, int]:
 
             # Category 3: multiple rows share the same video_id —
             # redundant downloads of the same YouTube video. Rather
-            # than delete rows or files (files are on Z:\ which is
+            # than delete rows or files (archive media may be
             # read-only per project rule), mark the non-primary ones
             # as duplicates via `is_duplicate_of=<primary filepath>`.
             # The Browse grid filter hides these so it matches what

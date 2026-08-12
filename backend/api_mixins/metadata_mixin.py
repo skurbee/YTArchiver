@@ -8,17 +8,15 @@ fallback state.
 """
 from __future__ import annotations
 
-import json
 import os
-import re
 import threading
-import time
-from typing import Any, Dict
+from typing import Any
 
-from ._shared import _api_err, _log
-from backend.ytarchiver_config import load_config
 from backend import archive_scan
 from backend import subs as subs_backend
+from backend.ytarchiver_config import load_config
+
+from ._shared import _api_err, _log
 
 
 class MetadataMixin:
@@ -449,7 +447,7 @@ class MetadataMixin:
         # N per-channel COUNT queries. Previous loop did 100+ serialized
         # queries on every click against a 9M-row table. The bulk path
         # is keyed by lowercased channel name.
-        _bulk_status: Dict[str, Dict[str, Any]] = {}
+        _bulk_status: dict[str, dict[str, Any]] = {}
         if only_missing:
             try:
                 from backend.metadata import count_video_id_status_bulk as _cvids_bulk

@@ -10,9 +10,10 @@ from __future__ import annotations
 import threading
 import time
 
-from ._shared import _log
-from backend.ytarchiver_config import load_config
 from backend import subs as subs_backend
+from backend.ytarchiver_config import load_config
+
+from ._shared import _log
 
 
 class ThumbnailMixin:

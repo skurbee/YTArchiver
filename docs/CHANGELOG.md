@@ -6,6 +6,64 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v82.9 - 2026-08-11
+
+### Added
+- **Channel management now lives directly in Browse.** The Channels view has a dedicated Add Channel action and a modern shared add/edit dialog with the full channel configuration surface, post-add Sync Now prompt, unfinished-redownload state, and resume/cancel controls.
+- **Dense Subs remains available as an optional persistent view.** The Appearance toggle and matching checkbox actions on Browse > Channels and the main Subs tab stay synchronized across restarts. Existing installations receive the dense view by default during migration, while fresh installations begin with the streamlined Browse-first layout.
+- **Empty archives now provide a first-channel call to action.** First-run guidance and the Browse empty state lead directly into the Add Channel dialog.
+
+### Changed
+- **Browse channel menus are easier to scan.** Frequently used open, sync, and edit actions are emphasized under an Open & Manage group; transcription, metadata, organization, and redownload tools are separated under Maintenance.
+- **Browse edits stay in Browse.** Enabling Dense Subs no longer redirects Edit Settings from a Browse channel card or channel header into the Subs tab.
+- **Channel-form labels and Add Channel styling have clearer visual hierarchy.** Group labels are more prominent, and the primary add action receives a restrained green hover treatment.
+
+### Fixed
+- **Interrupted redownloads remain visible in the Browse-first workflow.** Channel cards carry the saved resolution state, show the existing chartreuse indicator, and expose a direct Continue Redownload action.
+- **Archive maintenance has stronger safety and consistency guards.** Suspicious mass-prune results abort, unreachable archive roots cancel rescans, hidden duplicate/partial rows stay out of totals, and scheduled-backup retention remains bounded.
+- **Metadata, transcription, and download identity fallbacks are more precise.** Channel-scoped title lookup prevents cross-channel status matches, refresh timestamps persist for empty scoped passes, all-letter video IDs are recognized, and completed downloads without a recoverable ID can still be registered safely.
+
+### Validation
+- Backend smoke suite, frontend JavaScript syntax checks, generated HTML freshness, Python compile checks, lint checks, and `git diff --check` passed.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
+## v82.8 - 2026-08-02
+
+### Fixed
+- **YouTube traffic accounting now fails closed.** Operations and auto-sync reservations do not proceed when the durable traffic ledger cannot record their budget use.
+- **Reservation refunds no longer mask unrelated later traffic.** Unused units are folded into the original reservation window, and legacy negative-refund rows are migrated safely.
+- **Traffic waits are shared across metadata paths.** Metadata requests carry their log stream and cancellation state into the same governor used by sync and other YouTube operations.
+- **Taskbar activity reflects budget holds accurately.** A sync parked on a traffic limit stops its spinner while independent processing work remains visible.
+
+### Validation
+- Added regression coverage for reservation windows, ledger-write failures, short limit waits, taskbar state, and metadata governor propagation.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
+## v82.7 - 2026-07-31
+
+### Fixed
+- **Taskbar activity survives late window-handle discovery.** An active spinner is rebound when the native window handle becomes available, without restarting it when the handle is unchanged.
+- **Traffic-limit warnings stay visible for short waits.** Budget holds no longer disappear merely because the remaining wait is brief.
+- **Limit-held syncs no longer look actively busy.** The taskbar spinner pauses for traffic waits and resumes with real work.
+
+### Validation
+- Added regression coverage for late taskbar binding, stable handle reuse, and traffic-limit warning behavior.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
+## v82.6 - 2026-07-30
+
+### Added
+- **Traffic-limit waits now explain themselves.** Logs report the active hourly or daily ceiling, current usage, expected continuation, and allow the current pass to be overridden deliberately.
+- **Taskbar and tray feedback now cover background activity.** Static taskbar badges track unseen completed downloads, clear when the window regains focus, and coexist with live sync/processing indicators.
+
+### Changed
+- **Governor waits are interruptible.** Pause and cancellation signals end parked operations promptly instead of leaving workers asleep until the full budget delay expires.
+- **Request-governor feedback is propagated through sync, redownload, and quick-check paths.** User-facing wait details remain attached to the operation that triggered them.
+
+### Validation
+- Added focused governor-wait, override, taskbar-badge, window-focus, and log-detail regression coverage.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
 ## v82.5 - 2026-07-29
 
 ### Added
@@ -911,12 +969,11 @@ Three things this build.
 
 1) Transcribe "file not found" errors when DLTRACK fires mid-merge.
 
- Caught two SNL "Weekend Update" videos in the morning sync with
+ Caught two videos during a sync with
  log lines like:
 
  Transcribe: file not found:
- …\Weekend Update： Mr. On Blast Speaks His Mind Again Without
- Holding Back - SNL.f135.mp4
+ ...\Example Video.f135.mp4
 
  The actual merged .mp4 was on disk (17.6 MB), but transcribe got
  handed the .f135 intermediate path — which yt-dlp's merger had

@@ -1,10 +1,8 @@
 /* ═══════════════════════════════════════════════════════════════════════
    styles-download-controls.css — Download tab controls + buttons
 
-   Extracted from styles-settings.css (Patch 23, v72.5). The control
-   strip at the top of the Download tab — URL field, format pickers,
-   action buttons. Was bundled with Settings styles because the form
-   widgets are the same, but it's a distinct visual concern.
+   The control strip at the top of the Download tab: URL field, format
+   pickers, and action buttons.
    ═══════════════════════════════════════════════════════════════════════ */
 
 /* ═══ Controls area (top of download tab) ═══ */
@@ -251,11 +249,7 @@
 }
 .btn-sync:hover { background: var(--c-sync-hover); }
 
-/* Primary action button — green like Sync Subbed and the askChoice
-   primary so "this is the go button" is consistent across the app.
-   Previously this class painted the same grey as a regular .btn,
-   which gave NO visual hierarchy on Save / Confirm / Apply buttons
-   throughout the app. UI audit #16. */
+/* Primary action button, shared by Save, Confirm, and Apply actions. */
 .btn-primary {
   background: var(--c-sync);
   border-color: var(--c-sync-border);

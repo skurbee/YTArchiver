@@ -63,6 +63,7 @@
     const card = document.createElement("div");
     card.className = "channel-card";
     card.dataset.channelIndex = String(index);
+    card.dataset.channelName = name;
     card.setAttribute("role", "button");
     card.tabIndex = 0;
     card.setAttribute("aria-label", `Open channel ${name || "Untitled"}`);
@@ -75,6 +76,10 @@
     }
     if (typeof c.metadata_pending === "number") {
       card.dataset.pendingMeta = String(c.metadata_pending);
+    }
+    if (c._pending_redownload) {
+      card.dataset.pendingRedownload = "1";
+      card.dataset.redownloadRes = c._redownload_res || "best";
     }
 
     // Banner + avatar URLs come from per-channel metadata (potentially
@@ -112,7 +117,17 @@
       avEl.alt = "";
       card.appendChild(avEl);
     }
-    card.querySelector(".channel-card-name").textContent = name;
+    const nameEl = card.querySelector(".channel-card-name");
+    nameEl.textContent = name;
+    if (c._pending_redownload) {
+      const dot = document.createElement("span");
+      dot.className = "channel-redownload-dot";
+      dot.setAttribute("aria-label", "Unfinished redownload");
+      const savedRes = c._redownload_res || "best";
+      const savedLabel = savedRes === "best" ? "best available" : `${savedRes}p`;
+      dot.title = `Unfinished redownload at ${savedLabel}`;
+      nameEl.appendChild(dot);
+    }
     card.querySelector(".channel-card-meta").textContent =
       `${vids}${vids && vids !== "\u2014" ? " videos" : ""}${size ? " \u00b7 " + size : ""}`;
 
@@ -166,7 +181,31 @@
       });
     }
     if (!channels.length) {
-      grid.innerHTML = '<div class="browse-empty">No channels yet. Add one on the <b>Subs</b> tab to start archiving.</div>';
+      const hasAnyChannels = Array.isArray(window._browseState?.channels)
+        && window._browseState.channels.length > 0;
+      if (hasAnyChannels) {
+        const noMatches = document.createElement("div");
+        noMatches.className = "browse-empty";
+        noMatches.textContent = "No channels match this filter.";
+        grid.appendChild(noMatches);
+        return;
+      }
+      const welcome = document.createElement("div");
+      welcome.className = "browse-first-channel";
+      const eyebrow = document.createElement("span");
+      eyebrow.className = "browse-first-channel-eyebrow";
+      eyebrow.textContent = "YOUR ARCHIVE STARTS HERE";
+      const title = document.createElement("strong");
+      title.textContent = "Add your first channel";
+      const copy = document.createElement("span");
+      copy.textContent = "Choose a YouTube channel and how you want YTArchiver to save it.";
+      const add = document.createElement("button");
+      add.type = "button";
+      add.className = "btn browse-first-channel-btn";
+      add.textContent = "Add your first channel";
+      add.addEventListener("click", () => window._openAddChannelEditor?.(""));
+      welcome.append(eyebrow, title, copy, add);
+      grid.appendChild(welcome);
       return;
     }
 

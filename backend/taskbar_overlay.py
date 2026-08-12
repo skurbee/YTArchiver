@@ -33,7 +33,7 @@ class _GUID(ctypes.Structure):
     ]
 
     @classmethod
-    def from_uuid(cls, value: uuid.UUID) -> "_GUID":
+    def from_uuid(cls, value: uuid.UUID) -> _GUID:
         raw = value.bytes_le
         return cls(
             int.from_bytes(raw[0:4], "little"),
@@ -141,8 +141,7 @@ class WindowsTaskbarOverlay:
         if not self.available or image is None:
             return False
         try:
-            from pystray._util import serialized_image
-            from pystray._util import win32
+            from pystray._util import serialized_image, win32
 
             with serialized_image(image, "ICO") as icon_path:
                 hicon = win32.LoadImage(
@@ -180,7 +179,7 @@ class WindowsTaskbarOverlay:
                 pass
         self._com_owned = False
 
-    def __enter__(self) -> "WindowsTaskbarOverlay":
+    def __enter__(self) -> WindowsTaskbarOverlay:
         return self
 
     def __exit__(self, _exc_type, _exc, _tb) -> None:

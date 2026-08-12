@@ -39,7 +39,7 @@
       }
       try {
         const info = await bridgeCall("about_info");
-        // UI audit fix: parent .askq-body sets `white-space: pre-wrap`
+        // Parent .askq-body sets `white-space: pre-wrap`
         // (so plain text askQuestion messages render with line breaks).
         // For this rich HTML About content that creates double-spacing
         // around every <div>. Override to `normal` and emit the markup

@@ -1,8 +1,7 @@
 /**
  * web/graphTab.js — Browse > Graph sub-mode.
  *
- * Patch 14 Phase 2 (v67.9): extracted from app.js (lines 2287-2687).
- * Owns: Chart.js word-frequency graph, word cloud, CSV export,
+ * Owns the Chart.js word-frequency graph, word cloud, CSV export,
  * click-to-drill into search, _graphChart state.
  *
  * Depends on: util.js, bridge.js, vendor/chart.umd.min.js.

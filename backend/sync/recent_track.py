@@ -140,7 +140,7 @@ def _record_recent_download(filepath: str, channel: str, title: str,
     already knows them (the DLTRACK handler does, both come straight
     from yt-dlp), pass them through to skip the redundant disk work.
     Without that fast path, ffprobe is spawned to parse duration off
-    the newly-merged .mp4, which on a contended slow disk (Z: DrivePool
+    the newly-merged .mp4, which on a contended pooled archive
     during the boot sweep) can stall the whole DLTRACK handler for
     several seconds per download.
     """
@@ -172,8 +172,8 @@ def _record_recent_download(filepath: str, channel: str, title: str,
         _needs_duration_backfill = not duration_s
 
         # Prefer yt-dlp's emitted upload_date (from DLTRACK) over file
-        # mtime. On some Windows network drives + Z: drivepool setups,
-        # --mtime silently fails to set mtime on the new file, leaving
+        # mtime. On some Windows network filesystems, --mtime can fail
+        # to set mtime on the new file, leaving
         # mtime=download-time. We use the authoritative YYYYMMDD value
         # yt-dlp already knows and only fall back to mtime if it wasn't
         # provided.

@@ -38,8 +38,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .log import get_logger
 from . import youtube_traffic
+from .log import get_logger
 from .sync import _find_cookie_source, _startupinfo, find_yt_dlp
 from .transcribe import _parse_vtt, _replace_jsonl_entry
 from .transcribe.transcribe_files import parse_transcript_header
@@ -185,7 +185,7 @@ def _load_checkpoint(scope_url: str) -> list | None:
         if isinstance(row, list) and len(row) >= 4:
             jp = Path(row[0])
             # Drop entries whose jsonl_path no longer exists — typically
-            # happens after a drive remap (Z:\ → Y:\) or after the user
+            # happens after a drive remap (X:\ → Y:\) or after the user
             # moved their archive. Without this filter, every video in
             # the checkpoint would fail-fetch against a nonexistent
             # path and produce a massive failure rate on resume.

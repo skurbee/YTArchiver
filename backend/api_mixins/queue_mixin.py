@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import time
 
-from ._shared import _log
 from backend.ytarchiver_config import load_config, save_config
+
+from ._shared import _log
 
 
 class QueueMixin:

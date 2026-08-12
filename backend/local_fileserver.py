@@ -4,7 +4,7 @@ pywebview window.
 
 Problem: pywebview loads index.html from a `file://` origin. Modern webviews
 (WebView2 on Windows) block cross-origin `file://` image requests for
-security — so `background-image: url("file:///Z:/.../thumb.jpg")` silently
+security — so `background-image: url("file:///X:/.../thumb.jpg")` silently
 fails to load even though the file exists.
 
 Solution: spin up an `http.server` on 127.0.0.1 with a random free port at
@@ -203,7 +203,7 @@ class _FileRequestHandler(BaseHTTPRequestHandler):
             self.send_error(400); return None
         # reject requests outside the archive root
         # allowlist (set_allowed_roots). Previously a request for
-        # /file/C:/Users/*/Documents/*.pdf passed all the other
+        # /file/C:/private/document.pdf passed all the other
         # checks. Allowlist empty = fallback allow (backward-compat
         # for dev/demo).
         if not _is_under_allowed_root(path):

@@ -72,7 +72,9 @@
         const card = e.target.closest(".channel-card");
         if (!card) return;
         e.preventDefault();
-        const name = card.querySelector(".channel-card-name")?.textContent || "";
+        const name = card.dataset.channelName
+          || card.querySelector(".channel-card-name")?.firstChild?.textContent
+          || "";
         const api = window.YT?.api;
         // Live-count labels: pull pending counters stashed on the card by
         // renderChannelGrid. folder-level
@@ -85,12 +87,25 @@
         const _metaLabel = _pendMeta > 0
           ? `Recheck metadata (${_pendMeta} pending)`
           : "Recheck metadata";
+        const _hasPendingRedownload = card.dataset.pendingRedownload === "1";
+        const _redownloadRes = card.dataset.redownloadRes || "best";
+        const _redownloadResLabel = _redownloadRes === "best"
+          ? "Best available"
+          : `${_redownloadRes}p`;
         showContextMenu(e.clientX, e.clientY, [
-          { label: "Open videos", action: () => card.click() },
-          { label: "Open folder", action: () => api?.chan_open_folder?.(name) },
-          { label: "Open channel on YouTube", action: () => api?.chan_open_url?.(name) },
+          { header: "Open & manage" },
+          { label: "Open videos", cls: "primary", action: () => card.click() },
+          { label: "Open folder", cls: "primary",
+            action: () => api?.chan_open_folder?.(name) },
+          { label: "Open channel on YouTube", cls: "primary",
+            action: () => api?.chan_open_url?.(name) },
           { sep: true },
-          { label: "Sync now", action: () => api?.sync_one_channel?.({ name }) },
+          { label: "Sync now", cls: "primary",
+            action: () => api?.sync_one_channel?.({ name }) },
+          { label: "Edit settings", cls: "primary",
+            action: () => window._editChannelFromBrowse?.(name) },
+          { sep: true },
+          { header: "Maintenance" },
           // refetch missing thumbnails for this channel.
           // Surfaces the same backend function used by the Settings >
           // Metadata "Refresh thumbnails" affordance.
@@ -173,25 +188,43 @@
                 action: () => window._cancelFolderOps?.() },
             ]},
           // "Fetch channel art" removed — now bundled with the metadata sweep.
-          { label: "Redownload at\u2026",
-            submenu: [
-              { label: "Best available",
-                action: () => window._askRedownload?.(name, "best") },
-              { label: "2160p (4K)",
-                action: () => window._askRedownload?.(name, "2160") },
-              { label: "1440p",
-                action: () => window._askRedownload?.(name, "1440") },
-              { label: "1080p",
-                action: () => window._askRedownload?.(name, "1080") },
-              { label: "720p",
-                action: () => window._askRedownload?.(name, "720") },
-              { label: "480p",
-                action: () => window._askRedownload?.(name, "480") },
-              { label: "360p",
-                action: () => window._askRedownload?.(name, "360") },
-            ]},
-          { sep: true },
-          { label: "Edit settings", action: () => window._editChannelFromContext?.(name) },
+          _hasPendingRedownload
+            ? {
+                label: `Continue redownload at ${_redownloadResLabel}`,
+                action: async () => {
+                  const r = await api?.chan_redownload?.(
+                    { name }, _redownloadRes);
+                  if (r?.ok) {
+                    window._showToast?.(
+                      r.queued
+                        ? `Queued redownload of ${name}.`
+                        : `Resumed redownload of ${name}.`,
+                      "ok");
+                  } else {
+                    window._showToast?.(
+                      r?.error || "Resume failed.", "error");
+                  }
+                },
+              }
+            : {
+                label: "Redownload at\u2026",
+                submenu: [
+                  { label: "Best available",
+                    action: () => window._askRedownload?.(name, "best") },
+                  { label: "2160p (4K)",
+                    action: () => window._askRedownload?.(name, "2160") },
+                  { label: "1440p",
+                    action: () => window._askRedownload?.(name, "1440") },
+                  { label: "1080p",
+                    action: () => window._askRedownload?.(name, "1080") },
+                  { label: "720p",
+                    action: () => window._askRedownload?.(name, "720") },
+                  { label: "480p",
+                    action: () => window._askRedownload?.(name, "480") },
+                  { label: "360p",
+                    action: () => window._askRedownload?.(name, "360") },
+                ],
+              },
         ]);
       });
     }

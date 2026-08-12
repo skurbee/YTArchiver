@@ -151,7 +151,7 @@
     });
   }
 
-  // Patch 14 phase 2: Graph sub-view moved to web/graphTab.js.
+  // The Graph sub-view is implemented in web/graphTab.js.
   // window.initGraphView / drawGraph / populateGraphChannels / _drillIntoSearch
   // remain as back-compat globals.
 

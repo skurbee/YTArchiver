@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════════
    styles-tabs-data.css — Subs + Recent tabs + per-row context menus
 
-   Extracted from styles.css (Patch 18, v72.0). Contains:
+   Contains:
      • Subs tab: channel table, column widths, mark cells
      • Recent tab: downloads list, grid view, filter input
      • Subs context menu (right-click on a row)
@@ -244,6 +244,10 @@
   border-top: 1px solid var(--c-border);
   background: rgba(255, 255, 255, 0.015);
   font-size: var(--fs-sm);
+}
+#legacy-channel-editor-home {
+  flex: 0 0 auto;
+  min-width: 0;
 }
 .edit-channel-box > .subs-section-label {
   display: block;
@@ -598,6 +602,26 @@
   white-space: nowrap;
 }
 .ctx-menu-item:hover { background: var(--c-btn); }
+.ctx-menu-item.primary {
+  font-weight: 720;
+  color: var(--c-text);
+}
+.ctx-menu-item.checkable {
+  position: relative;
+  padding-left: 30px;
+}
+.ctx-menu-item.checkable::before {
+  content: "";
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  width: 10px;
+  transform: translateY(-52%);
+  color: var(--c-accent);
+  font-weight: 800;
+  text-align: center;
+}
+.ctx-menu-item.checkable.checked::before { content: "\2713"; }
 .ctx-menu-item.dim { color: var(--c-dim); }
 .ctx-menu-item.danger { color: var(--c-log-red, #d36e6e); }
 .ctx-menu-item.danger:hover {
@@ -610,6 +634,15 @@
   height: 1px;
   background: var(--c-border);
   margin: 4px 0;
+}
+.ctx-menu-header {
+  padding: 7px 14px 4px;
+  color: var(--c-dim);
+  font-size: var(--fs-2xs);
+  font-weight: 750;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
 .ctx-submenu-wrap {
   position: relative;

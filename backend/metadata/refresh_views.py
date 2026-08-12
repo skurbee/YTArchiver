@@ -1,7 +1,7 @@
 """
 metadata.refresh_views â€” bulk views/likes refresh.
 
-Extracted from metadata/refresh.py (Patch 22, v72.4).
+Channel views-and-likes refresh implementation.
 
 Fast view-count refresh via a single flat-playlist call. Compares
 against existing JSONL, only full-fetches videos whose counts changed.
@@ -18,13 +18,6 @@ from typing import Any
 
 from ..log import get_logger
 from ..log_stream import LogStreamer
-from ..ytarchiver_config import ConfigUnchanged
-from .io import (
-    _folder_for_channel,
-    _lock_for,
-    _read_metadata_jsonl,
-    _write_metadata_jsonl,
-)
 from ..sync import find_yt_dlp
 from ..text_utils import normalize_title as _canon_norm_title
 from ..utils import sqlite_like_escape as _like_esc
@@ -36,6 +29,13 @@ from ._refresh_proxies import (
 from .fetcher import (
     fetch_single_video_metadata,
 )
+from .io import (
+    _folder_for_channel,
+    _lock_for,
+    _read_metadata_jsonl,
+    _write_metadata_jsonl,
+)
+from .refresh_state import stamp_channel_refresh
 from .scan import _scan_channel_videos
 
 _log = get_logger(__name__)
@@ -459,6 +459,10 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                  ["simpleline", "views_refresh_progress"]],
             ])
             _clear_views_refresh_progress(stream)
+            # The catalog request and local scope check both completed. An
+            # empty recent window is therefore a successful fresh check, not
+            # an unattempted refresh.
+            stamp_channel_refresh(channel, "last_views_refresh_ts")
             return {"ok": True, "fetched": 0, "refreshed": 0,
                     "errors": 0, "skipped": 0,
                     "bulk_fetched": len(bulk)}
@@ -760,7 +764,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         # actually changed. The previous "always bump fetched_at"
         # path meant every "no-op" refresh rewrote EVERY metadata
         # jsonl on disk (10k-video archive = thousands of MB of churn
-        # + DrivePool I/O + mtime bumps that defeated downstream
+        # + archive I/O + mtime bumps that defeated downstream
         # fingerprint caches). Now unchanged vids stay untouched.
         if _view_new is not None:
             old["view_count"] = _view_new
@@ -938,7 +942,8 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                     label = (title_hint or vid).strip()
                     try:
                         from ..youtube_session import (
-                            handle_youtube_failure_text)
+                            handle_youtube_failure_text,
+                        )
                         failure_kind = handle_youtube_failure_text(
                             reason,
                             context=f"refreshing views/likes for {name}",
@@ -992,24 +997,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     # from per-video fetched_at so the Subs UI can say "refreshed
     # N minutes ago" for the whole channel.
     if not cookie_auth_required and not rate_limited:
-        try:
-            from .. import ytarchiver_config as _cfg
-            with _cfg.config_transaction() as cfg:
-                ch_url_norm = ch_url.rstrip("/")
-                now_ts = time.time()
-                matched = False
-                for ch in cfg.get("channels", []):
-                    if (ch.get("url") or "").rstrip("/") == ch_url_norm:
-                        ch["last_views_refresh_ts"] = now_ts
-                        matched = True
-                        break
-                if not matched:
-                    raise _cfg.ConfigUnchanged()
-        except ConfigUnchanged:
-            pass
-        except Exception as e:
-            _log.warning("views refresh timestamp stamp failed for %r: %s",
-                         name, e)
+        stamp_channel_refresh(channel, "last_views_refresh_ts")
 
     # Stop the heartbeat thread BEFORE the clear_line + summary so
     # the in-place line doesn't get re-painted on top of the summary.
@@ -1054,5 +1042,5 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
 
 
 
-# Patch 19 phase M5 (v69.2): thumbnail/video-id status ops moved out.
+# Thumbnail and video-id status operations live in thumbnails_ops.py.
 

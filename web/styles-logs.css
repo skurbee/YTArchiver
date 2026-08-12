@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════════
    styles-logs.css — Log rendering styles
 
-   Extracted from styles.css (Patch 18, v72.0). The "crown jewel":
+   Contains:
      • Activity log (per-channel autorun history, alt-row striped)
      • Main log (sync output, ~40 color tags)
      • Mini logs (per-tab tail-of-activity strips)
@@ -28,8 +28,8 @@
 .activity-log-frame {
   /* Default to ~5 rows when the log first becomes populated. The
      user can drag the splitter to grow it; that choice persists via
-     window_state_save. (Was 240px ≈ 15 rows, which opened to a huge
-     unfilled void after a single entry — UI audit 2026-05-14.) The
+     window_state_save. A larger default opened to an unfilled void after
+     a single entry. The
      old "huge void on tall monitors" concern doesn't apply anymore
      because `frame.hidden` is toggled by syncActivityLogVisibility
      when the log is empty. */
@@ -446,4 +446,3 @@
    during a concurrent disk scan). Amber, not red — the file IS on disk,
    it just needs a Rescan to show up in Browse/Watch. */
 .t-dlwarn { color: var(--c-log-reorg); font-weight: 700; }
-

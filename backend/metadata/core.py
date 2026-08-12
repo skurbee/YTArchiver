@@ -31,9 +31,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .. import youtube_traffic
 from ..log_stream import LogStreamer
 from ..sync import _find_cookie_source, _startupinfo, find_yt_dlp
-from .. import youtube_traffic
 
 # YouTube IDs are 11 chars of [A-Za-z0-9_-]
 
@@ -62,7 +62,7 @@ from ..log import get_logger
 # of `\`, `%`, `_` in channel folder paths. The function was never
 # defined module-locally; the call sites silently NameError'd, the
 # enclosing try/except swallowed it, and `fp_to_id` ended up empty.
-# Channels with OLD-style filenames (no `[id]` bracket) then had
+# Channels with legacy filenames (no `[id]` bracket) then had
 # vid_id="" for every file, so the thumbnail-status check wrote 0 to
 # the DB for every video — Settings > Metadata table showed "X 0%"
 # for those channels permanently. Alias the canonical helper here.
@@ -71,45 +71,40 @@ from ..utils import utf8_subprocess_env as _utf8_env
 
 _log = get_logger(__name__)
 
-# Patch 6 (2026-05-17): thumbnail helpers extracted to thumbnails.py.
-# Re-imported here so existing call sites inside metadata.py keep
-# working unchanged.
+# Thumbnail helpers live in thumbnails.py and remain available through the
+# metadata package's compatibility surface.
 
 
 # ── OLD-compat helpers ──────────────────────────────────────────────────
-# the JSONL I/O + path/hide helpers below were moved
+# The JSONL I/O + path/hide helpers below were moved
 # to backend/metadata/io.py. They're re-imported into this module's
 # namespace so existing call sites (e.g.
 # `from backend.metadata import _read_metadata_jsonl`) keep working
 # unchanged. The actual implementation now lives ONCE in metadata.io.
+# Fetch helpers live in fetcher.py and are re-imported for existing callers.
+from .fetcher import (
+    fetch_metadata_for_videos,
+    fetch_single_video_metadata,
+)
 from .io import (
     _folder_for_channel,
     _read_metadata_jsonl,
 )
 
-# Patch 19 phase M3 (v69.4): fetcher helpers moved to fetcher.py.
-# Re-imported so internal callers in this file keep resolving them.
-from .fetcher import (
-    fetch_metadata_for_videos,
-    fetch_single_video_metadata,
-)
-
-# Patch 19 phase M1 (v68.10): title-normalization wrappers moved out.
-# Re-imported so internal callers in this file keep resolving them.
+# Title-normalization wrappers live in normalize.py.
 from .normalize import (
     _norm_title_for_match,
     _normalize_title_for_match,
 )
 
-# Patch 19 phase M6 (v69.4): refresh helpers moved to refresh.py.
-# Re-imported so internal callers in this file keep resolving them.
+# Refresh helpers live in refresh.py.
 from .refresh import (
     bulk_refresh_views_likes,
     fetch_channel_metadata,
     refresh_channel_comments,
 )
 
-# Patch 19 phase M2 (v69.1): scan helpers moved to scan.py.
+# Folder-scanning helpers live in scan.py.
 from .scan import (
     _read_info_json_vid,
     _scan_channel_videos,
@@ -186,8 +181,7 @@ def _resolve_ids_by_title(yt: str, url: str,
         with proc.stdout:
             for line in proc.stdout:
                 try:
-                    from ..youtube_session import (
-                        handle_youtube_failure_text)
+                    from ..youtube_session import handle_youtube_failure_text
                     if handle_youtube_failure_text(
                             line,
                             context="matching local files to YouTube"):
@@ -249,7 +243,7 @@ def _resolve_ids_by_title(yt: str, url: str,
     return out
 
 
-# Patch 19 phase M1: _normalize_title_for_match moved to normalize.py.
+# _normalize_title_for_match is implemented in normalize.py.
 # Imported via the package-level re-import block at top of this file.
 
 _ID_RE_11 = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -619,7 +613,7 @@ from .thumbnails_ops import (
     sweep_missing_thumbnails,
 )
 
-# Patch 19 phase M1: _norm_title_for_match moved to normalize.py.
+# _norm_title_for_match is implemented in normalize.py.
 
 
 def _probe_file_duration(filepath: str) -> float | None:
@@ -850,7 +844,7 @@ def _fetch_per_video_upload_dates(yt: str, vids: list[str],
             return (vid, "")
         try:
             proc = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cmd, capture_output=True,
                 startupinfo=_startupinfo, env=_utf8_env(),
                 timeout=30, encoding="utf-8", errors="replace")
         except Exception:

@@ -1,13 +1,13 @@
 /* ═══════════════════════════════════════════════════════════════════════
    indexControls.js — Settings → Index sub-tab controls
 
-   After Patch 15 (v71.7) this file is focused on the Index sub-tab only:
+   Focused on the Index sub-tab:
      • Build / Rebuild buttons (archive rescan, FTS rebuild)
      • Stats panel (channels, videos, segments, hours, %, DB size)
      • Inline log mirror
      • Compat shim for the legacy `window._applyIndexSummary` consumers
 
-   Sibling files extracted in the same patch:
+   Related settings modules:
      • settingsInfra.js — Settings sub-tab nav + Archive Roots panel
      • metadataTab.js — Settings → Metadata refresh-status table
 

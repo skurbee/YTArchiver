@@ -1,9 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════════
    metadataTab.js — Settings → Metadata tab
 
-   Extracted from indexControls.js (Patch 15, v71.7). The biggest single
-   chunk of indexControls.js — owns the per-channel metadata refresh
-   workflow:
+   Owns the per-channel metadata refresh workflow:
 
      • Channel table rendering with sort (Views / Likes / Comments /
        Thumbs / Backfill / Still-on-YT / IDs / last-refresh column)

@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from .. import utils as _utils
+from .. import youtube_traffic
 from ..log import get_logger, swallow
 from ..process_runner import PROCESS_REGISTRY
-from .. import youtube_traffic
 
 _log = get_logger(__name__)
 

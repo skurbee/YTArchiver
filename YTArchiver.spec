@@ -4,8 +4,8 @@
 # Build with:
 # py -3.13 -m PyInstaller YTArchiver.spec
 #
-# IMPORTANT: Must build with Python 3.13 (same reason as ArchivePlayer —
-# pywebview ships for 3.13 but not for the PATH's 3.11).
+# IMPORTANT: Build with Python 3.13, where the required pywebview runtime is
+# installed. A different interpreter can produce an incomplete executable.
 #
 # Deps bundled next to the exe at runtime:
 # - yt-dlp.exe (sync downloads)
@@ -28,10 +28,8 @@ PROJECT_ROOT = Path(os.path.abspath(SPECPATH))
 datas = [
     (str(PROJECT_ROOT / 'web'), 'web'),
     (str(PROJECT_ROOT / 'backend' / 'whisper_worker.py'), 'backend'),
-    # Patch fix (v68.2): punct_worker.py runs as a subprocess (path
-    # only — no static import), so PyInstaller's Analysis pass can't
-    # detect it. Bundle it explicitly so PunctuationManager's
-    # is_available() check finds it at runtime.
+    # punct_worker.py is launched by path, so PyInstaller cannot discover
+    # it through static analysis. Bundle it explicitly.
     (str(PROJECT_ROOT / 'backend' / 'punct_worker.py'), 'backend'),
 ]
 # Optional: icon.ico (only if present)
@@ -40,10 +38,7 @@ if icon_path.exists():
     datas.append((str(icon_path), '.'))
 
 # If yt-dlp.exe / ffmpeg.exe / ffprobe.exe live next to main.py, bundle them too.
-# ffprobe is used by redownload.py's _ffprobe_height() to detect videos
-# already at the target resolution — if missing on a clean-install
-# machine, every redownload re-downloads every file regardless of its
-# existing resolution (the "0% smaller" spam bug from v50.4).
+# ffprobe lets redownload.py detect videos already at the target resolution.
 for _exe_name in ('yt-dlp.exe', 'ffmpeg.exe', 'ffprobe.exe'):
     _p = PROJECT_ROOT / _exe_name
     if _p.exists():
@@ -68,12 +63,12 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # We don't need tkinter in the pywebview build — it was the legacy stack
+        # The pywebview build does not use tkinter.
         'tkinter',
         'tkinter.ttk',
         'tkinter.messagebox',
         'tkinter.filedialog',
-        # Keep the numpy/scipy stack out — transcribe.py spawns Py 3.11 for it
+        # Transcription runs this stack in a separate Python 3.11 process.
         'faster_whisper',
         'ctranslate2',
         'torch',

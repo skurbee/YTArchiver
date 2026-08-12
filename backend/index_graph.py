@@ -1,8 +1,7 @@
 """
 index_graph — word-frequency graphing + per-bucket aggregate stats.
 
-Extracted from backend/index.py (Patch 17, v71.9). Powers the
-Browse > Graph view:
+Graph queries extracted from backend/index.py. Powers Browse > Graph:
 
     bucket_totals(bucket, channel=None)
         — {bucket_label: total_segments} for normalization
@@ -16,8 +15,6 @@ Browse > Graph view:
         — overlay multiple words on the same chart
     graph_channel_overlay(word, channels, ...)
         — same word across multiple channels
-    graph_word_frequency_multi(...)
-        — alias / variant for the multi-word path
     list_all_channels_in_db()
         — distinct channels present in the segments table
 
@@ -32,7 +29,7 @@ import threading
 from collections import OrderedDict
 from typing import Any
 
-from .log import get_logger
+from .log import get_logger, swallow
 
 _log = get_logger(__name__)
 _TOP_WORDS_CACHE_MAX = 24
@@ -225,9 +222,10 @@ def top_words(channel: str | None = None, top_n: int = 120,
         _log.warning("top_words query failed: %s", exc)
         return []
     finally:
-        try: conn.close()
-        except Exception:
-            pass
+        try:
+            conn.close()
+        except Exception as exc:
+            swallow("close top-words reader connection", exc)
     # Top-N
     items = sorted(counts.items(), key=lambda x: -x[1])[:top_n_i]
     result = [{"word": w, "count": c} for w, c in items]
@@ -298,8 +296,8 @@ def backfill_upload_ts(limit: int = 0) -> dict[str, int]:
         try:
             with _index()._db_lock:
                 writer.rollback()
-        except sqlite3.Error:
-            pass
+        except sqlite3.Error as rollback_exc:
+            swallow("roll back graph upload-time backfill", rollback_exc)
         _log.warning("backfill_upload_ts failed after %d filled/%d skipped: %s",
                      filled, skipped, exc)
     return {"filled": filled, "skipped": skipped}
@@ -343,8 +341,8 @@ def graph_word_frequency(word: str, channel: str | None = None,
     try:
         from .index_search import _normalize_fts_query as _norm_fts
         word = _norm_fts(word)
-    except Exception:
-        pass
+    except Exception as exc:
+        swallow("normalize graph search term", exc)
     if bucket == "week":
         # LEFT JOIN so segments with NULL video_id (common
         # for legacy rows and drop-in-mode archives without .info.json)
@@ -533,39 +531,6 @@ def graph_channel_overlay(word: str, channels: list[str],
     series = [{"channel": ch, "values": [per_ch[ch].get(lbl, 0) for lbl in labels]}
               for ch in channels]
     return {"labels": labels, "series": series}
-
-
-def graph_word_frequency_multi(words: list[str], channel: str | None = None,
-                                bucket: str = "month") -> dict[str, Any]:
-    """Run multiple word-frequency queries in one call. Returns a shape
-    ready for Chart.js with one dataset per word."""
-    out = {"labels": [], "series": []}
-    if not words:
-        return out
-    per = []
-    all_labels = set()
-    backfill_pending = None
-    if bucket == "week":
-        conn = _index()._reader_open()
-        if conn is not None:
-            backfill_pending = _week_backfill_pending(conn)
-    for w in words:
-        if bucket == "week":
-            r = graph_word_frequency(
-                w, channel=channel, bucket=bucket,
-                _backfill_pending=backfill_pending)
-        else:
-            r = graph_word_frequency(w, channel=channel, bucket=bucket)
-        per.append({"word": w, "data": dict(zip(r["labels"], r["values"], strict=False))})
-        all_labels.update(r["labels"])
-    labels = sorted(all_labels)
-    out["labels"] = labels
-    for p in per:
-        out["series"].append({
-            "word": p["word"],
-            "values": [p["data"].get(l, 0) for l in labels],
-        })
-    return out
 
 
 def list_all_channels_in_db() -> list[str]:

@@ -1,8 +1,7 @@
 """
 metadata.normalize — title normalization shims used by the metadata path.
 
-Patch 19 phase M1 (v68.10): thin re-export shim. The canonical
-`normalize_title` lives in `backend.text_utils` (Patch 11). This module
+The canonical `normalize_title` lives in `backend.text_utils`. This module
 namespaces the metadata-specific helpers + variants so callers reading
 the metadata package make sense of them.
 
@@ -21,7 +20,7 @@ from ..text_utils import normalize_title, normalize_title_loose
 
 
 def _normalize_title_for_match(title: str) -> str:
-    """Patch 11: thin wrapper around text_utils.normalize_title.
+    """Metadata-specific wrapper around text_utils.normalize_title.
 
     Mode: lowercase + NFKC + unify-fullwidth-substitutions +
     strip-windows-illegal + collapse-whitespace. NO trailing-punct
@@ -35,7 +34,7 @@ def _normalize_title_for_match(title: str) -> str:
 
 
 def _norm_title_for_match(s: str) -> str:
-    """Patch 11: thin wrapper around text_utils.normalize_title.
+    """Backfill-specific wrapper around text_utils.normalize_title.
 
     Mode: lowercase + NFKC + strip-id-bracket + alnum-only-collapse.
     Used by backfill_video_ids matching strategies so candidates

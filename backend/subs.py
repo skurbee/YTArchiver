@@ -250,7 +250,6 @@ def _payload_to_channel(payload: dict[str, Any]) -> dict[str, Any]:
 class SubsError(Exception):
     """Raised for user-correctable subscription add/update failures."""
 
-    pass
 
 
 def list_channels() -> list[dict[str, Any]]:
@@ -298,8 +297,7 @@ def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> str | None:
                 try:
                     out, _err = proc.communicate(timeout=timeout)
                     try:
-                        from .youtube_session import (
-                            handle_youtube_failure_text)
+                        from .youtube_session import handle_youtube_failure_text
                         if handle_youtube_failure_text(
                                 _err or "",
                                 context="resolving a channel name"):

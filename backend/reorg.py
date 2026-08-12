@@ -231,7 +231,7 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer,
     # Refuse cross-volume reorg moves. shutil.move falls back to
     # copy+delete across volumes, which is NOT atomic — a cancel or
     # crash between the copy and the delete leaves the file in BOTH
-    # locations with no automatic cleanup. On Z:\ DrivePool this can
+    # locations with no automatic cleanup. On pooled filesystems this can
     # happen if the pool reassigns the physical drive mid-pool.
     # Better to refuse and let the user move manually than risk a
     # silent duplicate.
@@ -642,7 +642,7 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
         if _move_video(video, target, stream, dry_run=dry_run):
             moved += 1
             # re-stamp the moved file's mtime to the date
-            # we chose for it. On StableBit DrivePool pooled drives a
+            # we chose for it. On pooled filesystems a
             # cross-physical-drive move can reset mtime to "now", and
             # future reorg passes would then classify this file under
             # today's year instead of its upload year — silently
@@ -653,7 +653,7 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
                     ts_stamp = d.timestamp()
                     os.utime(_moved_path, (ts_stamp, ts_stamp))
                     # Re-stamp any sidecars that moved alongside the
-                    # video. Cross-pool moves (DrivePool boundary) can
+                    # video. Cross-pool moves can
                     # reset sidecar mtimes to "now", and any future
                     # mtime-based logic (drift detection, "what's
                     # changed since last sync" probes) would then

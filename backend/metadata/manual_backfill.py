@@ -32,8 +32,8 @@ import time
 from difflib import SequenceMatcher
 from typing import Any
 
-from ..log import get_logger, swallow
 from .. import youtube_traffic
+from ..log import get_logger, swallow
 from ..ytarchiver_config import APP_DATA_DIR
 from .normalize import _normalize_title_for_match
 
@@ -180,8 +180,7 @@ def _ytsearch(yt: str, query: str, n: int,
         with proc.stdout:
             for line in proc.stdout:
                 try:
-                    from ..youtube_session import (
-                        handle_youtube_failure_text)
+                    from ..youtube_session import handle_youtube_failure_text
                     if handle_youtube_failure_text(
                             line, context="searching YouTube for a video ID"):
                         try: proc.terminate()
@@ -246,8 +245,8 @@ def backfill_manual_video_ids(stream, *,
     stamped tried. Streams a progress line per video. Honors cancel/pause and
     backs off on YouTube 429s.
     """
-    from ..process_runner import find_yt_dlp, find_ffprobe
     from .. import index as _idx
+    from ..process_runner import find_ffprobe, find_yt_dlp
 
     def _emit(text, tag="dim"):
         try: stream.emit_text(text, tag)

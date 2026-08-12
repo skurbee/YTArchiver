@@ -31,6 +31,11 @@
           <button class="back-btn" id="browse-back-btn" hidden>&#8592; Back</button>
           <span class="browse-main-title" id="browse-main-title">Channels</span>
           <div class="spacer"></div>
+          <button class="btn browse-add-channel-btn" id="browse-add-channel" type="button"
+                  title="Add a YouTube channel to your archive">
+            <span class="browse-add-channel-icon" aria-hidden="true">+</span>
+            Add channel
+          </button>
           <!-- Channel-grid sort. Visible by default because Channels is the
                default Browse view; browseNavigate()/showView() hide it when
                switching to other submodes/views. -->
@@ -207,12 +212,13 @@
                       <option value="outline">Outline</option>
                       <option value="none">None</option>
                     </select>
-                    <label class="overlay-sublabel">words</label>
+                    <label class="overlay-sublabel">mode</label>
                     <select class="ctl-select" id="watch-cap-mode"
-                            aria-label="Words shown in overlay"
-                            title="1 word: just the spoken word.&#10;3 words: previous + current + next (neighbors dimmer).">
+                            aria-label="Caption overlay mode"
+                            title="1 word: just the spoken word.&#10;3 words: previous + current + next (neighbors dimmer).&#10;Default: YouTube-style phrases in up to two lines.">
                       <option value="single" selected>1 word</option>
                       <option value="phrase3">3 words</option>
+                      <option value="default">Default</option>
                     </select>
                   </span>
                 </div>

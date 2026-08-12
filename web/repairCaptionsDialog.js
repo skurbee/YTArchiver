@@ -1,8 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════════
    repairCaptionsDialog.js — "Repair YT auto-captions" modal
 
-   Extracted from settingsTab.js (Patch 24, v72.6). Re-parses
-   YouTube auto-caption files with the v64.7 parser fix (handles
+   Re-parses YouTube auto-caption files using the current parser (handles
    word-rollover punctuation lost in earlier ingests). Channel
    dropdown or All; dry-run + include-already-punctuated toggles.
    On Run, kicks off the background worker via api.repair_yt_captions

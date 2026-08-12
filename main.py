@@ -52,18 +52,12 @@ def _ensure_webview2_browser_args() -> None:
 
 _ensure_webview2_browser_args()
 
-# ── Version header — last updated 4.20.26 5:27pm ───────────────────────
-# Surfaced in the window title, /cmd/ping, and the HTML header bar.
-# Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
-# carrying the ten at v45.9 -> v46.0.
-# Patch 7 moved the constants to backend/version.py so the api_mixins
-# package can read the same value without a circular import. Bump
-# the values THERE on each release.
+# APP_VERSION + APP_VERSION_DATE live in backend/version.py — bump THERE
+# (+0.1, single-decimal rollover) on every push. Surfaced in the window
+# title, /cmd/ping, and the header bar.
 from backend.version import APP_VERSION
 
-# ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
-# Use a DIFFERENT mutex name than the OLD tkinter YTArchiver so both CAN
-# coexist on the user's machine if the classic copy is still around.
+# ── Single-instance mutex ──────────────────────────────────────────────
 _INSTANCE_MUTEX = None
 if os.name == "nt":
     _INSTANCE_MUTEX = ctypes.windll.kernel32.CreateMutexW(
@@ -105,12 +99,8 @@ if os.name == "nt":
             if _n > 0:
                 _buf = ctypes.create_unicode_buffer(_n + 1)
                 ctypes.windll.user32.GetWindowTextW(hwnd, _buf, _n + 1)
-                # Match both legacy "YT Archiver" (space) AND
-                # current "YTArchiver" (no space). The window kwarg
-                # uses the no-space form, so the original substring
-                # check would never match the real window and the
-                # second-instance launch silently exited without
-                # focusing the existing window (audit: main.py:28-47).
+                # Accept both historical title spellings when focusing an
+                # existing instance.
                 _tv = _buf.value
                 if _tv in {"YTArchiver", "YT Archiver"} \
                         and _window_belongs_to_this_exe(hwnd):
@@ -139,7 +129,7 @@ except ImportError:
     except Exception as e:
         # _log isn't defined yet at this stage (set below) — use print
         # so a secondary ctypes failure doesn't mask the original
-        # ImportError with NameError (audit: main.py:62).
+        # ImportError with NameError.
         print(f"[YTArchiver] pywebview ImportError MessageBox failed: {e}")
     sys.exit(1)
 
@@ -153,8 +143,7 @@ _boot_trace("paths resolved")
 # now just return empty results — the UI handles those cleanly.
 sys.path.insert(0, str(ROOT))
 
-# Patch 19 (v72.1): web/index.html is built from a template + partials
-# (web/index.template.html + web/partials/*.html). Assemble the output
+# web/index.html is built from a template and partials. Assemble the output
 # file before pywebview opens the window so the UI sees a complete HTML
 # page. Idempotent: skipped if index.html is already up to date.
 try:
@@ -167,11 +156,11 @@ except Exception as _e:  # pragma: no cover - boot-time best effort
 
 from backend import auto_backup as auto_backup_backend
 from backend import autorun as autorun_backend
-from backend.archive_capacity import archive_capacity_status
 from backend import index as index_backend
 from backend import net as net_backend
 from backend import sync as sync_backend
 from backend import window_state as winstate
+from backend.archive_capacity import archive_capacity_status
 from backend.log import get_logger as _get_logger
 from backend.log import install as _install_log_bridge
 from backend.log_stream import LogStreamer
@@ -186,6 +175,7 @@ from backend.ytarchiver_config import (
     load_config,
     save_config,
 )
+
 _boot_trace("backend imports complete")
 
 _log = _get_logger("main")
@@ -216,6 +206,7 @@ from backend.api_mixins import (
     VideoMixin,
     WindowMixin,
 )
+
 _boot_trace("api mixins imported")
 
 
@@ -653,6 +644,11 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 _traffic_wait = _yt_traffic.wait_status()
             except Exception:
                 _traffic_wait = {"active": False}
+            try:
+                from backend import youtube_session as _yt_session
+                _session_limited = bool(_yt_session.rate_limit_detected())
+            except Exception:
+                _session_limited = False
             self.services.event_bus.update_queues(payload, {
                 "sync": {
                     "running": sync_running,
@@ -660,6 +656,11 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     "pausedActive": _sync_pa,
                     "trafficWaiting": bool(_traffic_wait.get("active")),
                     "trafficWait": _traffic_wait,
+                    # YouTube's emergency "current session has been
+                    # rate-limited" hold is separate from the configured
+                    # hourly/24-hour rolling-budget wait above. Forward it
+                    # explicitly so Sync Tasks parks while its worker waits.
+                    "sessionLimited": _session_limited,
                 },
                 "gpu": {
                     "running": gpu_running,
@@ -812,8 +813,8 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             """Push startup status text, or `None`/`""` to hide it.
             Visible in Simple + Verbose.
 
-            LOW FIX (audit 5.23 LOW-5): use json.dumps to encode the
-            text argument. The previous manual replace-chain escaped
+            Use json.dumps to encode the text argument. A manual replace-chain
+            escaped
             `\\` and `'` only — a literal newline / carriage return
             inside a channel folder name would produce broken JS
             (unescaped newline inside a quoted string is a
@@ -1262,11 +1263,7 @@ def main():
                 if _co:
                     _roots.append(_co)
             # Serve only explicit app asset dirs, not the whole app root.
-            _roots.extend([
-                str(WEB),
-                str(ROOT / "thumbs"),
-                str(ROOT / "channel_art"),
-            ])
+            _roots.append(str(WEB))
             _fs.set_allowed_roots(_roots)
         except Exception as _re:
             print(f"[fileserver] could not set allowed roots: {_re}")
@@ -1986,8 +1983,7 @@ def main():
         # keeping the concepts separate prevents rescans of old archives from
         # corrupting Browse > Recently Downloaded ordering.
         try:
-            from backend.index import (
-                backfill_downloaded_ts_from_recent as _backfill_downloads)
+            from backend.index import backfill_downloaded_ts_from_recent as _backfill_downloads
             from backend.ytarchiver_config import load_config as _load_dl_cfg
             _dl_result = _backfill_downloads(
                 _load_dl_cfg().get("recent_downloads", []))
@@ -2025,12 +2021,10 @@ def main():
             if not _lc_vid().get("video_id_seg_backfill_done"):
                 def _vid_seg_backfill():
                     try:
-                        from backend.index import (
-                            backfill_video_ids_from_segments as _bvi)
+                        from backend.index import backfill_video_ids_from_segments as _bvi
                         r = _bvi()
                         if r.get("ok"):
-                            from backend.ytarchiver_config import (
-                                config_transaction as _ctx)
+                            from backend.ytarchiver_config import config_transaction as _ctx
                             with _ctx() as _cfg:
                                 _cfg["video_id_seg_backfill_done"] = True
                             _log.debug(

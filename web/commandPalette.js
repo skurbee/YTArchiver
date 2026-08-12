@@ -46,11 +46,17 @@
       { label: "Sync all subscribed channels", hint: "action", run: () => $("btn-sync-subbed")?.click() },
       { label: "Search transcripts + titles", hint: "action", run: () => {
           _clickTab("browse");
-          setTimeout(() => document.querySelector('[data-browse-sub="search"]')?.click(), 50);
+          setTimeout(() => document.querySelector('[data-submode="search"]')?.click(), 50);
         } },
       { label: "Download", hint: "tab", run: () => _clickTab("download") },
-      { label: "Subs — channel list", hint: "tab", run: () => _clickTab("subs") },
-      { label: "Browse — library", hint: "tab", run: () => _clickTab("browse") },
+      { label: "Channels — browse and manage", hint: "browse", run: () => {
+          _clickTab("browse");
+          setTimeout(() => document.querySelector('[data-submode="channels"]')?.click(), 50);
+        } },
+      { label: "Videos — Browse library", hint: "browse", run: () => {
+          _clickTab("browse");
+          setTimeout(() => document.querySelector('[data-submode="recent"]')?.click(), 50);
+        } },
       { label: "Health", hint: "tab", run: () => _clickTab("health") },
       { label: "Settings", hint: "tab", run: () => _clickTab("settings") },
       { label: "Tools", hint: "health", run: () => _healthSub("tools") },
@@ -58,6 +64,13 @@
       { label: "Index & rebuild", hint: "health", run: () => _healthSub("index") },
       { label: "Keyboard shortcuts", hint: "help", run: () => $("btn-shortcuts-help")?.click() },
     ];
+    if (window._legacySubsTabEnabled) {
+      items.push({
+        label: "Subs — legacy channel table",
+        hint: "legacy tab",
+        run: () => _clickTab("subs"),
+      });
+    }
     const chans = (window._browseState && window._browseState.channels) || [];
     for (const c of chans) {
       const name = (c.folder || c.name || "").trim();

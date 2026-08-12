@@ -4,12 +4,15 @@
  * extracted out of app.js (lines 7527-7595).
  * Provides:
  *   - YT.ctx.show(x, y, items) — open a context menu at coords with
- *     a list of { label, action, cls?, sep?, submenu? } entries.
+ *     a list of { label, action, cls?, checked?, sep?, header?, submenu? }
+ *     entries.
  *   - YT.ctx.close() — explicit close (called automatically on
  *     outside-click and Escape).
  *
  * Items shape:
  *   { label: "Open", action: () => ... }
+ *   { label: "Enabled option", checked: true, action: () => ... }
+ *   { header: "Maintenance" }
  *   { sep: true }
  *   { label: "More…", submenu: [...] }
  *   { label: "Delete", action: ..., cls: "danger" }
@@ -40,6 +43,13 @@
     menu.style.left = x + "px";
     menu.style.top = y + "px";
     for (const it of items) {
+      if (it.header) {
+        const header = document.createElement("div");
+        header.className = "ctx-menu-header";
+        header.textContent = it.header;
+        menu.appendChild(header);
+        continue;
+      }
       if (it.sep) {
         const sep = document.createElement("div");
         sep.className = "ctx-menu-sep";
@@ -49,7 +59,14 @@
       }
       const row = document.createElement("div");
       row.className = "ctx-menu-item" + (it.cls ? " " + it.cls : "");
-      row.setAttribute("role", "menuitem");
+      if (typeof it.checked === "boolean") {
+        row.classList.add("checkable");
+        row.classList.toggle("checked", it.checked);
+        row.setAttribute("role", "menuitemcheckbox");
+        row.setAttribute("aria-checked", it.checked ? "true" : "false");
+      } else {
+        row.setAttribute("role", "menuitem");
+      }
       row.tabIndex = -1;
       row.textContent = it.label;
       if (it.title) row.title = it.title;   // hover tooltip (e.g. why disabled)
@@ -70,10 +87,18 @@
             continue;
           }
           const srow = document.createElement("div");
-          srow.className = "ctx-menu-item";
-          srow.setAttribute("role", "menuitem");
+          srow.className = "ctx-menu-item" + (sit.cls ? " " + sit.cls : "");
+          if (typeof sit.checked === "boolean") {
+            srow.classList.add("checkable");
+            srow.classList.toggle("checked", sit.checked);
+            srow.setAttribute("role", "menuitemcheckbox");
+            srow.setAttribute("aria-checked", sit.checked ? "true" : "false");
+          } else {
+            srow.setAttribute("role", "menuitem");
+          }
           srow.tabIndex = -1;
           srow.textContent = sit.label;
+          if (sit.title) srow.title = sit.title;
           srow.addEventListener("click", (e) => {
             e.stopPropagation();
             closeContextMenu();

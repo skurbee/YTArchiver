@@ -894,7 +894,7 @@
     if (url) {
       // Stop the previous video's load explicitly before swapping src.
       // Without this, rapid back-to-back video clicks can leave the
-      // old request holding the file handle on Z:\ DrivePool until
+      // old request holding the file handle on the archive drive until
       // the local HTTP server times out (~30s) — at peak this
       // transiently leaks N file handles. Pause+removeAttribute+load
       // is the documented clean-teardown pattern.
@@ -1093,9 +1093,15 @@
     const myGen = ++_karaokeGen;
     let lastSegIdx = -1;
     let lastWordEl = null;
+    let lastCapWordEl = null;
+    vEl._capDefaultCueCache = null;
     // Repaint the pinned overlay immediately (e.g. when the user flips
     // overlay size/mode while paused) without waiting for the next tick.
-    vEl._capForceRefresh = () => _updateCapOverlay(vEl, lastWordEl, allWordEls, wordIndex);
+    vEl._capForceRefresh = () => {
+      const mode = window._captionPrefs?.mode || "single";
+      _updateCapOverlay(vEl, mode === "default" ? lastCapWordEl : lastWordEl,
+                        allWordEls, wordIndex);
+    };
 
     const _tick = () => {
       if (myGen !== _karaokeGen) return;
@@ -1141,8 +1147,27 @@
       if (newWordEl !== lastWordEl) {
         if (lastWordEl) lastWordEl.classList.remove("active");
         if (newWordEl) newWordEl.classList.add("active");
-        _updateCapOverlay(vEl, newWordEl, allWordEls, wordIndex);
         lastWordEl = newWordEl;
+      }
+      // YouTube-style cues stay visible through the tiny timing gaps between
+      // words. Keep a separate overlay anchor so the transcript's active-word
+      // highlight still remains exact and clears normally in those gaps.
+      let capWordEl = newWordEl;
+      if (!capWordEl && window._captionPrefs?.mode === "default"
+          && idx >= 0 && segEls[idx]) {
+        const segEnd = parseFloat(segEls[idx].dataset.e || "0");
+        if (!Number.isFinite(segEnd) || t <= segEnd + 0.7) {
+          const words = segEls[idx].querySelectorAll(".word");
+          for (const word of words) {
+            const start = parseFloat(word.dataset.s || "0");
+            if (start <= t) capWordEl = word;
+            else break;
+          }
+        }
+      }
+      if (capWordEl !== lastCapWordEl) {
+        _updateCapOverlay(vEl, capWordEl, allWordEls, wordIndex);
+        lastCapWordEl = capWordEl;
       }
       // Schedule the next frame as long as the video is still loaded.
       // The unbind path cancels the in-flight rAF so this never leaks.
@@ -1287,6 +1312,127 @@
   // cells. `curEl` is the active `.word` span from the transcript pane,
   // or null when playback is between words — in which case we hide the
   // overlay. `allWordEls`/`wordIndex` give O(1) neighbour lookup.
+  function _defaultCaptionProfile(vEl) {
+    const size = window._captionPrefs?.size || "small";
+    const fontPx = { small: 18, medium: 26, large: 40 }[size] || 18;
+    const videoWidth = vEl?.getBoundingClientRect?.().width || 640;
+    // Estimate how much text fits at the selected size, then cap it near
+    // YouTube's familiar short-line length. Two lines are the hard maximum.
+    const lineChars = Math.max(18, Math.min(42,
+      Math.floor((videoWidth * 0.84) / (fontPx * 0.54))));
+    const maxChars = lineChars * 2;
+    const maxWords = Math.max(7, Math.min(15, Math.floor(maxChars / 5.5)));
+    return {
+      key: `${size}:${lineChars}`,
+      lineChars,
+      maxChars,
+      maxWords,
+      targetWords: Math.max(5, Math.floor(maxWords * 0.72)),
+    };
+  }
+
+  function _splitDefaultCaptionLines(words, lineChars) {
+    const full = words.join(" ");
+    if (words.length < 2 || full.length <= lineChars) return [full];
+    let bestAt = 1;
+    let bestScore = Infinity;
+    for (let i = 1; i < words.length; i++) {
+      const left = words.slice(0, i).join(" ");
+      const right = words.slice(i).join(" ");
+      const overflow = Math.max(0, left.length - lineChars)
+                     + Math.max(0, right.length - lineChars);
+      const score = overflow * 20 + Math.abs(left.length - right.length);
+      if (score < bestScore) {
+        bestScore = score;
+        bestAt = i;
+      }
+    }
+    return [words.slice(0, bestAt).join(" "), words.slice(bestAt).join(" ")];
+  }
+
+  function _buildDefaultCaptionCues(allWordEls, profile) {
+    const byWord = new Array(allWordEls.length);
+    const textAt = (i) => allWordEls[i]?.textContent?.trim() || "";
+    const startAt = (i) => parseFloat(allWordEls[i]?.dataset.s || "0");
+    const endAt = (i) => {
+      const el = allWordEls[i];
+      const end = parseFloat(el?.dataset.e || "");
+      return Number.isFinite(end) ? end : startAt(i);
+    };
+    const sentenceEnd = (text) => _isNonSpeechToken(text)
+      || /[.!?\u2026](?:["'\u201d\u2019)\]]+)?$/.test(text);
+    const softEnd = (text) => /(?:[,;:]|[\u2013\u2014])(?:["'\u201d\u2019)\]]+)?$/.test(text);
+
+    let first = 0;
+    while (first < allWordEls.length) {
+      let chars = 0;
+      let lastSoft = -1;
+      let last = first;
+      for (let i = first; i < allWordEls.length; i++) {
+        const text = textAt(i);
+        const count = i - first + 1;
+        const nextChars = chars + (chars ? 1 : 0) + text.length;
+        const gap = i > first ? startAt(i) - endAt(i - 1) : 0;
+
+        if (i > first && count > 3 && gap > 0.85) {
+          last = i - 1;
+          break;
+        }
+        if (i > first && (nextChars > profile.maxChars
+                          || count > profile.maxWords)) {
+          last = lastSoft >= first ? lastSoft : i - 1;
+          break;
+        }
+
+        chars = nextChars;
+        last = i;
+        if (sentenceEnd(text)) break;
+        if (count >= 4 && softEnd(text)) lastSoft = i;
+        if (count >= profile.targetWords && lastSoft >= first) {
+          last = lastSoft;
+          break;
+        }
+        if (count >= 4 && endAt(i) - startAt(first) >= 5.5) break;
+      }
+
+      const words = [];
+      for (let i = first; i <= last; i++) words.push(textAt(i));
+      const cue = {
+        key: `${profile.key}:${first}:${last}`,
+        lines: _splitDefaultCaptionLines(words, profile.lineChars),
+      };
+      for (let i = first; i <= last; i++) byWord[i] = cue;
+      first = last + 1;
+    }
+    return byWord;
+  }
+
+  function _defaultCaptionCue(vEl, allWordEls, index) {
+    const profile = _defaultCaptionProfile(vEl);
+    let cache = vEl._capDefaultCueCache;
+    if (!cache || cache.words !== allWordEls || cache.key !== profile.key) {
+      cache = {
+        key: profile.key,
+        words: allWordEls,
+        byWord: _buildDefaultCaptionCues(allWordEls, profile),
+      };
+      vEl._capDefaultCueCache = cache;
+    }
+    return cache.byWord[index] || null;
+  }
+
+  function _renderDefaultCaption(cell, cue) {
+    if (cell.dataset.cueKey === cue.key) return;
+    const lines = cue.lines.map((text) => {
+      const line = document.createElement("span");
+      line.className = "cap-ovl-line";
+      line.textContent = text;
+      return line;
+    });
+    cell.replaceChildren(...lines);
+    cell.dataset.cueKey = cue.key;
+  }
+
   function _updateCapOverlay(vEl, curEl, allWordEls, wordIndex) {
     const ovl = vEl && vEl._capOverlay;
     if (!ovl) return;
@@ -1296,9 +1442,20 @@
     const mode = p.mode || "single";
     const i = wordIndex ? wordIndex.get(curEl) : -1;
     const has = (j) => allWordEls && j >= 0 && j < allWordEls.length;
+    ovl.dataset.capMode = mode;
+    if (mode === "default") {
+      const cue = has(i) ? _defaultCaptionCue(vEl, allWordEls, i) : null;
+      if (!cue) { ovl.classList.remove("show"); return; }
+      ovl.children[0].textContent = "";
+      ovl.children[2].textContent = "";
+      _renderDefaultCaption(ovl.children[1], cue);
+      ovl.classList.add("show");
+      return;
+    }
     const prevEl = (mode === "phrase3" && has(i - 1)) ? allWordEls[i - 1] : null;
     const nextEl = (mode === "phrase3" && has(i + 1)) ? allWordEls[i + 1] : null;
     ovl.children[0].textContent = prevEl ? prevEl.textContent.trim() : "";
+    delete ovl.children[1].dataset.cueKey;
     ovl.children[1].textContent = curEl.textContent.trim();
     ovl.children[2].textContent = nextEl ? nextEl.textContent.trim() : "";
     ovl.classList.add("show");
@@ -1313,10 +1470,12 @@
     const p = window._captionPrefs || {};
     const size = p.size || "off";
     const bg = p.bg || "translucent";
+    const mode = p.mode || "single";
     const ovl = vEl._capOverlay;
     if (ovl) {
       ovl.dataset.capSize = (size === "off") ? "" : size;
       ovl.dataset.capBg = bg;
+      ovl.dataset.capMode = mode;
       if (size === "off") ovl.classList.remove("show");
     }
   }

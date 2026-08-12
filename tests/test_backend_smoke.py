@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import contextlib
+import json
 import os
 import queue
 import sqlite3
@@ -24,7 +24,6 @@ os.environ["APPDATA"] = _TEST_APPDATA.name
 from backend import (
     archive_capacity,
     archive_scan,
-    autorun as autorun_backend,
     channel_art,
     cmd_server,
     compress,
@@ -35,58 +34,73 @@ from backend import (
     fs_safety,
     index,
     index_bookmarks,
-    index_maintenance,
     index_graph,
+    index_maintenance,
     index_search,
-    log_stream,
-    local_fileserver,
     livestreams,
+    local_fileserver,
+    log_stream,
     net,
     process_runner,
     punct_alignment,
     punct_restore,
     queues,
     redownload,
-    repair_captions,
     reorg,
+    repair_captions,
     subs,
     text_utils,
     thumbnails,
-    tray as tray_backend,
     utils,
     youtube_session,
     youtube_traffic,
     ytarchiver_config,
 )
-from backend.services import AppServices, BridgeEventBus, file_ops
-from backend.api_mixins.channel_mixin import ChannelMixin
+from backend import (
+    autorun as autorun_backend,
+)
+from backend import (
+    tray as tray_backend,
+)
 from backend.api_mixins import _shared as api_shared
-from backend.api_mixins import archive_mixin
-from backend.api_mixins import backup_mixin
-from backend.api_mixins import browse_mixin
-from backend.api_mixins import channel_mixin
-from backend.api_mixins import diagnostics_mixin
-from backend.api_mixins import metadata_mixin
-from backend.api_mixins import settings_mixin
-from backend.api_mixins import subs_mixin
-from backend.api_mixins import sync_mixin
-from backend.api_mixins import thumbnail_mixin
-from backend.api_mixins import transcribe_mixin
-from backend.api_mixins import window_mixin
+from backend.api_mixins import (
+    archive_mixin,
+    backup_mixin,
+    browse_mixin,
+    channel_mixin,
+    diagnostics_mixin,
+    metadata_mixin,
+    settings_mixin,
+    subs_mixin,
+    sync_mixin,
+    thumbnail_mixin,
+    transcribe_mixin,
+    window_mixin,
+)
 from backend.api_mixins.browse_mixin import BrowseMixin
-from backend.api_mixins.info_mixin import InfoMixin
+from backend.api_mixins.channel_mixin import ChannelMixin
 from backend.api_mixins.index_mixin import IndexMixin
+from backend.api_mixins.info_mixin import InfoMixin
 from backend.api_mixins.media_ops_mixin import MediaOpsMixin
 from backend.api_mixins.onboarding_mixin import OnboardingMixin
 from backend.api_mixins.queue_mixin import QueueMixin
-from backend.api_mixins.redownload_mixin import RedownloadMixin
-from backend.metadata import io as metadata_io
 from backend.api_mixins.recent_mixin import RecentMixin
+from backend.api_mixins.redownload_mixin import RedownloadMixin
 from backend.api_mixins.sync_mixin import SyncMixin
 from backend.api_mixins.thumbnail_mixin import ThumbnailMixin
 from backend.api_mixins.transcribe_mixin import TranscribeMixin
 from backend.api_mixins.video_mixin import VideoMixin
 from backend.api_mixins.window_mixin import WindowMixin
+from backend.metadata import core as metadata_core
+from backend.metadata import fetcher as metadata_fetcher
+from backend.metadata import io as metadata_io
+from backend.metadata import (
+    refresh_comments,
+    refresh_fetch,
+    refresh_state,
+    refresh_views,
+)
+from backend.services import AppServices, BridgeEventBus, file_ops
 from backend.sync import core as sync_core
 from backend.sync import (
     log_rows,
@@ -105,15 +119,10 @@ from backend.sync.ytdlp_events import (
     extract_video_id_from_line,
     is_verbose_chatter_line,
 )
-from backend.metadata import fetcher as metadata_fetcher
-from backend.metadata import core as metadata_core
-from backend.metadata import refresh_views
-from backend.metadata import refresh_fetch
-from backend.transcribe.punct_manager import PunctuationManager
 from backend.transcribe import core as transcribe_core
 from backend.transcribe import helpers as transcribe_helpers
-from backend.transcribe import transcribe_vtt
-from backend.transcribe import transcribe_files
+from backend.transcribe import transcribe_files, transcribe_vtt
+from backend.transcribe.punct_manager import PunctuationManager
 
 _TEST_TRAFFIC_TMP = None
 _TEST_TRAFFIC_PRESETS = None
@@ -388,6 +397,57 @@ class SharedApiHelperTests(unittest.TestCase):
         self.assertFalse(result["manifest"]["fts_db_included"])
 
 
+class AutoBackupRetentionTests(unittest.TestCase):
+    def test_rotation_is_bounded_and_only_prunes_scheduled_backups(self) -> None:
+        from backend import auto_backup
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            info_dir = root / auto_backup.INFO_DIR_NAME
+            info_dir.mkdir()
+
+            generated = []
+            for day in range(1, 8):
+                path = info_dir / (
+                    f"{auto_backup.BACKUP_PREFIX}2026-08-{day:02d}_120000.zip")
+                path.write_bytes(str(day).encode("ascii"))
+                generated.append(path)
+
+            # Prefix lookalikes and user-created ZIPs are outside retention.
+            lookalike = info_dir / "ytarchiver_backup_keep_this.zip"
+            manual = info_dir / "my_manual_backup.zip"
+            lookalike.write_bytes(b"user")
+            manual.write_bytes(b"user")
+
+            # Pre-fix builds moved expired scheduled ZIPs here. Rotation must
+            # clean those up or total disk use would still grow forever.
+            legacy_trash = (
+                root / ".YTArchiver Trash" / auto_backup.INFO_DIR_NAME)
+            legacy_trash.mkdir(parents=True)
+            legacy_plain = (
+                legacy_trash /
+                "ytarchiver_backup_2026-07-01_120000.zip")
+            legacy_collision = (
+                legacy_trash /
+                "ytarchiver_backup_2026-07-01_120000.1234567890.zip")
+            unrelated_trash = legacy_trash / "notes.zip"
+            for path in (legacy_plain, legacy_collision, unrelated_trash):
+                path.write_bytes(b"trash")
+
+            removed = auto_backup._rotate_backups(str(info_dir), str(root))
+
+            self.assertEqual(removed, 5)
+            self.assertEqual(
+                [path.name for path in generated if path.exists()],
+                [path.name for path in generated[-auto_backup.KEEP_BACKUPS:]],
+            )
+            self.assertTrue(lookalike.exists())
+            self.assertTrue(manual.exists())
+            self.assertFalse(legacy_plain.exists())
+            self.assertFalse(legacy_collision.exists())
+            self.assertTrue(unrelated_trash.exists())
+
+
 class ArchiveMixinTests(unittest.TestCase):
     def test_write_probe_uses_unique_tempfile_and_leaves_no_fixed_probe(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -511,7 +571,7 @@ class UtilsTests(unittest.TestCase):
                 mock.patch.object(archive_capacity.shutil, "disk_usage",
                                   return_value=(1000, 910, 90)):
             status = archive_capacity.archive_capacity_status(
-                "Z:/Archive",
+                "X:/Archive",
                 {
                     "archive_capacity_warning_mode": "percent",
                     "archive_capacity_warning_percent": 90,
@@ -529,7 +589,7 @@ class UtilsTests(unittest.TestCase):
                 mock.patch.object(archive_capacity.shutil, "disk_usage",
                                   return_value=(1000 * gib, 940 * gib, 60 * gib)):
             status = archive_capacity.archive_capacity_status(
-                "Z:/Archive",
+                "X:/Archive",
                 {
                     "archive_capacity_warning_mode": "free_gb",
                     "archive_capacity_warning_free_gb": 100,
@@ -546,7 +606,7 @@ class UtilsTests(unittest.TestCase):
         with mock.patch.object(fs_safety.shutil, "disk_usage",
                                side_effect=OSError("offline")):
             with self.assertLogs(fs_safety._log, level="WARNING"):
-                self.assertFalse(utils.check_disk_space("Z:/Archive", 1))
+                self.assertFalse(utils.check_disk_space("X:/Archive", 1))
 
     def test_browse_launch_guard_rejects_outside_archive_root(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1348,6 +1408,25 @@ class YouTubeSessionGuardTests(unittest.TestCase):
         self.assertTrue(pause_event.is_set())
         stream.emit_error.assert_called_once()
 
+    def test_passive_log_scanner_ignores_rate_limit_words_in_title(self) -> None:
+        stream = mock.Mock()
+        pause_event = threading.Event()
+        queue_state = mock.Mock()
+        youtube_session.configure(stream, pause_event, queue_state)
+        youtube_session.begin_sync_scope()
+
+        youtube_session.scan_log_line(
+            "      — ✓ Too Many Requests (54.2 MB)")
+
+        self.assertFalse(youtube_session.rate_limit_detected())
+        self.assertFalse(pause_event.is_set())
+
+        youtube_session.scan_log_line(
+            "ERROR: HTTP Error 429: Too Many Requests")
+
+        self.assertTrue(youtube_session.rate_limit_detected())
+        self.assertTrue(pause_event.is_set())
+
     def test_background_rate_limit_cancels_without_resume_message(
             self) -> None:
         stream = mock.Mock()
@@ -1456,10 +1535,16 @@ class MetadataJsonlTests(unittest.TestCase):
                                   return_value=old_catalog), \
                 mock.patch.object(refresh_views, "_filter_recent_on_disk",
                                   return_value=[]), \
+                mock.patch.object(refresh_views, "stamp_channel_refresh") \
+                as stamp_refresh, \
                 mock.patch.object(refresh_views.threading, "Thread",
                                   NoopThread):
+            channel = {
+                "name": "Old Channel",
+                "url": "https://example.test/channel",
+            }
             result = refresh_views.bulk_refresh_views_likes(
-                {"name": "Old Channel", "url": "https://example.test/channel"},
+                channel,
                 stream,
                 scope={"days": 365},
             )
@@ -1473,6 +1558,54 @@ class MetadataJsonlTests(unittest.TestCase):
             controls,
             [{"kind": "clear_line", "marker": "views_refresh_progress"}],
         )
+        stamp_refresh.assert_called_once_with(
+            channel, "last_views_refresh_ts")
+
+    def test_scoped_comments_refresh_stamps_when_no_videos_match(
+            self) -> None:
+        stream = mock.Mock()
+        channel = {
+            "name": "Old Channel",
+            "url": "https://example.test/channel",
+        }
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(refresh_comments, "_folder_for_channel",
+                                  return_value=Path(td)), \
+                mock.patch.object(refresh_comments, "find_yt_dlp",
+                                  return_value="yt-dlp"), \
+                mock.patch.object(refresh_comments, "_scan_channel_videos",
+                                  return_value=[]), \
+                mock.patch.object(refresh_comments, "stamp_channel_refresh") \
+                as stamp_refresh:
+            result = refresh_comments.refresh_channel_comments(
+                channel, stream, only_recent_days=30)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["fetched"], 0)
+        stamp_refresh.assert_called_once_with(
+            channel, "last_comments_refresh_ts")
+
+    def test_channel_refresh_stamp_updates_matching_saved_channel(self) -> None:
+        channel = {
+            "name": "Channel",
+            "url": "https://example.test/channel/",
+        }
+        saved = {"channels": [{
+            "name": "Channel",
+            "url": "https://example.test/channel",
+            "last_views_refresh_ts": 1,
+        }]}
+        with mock.patch.object(
+                ytarchiver_config, "config_transaction",
+                return_value=contextlib.nullcontext(saved)), \
+                mock.patch.object(refresh_state.time, "time",
+                                  return_value=1234.5):
+            stamped = refresh_state.stamp_channel_refresh(
+                channel, "last_views_refresh_ts")
+
+        self.assertTrue(stamped)
+        self.assertEqual(
+            saved["channels"][0]["last_views_refresh_ts"], 1234.5)
 
     def test_recent_views_scope_uses_local_upload_time_when_catalog_date_missing(
             self) -> None:
@@ -2054,6 +2187,12 @@ class YtDlpEventsTests(unittest.TestCase):
             "Abc123_def4",
         )
 
+    def test_extract_video_id_from_line_accepts_all_alpha_id(self) -> None:
+        self.assertEqual(
+            extract_video_id_from_line("[youtube] abcdefghijk: Downloading"),
+            "abcdefghijk",
+        )
+
     def test_verbose_chatter_line_detection(self) -> None:
         self.assertTrue(is_verbose_chatter_line("  [Merger] Merging formats"))
         self.assertTrue(is_verbose_chatter_line("[info] Writing video metadata"))
@@ -2101,7 +2240,7 @@ class TextUtilsTests(unittest.TestCase):
     def test_extract_video_id_accepts_all_alpha_db_fallback(self) -> None:
         conn = sqlite3.connect(":memory:")
         try:
-            path = r"Z:\Archive\Channel\Video.mp4"
+            path = r"X:\Archive\Channel\Video.mp4"
             conn.execute("CREATE TABLE videos(filepath TEXT, video_id TEXT)")
             conn.execute("INSERT INTO videos(filepath, video_id) VALUES (?, ?)",
                          (path, "ABCDEFGHIJK"))
@@ -2375,8 +2514,8 @@ class ThumbnailMixinTests(unittest.TestCase):
         """sweep_missing_thumbnails must invalidate the channel's status
         cache when it actually fetched files (so the % column refreshes),
         and must NOT bother when nothing changed."""
-        from backend.metadata import thumbnails_ops as _ops
         from backend import thumbnails as _th
+        from backend.metadata import thumbnails_ops as _ops
         calls: list[str] = []
 
         def _fake_sweep_body(fetched):
@@ -2680,9 +2819,9 @@ class SubsTests(unittest.TestCase):
         api.chan_transcribe_pending = mock.Mock(return_value={
             "ok": True, "queued": 1})
 
-        cfg0 = {"output_dir": "Z:/Archive", "channels": []}
+        cfg0 = {"output_dir": "X:/Archive", "channels": []}
         fresh = {
-            "output_dir": "Z:/Archive",
+            "output_dir": "X:/Archive",
             "autorun_sync": False,
             "channels": [{
                 "name": "Fresh",
@@ -2824,7 +2963,7 @@ class MetadataMixinTests(unittest.TestCase):
                 self._on_queue_changed = mock.Mock()
                 self._maybe_autostart_sync = mock.Mock(return_value=False)
                 self.services = AppServices(
-                    load_config=lambda: {},
+                    load_config=dict,
                     save_config=lambda cfg: True,
                     queues=service_queues,
                     log_stream=service_log,
@@ -2854,6 +2993,49 @@ class MetadataMixinTests(unittest.TestCase):
 class BrowseMixinTests(unittest.TestCase):
     def tearDown(self) -> None:
         browse_mixin._METADATA_DRAWER_CACHE.clear()
+
+    def test_channel_grid_reports_unfinished_redownload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            channel_dir = Path(td) / "Channel One"
+            channel_dir.mkdir()
+            (channel_dir / "_redownload_progress.json").write_text(
+                json.dumps({"resolution": "480", "done_ids": ["abc"]}),
+                encoding="utf-8")
+
+            class Api(BrowseMixin):
+                def _browse_fresh_config(self):
+                    return {
+                        "output_dir": td,
+                        "channels": [{
+                            "name": "Channel One",
+                            "folder": "Channel One",
+                            "url": "https://youtube.com/@channelone",
+                        }],
+                    }
+
+            stats = {"n_vids": 1, "size_bytes": 10, "size_gb": 0.0}
+            with mock.patch.object(
+                    browse_mixin.archive_scan, "load_disk_cache",
+                    return_value={}), \
+                    mock.patch.object(
+                        browse_mixin.archive_scan, "stats_for_channel",
+                        return_value=stats), \
+                    mock.patch.object(
+                        browse_mixin.index_backend, "_reader_open",
+                        return_value=None), \
+                    mock.patch.object(channel_art, "ensure_banner_thumb",
+                                      return_value=None), \
+                    mock.patch.object(channel_art, "banner_path_for",
+                                      return_value=None), \
+                    mock.patch.object(channel_art, "ensure_avatar_thumb",
+                                      return_value=None), \
+                    mock.patch.object(channel_art, "avatar_path_for",
+                                      return_value=None):
+                rows = Api()._browse_list_channels_impl()
+
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["_pending_redownload"])
+        self.assertEqual(rows[0]["_redownload_res"], "480")
 
     def test_search_context_clamps_before_after(self) -> None:
         class Api(BrowseMixin):
@@ -3445,7 +3627,7 @@ class BrowseMixinTests(unittest.TestCase):
                 self._log_stream = mock.Mock()
                 self._push_recent_refresh = mock.Mock()
                 self.services = AppServices(
-                    load_config=lambda: {},
+                    load_config=dict,
                     save_config=lambda cfg: True,
                     queues=mock.Mock(),
                     log_stream=mock.Mock(),
@@ -3589,7 +3771,7 @@ class BrowseMixinTests(unittest.TestCase):
                     self._log_stream = mock.Mock()
                     self._on_queue_changed = mock.Mock()
                     self.services = AppServices(
-                        load_config=lambda: {},
+                        load_config=dict,
                         save_config=lambda cfg: True,
                         queues=mock.Mock(),
                         log_stream=mock.Mock(),
@@ -3941,7 +4123,7 @@ class InfoMixinServicesTests(unittest.TestCase):
 class VideoMixinTests(unittest.TestCase):
     def test_video_delete_removes_stale_catalog_row_when_file_is_gone(self) -> None:
         mixin = VideoMixin()
-        missing = r"Z:\Archive\Gone.temp.mp4"
+        missing = r"X:\Archive\Gone.temp.mp4"
 
         class Result:
             def __init__(self, row=None):
@@ -4110,6 +4292,15 @@ class LogRowsTests(unittest.TestCase):
         self.assertNotIn("bad_low", log_rows._HIST_INDEX_BY_ROW_ID)
         self.assertNotIn("bad_high", log_rows._HIST_INDEX_BY_ROW_ID)
         self.assertIn("ok", log_rows._HIST_INDEX_BY_ROW_ID)
+
+    def test_sync_row_index_has_no_leading_padding(self) -> None:
+        stream = mock.Mock()
+
+        log_rows._sync_row_emit(stream, 99, 111, "Channel")
+        segments = stream.emit.call_args.args[0]
+        rendered = "".join(segment[0] for segment in segments)
+
+        self.assertTrue(rendered.startswith("[99/111] "))
 
 
 class YouTubeTrafficGovernorTests(unittest.TestCase):
@@ -6410,6 +6601,8 @@ class MediaOpsMixinTests(unittest.TestCase):
                            return_value={"checked": 1, "updated": 0}) as sizes, \
                 mock.patch("backend.api_mixins.media_ops_mixin"
                            ".archive_scan_backend.update_disk_cache_for_channel"), \
+                mock.patch("backend.api_mixins.media_ops_mixin.os.path.isdir",
+                           return_value=True), \
                 mock.patch("backend.api_mixins.media_ops_mixin.threading.Thread",
                            ImmediateThread):
             result = api.archive_rescan()
@@ -6425,6 +6618,45 @@ class MediaOpsMixinTests(unittest.TestCase):
                             for js in js_calls))
         self.assertTrue(any("_onArchiveRescanComplete" in js
                             for js in js_calls))
+
+    def test_archive_rescan_cancels_when_archive_root_is_unreachable(self) -> None:
+        class Api(MediaOpsMixin):
+            def sync_is_running(self):
+                return False
+
+            def archive_single_is_running(self):
+                return False
+
+        class ImmediateThread:
+            def __init__(self, target, daemon=False, name=None):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        api = Api()
+        api._config = {"output_dir": "X:/Archive", "channels": []}
+        api._log_stream = mock.Mock()
+        api._window = None
+
+        with mock.patch("backend.api_mixins.media_ops_mixin"
+                        ".index_backend.is_db_writer_busy",
+                        return_value=False), \
+                mock.patch("backend.api_mixins.media_ops_mixin.os.path.isdir",
+                           return_value=False), \
+                mock.patch("backend.api_mixins.media_ops_mixin"
+                           ".index_backend.prune_missing_videos") as prune, \
+                mock.patch("backend.api_mixins.media_ops_mixin.threading.Thread",
+                           ImmediateThread):
+            result = api.archive_rescan()
+
+        self.assertTrue(result["started"])
+        prune.assert_not_called()
+        api._log_stream.emit_error.assert_called_once()
+        self.assertIn("not reachable", api._log_stream.emit_error.call_args.args[0])
+        state = api.archive_rescan_state()
+        self.assertFalse(state["running"])
+        self.assertEqual(state["phase"], "error")
 
     def test_reorg_cancel_sets_active_reorg_event(self) -> None:
         class Api(MediaOpsMixin):
@@ -6532,6 +6764,30 @@ class SyncCoreTests(unittest.TestCase):
         stream.emit_text.assert_not_called()
         self.assertTrue(pause.is_set())
         stream.emit_error.assert_called_once()
+
+    def test_idless_completed_download_is_registered(self) -> None:
+        stream = mock.Mock()
+        with mock.patch.object(index, "register_video", return_value=True) as reg:
+            registered = sync_core._register_idless_download(
+                "X:/Archive/Channel/Video.mp4",
+                "Channel",
+                "Video",
+                auto_transcribe=False,
+                duration="not-a-number",
+                upload_date="20260809",
+                stream=stream,
+            )
+
+        self.assertTrue(registered)
+        reg.assert_called_once_with(
+            "X:/Archive/Channel/Video.mp4",
+            "Channel",
+            "Video",
+            tx_status="no_captions",
+            duration_secs=None,
+            upload_date="20260809",
+        )
+        stream.emit_dim.assert_called_once()
 
     def test_failed_video_merge_does_not_resurrect_timeout_giveup(self) -> None:
         video_id = "abc123def45"
@@ -7292,6 +7548,43 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(cfg["channels"], [])
             self.assertEqual(cfg["output_dir"], "")
+            self.assertFalse(cfg["legacy_subs_tab"])
+
+    def test_existing_config_without_dense_setting_migrates_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_file = Path(td) / "ytarchiver_config.json"
+            cfg_file.write_text(json.dumps({
+                "_migration_v2_pending_tx_ids": True,
+                "channels": [{
+                    "name": "Existing",
+                    "url": "https://example.test/channel",
+                }],
+                "output_dir": "X:/Archive",
+            }), encoding="utf-8")
+
+            with mock.patch.object(ytarchiver_config, "APP_DATA_DIR", Path(td)), \
+                    mock.patch.object(ytarchiver_config, "CONFIG_FILE", cfg_file):
+                loaded = ytarchiver_config.load_config()
+                persisted = json.loads(cfg_file.read_text(encoding="utf-8"))
+
+            self.assertTrue(loaded["legacy_subs_tab"])
+            self.assertTrue(persisted["legacy_subs_tab"])
+
+    def test_existing_dense_setting_is_never_overridden(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_file = Path(td) / "ytarchiver_config.json"
+            cfg_file.write_text(json.dumps({
+                "_migration_v2_pending_tx_ids": True,
+                "channels": [],
+                "output_dir": "X:/Archive",
+                "legacy_subs_tab": False,
+            }), encoding="utf-8")
+
+            with mock.patch.object(ytarchiver_config, "APP_DATA_DIR", Path(td)), \
+                    mock.patch.object(ytarchiver_config, "CONFIG_FILE", cfg_file):
+                loaded = ytarchiver_config.load_config()
+
+            self.assertFalse(loaded["legacy_subs_tab"])
 
     def test_config_transaction_persists_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -7321,6 +7614,7 @@ class ConfigTests(unittest.TestCase):
                 "_migration_v2_pending_tx_ids": True,
                 "channels": [],
                 "output_dir": "X:/Archive",
+                "legacy_subs_tab": False,
             }), encoding="utf-8")
             orig_json_load = json.load
 
@@ -7368,7 +7662,7 @@ class ConfigTests(unittest.TestCase):
             {
                 "title": f"Video {i}",
                 "channel": "Channel",
-                "filepath": f"Z:/Archive/video-{i}.mp4",
+                "filepath": f"X:/Archive/video-{i}.mp4",
                 "download_ts": i,
             }
             for i in range(1000)
@@ -7476,6 +7770,34 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(saved[-1]["archive_capacity_warning_percent"], 100)
         self.assertEqual(saved[-1]["archive_capacity_warning_free_gb"], 75)
 
+    def test_legacy_subs_tab_setting_round_trip(self) -> None:
+        saved = []
+
+        class Api(settings_mixin.SettingsMixin):
+            def __init__(self):
+                self._config = {
+                    "log_mode": "Simple",
+                    "legacy_subs_tab": False,
+                }
+                self._log_stream = mock.Mock()
+                self._transcribe = mock.Mock()
+                self._reload_config = mock.Mock()
+
+        fresh = {"log_mode": "Simple", "legacy_subs_tab": False}
+        with mock.patch.object(settings_mixin, "config_is_writable",
+                               return_value=True), \
+                mock.patch.object(settings_mixin, "load_config",
+                                  return_value=dict(fresh)), \
+                mock.patch.object(Api, "_settings_save_config",
+                                  side_effect=lambda cfg: saved.append(dict(cfg)) or True):
+            api = Api()
+            loaded = api.settings_load()
+            result = api.settings_save({"legacy_subs_tab": True})
+
+        self.assertFalse(loaded["legacy_subs_tab"])
+        self.assertTrue(result["ok"])
+        self.assertTrue(saved[-1]["legacy_subs_tab"])
+
     def test_ytdlp_update_clears_cached_version_on_success(self) -> None:
         class Api(settings_mixin.SettingsMixin):
             def __init__(self):
@@ -7560,6 +7882,126 @@ class AppServicesTests(unittest.TestCase):
         self.assertEqual(services.fresh_config()["output_dir"], "X:/Archive")
 
 
+class FrontendShortcutSourceTests(unittest.TestCase):
+    def test_search_shortcuts_use_real_submode_selector(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        shortcuts = (root / "web" / "shortcuts.js").read_text(
+            encoding="utf-8")
+        palette = (root / "web" / "commandPalette.js").read_text(
+            encoding="utf-8")
+
+        self.assertNotIn('data-browse-sub="search"', shortcuts)
+        self.assertNotIn('data-browse-sub="search"', palette)
+        self.assertIn('data-submode="search"', shortcuts)
+        self.assertIn('data-submode="search"', palette)
+        self.assertIn(
+            'const browsePanel = document.getElementById("panel-browse")',
+            shortcuts,
+        )
+
+    def test_ctrl_letter_shortcuts_normalize_capslock(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        shortcuts = (root / "web" / "shortcuts.js").read_text(
+            encoding="utf-8")
+
+        self.assertIn("e.key.toLowerCase()", shortcuts)
+        for letter in ("q", "f", "l", "s", "k", "p"):
+            self.assertIn(f'key === "{letter}"', shortcuts)
+
+
+class FrontendBrowseSourceTests(unittest.TestCase):
+    def test_index_summary_populates_search_segment_count(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        browse = (root / "web" / "browseContent.js").read_text(
+            encoding="utf-8")
+
+        self.assertIn('setText("search-stat-segments"', browse)
+
+    def test_channel_menu_promotes_edit_and_exposes_redownload_resume(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        menu = (root / "web" / "browseContextMenus.js").read_text(
+            encoding="utf-8")
+
+        sync_pos = menu.index('{ label: "Sync now"')
+        edit_pos = menu.index('{ label: "Edit settings"', sync_pos)
+        refetch_pos = menu.index('{ label: "Refetch missing thumbnails"')
+        self.assertLess(sync_pos, edit_pos)
+        self.assertLess(edit_pos, refetch_pos)
+        self.assertIn("Continue redownload at ${_redownloadResLabel}", menu)
+        self.assertIn('api?.chan_redownload?.(', menu)
+
+    def test_add_channel_still_offers_immediate_sync(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        editor = (root / "web" / "editChannel.js").read_text(
+            encoding="utf-8")
+
+        self.assertIn("if (wasAdd && addedChannelName)", editor)
+        self.assertIn('"Channel added. Sync now?"', editor)
+        self.assertIn('bridgeCall("sync_one_channel"', editor)
+
+    def test_dense_view_context_toggle_persists_and_is_shared(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        browse_view = (root / "web" / "browseView.js").read_text(
+            encoding="utf-8")
+        editor = (root / "web" / "editChannel.js").read_text(
+            encoding="utf-8")
+
+        self.assertIn('addEventListener("contextmenu"', browse_view)
+        self.assertIn("window._denseSubsContextMenuItem?.()", browse_view)
+        self.assertIn('label: "View Dense Subs List"', editor)
+        self.assertIn("checked: !!window._legacySubsTabEnabled", editor)
+        self.assertIn('bridgeCall("settings_save"', editor)
+        self.assertIn("legacy_subs_tab: useDense", editor)
+        self.assertIn('mainSubsTab?.addEventListener("contextmenu"', editor)
+
+    def test_browse_edit_forces_modern_channel_dialog(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        editor = (root / "web" / "editChannel.js").read_text(
+            encoding="utf-8")
+        menu = (root / "web" / "browseContextMenus.js").read_text(
+            encoding="utf-8")
+        content = (root / "web" / "browseContent.js").read_text(
+            encoding="utf-8")
+
+        self.assertIn("window._editChannelFromBrowse =", editor)
+        self.assertIn("{ forceModern: true }", editor)
+        self.assertIn("window._editChannelFromBrowse?.(name)", menu)
+        self.assertIn("window._editChannelFromBrowse?.(name)", content)
+
+    def test_channel_menu_visually_groups_primary_actions(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        menu = (root / "web" / "browseContextMenus.js").read_text(
+            encoding="utf-8")
+        context_menu = (root / "web" / "contextMenu.js").read_text(
+            encoding="utf-8")
+
+        self.assertIn('{ header: "Open & manage" }', menu)
+        self.assertIn('{ header: "Maintenance" }', menu)
+        self.assertIn('label: "Open videos", cls: "primary"', menu)
+        self.assertIn('label: "Sync now", cls: "primary"', menu)
+        self.assertIn("typeof it.checked === \"boolean\"", context_menu)
+        self.assertIn('row.setAttribute("role", "menuitemcheckbox")',
+                      context_menu)
+
+    def test_empty_channel_grid_has_first_channel_call_to_action(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        grids = (root / "web" / "browseGrids.js").read_text(
+            encoding="utf-8")
+
+        self.assertIn('welcome.className = "browse-first-channel"', grids)
+        self.assertIn('title.textContent = "Add your first channel"', grids)
+        self.assertIn("window._openAddChannelEditor?.(\"\")", grids)
+
+    def test_dense_sub_tab_setting_uses_current_product_copy(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        settings = (root / "web" / "partials" / "tab-settings.html").read_text(
+            encoding="utf-8")
+
+        self.assertIn(">Dense Sub Tab</label>", settings)
+        self.assertIn("Show dense Subs tab", settings)
+        self.assertNotIn("Show legacy Subs tab", settings)
+
+
 class SettingsMixinServicesTests(unittest.TestCase):
     def test_settings_mixin_prefers_app_services_dependencies(self) -> None:
         saved: list[dict] = []
@@ -7623,7 +8065,7 @@ class SettingsMixinServicesTests(unittest.TestCase):
             def __init__(self):
                 self._log_stream = mock.Mock()
                 self.services = AppServices(
-                    load_config=lambda: {},
+                    load_config=dict,
                     save_config=lambda cfg: True,
                     queues=mock.Mock(),
                     log_stream=service_log,
@@ -7708,6 +8150,31 @@ class OnboardingMixinServicesTests(unittest.TestCase):
 
 
 class QueueMixinServicesTests(unittest.TestCase):
+    def test_footer_traffic_counter_refreshes_on_queue_edges(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1] / "web" / "statusBar.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("_requestTrafficRefresh(0);", source)
+        self.assertIn("setInterval(_refreshTraffic, 5000)", source)
+        self.assertIn("_trafficRefreshPending = true", source)
+        self.assertNotIn("setInterval(refreshTraffic, 15000)", source)
+
+    def test_sync_task_blink_parks_for_both_youtube_limit_holds(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        blink_source = (root / "web" / "queueBlink.js").read_text(
+            encoding="utf-8")
+        main_source = (root / "main.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "s.trafficWaiting || s.sessionLimited", blink_source)
+        self.assertIn(
+            "!_isYouTubeLimitHold(_blinkState.sync)", blink_source)
+        self.assertIn(
+            "if (_isYouTubeLimitHold(s) && (s.running || s.count > 0))",
+            blink_source)
+        self.assertIn('"sessionLimited": _session_limited', main_source)
+
     def test_popover_pause_button_uses_only_custom_tooltip(self) -> None:
         source = (
             Path(__file__).resolve().parents[1] / "web" / "queueBlink.js"
@@ -7787,7 +8254,7 @@ class QueueMixinServicesTests(unittest.TestCase):
                 self._sync_pause = threading.Event()
                 self._on_queue_changed = mock.Mock()
                 self.services = AppServices(
-                    load_config=lambda: {},
+                    load_config=dict,
                     save_config=lambda cfg: True,
                     queues=service_queues,
                     log_stream=service_log,
@@ -7826,7 +8293,7 @@ class QueueMixinServicesTests(unittest.TestCase):
                 self._sync_pause = threading.Event()
                 self._on_queue_changed = mock.Mock()
                 self.services = AppServices(
-                    load_config=lambda: {},
+                    load_config=dict,
                     save_config=lambda cfg: True,
                     queues=service_queues,
                     log_stream=service_log,
@@ -7858,7 +8325,7 @@ class QueueMixinServicesTests(unittest.TestCase):
                 self._on_queue_changed = mock.Mock()
                 self.sync_is_running = mock.Mock(return_value=True)
                 self.services = AppServices(
-                    load_config=lambda: {},
+                    load_config=dict,
                     save_config=lambda cfg: True,
                     queues=service_queues,
                     log_stream=service_log,
@@ -8019,7 +8486,7 @@ class IndexMixinServicesTests(unittest.TestCase):
             def __init__(self):
                 self._log_stream = mock.Mock()
                 self.services = AppServices(
-                    load_config=lambda: {},
+                    load_config=dict,
                     save_config=lambda cfg: True,
                     queues=mock.Mock(),
                     log_stream=service_log,
@@ -8169,6 +8636,19 @@ class BridgeEventBusTests(unittest.TestCase):
 
 
 class QueueStateTests(unittest.TestCase):
+    def test_queue_payload_omits_legacy_write_only_order(self) -> None:
+        q = queues.QueueState()
+        try:
+            q.sync = [{"name": "Channel", "url": "https://example.test/c"}]
+            q.gpu = [{"path": "video.mp4"}]
+
+            with q._lock:
+                payload = q._build_save_payload_locked()
+
+            self.assertNotIn("order", payload)
+        finally:
+            q.mark_orphan()
+
     def test_gpu_snapshot_is_isolated_from_persisted_queue(self) -> None:
         q = queues.QueueState()
         q.gpu = [{"path": "video.mp4", "nested": {"value": 1}}]
@@ -8232,14 +8712,14 @@ class QueueStateTests(unittest.TestCase):
         q = queues.QueueState()
         try:
             q.current_sync = {
-                "name": "The Rest Is Science",
+                "name": "Example Channel",
                 "_status_label": "Metadata finalizing",
             }
 
             row = q.to_ui_payload()["sync"][0]
 
             self.assertEqual(
-                row["name"], "Metadata finalizing \u2014 The Rest Is Science")
+                row["name"], "Metadata finalizing \u2014 Example Channel")
             self.assertEqual(row["status"], "running")
         finally:
             q.mark_orphan()
@@ -8519,9 +8999,9 @@ class DiskWatchTests(unittest.TestCase):
         stream = mock.Mock()
         on_resume = mock.Mock()
         monitor = disk_watch.DiskErrorMonitor(
-            stream, mock.Mock(), on_resume, lambda: "Z:\\Archive")
+            stream, mock.Mock(), on_resume, lambda: "X:\\Archive")
         monitor._active = True
-        monitor._path = "Z:\\Archive"
+        monitor._path = "X:\\Archive"
         barrier = threading.Barrier(2)
 
         def check(_path):
@@ -8628,26 +9108,6 @@ class SyncMixinQueueTests(unittest.TestCase):
 
 
 class IndexGraphShapeTests(unittest.TestCase):
-    def test_graph_word_frequency_multi_merges_labels_stably(self) -> None:
-        fake = {
-            "alpha": {"labels": ["2026-01", "2026-03"], "values": [2, 5]},
-            "beta": {"labels": ["2026-02", "2026-03"], "values": [7, 11]},
-        }
-
-        def _fake_graph(word: str, channel=None, bucket: str = "month"):
-            return fake[word]
-
-        with mock.patch.object(index_graph, "graph_word_frequency",
-                               side_effect=_fake_graph):
-            out = index_graph.graph_word_frequency_multi(
-                ["alpha", "beta"], channel="Any", bucket="month")
-
-        self.assertEqual(out["labels"], ["2026-01", "2026-02", "2026-03"])
-        self.assertEqual(out["series"][0],
-                         {"word": "alpha", "values": [2, 0, 5]})
-        self.assertEqual(out["series"][1],
-                         {"word": "beta", "values": [0, 7, 11]})
-
     def test_graph_multi_hoists_week_backfill_pending_count(self) -> None:
         fake_conn = object()
 
@@ -9295,7 +9755,7 @@ class IndexIngestTests(unittest.TestCase):
                 real_scandir = os.scandir
                 def guarded_scandir(path):
                     if os.path.normcase(os.fspath(path)) == os.path.normcase(str(blocked)):
-                        raise PermissionError("simulated DrivePool read failure")
+                        raise PermissionError("simulated archive read failure")
                     return real_scandir(path)
 
                 with mock.patch("backend.index_maintenance.os.scandir",
@@ -9316,7 +9776,7 @@ class IndexIngestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "transcription_index.db"
             missing_video = (
-                r"Z:\Archive\Huge Channel\2026\06 June"
+                r"X:\Archive\Large Channel\2026\06 June"
                 r"\Huge Video [abc123_def4].mp4"
             )
 
@@ -9945,6 +10405,38 @@ class IndexMaintenanceTests(unittest.TestCase):
                 self.assertEqual(result["missing"], 1)
                 self.assertEqual(result["videos_removed"], 1)
 
+    def test_prune_missing_videos_aborts_suspicious_mass_prune(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db_path = Path(td) / "transcription_index.db"
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                IndexIngestTests._reset_index_module()
+                conn = index._open()
+                self.assertIsNotNone(conn)
+                assert conn is not None
+                rows = [
+                    (str(Path(td) / f"missing-{i}.mp4"), f"Missing {i}",
+                     "Channel", f"vid{i:08d}"[-11:], 123)
+                    for i in range(60)
+                ]
+                conn.executemany(
+                    "INSERT INTO videos("
+                    "filepath, title, channel, video_id, size_bytes"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    rows,
+                )
+                conn.commit()
+
+                with mock.patch.object(index_maintenance.os.path, "isfile",
+                                       return_value=False):
+                    result = index_maintenance.prune_missing_videos()
+
+                self.assertEqual(result["aborted_suspicious"], 60)
+                self.assertEqual(result["videos_removed"], 0)
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0],
+                    60,
+                )
+
 
 class BookmarkStorageTests(unittest.TestCase):
     def tearDown(self) -> None:
@@ -10055,9 +10547,8 @@ class NoSpeechStatusTests(unittest.TestCase):
             db_path = Path(td) / "transcription_index.db"
             chan_dir = Path(td) / "Chan"
             chan_dir.mkdir(parents=True)
-            # Real YouTube ids are 11 chars; the id extractor rejects
-            # shorter/alpha-only hints, so use valid 11-char ids (also
-            # embedded in the filename as a belt-and-suspenders).
+            # Real YouTube ids are 11 chars; use valid ids embedded in the
+            # filename as a belt-and-suspenders identity source.
             ids = {"trans": "vTrans00001", "silent": "vSilent0001",
                    "pending": "vPend000001"}
             paths = {}
@@ -10100,6 +10591,70 @@ class NoSpeechStatusTests(unittest.TestCase):
                 # fully-checked archive with a silent video reads below 100%.
                 stats = archive_scan.index_db_stats()
                 self.assertEqual(stats["total_videos"], 3)
+                self.assertEqual(stats["transcribed_videos"], 1)
+                IndexIngestTests._reset_index_module()
+
+    def test_title_only_status_lookup_is_scoped_to_channel(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db_path = Path(td) / "transcription_index.db"
+            first = Path(td) / "first.mp4"
+            second = Path(td) / "second.mp4"
+            first.write_bytes(b"v")
+            second.write_bytes(b"v")
+
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path):
+                IndexIngestTests._reset_index_module()
+                self.assertTrue(index.register_video(
+                    str(first), "First Channel", "Shared Title",
+                    video_id="first000001"))
+                self.assertTrue(index.register_video(
+                    str(second), "Second Channel", "Shared Title",
+                    video_id="second00001"))
+                self.assertTrue(index.mark_video_no_speech(str(second)))
+
+                self.assertNotEqual(
+                    index.video_tx_status(
+                        title="Shared Title", channel="First Channel"),
+                    "no_speech",
+                )
+                self.assertEqual(
+                    index.video_tx_status(
+                        title="Shared Title", channel="Second Channel"),
+                    "no_speech",
+                )
+                IndexIngestTests._reset_index_module()
+
+    def test_archive_stats_exclude_hidden_duplicate_and_partial_rows(self) -> None:
+        from backend import archive_scan
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db_path = Path(td) / "transcription_index.db"
+            with mock.patch.object(index, "TRANSCRIPTION_DB", db_path), \
+                    mock.patch.object(ytarchiver_config, "TRANSCRIPTION_DB",
+                                      db_path):
+                IndexIngestTests._reset_index_module()
+                conn = index._open()
+                self.assertIsNotNone(conn)
+                assert conn is not None
+                conn.executemany(
+                    "INSERT INTO videos("
+                    "filepath, title, channel, video_id, tx_status, "
+                    "is_duplicate_of, availability"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (str(Path(td) / "visible.mp4"), "Visible", "Channel",
+                         "visible0001", "transcribed", None, "available"),
+                        (str(Path(td) / "duplicate.mp4"), "Duplicate", "Channel",
+                         "dupe0000001", "transcribed", "visible.mp4", "available"),
+                        (str(Path(td) / "partial.mp4"), "Partial", "Channel",
+                         "part0000001", "transcribed", None, "partial"),
+                    ],
+                )
+                conn.commit()
+
+                stats = archive_scan.index_db_stats()
+
+                self.assertEqual(stats["total_videos"], 1)
                 self.assertEqual(stats["transcribed_videos"], 1)
                 IndexIngestTests._reset_index_module()
 

@@ -269,6 +269,9 @@
         document.getElementById("settings-whisper-model").value = s.whisper_model || "small";
         document.getElementById("settings-default-res").value = s.default_resolution || "720";
         document.getElementById("settings-log-mode").value = s.log_mode || "Simple";
+        const legacySubsEl = document.getElementById("settings-legacy-subs-tab");
+        if (legacySubsEl) legacySubsEl.checked = !!s.legacy_subs_tab;
+        window._applyLegacySubsMode?.(!!s.legacy_subs_tab);
         if (ytdlpChannelSel) {
           ytdlpChannelSel.value =
             ["stable", "nightly"].includes(s.ytdlp_channel) ? s.ytdlp_channel : "stable";
@@ -379,6 +382,17 @@
       ?.addEventListener("change", (e) => saveField("default_resolution", e.target.value));
     document.getElementById("settings-log-mode")
       ?.addEventListener("change", (e) => saveField("log_mode", e.target.value));
+    document.getElementById("settings-legacy-subs-tab")
+      ?.addEventListener("change", async (e) => {
+        const enabled = !!e.target.checked;
+        if (window._setDenseSubsPreference) {
+          const saved = await window._setDenseSubsPreference(enabled);
+          if (!saved) e.target.checked = !enabled;
+          return;
+        }
+        window._applyLegacySubsMode?.(enabled);
+        saveField("legacy_subs_tab", enabled);
+      });
     document.getElementById("settings-close-behavior")
       ?.addEventListener("change", (e) => saveField("close_behavior", e.target.value));
     document.getElementById("settings-auto-backup")
@@ -786,9 +800,8 @@
           return;
         }
         const names = channels.map(c => c.name || c.folder || "").filter(Boolean);
-        // UI audit #1: replaced native window.prompt/confirm with
-        // the styled askTextInput + askQuestion modals so this flow
-        // doesn't jarringly fall back to the OS dialog look.
+        // Use styled askTextInput + askQuestion modals so this flow
+        // stays visually consistent with the rest of the app.
         const head = "Clears: initialized, sync_complete, init_complete, "
           + "batch_resume_index, init_batch_after, last_sync.\n"
           + "The next sync will bootstrap the channel from scratch.\n\n"

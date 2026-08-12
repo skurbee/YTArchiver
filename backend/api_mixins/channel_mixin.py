@@ -8,20 +8,15 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-import json
 import os
-import re
-import subprocess
 import sys
 import threading
-import time
 
-from ._shared import _log, ALLOWED_REDOWNLOAD_RESOLUTIONS
-from backend.ytarchiver_config import load_config, save_config
-from backend import archive_scan
-from backend import subs as subs_backend
 from backend import reorg as reorg_backend
-from backend.queues import QueueState
+from backend import subs as subs_backend
+from backend.ytarchiver_config import load_config
+
+from ._shared import ALLOWED_REDOWNLOAD_RESOLUTIONS, _log
 
 
 class ChannelMixin:

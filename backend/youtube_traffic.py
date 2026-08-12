@@ -246,12 +246,9 @@ def is_youtube_url(value: Any) -> bool:
     except Exception:
         return False
     return (
-        host == "youtu.be"
-        or host.endswith(".youtu.be")
-        or host == "youtube.com"
-        or host.endswith(".youtube.com")
-        or host == "youtube-nocookie.com"
-        or host.endswith(".youtube-nocookie.com")
+        host in {"youtu.be", "youtube.com", "youtube-nocookie.com"}
+        or host.endswith((
+            ".youtu.be", ".youtube.com", ".youtube-nocookie.com"))
     )
 
 

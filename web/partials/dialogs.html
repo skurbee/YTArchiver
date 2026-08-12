@@ -34,8 +34,8 @@
             <option value="1440">1440p</option>
             <option value="2160">2160p</option>
           </select>
-          <!-- Re-run action gets the primary (green) treatment so the
-               "do something" affordance is visually obvious (UI audit). -->
+           <!-- Re-run action gets the primary (green) treatment so the
+                primary action is visually obvious. -->
           <button class="btn btn-primary btn-thin" id="compress-dry-recalc">Recompute</button>
         </div>
         <div id="compress-dry-body" class="askq-scroll-body">
@@ -268,5 +268,25 @@
         <button class="btn btn-ghost" id="autorun-history-export">Export CSV</button>
       </div>
     </div>
+  </div>
+
+  <!-- Shared channel editor. In the default Browse-first experience the
+       existing add/edit form is mounted here as a modern dialog. Enabling
+       Settings > Appearance > legacy Subs moves that exact same form back
+       into #legacy-channel-editor-home, so both paths always stay in sync. -->
+  <div class="askq-backdrop channel-editor-backdrop" id="channel-editor-backdrop" hidden>
+    <section class="channel-editor-dialog" role="dialog" aria-modal="true"
+             aria-labelledby="channel-editor-title" aria-describedby="channel-editor-subtitle">
+      <header class="channel-editor-header">
+        <div class="channel-editor-heading">
+          <span class="channel-editor-eyebrow">CHANNEL MANAGEMENT</span>
+          <h2 id="channel-editor-title">Add channel</h2>
+          <p id="channel-editor-subtitle">Choose what to archive now and how future downloads should be handled.</p>
+        </div>
+        <button class="channel-editor-close" id="channel-editor-close" type="button"
+                title="Close" aria-label="Close channel editor">&times;</button>
+      </header>
+      <div class="channel-editor-body" id="channel-editor-mount"></div>
+    </section>
   </div>
 

@@ -28,7 +28,7 @@ select = ["E", "W", "F", "I", "B", "UP", "C4", "PIE"]
 # Allow long lines in comments + docstrings — the patch-history comments
 # scattered through the codebase aren't worth a reflow pass.
 ignore = [
-    "E501",   # line-too-long: project has many wide docstrings + URLs
+    "E501",   # line-too-long: operational rationale and URLs are preserved
     "E731",   # lambda-assignment: we use lambdas as ad-hoc helpers
     "E741",   # ambiguous-variable-name (l, I, O): legacy code uses these
     "E402",   # module-import-not-at-top: deliberate lazy/conditional imports

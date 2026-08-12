@@ -1,10 +1,9 @@
 """
 sync.sync_helpers — small per-file / formatting helpers used by sync_channel.
 
-Extracted from sync/core.py (Patch 14, v71.6). Pure helpers with no
-mutable state — safe to import anywhere without circular concerns.
+Pure helpers with no mutable state, safe to import without circular concerns.
 
-Public surface (re-exported via sync/__init__.py for back-compat):
+Public surface (re-exported through the sync package):
     _hide_sidecar_win(video_path)
     _sweep_orphan_vtts(channel_folder) -> int
     _scan_recent_video(channel_dir) -> str | None

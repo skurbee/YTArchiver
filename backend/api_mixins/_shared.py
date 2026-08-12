@@ -57,9 +57,10 @@ from backend import subs as subs_backend  # noqa: F401
 from backend import sync as sync_backend  # noqa: F401
 from backend import window_state as winstate  # noqa: F401
 
-# The logger that Patch 3 wired up. Method bodies emit `_log.debug(...)`
+# Shared logger used by mixin methods for diagnostic output.
 # to surface previously-silent exception swallows.
-from backend.log import get_logger as _get_logger, swallow  # noqa: F401
+from backend.log import get_logger as _get_logger  # noqa: F401
+from backend.log import swallow
 from backend.log_stream import LogStreamer  # noqa: F401
 from backend.queues import QueueState  # noqa: F401
 from backend.transcribe import TranscribeManager  # noqa: F401

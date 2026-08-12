@@ -8,16 +8,15 @@ fallback state.
 """
 from __future__ import annotations
 
-import ctypes
 import os
-import subprocess
 import sys
 import threading
 import time
 
-from ._shared import _log, webview, normalize_dialog_paths
-from backend.ytarchiver_config import load_config, save_config
 from backend import window_state as winstate
+from backend.ytarchiver_config import load_config, save_config
+
+from ._shared import _log, normalize_dialog_paths
 
 
 class WindowMixin:
@@ -162,9 +161,9 @@ class WindowMixin:
             # path skipped it entirely: TerminateProcess does NOT kill
             # children on Windows, so in-flight yt-dlp/ffmpeg kept
             # writing to the archive headless and the whisper worker
-            # lingered holding VRAM — and the queue save was capped at
-            # a 200ms join that a waking DrivePool routinely blew
-            # through, abandoning the write mid-flight.
+            # lingered holding VRAM. The queue save also used a 200ms join;
+            # a waking pooled filesystem could exceed that timeout and leave
+            # the write unfinished.
             _cb = getattr(self, "_shutdown_cleanup_fn", None)
             if callable(_cb):
                 try:

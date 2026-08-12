@@ -10,17 +10,15 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import threading
 import time
 
+from backend import archive_scan as archive_scan_backend
+from backend import index as index_backend
+from backend import reorg as reorg_backend
+from backend import subs as subs_backend
 from backend.log import swallow
 from backend.ytarchiver_config import load_config
-from backend import subs as subs_backend
-from backend import index as index_backend
-from backend import archive_scan as archive_scan_backend
-from backend import reorg as reorg_backend
-from backend.transcribe import TranscribeManager
 
 
 class MediaOpsMixin:
@@ -163,6 +161,14 @@ class MediaOpsMixin:
                     _failure = "No output_dir configured."
                     self._log_stream.emit_error(_failure)
                     return
+                if not os.path.isdir(output_dir):
+                    _failure = (
+                        "Archive folder is not reachable right now "
+                        "(drive offline?). Rescan cancelled — nothing "
+                        "was changed."
+                    )
+                    self._log_stream.emit_error(_failure)
+                    return
                 channels = cfg.get("channels", [])
                 _channel_total = len(channels)
                 # One unit for prune, then one per channel for sweep and size
@@ -183,7 +189,13 @@ class MediaOpsMixin:
                     "simpleline_blue")
                 self._log_stream.flush()
                 pruned = index_backend.prune_missing_videos()
-                if (pruned.get("videos_removed") or pruned.get("duplicate_id")
+                if pruned.get("aborted_suspicious"):
+                    self._log_stream.emit_error(
+                        "Prune skipped: "
+                        f"{pruned['aborted_suspicious']} files were "
+                        "unreachable — check the archive drive, then rescan."
+                    )
+                elif (pruned.get("videos_removed") or pruned.get("duplicate_id")
                         or pruned.get("fake_id_cleared")):
                     _parts = []
                     if pruned.get("missing"):

@@ -15,8 +15,7 @@ import time
 
 from backend import subs as subs_backend
 from backend import sync as sync_backend
-from backend import youtube_session
-from backend import youtube_traffic
+from backend import youtube_session, youtube_traffic
 from backend.log import swallow
 from backend.ytarchiver_config import ARCHIVE_FILE, load_config
 

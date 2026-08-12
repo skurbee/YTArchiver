@@ -15,12 +15,12 @@ import os
 import subprocess
 import time
 import urllib.request
-from urllib.parse import urlparse
 from typing import Any
+from urllib.parse import urlparse
 
+from . import youtube_traffic
 from .log import get_logger
 from .sync import _find_cookie_source, find_yt_dlp
-from . import youtube_traffic
 from .utils import hide_file_win
 
 _CHANNEL_ART_REFRESH_DAYS = 30 # YTArchiver refreshes monthly

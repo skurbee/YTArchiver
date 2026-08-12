@@ -309,7 +309,7 @@
     const _capModeKey = "ytarchiver_caption_mode";
     const _CAP_SIZES = new Set(["off", "small", "medium", "large"]);
     const _CAP_BGS   = new Set(["translucent", "outline", "none"]);
-    const _CAP_MODES = new Set(["single", "phrase3"]);
+    const _CAP_MODES = new Set(["single", "phrase3", "default"]);
     function _applyCapSize(size) {
       const v = _CAP_SIZES.has(size) ? size : "off";
       window.setCaptionPref?.("size", v);

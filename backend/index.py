@@ -307,7 +307,7 @@ def _open() -> sqlite3.Connection | None:
             TRANSCRIPTION_DB.parent.mkdir(parents=True, exist_ok=True)
             _conn = sqlite3.connect(str(TRANSCRIPTION_DB), check_same_thread=False, timeout=30.0)
             # Check the PRAGMA result — on some filesystems (network
-            # shares without shared-memory support, certain DrivePool
+            # shares without shared-memory support and some pooled-filesystem
             # configs) WAL silently falls back to "delete" mode, and
             # downstream code that assumes WAL semantics
             # (readers-don't-block-writers) would block the entire UI
@@ -401,7 +401,7 @@ def _open() -> sqlite3.Connection | None:
             # run — "OLD would skip videos that didn't have the
             # information we needed or that failed every single fetch
             # we tried. It was working great."
-            # Patch 6 (2026-05-17): schema versioning via PRAGMA user_version.
+            # Schema migrations are tracked with PRAGMA user_version.
             # The legacy ALTER-TABLE-then-ignore-OperationalError pattern below
             # has worked but offers no path forward for non-idempotent
             # migrations (column renames, constraint changes, data backfills).
@@ -436,7 +436,7 @@ def _open() -> sqlite3.Connection | None:
                 # YTArchiver re-downloaded under the new title),
                 # both files sit on disk and both get indexed as
                 # separate rows. Rather than silently delete (can't
-                # touch Z:\) we mark the smaller / older copy as a
+                # touch the archive drive) we mark the smaller / older copy as a
                 # duplicate of the primary row's filepath, and the
                 # Browse grid query filters these out so the grid
                 # shows exactly what YouTube shows.
@@ -494,7 +494,7 @@ def _open() -> sqlite3.Connection | None:
                 # Availability is catalog state, not a filesystem operation.
                 # NULL is treated as available for legacy rows; new writes set
                 # an explicit value. Partial artifacts are quarantined here so
-                # Browse can hide them without stat'ing 100k files on Z:\\.
+                # Browse can hide them without stat'ing the entire archive.
                 "ALTER TABLE videos ADD COLUMN availability TEXT DEFAULT 'available'",
             ):
                 try:
@@ -582,7 +582,7 @@ def _open() -> sqlite3.Connection | None:
                     raise
             # Quarantine legacy partial rows using filename-only evidence.
             # This is deliberately a DB-only migration: it never deletes or
-            # even stats anything on Z:\\. Future partials are rejected by
+            # even stats anything on the archive drive. Future partials are rejected by
             # register_video() before they can enter the catalog.
             try:
                 _conn.execute(
@@ -638,7 +638,7 @@ def _parse_year_month_from_path(filepath: str) -> tuple[int | None, int | None]:
     """Best-effort year/month from a path like .../<channel>/<year>/<Month>/<file>.
 
     walk parts TAIL-FIRST so the innermost year/month wins.
-    Deep archive paths like `Z:\\Archive\\2024\\Channels\\SomeCh\\2020\\
+    Deep archive paths like `X:\\Archive\\2024\\Channels\\SomeCh\\2020\\
     March\\file.mp4` used to set year=2024 (from archive root), then
     overwrite to 2020 (correct) — but a base path containing a 4-digit
     year-like number mid-path could silently clobber the real channel
@@ -690,7 +690,7 @@ def _parse_year_month_from_path(filepath: str) -> tuple[int | None, int | None]:
 # contains the real `id` AND the actual output filename it used (`_filename`).
 # The old recovery matched the sidecar to the video by *filename stem*, which
 # breaks whenever yt-dlp sanitized/trimmed the .mp4 and the .info.json names
-# differently (titles with punctuation — SNL etc.). This resolves the id by
+# differently (especially titles with punctuation). This resolves the id by
 # reading the JSON *content* instead: match on the recorded output filename,
 # falling back to a normalized-title match. The id is always inside the JSON,
 # so it's recoverable regardless of what the sidecar file is named.
@@ -925,8 +925,8 @@ def register_video(filepath: str, channel: str, title: str | None = None,
     vid_url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None
     year, month = _parse_year_month_from_path(fp)
     # Single os.stat() call rather than separate isfile + getsize +
-    # getmtime. The triple-call version had a TOCTOU window where Z:\
-    # DrivePool could relocate the file between isfile and getsize,
+    # getmtime. The triple-call version had a TOCTOU window where a pooled
+    # filesystem could relocate the file between isfile and getsize,
     # giving size=0 / upload_ts=None for a file that DID exist — later
     # prune passes would then misclassify the row as zero_byte and
     # flag it for deletion. Single stat captures a consistent snapshot.
@@ -1924,8 +1924,8 @@ class _LowPriorityInterrupted(Exception):
 
 # ── Foreground-browse guard ────────────────────────────────────────────
 # The startup sweep and cold Browse views both walk the (slow, ~16 MB/s)
-# Z: DrivePool to resolve thumbnails. Before this guard there was NO signal
-# telling startup work that the USER is actively loading a Browse view, so a
+# archive filesystem to resolve thumbnails. Before this guard there was no
+# signal telling startup work that the user is actively loading a Browse view, so a
 # cold "Videos" open could run head-to-head with background indexing. The fix:
 # the API entry points that serve the Browse tab
 # (list_all_videos, list_videos_for_channel) bump this counter for the
@@ -2205,7 +2205,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
             _walk_failed = True
             _log.debug("swallowed: %s", e)
         # Don't cache an EMPTY result that came from an exception path
-        # (transient Z:\ DrivePool hiccup, etc.) — caching the empty
+        # (for example, a transient archive-drive hiccup) — caching the empty
         # entries dict permanently zeros metadata for that folder for
         # the rest of the process lifetime. View_counts all show 0,
         # Most Viewed sort breaks. Cache only on clean success or
@@ -2238,21 +2238,10 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     # Channel-wide thumbnail index. `find_thumbnail` walks UP the path
     # at most 3 levels — it does NOT cross over to sibling year folders.
     # On channels where thumbnails ended up in a different year's
-    # `.Thumbnails/` than where the mp4 currently lives (e.g.
-    # The PrimeTime had most thumbs in 2025/.Thumbnails/ but the mp4s
-    # got re-foldered into 2023/ and 2024/), every Browse video tile
-    # rendered as the gradient placeholder. Pre-walk the channel root
-    # once, build vid → path, and use it for vid-keyed lookup. Falls
-    # back to find_thumbnail for the no-vid / stem-only path.
-    # Channel-wide thumbnail index. `find_thumbnail` walks UP the path
-    # at most 3 levels — it does NOT cross over to sibling year folders.
-    # On channels where thumbnails ended up in a different year's
-    # `.Thumbnails/` than where the mp4 currently lives (e.g.
-    # The PrimeTime had most thumbs in 2025/.Thumbnails/ but the mp4s
-    # got re-foldered into 2023/ and 2024/), every Browse video tile
-    # rendered as the gradient placeholder. Pre-walk the channel root
-    # once, build vid → path, and use it for vid-keyed lookup. Falls
-    # back to find_thumbnail for the no-vid / stem-only path.
+    # `.Thumbnails/` than the video, every Browse tile rendered as the
+    # gradient placeholder. Pre-walk the channel root once, build a
+    # video-id → path map, and use it for keyed lookup. Fall back to
+    # find_thumbnail for no-id and stem-only paths.
     _thumb_by_vid: dict[str, str] = {}
     if include_thumbs and out:
         _root_votes: dict[str, int] = {}
@@ -3579,7 +3568,8 @@ def find_archived_by_video_id(video_id: str) -> dict | None:
 
 
 def video_tx_status(video_id: str | None = None,
-                    title: str | None = None) -> str:
+                    title: str | None = None,
+                    channel: str | None = None) -> str:
     """Return the tx_status for a single video, or "" if unknown.
 
     Values: 'transcribed' | 'pending' | 'no_speech' | 'no_captions' |
@@ -3605,9 +3595,15 @@ def video_tx_status(video_id: str | None = None,
                 if row:
                     return row[0] or ""
             if title:
-                row = conn.execute(
-                    "SELECT tx_status FROM videos WHERE title=? LIMIT 1",
-                    (title,)).fetchone()
+                if channel:
+                    row = conn.execute(
+                        "SELECT tx_status FROM videos "
+                        "WHERE title=? AND channel=? COLLATE NOCASE LIMIT 1",
+                        (title, channel)).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT tx_status FROM videos WHERE title=? LIMIT 1",
+                        (title,)).fetchone()
                 if row:
                     return row[0] or ""
     except sqlite3.Error as e:
@@ -3928,17 +3924,14 @@ def get_segment_context(segment_id: int, before: int = 30,
         return {"ok": False, "error": str(e)}
 
 
-# Patch 17 (v71.9): search functions extracted to index_search.py.
-# Re-imported here so existing callers (api_mixins.browse_mixin, etc.)
-# continue to resolve the names against the index module's namespace.
-# Patch 17 (v71.9): graph functions extracted to index_graph.py.
+# Search and graph functions live in focused submodules. Re-import them here
+# so existing callers continue to resolve names from the index namespace.
 from .index_graph import (  # noqa: F401
     backfill_upload_ts,
     bucket_totals,
     graph_channel_overlay,
     graph_multi,
     graph_word_frequency,
-    graph_word_frequency_multi,
     list_all_channels_in_db,
     top_words,
 )
@@ -3982,7 +3975,8 @@ def summary() -> dict[str, Any]:
 
 
 
-# Patch 20 (v72.2): bookmarks + sweep/prune/rebuild extracted.
+# Bookmark and maintenance operations live in focused submodules and remain
+# available through the established backend.index API.
 from .index_bookmarks import (  # noqa: F401
     bookmark_add,
     bookmark_list,
@@ -3991,7 +3985,7 @@ from .index_bookmarks import (  # noqa: F401
 )
 from .index_maintenance import (  # noqa: F401
     prune_missing_videos,
-    refresh_channel_file_sizes,
     rebuild_fts_index,
+    refresh_channel_file_sizes,
     sweep_new_videos,
 )

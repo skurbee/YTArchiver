@@ -635,7 +635,7 @@ def compress_video(input_path: str, stream: LogStreamer,
 
             # Post-replace verification — the original is now GONE (os.replace
             # already overwrote it atomically at the directory-entry level).
-            # On a StableBit DrivePool boundary or other rare backend write
+            # On a pooled-filesystem boundary or other rare backend write
             # failure, the rename can succeed while the underlying inode is
             # corrupt or zero-length. Re-stat input_path immediately and bail
             # LOUDLY if size doesn't match what we just wrote — the user

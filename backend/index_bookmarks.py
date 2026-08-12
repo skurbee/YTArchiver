@@ -1,7 +1,7 @@
 """
 index_bookmarks — bookmark CRUD over the SQLite index.
 
-Extracted from backend/index.py (Patch 20, v72.2). Four small ops:
+Focused bookmark operations extracted from backend/index.py:
 
     bookmark_add(video_id, title, channel, start_time, text, note="") -> int|None
     bookmark_list(limit=500) -> list[dict]

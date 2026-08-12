@@ -220,7 +220,18 @@ def handle_youtube_failure_text(text: str, *, context: str = "",
 
 
 def scan_log_line(text: str) -> None:
-    """LogStreamer scanner: final safety net for all YouTube operations."""
+    """LogStreamer scanner: final safety net for all YouTube operations.
+
+    Passive log scanning sees user-facing download titles as well as real
+    yt-dlp diagnostics. Require an error-shaped line here so a title such as
+    "Too Many Requests" cannot trip the persistent rate-limit circuit.
+    Direct stderr callers keep the full classifier sensitivity through
+    :func:`handle_youtube_failure_text`.
+    """
+    low = str(text or "").lower()
+    if ("error" not in low and "http" not in low
+            and "warning" not in low):
+        return
     handle_youtube_failure_text(text)
 
 

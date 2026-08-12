@@ -2,12 +2,10 @@
 Thumbnails — fetch + on-disk layout for the per-channel `.Thumbnails/`
 sidecar folders.
 
-Extracted from `metadata.py` in Patch 6 (2026-05-17) so the thumbnail
-download + atomic-write + status-cache code lives in one focused module
-instead of being scattered across the 4400-line metadata file.
+Thumbnail download, atomic-write, and status-cache behavior lives here rather
+than being scattered across metadata orchestration.
 
-Public API (used by metadata.py — internal underscore-prefixed names
-preserved so existing call sites work via re-export):
+Public API (internal underscore-prefixed names are preserved via re-export):
 
     _ensure_thumbnails_dir(subfolder) -> str
         Create + hide `.Thumbnails/` under subfolder.

@@ -172,11 +172,20 @@
 
         <label class="subs-section-label">Appearance</label>
         <div class="edit-grid">
-          <label class="edit-gl">Subs table</label>
-          <div class="edit-gv-stack">
+          <label class="edit-gl">Dense Sub Tab</label>
+          <div class="edit-gv-stack settings-appearance-choice">
+            <label class="edit-gv-inline settings-checkbox-row">
+              <input type="checkbox" id="settings-legacy-subs-tab" />
+              <span>Show dense Subs tab</span>
+            </label>
+            <span class="settings-inline-note">Adds a dense-view &ldquo;Subs&rdquo; tab for easy channel editing.</span>
+          </div>
+
+          <label class="edit-gl" id="settings-subs-table-label" hidden>Legacy Subs table</label>
+          <div class="edit-gv-stack" id="settings-subs-table-options" hidden>
             <label class="edit-gv-inline settings-checkbox-row">
               <input type="checkbox" id="settings-show-avg-size" />
-              <span>Show Avg filesize in subs tab</span>
+              <span>Show Avg filesize in Subs tab</span>
             </label>
           </div>
 

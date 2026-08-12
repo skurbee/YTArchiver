@@ -133,8 +133,7 @@ def _title_id_map(jsonl_path: str) -> dict[str, set[str]]:
 def _upgrade_txt_file(txt_path: str, dry_run: bool) -> dict:
     """Upgrade one aggregated .txt's v1 headers in place (atomic).
     Returns {upgraded, ambiguous, unknown, changed}."""
-    from .transcribe.transcribe_files import (_HEADER_RE, _VIDEO_ID_RE,
-                                              txt_lock_for)
+    from .transcribe.transcribe_files import _HEADER_RE, _VIDEO_ID_RE, txt_lock_for
     from .utils import _file_has_hidden_attribute
     stats = {"upgraded": 0, "ambiguous": 0, "unknown": 0, "changed": False}
     ids_by_title = _title_id_map(_jsonl_for_txt(txt_path))

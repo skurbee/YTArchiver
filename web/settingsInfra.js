@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════════
    settingsInfra.js — Health sub-tab navigation + Archive Roots panel
 
-   Extracted from indexControls.js (Patch 15, v71.7).
+   Shared Settings navigation and infrastructure.
 
    Two related plumbing functions:
      • initSettingsSubTabs — wires the sub-navigation buttons

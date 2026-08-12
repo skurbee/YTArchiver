@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import threading
 
-from ._shared import _log, ALLOWED_REDOWNLOAD_RESOLUTIONS
 from backend.ytarchiver_config import load_config
-from backend import archive_scan
+
+from ._shared import ALLOWED_REDOWNLOAD_RESOLUTIONS, _log
 
 
 class RedownloadMixin:

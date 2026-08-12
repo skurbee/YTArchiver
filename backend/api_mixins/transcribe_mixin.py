@@ -7,15 +7,12 @@ private Api attributes kept as fallback state.
 """
 from __future__ import annotations
 
-import json
 import os
-import re
 import threading
-import time
-from pathlib import Path
 
-from ._shared import _api_err, _log, webview
 from backend.ytarchiver_config import load_config
+
+from ._shared import _api_err, _log
 
 _TRANSCRIBE_FOLDER_MAX_CANDIDATES = 500
 

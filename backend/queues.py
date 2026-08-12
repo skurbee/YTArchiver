@@ -10,7 +10,6 @@ Matches YTArchiver's ytarchiver_queue.json schema (YTArchiver.py:34016):
       "redownload": [dict, ...],
       "metadata": [dict, ...],
       "gpu": [dict, ...],
-      "order": [["kind", "id"], ...],
       "gpu_paused": false,
       "sync_paused": false
     }
@@ -41,15 +40,9 @@ class QueueState:
     def __init__(self):
         self._lock = threading.RLock()
         self.sync: list[dict[str, Any]] = []
-        # LOW FIX (audit 5.23 LOW-3): removed five vestigial sub-queue
-        # lists (reorg, video, transcribe, redownload, metadata). They
-        # were initialized, persisted, loaded, and counted, but no code
-        # outside this file ever appended to or popped from them.
-        # Redownload / transcribe / comments-refresh / etc. all ride
-        # `self.sync` with a `kind="..."` discriminator (see
-        # _task_label_sync). Verified by grep across the entire repo.
+        # Redownload, metadata, and other network tasks share this queue and
+        # use their `kind` field to select behavior.
         self.gpu: list[dict[str, Any]] = []
-        self.order: list[list] = [] # [[kind, id], ...]
         self.gpu_paused: bool = False
         self.sync_paused: bool = False
         # Pause is requested via set_*_paused(True), but the worker may
@@ -75,10 +68,6 @@ class QueueState:
         # Current in-flight items (not yet re-queued, but shown in popover)
         self.current_sync: dict[str, Any] | None = None
         self.current_gpu: dict[str, Any] | None = None
-        # LOW FIX (audit 5.23 LOW-3): current_redownload / current_metadata
-        # removed alongside their parent lists. No code assigned them, so
-        # save_now never populated the corresponding `resuming` keys and
-        # requeue_resuming's redownload/metadata branches were unreachable.
 
         # Sync-pass progress: when "Sync Subbed" runs, we don't enqueue 103
         # individual channel items into `self.sync` — we iterate them
@@ -166,8 +155,9 @@ class QueueState:
     # ── listener registration ───────────────────────────────────────
 
     def get_loaded_resuming(self) -> dict[str, Any]:
-        """Patch 1 (v66.5): items that were in-flight when the app
-        last shut down. Caller (main.py boot) reads after `load()` to
+        """Return items that were in flight when the app last shut down.
+
+        Startup reads this after `load()` to
         decide how to requeue them (typically: append to the tail of
         their respective queues with a "restored" tag). Returns a
         copy; safe to consume."""
@@ -216,12 +206,7 @@ class QueueState:
         return ok
 
     def add_listener(self, fn: Callable[[], None]):
-        # LOW FIX (audit 5.23 LOW-4): hold _lock around the listener-list
-        # mutation. Today listeners are only added once at startup so the
-        # race is theoretical, but the rest of QueueState's invariant is
-        # "any shared mutable state goes through _lock" — keep this site
-        # consistent so a future caller that registers a listener mid-run
-        # can't race the snapshot in _notify.
+        # Keep listener mutation under the same lock as notification snapshots.
         with self._lock:
             self._listeners.append(fn)
 
@@ -295,16 +280,6 @@ class QueueState:
             deduped.append(item)
         return deduped, changed
 
-    def _rebuild_order_locked(self) -> list[list[str]]:
-        order: list[list[str]] = []
-        for ch in self.sync:
-            order.append(["sync", str(ch.get("url") or "")])
-        for item in self.gpu:
-            ident = str(item.get("id") or item.get("path")
-                        or item.get("bulk_id") or "")
-            order.append(["gpu", ident])
-        return order
-
     def load(self) -> bool:
         """Load queue state from ytarchiver_queue.json. Returns True on success.
 
@@ -327,9 +302,12 @@ class QueueState:
             try:
                 bak = str(QUEUE_FILE) + ".bak"
                 os.replace(str(QUEUE_FILE), bak)
-            except OSError:
-                try: os.remove(str(QUEUE_FILE))
-                except OSError: pass
+            except OSError as backup_exc:
+                swallow("back up corrupt queue file", backup_exc)
+                try:
+                    os.remove(str(QUEUE_FILE))
+                except OSError as remove_exc:
+                    swallow("remove corrupt queue file", remove_exc)
             return False
         sidecar_exists, sidecar_resuming = self._load_resuming_sidecar()
         raw_sync = data.get("sync", [])
@@ -341,20 +319,10 @@ class QueueState:
             raw_gpu = []
         gpu_items = [g for g in raw_gpu if isinstance(g, dict)]
         gpu_normalized = len(gpu_items) != len(raw_gpu)
-        raw_order = data.get("order", [])
-        if not isinstance(raw_order, list):
-            raw_order = []
         with self._lock:
             self.sync = sync_items
-            # LOW FIX (audit 5.23 LOW-3): no longer load five dead lists
-            # (reorg / video / transcribe / redownload / metadata). If an
-            # old queue file on disk still has those keys, they're silently
-            # ignored. None of those kinds carried real items in practice
-            # — they all ride the sync queue with a `kind=` discriminator.
+            # Unknown keys from older queue schemas are intentionally ignored.
             self.gpu = gpu_items
-            self.order = (self._rebuild_order_locked()
-                          if sync_normalized or gpu_normalized
-                          else list(raw_order))
             self.gpu_paused = bool(data.get("gpu_paused", False))
             self.sync_paused = bool(data.get("sync_paused", False))
             # Mark a restored pause so the enqueue / sync-start paths may
@@ -384,9 +352,6 @@ class QueueState:
                 # twice (once as a resuming candidate AND again as a
                 # normal head item).
                 self._loaded_resuming = {}
-                # LOW FIX (audit 5.23 LOW-3): removed redownload / metadata
-                # from this loop — those attributes no longer exist and
-                # they never carried real items in practice anyway.
                 for key in ("sync", "gpu"):
                     lst = getattr(self, key, None)
                     if (lst and isinstance(lst, list)
@@ -414,8 +379,8 @@ class QueueState:
         except (OSError, json.JSONDecodeError, ValueError):
             try:
                 os.replace(str(sidecar), str(sidecar) + ".bak")
-            except OSError:
-                pass
+            except OSError as exc:
+                swallow("back up corrupt queue-resuming sidecar", exc)
             return False, {}
         resuming = data.get("resuming") if isinstance(data, dict) else None
         return True, dict(resuming) if isinstance(resuming, dict) else {}
@@ -432,7 +397,6 @@ class QueueState:
         payload: dict[str, Any] = {
             "sync": copy.deepcopy(self.sync),
             "gpu": copy.deepcopy(self.gpu),
-            "order": copy.deepcopy(self.order),
             "gpu_paused": self.gpu_paused,
             "sync_paused": self.sync_paused,
         }
@@ -588,7 +552,6 @@ class QueueState:
                         (c.get("kind") or "download").lower() == kind):
                     return False
             self.sync.append(copy.deepcopy(channel))
-            self.order.append(["sync", url])
         self._notify()
         self.save_debounced()
         return True
@@ -603,18 +566,6 @@ class QueueState:
             if not self.sync:
                 return None
             ch = self.sync.pop(0)
-            # remove only the FIRST matching order entry
-            # (not all of them). Same URL can legitimately have multiple
-            # sync jobs queued (e.g. a Download task and a separate
-            # Metadata-recheck task — `sync_enqueue` dedupes on
-            # (kind, url), not url alone). Wiping all order entries for
-            # that URL dropped the bookkeeping for the OTHER pending
-            # job, which then dispatched out of insertion order.
-            _u = ch.get("url")
-            for _i, _o in enumerate(self.order):
-                if _o and _o[0] == "sync" and _o[1] == _u:
-                    self.order.pop(_i)
-                    break
         self._notify()
         self.save_debounced()
         return ch
@@ -641,11 +592,6 @@ class QueueState:
             if target_idx < 0:
                 return False
             del self.sync[target_idx]
-            # Drop ONE matching order entry (same first-match rule).
-            for j, o in enumerate(self.order):
-                if o and o[0] == "sync" and o[1] == url:
-                    del self.order[j]
-                    break
         self._notify()
         self.save_debounced()
         return True
@@ -682,15 +628,7 @@ class QueueState:
                     )
                     if target_idx < 0:
                         return False
-            item = self.sync[target_idx]
-            removed_url = (item.get("url") or "").strip()
             del self.sync[target_idx]
-            # Drop the matching order entry (first one with this URL).
-            if removed_url:
-                for j, o in enumerate(self.order):
-                    if o and o[0] == "sync" and o[1] == removed_url:
-                        del self.order[j]
-                        break
         self._notify()
         self.save_debounced()
         return True
@@ -712,13 +650,7 @@ class QueueState:
                     break
             if target_idx < 0:
                 return False
-            removed_url = (self.sync[target_idx].get("url") or "").strip()
             del self.sync[target_idx]
-            if removed_url:
-                for j, o in enumerate(self.order):
-                    if o and o[0] == "sync" and o[1] == removed_url:
-                        del self.order[j]
-                        break
         self._notify()
         self.save_debounced()
         return True
@@ -731,7 +663,6 @@ class QueueState:
         `_lock`, racing with concurrent `sync_pop` / `sync_remove` /
         `sync_enqueue` callers (audit: sync/sync_all.py C7).
         """
-        url = channel.get("url", "")
         key = self._sync_identity_key(channel)
         with self._lock:
             if key is not None:
@@ -739,7 +670,6 @@ class QueueState:
                     if self._sync_identity_key(existing) == key:
                         return False
             self.sync.insert(0, copy.deepcopy(channel))
-            self.order.insert(0, ["sync", url])
         self._notify()
         self.save_debounced()
         return True
@@ -750,7 +680,6 @@ class QueueState:
         with self._lock:
             removed = len(self.sync)
             self.sync = []
-            self.order = [o for o in self.order if not (o and o[0] == "sync")]
         if removed:
             self._notify()
             self.save_now()
@@ -761,7 +690,6 @@ class QueueState:
         with self._lock:
             removed = len(self.gpu)
             self.gpu = []
-            self.order = [o for o in self.order if not (o and o[0] == "gpu")]
         if removed:
             self._notify()
             self.save_now()
@@ -1235,11 +1163,7 @@ class QueueState:
     # ── stats ───────────────────────────────────────────────────────
 
     def counts(self) -> dict[str, int]:
-        # LOW FIX (audit 5.23 LOW-3): trimmed redownload/metadata/reorg/
-        # transcribe/video keys. Those lists no longer exist (see __init__
-        # comment) and were always zero. No production caller reads this
-        # method today (grep showed zero hits) but keep sync + gpu around
-        # in case a future caller does.
+        """Return pending plus in-flight counts for both queue lanes."""
         with self._lock:
             return {
                 "sync": len(self.sync) + (1 if self.current_sync else 0),
@@ -1248,12 +1172,7 @@ class QueueState:
 
     # ── restore-on-launch helpers ───────────────────────────────────
     def has_sync_pipeline_items(self) -> bool:
-        """True if the sync queue has items.
-        Used after load() to decide whether to force-pause (Project rule: launching with items in queue must never auto-start).
-
-        LOW FIX (audit 5.23 LOW-3): used to OR-check five other queue
-        lists; those are gone now, so this collapses to just self.sync.
-        """
+        """Return whether startup restored pending sync-lane work."""
         with self._lock:
             return bool(self.sync)
 

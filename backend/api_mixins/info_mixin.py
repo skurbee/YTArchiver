@@ -9,15 +9,14 @@ fallback state.
 from __future__ import annotations
 
 import os
-from datetime import datetime
-
-import re
 import sys
 import threading
+from datetime import datetime
+
+from backend.version import APP_VERSION, APP_VERSION_DATE
+from backend.ytarchiver_config import CONFIG_FILE, config_is_writable, load_config, save_config
 
 from ._shared import _log
-from backend.ytarchiver_config import CONFIG_FILE, config_is_writable, load_config, save_config
-from backend.version import APP_VERSION, APP_VERSION_DATE
 
 
 def _format_last_sync_label(ts_str):

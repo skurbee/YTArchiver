@@ -1,8 +1,6 @@
 """
 transcribe.transcribe_vtt — YT auto-caption fetch + VTT parse.
 
-Patch 19 phase T2 (v68.9): extracted from transcribe/legacy.py.
-
 Functions:
     _fetch_captions_via_ytdlp(video_path, stream, fetched_paths_out)
         Probe yt-dlp for captions; write a temp .vtt next to the video.
@@ -15,7 +13,7 @@ Functions:
 
     _ts_to_sec(ts), _parse_vtt(path)
         Pure parsers — the second one is a full-fidelity port of the
-        original tkinter app's VTT-to-segments routine.
+        established VTT-to-segments routine.
 
 Already imported standalone by `repair_captions.py` (for _parse_vtt)
 and reused by transcribe's auto-caption fast path here.
@@ -30,10 +28,10 @@ import shutil
 import subprocess
 import time
 
+from .. import youtube_traffic
 from ..log import get_logger
 from ..log_stream import LogStreamer
 from ..subprocess_util import make_startupinfo as _make_startupinfo
-from .. import youtube_traffic
 from .paths import (
     _generate_distributed_words,
     _hide_per_video_transcript_txt_if_needed,
@@ -180,8 +178,7 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
                 err_text = ""
             if err_text:
                 try:
-                    from ..youtube_session import (
-                        handle_youtube_failure_text)
+                    from ..youtube_session import handle_youtube_failure_text
                     if handle_youtube_failure_text(
                             err_text,
                             context="fetching captions for transcription",

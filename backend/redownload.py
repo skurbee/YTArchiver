@@ -21,10 +21,10 @@ from collections.abc import Callable
 from functools import lru_cache
 from typing import Any
 
+from . import youtube_traffic
 from .log import get_logger
 from .log_stream import LogStreamer
 from .net import block_if_down
-from . import youtube_traffic
 from .sync import (
     _find_cookie_source,
     find_yt_dlp,
@@ -818,7 +818,7 @@ def _ffprobe_embedded_video_id(filepath: str,
 
 
 def _height_from_metadata_jsonl(filepath: str) -> int | None:
-    """Patch 20 (v67.8): read the video's height from the aggregated
+    """Read the video's height from the aggregated
     .Metadata.jsonl sidecar that already lives next to the file, instead
     of spawning ffprobe (~50-200 ms × N at the start of every redownload).
 
@@ -1895,8 +1895,8 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     # Subs size cache. This affects only DB/cache state; transcript and
     # metadata sidecars are untouched.
     try:
-        from . import index as _idx
         from . import archive_scan as _archive_scan
+        from . import index as _idx
         _size_refresh = _idx.refresh_channel_file_sizes(ch_name, folder)
         _archive_scan.update_disk_cache_for_channel(
             {"name": ch_name, "folder": os.path.basename(folder),

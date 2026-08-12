@@ -717,11 +717,7 @@
       const ch = _cphChannel;
       const name = ch && (ch.folder || ch.name || "");
       if (!name) return;
-      // The edit panel lives in the Subs tab. Switch there FIRST — otherwise
-      // _editChannelFromContext opens the panel on a hidden tab and it looks
-      // like nothing happened.
-      document.querySelector('.tab[data-tab="subs"]')?.click();
-      setTimeout(() => window._editChannelFromContext?.(name), 60);
+      window._editChannelFromBrowse?.(name);
     });
     document.getElementById("cph-folder")?.addEventListener("click", () => {
       const ch = _cphChannel;
@@ -950,6 +946,7 @@
         bridgeCall("get_index_db_stats").then((db) => {
           if (db && db.segments != null) {
             setText("stat-segments", Number(db.segments).toLocaleString());
+            setText("search-stat-segments", Number(db.segments).toLocaleString());
           } else {
             window.__segStatFetched = false;
           }

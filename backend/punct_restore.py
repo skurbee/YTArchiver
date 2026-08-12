@@ -244,10 +244,10 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
 
     # Prefer the process-singleton manager so we share VRAM with the
     # live transcribe worker. Two managers each load the CUDA model
-    # and can OOM low-VRAM GPUs (audit: H44).
+    # and can exhaust low-VRAM GPUs.
     # Track whether WE created this manager. The shared/singleton manager is
-    # also used by the live transcribe worker (one CUDA model, shared VRAM —
-    # audit H44); _stop()-ing it in our finally would kill the punctuation
+    # also used by the live transcribe worker (one CUDA model, shared VRAM);
+    # stopping it in our finally would kill the punctuation
     # subprocess out from under a concurrent sync/transcribe pass. Only a
     # privately-created fallback instance is ours to stop.
     _punct_mgr_private = False

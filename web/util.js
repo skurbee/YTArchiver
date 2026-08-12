@@ -1,13 +1,8 @@
 /**
  * web/util.js — pure utilities used by every other web module.
  *
- * Patch 11/12 (v67.7):
- *   - Single canonical escapeHtml — replaces 5 copies across app.js
- *     and logs.js.
- *   - Single canonical _formatTs — was on window._formatTs because
- *     logs.js needed it; now namespaced under YT.util.
- *   - onceIdempotent() — wraps the dataset-flag "already-wired" pattern
- *     that appeared 5+ times for event-handler setup.
+ * Canonical HTML escaping, timestamp formatting, idempotent event wiring,
+ * and subscription-channel normalization.
  *
  * Loading order: this file MUST be loaded BEFORE bridge.js, logs.js,
  * and app.js (see web/index.html script tags).
@@ -93,9 +88,7 @@
     loadSubsChannels,
   };
 
-  // Back-compat shims — logs.js + app.js modules still reach for these.
-  // Deleting these globals is staged for Patch 14/15 when those files
-  // are fully split and migrate to YT.util.*.
+  // Compatibility aliases for modules that still consume global helpers.
   window._escapeHtml = escapeHtml;
   window._formatTs = _formatTs;
 })();

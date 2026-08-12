@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 
-from ._shared import _log
-from backend.ytarchiver_config import load_config
 from backend import archive_scan
 from backend import index as index_backend
+from backend.ytarchiver_config import load_config
+
+from ._shared import _log
 
 
 class IndexMixin:

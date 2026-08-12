@@ -6,9 +6,9 @@ config writability, and sidecar cleanup rules stay consistent.
 
 from __future__ import annotations
 
-import os
 import glob
 import json
+import os
 import shutil
 from datetime import datetime
 from typing import Any

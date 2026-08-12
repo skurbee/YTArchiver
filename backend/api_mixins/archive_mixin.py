@@ -8,21 +8,17 @@ when moving them out of main.py.
 """
 from __future__ import annotations
 
-import json
 import os
 import re
-import subprocess
 import threading
-import time
-import urllib.request
 from datetime import datetime
-from typing import Any, Optional
 
-from ._shared import _log
-from backend.log import swallow
-from backend.ytarchiver_config import load_config
 from backend import sync as sync_backend
 from backend import youtube_traffic
+from backend.log import swallow
+from backend.ytarchiver_config import load_config
+
+from ._shared import _log
 
 # Module-level init lock — the bridge attribute (_archive_single_lock)
 # is created lazily on first call, and without an outer lock two near-
@@ -56,6 +52,7 @@ def _recent_scan_bind_is_corroborated(path: str, video_id: str,
     if not path:
         return False
     import re as _re
+
     from ..text_utils import normalize_title
     stem = os.path.splitext(os.path.basename(path))[0]
     stem_no_date = _re.sub(r"\s*\(\d{2}\.\d{2}\.\d{2}\)\s*$", "", stem)
@@ -169,7 +166,7 @@ def _bind_file_via_sidecar_id(base: str, video_id: str) -> str:
 # them out lets the highest-risk logic be exercised without a live yt-dlp run.
 
 
-def parse_dltrack(line: str) -> Optional[dict]:
+def parse_dltrack(line: str) -> dict | None:
     """Parse a ``DLTRACK:::...`` manifest line into its fields.
 
     Format: ``DLTRACK:::<title>:::<uploader>:::<upload_date>:::<filesize>:::
@@ -191,7 +188,7 @@ def parse_dltrack(line: str) -> Optional[dict]:
     }
 
 
-def dltrack_duration_seconds(fields: Optional[dict]) -> float | None:
+def dltrack_duration_seconds(fields: dict | None) -> float | None:
     """Return a trustworthy positive duration from a parsed DLTRACK row."""
     try:
         value = float((fields or {}).get("duration") or 0)

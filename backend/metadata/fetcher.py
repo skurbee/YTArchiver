@@ -1,13 +1,11 @@
 """
 metadata.fetcher — per-video yt-dlp metadata fetches.
 
-Patch 19 phase M3 (v69.4): extracted from metadata/legacy.py.
-
-Public surface (re-imported into legacy.py):
+Public surface (re-exported through the metadata package):
     _fetch_video_metadata(yt, video_id, title_hint)
         Single yt-dlp --dump-json call. Returns OLD-schema dict or None.
         Has the 3-attempt retry-with-backoff and the {"_timeout": True}
-        sentinel from Patch D.
+        timeout sentinel.
 
     fetch_single_video_metadata(channel, video_id, fp, title, stream, ...)
         Inline per-video fetch used by sync.py's DLTRACK handler right
@@ -35,6 +33,9 @@ from typing import Any
 
 from ..log import get_logger, swallow
 from ..log_stream import LogStreamer
+from ..sync import _find_cookie_source, _startupinfo, find_yt_dlp
+from ..thumbnails import _download_thumbnail, _ensure_thumbnails_dir
+from ..utils import utf8_subprocess_env as _utf8_env
 from .io import (
     _folder_for_channel,
     _get_metadata_jsonl_path,
@@ -43,9 +44,6 @@ from .io import (
     _write_metadata_jsonl,
     _year_month_from_path,
 )
-from ..sync import _find_cookie_source, _startupinfo, find_yt_dlp
-from ..thumbnails import _download_thumbnail, _ensure_thumbnails_dir
-from ..utils import utf8_subprocess_env as _utf8_env
 from .scan import _group_by_metadata_path, _scan_channel_videos
 
 # Module-scoped tracking for in-flight metadata-fetch subprocesses.
@@ -97,8 +95,8 @@ def _exit_pause_wait(stream: LogStreamer, label: str, queues) -> None:
 
 def _fetch_video_metadata(yt: str, video_id: str,
                           title_hint: str = "",
-                          proc_registry: "set[subprocess.Popen] | None" = None,
-                          error_out: "list[str] | None" = None,
+                          proc_registry: set[subprocess.Popen] | None = None,
+                          error_out: list[str] | None = None,
                           stream: LogStreamer | None = None,
                           cancel_event: threading.Event | None = None,
                           ) -> dict[str, Any] | None:
@@ -411,8 +409,8 @@ def fetch_single_video_metadata(channel: dict[str, Any],
     try:
         # Hold the per-path lock across read+merge+write so a concurrent
         # metadata writer's just-landed entry isn't clobbered by our stale
-        # read (~line 300). The network fetch above ran OUTSIDE the lock;
-        # re-read fresh here under it (audit H2). RLock → the inner
+        # read above. The network fetch ran outside the lock; re-read fresh
+        # here under it. RLock allows the inner
         # _write_metadata_jsonl re-acquires on this thread safely.
         with _lock_for(jp):
             existing = _read_metadata_jsonl(jp, strict=True)
@@ -615,7 +613,7 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
         existing = _read_metadata_jsonl(jp)
         thumb_dir = _ensure_thumbnails_dir(g["subfolder"])
         changed = False
-        _changed_ids: set[str] = set()  # vids we mutate this group (audit H2)
+        _changed_ids: set[str] = set()  # videos mutated in this group
 
         # Hoist the thumbnail listing once per group. Old code did
         # os.listdir() inside _has_thumbnail_for, called per-video,
@@ -1026,7 +1024,7 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
             try:
                 # Re-read under the per-path lock and merge ONLY the vids we
                 # touched, so entries another metadata writer added between our
-                # read (~509) and now aren't clobbered (audit H2). The yt-dlp
+                # initial read and now aren't clobbered. The yt-dlp
                 # fetches above ran outside the lock; only this reload+merge+
                 # write is serialized.
                 with _lock_for(jp):

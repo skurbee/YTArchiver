@@ -68,13 +68,8 @@ __all__ = [
 _log = get_logger(__name__)
 
 
-# ── Patch 18 phase 2 (v68.8): pure helpers moved to ytdlp_proc.py ─────
-# These names are re-imported here so internal call sites in this file
-# and external callers (`from backend.sync import find_yt_dlp`, etc.)
-# keep resolving them as before.
-# Patch 18 phase 4 (v69.4): log row emitters moved to log_rows.py.
-# Re-imported so internal callers in this file keep resolving them.
-# ── Patch 18 phase 3 (v68.8): display-push + quickcheck moved out ─────
+# Focused helpers live in sibling modules and are re-imported here so internal
+# call sites and the established backend.sync package API remain stable.
 from .display_push import (
     clear_sync_progress,
     write_sync_progress,
@@ -115,8 +110,8 @@ from .recent_track import (  # noqa: F401
     set_recent_changed_hook,
 )
 
-# Patch 14 (v71.6): file/format helpers moved to sync_helpers.py.
-# Re-imported here so sync_channel and other call sites keep resolving
+# File and format helpers live in sync_helpers.py. Re-import them here so
+# sync_channel and other call sites keep resolving
 # the names. External callers reach for these via backend.sync.* —
 # the package __init__ re-exports them from this module.
 from .sync_helpers import (  # noqa: F401
@@ -302,6 +297,36 @@ def _maybe_429_backoff(stream: LogStreamer,
         if pause_event is not None:
             pause_event.set()
     return True
+
+
+def _register_idless_download(final_path: str, channel_name: str,
+                              title: str, *, auto_transcribe: bool,
+                              duration, upload_date: str, stream) -> bool:
+    """Keep a completed file in the catalog when yt-dlp yields no ID."""
+    try:
+        duration_secs = float(duration) if duration else None
+    except (TypeError, ValueError):
+        duration_secs = None
+    _log.warning(
+        "DLTRACK: file bound but no video id recoverable — "
+        "registering id-less: %s", final_path)
+    try:
+        stream.emit_dim(
+            " ⚠ downloaded a file but couldn't resolve its video ID — "
+            "registered without one (metadata can attach it on a later "
+            "pass): " + os.path.basename(final_path))
+    except Exception as exc:
+        swallow("id-less download warning emit", exc)
+    try:
+        from .. import index as _idx
+        return bool(_idx.register_video(
+            final_path, channel_name, title or None,
+            tx_status="pending" if auto_transcribe else "no_captions",
+            duration_secs=duration_secs,
+            upload_date=(upload_date or "").strip()))
+    except Exception as exc:
+        _log.warning("id-less register failed: %s", exc)
+        return False
 
 
 # startupinfo now comes from subprocess_util (one
@@ -709,8 +734,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # fast with a clear message instead of letting yt-dlp crash mid-download.
     # A minimum of 500MB free keeps room for the largest plausible single
     # video; actual videos are streamed so we don't need to pre-allocate.
-    from ..utils import (check_directory_writable, check_disk_space,
-                         ytdlp_embed_tag_args)
+    from ..utils import check_directory_writable, check_disk_space, ytdlp_embed_tag_args
     preflight_dir = base_dir if not ch_dir.exists() else ch_dir
     if not check_directory_writable(str(preflight_dir)):
         stream.emit([["ERROR: ", "red"],
@@ -1182,8 +1206,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 # In practice that left "⏳ Metadata queued…" stuck on
                 # the log (no done-line ever fires with the same
                 # marker) and the activity-row metadata counter at 0
-                # for the in-flight video (audit 2026-05-20: SNL row
-                # showed "0 metadata" after a pause/resume mid-fetch).
+                # for the in-flight video (the row could remain at
+                # "0 metadata" after a pause/resume during fetch).
                 # Instead, poll-wait until resume. The executor is
                 # single-worker so at most one task sleeps at a time;
                 # the rest queue behind it. 0.5s slices keep us
@@ -1392,12 +1416,10 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             # fallback when filename character substitution (`:` -> `：`
             # etc) causes the path lookup to miss.
             # `[download] Destination: foo.mp4` is a known false positive:
-            # the word `Destination` is exactly 11 letters and matches
-            # the [A-Za-z0-9_-]{11} class. Real YT video IDs are base64-
-            # url, which is letters + digits + `-_` — they almost always
-            # contain at least one non-letter. Rejecting all-alpha
-            # candidates filters the "Destination" footgun without
-            # rejecting legitimate IDs in practice.
+            # the word `Destination` is exactly 11 letters and matches the
+            # video-id shape. The parser rejects that explicit token while
+            # retaining legitimate all-letter IDs (about 10% of YouTube's
+            # identifier space).
             if _vid_cand := extract_video_id_from_line(s):
                 current_vid_id = _vid_cand
 
@@ -2089,7 +2111,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                     # later loop iteration that reassigns
                                     # final_path/_comp_lvl/_comp_res can't make
                                     # this fire-and-forget daemon compress the
-                                    # WRONG file (audit H4 / ruff B023). stream
+                                    # wrong file. stream
                                     # and cancel_event are channel-scoped, not
                                     # per-video, so closing over them is safe.
                                     def _do_compress(_path=final_path,
@@ -2113,6 +2135,14 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                 except Exception as _e:
                                     stream.emit_error(
                                         f"Video compression failed to start: {_e}")
+                    elif final_path and os.path.isfile(final_path) and not vid:
+                        _register_idless_download(
+                            final_path, name, t,
+                            auto_transcribe=auto_tx,
+                            duration=dur,
+                            upload_date=ud,
+                            stream=stream,
+                        )
                 except Exception as e:
                     # This handler wraps the ENTIRE per-video DLTRACK pipeline
                     # (bind → count → register → metadata → transcribe enqueue).
@@ -3143,8 +3173,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     #         + Shorts as a "multi-playlist", and yt-dlp returns 101 when
     #         it aborts the outer iteration after the first inner playlist
     #         hits the break. NOT a crash. Without 101 in the OK set, the
-    #         H31 emit below flags every fully-synced channel as having
-    #         "1 error" (audit 5.23 sync regression).
+    #         status emit below would flag every fully-synced channel as
+    #         having an error.
     # Anything else = real crash. If all rcs are None (cancelled/paused
     # before any pass finished) treat as ok-but-partial when downloaded > 0.
     _NORMAL_RCS = (0, 1, 101)
@@ -3239,7 +3269,7 @@ from .active_state import (  # noqa: F401
     set_sync_active,
 )
 
-# Patch 14 (v71.6): sync_all moved to sync_all.py. Re-import here so
+# sync_all is implemented in sync_all.py and re-imported here so
 # `from backend.sync.core import sync_all` continues to resolve and
 # the package __init__ star-import surface stays unchanged.
 from .sync_all import sync_all  # noqa: F401

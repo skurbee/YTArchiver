@@ -8,16 +8,14 @@ state.
 """
 from __future__ import annotations
 
-import json
 import os
-import subprocess
 import threading
-import urllib.request
 
-from ._shared import _log, webview
 from backend.archive_capacity import archive_capacity_status
-from backend.ytarchiver_config import CONFIG_FILE, config_is_writable, load_config
 from backend.version import APP_VERSION
+from backend.ytarchiver_config import CONFIG_FILE, load_config
+
+from ._shared import _log
 
 
 class DiagnosticsMixin:

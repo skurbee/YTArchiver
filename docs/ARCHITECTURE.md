@@ -19,7 +19,7 @@ Single user, Windows desktop only, no cloud sync. The archive root
 is user-configurable (`output_dir` in config) and the app makes no
 assumption about the drive layout beyond "it's a writeable local
 filesystem that supports atomic `os.replace` for same-directory
-renames" — see "DrivePool assumption" below.
+renames" — see "pooled-filesystem assumption" below.
 
 ## Process model
 
@@ -57,9 +57,9 @@ Main thread (pywebview event loop)
 ```
 
 All child subprocesses (yt-dlp, ffmpeg, ffprobe, whisper, punct) are
-tracked by `ProcessRegistry` (`backend/process_runner.py`) added in
-Patch 3, so shutdown cleanly kills them via `registry.kill_all()`
-without needing psutil child-scanning.
+tracked by `ProcessRegistry` (`backend/process_runner.py`), so shutdown
+cleanly kills them via `registry.kill_all()` without needing psutil
+child-scanning.
 
 ## State persistence
 
@@ -101,7 +101,7 @@ whisper_worker.py: Whisper transcribes audio → JSONL segments
      │
      ▼
 transcribe._transcribe_one: writes to .txt + atomic .jsonl
-     │  Patch 1 (v66.5): writes are now atomic via .tmp + replace
+     │  sidecar writes use .tmp + replace for atomicity
      │
      ▼
 PunctuationManager.punctuate (Python 3.11 subprocess)
@@ -158,7 +158,7 @@ background thread or the UI freezes. See [`../backend/api_mixins/README.md`](../
   destination directory and the `.tmp` file live on the same filesystem.
   This is the standard Unix-rename pattern and holds for any
   single-volume archive root (NTFS, ext4, APFS) and for pooled-drive
-  filesystems that proxy renames transparently (StableBit DrivePool,
+  filesystems that proxy renames transparently (pooled storage,
   Storage Spaces, etc.).
 
 ## Where things might surprise you
@@ -167,46 +167,14 @@ background thread or the UI freezes. See [`../backend/api_mixins/README.md`](../
   modules. This isn't a layering trick — it's a "global namespace" for
   every mixin file. See [`../backend/api_mixins/README.md`](../backend/api_mixins/README.md).
 
-- Some functions exist in two places (e.g. `_norm_title` in
-  `transcribe.py` AND `repair_captions.py` AND `metadata.py`). They
-  have subtly different semantics by design. Patch 1 created
-  `text_utils.normalize_title` as the canonical version; future patches
-  will collapse the rest.
+- A few feature-specific title-normalization helpers remain because they have
+  subtly different semantics. New shared behavior belongs in
+  `text_utils.normalize_title`.
 
 - `print()` calls in some modules go to a dropped stdout in PyInstaller
-  builds. Patch 4 (v66.8) replaced the load-bearing ones with `_log.*`;
-  any remaining ones are deliberate (boot-time before logger is up).
+  builds. Runtime diagnostics should use `_log.*`; remaining prints are
+  limited to boot-time code that runs before the logger is available.
 
 - `swallowed (...): {e}` log lines (DEBUG level) are intentional — see
   `backend/log.py:swallow()`. Means "this exception was caught and the
   surrounding code can continue without it." Verbose-mode only.
-
-## Patch history (high level)
-
-| Patch | Theme |
-|-------|-------|
-| 1 | Critical bug fixes (data integrity, security, deadlocks) |
-| 2 | Helper consolidation (`text_utils`, `subprocess_util`, `fs_search`) |
-| 3 | `ProcessRegistry` + `YtDlpRunner` (centralized subprocess lifecycle) |
-| 4 | `config_transaction()` + error-handling discipline |
-| 5 | `metadata.py` decomposition (`metadata/io.py` extracted) |
-| 6 | `transcribe.py` decomposition (`transcribe/paths.py` extracted) |
-| 7 | `ytarchiver_config.py` decomposition (`view_format.py` extracted) |
-| 8 | `api_mixins/` contract documentation (`api_mixins/README.md`) |
-| 9 | Frontend documentation (`web/README.md`) |
-| 10 | Contributor docs (this file, `CONTRIBUTING.md`, `BUILD.md`) |
-| 11–13 | `web/app.js` decomposition into ~40 single-concern modules |
-| 14 | `sync/core.py` split — `sync_all` + `sync_helpers` extracted |
-| 15 | `indexControls.js` split — `metadataTab.js`, `settingsInfra.js` extracted |
-| 16 | `transcribe/core.py` split — `helpers.py`, `punct_manager.py` extracted |
-| 17 | `index.py` split — `index_search.py`, `index_graph.py` extracted |
-| 18 | `styles.css` split into 6 themed sheets |
-| 19 | `index.html` split into template + 7 partials, assembled at boot |
-| 20 | `index.py` second split — `index_bookmarks.py`, `index_maintenance.py` |
-| 21 | `styles-browse.css` split — `styles-browse-grids.css`, `styles-watch.css` |
-| 22 | `metadata/refresh.py` split per refresh-kind (views / comments / fetch) |
-| 23 | `styles-settings.css` split — `styles-download-controls.css` extracted |
-| 24 | `settingsTab.js` split — 4 dialog modules (drift / compress / repair / punct-restore) |
-
-Each patch was designed to be self-contained and leave the app in a
-shippable state.

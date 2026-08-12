@@ -145,7 +145,8 @@ for line in sys.stdin:
             text_chunk, word_ends = joined_text_and_word_ends(batch)
             result = pipe(text_chunk)
             result_index = 0
-            for word, word_end in zip(batch[:len(batch) - ov], word_ends):
+            for word, word_end in zip(
+                    batch[:len(batch) - ov], word_ends, strict=False):
                 label = "0"
                 while (result_index < len(result)
                        and word_end >= result[result_index]["end"]):

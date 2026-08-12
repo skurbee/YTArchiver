@@ -1,26 +1,9 @@
-"""
-Centralized subprocess management — yt-dlp + ffmpeg / ffprobe.
+"""Shared subprocess lifecycle primitives for yt-dlp and ffmpeg.
 
-consolidates the 11+ ad-hoc Popen call sites scattered
-across sync.py, metadata.py, redownload.py, compress.py, transcribe.py,
-channel_art.py, repair_captions.py, and api_mixins/diagnostics_mixin.py.
-
-Before this module: every call site independently located yt-dlp, built
-its own cookie args, set its own startupinfo, decided whether to use
-creationflags, and the only way shutdown reaped zombies was psutil
-child-scanning + string-matching `"yt-dlp" in name`.
-
-After: every yt-dlp invocation goes through `YtDlpRunner`, every Popen
-is registered with `ProcessRegistry`, and shutdown just calls
-`registry.kill_all()`. PID tracking eliminates the brute-force child-
-scanning at shutdown.
-
-Migration is incremental — Patch 3 wires in the probe-style call sites
-(subs.fetch_channel_display_name, prefetch_channel_total,
-quick_check_new_uploads, channel_art, ytdlp_version). The 1,800-line
-sync_channel main pass is intentionally left on the legacy path until
-its decomposition in Patch 7; the registry catches its Popens anyway
-via the optional `track(proc)` call so shutdown still cleans up.
+`ProcessRegistry` tracks child processes for deterministic shutdown.
+`YtDlpRunner` and `FfmpegRunner` provide consistent command execution,
+environment handling, cancellation, and registry integration. Callers that
+need specialized streaming behavior may register subprocesses directly.
 
 Public API:
     PROCESS_REGISTRY: ProcessRegistry  (module-level singleton)
@@ -35,12 +18,12 @@ import shutil
 import subprocess
 import sys
 import threading
-from functools import lru_cache
 from collections.abc import Callable, Iterable
+from functools import lru_cache
 from pathlib import Path
 
-from .log import get_logger
 from . import youtube_traffic
+from .log import get_logger
 from .subprocess_util import (
     make_startupinfo,
     subprocess_creationflags,

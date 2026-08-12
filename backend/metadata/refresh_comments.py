@@ -1,7 +1,7 @@
 """
 metadata.refresh_comments — per-channel comment refresh.
 
-Extracted from metadata/refresh.py (Patch 22, v72.4).
+Channel comment-refresh implementation.
 
 Re-fetches full metadata so comments come back fresh for videos
 uploaded recently (or any video whose comments the user wants
@@ -19,16 +19,17 @@ from typing import Any
 
 from ..log import get_logger
 from ..log_stream import LogStreamer
-from .io import (
-    _folder_for_channel,
-    _read_metadata_jsonl,
-)
 from ..sync import find_yt_dlp
 from ._refresh_proxies import (
     _enter_pause_wait,
     _exit_pause_wait,
 )
 from .fetcher import fetch_single_video_metadata
+from .io import (
+    _folder_for_channel,
+    _read_metadata_jsonl,
+)
+from .refresh_state import stamp_channel_refresh
 from .scan import _scan_channel_videos
 
 _log = get_logger(__name__)
@@ -163,6 +164,10 @@ def refresh_channel_comments(channel: dict[str, Any],
     if total == 0:
         stream.emit([[" \u2014 No videos match the comment-refresh "
                       "scope.\n", "dim"]])
+        # A completed scoped check is fresh information even when the scope
+        # contains no videos. Keep the channel-level age aligned with the
+        # work the user requested.
+        stamp_channel_refresh(channel, "last_comments_refresh_ts")
         return {"ok": True, "fetched": 0, "errors": 0, "skipped": 0,
                 "took": 0}
 
@@ -243,19 +248,7 @@ def refresh_channel_comments(channel: dict[str, Any],
     _clear_active()
 
     # Stamp separate last-comments-refresh timestamp on the channel.
-    try:
-        from .. import ytarchiver_config as _cfg
-
-        with _cfg.config_transaction() as cfg:
-            ch_url_norm = (channel.get("url") or "").rstrip("/")
-            now_ts = time.time()
-            for ch in cfg.get("channels", []):
-                if (ch.get("url") or "").rstrip("/") == ch_url_norm:
-                    ch["last_comments_refresh_ts"] = now_ts
-                    break
-    except Exception as e:
-        _log.warning("comments refresh timestamp stamp failed for %r: %s",
-                     name, e)
+    stamp_channel_refresh(channel, "last_comments_refresh_ts")
 
     took = time.time() - t0
     # Per-channel summary is rendered by the sync loop's `_sync_row_emit`

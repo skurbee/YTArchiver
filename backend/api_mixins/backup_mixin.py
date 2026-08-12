@@ -10,17 +10,10 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import shutil
-import time
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
-from ._shared import _api_err, webview, normalize_dialog_paths
-from backend.ytarchiver_config import CONFIG_FILE, config_is_writable, load_config, save_config
 from backend import subs as subs_backend
-
 
 # v80: the zip-writing core + file list moved to backend/auto_backup.py
 # so the scheduled auto-backup and this manual export share ONE
@@ -28,9 +21,16 @@ from backend import subs as subs_backend
 # working unchanged.
 from backend.auto_backup import (  # noqa: E402
     BACKUP_MANIFEST_NAME as _BACKUP_MANIFEST_NAME,
+)
+from backend.auto_backup import (
     backup_file_entries as _backup_file_entries,
+)
+from backend.auto_backup import (
     build_backup_zip as _build_backup_zip,
 )
+from backend.ytarchiver_config import config_is_writable, load_config, save_config
+
+from ._shared import _api_err, normalize_dialog_paths
 
 
 def _allowed_backup_top_names() -> set[str]:
@@ -172,7 +172,7 @@ class BackupMixin:
             # track WHY each entry was skipped so the UI can
             # tell the user (previously just reported a raw count with
             # no way to debug a partial import).
-            skipped_reasons: List[Dict[str, str]] = []
+            skipped_reasons: list[dict[str, str]] = []
             for ch in imported:
                 if not isinstance(ch, dict):
                     skipped_reasons.append({

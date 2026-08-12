@@ -66,7 +66,7 @@
           }
         });
         row.querySelector("[data-ignore]").addEventListener("click", async () => {
-          // UI audit #11: lead with the human title, not the raw
+          // Lead with the human title, not the raw
           // YouTube ID. ID is secondary detail under the title.
           const _name = (it.title && it.title.trim())
             ? it.title.slice(0, 80)

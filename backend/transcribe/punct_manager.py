@@ -1,13 +1,12 @@
 """
 transcribe.punct_manager — PunctuationManager subprocess wrapper.
 
-Extracted from transcribe/core.py (Patch 16, v71.8). Owns the
-persistent `punct_worker.py` subprocess that restores punctuation +
+Owns the persistent `punct_worker.py` subprocess that restores punctuation +
 capitalization on Whisper's raw lowercase output. The subprocess is
 started lazily on first `.punctuate()` call and kept alive between
 calls (model load is the expensive part).
 
-Public surface (re-exported via transcribe/__init__.py for back-compat):
+Public surface (re-exported through the transcribe package):
     PunctuationManager
 """
 from __future__ import annotations
@@ -17,7 +16,7 @@ import os
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any  # used in line 174 type-annotation (audit H42)
+from typing import Any
 
 from ..log import get_logger
 from ..log_stream import LogStreamer
@@ -30,7 +29,7 @@ _startupinfo = _make_startupinfo()
 # Process-wide singleton handle. Two PunctuationManagers each spawn
 # their own subprocess and each load the CUDA model into VRAM, which
 # OOMs low-VRAM GPUs. Reuse one instance across both the live
-# transcribe worker AND the Restore-Punctuation pass (audit: H44).
+# transcribe worker and the Restore-Punctuation pass.
 _singleton_lock = threading.Lock()
 _singleton: PunctuationManager | None = None
 
@@ -67,10 +66,8 @@ class PunctuationManager:
         # re-acquire the lock it already held via the outer with block).
         self._lock = threading.RLock()
         self._starting = False
-        # Patch 19 fix (v68.2): this file moved from backend/transcribe.py
-        # to backend/transcribe/legacy.py. The worker script lives at
-        # backend/punct_worker.py (and is bundled into <bundle>/backend/
-        # by PyInstaller), so go up one more level.
+        # The worker lives at backend/punct_worker.py and is bundled into the
+        # same location, one package level above this module.
         self._worker_script = Path(__file__).resolve().parent.parent / "punct_worker.py"
         self._python311: str | None = None
         # Set by `_transcribe_one` before each punctuate() call so the

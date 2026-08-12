@@ -25,8 +25,7 @@
   --c-cancel: #6b1a1a;
   --c-warn: #6b3a10;
 
-  /* Patch 16 (v67.8) — promoted color literals previously duplicated
-     across 22+ rules. Names follow the prior tag-class convention. */
+  /* Shared semantic colors used across component stylesheets. */
   --c-warn-fg: #e1b25a;
   --c-ok-fg: #a3c99a;
   --c-bad-fg: #d87a7a;
@@ -79,7 +78,7 @@
   --c-log-compress: #c084fc;
   --c-log-reorg: #ff8c42;
 
-  --c-log-row-alt: #1c2433;  /* bumped from #101520 — old shade was nearly indistinguishable from the page background, so alternating rows looked uniform (UI audit 2026-05-14) */
+  --c-log-row-alt: #1c2433;  /* visible alternating log-row shade */
   --c-log-filterskip-dim: #4a5060;
   --c-livestream: #f5a023;
 
@@ -108,8 +107,8 @@
 
   /* Four variables referenced via var() in styles-browse.css +
      styles-dialogs.css that were never defined here, so every use
-     fell through to its inline fallback or to inherited color
-     (audit: H258). Define explicitly so palette tweaks land in one
+     fell through to its inline fallback or to inherited color.
+     Define explicitly so palette tweaks land in one
      place. */
   --c-bg-soft: #14161a;
   --c-card: #1c1e21;
@@ -522,9 +521,7 @@ body {
   font-weight: 600;
 }
 .settings-subnav-btn {
-  /* Sizing folded in from a second .settings-subnav-btn block that
-     used !important to override these values — consolidated to one
-     authoritative rule per UI audit #28. */
+  /* Keep sub-navigation sizing in this single authoritative rule. */
   padding: 10px 22px;
   font-size: var(--fs-lg);
   color: var(--c-text);

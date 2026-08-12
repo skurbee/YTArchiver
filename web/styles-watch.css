@@ -2,8 +2,7 @@
    styles-watch.css — Watch view + overlay captions + source banner +
                        metadata drawer
 
-   Extracted from styles-browse.css (Patch 21, v72.3). Everything that
-   only matters once the user clicks a video card and lands on the
+   Everything that matters once the user clicks a video card and lands on the
    embedded player:
      • .watch-layout (player + transcript split, splitter)
      • Video overlay captions (WebVTT styling via video::cue)
@@ -365,6 +364,50 @@
 }
 .cap-ovl[data-cap-bg="none"] .cap-ovl-cell { background: transparent; }
 
+/* Default mode mirrors conventional YouTube captions: a stable phrase,
+   centered near the bottom, balanced into no more than two opaque-backed
+   lines. The word-at-a-time modes keep the pinned three-column layout. */
+.cap-ovl[data-cap-mode="default"] {
+  width: 86%;
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: center;
+  align-items: end;
+}
+.cap-ovl[data-cap-mode="default"] .cap-ovl-prev,
+.cap-ovl[data-cap-mode="default"] .cap-ovl-next { display: none; }
+.cap-ovl[data-cap-mode="default"] .cap-ovl-cur {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-self: stretch;
+  gap: 2px;
+  min-width: 0;
+  padding: 0;
+  background: transparent !important;
+  font-weight: 500;
+  white-space: normal;
+}
+.cap-ovl-line {
+  display: block;
+  max-width: 100%;
+  padding: 2px 7px;
+  line-height: 1.25;
+  text-align: center;
+  white-space: nowrap;
+}
+.cap-ovl[data-cap-mode="default"][data-cap-bg="translucent"] .cap-ovl-line {
+  background: rgba(0, 0, 0, 0.78);
+}
+.cap-ovl[data-cap-mode="default"][data-cap-bg="outline"] .cap-ovl-line {
+  background: transparent;
+  text-shadow: -1px -1px 0 #000, 1px -1px 0 #000,
+               -1px  1px 0 #000, 1px  1px 0 #000,
+                0    0   4px #000;
+}
+.cap-ovl[data-cap-mode="default"][data-cap-bg="none"] .cap-ovl-line {
+  background: transparent;
+}
+
 /* Our fullscreen button (the native one is removed above). It fades in on
    hover and is click-through (pointer-events:none) while hidden so its
    invisible box never swallows a click meant for the video body — that
@@ -682,7 +725,7 @@
   /* Inherit scroll from .watch-video-wrap (its overflow-y: auto
      handles the whole column). Having both this AND the wrapper
      scroll caused scroll-chaining issues — wheel events stalled
-     when the inner reached its max-height (audit: H255). */
+     when the inner reached its max-height. */
   max-height: 420px;
 }
 .watch-meta-description {

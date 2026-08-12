@@ -1,14 +1,12 @@
 """
 sync.display_push — sync-progress JSON writes for a companion display.
 
-Patch 18 phase 3 (v68.8): extracted from sync/legacy.py.
-
 A companion display tool can poll `<APP_DATA>/sync_progress.json`
 to render the current channel + per-pass totals on its own UI. Sync
 writes that file on every "Channel idx/total" tick. This module owns
 that file and its locked state.
 
-Public surface (re-exported via sync/__init__.py for back-compat):
+Public surface (re-exported through the sync package):
     write_sync_progress(channel_name, idx, total, downloaded, skipped, errors)
     clear_sync_progress()
     _sync_progress_path()

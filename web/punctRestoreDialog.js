@@ -1,8 +1,8 @@
 /* ═══════════════════════════════════════════════════════════════════════
    punctRestoreDialog.js — "Restore transcript punctuation" modal
 
-   Extracted from settingsTab.js (Patch 24, v72.6). Same shape as the
-   Repair YT captions dialog. Channel dropdown (or All channels),
+   Uses the same interaction pattern as the Repair YT captions dialog.
+   Channel dropdown (or All channels),
    dry-run toggle. On Run, calls api.punct_restore_segments and the
    task queues on the sync queue for pause/resume/cancel.
 

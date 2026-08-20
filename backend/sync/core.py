@@ -153,6 +153,8 @@ _ID_IN_FILENAME = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
 
 _PROG_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 _TITLE_RE = re.compile(r"\[download\]\s+Destination:\s+(.+)$")
+_ALREADY_DOWNLOADED_RE = re.compile(
+    r"^\[download\]\s+(.+?)\s+has already been downloaded$")
 # Authoritative final path comes from the Merger / ffmpeg / FixupM3u8 log
 # line. — we want every flavor of yt-dlp's
 # final-file announcement (merge of separate tracks, remux for M3U8, etc.).
@@ -175,6 +177,22 @@ _DOWNLOADING_RE = re.compile(r"\[info\]\s+([^:]+):\s+Downloading\s+\d+\s+format"
 # the brackets — `\]` after the tag name keeps `[youtube:tab]` from
 # matching.
 _VIDID_RE = YTDLP_VIDEO_ID_RE
+
+
+def _existing_final_media_path(line: str) -> str | None:
+    """Return the final media path named by an existing-file notice.
+
+    yt-dlp can emit the same wording for subtitle sidecars or completed
+    intermediate format tracks. Neither means the final video was already on
+    disk, so they must not suppress the later real-download DLTRACK callback.
+    """
+    match = _ALREADY_DOWNLOADED_RE.match(line or "")
+    if not match:
+        return None
+    raw_path = match.group(1).strip().strip('"')
+    if not raw_path or _F_SUFFIX_RE.search(os.path.basename(raw_path)):
+        return None
+    return _resolve_final_mp4(raw_path)
 
 # Module-level download-row counter. The `dlrow_<N>` inplace kind must be
 # globally unique across the whole sync run (NOT per-channel), otherwise
@@ -216,6 +234,38 @@ _STALE_YTDLP_NUDGE_FIRED = False
 _archive_write_lock = threading.Lock()
 _LAST_429_BACKOFF_TS: float = 0.0
 _backoff_lock = threading.Lock()
+
+
+class _ExistingFileDLTrack:
+    """Match yt-dlp's existing-file notice to its later DLTRACK line.
+
+    ``--print after_video:...`` also fires when yt-dlp finds the final media
+    file already on disk.  The existing-file notice precedes that print, so
+    remember its video id and consume the matching DLTRACK instead of treating
+    it as a fresh download.  The idless counter is a narrow fallback for rare
+    extractor output that never exposes an id before the notice.
+    """
+
+    def __init__(self) -> None:
+        self._ids: set[str] = set()
+        self._idless = 0
+
+    def note(self, video_id: str | None) -> None:
+        vid = (video_id or "").strip()
+        if vid:
+            self._ids.add(vid)
+        else:
+            self._idless += 1
+
+    def consume(self, video_id: str | None) -> bool:
+        vid = (video_id or "").strip()
+        if vid and vid in self._ids:
+            self._ids.remove(vid)
+            return True
+        if self._idless:
+            self._idless -= 1
+            return True
+        return False
 
 # Network-outage hints. A dropped / flapping connection makes yt-dlp emit
 # text that OVERLAPS its genuine "signed-out / can't extract player
@@ -553,6 +603,46 @@ def _archived_failed_video_ids(video_ids) -> set[str]:
     except OSError:
         return set()
     return found
+
+
+def _append_download_archive_ids(video_ids) -> int:
+    """Durably add valid, missing ids to yt-dlp's global archive.
+
+    The empty-folder repopulation path deliberately cannot pass the global
+    archive to yt-dlp, because those old ids are exactly what would block the
+    requested refill.  Merge the ids that actually completed back into the
+    archive once the pass ends so the next normal sync can use its fast path.
+    Returns the number of new lines written.
+    """
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in video_ids or ():
+        vid = (value or "").strip() if isinstance(value, str) else ""
+        if (not re.fullmatch(r"[A-Za-z0-9_-]{11}", vid)
+                or vid in seen):
+            continue
+        seen.add(vid)
+        ordered.append(vid)
+    if not ordered:
+        return 0
+
+    with _archive_write_lock:
+        already = _archived_failed_video_ids(ordered)
+        missing = [vid for vid in ordered if vid not in already]
+        if not missing:
+            return 0
+        parent = os.path.dirname(os.fspath(ARCHIVE_FILE))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        payload = "".join(f"youtube {vid}\n" for vid in missing).encode("ascii")
+        with open(ARCHIVE_FILE, "ab") as archive:
+            archive.write(payload)
+            archive.flush()
+            try:
+                os.fsync(archive.fileno())
+            except OSError:
+                pass
+        return len(missing)
 
 
 def _merge_failed_video_ids(prior_failed, failed_this_run, downloaded_ids,
@@ -999,6 +1089,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # that first manual sync should still graduate the channel to the
     # fast path even when it has zero new downloads.
     _existing_file_skipped = 0
+    _existing_file_dltrack = _ExistingFileDLTrack()
     # track which video IDs hit an error during this run.
     # At end of sync we diff against successful downloads and persist
     # the leftovers into channel["failed_video_ids"] so the next sync
@@ -1521,11 +1612,10 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     "YouTube failure guard failed: %s", _yt_guard_error)
 
             # DLTRACK:::Title:::Uploader:::YYYYMMDD:::bytes:::secs:::videoID
-            # Emitted by yt-dlp's --print after_video:... directive ONLY
-            # when a video actually downloads + merges successfully. If
-            # the file was already on disk (archive hit, or --no-overwrites
-            # skip), DLTRACK does not fire — so this is the authoritative
-            # "real download" signal.
+            # Emitted by yt-dlp's --print after_video:... directive. Despite
+            # the name, yt-dlp also emits it after an existing-file skip. The
+            # existing-file tracker below filters those callbacks before any
+            # download counting, indexing, metadata, or transcription work.
             # ── Merger line capture ─────────────────────────────────
             # `[Merger] Merging formats into "PATH"` is the AUTHORITATIVE
             # final output path — yt-dlp emits it once after combining
@@ -1590,6 +1680,15 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     t = ":::".join(_parts[1:-5])
                     t = (t or "").strip()
                     vid = (vid or "").strip()
+                    if _existing_file_dltrack.consume(vid or current_vid_id):
+                        # This file was already present. yt-dlp may still use
+                        # the after_video callback and add the id to its own
+                        # --download-archive, but none of YTArchiver's fresh-
+                        # download pipeline should run for it.
+                        merge_dest_path = ""
+                        dest_path = ""
+                        current_title = ""
+                        continue
                     if t and vid:
                         _title_to_id[t] = vid
                         if vid not in downloaded_ids:
@@ -1879,7 +1978,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                         _title_announced[_pp] = True
                             stream.emit([
                                 [" ", ["dim", _done_kind]],
-                                ["\u2014 \u2713 ", ["simpleline_green", _done_kind]],
+                                ["\u2014 \u2713 ", ["simpleline_green", _done_kind,
+                                                "download_complete"]],
                                 [f"{_display}", ["simpleline", _done_kind]],
                                 [f"{_size_tag}\n", ["dim", _done_kind]],
                             ])
@@ -2180,7 +2280,12 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 # line we announced on the Destination will stay, but we
                 # won't add any more noise. The pass summary "0 downloaded"
                 # is the authoritative count.
-                _existing_file_skipped += 1
+                # Only arm the DLTRACK filter for the FINAL media file.
+                # Subtitle sidecars and completed .fNNN format tracks can use
+                # this same wording before a real merge completes.
+                if _existing_final_media_path(s):
+                    _existing_file_skipped += 1
+                    _existing_file_dltrack.note(current_vid_id)
                 stream.emit([[" ", "dim"], [f"{s[:140]}\n", "dim"]])
                 continue
 
@@ -2673,6 +2778,23 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         (cancel_event is not None and cancel_event.is_set())
         or (pause_event is not None and pause_event.is_set())
     )
+
+    # The empty-folder refill intentionally ran without --download-archive;
+    # otherwise the global history would block every deleted video. Record
+    # every file that actually completed before doing anything that can return
+    # from the post-sync pipeline. This also covers a normal Pause/Cancel:
+    # completed files remain known even when the channel walk was partial.
+    if _repopulate_empty and downloaded_ids:
+        try:
+            _append_download_archive_ids(downloaded_ids)
+        except OSError as archive_error:
+            errors += 1
+            stream.emit([
+                [" ⚠ ", "yellow"],
+                ["Videos downloaded, but their download history could not "
+                 f"be updated ({archive_error}). The next sync may check "
+                 "them again.\n", "yellow"],
+            ])
 
     # Per-channel [Sync] Done line is now rendered by sync_start_all via
     # _sync_row_emit — one compact `[N/total] Name \u2014 summary` row that

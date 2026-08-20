@@ -63,6 +63,8 @@ _DISK_ERROR_PATTERNS = [
     # pattern was pure noise.
 ]
 _DISK_ERROR_RE = re.compile("|".join(_DISK_ERROR_PATTERNS), re.IGNORECASE)
+_PERMISSION_ERROR_RE = re.compile(
+    r"(?:Permission denied|Access is denied)", re.IGNORECASE)
 
 DISK_RETRY_MINUTES = 5 # mirrors YTArchiver._DISK_RETRY_MINUTES
 
@@ -141,6 +143,18 @@ class DiskErrorMonitor:
             return
         if not _DISK_ERROR_RE.search(text):
             return
+        # Permission failures are commonly scoped to one locked, hidden, or
+        # ACL-restricted file. Probe the configured archive root before
+        # escalating one of those into a global disk outage. True drive-wide
+        # permission/read-only failures still pause because the probe fails;
+        # EIO/device-not-ready/full errors skip this branch and pause at once.
+        if _PERMISSION_ERROR_RE.search(text):
+            path = self._get_output_dir() or ""
+            if path and _check_directory_writable(path):
+                _log.warning(
+                    "File permission failure while archive root remains "
+                    "writable; not pausing all tasks: %s", text[:500])
+                return
         with self._lock:
             if self._active:
                 return

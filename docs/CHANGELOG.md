@@ -6,6 +6,24 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v83.1 - 2026-08-19
+
+### Added
+- **Background problems now remain visible on both Windows app surfaces.** The taskbar button and notification-area icon show a high-contrast error badge whenever the in-app session error list needs attention, and the badge clears with that list's Clear action.
+
+### Fixed
+- **Activity and unseen-download indicators are reliable while the app is unattended.** Active syncs keep their blue spinner through configured traffic waits, the notification-area spinner and count render at a readable size, and the unseen count advances only after a download is confirmed complete while the window is unfocused.
+- **Empty-folder recovery no longer causes a redundant full recheck on the next sync.** Successfully restored videos are merged back into the download archive, while files already present on disk are excluded from fresh-download totals and follow-up processing.
+- **Interrupted transcript sidecar updates recover safely.** Complete atomic-write temp files are promoted on the next update, conflicting data is preserved separately, and hidden-file state is restored even after a failed replacement.
+- **Hidden channel-art thumbnails can be refreshed in place.** Cached thumbnails are temporarily made writable for replacement and hidden again afterward, including failure paths.
+- **File-specific permission errors no longer pause the entire archive unnecessarily.** The disk watchdog verifies that the archive root is actually unwritable before escalating an access-denied message into a global storage outage.
+- **Adding or editing a channel returns control promptly.** Browse data can warm in the background without delaying the immediate channel-table refresh and follow-up sync prompt.
+
+### Validation
+- Backend smoke suite passed: 486 tests.
+- Frontend JavaScript syntax checks, generated HTML freshness, Python import checks, lint checks, and `git diff --check` passed.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
 ## v83.0 - 2026-08-12
 
 ### Added

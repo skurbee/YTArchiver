@@ -1007,7 +1007,10 @@
         const data = await bridgeCall("get_subs_channels");
         if (Array.isArray(data) && data.length === 2) {
           window.renderSubsTable(data[0], data[1]);
-          await window._primeBrowse(data[0]);
+          // The rich Browse refresh can touch every channel's art on disk.
+          // Let it finish behind the editor instead of delaying closePanel()
+          // and the immediate "Sync now?" prompt after a successful add.
+          window._primeBrowse(data[0]);
         }
       } catch (e) { console.warn("refresh failed", e); }
     }

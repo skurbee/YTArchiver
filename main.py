@@ -284,6 +284,9 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # below — read-modify-write under contention from multiple log
         # scanner threads (audit: HIGH H14).
         self._session_dl_count_lock = threading.Lock()
+        # Native error indicator mirrors the bottom status bar's session-error
+        # count exactly. The frontend owns that list and explicitly clears it.
+        self._session_error_count = 0
         # Archive-rescan single-flight + live progress state.  The rescan
         # mixin also lazy-initializes these for narrow test doubles, but the
         # real Api owns them up front so simultaneous first bridge calls can
@@ -386,28 +389,23 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # app again clears the badge through app_window_focus_changed().
         self._session_dl_count = 0
         self._window_focused = True
-        def _dl_scan(text: str) -> None:
+        def _dl_scan(_text: str) -> None:
             try:
-                # Match only the exact sync-emitted "Downloading <title>" prefix;
-                # don't false-positive on yt-dlp chatter or other flows.
-                if text.lstrip().startswith("Downloading ") and "yt-dlp" not in text:
-                    # Lock the read-modify-write + tray badge update so
-                    # two near-simultaneous Downloading lines from
-                    # parallel yt-dlp passes don't both read the same
-                    # pre-increment value and emit duplicate badge
-                    # counts (audit: main.py H14).
-                    with self._session_dl_count_lock:
-                        if self._window_focused:
-                            return
-                        self._session_dl_count += 1
-                        _badge_val = self._session_dl_count
-                    tray = getattr(self, "_tray", None)
-                    if tray is not None:
-                        try: tray.set_badge(_badge_val)
-                        except Exception as e: _log.debug("tray badge set failed: %s", e)
+                # The semantic marker fires only after DLTRACK confirms a
+                # merged file landed. This cannot count a started-but-failed
+                # download or a metadata/transcription checkmark.
+                with self._session_dl_count_lock:
+                    if self._window_focused:
+                        return
+                    self._session_dl_count += 1
+                    _badge_val = self._session_dl_count
+                tray = getattr(self, "_tray", None)
+                if tray is not None:
+                    try: tray.set_badge(_badge_val)
+                    except Exception as e: _log.debug("tray badge set failed: %s", e)
             except Exception as e:
                 _log.debug("_dl_scan failed: %s", e)
-        self._log_stream.add_line_scanner(_dl_scan)
+        self._log_stream.add_tag_scanner("download_complete", _dl_scan)
         # Note: self._queues was already constructed + loaded above
         # (moved earlier for audit E-60 — DiskErrorMonitor references it).
         # Connect the transcribe manager to the shared GPU queue so
@@ -702,7 +700,10 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     tray.set_tooltip(tip)
                 else:
                     tray.stop_spin()
-                    if _traffic_waiting:
+                    if getattr(tray, "error_active", False) is True:
+                        tray.set_tooltip(
+                            "YTArchiver — Errors need attention — open for details")
+                    elif _traffic_waiting:
                         _wait_label = (
                             "24-hour" if _traffic_wait.get("reason")
                             == "daily_limit" else "hourly"
@@ -718,6 +719,10 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
     def attach_tray(self, tray):
         """Attach the optional TrayController after pywebview is created."""
         self._tray = tray
+        try:
+            tray.set_error(self._session_error_count)
+        except Exception as exc:
+            _log.debug("session error indicator attach failed: %s", exc)
 
     def _reload_config(self):
         """Load real YTArchiver config from %APPDATA% if available."""

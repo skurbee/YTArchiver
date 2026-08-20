@@ -98,8 +98,81 @@ def _seg_to_jsonl_line(video_id: str, title: str, seg: dict) -> str:
     return json.dumps(entry, ensure_ascii=False) + "\n"
 
 
+def _valid_jsonl_bytes(payload: bytes) -> bool:
+    """Return True when *payload* is a complete UTF-8 JSONL document."""
+    if payload and not payload.endswith(b"\n"):
+        return False
+    try:
+        for raw_line in payload.splitlines():
+            if not raw_line.strip():
+                continue
+            if not isinstance(json.loads(raw_line.decode("utf-8")), dict):
+                return False
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _next_jsonl_recovery_path(tmp: str) -> str:
+    """Return a non-existent path that preserves a conflicting temp file."""
+    candidate = tmp + ".recovery"
+    suffix = 2
+    while os.path.exists(candidate):
+        candidate = f"{tmp}.recovery.{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _recover_stale_jsonl_tmp(jsonl_path: str) -> bool:
+    """Recover a complete stale atomic-write temp before the next update.
+
+    A failed ``os.replace`` can leave ``<jsonl>.tmp`` behind after it has
+    already been marked hidden. Reopening that fixed temp name with ``wb``
+    then fails with ``PermissionError`` on Windows. A valid temp that extends
+    the current JSONL is safe to promote. Any other temp is moved aside under
+    a hidden recovery name so it is preserved for inspection instead of being
+    truncated or deleted.
+    """
+    tmp = jsonl_path + ".tmp"
+    if not os.path.isfile(tmp):
+        return False
+
+    _unhide_file_win(os.path.normpath(tmp))
+    current = b""
+    if os.path.isfile(jsonl_path):
+        _unhide_file_win(os.path.normpath(jsonl_path))
+        with open(jsonl_path, "rb") as f:
+            current = f.read()
+    with open(tmp, "rb") as f:
+        pending = f.read()
+
+    if (len(pending) >= len(current)
+            and pending.startswith(current)
+            and _valid_jsonl_bytes(pending)):
+        os.replace(tmp, jsonl_path)
+        _hide_file_win(jsonl_path)
+        _log.warning("Recovered complete stale JSONL temp for %s",
+                     os.path.basename(jsonl_path))
+        return True
+
+    recovery = _next_jsonl_recovery_path(tmp)
+    os.replace(tmp, recovery)
+    _hide_file_win(recovery)
+    _log.error("Preserved conflicting stale JSONL temp as %s",
+               os.path.basename(recovery))
+    return False
+
+
 def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
                        segments: list[dict]) -> bool:
+    """Lock-serialized facade for the aggregated JSONL append writer."""
+    with txt_lock_for(jsonl_path):
+        return _write_jsonl_entry_unlocked(
+            jsonl_path, video_id, title, segments)
+
+
+def _write_jsonl_entry_unlocked(jsonl_path: str, video_id: str, title: str,
+                                segments: list[dict]) -> bool:
     """Append long-form JSONL entries for one video. Matches YTArchiver.py:8508.
 
     Each line:
@@ -110,10 +183,17 @@ def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
     helper accepts EITHER short-form or long-form keys and always writes
     long-form to disk.
     """
+    tmp = jsonl_path + ".tmp"
+    tmp_complete = False
     try:
         _jsonl_dir = os.path.dirname(jsonl_path)
         if _jsonl_dir:
             os.makedirs(_jsonl_dir, exist_ok=True)
+
+        # Promote a complete append left behind by an earlier failed replace
+        # before reading the current document. On Windows, a stale hidden temp
+        # otherwise makes open(..., "wb") fail with EACCES.
+        _recover_stale_jsonl_tmp(jsonl_path)
 
         # Build lines in memory so a disk failure mid-write doesn't leave
         # half-a-line on disk.
@@ -144,7 +224,6 @@ def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
             existing = existing + b"\n"
 
         new_bytes = existing + "".join(new_lines).encode("utf-8")
-        tmp = jsonl_path + ".tmp"
         with open(tmp, "wb") as f:
             f.write(new_bytes)
             try:
@@ -152,6 +231,7 @@ def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
                 os.fsync(f.fileno())
             except OSError as e:
                 _log.debug("swallowed: %s", e)
+        tmp_complete = True
         # Hide tmp BEFORE replace so the file is never briefly visible
         # in Explorer between the replace and the re-hide (audit:
         # transcribe_files H58).
@@ -165,6 +245,15 @@ def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
         except Exception: pass
         return True
     except Exception as _jse:
+        # A partial temp cannot be recovered safely. A complete temp is kept
+        # so the next invocation can promote it if atomic replace was the step
+        # that failed.
+        if not tmp_complete:
+            try:
+                _unhide_file_win(os.path.normpath(tmp))
+                os.remove(tmp)
+            except OSError:
+                pass
         # surface to module-level log so .txt/.jsonl desync
         # is diagnosable. Was a print() — routes via
         # logger so PyInstaller --noconsole builds also capture it.
@@ -175,6 +264,13 @@ def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
             print(f"[transcribe] _write_jsonl_entry failed for "
                   f"{os.path.basename(jsonl_path)}: {_jse}")
         return False
+    finally:
+        # Reading an existing sidecar requires clearing HIDDEN on Windows.
+        # Restore the archive invariant even when recovery or replace fails.
+        try:
+            _hide_file_win(jsonl_path)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
 
 def _write_transcript_entry(txt_path, *args, **kwargs):
@@ -329,6 +425,22 @@ def parse_transcript_header(line: str) -> tuple[str, str, str, str] | None:
 
 def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
                          new_segments: list[dict]) -> set:
+    """Lock-serialized facade for the aggregated JSONL replacement writer."""
+    with txt_lock_for(jsonl_path):
+        try:
+            return _replace_jsonl_entry_unlocked(
+                jsonl_path, title, video_id, new_segments)
+        finally:
+            # Also covers recovery/unhide failures that occur before the
+            # unlocked writer reaches its own try/finally block.
+            try:
+                _hide_file_win(jsonl_path)
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+
+
+def _replace_jsonl_entry_unlocked(jsonl_path: str, title: str, video_id: str,
+                                  new_segments: list[dict]) -> set:
     """Surgically swap this video's entries in the aggregated .jsonl.
 
     `_replace_jsonl_entry` — used by the
@@ -343,6 +455,10 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
     can feed them into `_replace_txt_entry` for the same cleanup on the
     .txt side.
     """
+    # Recover a complete append that may have been stranded by an earlier
+    # failed atomic replace before this operation snapshots the JSONL.
+    _recover_stale_jsonl_tmp(jsonl_path)
+
     # Clear Windows hidden/readonly so we can write. The re-hide is
     # in a try/finally below so the sidecar can never get stranded
     # visible — even if any step between unhide and the final hide
@@ -424,6 +540,7 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
 
         final_bytes = ("".join(kept) + "".join(new_lines)).encode("utf-8")
         tmp = jsonl_path + ".tmp"
+        tmp_complete = False
         try:
             with open(tmp, "wb") as f:
                 f.write(final_bytes)
@@ -432,6 +549,7 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
                     os.fsync(f.fileno())
                 except OSError as e:
                     _log.debug("swallowed: %s", e)
+            tmp_complete = True
             # Hide tmp BEFORE the replace so the jsonl is never
             # briefly visible in Explorer (audit: transcribe_files H58).
             try: _hide_file_win(tmp)
@@ -443,8 +561,12 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
             # caller thought retranscribe succeeded. Now we re-raise so the
             # caller's emit_error in _write_outputs surfaces the failure and
             # the user can see that their retranscribe didn't land.
-            try: os.remove(tmp)
-            except OSError: pass
+            if not tmp_complete:
+                try:
+                    _unhide_file_win(os.path.normpath(tmp))
+                    os.remove(tmp)
+                except OSError:
+                    pass
             _log.error("_replace_jsonl_entry atomic replace failed: %s", _oe)
             raise
     finally:

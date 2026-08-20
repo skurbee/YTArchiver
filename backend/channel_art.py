@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 from . import youtube_traffic
 from .log import get_logger
 from .sync import _find_cookie_source, find_yt_dlp
-from .utils import hide_file_win
+from .utils import hide_file_win, unhide_file_win
 
 _CHANNEL_ART_REFRESH_DAYS = 30 # YTArchiver refreshes monthly
 _log = get_logger(__name__)
@@ -335,24 +335,31 @@ def _make_thumb(src: str, dst: str, max_w: int) -> bool:
         from PIL import Image
     except ImportError:
         return False
+    dst_exists = os.path.isfile(dst)
     try:
+        # Windows refuses to truncate an existing FILE_ATTRIBUTE_HIDDEN
+        # destination. Channel-art refreshes can make the source newer than
+        # its cached hidden thumb, so clear HIDDEN before Pillow overwrites it
+        # and restore the archive invariant in the finally block below.
+        if dst_exists:
+            unhide_file_win(dst)
         with Image.open(src) as im:
             im.thumbnail((max_w, max_w * 2), Image.Resampling.LANCZOS)
             # Strip alpha / weird modes — convert to RGB for JPEG output
             if im.mode not in ("RGB", "L"):
                 im = im.convert("RGB")
             im.save(dst, "JPEG", quality=82, optimize=True, progressive=True)
-        # Match avatar.jpg / banner.jpg — keep the generated *_small.jpg
-        # thumbnail hidden so the whole .ChannelArt folder stays invisible.
-        # (Previously only the full-size art got the hidden attribute, so
-        # the _small variants showed up in the folder.)
-        try:
-            hide_file_win(dst)
-        except Exception:
-            pass
         return True
     except Exception:
         return False
+    finally:
+        # Match avatar.jpg / banner.jpg — keep the generated *_small.jpg
+        # thumbnail hidden even if a refresh fails after we cleared HIDDEN.
+        if os.path.isfile(dst):
+            try:
+                hide_file_win(dst)
+            except Exception:
+                pass
 
 
 def ensure_banner_thumb(folder_path: str, max_w: int = 640) -> str | None:

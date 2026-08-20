@@ -766,6 +766,20 @@ class LogStreamerTests(unittest.TestCase):
             ],
         )
 
+    def test_semantic_tag_scanner_fires_only_for_matching_event(self) -> None:
+        stream = log_stream.LogStreamer()
+        landed = mock.Mock()
+        stream.add_tag_scanner("download_complete", landed)
+
+        stream.emit([["— ✓ Metadata downloaded\n", "simpleline"]])
+        stream.emit([
+            ["— ✓ ", ["simpleline_green", "dlrow_1",
+                       "download_complete"]],
+            ["Video (12 MB)\n", ["simpleline", "dlrow_1"]],
+        ])
+
+        landed.assert_called_once_with("— ✓ Video (12 MB)\n")
+
 
 class NetMonitorTests(unittest.TestCase):
     def tearDown(self) -> None:
@@ -812,15 +826,18 @@ class TrayControllerTests(unittest.TestCase):
         def copy(self):
             return TrayControllerTests.FakeImage(self.name + "-copy")
 
-    def test_traffic_wait_parks_sync_spinner_but_not_active_gpu(self) -> None:
-        self.assertIsNone(tray_backend.activity_spin_color(
-            sync_working=True, gpu_working=False, traffic_waiting=True))
+    def test_traffic_wait_keeps_active_sync_spinner_running(self) -> None:
+        self.assertEqual(tray_backend.activity_spin_color(
+            sync_working=True, gpu_working=False, traffic_waiting=True),
+            "blue")
         self.assertEqual(tray_backend.activity_spin_color(
             sync_working=True, gpu_working=False, traffic_waiting=False),
             "blue")
         self.assertEqual(tray_backend.activity_spin_color(
             sync_working=True, gpu_working=True, traffic_waiting=True),
             "red")
+        self.assertIsNone(tray_backend.activity_spin_color(
+            sync_working=False, gpu_working=False, traffic_waiting=True))
 
     def test_tray_keepalive_reapplies_title_icon_and_reregisters(self) -> None:
         ctrl = tray_backend.TrayController(tooltip="YT Archiver")
@@ -847,6 +864,75 @@ class TrayControllerTests(unittest.TestCase):
 
         self.assertIsNone(icon.icon)
         self.assertEqual(icon.show_calls, 1)
+
+    def test_tray_spinner_is_visible_at_notification_area_size(self) -> None:
+        from PIL import Image, ImageChops, ImageDraw
+
+        ctrl = tray_backend.TrayController(tooltip="YT Archiver")
+        ctrl._Image = Image
+        ctrl._ImageDraw = ImageDraw
+        ctrl._base_img = Image.new("RGBA", (256, 256), (0, 0, 0, 255))
+        ctrl._badge_count = 3
+        ctrl._error_count = 1
+
+        first = ctrl._compose_tray_spin_frame(0)
+        second = ctrl._compose_tray_spin_frame(1)
+
+        self.assertEqual(first.size, (32, 32))
+        difference = ImageChops.difference(
+            first.convert("RGB"), second.convert("RGB"))
+        self.assertIsNotNone(difference.getbbox())
+        pixels = [
+            first.getpixel((x, y))
+            for y in range(first.height)
+            for x in range(first.width)
+        ]
+        self.assertTrue(any(b > r and b > g for r, g, b, _a in pixels))
+        self.assertTrue(any(r > g and r > b for r, g, b, _a in pixels))
+        self.assertTrue(any(r > 225 and g > 225 and b > 225
+                            for r, g, b, _a in pixels))
+
+    def test_idle_download_count_badge_is_readable_at_tray_size(self) -> None:
+        from PIL import Image, ImageDraw
+
+        ctrl = tray_backend.TrayController(tooltip="YT Archiver")
+        ctrl._Image = Image
+        ctrl._ImageDraw = ImageDraw
+        ctrl._base_img = Image.new("RGBA", (256, 256), (0, 0, 0, 255))
+        ctrl._badge_count = 7
+
+        image = ctrl._static_icon_image()
+
+        self.assertEqual(image.size, (32, 32))
+        pixels = [
+            image.getpixel((x, y))
+            for y in range(image.height)
+            for x in range(image.width)
+        ]
+        self.assertTrue(any(r > g and r > b for r, g, b, _a in pixels))
+        self.assertTrue(any(r > 225 and g > 225 and b > 225
+                            for r, g, b, _a in pixels))
+
+    def test_error_indicator_refreshes_both_idle_icon_surfaces(self) -> None:
+        ctrl = tray_backend.TrayController(tooltip="YT Archiver")
+        icon = self.FakeIcon()
+        ctrl._started = True
+        ctrl._icon = icon
+        ctrl._base_img = self.FakeImage()
+        ctrl._refresh_taskbar_static = mock.Mock()
+
+        ctrl.set_error(2)
+
+        self.assertTrue(ctrl.error_active)
+        self.assertEqual(ctrl._error_count, 2)
+        self.assertIsNot(icon.icon, ctrl._base_img)
+        ctrl._refresh_taskbar_static.assert_called_once_with()
+
+        ctrl.set_error(0)
+
+        self.assertFalse(ctrl.error_active)
+        self.assertIs(icon.icon, ctrl._base_img)
+        self.assertEqual(ctrl._refresh_taskbar_static.call_count, 2)
 
     def test_badge_refreshes_idle_taskbar_overlay(self) -> None:
         ctrl = tray_backend.TrayController(tooltip="YT Archiver")
@@ -1243,6 +1329,27 @@ class CosmeticProbeCookieTests(unittest.TestCase):
                 ok = channel_art._http_get("file:///C:/secret.png", dest)
 
         self.assertFalse(ok)
+
+    def test_channel_art_unhides_stale_thumb_before_overwrite(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "banner.jpg"
+            dst = Path(td) / "banner_small.jpg"
+            Image.new("RGB", (32, 16), "blue").save(src, "JPEG")
+            Image.new("RGB", (8, 4), "red").save(dst, "JPEG")
+            os.utime(dst, (1, 1))
+            os.utime(src, (2, 2))
+
+            with mock.patch.object(channel_art, "unhide_file_win") as unhide, \
+                    mock.patch.object(channel_art, "hide_file_win") as hide:
+                ok = channel_art._make_thumb(str(src), str(dst), 12)
+
+            self.assertTrue(ok)
+            unhide.assert_called_once_with(str(dst))
+            hide.assert_called_once_with(str(dst))
+            with Image.open(dst) as thumb:
+                self.assertLessEqual(thumb.width, 12)
 
     def test_deps_installer_rejects_non_http_scheme_before_urlopen(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -8074,6 +8181,9 @@ class FrontendBrowseSourceTests(unittest.TestCase):
         self.assertIn("if (wasAdd && addedChannelName)", editor)
         self.assertIn('"Channel added. Sync now?"', editor)
         self.assertIn('bridgeCall("sync_one_channel"', editor)
+        refresh = editor[editor.index("async function refreshSubsTable"):]
+        self.assertIn("window._primeBrowse(data[0]);", refresh)
+        self.assertNotIn("await window._primeBrowse(data[0]);", refresh)
 
     def test_dense_view_context_toggle_persists_and_is_shared(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -8286,6 +8396,19 @@ class OnboardingMixinServicesTests(unittest.TestCase):
 
 
 class QueueMixinServicesTests(unittest.TestCase):
+    def test_session_error_clear_drives_native_error_indicator(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1] / "web" / "statusBar.js"
+        ).read_text(encoding="utf-8")
+        clear_block = source[
+            source.index('getElementById("gsb-errors-clear")'):
+            source.index('getElementById("gsb-errors-open-log")')
+        ]
+
+        self.assertIn('"app_session_errors_changed"', source)
+        self.assertIn("_syncNativeErrorIndicator();", clear_block)
+        self.assertIn("_errorCount = 0;", clear_block)
+
     def test_footer_traffic_counter_refreshes_on_queue_edges(self) -> None:
         source = (
             Path(__file__).resolve().parents[1] / "web" / "statusBar.js"
@@ -8500,6 +8623,25 @@ class IndexWriterBusyTests(unittest.TestCase):
 
 
 class WindowMixinServicesTests(unittest.TestCase):
+    def test_session_error_count_controls_native_error_indicator(self) -> None:
+        class Api(WindowMixin):
+            def __init__(self):
+                self._session_error_count = 0
+                self._tray = mock.Mock()
+
+        api = Api()
+
+        raised = api.app_session_errors_changed(3)
+        cleared = api.app_session_errors_changed(0)
+
+        self.assertEqual(raised, {"ok": True, "count": 3})
+        self.assertEqual(cleared, {"ok": True, "count": 0})
+        self.assertEqual(api._session_error_count, 0)
+        self.assertEqual(
+            [call.args[0] for call in api._tray.set_error.call_args_list],
+            [3, 0],
+        )
+
     def test_focus_clears_unseen_download_badge(self) -> None:
         class Api(WindowMixin):
             def __init__(self):
@@ -9131,6 +9273,35 @@ class QueueStateTests(unittest.TestCase):
 
 
 class DiskWatchTests(unittest.TestCase):
+    def test_permission_failure_does_not_pause_when_root_is_writable(self) -> None:
+        stream = mock.Mock()
+        on_pause = mock.Mock()
+        monitor = disk_watch.DiskErrorMonitor(
+            stream, on_pause, mock.Mock(), lambda: "X:\\Archive")
+        line = ("_write_jsonl_entry failed: [Errno 13] Permission denied: "
+                "'X:\\Archive\\.Channel Transcript.jsonl.tmp'")
+
+        with mock.patch.object(disk_watch, "_check_directory_writable",
+                               return_value=True):
+            monitor.scan_line(line)
+
+        self.assertFalse(monitor.is_active())
+        on_pause.assert_not_called()
+
+    def test_permission_failure_pauses_when_root_probe_fails(self) -> None:
+        monitor = disk_watch.DiskErrorMonitor(
+            mock.Mock(), mock.Mock(), mock.Mock(), lambda: "X:\\Archive")
+        line = ("Unable to open output for writing: Permission denied: "
+                "'X:\\Archive\\video.mp4'")
+
+        with mock.patch.object(disk_watch, "_check_directory_writable",
+                               return_value=False), \
+                mock.patch.object(monitor, "_enter_error_state") as enter:
+            monitor.scan_line(line)
+
+        self.assertTrue(monitor.is_active())
+        enter.assert_called_once_with()
+
     def test_retry_tick_recovery_resumes_once_when_raced(self) -> None:
         stream = mock.Mock()
         on_resume = mock.Mock()
@@ -10991,6 +11162,68 @@ class TranscriptFileTests(unittest.TestCase):
             ]
             self.assertTrue(ok)
             self.assertEqual(rows[0]["video_id"], "vid1")
+
+    def test_write_jsonl_entry_recovers_complete_stale_hidden_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, ".Channel Transcript.jsonl")
+            tmp = path + ".tmp"
+            old = transcribe_files._seg_to_jsonl_line(
+                "old-video", "Old", {"start": 0, "end": 1,
+                                       "text": "old", "words": []})
+            recovered = transcribe_files._seg_to_jsonl_line(
+                "recovered-video", "Recovered",
+                {"start": 1, "end": 2, "text": "recovered", "words": []})
+            Path(path).write_text(old, encoding="utf-8")
+            Path(tmp).write_text(old + recovered, encoding="utf-8")
+            transcribe_files._hide_file_win(tmp)
+
+            ok = transcribe_files._write_jsonl_entry(
+                path, "new-video", "New",
+                [{"start": 2, "end": 3, "text": "new", "words": []}],
+            )
+
+            rows = [
+                json.loads(line)
+                for line in Path(path).read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(ok)
+            self.assertEqual([row["video_id"] for row in rows],
+                             ["old-video", "recovered-video", "new-video"])
+            self.assertFalse(os.path.exists(tmp))
+
+    def test_write_jsonl_entry_preserves_conflicting_stale_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, ".Channel Transcript.jsonl")
+            tmp = path + ".tmp"
+            old = transcribe_files._seg_to_jsonl_line(
+                "old-video", "Old", {"start": 0, "end": 1,
+                                       "text": "old", "words": []})
+            conflict = transcribe_files._seg_to_jsonl_line(
+                "other-video", "Other", {"start": 5, "end": 6,
+                                           "text": "other", "words": []})
+            Path(path).write_text(old, encoding="utf-8")
+            Path(tmp).write_text(conflict, encoding="utf-8")
+            transcribe_files._hide_file_win(tmp)
+
+            ok = transcribe_files._write_jsonl_entry(
+                path, "new-video", "New",
+                [{"start": 2, "end": 3, "text": "new", "words": []}],
+            )
+
+            recovery = tmp + ".recovery"
+            rows = [
+                json.loads(line)
+                for line in Path(path).read_text(encoding="utf-8").splitlines()
+            ]
+            recovery_rows = [
+                json.loads(line)
+                for line in Path(recovery).read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(ok)
+            self.assertEqual([row["video_id"] for row in rows],
+                             ["old-video", "new-video"])
+            self.assertEqual(recovery_rows[0]["video_id"], "other-video")
+            self.assertFalse(os.path.exists(tmp))
 
     def test_replace_jsonl_entry_preserves_same_title_different_video_id(self) -> None:
         with tempfile.TemporaryDirectory() as td:

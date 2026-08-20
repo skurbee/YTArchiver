@@ -31,6 +31,13 @@
   let _trafficRefreshPending = false;
   let _trafficRefreshTimer = null;
 
+  function _syncNativeErrorIndicator() {
+    if (!window.YT?.bridge?.isUp?.()) return;
+    window.YT.bridge.bridgeCall(
+      "app_session_errors_changed", { count: _errorCount },
+    ).catch(() => { /* best-effort native indicator */ });
+  }
+
   function _runningItem(list) {
     for (const t of (list || [])) {
       if ((t && t.status) === "running") return t;
@@ -356,6 +363,7 @@
         _errorCount += added;
         _renderErrorsPopover();
         _render();
+        _syncNativeErrorIndicator();
       }
     });
     obs.observe(log, { childList: true });
@@ -448,6 +456,7 @@
       _errorItems = [];
       _renderErrorsPopover();
       _render();
+      _syncNativeErrorIndicator();
       _closeErrorsPopover();
     });
     document.getElementById("gsb-errors-open-log")?.addEventListener("click", () => {
@@ -473,6 +482,9 @@
     _wireErrorCounter();
     _renderErrorsPopover();
     _render();
+    window.addEventListener(
+      "pywebviewready", _syncNativeErrorIndicator, { once: true },
+    );
 
     const hydrateRescan = async () => {
       if (!window.YT?.bridge?.isUp?.()) return;

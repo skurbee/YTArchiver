@@ -79,6 +79,22 @@ class WindowMixin:
             _log.debug("window focus badge reset failed: %s", e)
             return {"ok": False, "error": str(e)}
 
+    def app_session_errors_changed(self, count=0):
+        """Mirror the frontend session-error list onto both native icons."""
+        try:
+            n = max(0, int(count or 0))
+        except Exception:
+            n = 0
+        self._session_error_count = n
+        try:
+            tray = getattr(self, "_tray", None)
+            if tray is not None:
+                tray.set_error(n)
+            return {"ok": True, "count": n}
+        except Exception as exc:
+            _log.debug("native session error indicator update failed: %s", exc)
+            return {"ok": False, "error": str(exc), "count": n}
+
 
     def confirm_close(self, choice, remember=False):
         """Frontend hook for the close-to-tray dialog. `choice` is

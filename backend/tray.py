@@ -31,10 +31,15 @@ ICON_CANDIDATES = [
 
 def activity_spin_color(*, sync_working: bool, gpu_working: bool,
                         traffic_waiting: bool) -> str | None:
-    """Return the native activity-spinner color, or ``None`` when parked."""
+    """Return the native activity-spinner color, or ``None`` when paused/idle.
+
+    A traffic-governor wait is still part of an active sync. Keep the blue
+    spinner moving through that wait; the caller's ``sync_working`` state is
+    what distinguishes active waiting from a genuinely paused queue.
+    """
     if gpu_working:
         return "red"
-    if sync_working and not traffic_waiting:
+    if sync_working:
         return "blue"
     return None
 
@@ -134,6 +139,10 @@ class TrayController:
         # Badge overlay — downloaded-this-session count. 0 = no badge.
         # Mirrors OLD's _tray_set_badge (YTArchiver.py:3457).
         self._badge_count: int = 0
+        # Session-error alert mirrored from the bottom status bar. This takes
+        # visual priority over the ordinary new-download count until the user
+        # clears that error list, while the spinner can remain visible.
+        self._error_count: int = 0
         # The notification-area icon and the taskbar button are distinct
         # Windows surfaces. pystray owns the former; ITaskbarList3 uses this
         # HWND for the small spinner/count overlay on the latter.
@@ -288,6 +297,12 @@ class TrayController:
     def _static_icon_image(self):
         if self._base_img is None:
             return None
+        if self._error_count or self._badge_count:
+            normalized = self._compose_tray_spin_frame(None)
+            if normalized is not None:
+                return normalized
+        if self._error_count:
+            return self._compose_error_badge(self._base_img.copy())
         if self._badge_count:
             return self._compose_badge(self._base_img.copy())
         return self._base_img
@@ -410,6 +425,28 @@ class TrayController:
         if self._spin_thread is None:
             self._refresh_taskbar_static()
 
+    def set_error(self, count: int = 1):
+        """Mirror the frontend session-error count onto both native icons."""
+        try:
+            n = max(0, int(count or 0))
+        except Exception:
+            n = 0
+        if n == self._error_count:
+            return
+        self._error_count = n
+        if self._spin_thread is None and self._icon and self._base_img:
+            try:
+                with self._icon_lock:
+                    self._icon.icon = self._static_icon_image()
+            except Exception as exc:
+                _log.debug("tray error indicator refresh failed: %s", exc)
+        if self._spin_thread is None:
+            self._refresh_taskbar_static()
+
+    @property
+    def error_active(self) -> bool:
+        return self._error_count > 0
+
     def _compose_badge(self, img):
         """Draw `self._badge_count` into the bottom-right of an icon copy."""
         try:
@@ -441,6 +478,43 @@ class TrayController:
             _log.debug("swallowed: %s", e)
         return img
 
+    def _draw_error_badge(self, draw, *, cx: int, cy: int,
+                          radius: int) -> None:
+        """Draw a high-contrast red-and-gold exclamation badge."""
+        radius = max(4, int(radius))
+        outline_w = max(1, radius // 7)
+        draw.ellipse(
+            [cx - radius, cy - radius, cx + radius, cy + radius],
+            fill=(205, 35, 45, 255),
+            outline=(255, 210, 70, 255),
+            width=outline_w,
+        )
+        bar_half = max(1, radius // 6)
+        bar_top = cy - radius // 2
+        bar_bottom = cy + radius // 6
+        draw.rounded_rectangle(
+            [cx - bar_half, bar_top, cx + bar_half, bar_bottom],
+            radius=max(1, bar_half), fill=(255, 255, 255, 255))
+        dot_radius = max(1, radius // 7)
+        dot_y = cy + radius // 2
+        draw.ellipse(
+            [cx - dot_radius, dot_y - dot_radius,
+             cx + dot_radius, dot_y + dot_radius],
+            fill=(255, 255, 255, 255),
+        )
+
+    def _compose_error_badge(self, img):
+        try:
+            draw = self._ImageDraw.Draw(img)
+            w, h = img.size
+            radius = max(6, min(w, h) // 3)
+            self._draw_error_badge(
+                draw, cx=w - radius - 1, cy=h - radius - 1,
+                radius=radius)
+        except Exception as exc:
+            _log.debug("tray error badge composition failed: %s", exc)
+        return img
+
     def _compose_taskbar_overlay(self, frame: int | None = None):
         """Build a transparent spinner/badge for the taskbar button."""
         if self._Image is None or self._ImageDraw is None:
@@ -460,7 +534,11 @@ class TrayController:
                         [x - 3, y - 3, x + 3, y + 3],
                         fill=(base[0], base[1], base[2], alpha),
                     )
-            if self._badge_count:
+            if self._error_count:
+                radius = 8 if frame is not None else 12
+                self._draw_error_badge(
+                    draw, cx=16, cy=16, radius=radius)
+            elif self._badge_count:
                 radius = 8 if frame is not None else 12
                 cx = cy = 16
                 draw.ellipse(
@@ -492,6 +570,29 @@ class TrayController:
             _log.debug("taskbar overlay composition failed: %s", exc)
             return None
 
+    def _compose_tray_spin_frame(self, frame: int | None):
+        """Build a tray-sized app icon with its current overlay."""
+        if self._base_img is None or self._Image is None:
+            return None
+        overlay = self._compose_taskbar_overlay(frame)
+        if overlay is None:
+            return self._base_img.copy()
+        try:
+            # icon.ico is 256px, while Windows normally renders notification-
+            # area icons at 16-32px. Drawing directly on the source icon made
+            # the old six-pixel spinner shrink to less than one screen pixel.
+            size = overlay.size
+            base = self._base_img
+            if base.size != size:
+                resampling = getattr(self._Image, "Resampling", self._Image)
+                base = base.resize(size, resampling.LANCZOS)
+            else:
+                base = base.copy()
+            return self._Image.alpha_composite(base, overlay)
+        except Exception as exc:
+            _log.debug("tray spinner composition failed: %s", exc)
+            return self._base_img.copy()
+
     def _refresh_taskbar_static(self) -> None:
         """Show the unseen-download badge, or clear an idle overlay."""
         if not self._taskbar_hwnd:
@@ -499,7 +600,12 @@ class TrayController:
         try:
             from .taskbar_overlay import WindowsTaskbarOverlay
             with WindowsTaskbarOverlay(self._taskbar_hwnd) as overlay:
-                if self._badge_count:
+                if self._error_count:
+                    overlay.set_pil_image(
+                        self._compose_taskbar_overlay(),
+                        "YTArchiver errors need attention — open for details",
+                    )
+                elif self._badge_count:
                     overlay.set_pil_image(
                         self._compose_taskbar_overlay(),
                         f"{self._badge_count} new downloads",
@@ -510,7 +616,6 @@ class TrayController:
             _log.debug("taskbar static overlay failed: %s", exc)
 
     def _spin_loop(self, epoch: int = 0):
-        import math
         frame = 0
         taskbar = None
         if self._taskbar_hwnd:
@@ -519,14 +624,6 @@ class TrayController:
                 taskbar = WindowsTaskbarOverlay(self._taskbar_hwnd)
             except Exception as exc:
                 _log.debug("taskbar spinner setup failed: %s", exc)
-        # .txt issue: the spin animation was barely visible — a single
-        # 4-pixel dot in a 32x32 icon at typical DPI. Draw a brighter
-        # ring of fading dots so the animation reads at a glance even
-        # on hi-DPI displays. Eight dots, with the "head" of the spin
-        # at full opacity and trailing dots fading down.
-        DOT_COUNT = 8
-        # Trailing dot opacities — head bright, tail dim.
-        OPACITIES = [255, 220, 180, 140, 100, 70, 40, 25]
         while not self._spin_stop.is_set():
             # If a newer start_spin was issued after our join-timeout,
             # the epoch will have bumped — bail rather than fight the
@@ -534,27 +631,8 @@ class TrayController:
             if epoch != self._spin_epoch:
                 break
             try:
-                img = self._base_img.copy()
-                draw = self._ImageDraw.Draw(img)
-                w, h = img.size
-                # Center the ring near the bottom-right but with enough
-                # margin for the radius so dots stay inside the icon.
-                cx = w - 8
-                cy = h - 8
-                ring_r = min(6, w // 5)
-                dot_r = max(2, ring_r // 3)
-                base_color = self._spin_color  # RGBA tuple
-                for i in range(DOT_COUNT):
-                    angle = (frame * 45 - i * (360 / DOT_COUNT)) % 360
-                    x = cx + ring_r * math.cos(math.radians(angle))
-                    y = cy + ring_r * math.sin(math.radians(angle))
-                    a = OPACITIES[i] if i < len(OPACITIES) else 25
-                    fill = (base_color[0], base_color[1], base_color[2], a)
-                    draw.ellipse([x - dot_r, y - dot_r,
-                                  x + dot_r, y + dot_r], fill=fill)
-                if self._badge_count:
-                    img = self._compose_badge(img)
-                if self._icon:
+                img = self._compose_tray_spin_frame(frame)
+                if self._icon and img is not None:
                     with self._icon_lock:
                         self._icon.icon = img
                 if taskbar is not None and taskbar.available:

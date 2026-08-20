@@ -129,6 +129,9 @@ class LogStreamer:
         # Optional line-by-line scanners (e.g. disk-error watchdog). Each
         # callable receives the concatenated text of one emitted line.
         self._line_scanners: list = []
+        # Semantic-tag scanners avoid brittle text matching for exact events
+        # such as a confirmed completed download. Mapping: tag -> callbacks.
+        self._tag_scanners: dict[str, list] = {}
         # Consecutive evaluate_js drop counter — declared here so it isn't
         # lazily materialized on the error path (see _do_flush).
         self._drop_count = 0
@@ -155,8 +158,14 @@ class LogStreamer:
         if callable(fn):
             self._line_scanners.append(fn)
 
+    def add_tag_scanner(self, tag: str, fn) -> None:
+        """Invoke ``fn(text)`` when an emitted line carries ``tag``."""
+        marker = str(tag or "").strip()
+        if marker and callable(fn):
+            self._tag_scanners.setdefault(marker, []).append(fn)
+
     def _run_line_scanners(self, segments: SegmentList):
-        if not self._line_scanners:
+        if not self._line_scanners and not self._tag_scanners:
             return
         try:
             text = "".join(str(seg[0] or "") for seg in segments if seg)
@@ -165,6 +174,21 @@ class LogStreamer:
         for fn in list(self._line_scanners):
             try: fn(text)
             except Exception as e: _log.debug("swallowed: %s", e)
+        if not self._tag_scanners:
+            return
+        markers: set[str] = set()
+        for seg in segments:
+            if not isinstance(seg, (list, tuple)) or len(seg) < 2:
+                continue
+            tag = seg[1]
+            if isinstance(tag, (list, tuple, set)):
+                markers.update(str(item) for item in tag if item)
+            elif tag:
+                markers.add(str(tag))
+        for marker in markers:
+            for fn in list(self._tag_scanners.get(marker, ())):
+                try: fn(text)
+                except Exception as e: _log.debug("swallowed: %s", e)
 
     # ── main log ──
 

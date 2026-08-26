@@ -66,6 +66,28 @@ class SyncMixin:
             return False
 
 
+    def _drain_pending_redownload_after_sync(self):
+        """Start the redownload chain after a regular sync releases the lane."""
+        try:
+            with self._redwnl_lock:
+                if not self._redwnl_pending:
+                    return
+                # chan_redownload re-appends this item and starts the shared
+                # worker now that the regular sync thread has exited.
+                first = self._redwnl_pending.pop(0)
+            ch = first.get("ch") or {}
+            new_res = first.get("new_res") or "best"
+            self.chan_redownload(
+                ch,
+                new_res,
+                scope=first.get("scope"),
+                only_video=first.get("only_video"),
+            )
+        except Exception as e:
+            _log.warning(
+                "post-sync redownload drain failed for queued task: %s", e)
+
+
     def sync_start_all(self, add_downloads_from_config=True, scheduled=False,
                        traffic_reservation_id=None):
         """Kick off the sync worker thread.
@@ -309,30 +331,11 @@ class SyncMixin:
                 # there forever. Defer to after our finally returns
                 # so _sync_thread.is_alive() reads False when the
                 # chain worker is spawned.
-                def _maybe_drain_redwnl():
-                    try:
-                        with self._redwnl_lock:
-                            pending = list(self._redwnl_pending)
-                        if not pending:
-                            return
-                        # Fire the existing chain-worker entry point.
-                        # chan_redownload with an existing-pending
-                        # list spawns the worker if no sync is running.
-                        first = pending[0]
-                        ch = first.get("ch") or {}
-                        new_res = first.get("new_res") or "best"
-                        # Pop the head; chan_redownload re-appends.
-                        with self._redwnl_lock:
-                            if self._redwnl_pending:
-                                self._redwnl_pending.pop(0)
-                        # Carry the original scope (year/month) so a scoped
-                        # redownload queued during a sync doesn't drain as a
-                        # WHOLE-channel redownload (audit r2).
-                        self.chan_redownload(ch, new_res,
-                                             scope=first.get("scope"))
-                    except Exception as e:
-                        _log.warning("post-sync redownload drain failed for queued channel: %s", e)
-                try: threading.Timer(0.6, _maybe_drain_redwnl).start()
+                try:
+                    threading.Timer(
+                        0.6,
+                        self._drain_pending_redownload_after_sync,
+                    ).start()
                 except Exception as e: _log.debug("swallowed: %s", e)
                 # Scheduled second push AFTER this thread's finally
                 # actually returns. Without this, _on_queue_changed

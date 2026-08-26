@@ -233,10 +233,23 @@ class VideoMixin:
                           else (ch.get("folder") or channel_name))
         except Exception:
             _ch_folder = ch.get("folder") or channel_name
-        # Redownload JUST this one video: reuse the channel redownload
-        # pipeline (match → containment → replace) but pass only_video_id so it
-        # filters to this single file instead of re-downloading the WHOLE
-        # channel (audit r2: this per-video button was a whole-channel redownload).
+        # Route Browse/Watch work through the shared sync/redownload lane.
+        # When a sync is already active this becomes a visible queued task and
+        # starts only after the current pass releases the lane.
+        queue_redownload = getattr(self, "chan_redownload", None)
+        if callable(queue_redownload):
+            return queue_redownload(
+                {"name": channel_name},
+                res,
+                only_video={
+                    "video_id": vid,
+                    "filepath": filepath,
+                    "title": title,
+                },
+            )
+
+        # Isolated VideoMixin users/tests do not compose ChannelMixin. Keep a
+        # direct fallback, still using the exact-file fast path.
         try:
             from backend import redownload as _rd
             log_stream = self._video_log_stream()
@@ -256,6 +269,8 @@ class VideoMixin:
                         confirm_cb=None,
                         queues=queues,
                         only_video_id=vid,
+                        only_filepath=filepath,
+                        only_title=title,
                     )
                 except Exception as e:
                     log_stream.emit_error(

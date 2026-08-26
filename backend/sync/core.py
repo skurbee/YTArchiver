@@ -3342,8 +3342,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                           "red"], ["\n", "red"]])
             stream.emit([["█  ", "red"],
                          ["It's almost certainly out of date — YouTube "
-                          "changes break old yt-dlp. Update it in "
-                          "Settings → Update yt-dlp, then sync again.",
+                          "changes break old yt-dlp. Update it in Health → "
+                          "Tools → yt-dlp → Update, then sync again.",
                           "red"], ["\n", "red"]])
             stream.emit([[_sbar + "\n\n", "red"]])
     if _good_rcs:

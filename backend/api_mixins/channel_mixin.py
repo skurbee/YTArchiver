@@ -653,7 +653,11 @@ class ChannelMixin:
             try:
                 cur = self._queues.current_sync or {}
                 if ((cur.get("kind") or "").lower() == "redownload"
-                        and (cur.get("url") or "").strip() == ch_url):
+                        and (
+                            (cur.get("url") or "").strip() == ch_url
+                            or (cur.get("channel_url") or "").strip()
+                            == ch_url
+                        )):
                     was_running = True
                     # Per-channel cancel sets the REDOWNLOAD event only
                     # — setting the shared _sync_cancel here killed
@@ -670,8 +674,12 @@ class ChannelMixin:
                     before = len(self._redwnl_pending)
                     self._redwnl_pending = [
                         it for it in self._redwnl_pending
-                        if (it.get("rd_task", {}).get("url") or "").strip()
-                        != ch_url
+                        if (
+                            (it.get("rd_task", {}).get("url") or "").strip()
+                            != ch_url
+                            and (it.get("rd_task", {}).get("channel_url")
+                                 or "").strip() != ch_url
+                        )
                     ]
                     if len(self._redwnl_pending) < before:
                         was_queued = True
@@ -682,8 +690,17 @@ class ChannelMixin:
             # in _redwnl_pending if the worker already popped it).
             try:
                 if ch_url:
-                    removed = self._queues.sync_remove(ch_url)
-                    was_queued = was_queued or bool(removed)
+                    for task in self._queues.sync_snapshot():
+                        if ((task.get("kind") or "").lower() != "redownload"
+                                or (
+                                    (task.get("url") or "").strip() != ch_url
+                                    and (task.get("channel_url") or "").strip()
+                                    != ch_url
+                                )):
+                            continue
+                        removed = self._queues.sync_remove(
+                            (task.get("url") or "").strip())
+                        was_queued = was_queued or bool(removed)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
 
@@ -847,7 +864,7 @@ class ChannelMixin:
 
 
     def chan_redownload(self, folder_or_name, new_resolution=None,
-                        scope=None):
+                        scope=None, only_video=None):
         """Queue a channel's videos for redownload at a new resolution.
 
         Runs the full pipeline in `backend/redownload.py` — scans local files,
@@ -917,8 +934,53 @@ class ChannelMixin:
                 return {"ok": False,
                         "error": f"Scope folder missing: {sub}"}
             folder = sub
+
+        only_video = only_video if isinstance(only_video, dict) else {}
+        if only_video:
+            video_id = str(only_video.get("video_id") or "").strip()
+            filepath = str(only_video.get("filepath") or "").strip()
+            if not video_id or not filepath:
+                return {"ok": False,
+                        "error": "Single-video redownload needs an indexed "
+                                 "video ID and filepath."}
+            video_title = (str(only_video.get("title") or "").strip()
+                           or os.path.splitext(os.path.basename(filepath))[0])
+            only_video = {
+                "video_id": video_id,
+                "filepath": filepath,
+                "title": video_title,
+            }
+
+        # Build both the durable UI task and the richer in-memory work item
+        # before the running-worker gate so an active sync can queue this
+        # request instead of launching it concurrently.
+        _rd_task = dict(ch)
+        _rd_task["kind"] = "redownload"
+        _rd_task["redownload_res"] = new_res
+        _rd_task["scope"] = scope
+        if only_video:
+            _rd_task.update({
+                "name": only_video["title"],
+                "url": ("https://www.youtube.com/watch?v="
+                        f"{only_video['video_id']}"),
+                "channel_name": ch.get("name") or ch.get("folder") or "",
+                "channel_url": ch.get("url") or "",
+                "only_video_id": only_video["video_id"],
+                "only_filepath": only_video["filepath"],
+                "only_title": only_video["title"],
+            })
+        _pending_item = {
+            "ch": dict(ch),
+            "folder": folder,
+            "new_res": new_res,
+            "scope_label": scope_label,
+            "scope": scope,
+            "only_video": only_video,
+            "rd_task": _rd_task,
+        }
+
         # Gate behavior:
-        #   - If a regular (non-redownload) sync is running, refuse.
+        #   - If a regular sync is running, queue behind it.
         #   - If a redownload is running, QUEUE this request so the
         #     worker picks it up after the current one finishes.
         #   - If nothing is running, start a worker that drains the
@@ -928,63 +990,31 @@ class ChannelMixin:
         _sync_alive = bool(self._sync_thread and self._sync_thread.is_alive())
         if _sync_alive:
             _cur = self._queues.current_sync or {}
-            # previously a regular-sync-in-flight refused
-            # the redownload outright. Now we surface a clearer error
-            # AND enqueue it on the redownload chain so a follow-up
-            # "Start" click can drain it after the current sync ends.
-            # (A fully-automatic hand-off would require sync_start_all
-            # to drain _redwnl_pending on completion — left for a
-            # follow-up since it crosses two worker abstractions.)
             if (_cur.get("kind") or "").lower() != "redownload":
-                # Pre-check for duplicate enqueue against the same
-                # channel URL so a user clicking multiple times doesn't
-                # pile up the same redownload in the pending list.
-                _ch_url = (ch.get("url") or "").strip()
+                # A regular sync owns the lane. Persist + expose the request
+                # now; the sync completion hook starts the redownload chain.
+                _task_url = (_rd_task.get("url") or "").strip()
                 with self._redwnl_lock:
                     _already = any(
-                        (p.get("ch") or {}).get("url") == _ch_url
-                        for p in self._redwnl_pending) if _ch_url else False
+                        (p.get("rd_task") or {}).get("url") == _task_url
+                        for p in self._redwnl_pending
+                    ) if _task_url else False
                     if not _already:
-                        self._redwnl_pending.append({
-                            "ch": dict(ch),
-                            "folder": folder,
-                            "new_res": new_res,
-                        "scope_label": scope_label,
-                        "scope": scope,
-                        "rd_task": dict(ch, kind="redownload",
-                                         redownload_res=new_res,
-                                         scope=scope),
-                    })
+                        self._redwnl_pending.append(_pending_item)
+                        try:
+                            self._queues.sync_enqueue(_rd_task)
+                        except Exception as e:
+                            _log.warning(
+                                "redownload sync_enqueue failed; task won't "
+                                "appear in Tasks popover: %s", e)
                 try: self._on_queue_changed()
                 except Exception as e: _log.debug("swallowed: %s", e)
-                # Branch on `_already` so the second click on the same
-                # channel doesn't get the same "queued" message that
-                # the first click got — the second click did NOT
-                # actually enqueue, and the user deserves to know
-                # (audit: channel_mixin H3).
                 if _already:
                     return {"ok": False,
-                            "error": "Redownload already queued for this channel."}
-                return {"ok": False,
-                        "error": "Sync pipeline running — redownload queued. "
-                                 "It will start when the current sync ends."}
+                            "error": "Redownload is already queued."}
+                return {"ok": True, "queued": True, "started": False,
+                        "resolution": new_res}
             # Fall through into the enqueue path below.
-
-        # Build a queue item + the UI-visible task dict. (folder + scope_label
-        # were already narrowed above, before the gate; `scope` is carried so
-        # the sync-side drain can re-narrow correctly — audit r2.)
-        _rd_task = dict(ch)
-        _rd_task["kind"] = "redownload"
-        _rd_task["redownload_res"] = new_res
-        _rd_task["scope"] = scope
-        _pending_item = {
-            "ch": dict(ch),
-            "folder": folder,
-            "new_res": new_res,
-            "scope_label": scope_label,
-            "scope": scope,
-            "rd_task": _rd_task,
-        }
 
         with self._redwnl_lock:
             # Always enqueue to the internal chain.
@@ -1047,7 +1077,8 @@ class ChannelMixin:
                     try:
                         self._run_redownload_one(
                             item["ch"], item["folder"],
-                            item["new_res"], item["scope_label"])
+                            item["new_res"], item["scope_label"],
+                            only_video=item.get("only_video"))
                     except Exception as _re:
                         try: self._log_stream.emit_error(
                             f"Redownload crashed: {_re}")

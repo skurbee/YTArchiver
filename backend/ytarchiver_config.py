@@ -84,6 +84,10 @@ DEFAULT_CONFIG = {
     # YouTube fixes days-to-weeks ahead of stable; use it when stable is
     # current but downloads still 403). Read by ytdlp_update().
     "ytdlp_channel": "stable",
+    # Check the selected yt-dlp release channel on app launch when the last
+    # successful check is at least this many days old. 0 disables the check.
+    "ytdlp_update_check_days": 7,
+    "last_ytdlp_update_check_ts": 0.0,
     "autorun_gpu": False,
     "autorun_sync": False,
     "chan_col_widths": {},

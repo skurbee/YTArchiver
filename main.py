@@ -2004,7 +2004,7 @@ def main():
         _start_dark_titlebar_thread()
         try: api.check_dependencies()
         except Exception as e: _log.debug("swallowed: %s", e)
-        try: api.check_ytdlp_freshness()
+        try: api.check_ytdlp_update()
         except Exception as e: _log.debug("swallowed: %s", e)
         # Do not touch YouTube merely because the app opened.  Session health
         # is checked lazily by operations that actually need the network, so

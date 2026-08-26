@@ -709,10 +709,10 @@ def _match_files_to_ids(local_files: dict[str, str],
         # caused _download_one to overwrite files with the WRONG video's
         # content. The 4 strategies above are safe; falling through here
         # means we genuinely couldn't identify the file — skip it.
-        # Log so the user sees previously-silent skips.
+        # Keep unmatched filenames available in Verbose mode without leaking
+        # hundreds of internal path/matcher diagnostics into Simple mode.
         try:
-            _log.warning("redownload: no safe match for %r — skipping",
-                         fname)
+            _log.debug("redownload: no safe match for %r — skipping", fname)
         except Exception:
             pass
     return matched
@@ -1227,6 +1227,8 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                        confirm_cb: Callable[[float, str, str, int], str] | None = None,
                        queues=None,
                        only_video_id: str = "",
+                       only_filepath: str = "",
+                       only_title: str = "",
                        ) -> dict[str, Any]:
     """Run the full redownload pipeline synchronously. Returns a summary.
 
@@ -1245,8 +1247,12 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     Mirrors OLD's `_show_sample_popup` at YTArchiver.py:10711.
     """
     res_label = "Best" if new_res == "best" else f"{new_res}p"
-    stream.emit([["=== Resolution Redownload: ", "header"],
-                 [f"{ch_name} ({res_label}) ===\n", "header"]])
+    single_video = bool(only_video_id and only_filepath)
+    run_label = (only_title or os.path.splitext(
+        os.path.basename(only_filepath))[0]) if single_video else ch_name
+    header = "Video Redownload" if single_video else "Resolution Redownload"
+    stream.emit([[f"=== {header}: ", "header"],
+                 [f"{run_label} ({res_label}) ===\n", "header"]])
 
     # Pause-on-entry — makes the Resume from a restored pause clean.
     if pause_ev is not None and pause_ev.is_set() and not cancel_ev.is_set():
@@ -1275,7 +1281,27 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     # that obviously had hundreds of files \u2014 the root cause was a
     # mis-built folder argument upstream that pointed at the parent
     # archive root instead of the channel subfolder.
-    local = _scan_local_files(folder)
+    if single_video:
+        # Browse/Watch already resolved the exact archive row. Validate that
+        # path instead of scanning the entire channel to rediscover it.
+        folder_real = os.path.realpath(folder)
+        file_real = os.path.realpath(only_filepath)
+        try:
+            inside_channel = (os.path.normcase(os.path.commonpath(
+                [folder_real, file_real])) == os.path.normcase(folder_real))
+        except (OSError, ValueError):
+            inside_channel = False
+        valid_ext = file_real.lower().endswith(_VIDEO_EXTS)
+        if not inside_channel or not valid_ext or not os.path.isfile(file_real):
+            stream.emit([["  \u2014", "simpleline_redwnl"],
+                         [" Single-video redownload aborted \u2014 indexed "
+                          "file is missing or outside its channel folder.\n",
+                          "red"]])
+            return {"ok": False, "done": 0, "skipped": 0,
+                    "errors": 1, "total": 0}
+        local = {os.path.basename(file_real): file_real}
+    else:
+        local = _scan_local_files(folder)
     if not local:
         if not folder:
             stream.emit([["  \u2014", "simpleline_redwnl"],
@@ -1290,22 +1316,28 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             stream.emit([["  \u2014", "simpleline_redwnl"],
                          [f" No video files in {folder}.\n", "simpleline"]])
         return {"ok": True, "done": 0, "skipped": 0, "errors": 0, "total": 0}
-    stream.emit([["  \u2014", "simpleline_redwnl"],
-                 [f" Found {len(local)} local file(s).\n", "simpleline"]])
+    if not single_video:
+        stream.emit([["  \u2014", "simpleline_redwnl"],
+                     [f" Found {len(local)} local file(s).\n", "simpleline"]])
 
     if cancel_ev.is_set():
         return {"ok": False, "cancelled": True}
 
     # 2. Fetch YouTube catalog (with internet-block protection)
-    if not block_if_down(stream=stream, check_cancel=cancel_ev.is_set):
+    if (not single_video
+            and not block_if_down(
+                stream=stream, check_cancel=cancel_ev.is_set)):
         return {"ok": False, "cancelled": True}
-    stream.emit([["  \u2014", "simpleline_redwnl"],
-                 [" Fetching YouTube video list\u2026\n", "simpleline"]])
-    yt_titles = _fetch_yt_catalog(ch_url, cancel_ev, pause_ev, stream,
-                                  queues=queues)
+    if not single_video:
+        stream.emit([["  \u2014", "simpleline_redwnl"],
+                     [" Fetching YouTube video list\u2026\n", "simpleline"]])
+        yt_titles = _fetch_yt_catalog(
+            ch_url, cancel_ev, pause_ev, stream, queues=queues)
+    else:
+        yt_titles = {}
     if cancel_ev.is_set():
         return {"ok": False, "cancelled": True}
-    if not yt_titles:
+    if not single_video and not yt_titles:
         stream.emit([["  \u2014", "simpleline_redwnl"],
                      [" YouTube catalog fetch failed.\n", "red"]])
         # Keep the progress file. The old "stale catalog-vs-progress
@@ -1321,29 +1353,41 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     #    YTArchiver's archive DB. Only parse the much larger metadata JSONL
     #    collection if the DB/catalog/embedded-provenance paths leave files
     #    unresolved.
-    filepath_ids = _build_index_filepath_map(folder)
-    empty_meta = {"by_title": {}, "by_date": {}, "by_id": {}}
-    matched = _match_files_to_ids(
-        local, yt_titles, meta_index=empty_meta,
-        filepath_to_id=filepath_ids)
-    if len(matched) < len(local):
-        matched_names = {m["filename"] for m in matched}
-        unresolved = {name: path for name, path in local.items()
-                      if name not in matched_names}
-        meta_index = _build_metadata_index(folder)
-        matched.extend(_match_files_to_ids(
-            unresolved, yt_titles, meta_index=meta_index,
-            filepath_to_id=filepath_ids))
-    if only_video_id:
-        # Single-video redownload (Watch/Browse "Redownload" on ONE video):
-        # keep only the requested id so the per-video button doesn't
-        # re-download the ENTIRE channel (audit r2). Reuses the whole tested
-        # match/replace/containment pipeline for that one file.
-        matched = [m for m in matched
-                   if (m.get("video_id") or "") == only_video_id]
+    if single_video:
+        matched = [{
+            "filename": os.path.basename(file_real),
+            "filepath": file_real,
+            "video_id": only_video_id,
+            "title": only_title or os.path.splitext(
+                os.path.basename(file_real))[0],
+        }]
+    else:
+        filepath_ids = _build_index_filepath_map(folder)
+        empty_meta = {"by_title": {}, "by_date": {}, "by_id": {}}
+        matched = _match_files_to_ids(
+            local, yt_titles, meta_index=empty_meta,
+            filepath_to_id=filepath_ids)
+        if len(matched) < len(local):
+            matched_names = {m["filename"] for m in matched}
+            unresolved = {name: path for name, path in local.items()
+                          if name not in matched_names}
+            meta_index = _build_metadata_index(folder)
+            matched.extend(_match_files_to_ids(
+                unresolved, yt_titles, meta_index=meta_index,
+                filepath_to_id=filepath_ids))
+        if only_video_id:
+            # Compatibility fallback for callers that have an ID but no exact
+            # filepath. New Browse/Watch calls always take the direct path.
+            matched = [m for m in matched
+                       if (m.get("video_id") or "") == only_video_id]
 
     # 4. Resume support
-    done, broken_counts = _load_progress_state(folder, ch_url, new_res)
+    if single_video:
+        # A manual one-video action must never consume, overwrite, or clear a
+        # saved whole-channel redownload's resume state.
+        done, broken_counts = set(), {}
+    else:
+        done, broken_counts = _load_progress_state(folder, ch_url, new_res)
     if done:
         stream.emit([["  \u2014", "simpleline_redwnl"],
                      [f" Resuming \u2014 {len(done)} already redownloaded.\n",
@@ -1374,6 +1418,12 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     # can rewrite it mid-loop without breaking the closure.
     cur_res = [new_res]
     cur_res_label = [res_label]
+
+    def _save_current_progress() -> bool:
+        if single_video:
+            return True
+        return _save_progress(folder, ch_url, cur_res[0], done,
+                              broken_counts)
     # Active status line — the sticky `[N/total] Redownloading: Ch...`
     # that classic YTArchiver pins at the bottom of the log during a
     # redownload pass (YTArchiver.py:10696 _start_simple_anim).
@@ -1498,7 +1548,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             # that stale resume state in place and process the file normally.
             done.discard(vid)
             broken_counts.pop(vid, None)
-            _save_progress(folder, ch_url, cur_res[0], done, broken_counts)
+            _save_current_progress()
         if already_target:
             # File already at target resolution — skip it. Emit a
             # completed-style `[N/total] filename — already at Xp. skip.`
@@ -1525,7 +1575,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             _emit_active(file_num, _live_total)
             done.add(vid)
             broken_counts.pop(vid, None)
-            _save_progress(folder, ch_url, cur_res[0], done, broken_counts)
+            _save_current_progress()
             n_skipped += 1
             continue
         # Emit / update the sticky active line for this video.
@@ -1608,8 +1658,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                         broken_counts.pop(vid, None)
                     else:
                         broken_counts[vid] = _bc
-                    if not _save_progress(folder, ch_url, cur_res[0], done,
-                                          broken_counts):
+                    if not _save_current_progress():
                         stream.emit_dim(
                             "  \u2014 warning: progress file save failed; "
                             "broken-download retry state may be stale.")
@@ -1649,8 +1698,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                     _emit_active(file_num, _live_total)
                     done.add(vid)
                     broken_counts.pop(vid, None)
-                    _save_progress(folder, ch_url, cur_res[0], done,
-                                   broken_counts)
+                    _save_current_progress()
                     n_skipped += 1
                     continue
             # Resolution guard — never replace an original with a WORSE
@@ -1759,8 +1807,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                              target_fp, _ie)
             done.add(vid)
             broken_counts.pop(vid, None)
-            if not _save_progress(folder, ch_url, cur_res[0], done,
-                                  broken_counts):
+            if not _save_current_progress():
                 stream.emit_dim(
                     "  — warning: progress file save failed; resume "
                     "may retry this video on next run.")
@@ -1910,7 +1957,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     # AND without errors — errored ids are not in `done`, so keeping
     # the file makes the next run retry exactly the failures instead
     # of re-downloading every previously completed video.
-    if not cancel_ev.is_set() and n_err == 0:
+    if not single_video and not cancel_ev.is_set() and n_err == 0:
         _clear_progress(folder)
 
     # Drop the sticky redwnl_active line so the === Redownload

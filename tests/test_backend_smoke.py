@@ -2527,6 +2527,66 @@ class ChannelMixinTests(unittest.TestCase):
             {"ok": False, "error": "Invalid channel argument"},
         )
 
+    def test_single_video_redownload_queues_behind_active_sync(self) -> None:
+        class LiveThread:
+            @staticmethod
+            def is_alive():
+                return True
+
+        class Api(ChannelMixin):
+            def __init__(self):
+                self._sync_thread = LiveThread()
+                self._queues = mock.Mock()
+                self._queues.current_sync = {
+                    "kind": "download",
+                    "name": "Other Channel",
+                }
+                self._queues.sync_enqueue.return_value = True
+                self._redwnl_pending = []
+                self._redwnl_lock = threading.Lock()
+                self._on_queue_changed = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as td:
+            channel_dir = Path(td) / "Channel"
+            channel_dir.mkdir()
+            video = channel_dir / "Favorite.mp4"
+            video.write_bytes(b"video")
+            api = Api()
+            with mock.patch.object(
+                    channel_mixin, "load_config",
+                    return_value={"output_dir": td}), \
+                    mock.patch.object(
+                        channel_mixin.subs_backend, "get_channel",
+                        return_value={
+                            "name": "Channel",
+                            "url": "https://www.youtube.com/@channel",
+                        }), \
+                    mock.patch(
+                        "backend.sync.channel_folder_name",
+                        return_value="Channel"):
+                result = api.chan_redownload(
+                    "Channel",
+                    "best",
+                    only_video={
+                        "video_id": "abc123def45",
+                        "filepath": str(video),
+                        "title": "Favorite",
+                    },
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["queued"])
+        self.assertFalse(result["started"])
+        self.assertEqual(len(api._redwnl_pending), 1)
+        queued_task = api._queues.sync_enqueue.call_args.args[0]
+        self.assertEqual(queued_task["kind"], "redownload")
+        self.assertEqual(queued_task["name"], "Favorite")
+        self.assertEqual(queued_task["only_video_id"], "abc123def45")
+        self.assertEqual(
+            queued_task["url"],
+            "https://www.youtube.com/watch?v=abc123def45",
+        )
+
     def test_chan_open_folder_uses_folder_override(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             override_dir = Path(td) / "Actual_ Folder"
@@ -4482,6 +4542,54 @@ class VideoMixinTests(unittest.TestCase):
         self.assertIs(run.call_args.kwargs["stream"], service_log)
         self.assertIs(run.call_args.kwargs["queues"], service_queues)
         self.assertEqual(run.call_args.kwargs["only_video_id"], "abc123def45")
+        self.assertEqual(
+            run.call_args.kwargs["only_filepath"],
+            r"X:\Archive\Fresh Folder\Video.mp4",
+        )
+        self.assertEqual(run.call_args.kwargs["only_title"], "Video")
+
+    def test_video_redownload_uses_shared_redownload_queue(self) -> None:
+        filepath = r"X:\Archive\Channel\Favorite.mp4"
+
+        class Api(VideoMixin):
+            def __init__(self):
+                self._config = {
+                    "output_dir": r"X:\Archive",
+                    "channels": [{
+                        "name": "Channel",
+                        "url": "https://www.youtube.com/@channel",
+                    }],
+                }
+                self._sync_pause = threading.Event()
+                self.chan_redownload = mock.Mock(return_value={
+                    "ok": True, "queued": True, "started": False,
+                })
+
+        class FakeReader:
+            def execute(self, *args, **kwargs):
+                return self
+
+            def fetchone(self):
+                return (filepath, "Channel")
+
+        api = Api()
+        with mock.patch("backend.index._reader_open",
+                        return_value=FakeReader()), \
+                mock.patch("backend.redownload.redownload_channel") as direct:
+            result = api.video_redownload(
+                "abc123def45", "Favorite", "best")
+
+        self.assertTrue(result["queued"])
+        api.chan_redownload.assert_called_once_with(
+            {"name": "Channel"},
+            "best",
+            only_video={
+                "video_id": "abc123def45",
+                "filepath": filepath,
+                "title": "Favorite",
+            },
+        )
+        direct.assert_not_called()
 
 
 class LogRowsTests(unittest.TestCase):
@@ -6558,6 +6666,77 @@ class RedownloadTests(unittest.TestCase):
             scanned = redownload._scan_local_files(str(root))
         self.assertEqual(set(scanned), {"Video.mp4"})
 
+    def test_single_video_redownload_skips_channel_scan_and_catalog(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            video = root / "Favorite.mp4"
+            video.write_bytes(b"video")
+            progress = root / "_redownload_progress.json"
+            progress.write_text('{"sentinel": true}', encoding="utf-8")
+            stream = log_stream.LogStreamer()
+            stream.simple_mode = True
+
+            with mock.patch.object(
+                    redownload, "_scan_local_files",
+                    side_effect=AssertionError("channel scan used")), \
+                    mock.patch.object(
+                        redownload, "_fetch_yt_catalog",
+                        side_effect=AssertionError("catalog fetch used")), \
+                    mock.patch.object(
+                        redownload, "_build_index_filepath_map",
+                        side_effect=AssertionError("index walk used")), \
+                    mock.patch.object(
+                        redownload, "_build_metadata_index",
+                        side_effect=AssertionError("metadata walk used")), \
+                    mock.patch.object(
+                        redownload, "_match_files_to_ids",
+                        side_effect=AssertionError("matcher used")), \
+                    mock.patch.object(
+                        redownload, "block_if_down",
+                        side_effect=AssertionError("catalog network gate used")), \
+                    mock.patch.object(
+                        redownload, "_already_at_target",
+                        return_value=True), \
+                    mock.patch.object(
+                        redownload, "_ffprobe_embedded_video_id",
+                        return_value=None), \
+                    mock.patch.object(
+                        redownload, "_clear_progress") as clear_progress, \
+                    mock.patch(
+                        "backend.index.refresh_channel_file_sizes",
+                        return_value={"checked": 1}), \
+                    mock.patch(
+                        "backend.archive_scan.update_disk_cache_for_channel"), \
+                    mock.patch(
+                        "backend.autorun.append_history_entry"):
+                result = redownload.redownload_channel(
+                    "Channel",
+                    "https://www.youtube.com/@channel",
+                    str(root),
+                    "best",
+                    stream=stream,
+                    cancel_ev=threading.Event(),
+                    only_video_id="abc123def45",
+                    only_filepath=str(video),
+                    only_title="Favorite",
+                )
+
+            rendered = "\n".join(
+                "".join(str(segment[0]) for segment in line)
+                for line in stream._buffer
+            )
+            progress_text = progress.read_text(encoding="utf-8")
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["skipped"], 1)
+        self.assertIn("Video Redownload: Favorite", rendered)
+        self.assertNotIn("Found ", rendered)
+        self.assertNotIn("Fetching YouTube video list", rendered)
+        self.assertNotIn("Scanning catalog", rendered)
+        self.assertEqual(progress_text, '{"sentinel": true}')
+        clear_progress.assert_not_called()
+
     def test_match_uses_embedded_id_for_renamed_clean_filename(self) -> None:
         video_id = "LCQPEIDgVoQ"
         local = {"Completely renamed.mp4": "C:/archive/video.mp4"}
@@ -6718,6 +6897,43 @@ class RedownloadMixinTests(unittest.TestCase):
             {"url": "https://youtube.com/@correct"},
             "1080",
             scope={"year": "2024", "month": 5},
+        )
+
+    def test_resume_pending_single_video_redownload_preserves_identity(
+            self) -> None:
+        filepath = r"X:\Archive\Channel\Favorite.mp4"
+
+        class Api(RedownloadMixin):
+            def __init__(self):
+                self._queues = mock.Mock()
+                self._queues.sync = [{
+                    "kind": "redownload",
+                    "name": "Favorite",
+                    "url": "https://www.youtube.com/watch?v=abc123def45",
+                    "channel_name": "Channel",
+                    "channel_url": "https://youtube.com/@channel",
+                    "redownload_res": "best",
+                    "only_video_id": "abc123def45",
+                    "only_filepath": filepath,
+                    "only_title": "Favorite",
+                }]
+                self.chan_redownload = mock.Mock(return_value={"ok": True})
+
+        api = Api()
+        result = api.resume_pending_redownloads()
+
+        self.assertEqual(result, {"ok": True, "resumed": 1, "skipped": 0})
+        api._queues.sync_remove.assert_called_once_with(
+            "https://www.youtube.com/watch?v=abc123def45")
+        api.chan_redownload.assert_called_once_with(
+            {"url": "https://youtube.com/@channel"},
+            "best",
+            scope=None,
+            only_video={
+                "video_id": "abc123def45",
+                "filepath": filepath,
+                "title": "Favorite",
+            },
         )
 
     def test_redownload_mixin_prefers_app_services_dependencies(self) -> None:
@@ -8079,6 +8295,35 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(result["started"])
         self.assertNotIn("yt-dlp.exe", cache_after)
 
+    def test_ytdlp_update_check_interval_round_trips_and_is_bounded(self) -> None:
+        saved = []
+
+        class Api(settings_mixin.SettingsMixin):
+            def __init__(self):
+                self._config = {
+                    "log_mode": "Simple",
+                    "ytdlp_update_check_days": 7,
+                    "last_ytdlp_update_check_ts": 123.0,
+                }
+                self._log_stream = mock.Mock()
+                self._transcribe = mock.Mock()
+                self._reload_config = mock.Mock()
+
+        with mock.patch.object(settings_mixin, "config_is_writable",
+                               return_value=True), \
+                mock.patch.object(Api, "_settings_fresh_config",
+                                  return_value=dict(Api()._config)), \
+                mock.patch.object(Api, "_settings_save_config",
+                                  side_effect=lambda cfg: saved.append(dict(cfg)) or True):
+            api = Api()
+            loaded = api.settings_load()
+            result = api.settings_save({"ytdlp_update_check_days": 999})
+
+        self.assertEqual(loaded["ytdlp_update_check_days"], 7)
+        self.assertEqual(loaded["last_ytdlp_update_check_ts"], 123.0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(saved[-1]["ytdlp_update_check_days"], 365)
+
     def test_onboarding_finish_reports_save_failure(self) -> None:
         class Api(OnboardingMixin):
             def _reload_config(self):
@@ -9330,6 +9575,38 @@ class DiskWatchTests(unittest.TestCase):
 
 
 class SyncMixinQueueTests(unittest.TestCase):
+    def test_post_sync_redownload_handoff_preserves_single_video(self) -> None:
+        only_video = {
+            "video_id": "abc123def45",
+            "filepath": r"X:\Archive\Channel\Favorite.mp4",
+            "title": "Favorite",
+        }
+        api = sync_mixin.SyncMixin()
+        api._redwnl_lock = threading.Lock()
+        api._redwnl_pending = [{
+            "ch": {
+                "name": "Channel",
+                "url": "https://youtube.com/@channel",
+            },
+            "new_res": "best",
+            "scope": None,
+            "only_video": only_video,
+        }]
+        api.chan_redownload = mock.Mock(return_value={"ok": True})
+
+        api._drain_pending_redownload_after_sync()
+
+        self.assertEqual(api._redwnl_pending, [])
+        api.chan_redownload.assert_called_once_with(
+            {
+                "name": "Channel",
+                "url": "https://youtube.com/@channel",
+            },
+            "best",
+            scope=None,
+            only_video=only_video,
+        )
+
     def test_sync_one_channel_routes_idle_work_through_persistent_queue(self) -> None:
         api = sync_mixin.SyncMixin()
         api._queues = mock.Mock(sync_paused=False)
@@ -11560,21 +11837,47 @@ class NetworkOutageGuardTests(unittest.TestCase):
                 msg=f"hard-cookie line should not be network-flagged: {line!r}")
 
 
-class YtdlpFreshnessTests(unittest.TestCase):
-    """Regression lock for the stale-yt-dlp startup nudge (root cause of the
-    'idle a month -> channel download face-plants' report). A month-old
-    date-versioned yt-dlp must be flagged stale; a fresh one must not; an
-    unparseable version must fail safe (never flagged)."""
+class YtdlpUpdateCheckTests(unittest.TestCase):
+    """Regression coverage for the cadence-aware yt-dlp release check."""
 
-    def _stub(self, version):
+    class _ImmediateThread:
+        def __init__(self, target, daemon=False):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    class _Response:
+        def __init__(self, tag):
+            self.payload = json.dumps({"tag_name": tag}).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, limit=-1):
+            return self.payload[:limit]
+
+    def _stub(self, version, *, days=7, last_check=0,
+              channel="stable"):
         from backend.api_mixins.settings_mixin import SettingsMixin
 
         class _FakeStream:
             def __init__(self):
                 self.lines = []
+                self.dim = []
+                self.flushed = False
 
             def emit(self, *a, **k):
                 self.lines.append(a)
+
+            def emit_dim(self, line):
+                self.dim.append(line)
+
+            def flush(self):
+                self.flushed = True
 
         class _Stub(SettingsMixin):
             def ytdlp_version(self_inner):
@@ -11583,34 +11886,76 @@ class YtdlpFreshnessTests(unittest.TestCase):
             def _settings_log_stream(self_inner):
                 return self_inner._fake_stream
 
+            def _settings_fresh_config(self_inner):
+                return dict(self_inner._config)
+
+            def _settings_save_config(self_inner, cfg):
+                self_inner.saved.append(dict(cfg))
+                self_inner._config = dict(cfg)
+                return True
+
         s = _Stub()
         s._fake_stream = _FakeStream()
+        s._config = {
+            "ytdlp_update_check_days": days,
+            "last_ytdlp_update_check_ts": last_check,
+            "ytdlp_channel": channel,
+        }
+        s.saved = []
         return s
 
-    def test_old_ytdlp_is_flagged_stale(self):
-        old = datetime.now().date() - __import__("datetime").timedelta(days=120)
-        ver = f"{old.year}.{old.month:02d}.{old.day:02d}"
-        stub = self._stub(ver)
-        r = stub.check_ytdlp_freshness(max_age_days=30)
-        self.assertTrue(r["ok"])
-        self.assertTrue(r["stale"])
-        self.assertGreaterEqual(r["age_days"], 100)
-        self.assertTrue(stub._fake_stream.lines, "stale yt-dlp should emit a warning")
+    def test_disabled_check_does_not_start_worker(self):
+        stub = self._stub("2026.08.19", days=0)
+        with mock.patch.object(settings_mixin.threading, "Thread") as thread:
+            result = stub.check_ytdlp_update()
 
-    def test_fresh_ytdlp_is_not_stale(self):
-        new = datetime.now().date() - __import__("datetime").timedelta(days=2)
-        ver = f"{new.year}.{new.month:02d}.{new.day:02d}"
-        stub = self._stub(ver)
-        r = stub.check_ytdlp_freshness(max_age_days=30)
-        self.assertTrue(r["ok"])
-        self.assertFalse(r["stale"])
-        self.assertFalse(stub._fake_stream.lines, "fresh yt-dlp should not warn")
+        self.assertTrue(result["disabled"])
+        self.assertFalse(result["started"])
+        thread.assert_not_called()
 
-    def test_unparseable_version_fails_safe(self):
-        stub = self._stub("unknown-custom-build")
-        r = stub.check_ytdlp_freshness()
-        self.assertTrue(r["ok"])
-        self.assertFalse(r["stale"])
+    def test_recent_check_is_not_repeated_before_interval(self):
+        now = 2_000_000.0
+        stub = self._stub(
+            "2026.08.19", days=7, last_check=now - (6 * 86_400))
+        with mock.patch("time.time", return_value=now), \
+                mock.patch.object(settings_mixin.threading, "Thread") as thread:
+            result = stub.check_ytdlp_update()
+
+        self.assertFalse(result["due"])
+        self.assertFalse(result["started"])
+        thread.assert_not_called()
+
+    def test_due_check_uses_channel_and_points_warning_to_health(self):
+        now = 2_000_000.0
+        stub = self._stub("2026.08.19", channel="nightly")
+        response = self._Response("2026.08.20.234504")
+        with mock.patch("time.time", return_value=now), \
+                mock.patch.object(settings_mixin.threading, "Thread",
+                                  self._ImmediateThread), \
+                mock.patch("urllib.request.urlopen",
+                           return_value=response) as urlopen:
+            result = stub.check_ytdlp_update()
+
+        self.assertTrue(result["started"])
+        self.assertEqual(stub.saved[-1]["last_ytdlp_update_check_ts"], now)
+        requested_url = urlopen.call_args.args[0].full_url
+        self.assertIn("yt-dlp-nightly-builds", requested_url)
+        warning = str(stub._fake_stream.lines)
+        self.assertIn("Health → Tools → yt-dlp → Update", warning)
+        self.assertNotIn("Settings → Update yt-dlp", warning)
+        self.assertTrue(stub._fake_stream.flushed)
+
+    def test_failed_remote_check_is_retried_next_launch(self):
+        stub = self._stub("2026.08.19")
+        with mock.patch.object(settings_mixin.threading, "Thread",
+                               self._ImmediateThread), \
+                mock.patch("urllib.request.urlopen",
+                           side_effect=OSError("offline")):
+            result = stub.check_ytdlp_update()
+
+        self.assertTrue(result["started"])
+        self.assertFalse(stub.saved)
+        self.assertTrue(any("offline" in line for line in stub._fake_stream.dim))
 
 
 class ManualBackfillDecideTests(unittest.TestCase):

@@ -202,6 +202,10 @@ class SettingsMixin:
             # yt-dlp release channel the updater targets: "stable" or
             # "nightly" (beta). Surfaced by the Health > Tools yt-dlp row.
             "ytdlp_channel": (cfg.get("ytdlp_channel") or "stable"),
+            "ytdlp_update_check_days": int(
+                cfg.get("ytdlp_update_check_days", 7) or 0),
+            "last_ytdlp_update_check_ts": float(
+                cfg.get("last_ytdlp_update_check_ts", 0) or 0),
             # Index tab surfaces these directly — must round-trip.
             "tp_archive_roots": list(cfg.get("tp_archive_roots") or []),
             "auto_index_enabled": bool(cfg.get("auto_index_enabled", False)),
@@ -279,6 +283,12 @@ class SettingsMixin:
         # yt-dlp release channel — only accept the two known values.
         if data.get("ytdlp_channel") in ("stable", "nightly"):
             cfg["ytdlp_channel"] = data["ytdlp_channel"]
+        if "ytdlp_update_check_days" in data:
+            try:
+                cfg["ytdlp_update_check_days"] = max(
+                    0, min(365, int(data["ytdlp_update_check_days"])))
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         # Index-tab persistence: archive roots + auto-index toggle + threshold.
         if isinstance(data.get("tp_archive_roots"), list):
             cfg["tp_archive_roots"] = [str(r) for r in data["tp_archive_roots"] if r]
@@ -415,6 +425,15 @@ class SettingsMixin:
     # 206-213). Cache by yt-dlp path so a user pointing at a new
     # binary still re-probes.
     _ytdlp_version_cache: dict[str, dict] = {}
+    _ytdlp_update_check_lock = threading.Lock()
+    _ytdlp_update_check_running = False
+    _ytdlp_release_apis = {
+        "stable": "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
+        "nightly": (
+            "https://api.github.com/repos/yt-dlp/"
+            "yt-dlp-nightly-builds/releases/latest"
+        ),
+    }
 
     def ytdlp_version(self):
         """Return current yt-dlp version string."""
@@ -436,38 +455,113 @@ class SettingsMixin:
             return _api_err("MISSING_DEPENDENCY", str(e))
 
 
-    def check_ytdlp_freshness(self, max_age_days: int = 30):
-        """Non-blocking startup nudge: warn if yt-dlp's date-based version is
-        older than `max_age_days`. yt-dlp ships 'YYYY.MM.DD' versions; a stale
-        binary silently fails to extract videos (nsig errors), so we surface
-        its age before the user hits a mystery face-plant. Never blocks, never
-        auto-updates — just emits one warning line to the activity log."""
+    @staticmethod
+    def _ytdlp_version_tuple(version):
+        """Return a comparable numeric tuple for stable or nightly versions."""
+        match = re.search(r"(\d{4}(?:\.\d+){2,})", str(version or ""))
+        if not match:
+            return ()
         try:
-            info = self.ytdlp_version()
-            if not info.get("ok"):
-                return {"ok": False}
-            ver = (info.get("version") or "").strip()
-            m = re.match(r"(\d{4})\.(\d{1,2})\.(\d{1,2})", ver)
-            if not m:
-                return {"ok": True, "stale": False}
-            import datetime as _dt
-            rel = _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            age = (_dt.date.today() - rel).days
-            stale = age > max_age_days
-            if stale:
-                try:
+            return tuple(int(part) for part in match.group(1).split("."))
+        except ValueError:
+            return ()
+
+    def _record_ytdlp_update_check(self, checked_at):
+        """Persist a successful remote check without disturbing other fields."""
+        with SettingsMixin._settings_save_lock:
+            cfg = self._settings_fresh_config()
+            cfg["last_ytdlp_update_check_ts"] = float(checked_at)
+            if not self._settings_save_config(cfg):
+                return False
+            cached = getattr(self, "_config", None)
+            if isinstance(cached, dict):
+                cached["last_ytdlp_update_check_ts"] = float(checked_at)
+            return True
+
+    def check_ytdlp_update(self, force=False):
+        """Check the selected yt-dlp channel for a newer release.
+
+        The startup caller uses the configured day interval and returns
+        immediately while the network request runs in a daemon thread. A
+        successful request records its timestamp; failed requests are retried
+        on the next launch. This only checks and notifies — it never installs
+        an update automatically.
+        """
+        import time as _time
+
+        cfg = self._settings_fresh_config()
+        try:
+            interval_days = max(
+                0, min(365, int(cfg.get("ytdlp_update_check_days", 7) or 0)))
+        except (TypeError, ValueError):
+            interval_days = 7
+        now = _time.time()
+        try:
+            last_check = float(cfg.get("last_ytdlp_update_check_ts", 0) or 0)
+        except (TypeError, ValueError):
+            last_check = 0.0
+
+        if not force:
+            if interval_days == 0:
+                return {"ok": True, "started": False, "disabled": True}
+            interval_seconds = interval_days * 86_400
+            if 0 < last_check <= now and now - last_check < interval_seconds:
+                return {"ok": True, "started": False, "due": False}
+
+        with SettingsMixin._ytdlp_update_check_lock:
+            if SettingsMixin._ytdlp_update_check_running:
+                return {"ok": True, "started": False, "running": True}
+            SettingsMixin._ytdlp_update_check_running = True
+
+        def _run():
+            try:
+                import json as _json
+                import urllib.request as _ur
+
+                info = self.ytdlp_version()
+                if not info.get("ok"):
+                    raise RuntimeError(info.get("error") or "yt-dlp not found")
+                current = (info.get("version") or "").strip()
+                current_tuple = self._ytdlp_version_tuple(current)
+                if not current_tuple:
+                    raise RuntimeError(f"unrecognized installed version: {current}")
+
+                channel = (cfg.get("ytdlp_channel") or "stable").strip().lower()
+                if channel not in SettingsMixin._ytdlp_release_apis:
+                    channel = "stable"
+                req = _ur.Request(
+                    SettingsMixin._ytdlp_release_apis[channel],
+                    headers={"User-Agent": "YTArchiver"},
+                )
+                with _ur.urlopen(req, timeout=8) as resp:
+                    data = _json.loads(resp.read(1_000_000))
+                latest = (data.get("tag_name") or "").strip().lstrip("v")
+                latest_tuple = self._ytdlp_version_tuple(latest)
+                if not latest_tuple:
+                    raise RuntimeError("release service returned no version")
+
+                self._record_ytdlp_update_check(now)
+                if latest_tuple > current_tuple:
+                    label = "beta (nightly)" if channel == "nightly" else "stable"
                     self._settings_log_stream().emit([
                         ["⚠ ", "red"],
-                        [f"yt-dlp is {age} days old (v{ver}). YouTube changes "
-                         "often break old yt-dlp — if downloads start failing, "
-                         "update it in Settings → Update yt-dlp.\n", "red"],
+                        [f"yt-dlp {latest} is available on the {label} channel "
+                         f"(installed: {current}). Update it in Health → Tools "
+                         "→ yt-dlp → Update.\n", "red"],
                     ])
-                except Exception as _ee:
-                    _log.debug("ytdlp freshness emit failed: %s", _ee)
-            return {"ok": True, "stale": stale, "age_days": age, "version": ver}
-        except Exception as e:
-            _log.debug("ytdlp freshness check failed: %s", e)
-            return {"ok": False}
+                    self._settings_log_stream().flush()
+            except Exception as e:
+                try:
+                    self._settings_log_stream().emit_dim(
+                        f"[Update] yt-dlp check skipped: {e}")
+                except Exception as log_error:
+                    _log.debug("ytdlp update check log failed: %s", log_error)
+            finally:
+                with SettingsMixin._ytdlp_update_check_lock:
+                    SettingsMixin._ytdlp_update_check_running = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {"ok": True, "started": True, "due": True}
 
     def ytdlp_update(self):
         """Update yt-dlp in a background thread; stream output to the log.

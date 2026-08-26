@@ -6,6 +6,22 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v83.2 - 2026-08-25
+
+### Added
+- **yt-dlp update checks can run automatically at launch.** The selected stable or nightly release channel is checked on a configurable interval, with update notices directing users to the existing Health tool. Automatic installation remains opt-in.
+
+### Fixed
+- **Single-video quality redownloads now share the main sync lane.** Requests made while a subscription sync is active remain visible in the queue and start after that sync releases the worker.
+- **Single-video redownloads avoid channel-wide discovery work.** Exact indexed video identity is carried through the queue, bypassing local-folder enumeration, remote catalog fetching, match scans, and channel-level resume state.
+- **Simple logging stays concise during redownloads.** Internal path-matching diagnostics remain available in Verbose mode without leaking into the default activity view.
+- **yt-dlp recovery guidance points to the current Health location.** Download failure messages and launch checks use the same tool location and selected release channel.
+
+### Validation
+- Backend smoke and sync archive bookkeeping suites passed: 493 tests.
+- Python compile checks and `git diff --check` passed.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
 ## v83.1 - 2026-08-19
 
 ### Added

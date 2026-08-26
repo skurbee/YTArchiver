@@ -30,6 +30,17 @@
               </select>
             </div>
 
+            <label class="edit-gl">Auto-check</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <span class="settings-control-caption">At launch every</span>
+              <input type="number" min="0" max="365" step="1"
+                     class="ctl-input edit-num"
+                     id="settings-ytdlp-check-days" value="7"
+                     title="Check the selected yt-dlp release channel at launch when this many days have passed. Use 0 to disable." />
+              <span class="settings-control-unit">days</span>
+              <span class="settings-inline-note" id="settings-ytdlp-check-status">0 disables</span>
+            </div>
+
           </div>
 
           <label class="subs-section-label">Backup and Migration</label>

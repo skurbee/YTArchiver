@@ -79,6 +79,7 @@
     // Last-persisted disk-staleness, so a blur on an invalid/blank value
     // can revert the field instead of saving garbage.
     let _diskLastGood = "24";
+    let _ytdlpCheckLastGood = "7";
     let _archiveCapacity = { mode: "percent", percent: 90, free_gb: 100 };
     let _archiveCapacityLastGood = "90";
     let _trafficStatus = null;
@@ -260,6 +261,16 @@
         : `Last backup: ${label}`;
     }
 
+    function _fmtYtdlpCheckAge(ts) {
+      if (!ts) return "0 disables · never checked";
+      const wholeDays = Math.max(0,
+        Math.floor((Date.now() / 1000 - ts) / 86400));
+      const label = wholeDays === 0 ? "today"
+        : wholeDays === 1 ? "yesterday"
+        : `${wholeDays} days ago`;
+      return `0 disables · last checked ${label}`;
+    }
+
     async function load() {
       if (!nativeBridgeUp()) return;
       try {
@@ -276,6 +287,18 @@
           ytdlpChannelSel.value =
             ["stable", "nightly"].includes(s.ytdlp_channel) ? s.ytdlp_channel : "stable";
           ytdlpChannelSel._ytddRepaint?.();
+        }
+        const ytdlpCheckEl = document.getElementById("settings-ytdlp-check-days");
+        if (ytdlpCheckEl) {
+          const days = Math.max(0, Math.min(365,
+            parseInt(s.ytdlp_update_check_days ?? 7, 10) || 0));
+          ytdlpCheckEl.value = String(days);
+          _ytdlpCheckLastGood = ytdlpCheckEl.value;
+        }
+        const ytdlpCheckStatus = document.getElementById("settings-ytdlp-check-status");
+        if (ytdlpCheckStatus) {
+          ytdlpCheckStatus.textContent = _fmtYtdlpCheckAge(
+            Number(s.last_ytdlp_update_check_ts) || 0);
         }
         // Startup knobs
         const stEl = document.getElementById("settings-disk-staleness");
@@ -397,6 +420,22 @@
       ?.addEventListener("change", (e) => saveField("close_behavior", e.target.value));
     document.getElementById("settings-auto-backup")
       ?.addEventListener("change", (e) => saveField("auto_backup_interval", e.target.value));
+    const _ytdlpCheckEl = document.getElementById("settings-ytdlp-check-days");
+    _ytdlpCheckEl?.addEventListener("change", () => {
+      const raw = _ytdlpCheckEl.value;
+      const days = parseInt(raw, 10);
+      if (raw === "" || !Number.isFinite(days) || days < 0 || days > 365) {
+        _ytdlpCheckEl.value = _ytdlpCheckLastGood;
+        window._showToast?.("Auto-check interval must be 0–365 days.", "warn");
+        return;
+      }
+      _ytdlpCheckEl.value = String(days);
+      _ytdlpCheckLastGood = _ytdlpCheckEl.value;
+      saveField("ytdlp_update_check_days", days);
+    });
+    _ytdlpCheckEl?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); _ytdlpCheckEl.blur(); }
+    });
     document.getElementById("settings-youtube-traffic-mode")
       ?.addEventListener("change", (e) => {
         const mode = e.target.value;
@@ -522,10 +561,10 @@
       }
     });
 
-    // Reload fields whenever the user switches to the Settings tab.
-    // initTabs wires clicks on .tab elements; we listen on the tab itself.
-    const settingsTab = document.querySelector('.tab[data-tab="settings"]');
-    settingsTab?.addEventListener("click", () => { setTimeout(load, 50); });
+    // Reload fields whenever the user switches to Settings or Health. The
+    // yt-dlp controls live under Health > Tools, while the rest live here.
+    document.querySelectorAll('.tab[data-tab="settings"], .tab[data-tab="health"]')
+      .forEach((tab) => tab.addEventListener("click", () => { setTimeout(load, 50); }));
     // Also load once on boot so values are ready if the user switches fast.
     setTimeout(load, 200);
     const _trafficRefreshIv = setInterval(() => {

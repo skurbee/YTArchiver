@@ -73,8 +73,23 @@ class RedownloadMixin:
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             try:
-                identity = {"url": url} if url else {"name": name}
-                r = self.chan_redownload(identity, res, scope=t.get("scope"))
+                video_id = str(t.get("only_video_id") or "").strip()
+                if video_id:
+                    channel_url = str(t.get("channel_url") or "").strip()
+                    channel_name = str(t.get("channel_name") or "").strip()
+                    identity = ({"url": channel_url} if channel_url
+                                else {"name": channel_name})
+                    r = self.chan_redownload(
+                        identity, res, scope=t.get("scope"),
+                        only_video={
+                            "video_id": video_id,
+                            "filepath": t.get("only_filepath") or "",
+                            "title": t.get("only_title") or name,
+                        })
+                else:
+                    identity = {"url": url} if url else {"name": name}
+                    r = self.chan_redownload(
+                        identity, res, scope=t.get("scope"))
                 if isinstance(r, dict) and r.get("ok"):
                     resumed += 1
                 else:
@@ -84,7 +99,8 @@ class RedownloadMixin:
         return {"ok": True, "resumed": resumed, "skipped": skipped}
 
 
-    def _run_redownload_one(self, ch, folder, new_res, scope_label):
+    def _run_redownload_one(self, ch, folder, new_res, scope_label,
+                            only_video=None):
         """Run ONE redownload to completion. Called from the chain
         worker. Previously inlined as `_run` inside `chan_redownload`;
         extracted so the worker can drain multiple queued items
@@ -97,6 +113,20 @@ class RedownloadMixin:
         _rd_task = dict(ch)
         _rd_task["kind"] = "redownload"
         _rd_task["redownload_res"] = new_res
+        only_video = only_video if isinstance(only_video, dict) else {}
+        if only_video:
+            video_id = str(only_video.get("video_id") or "").strip()
+            video_title = (str(only_video.get("title") or "").strip()
+                           or video_id)
+            _rd_task.update({
+                "name": video_title,
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "channel_name": ch.get("name") or ch.get("folder") or "",
+                "channel_url": ch.get("url") or "",
+                "only_video_id": video_id,
+                "only_filepath": only_video.get("filepath") or "",
+                "only_title": video_title,
+            })
         try:
             queues.set_current_sync(_rd_task)
         except Exception as e:
@@ -104,7 +134,7 @@ class RedownloadMixin:
         try:
             log_stream.emit([
                 ["[Sync] ", "sync_bracket"],
-                [f"Redownload {ch.get('name','?')}{_scope_text} \u2192 ",
+                [f"Redownload {_rd_task.get('name','?')}{_scope_text} \u2192 ",
                  "simpleline_green"],
                 [("Best\n" if new_res == "best" else f"{new_res}p\n"),
                  "simpleline_green"],
@@ -184,6 +214,9 @@ class RedownloadMixin:
                 pause_ev=self._sync_pause,
                 confirm_cb=_confirm,
                 queues=queues,
+                only_video_id=_rd_task.get("only_video_id", ""),
+                only_filepath=_rd_task.get("only_filepath", ""),
+                only_title=_rd_task.get("only_title", ""),
             )
         except Exception as e:
             log_stream.emit_error(f"Redownload crashed: {e}")

@@ -18,6 +18,10 @@ Public surface (re-exported by backend.sync):
     clear_sync_active(name)
     is_sync_active(name) -> bool
     is_any_sync_active() -> bool
+    begin_sync_pass()
+    end_sync_pass()
+    is_sync_pass_active() -> bool
+    is_sync_work_active() -> bool
     set_metadata_changed_hook(hook)
     fire_metadata_changed_hook()
 """
@@ -34,6 +38,14 @@ _log = get_logger(__name__)
 # Channels with an in-flight `sync_channel` call.
 _active_sync_channels: set[str] = set()
 _active_sync_lock = threading.Lock()
+
+# Whole-pass activity is deliberately separate from the per-channel set.
+# `sync_all` clears one channel before advancing to the next, so using only
+# `_active_sync_channels` creates a brief false-idle window between channels.
+# Slow archive maintenance used to enter through that gap and compete with the
+# next foreground channel on pooled storage.
+_active_sync_passes = 0
+_active_sync_pass_lock = threading.Lock()
 
 
 def set_sync_active(channel_name: str) -> None:
@@ -72,6 +84,31 @@ def is_any_sync_active() -> bool:
     """True iff at least one channel is currently mid-sync."""
     with _active_sync_lock:
         return len(_active_sync_channels) > 0
+
+
+def begin_sync_pass() -> None:
+    """Mark one whole `sync_all` pass active (nesting-safe)."""
+    global _active_sync_passes
+    with _active_sync_pass_lock:
+        _active_sync_passes += 1
+
+
+def end_sync_pass() -> None:
+    """Release one whole-pass activity mark; safe after partial failures."""
+    global _active_sync_passes
+    with _active_sync_pass_lock:
+        _active_sync_passes = max(0, _active_sync_passes - 1)
+
+
+def is_sync_pass_active() -> bool:
+    """True while any `sync_all` invocation is still in flight."""
+    with _active_sync_pass_lock:
+        return _active_sync_passes > 0
+
+
+def is_sync_work_active() -> bool:
+    """True for either a whole pass or a direct single-channel sync."""
+    return is_sync_pass_active() or is_any_sync_active()
 
 
 # Metadata-changed hook — Settings → Metadata auto-refreshes its

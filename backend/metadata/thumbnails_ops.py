@@ -499,7 +499,7 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
 
 
 def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
-                                  force: bool = False
+                                  force: bool = False, busy_fn=None
                                   ) -> dict[str, dict[str, Any]]:
     """Issue #154: count thumbnail coverage per channel. Returns
     {channel_lower: {total, with_thumb, missing}}.
@@ -522,6 +522,25 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
     out: dict[str, dict[str, Any]] = {}
     needs_walk: list[tuple[dict[str, Any], Path, str, float]] = []
     active_keys = _active_channel_keys(channels)
+
+    def _busy() -> bool:
+        try:
+            return bool(busy_fn and busy_fn())
+        except Exception:
+            return False
+
+    def _merge_cached_rows() -> dict[str, dict[str, Any]]:
+        """Return best-known values without touching channel folders."""
+        for ch in (channels or []):
+            name = (ch.get("name") or ch.get("folder") or "").lower()
+            cached = cache.get(name)
+            if name and name not in out and cached and "total" in cached:
+                out[name] = {
+                    "total": cached.get("total", 0),
+                    "with_thumb": cached.get("with_thumb", 0),
+                    "missing": cached.get("missing", 0),
+                }
+        return out
 
     # FAST PATH (2026-05-14): when `force=False`, query the DB column
     # `has_thumbnail` instead of walking disk. The column is populated
@@ -576,6 +595,9 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
         except Exception as e:
             _log.warning("thumbnail status DB backfill failed: %s", e)
 
+    if _busy():
+        return _merge_cached_rows()
+
     # Pass 1: figure out which channels can use the cache.
     # Patch fix (v68.3): also distrust cache entries with total>0 but
     # with_thumb=0 — those are the stale writes from before the
@@ -583,6 +605,8 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
     # cache self-heal. (Channels that legitimately have 0 thumbnails
     # pay one extra disk walk per Settings page open; cheap.)
     for ch in (channels or []):
+        if _busy():
+            return _merge_cached_rows()
         folder = _folder_for_channel(ch)
         name = (ch.get("name") or ch.get("folder") or "").lower()
         if not folder or not folder.exists() or not name:
@@ -590,7 +614,9 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
         if name in out:
             # Already filled by the DB fast path above.
             continue
-        fp = _channel_fingerprint(folder)
+        fp = _channel_fingerprint(folder, stop_if=busy_fn)
+        if fp is None:
+            return _merge_cached_rows()
         cached = cache.get(name)
         _cache_looks_stale = (cached
                               and cached.get("total", 0) > 0
@@ -618,6 +644,8 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
     # directory once, then check membership per video.
     def _count_one(item):
         ch, folder, name, fp = item
+        if _busy():
+            return (name, fp, None)
         total = with_thumb = 0
         # Collect every video_id present in any .Thumbnails/ under
         # this channel folder. One folder walk; cheap.
@@ -625,9 +653,13 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
         try:
             id_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
             for dp, _dns, fns in os.walk(str(folder)):
+                if _busy():
+                    return (name, fp, None)
                 if os.path.basename(dp) != ".Thumbnails":
                     continue
                 for fn in fns:
+                    if _busy():
+                        return (name, fp, None)
                     if not fn.lower().endswith(
                             (".jpg", ".jpeg", ".png", ".webp")):
                         continue
@@ -648,6 +680,8 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
         db_name = ch.get("name") or ch.get("folder") or ""
         try:
             for vid_id, _title, _y, _m, path in _scan_channel_videos(folder):
+                if _busy():
+                    return (name, fp, None)
                 total += 1
                 has = 1 if (vid_id and vid_id in all_thumb_vids) else 0
                 if vid_id:
@@ -681,6 +715,8 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
         for fut in as_completed(futures):
             try:
                 name, fp, stats = fut.result()
+                if stats is None:
+                    continue
                 out[name] = stats
                 # Update cache with fresh values + fingerprint.
                 cache[name] = {

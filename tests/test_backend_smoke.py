@@ -48,8 +48,9 @@ from backend import (
     redownload,
     reorg,
     repair_captions,
-    subscriber_counts,
     subs,
+    subscriber_counts,
+    temp_cleanup,
     text_utils,
     thumbnails,
     utils,
@@ -70,6 +71,7 @@ from backend.api_mixins import (
     browse_mixin,
     channel_mixin,
     diagnostics_mixin,
+    index_mixin,
     metadata_mixin,
     settings_mixin,
     subs_mixin,
@@ -100,15 +102,19 @@ from backend.metadata import (
     refresh_fetch,
     refresh_state,
     refresh_views,
+    thumbnails_ops,
 )
 from backend.services import AppServices, BridgeEventBus, file_ops
-from backend.sync import core as sync_core
 from backend.sync import (
+    active_state,
     log_rows,
     quickcheck,
     recent_track,
     sync_helpers,
     ytdlp_session,
+)
+from backend.sync import (
+    core as sync_core,
 )
 from backend.sync.options import (
     build_match_filter,
@@ -566,6 +572,28 @@ class ArchiveMixinTests(unittest.TestCase):
 
 
 class UtilsTests(unittest.TestCase):
+    def test_temp_cleanup_yields_before_archive_walk_when_sync_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            partial = Path(td) / "video.part"
+            partial.write_bytes(b"partial")
+            with mock.patch.object(
+                    temp_cleanup.os, "walk",
+                    side_effect=AssertionError("storage scan started")):
+                cleaned = temp_cleanup.cleanup_folder(
+                    td, busy_fn=lambda: True)
+
+            self.assertEqual(cleaned, 0)
+            self.assertTrue(partial.exists())
+
+    def test_directory_writable_probe_does_not_enumerate_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(
+                    fs_safety.os, "listdir",
+                    side_effect=AssertionError("foreground scan")):
+                self.assertTrue(fs_safety.check_directory_writable(td))
+            self.assertFalse(any(
+                p.name.startswith(".yta_probe_") for p in Path(td).iterdir()))
+
     def test_archive_capacity_percent_threshold_warns(self) -> None:
         with mock.patch.object(archive_capacity.os.path, "isdir",
                                return_value=True), \
@@ -1406,6 +1434,22 @@ class DependencyInstallerTests(unittest.TestCase):
 
 
 class ArchiveScanTests(unittest.TestCase):
+    def test_full_scan_stops_before_channel_walk_when_foreground_busy(
+            self) -> None:
+        with mock.patch.object(
+                archive_scan, "load_config",
+                return_value={"output_dir": "X:/Archive", "channels": [{
+                    "name": "Channel",
+                    "url": "https://www.youtube.com/@channel",
+                }]}), mock.patch.object(
+                    archive_scan, "load_disk_cache", return_value={}), \
+                mock.patch.object(
+                    archive_scan, "scan_channel_folder") as scan_folder:
+            result = archive_scan.scan_all_channels(stop_if=lambda: True)
+
+        self.assertIsNone(result)
+        scan_folder.assert_not_called()
+
     def test_scan_channel_folder_skips_stat_failure_without_sleeping(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -2174,6 +2218,32 @@ class MetadataFetcherTests(unittest.TestCase):
 
 
 class ThumbnailCacheTests(unittest.TestCase):
+    def test_channel_fingerprint_stops_before_storage_probe_when_busy(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+                thumbnails.os, "scandir",
+                side_effect=AssertionError("storage scan started")):
+            result = thumbnails._channel_fingerprint(
+                Path(td), stop_if=lambda: True)
+
+        self.assertIsNone(result)
+
+    def test_thumbnail_status_uses_cache_when_sync_becomes_busy(self) -> None:
+        channel = {"name": "Channel"}
+        cached = {"channel": {
+            "fingerprint": 1.0, "total": 10,
+            "with_thumb": 8, "missing": 2,
+        }}
+        with mock.patch.object(
+                thumbnails_ops, "_load_thumb_cache", return_value=cached), \
+                mock.patch.object(
+                    thumbnails_ops, "_folder_for_channel",
+                    side_effect=AssertionError("storage scan started")):
+            result = thumbnails_ops.count_thumbnail_status_bulk(
+                [channel], busy_fn=lambda: True)
+
+        self.assertEqual(result["channel"]["missing"], 2)
+
     def test_thumbnail_exists_rejects_short_file(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             thumb_dir = Path(td) / ".Thumbnails"
@@ -2784,6 +2854,19 @@ class DiagnosticsMixinTests(unittest.TestCase):
 
 
 class ThumbnailMixinTests(unittest.TestCase):
+    def test_force_thumbnail_status_refuses_during_sync(self) -> None:
+        class Api(ThumbnailMixin):
+            def sync_is_running(self):
+                return True
+
+        with mock.patch(
+                "backend.metadata.count_thumbnail_status_bulk") as count_bulk:
+            result = Api().thumbnail_status_bulk(force=True)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("sync is active", result["error"].lower())
+        count_bulk.assert_not_called()
+
     def test_realign_poll_recovers_partial_lazy_state(self) -> None:
         api = ThumbnailMixin()
         api._realign_jobs = {}
@@ -2915,6 +2998,9 @@ class ThumbnailMixinTests(unittest.TestCase):
         api = Api()
         with mock.patch("backend.api_mixins.thumbnail_mixin.load_config",
                         side_effect=AssertionError("use services")), \
+                mock.patch(
+                    "backend.sync.active_state.is_sync_work_active",
+                    return_value=False), \
                 mock.patch("backend.api_mixins.thumbnail_mixin"
                            ".subs_backend.get_channel",
                            return_value=service_channels[0]), \
@@ -2940,7 +3026,8 @@ class ThumbnailMixinTests(unittest.TestCase):
 
         self.assertEqual(
             status["rows"]["Service Channel"]["missing"], 0)
-        count_bulk.assert_called_once_with(service_channels, force=True)
+        count_bulk.assert_called_once_with(
+            service_channels, force=True, busy_fn=mock.ANY)
         self.assertTrue(single["started"])
         self.assertTrue(bulk["started"])
         self.assertEqual(bulk["channels"], 1)
@@ -4221,6 +4308,29 @@ class RecentMixinTests(unittest.TestCase):
         kwargs = list_all.call_args.kwargs
         self.assertEqual(kwargs["limit"], 1000)
         self.assertEqual(kwargs["offset"], 0)
+        self.assertFalse(kwargs["include_thumbs"])
+
+    def test_video_thumbnail_page_resolves_and_pushes_after_rows(self) -> None:
+        mixin = RecentMixin()
+        mixin._window = mock.Mock()
+        page = {"rows": [{
+            "filepath": "X:/Archive/Channel/2026/video.mp4",
+            "video_id": "abc123def45",
+        }]}
+
+        with mock.patch("backend.api_mixins.recent_mixin.index_backend"
+                        ".list_all_videos", return_value=page) as list_all, \
+                mock.patch("backend.api_mixins.recent_mixin.index_backend"
+                           ".find_thumbnail_channelwide",
+                           return_value="X:/Archive/thumb.jpg"), \
+                mock.patch("backend.api_mixins.recent_mixin.index_backend"
+                           "._file_url", return_value="http://thumb"):
+            mixin._resolve_video_thumbnail_page(("recent", 60, 0, ""))
+
+        self.assertFalse(list_all.call_args.kwargs["include_thumbs"])
+        js = mixin._window.evaluate_js.call_args.args[0]
+        self.assertIn("abc123def45", js)
+        self.assertIn("http://thumb", js)
 
     def test_list_all_videos_error_returns_coerced_offset(self) -> None:
         mixin = RecentMixin()
@@ -7287,6 +7397,46 @@ class SyncCoreTests(unittest.TestCase):
 
         self.assertEqual(found, {video_id})
 
+    def test_sync_all_holds_pass_marker_through_early_return(self) -> None:
+        sync_all_module = __import__(
+            "backend.sync.sync_all", fromlist=["sync_all"])
+        marker_seen: list[bool] = []
+
+        def fake_load_config():
+            marker_seen.append(active_state.is_sync_pass_active())
+            return {"channels": []}
+
+        with mock.patch.object(sync_all_module, "load_config",
+                               side_effect=fake_load_config), \
+                mock.patch.object(sync_all_module, "clear_sync_progress"):
+            result = sync_all_module.sync_all(mock.Mock())
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(marker_seen, [True])
+        self.assertFalse(active_state.is_sync_pass_active())
+
+    def test_post_sync_maintenance_waits_and_coalesces(self) -> None:
+        calls: list[int] = []
+        completed = threading.Event()
+        target = f"coalesce-{id(self)}"
+
+        def maintenance(_target, marker):
+            calls.append(marker)
+            completed.set()
+
+        active_state.begin_sync_pass()
+        try:
+            sync_core._bg_channel_maintenance(
+                "test", maintenance, target, 1)
+            sync_core._bg_channel_maintenance(
+                "test", maintenance, target, 2)
+            self.assertFalse(completed.wait(0.15))
+        finally:
+            active_state.end_sync_pass()
+
+        self.assertTrue(completed.wait(2.0))
+        self.assertEqual(calls, [2])
+
     def test_sync_all_pause_mid_download_keeps_task_visible(self) -> None:
         sync_all_module = __import__(
             "backend.sync.sync_all", fromlist=["sync_all"])
@@ -8964,6 +9114,20 @@ class WindowMixinServicesTests(unittest.TestCase):
 
 
 class IndexMixinServicesTests(unittest.TestCase):
+    def test_unindexed_count_defers_without_disk_walk_during_sync(self) -> None:
+        class Api(IndexMixin):
+            def sync_is_running(self):
+                return True
+
+        with mock.patch.object(
+                index_mixin.os, "walk",
+                side_effect=AssertionError("storage scan started")):
+            result = Api().index_unindexed_count()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["deferred"])
+        self.assertEqual(result["unindexed"], 0)
+
     def test_index_count_transcripts_prefers_app_services_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -1001,18 +1001,39 @@
       closePanel();
     });
 
-    async function refreshSubsTable() {
+    let _subsRefreshInFlight = null;
+    let _subsRefreshQueued = false;
+    let _subsRefreshQueuedPrime = false;
+
+    async function refreshSubsTable(options = {}) {
       if (!nativeBridgeUp()) return;
+      const primeBrowse = options.primeBrowse !== false;
+      if (_subsRefreshInFlight) {
+        _subsRefreshQueued = true;
+        _subsRefreshQueuedPrime = _subsRefreshQueuedPrime || primeBrowse;
+        return _subsRefreshInFlight;
+      }
       try {
-        const data = await bridgeCall("get_subs_channels");
-        if (Array.isArray(data) && data.length === 2) {
-          window.renderSubsTable(data[0], data[1]);
-          // The rich Browse refresh can touch every channel's art on disk.
-          // Let it finish behind the editor instead of delaying closePanel()
-          // and the immediate "Sync now?" prompt after a successful add.
-          window._primeBrowse(data[0]);
-        }
+        _subsRefreshInFlight = (async () => {
+          const data = await bridgeCall("get_subs_channels");
+          if (Array.isArray(data) && data.length === 2) {
+            window.renderSubsTable(data[0], data[1]);
+            // The rich Browse refresh can touch every channel's art on disk.
+            // Per-channel sync pushes opt out; user/startup refreshes keep it.
+            if (primeBrowse) window._primeBrowse(data[0]);
+          }
+        })();
+        await _subsRefreshInFlight;
       } catch (e) { console.warn("refresh failed", e); }
+      finally {
+        _subsRefreshInFlight = null;
+        if (_subsRefreshQueued) {
+          const queuedPrime = _subsRefreshQueuedPrime;
+          _subsRefreshQueued = false;
+          _subsRefreshQueuedPrime = false;
+          setTimeout(() => refreshSubsTable({ primeBrowse: queuedPrime }), 0);
+        }
+      }
     }
     window.refreshSubsTable = refreshSubsTable;
 

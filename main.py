@@ -914,6 +914,38 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         except Exception as e:
             _log.debug("swallowed: %s", e)
 
+        # Every startup archive walk is lowest-priority work. This predicate
+        # stays true for an entire sync worker/pass, allowing a scan that
+        # began before the user pressed Sync/Resume to stop cooperatively
+        # instead of monopolizing pooled-storage metadata I/O underneath it.
+        def _startup_low_priority_busy():
+            try:
+                if index_backend.is_foreground_browse_busy():
+                    return True
+            except Exception:
+                pass
+            try:
+                if self.sync_is_running():
+                    return True
+            except Exception:
+                pass
+            try:
+                if self.archive_single_is_running():
+                    return True
+            except Exception:
+                pass
+            try:
+                mgr = self._transcribe
+                if mgr._current_job is not None:
+                    return True
+            except Exception:
+                pass
+            try:
+                from backend.sync.active_state import is_sync_work_active
+                return bool(is_sync_work_active())
+            except Exception:
+                return False
+
         # ── Stage 2: Disk walk (staleness-gated) ───────────────────────
         def _stage2_disk_walk():
             """Refresh disk-scan cache after Stage 1 makes the UI usable."""
@@ -944,7 +976,17 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                         clean = (ch_name or "")[:32]
                         dots_state["sweep"]["phase"] = "Scanning disk"
                         dots_state["sweep"]["detail"] = f"{idx+1}/{total} \u2014 {clean}"
-                    walked = scan_all_channels(progress_cb=_on_walk)
+                    walked = scan_all_channels(
+                        progress_cb=_on_walk,
+                        stop_if=_startup_low_priority_busy)
+                    if walked is None:
+                        dots_state["sweep"]["phase"] = ""
+                        dots_state["sweep"]["detail"] = ""
+                        s.emit_dim(
+                            " Disk scan deferred — sync or foreground work "
+                            "started; existing cache preserved.")
+                        _flush_now()
+                        return
                     if walked:
                         save_disk_cache(walked)
                         # Persist the timestamp so next boot can decide
@@ -1056,57 +1098,6 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             """Run the archive sweep after disk state is known."""
             output_dir = (cfg.get("output_dir") or "").strip()
             sweep_result = {"registered": 0, "ingested": 0}
-
-            # Startup maintenance is the
-            # LOWEST-priority work in the app. It must fully yield to anything
-            # the user (or autorun) kicks off and NEVER compete for the Z:
-            # pool / SQLite writer / GIL while that runs.
-            #
-            # Gate on the COARSEST signals available so the gate stays CLOSED
-            # for the whole duration of a user-direct action instead of
-            # flickering open between its sub-steps:
-            #   * sync_is_running()           — the sync WORKER THREAD is alive.
-            #       Stays True across ALL channels of a pass. The old gate used
-            #       only is_any_sync_active(), which is set/cleared per channel
-            #       and so flickers False in every gap BETWEEN channels — each
-            #       gap let the sweep thread sneak a chunk of disk I/O
-            #       onto the slow pool mid-pass, stalling the active download.
-            #   * archive_single_is_running() — a single ad-hoc download.
-            #   * _transcribe._current_job    — a Whisper/GPU job finishing.
-            #   * is_any_sync_active()        — belt-and-suspenders fallback.
-            def _startup_low_priority_busy():
-                try:
-                    # User is actively loading a Browse view (Videos grid /
-                    # channel grid). Cold opens do channel-wide thumbnail
-                    # walks on the slow Z: pool — park sweep so the
-                    # foreground query isn't fighting them for the disk.
-                    if index_backend.is_foreground_browse_busy():
-                        return True
-                except Exception:
-                    pass
-                try:
-                    if self.sync_is_running():
-                        return True
-                except Exception:
-                    pass
-                try:
-                    if self.archive_single_is_running():
-                        return True
-                except Exception:
-                    pass
-                try:
-                    mgr = self._transcribe
-                    if mgr._current_job is not None:
-                        return True
-                except Exception:
-                    pass
-                try:
-                    from backend.sync.active_state import (
-                        is_any_sync_active as _any_sync_active,
-                    )
-                    return bool(_any_sync_active())
-                except Exception:
-                    return False
 
             def _run_sweep():
                 if not output_dir:
@@ -2015,7 +2006,19 @@ def main():
         except Exception as e: _log.debug("swallowed: %s", e)
         try:
             from backend.temp_cleanup import startup_cleanup_temps
-            startup_cleanup_temps(api._log_stream)
+            def _startup_cleanup_busy():
+                try:
+                    if api.sync_is_running() or api.archive_single_is_running():
+                        return True
+                except Exception:
+                    pass
+                try:
+                    from backend.sync.active_state import is_sync_work_active
+                    return bool(is_sync_work_active())
+                except Exception:
+                    return False
+            startup_cleanup_temps(
+                api._log_stream, busy_fn=_startup_cleanup_busy)
         except Exception as e: _log.debug("swallowed: %s", e)
         # Legacy upload-timestamp fallback — needed for the Graph tab's Week
         # bucket. Populates only NULL rows from file mtime. New downloads and

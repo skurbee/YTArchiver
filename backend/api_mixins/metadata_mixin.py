@@ -86,9 +86,9 @@ class MetadataMixin:
         the user clicked away and back.
 
         Fired by `sync.active_state.fire_channel_synced_hook` after each
-        channel's done-row emit in sync_all. evaluate_js is cheap when
-        the tab isn't visible, so no throttling needed at the per-
-        channel cadence of a normal sync pass.
+        channel's done-row emit in sync_all. The JS side single-flights
+        repeated refreshes and skips its archive-wide Browse art prime for
+        these per-channel timestamp-only updates.
         """
         if self._window is None:
             return
@@ -100,7 +100,8 @@ class MetadataMixin:
             try: self._reload_config()
             except Exception as e: _log.debug("swallowed: %s", e)
             self._window.evaluate_js(
-                "window.refreshSubsTable && window.refreshSubsTable();")
+                "window.refreshSubsTable && "
+                "window.refreshSubsTable({primeBrowse:false});")
         except Exception as e:
             try: self._metadata_log_stream().emit_dim(
                 f"(subs tab refresh push failed: {e})")

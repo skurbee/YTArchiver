@@ -6,6 +6,21 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v83.3 - 2026-08-29
+
+### Changed
+- **Foreground syncs now take priority over archive maintenance.** Startup scans, transcript-index counts, temporary-file cleanup, thumbnail checks, and other storage-heavy background work yield or defer when sync activity begins.
+- **Post-download maintenance waits for a fully idle sync lane.** Repeated channel-maintenance requests are coalesced and held until the complete multi-channel pass finishes, avoiding storage contention between channels.
+- **The Videos view paints database results before resolving thumbnails.** Thumbnail discovery runs through one background queue and streams images into existing cards without blocking the initial grid.
+
+### Fixed
+- **Large or slow archive folders no longer stall common foreground paths unnecessarily.** Directory writability checks use a collision-safe probe without enumerating the target folder, and long-running archive walks can stop cooperatively when higher-priority work starts.
+- **Repeated Browse and subscription refreshes no longer multiply background work.** Concurrent refresh requests are single-flighted, with one follow-up refresh retained when needed.
+
+### Validation
+- Release gate passed: 503 tests, definite-bug lint checks, and full backend import checks.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
 ## v83.2 - 2026-08-25
 
 ### Added

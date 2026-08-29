@@ -519,11 +519,20 @@ def _channel_folder_name(ch: dict[str, Any]) -> str:
     return _sync.channel_folder_name(ch)
 
 
-def scan_channel_folder(base_dir: Path, channel: dict[str, Any]) -> tuple[int, int]:
+def scan_channel_folder(base_dir: Path, channel: dict[str, Any],
+                        stop_if=None) -> tuple[int, int] | None:
     """Walk a channel's folder, return (num_vids, total_bytes).
 
     Mirrors YTArchiver.py:3012 _scan_channel_disk_info for the two counts we need.
     """
+    def _should_stop() -> bool:
+        try:
+            return bool(stop_if and stop_if())
+        except Exception:
+            return False
+
+    if _should_stop():
+        return None
     folder_name = _channel_folder_name(channel)
     if not folder_name:
         return (0, 0)
@@ -534,7 +543,11 @@ def scan_channel_folder(base_dir: Path, channel: dict[str, Any]) -> tuple[int, i
     total = 0
     zero_byte = 0
     for dp, _dns, fns in os.walk(ch_folder):
+        if _should_stop():
+            return None
         for fn in fns:
+            if _should_stop():
+                return None
             if not fn.lower().endswith(_CHANNEL_VIDEO_EXTS):
                 continue
             if is_partial_artifact(fn, dp):
@@ -610,7 +623,8 @@ def scan_channel_folder(base_dir: Path, channel: dict[str, Any]) -> tuple[int, i
     return (n_vids, total)
 
 
-def scan_all_channels(progress_cb=None) -> dict[str, dict[str, Any]]:
+def scan_all_channels(progress_cb=None,
+                      stop_if=None) -> dict[str, dict[str, Any]] | None:
     """Walk the entire archive. Slow — use only when cache is missing/stale.
 
     progress_cb(current_ch_name: str, done: int, total: int) — optional.
@@ -626,12 +640,20 @@ def scan_all_channels(progress_cb=None) -> dict[str, dict[str, Any]]:
     now = time.time()
     total = len(channels)
     for i, ch in enumerate(channels):
+        try:
+            if stop_if and stop_if():
+                return None
+        except Exception:
+            pass
         if progress_cb:
             try:
                 progress_cb(ch.get("name", ""), i, total)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-        n_vids, size_bytes = scan_channel_folder(base_dir, ch)
+        scanned = scan_channel_folder(base_dir, ch, stop_if=stop_if)
+        if scanned is None:
+            return None
+        n_vids, size_bytes = scanned
         url = ch.get("url", "").strip()
         if url:
             rec = {

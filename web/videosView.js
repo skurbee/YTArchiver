@@ -35,6 +35,8 @@
   let _filter = "";      // title/channel substring filter (server-side)
   let _offset = 0;
   let _loading = false;
+  let _refreshing = false;
+  let _refreshPending = false;
   let _hasMore = true;
   let _seq = 0;          // stale-load guard: a newer sort/reset wins
   let _wired = false;
@@ -99,6 +101,49 @@
     return card;
   }
 
+  function _queueThumbnailPage(sort, offset, filter, rowCount) {
+    if (!rowCount || !nativeBridgeUp()) return;
+    try {
+      const pending = bridgeCall(
+        "queue_video_thumbnails", sort, PAGE, offset, filter);
+      // Deliberately do not await: cards are already visible and thumbnail
+      // filesystem I/O must never put the whole Videos view back behind a
+      // spinner. The backend pushes each URL as it becomes available.
+      pending?.catch?.((e) => console.warn("[videos] thumbnail queue failed", e));
+    } catch (e) {
+      console.warn("[videos] thumbnail queue failed", e);
+    }
+  }
+
+  window._applyVideosThumbnail = function (payload) {
+    const key = String(payload?.key || "");
+    const url = String(payload?.url || "");
+    const g = grid();
+    if (!key || !url || !g) return;
+    for (const card of g.querySelectorAll(".video-card")) {
+      const cardKey = card.dataset.videoId || card.dataset.filepath || "";
+      if (cardKey !== key) continue;
+      const thumbWrap = card.querySelector(".video-thumb");
+      if (!thumbWrap || thumbWrap.querySelector(".video-thumb-img")) continue;
+      const img = document.createElement("img");
+      img.className = "video-thumb-img";
+      img.alt = "";
+      img.loading = "eager";
+      img.decoding = "async";
+      img.addEventListener("load", () => {
+        thumbWrap.style.background = "";
+        const placeholder = Array.from(thumbWrap.children).find((el) =>
+          el.tagName === "SPAN"
+          && !el.classList.contains("video-duration-badge")
+          && !el.classList.contains("video-removed-badge"));
+        placeholder?.remove();
+      }, { once: true });
+      img.addEventListener("error", () => img.remove(), { once: true });
+      img.src = url;
+      thumbWrap.insertBefore(img, thumbWrap.firstChild);
+    }
+  };
+
   async function loadPage(reset) {
     if (!nativeBridgeUp()) return;
     if (_loading) return;
@@ -111,6 +156,7 @@
       g.innerHTML = '<div class="grid-loading"><div class="grid-spinner"></div>'
         + '<span class="grid-loading-label">Loading videos…</span></div>';
     } else if (moreEl) { moreEl.hidden = false; }
+    const pageOffset = _offset;
     try {
       const res = await bridgeCall("list_all_videos", _sort, PAGE, _offset, _filter);
       if (myId !== _seq) return;  // superseded by a newer sort/reset
@@ -124,6 +170,7 @@
       if (g) g.appendChild(frag);
       _offset += rows.length;
       _hasMore = !!(res && res.has_more);
+      _queueThumbnailPage(_sort, pageOffset, _filter, rows.length);
       if (g && _offset === 0) {
         g.innerHTML = _filter
           ? `<div class="browse-empty">No videos match “${_filter
@@ -204,6 +251,10 @@
   // loadPage() always rebuilds it for whatever sort is active.
   window._refreshVideosViewIfActive = async function () {
     if (_loading) return;
+    if (_refreshing) {
+      _refreshPending = true;
+      return;
+    }
     if (!nativeBridgeUp()) return;
     // Background-capable: refresh when the view is visible OR when it was
     // already loaded once (`_firstPageSig` set). Updating the hidden grid
@@ -212,6 +263,7 @@
     // (it'll load fresh on first open). DOM prepends on a hidden grid are
     // cheap and safe.
     if (!isActive() && !_firstPageSig) return;
+    _refreshing = true;
     const sortAtCall = _sort;
     const filterAtCall = _filter;
     try {
@@ -239,6 +291,7 @@
             }
             g.insertBefore(frag, g.firstChild);
             _firstPageSig = newSig;
+            _queueThumbnailPage(sortAtCall, 0, filterAtCall, rows.length);
             return; // done — no blank flash, scroll position preserved
           }
         }
@@ -248,6 +301,13 @@
       // item no longer in the new page because many videos were added).
       loadPage(true);
     } catch (_e) { /* non-fatal — leave the current grid as-is */ }
+    finally {
+      _refreshing = false;
+      if (_refreshPending) {
+        _refreshPending = false;
+        setTimeout(() => window._refreshVideosViewIfActive(), 0);
+      }
+    }
   };
 
   if (document.readyState === "loading") {

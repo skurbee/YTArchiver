@@ -226,7 +226,29 @@ class IndexMixin:
         count so the Search/Graph views can show an amber warning banner
         (YTArchiver.py:24756 _update_index_warning).
         """
+        def _sync_busy() -> bool:
+            try:
+                if self.sync_is_running():
+                    return True
+            except Exception:
+                pass
+            try:
+                from backend.sync.active_state import is_sync_work_active
+                return bool(is_sync_work_active())
+            except Exception:
+                return False
+
+        def _deferred_result():
+            cached = getattr(self, "_index_unindexed_count_cache", None)
+            result = dict(cached) if isinstance(cached, dict) else {
+                "ok": True, "unindexed": 0, "on_disk": 0, "indexed": 0,
+            }
+            result["deferred"] = True
+            return result
+
         try:
+            if _sync_busy():
+                return _deferred_result()
             cfg = self._index_config()
             output_dir = (cfg.get("output_dir") or "").strip()
             if not output_dir or not os.path.isdir(output_dir):
@@ -234,7 +256,11 @@ class IndexMixin:
             # Collect every aggregated JSONL on disk
             on_disk = set()
             for dp, _dns, fns in os.walk(output_dir):
+                if _sync_busy():
+                    return _deferred_result()
                 for fn in fns:
+                    if _sync_busy():
+                        return _deferred_result()
                     if fn.startswith(".") and fn.endswith("Transcript.jsonl"):
                         on_disk.add(os.path.normpath(os.path.join(dp, fn)))
             # Pull the indexed set from the DB. Use the reader connection
@@ -251,8 +277,10 @@ class IndexMixin:
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             unindexed = len(on_disk - indexed)
-            return {"ok": True, "unindexed": unindexed, "on_disk": len(on_disk),
-                    "indexed": len(indexed)}
+            result = {"ok": True, "unindexed": unindexed,
+                      "on_disk": len(on_disk), "indexed": len(indexed)}
+            self._index_unindexed_count_cache = dict(result)
+            return result
         except Exception as e:
             return {"ok": False, "error": str(e)}
 

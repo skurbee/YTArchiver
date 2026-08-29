@@ -6,6 +6,7 @@ import glob
 import json
 import os
 import shutil
+import tempfile
 from typing import Any
 
 from .fs_attrs import _file_has_hidden_attribute
@@ -18,28 +19,24 @@ def check_directory_writable(path: str) -> bool:
     """Can we create + delete a probe file inside `path`? True if yes."""
     if not path:
         return False
+    probe = ""
     try:
         if not os.path.isdir(path):
             return False
-        # clean up any stale probe files from a previous
-        # run (crashed process, antivirus-blocked unlink, etc.) before
-        # writing a new one. Without this, the archive root accumulates
-        # `.yta_probe_<PID>` litter over time.
-        try:
-            for _f in os.listdir(path):
-                if _f.startswith(".yta_probe_"):
-                    try: os.remove(os.path.join(path, _f))
-                    except OSError: pass
-        except OSError:
-            pass
-        probe = os.path.join(path, f".yta_probe_{os.getpid()}")
-        with open(probe, "w", encoding="utf-8") as f:
+        # Do not enumerate the directory here. This preflight runs in the
+        # foreground for every channel; listing a huge pooled-storage folder
+        # can block for minutes when another archive walk is active. mkstemp
+        # gives the probe a collision-safe name without a scan.
+        fd, probe = tempfile.mkstemp(prefix=".yta_probe_", dir=path, text=True)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("ok")
-        try: os.remove(probe)
-        except OSError: pass
         return True
     except OSError:
         return False
+    finally:
+        if probe:
+            try: os.remove(probe)
+            except OSError: pass
 
 
 def check_disk_space(path: str, required_bytes: int) -> bool:

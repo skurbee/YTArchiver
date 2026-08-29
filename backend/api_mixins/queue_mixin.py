@@ -133,13 +133,13 @@ class QueueMixin:
             elif kind == "gpu" and not enabled:
                 # emit an unambiguous log line when the user
                 # disables GPU Auto mid-sync so they understand the
-                # behavior — the in-flight transcription will complete,
-                # then new arrivals will sit in the queue until they
+                # behavior — the in-flight task will complete, then new
+                # GPU processing jobs will sit in the queue until they
                 # re-enable Auto or click Start in the GPU Tasks popover.
                 try:
                     self._queue_log_stream().emit_text(
-                        " - Auto-processing disabled — incoming transcriptions "
-                        "will queue. (In-flight job finishes first.)",
+                        " - Auto-processing disabled — new GPU tasks will queue "
+                        "instead of starting automatically. (In-flight task finishes first.)",
                         "simpleline_blue")
                 except Exception as e:
                     _log.debug("swallowed: %s", e)

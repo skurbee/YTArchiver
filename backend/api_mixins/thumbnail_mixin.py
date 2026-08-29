@@ -38,6 +38,18 @@ class ThumbnailMixin:
                   if services is not None else None)
         return stream if stream is not None else self._log_stream
 
+    def _thumbnail_sync_busy(self) -> bool:
+        try:
+            if self.sync_is_running():
+                return True
+        except Exception:
+            pass
+        try:
+            from backend.sync.active_state import is_sync_work_active
+            return bool(is_sync_work_active())
+        except Exception:
+            return False
+
     def _ensure_realign_jobs(self):
         if (hasattr(self, "_realign_jobs")
                 and hasattr(self, "_realign_jobs_lock")):
@@ -60,12 +72,17 @@ class ThumbnailMixin:
         (wired to the "Force recheck thumbnails" button).
         """
         try:
+            if bool(force) and self._thumbnail_sync_busy():
+                return {"ok": False,
+                        "error": "A sync is active; thumbnail recheck deferred.",
+                        "rows": {}}
             from backend.metadata import count_thumbnail_status_bulk
             cfg = self._thumbnail_config()
             channels = cfg.get("channels", []) or []
             return {"ok": True,
                     "rows": count_thumbnail_status_bulk(
-                        channels, force=bool(force))}
+                        channels, force=bool(force),
+                        busy_fn=self._thumbnail_sync_busy)}
         except Exception as e:
             return {"ok": False, "error": str(e), "rows": {}}
 

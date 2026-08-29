@@ -7,7 +7,10 @@ private Api attributes kept as fallback state.
 """
 from __future__ import annotations
 
+import json
 import os
+import queue
+import threading
 
 from backend import index as index_backend
 from backend.log import swallow
@@ -17,6 +20,8 @@ from ._shared import _log
 
 
 class RecentMixin:
+    _video_thumb_init_lock = threading.Lock()
+
     def _recent_services(self):
         return getattr(self, "services", None)
 
@@ -65,18 +70,110 @@ class RecentMixin:
         except (TypeError, ValueError):
             _offset = 0
         try:
-            # Mark this as a foreground Browse query so the startup sweep
-            # yields the Z: pool to it — a cold Videos open
-            # does up to 60 channel-wide thumbnail walks and must not run
-            # head-to-head with the background walkers on the same disk.
-            with index_backend.foreground_browse():
-                return index_backend.list_all_videos(
-                    sort=str(sort or "recent"),
-                    limit=_limit, offset=_offset,
-                    query=str(query or ""))
+            # The first page must be database-only. Thumbnail discovery probes
+            # the archive filesystem and Windows can park a single stat call
+            # indefinitely when a USB/pool member is timing out. Returning the
+            # rows first lets the UI paint usable cards immediately; the
+            # separate queue_video_thumbnails worker fills images afterward.
+            return index_backend.list_all_videos(
+                sort=str(sort or "recent"),
+                limit=_limit, offset=_offset,
+                include_thumbs=False,
+                query=str(query or ""))
         except Exception as e:
             return {"rows": [], "has_more": False, "offset": _offset,
                     "error": str(e)}
+
+    def _ensure_video_thumbnail_queue(self):
+        with self._video_thumb_init_lock:
+            if not hasattr(self, "_video_thumb_queue"):
+                self._video_thumb_queue = queue.Queue()
+                self._video_thumb_pending = set()
+                self._video_thumb_lock = threading.Lock()
+                self._video_thumb_worker = None
+
+    def _resolve_video_thumbnail_page(self, request):
+        sort, limit, offset, query = request
+        with index_backend.foreground_browse():
+            result = index_backend.list_all_videos(
+                sort=sort, limit=limit, offset=offset,
+                include_thumbs=False, query=query)
+        for row in (result.get("rows") or []):
+            filepath = str(row.get("filepath") or "")
+            video_id = str(row.get("video_id") or "")
+            key = video_id or filepath
+            if not filepath or not key:
+                continue
+            thumb_path = index_backend.find_thumbnail_channelwide(
+                filepath, video_id)
+            if not thumb_path:
+                continue
+            window = getattr(self, "_window", None)
+            if window is None:
+                return
+            payload = json.dumps({
+                "key": key,
+                "url": index_backend._file_url(thumb_path),
+            })
+            try:
+                window.evaluate_js(
+                    "window._applyVideosThumbnail && "
+                    f"window._applyVideosThumbnail({payload});")
+            except Exception as exc:
+                swallow("Videos thumbnail push", exc)
+                return
+
+    def _run_video_thumbnail_queue(self):
+        while True:
+            try:
+                request = self._video_thumb_queue.get(timeout=2.0)
+            except queue.Empty:
+                with self._video_thumb_lock:
+                    if self._video_thumb_queue.empty():
+                        self._video_thumb_worker = None
+                        return
+                continue
+            try:
+                self._resolve_video_thumbnail_page(request)
+            except Exception as exc:
+                swallow("Videos thumbnail background resolve", exc)
+            finally:
+                with self._video_thumb_lock:
+                    self._video_thumb_pending.discard(request)
+                self._video_thumb_queue.task_done()
+
+    def queue_video_thumbnails(self, sort="recent", limit=60, offset=0,
+                               query=""):
+        """Resolve one Videos page's thumbnails without blocking its rows.
+
+        A single daemon worker owns the queue. If Windows parks it on a sick
+        archive device, the already-rendered cards remain usable and repeated
+        UI refreshes do not leak more blocked filesystem threads.
+        """
+        try:
+            _limit = max(1, min(int(limit or 60), 1000))
+        except (TypeError, ValueError):
+            _limit = 60
+        try:
+            _offset = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            _offset = 0
+        request = (
+            str(sort or "recent"), _limit, _offset, str(query or ""))
+        self._ensure_video_thumbnail_queue()
+        with self._video_thumb_lock:
+            if request in self._video_thumb_pending:
+                return {"ok": True, "queued": False, "already_queued": True}
+            self._video_thumb_pending.add(request)
+            self._video_thumb_queue.put(request)
+            worker = self._video_thumb_worker
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(
+                    target=self._run_video_thumbnail_queue,
+                    name="videos-thumbnail-resolver", daemon=True)
+                self._video_thumb_worker = worker
+                worker.start()
+        return {"ok": True, "queued": True}
 
 
     def clear_recent_downloads(self):

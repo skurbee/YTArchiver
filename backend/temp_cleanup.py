@@ -96,16 +96,28 @@ def _dir_is_active(full: str) -> bool:
 is_partial_file = is_partial_artifact
 
 
-def cleanup_folder(folder: str) -> int:
+def cleanup_folder(folder: str, busy_fn=None) -> int:
     """Recursively remove partial files under `folder`. Returns count."""
+    def _busy() -> bool:
+        try:
+            return bool(busy_fn and busy_fn())
+        except Exception:
+            return False
+
+    if _busy():
+        return 0
     if not folder or not os.path.isdir(folder):
         return 0
     cleaned = 0
     failed: list[str] = []
     for dp, dns, fns in os.walk(folder):
+        if _busy():
+            return cleaned
         # Drop any stale temp working dirs (skip ones still in active use)
         drop = [d for d in dns if d in _STALE_TEMP_DIRS]
         for d in drop:
+            if _busy():
+                return cleaned
             full = os.path.join(dp, d)
             if _dir_is_active(full):
                 # Don't recurse into an active temp dir either — its
@@ -119,6 +131,8 @@ def cleanup_folder(folder: str) -> int:
                 _log.debug("swallowed: %s", e)
             dns.remove(d)
         for f in fns:
+            if _busy():
+                return cleaned
             if is_partial_file(f):
                 fp = os.path.join(dp, f)
                 # age-gate partial-file removal so an
@@ -149,7 +163,7 @@ def cleanup_folder(folder: str) -> int:
     return cleaned
 
 
-def startup_cleanup_temps(stream: LogStreamer) -> int:
+def startup_cleanup_temps(stream: LogStreamer, busy_fn=None) -> int:
     """Walk every subscribed channel folder and nuke partial / temp files.
 
     Invoked on launch so a fresh session starts with a clean archive tree.
@@ -164,8 +178,13 @@ def startup_cleanup_temps(stream: LogStreamer) -> int:
     channels = cfg.get("channels", []) or []
     total = 0
     for ch in channels:
+        try:
+            if busy_fn and busy_fn():
+                return total
+        except Exception:
+            pass
         ch_folder = os.path.join(base, _cfn(ch))
-        total += cleanup_folder(ch_folder)
+        total += cleanup_folder(ch_folder, busy_fn=busy_fn)
     if total and stream is not None:
         stream.emit([["[Startup] ", "sync_bracket"],
                      [f"\U0001f9f9 Cleaned {total} leftover temp file(s).\n",

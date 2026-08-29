@@ -32,7 +32,12 @@ from ..ytarchiver_config import ARCHIVE_FILE, config_transaction, load_config
 from . import core as _core
 
 # Helpers used by sync_all
-from .active_state import fire_channel_synced_hook, fire_metadata_changed_hook
+from .active_state import (
+    begin_sync_pass,
+    end_sync_pass,
+    fire_channel_synced_hook,
+    fire_metadata_changed_hook,
+)
 from .core import sync_channel
 from .display_push import clear_sync_progress
 from .log_rows import (
@@ -93,12 +98,14 @@ def _channel_folder_has_media(cfg: dict[str, Any], ch: dict[str, Any]) -> bool:
         return True
 
 
-def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
-             only_with_new: bool = True, queues=None, transcribe_mgr=None,
-             pause_event: threading.Event | None = None,
-             skip_event: threading.Event | None = None,
-             add_downloads_from_config: bool = True,
-             autosync: bool = False) -> dict[str, Any]:
+def _sync_all_impl(stream: LogStreamer,
+                   cancel_event: threading.Event | None = None,
+                   only_with_new: bool = True, queues=None,
+                   transcribe_mgr=None,
+                   pause_event: threading.Event | None = None,
+                   skip_event: threading.Event | None = None,
+                   add_downloads_from_config: bool = True,
+                   autosync: bool = False) -> dict[str, Any]:
     """
     Sync every channel in config["channels"] sequentially.
 
@@ -1349,3 +1356,25 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
             "downloaded": sum_dl, "errors": sum_err,
             "skipped": skipped,
             "took": _fmt_duration(elapsed), "total": total}
+
+
+def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
+             only_with_new: bool = True, queues=None, transcribe_mgr=None,
+             pause_event: threading.Event | None = None,
+             skip_event: threading.Event | None = None,
+             add_downloads_from_config: bool = True,
+             autosync: bool = False) -> dict[str, Any]:
+    """Run one sync pass while holding the process-wide foreground marker.
+
+    The marker spans the entire pass, including the small gaps between
+    channels. Deferred archive maintenance uses it to avoid starting a long
+    walk in one of those gaps and starving the next channel's filesystem
+    preflight.
+    """
+    begin_sync_pass()
+    try:
+        return _sync_all_impl(
+            stream, cancel_event, only_with_new, queues, transcribe_mgr,
+            pause_event, skip_event, add_downloads_from_config, autosync)
+    finally:
+        end_sync_pass()

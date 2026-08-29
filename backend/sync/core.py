@@ -383,31 +383,72 @@ def _register_idless_download(final_path: str, channel_name: str,
 # source of truth shared with compress.py and transcribe.py).
 from ..subprocess_util import make_startupinfo as _make_startupinfo
 
-# Post-download channel maintenance (orphan-caption sweep + thumbnail
-# sweep) does full os.walks of the channel folder. On large channels (tens
-# of thousands of files on pooled storage) each walk takes minutes, and
-# running them inline blocked the whole sync pass after every download (the
-# "stuck 5-8 minutes after a big channel downloads" report). Run them in a
-# background daemon thread so the sync moves straight to the next channel.
-# A single module lock serializes them so several downloading channels
-# don't thrash the disk with parallel walks. Best-effort cleanup, so silent
-# failure / app-exit mid-run is harmless.
-_post_sync_maint_lock = threading.Lock()
+# Post-download channel maintenance (orphan-caption, thumbnail, and hidden-
+# sidecar sweeps) performs full channel walks. A background thread alone is
+# not sufficient: on pooled storage the walk can monopolize metadata I/O and
+# starve the next foreground channel's `exists`/writability probes for minutes.
+# Keep one coalescing worker and do not begin a queued walk until the WHOLE
+# sync pass is idle (not merely the per-channel flag, which flickers between
+# channels). Repeated requests for the same operation/channel collapse to the
+# newest call.
+_post_sync_maint_condition = threading.Condition()
+_post_sync_maint_pending: dict[tuple[str, str], tuple] = {}
+_post_sync_maint_worker_started = False
+
+
+def _post_sync_maintenance_key(label: str, args: tuple) -> tuple[str, str]:
+    target = args[0] if args else ""
+    if isinstance(target, dict):
+        target = (target.get("folder") or target.get("name")
+                  or target.get("url") or repr(target))
+    try:
+        identity = os.path.normcase(os.fspath(target))
+    except TypeError:
+        identity = repr(target)
+    return label, identity
+
+
+def _post_sync_maintenance_worker() -> None:
+    from .active_state import is_sync_work_active
+
+    while True:
+        with _post_sync_maint_condition:
+            while not _post_sync_maint_pending:
+                _post_sync_maint_condition.wait()
+
+        # Foreground sync always wins. Polling is intentional: the activity
+        # state changes at coarse channel/pass boundaries and needs no extra
+        # condition coupling.
+        if is_sync_work_active():
+            time.sleep(0.25)
+            continue
+
+        with _post_sync_maint_condition:
+            if not _post_sync_maint_pending or is_sync_work_active():
+                continue
+            _key = next(iter(_post_sync_maint_pending))
+            label, fn, args, kwargs = _post_sync_maint_pending.pop(_key)
+        try:
+            fn(*args, **kwargs)
+        except Exception as _e:
+            _log.debug("bg maintenance %s failed: %s", label, _e)
 
 
 def _bg_channel_maintenance(label: str, fn, *args, **kwargs) -> None:
-    """Run a post-download maintenance op in a serialized background thread."""
-    def _runner():
-        try:
-            with _post_sync_maint_lock:
-                fn(*args, **kwargs)
-        except Exception as _e:
-            _log.debug("bg maintenance %s failed: %s", label, _e)
+    """Queue a coalesced channel-maintenance op for the next sync-idle window."""
+    global _post_sync_maint_worker_started
+    key = _post_sync_maintenance_key(label, args)
     try:
-        threading.Thread(target=_runner, name=f"yta-maint-{label}",
-                         daemon=True).start()
+        with _post_sync_maint_condition:
+            _post_sync_maint_pending[key] = (label, fn, args, kwargs)
+            if not _post_sync_maint_worker_started:
+                threading.Thread(
+                    target=_post_sync_maintenance_worker,
+                    name="yta-maint-deferred", daemon=True).start()
+                _post_sync_maint_worker_started = True
+            _post_sync_maint_condition.notify()
     except Exception as _te:
-        _log.debug("bg maintenance %s spawn failed: %s", label, _te)
+        _log.debug("bg maintenance %s queue failed: %s", label, _te)
 
 
 # ── Robust network-timeout give-up (immune to the shared-config save race) ──
@@ -825,7 +866,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # A minimum of 500MB free keeps room for the largest plausible single
     # video; actual videos are streamed so we don't need to pre-allocate.
     from ..utils import check_directory_writable, check_disk_space, ytdlp_embed_tag_args
-    preflight_dir = base_dir if not ch_dir.exists() else ch_dir
+    ch_dir_exists = ch_dir.exists()
+    preflight_dir = ch_dir if ch_dir_exists else base_dir
     if not check_directory_writable(str(preflight_dir)):
         stream.emit([["ERROR: ", "red"],
                      [f"Cannot write to {ch_dir} \u2014 disk may be full, read-only, or disconnected.\n", "red"]])
@@ -842,7 +884,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                      [f"Less than 500 MB free at {ch_dir} \u2014 downloads may fail mid-stream.\n", "red"]])
         # warn but don't block — user may still want to try
 
-    ch_dir.mkdir(parents=True, exist_ok=True)
+    if not ch_dir_exists:
+        ch_dir.mkdir(parents=True, exist_ok=True)
 
     fmt = build_format_string(resolution)
     # Output template matches YTArchiver.py:17257-17267 — files live under

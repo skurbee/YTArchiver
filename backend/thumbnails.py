@@ -522,7 +522,7 @@ def invalidate_thumb_cache_entry(channel_name: str) -> None:
         pass
 
 
-def _channel_fingerprint(folder: Path) -> float:
+def _channel_fingerprint(folder: Path, stop_if=None) -> float | None:
     """Max mtime across the channel folder plus shallow year/month content.
 
     Directory mtimes catch newly added files, but not every in-place file
@@ -530,27 +530,42 @@ def _channel_fingerprint(folder: Path) -> float:
     through the usual channel/year/month layout so thumbnail status cache
     invalidates when existing media changes.
     """
+    def _should_stop() -> bool:
+        try:
+            return bool(stop_if and stop_if())
+        except Exception:
+            return False
+
+    if _should_stop():
+        return None
     if not folder.exists():
         return 0.0
     try:
         mx = folder.stat().st_mtime
     except OSError:
         return 0.0
-    def _scan(path: str | os.PathLike, depth: int) -> None:
+    def _scan(path: str | os.PathLike, depth: int) -> bool:
         nonlocal mx
+        if _should_stop():
+            return False
         try:
             with os.scandir(path) as it:
                 for entry in it:
+                    if _should_stop():
+                        return False
                     try:
                         st = entry.stat(follow_symlinks=False)
                         if st.st_mtime > mx:
                             mx = st.st_mtime
                         if depth > 0 and entry.is_dir(follow_symlinks=False):
-                            _scan(entry.path, depth - 1)
+                            if not _scan(entry.path, depth - 1):
+                                return False
                     except OSError:
                         pass
         except OSError:
             pass
+        return True
 
-    _scan(folder, 2)
+    if not _scan(folder, 2):
+        return None
     return mx

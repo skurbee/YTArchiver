@@ -31,6 +31,7 @@ import time
 from .. import youtube_traffic
 from ..log import get_logger
 from ..log_stream import LogStreamer
+from ..process_runner import run_ytdlp
 from ..subprocess_util import make_startupinfo as _make_startupinfo
 from .paths import (
     _generate_distributed_words,
@@ -167,7 +168,7 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
             # pointing at the root cause. Only emit when the stderr
             # looks like an auth/cookie issue — generic "no captions
             # available" is noise.
-            r = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+            r = run_ytdlp(cmd, stdin=subprocess.DEVNULL,
                                stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE,
                                timeout=120, startupinfo=_startupinfo)

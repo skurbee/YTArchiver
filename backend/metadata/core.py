@@ -33,6 +33,7 @@ from typing import Any
 
 from .. import youtube_traffic
 from ..log_stream import LogStreamer
+from ..process_runner import popen_ytdlp, run_ytdlp
 from ..sync import _find_cookie_source, _startupinfo, find_yt_dlp
 
 # YouTube IDs are 11 chars of [A-Za-z0-9_-]
@@ -158,7 +159,7 @@ def _resolve_ids_by_title(yt: str, url: str,
     if not permission.get("ok"):
         return {}
     try:
-        proc = subprocess.Popen(
+        proc = popen_ytdlp(
             [yt, "--flat-playlist",
              "--print", "%(id)s\t%(title)s",
              *_find_cookie_source(), url],
@@ -327,7 +328,7 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
     if not permission.get("ok"):
         return {}
     try:
-        proc = subprocess.Popen(
+        proc = popen_ytdlp(
             cmd, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             encoding="utf-8", errors="replace", bufsize=1,
@@ -579,7 +580,7 @@ def _resolve_channel_id_url(yt: str, handle_url: str) -> str:
     if not permission.get("ok"):
         return ""
     try:
-        proc = subprocess.run(
+        proc = run_ytdlp(
             [yt, "--skip-download", "--no-warnings",
              "--print", "%(channel_id)s",
              "--playlist-end", "1",
@@ -843,7 +844,7 @@ def _fetch_per_video_upload_dates(yt: str, vids: list[str],
         if not permission.get("ok"):
             return (vid, "")
         try:
-            proc = subprocess.run(
+            proc = run_ytdlp(
                 cmd, capture_output=True,
                 startupinfo=_startupinfo, env=_utf8_env(),
                 timeout=30, encoding="utf-8", errors="replace")

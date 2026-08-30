@@ -25,6 +25,7 @@ from . import youtube_traffic
 from .log import get_logger
 from .log_stream import LogStreamer
 from .net import block_if_down
+from .process_runner import popen_ytdlp
 from .sync import (
     _find_cookie_source,
     find_yt_dlp,
@@ -273,7 +274,7 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
             permission.get("error") or "YouTube traffic governor cancelled")
         return {}
     try:
-        proc = subprocess.Popen(
+        proc = popen_ytdlp(
             enum_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             creationflags=(0x08000000 if os.name == "nt" else 0), # CREATE_NO_WINDOW
@@ -1066,7 +1067,7 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
             permission.get("error") or "YouTube traffic governor cancelled")
         return None
     try:
-        proc = subprocess.Popen(
+        proc = popen_ytdlp(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             creationflags=(0x08000000 if os.name == "nt" else 0),

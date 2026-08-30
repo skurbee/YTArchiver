@@ -305,11 +305,10 @@ def check_configured_cookie_session(*, context: str) -> bool:
             return False
         return True
     try:
-        import subprocess
-
         from .proc_utils import utf8_subprocess_env
+        from .process_runner import run_ytdlp
         from .subprocess_util import make_startupinfo
-        proc = subprocess.run(
+        proc = run_ytdlp(
             [
                 yt,
                 "--flat-playlist",

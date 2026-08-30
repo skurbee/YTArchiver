@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 from . import youtube_traffic
 from .log import get_logger
+from .process_runner import run_ytdlp
 from .sync import _find_cookie_source, find_yt_dlp
 from .utils import hide_file_win, unhide_file_win
 
@@ -186,7 +187,7 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
         if not permission.get("ok"):
             raise RuntimeError(
                 permission.get("error") or "traffic governor cancelled")
-        return subprocess.run(
+        return run_ytdlp(
             cmd, capture_output=True, text=True, timeout=60,
             encoding="utf-8", errors="replace",
             creationflags=(0x08000000 if os.name == "nt" else 0),

@@ -84,10 +84,18 @@ DEFAULT_CONFIG = {
     # YouTube fixes days-to-weeks ahead of stable; use it when stable is
     # current but downloads still 403). Read by ytdlp_update().
     "ytdlp_channel": "stable",
-    # Check the selected yt-dlp release channel on app launch when the last
-    # successful check is at least this many days old. 0 disables the check.
-    "ytdlp_update_check_days": 7,
+    # Keep yt-dlp current while the app remains open. Automatic updates are
+    # limited to the app-managed copy; external installations fall back to a
+    # notification so YTArchiver never silently mutates another toolchain.
+    "ytdlp_update_mode": "automatic",
+    # Persisted elapsed-time cadence. The monitor checks at launch when due
+    # and continues to honor this interval without an app restart.
+    "ytdlp_update_check_days": 1,
     "last_ytdlp_update_check_ts": 0.0,
+    # A managed-copy update discovered while the app is busy survives a
+    # crash/restart and is retried before the next remote check.
+    "ytdlp_update_pending_version": "",
+    "ytdlp_update_pending_channel": "",
     "autorun_gpu": False,
     "autorun_sync": False,
     "chan_col_widths": {},
@@ -352,6 +360,10 @@ def load_config() -> dict[str, Any]:
         # on-disk config exists but has never stored this key. New installs
         # take DEFAULT_CONFIG's False value, and explicit choices are kept.
         _needs_dense_subs_default = "legacy_subs_tab" not in data
+        # The old launch-only checker used 0 days as its Off switch. Preserve
+        # that explicit choice while migrating positive intervals to the new
+        # automatic long-running monitor.
+        _needs_ytdlp_update_mode = "ytdlp_update_mode" not in data
 
         # Run migrations exactly once per config, then stamp a flag/key so
         # subsequent load_config calls skip the work. Previously
@@ -359,7 +371,8 @@ def load_config() -> dict[str, Any]:
         # wasteful, and any future migration accidentally breaking
         # idempotency would silently corrupt state.
         if (not merged.get("_migration_v2_pending_tx_ids")
-                or _needs_dense_subs_default):
+                or _needs_dense_subs_default
+                or _needs_ytdlp_update_mode):
             # Run the migration on a DEEP COPY first. If save_config
             # fails (antivirus lock, OneDrive sync, disk full), the
             # in-memory `merged` we return must NOT carry the migrated
@@ -376,6 +389,14 @@ def load_config() -> dict[str, Any]:
                 _candidate["_migration_v2_pending_tx_ids"] = True
             if _needs_dense_subs_default:
                 _candidate["legacy_subs_tab"] = True
+            if _needs_ytdlp_update_mode:
+                try:
+                    _old_ytdlp_days = int(
+                        data.get("ytdlp_update_check_days", 1) or 0)
+                except (TypeError, ValueError):
+                    _old_ytdlp_days = 1
+                _candidate["ytdlp_update_mode"] = (
+                    "off" if _old_ytdlp_days == 0 else "automatic")
             if getattr(_in_tx, 'active', False):
                 # Inside a config_transaction: adopt migrated state now;
                 # the outer transaction's exit-save will persist it.
@@ -416,6 +437,15 @@ def load_config() -> dict[str, Any]:
                         # any explicit True/False value already stored.
                         if "legacy_subs_tab" not in data:
                             merged["legacy_subs_tab"] = True
+                        if "ytdlp_update_mode" not in data:
+                            try:
+                                _old_ytdlp_days = int(
+                                    data.get("ytdlp_update_check_days", 1) or 0)
+                            except (TypeError, ValueError):
+                                _old_ytdlp_days = 1
+                            merged["ytdlp_update_mode"] = (
+                                "off" if _old_ytdlp_days == 0
+                                else "automatic")
                         # Sideline the corrupt file so the next launch uses the snapshot
                         try:
                             # Use a unique timestamp suffix so

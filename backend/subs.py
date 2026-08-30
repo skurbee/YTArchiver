@@ -272,7 +272,7 @@ def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> str | None:
 
         from . import sync as _sync
         from . import youtube_traffic
-        from .process_runner import PROCESS_REGISTRY
+        from .process_runner import PROCESS_REGISTRY, popen_ytdlp
         yt = _sync.find_yt_dlp()
         if not yt:
             return None
@@ -285,14 +285,11 @@ def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> str | None:
             permission = youtube_traffic.acquire("channel_name_probe")
             if not permission.get("ok"):
                 return ""
-            proc = _sp.Popen(
+            proc = popen_ytdlp(
                 argv, stdout=_sp.PIPE, stderr=_sp.PIPE,
                 text=True, encoding="utf-8", errors="replace",
-                startupinfo=_sync._startupinfo)
-            try:
-                PROCESS_REGISTRY.register(proc)
-            except Exception:
-                pass
+                startupinfo=_sync._startupinfo,
+                registry=PROCESS_REGISTRY)
             try:
                 try:
                     out, _err = proc.communicate(timeout=timeout)

@@ -34,6 +34,7 @@
     const browseVid = document.getElementById("settings-browse-video");
     const ytdlpBtn = document.getElementById("btn-ytdlp-update");
     const ytdlpChannelSel = document.getElementById("settings-ytdlp-channel");
+    const ytdlpUpdateModeSel = document.getElementById("settings-ytdlp-update-mode");
     const expBtn = document.getElementById("btn-export-channels");
     const impBtn = document.getElementById("btn-import-channels");
     const bkExpBtn = document.getElementById("btn-export-backup");
@@ -79,7 +80,9 @@
     // Last-persisted disk-staleness, so a blur on an invalid/blank value
     // can revert the field instead of saving garbage.
     let _diskLastGood = "24";
-    let _ytdlpCheckLastGood = "7";
+    let _ytdlpCheckLastGood = "1";
+    let _ytdlpUpdateMode = "automatic";
+    let _ytdlpAutoUpdatable = true;
     let _archiveCapacity = { mode: "percent", percent: 90, free_gb: 100 };
     let _archiveCapacityLastGood = "90";
     let _trafficStatus = null;
@@ -262,13 +265,29 @@
     }
 
     function _fmtYtdlpCheckAge(ts) {
-      if (!ts) return "0 disables · never checked";
+      if (!ts) return "never checked";
       const wholeDays = Math.max(0,
         Math.floor((Date.now() / 1000 - ts) / 86400));
       const label = wholeDays === 0 ? "today"
         : wholeDays === 1 ? "yesterday"
         : `${wholeDays} days ago`;
-      return `0 disables · last checked ${label}`;
+      return `last checked ${label}`;
+    }
+
+    function _renderYtdlpUpdateControls() {
+      const daysEl = document.getElementById("settings-ytdlp-check-days");
+      const noteEl = document.getElementById("settings-ytdlp-update-note");
+      if (daysEl) daysEl.disabled = _ytdlpUpdateMode === "off";
+      if (!noteEl) return;
+      if (_ytdlpUpdateMode === "off") {
+        noteEl.textContent = "Update checks are disabled";
+      } else if (_ytdlpUpdateMode === "notify") {
+        noteEl.textContent = "Reports new releases without installing them";
+      } else if (!_ytdlpAutoUpdatable) {
+        noteEl.textContent = "Package-managed yt-dlp detected — updates remain notify-only";
+      } else {
+        noteEl.textContent = "Installs when YouTube work is idle; no restart required";
+      }
     }
 
     async function load() {
@@ -288,13 +307,20 @@
             ["stable", "nightly"].includes(s.ytdlp_channel) ? s.ytdlp_channel : "stable";
           ytdlpChannelSel._ytddRepaint?.();
         }
+        _ytdlpUpdateMode = ["automatic", "notify", "off"].includes(s.ytdlp_update_mode)
+          ? s.ytdlp_update_mode : "automatic";
+        if (ytdlpUpdateModeSel) {
+          ytdlpUpdateModeSel.value = _ytdlpUpdateMode;
+          ytdlpUpdateModeSel._ytddRepaint?.();
+        }
         const ytdlpCheckEl = document.getElementById("settings-ytdlp-check-days");
         if (ytdlpCheckEl) {
-          const days = Math.max(0, Math.min(365,
-            parseInt(s.ytdlp_update_check_days ?? 7, 10) || 0));
+          const days = Math.max(1, Math.min(365,
+            parseInt(s.ytdlp_update_check_days ?? 1, 10) || 1));
           ytdlpCheckEl.value = String(days);
           _ytdlpCheckLastGood = ytdlpCheckEl.value;
         }
+        _renderYtdlpUpdateControls();
         const ytdlpCheckStatus = document.getElementById("settings-ytdlp-check-status");
         if (ytdlpCheckStatus) {
           ytdlpCheckStatus.textContent = _fmtYtdlpCheckAge(
@@ -393,6 +419,8 @@
         try {
           const v = await bridgeCall("ytdlp_version");
           if (vEl) vEl.textContent = v?.ok ? v.version : (v?.error || "not found");
+          _ytdlpAutoUpdatable = v?.ok ? v.auto_updatable !== false : true;
+          _renderYtdlpUpdateControls();
         } catch { if (vEl) vEl.textContent = "check failed"; }
       } catch (e) { console.warn("settings load:", e); }
     }
@@ -420,13 +448,19 @@
       ?.addEventListener("change", (e) => saveField("close_behavior", e.target.value));
     document.getElementById("settings-auto-backup")
       ?.addEventListener("change", (e) => saveField("auto_backup_interval", e.target.value));
+    ytdlpUpdateModeSel?.addEventListener("change", async (e) => {
+      _ytdlpUpdateMode = ["automatic", "notify", "off"].includes(e.target.value)
+        ? e.target.value : "automatic";
+      _renderYtdlpUpdateControls();
+      await saveField("ytdlp_update_mode", _ytdlpUpdateMode);
+    });
     const _ytdlpCheckEl = document.getElementById("settings-ytdlp-check-days");
     _ytdlpCheckEl?.addEventListener("change", () => {
       const raw = _ytdlpCheckEl.value;
       const days = parseInt(raw, 10);
-      if (raw === "" || !Number.isFinite(days) || days < 0 || days > 365) {
+      if (raw === "" || !Number.isFinite(days) || days < 1 || days > 365) {
         _ytdlpCheckEl.value = _ytdlpCheckLastGood;
-        window._showToast?.("Auto-check interval must be 0–365 days.", "warn");
+        window._showToast?.("Update interval must be 1–365 days.", "warn");
         return;
       }
       _ytdlpCheckEl.value = String(days);
@@ -1019,6 +1053,22 @@
       await _refreshYtdlpVersion();           // timed out — show current
     }
 
+    window._onYtdlpUpdateStatus = function (payload) {
+      const status = String(payload?.status || "");
+      const message = String(payload?.message || "yt-dlp update status changed.");
+      const version = String(payload?.version || "");
+      const vEl = document.getElementById("settings-ytdlp-version");
+      if (status === "success" && version && vEl) vEl.textContent = version;
+      if (status === "success" || status === "available") {
+        const ageEl = document.getElementById("settings-ytdlp-check-status");
+        if (ageEl) ageEl.textContent = "last checked today";
+      }
+      const tone = status === "success" ? "ok"
+        : status === "error" ? "error"
+        : (status === "deferred" || status === "available") ? "warn" : "";
+      window._showToast?.(message, tone);
+    };
+
     ytdlpBtn?.addEventListener("click", async () => {
       const ok = await askConfirm("Update yt-dlp",
         `Update yt-dlp to the latest ${_channelLabel()} release?\n\n` +
@@ -1026,7 +1076,16 @@
         { confirm: "Update" });
       if (!ok) return;
       const prev = document.getElementById("settings-ytdlp-version")?.textContent || "";
-      await bridgeCall("ytdlp_update");
+      const result = await bridgeCall("ytdlp_update");
+      if (result?.pending || result?.running) {
+        window._showToast?.(
+          "yt-dlp update queued until current YouTube work is idle.");
+        return;
+      }
+      if (!result?.ok) {
+        window._showToast?.(result?.error || "Couldn't start yt-dlp update.", "error");
+        return;
+      }
       _pollYtdlpVersion(prev);
     });
 
@@ -1042,11 +1101,21 @@
         (channel === "nightly"
           ? "Beta pulls YouTube fixes ahead of stable — good when stable is up to date but downloads still fail with 403 errors.\n\n"
           : "This switches back to the stable channel (may downgrade to the latest stable release).\n\n") +
-        `Update yt-dlp to ${label} now?\n\nIf a sync is running, stop it first — the .exe can't be replaced while it's open.`,
+        `Update yt-dlp to ${label} now?\n\nIf YouTube work is active, the update will wait for an idle window.`,
         { confirm: "Update now", cancel: "Later" });
       if (go) {
         const prev = document.getElementById("settings-ytdlp-version")?.textContent || "";
-        await bridgeCall("ytdlp_update");
+        const result = await bridgeCall("ytdlp_update");
+        if (result?.pending || result?.running) {
+          window._showToast?.(
+            "yt-dlp update queued until current YouTube work is idle.");
+          return;
+        }
+        if (!result?.ok) {
+          window._showToast?.(
+            result?.error || "Couldn't start yt-dlp update.", "error");
+          return;
+        }
         _pollYtdlpVersion(prev);
       }
     });

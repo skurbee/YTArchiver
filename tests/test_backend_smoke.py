@@ -8006,6 +8006,25 @@ class ProcessRunnerCacheTests(unittest.TestCase):
         second.wait.assert_called_once_with(timeout=1.25)
         second.kill.assert_not_called()
 
+    def test_ytdlp_update_gate_blocks_launch_until_update_releases(self) -> None:
+        gate = process_runner.YtDlpUpdateGate()
+        entered = threading.Event()
+
+        self.assertTrue(gate.try_reserve_update(lambda: False))
+
+        def launch():
+            with gate.launch_slot():
+                entered.set()
+
+        thread = threading.Thread(target=launch, daemon=True)
+        thread.start()
+        self.assertFalse(entered.wait(0.05))
+
+        gate.release_update()
+        self.assertTrue(entered.wait(1.0))
+        thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive())
+
     def test_run_streaming_marks_cancel_event_as_cancelled(self) -> None:
         class FakePipe:
             def __init__(self, lines):
@@ -8187,6 +8206,7 @@ class ConfigTests(unittest.TestCase):
                 "channels": [],
                 "output_dir": "X:/Archive",
                 "legacy_subs_tab": False,
+                "ytdlp_update_mode": "automatic",
             }), encoding="utf-8")
 
             with mock.patch.object(ytarchiver_config, "APP_DATA_DIR", Path(td)), \
@@ -8194,6 +8214,30 @@ class ConfigTests(unittest.TestCase):
                 loaded = ytarchiver_config.load_config()
 
             self.assertFalse(loaded["legacy_subs_tab"])
+
+    def test_legacy_ytdlp_check_interval_migrates_to_update_mode(self) -> None:
+        for days, expected_mode in ((0, "off"), (7, "automatic")):
+            with self.subTest(days=days), tempfile.TemporaryDirectory() as td:
+                cfg_file = Path(td) / "ytarchiver_config.json"
+                cfg_file.write_text(json.dumps({
+                    "_migration_v2_pending_tx_ids": True,
+                    "channels": [],
+                    "output_dir": "X:/Archive",
+                    "legacy_subs_tab": False,
+                    "ytdlp_update_check_days": days,
+                }), encoding="utf-8")
+
+                with mock.patch.object(
+                        ytarchiver_config, "APP_DATA_DIR", Path(td)), \
+                        mock.patch.object(
+                            ytarchiver_config, "CONFIG_FILE", cfg_file):
+                    loaded = ytarchiver_config.load_config()
+                    persisted = json.loads(
+                        cfg_file.read_text(encoding="utf-8"))
+
+                self.assertEqual(loaded["ytdlp_update_mode"], expected_mode)
+                self.assertEqual(
+                    persisted["ytdlp_update_mode"], expected_mode)
 
     def test_config_transaction_persists_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -8224,6 +8268,7 @@ class ConfigTests(unittest.TestCase):
                 "channels": [],
                 "output_dir": "X:/Archive",
                 "legacy_subs_tab": False,
+                "ytdlp_update_mode": "automatic",
             }), encoding="utf-8")
             orig_json_load = json.load
 
@@ -8434,6 +8479,10 @@ class ConfigTests(unittest.TestCase):
         try:
             with mock.patch.object(settings_mixin.sync_backend, "find_yt_dlp",
                                    return_value="yt-dlp.exe"), \
+                    mock.patch.object(Api, "_ytdlp_update_busy",
+                                      return_value=False), \
+                    mock.patch.object(Api, "_record_ytdlp_update_check",
+                                      return_value=True), \
                     mock.patch.object(settings_mixin.threading, "Thread",
                                       ImmediateThread), \
                     mock.patch("subprocess.Popen", return_value=FakeProc()):
@@ -8442,7 +8491,7 @@ class ConfigTests(unittest.TestCase):
             cache_after = dict(settings_mixin.SettingsMixin._ytdlp_version_cache)
             settings_mixin.SettingsMixin._ytdlp_version_cache = old_cache
 
-        self.assertTrue(result["started"])
+        self.assertTrue(result["started"], result)
         self.assertNotIn("yt-dlp.exe", cache_after)
 
     def test_ytdlp_update_check_interval_round_trips_and_is_bounded(self) -> None:
@@ -8454,6 +8503,8 @@ class ConfigTests(unittest.TestCase):
                     "log_mode": "Simple",
                     "ytdlp_update_check_days": 7,
                     "last_ytdlp_update_check_ts": 123.0,
+                    "ytdlp_update_pending_version": "2026.08.20",
+                    "ytdlp_update_pending_channel": "stable",
                 }
                 self._log_stream = mock.Mock()
                 self._transcribe = mock.Mock()
@@ -8467,12 +8518,18 @@ class ConfigTests(unittest.TestCase):
                                   side_effect=lambda cfg: saved.append(dict(cfg)) or True):
             api = Api()
             loaded = api.settings_load()
-            result = api.settings_save({"ytdlp_update_check_days": 999})
+            result = api.settings_save({
+                "ytdlp_update_check_days": 999,
+                "ytdlp_update_mode": "off",
+            })
 
+        self.assertEqual(loaded["ytdlp_update_mode"], "automatic")
         self.assertEqual(loaded["ytdlp_update_check_days"], 7)
         self.assertEqual(loaded["last_ytdlp_update_check_ts"], 123.0)
         self.assertTrue(result["ok"])
         self.assertEqual(saved[-1]["ytdlp_update_check_days"], 365)
+        self.assertEqual(saved[-1]["ytdlp_update_mode"], "off")
+        self.assertEqual(saved[-1]["ytdlp_update_pending_version"], "")
 
     def test_onboarding_finish_reports_save_failure(self) -> None:
         class Api(OnboardingMixin):
@@ -8548,6 +8605,25 @@ class FrontendShortcutSourceTests(unittest.TestCase):
 
 
 class FrontendBrowseSourceTests(unittest.TestCase):
+    def test_ytdlp_updates_are_interval_based_and_idle_automatic(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        health = (root / "web" / "partials" / "tab-health.html").read_text(
+            encoding="utf-8")
+        settings = (root / "web" / "settingsTab.js").read_text(
+            encoding="utf-8")
+
+        self.assertIn('id="settings-ytdlp-update-mode"', health)
+        self.assertIn('value="automatic"', health)
+        self.assertIn('value="notify"', health)
+        self.assertIn('value="off"', health)
+        self.assertIn("while YTArchiver stays open", health)
+        self.assertIn("no restart required", health)
+        self.assertNotIn("At launch every", health)
+        self.assertIn('saveField("ytdlp_update_mode"', settings)
+        self.assertIn('_ytdlpUpdateMode === "off"', settings)
+        self.assertIn("Update interval must be 1–365 days", settings)
+        self.assertIn("window._onYtdlpUpdateStatus", settings)
+
     def test_index_summary_populates_search_segment_count(self) -> None:
         root = Path(__file__).resolve().parents[1]
         browse = (root / "web" / "browseContent.js").read_text(
@@ -8735,6 +8811,10 @@ class SettingsMixinServicesTests(unittest.TestCase):
         try:
             with mock.patch.object(settings_mixin.sync_backend, "find_yt_dlp",
                                    return_value="yt-dlp.exe"), \
+                    mock.patch.object(Api, "_ytdlp_update_busy",
+                                      return_value=False), \
+                    mock.patch.object(Api, "_record_ytdlp_update_check",
+                                      return_value=True), \
                     mock.patch.object(settings_mixin.threading, "Thread",
                                       ImmediateThread), \
                     mock.patch("subprocess.Popen", return_value=FakeProc()):
@@ -8743,11 +8823,11 @@ class SettingsMixinServicesTests(unittest.TestCase):
             cache_after = dict(settings_mixin.SettingsMixin._ytdlp_version_cache)
             settings_mixin.SettingsMixin._ytdlp_version_cache = old_cache
 
-        self.assertTrue(result["started"])
+        self.assertTrue(result["started"], result)
         self.assertNotIn("yt-dlp.exe", cache_after)
         service_log.emit.assert_any_call([
             ["[Update] ", "update_head"],
-            ["Updating yt-dlp to stable...\n", "update_sep"],
+            ["Manual yt-dlp update to stable...\n", "update_sep"],
         ])
         service_log.emit_dim.assert_called_once_with(" updated")
         service_log.flush.assert_called_once()
@@ -12025,7 +12105,7 @@ class YtdlpUpdateCheckTests(unittest.TestCase):
             return self.payload[:limit]
 
     def _stub(self, version, *, days=7, last_check=0,
-              channel="stable"):
+              channel="stable", mode=None, path="external-yt-dlp.exe"):
         from backend.api_mixins.settings_mixin import SettingsMixin
 
         class _FakeStream:
@@ -12040,12 +12120,15 @@ class YtdlpUpdateCheckTests(unittest.TestCase):
             def emit_dim(self, line):
                 self.dim.append(line)
 
+            def emit_error(self, line):
+                self.lines.append(("error", line))
+
             def flush(self):
                 self.flushed = True
 
         class _Stub(SettingsMixin):
             def ytdlp_version(self_inner):
-                return {"ok": True, "version": version}
+                return {"ok": True, "version": version, "path": path}
 
             def _settings_log_stream(self_inner):
                 return self_inner._fake_stream
@@ -12065,6 +12148,8 @@ class YtdlpUpdateCheckTests(unittest.TestCase):
             "last_ytdlp_update_check_ts": last_check,
             "ytdlp_channel": channel,
         }
+        if mode is not None:
+            s._config["ytdlp_update_mode"] = mode
         s.saved = []
         return s
 
@@ -12108,6 +12193,457 @@ class YtdlpUpdateCheckTests(unittest.TestCase):
         self.assertIn("Health → Tools → yt-dlp → Update", warning)
         self.assertNotIn("Settings → Update yt-dlp", warning)
         self.assertTrue(stub._fake_stream.flushed)
+
+    def test_managed_automatic_update_is_persisted_and_queued(self):
+        now = 2_000_000.0
+        stub = self._stub(
+            "2026.08.19", mode="automatic",
+            path=r"C:\Managed\yt-dlp.exe")
+        response = self._Response("2026.08.20")
+        with mock.patch("time.time", return_value=now), \
+                mock.patch.object(settings_mixin.threading, "Thread",
+                                  self._ImmediateThread), \
+                mock.patch("urllib.request.urlopen", return_value=response), \
+                mock.patch.object(stub, "_is_managed_ytdlp",
+                                  return_value=True), \
+                mock.patch.object(
+                    stub, "_queue_ytdlp_update",
+                    return_value={"ok": True, "pending": True}) as queue_update:
+            result = stub.check_ytdlp_update()
+
+        self.assertTrue(result["started"])
+        self.assertEqual(
+            stub.saved[-1]["ytdlp_update_pending_version"], "2026.08.20")
+        self.assertEqual(
+            stub.saved[-1]["ytdlp_update_pending_channel"], "stable")
+        self.assertEqual(stub.saved[-1]["last_ytdlp_update_check_ts"], 0)
+        queue_update.assert_called_once_with(
+            yt=r"C:\Managed\yt-dlp.exe", channel="stable",
+            automatic=True, latest="2026.08.20", current="2026.08.19",
+            record_check=True)
+
+    def test_external_automatic_install_falls_back_to_notification(self):
+        now = 2_000_000.0
+        stub = self._stub("2026.08.19", mode="automatic")
+        response = self._Response("2026.08.20")
+        with mock.patch("time.time", return_value=now), \
+                mock.patch.object(settings_mixin.threading, "Thread",
+                                  self._ImmediateThread), \
+                mock.patch("urllib.request.urlopen", return_value=response), \
+                mock.patch.object(stub, "_queue_ytdlp_update") as queue_update:
+            stub.check_ytdlp_update()
+
+        queue_update.assert_not_called()
+        self.assertEqual(stub.saved[-1]["last_ytdlp_update_check_ts"], now)
+        self.assertIn("controlled by a package manager",
+                      str(stub._fake_stream.lines))
+
+    def test_windows_standalone_executable_is_auto_updatable(self):
+        if os.name != "nt":
+            self.skipTest("Windows PE recognition")
+        stub = self._stub("2026.08.19", mode="automatic")
+        with tempfile.TemporaryDirectory() as td:
+            standalone = Path(td) / "yt-dlp.exe"
+            with standalone.open("wb") as executable:
+                executable.write(b"MZ")
+                executable.truncate(1_000_001)
+
+            self.assertTrue(stub._can_auto_update_ytdlp(standalone))
+
+    def test_small_package_launcher_is_not_auto_updatable(self):
+        stub = self._stub("2026.08.19", mode="automatic")
+        with tempfile.TemporaryDirectory() as td:
+            launcher = Path(td) / "yt-dlp.exe"
+            launcher.write_bytes(b"MZ" + (b"\0" * 1024))
+
+            self.assertFalse(stub._can_auto_update_ytdlp(launcher))
+
+    def test_notify_mode_pushes_available_update_status(self):
+        stub = self._stub("2026.08.19", mode="notify")
+        response = self._Response("2026.08.20")
+        with mock.patch.object(settings_mixin.threading, "Thread",
+                               self._ImmediateThread), \
+                mock.patch("urllib.request.urlopen", return_value=response), \
+                mock.patch.object(stub, "_push_ytdlp_update_status") as push:
+            stub.check_ytdlp_update()
+
+        push.assert_called_once()
+        self.assertEqual(push.call_args.args[0], "available")
+        self.assertEqual(push.call_args.args[2], "2026.08.20")
+
+    def test_inflight_check_is_discarded_after_mode_changes_to_off(self):
+        stub = self._stub(
+            "2026.08.19", mode="automatic",
+            path=r"C:\Managed\yt-dlp.exe")
+        response = self._Response("2026.08.20")
+
+        def switch_off(*_args, **_kwargs):
+            stub._config["ytdlp_update_mode"] = "off"
+            return response
+
+        with mock.patch.object(settings_mixin.threading, "Thread",
+                               self._ImmediateThread), \
+                mock.patch("urllib.request.urlopen", side_effect=switch_off), \
+                mock.patch.object(stub, "_is_managed_ytdlp",
+                                  return_value=True), \
+                mock.patch.object(stub, "_queue_ytdlp_update") as queue:
+            stub.check_ytdlp_update()
+
+        queue.assert_not_called()
+        self.assertFalse(stub.saved)
+
+    def test_inflight_check_is_discarded_after_channel_switch(self):
+        stub = self._stub(
+            "2026.08.19", mode="automatic", channel="stable",
+            path=r"C:\Managed\yt-dlp.exe")
+        response = self._Response("2026.08.20")
+
+        def switch_channel(*_args, **_kwargs):
+            stub._config["ytdlp_channel"] = "nightly"
+            return response
+
+        with mock.patch.object(settings_mixin.threading, "Thread",
+                               self._ImmediateThread), \
+                mock.patch("urllib.request.urlopen",
+                           side_effect=switch_channel), \
+                mock.patch.object(stub, "_is_managed_ytdlp",
+                                  return_value=True), \
+                mock.patch.object(stub, "_queue_ytdlp_update") as queue:
+            stub.check_ytdlp_update()
+
+        queue.assert_not_called()
+        self.assertFalse(stub.saved)
+
+    def test_monitor_rechecks_after_interval_without_restart(self):
+        now = 2_000_000.0
+        stub = self._stub(
+            "2026.08.19", days=2, last_check=now - (2 * 86_400),
+            mode="notify")
+        with mock.patch.object(
+                stub, "check_ytdlp_update",
+                return_value={"ok": True, "started": True}) as check:
+            wait_seconds = stub._ytdlp_update_monitor_once(now=now)
+
+        check.assert_called_once_with()
+        self.assertEqual(wait_seconds, 60.0)
+
+    def test_monitor_restores_persisted_managed_update(self):
+        now = 2_000_000.0
+        stub = self._stub(
+            "2026.08.19", days=2, last_check=now,
+            mode="automatic")
+        stub._config.update({
+            "ytdlp_update_pending_version": "2026.08.20",
+            "ytdlp_update_pending_channel": "stable",
+        })
+        with mock.patch.object(settings_mixin.sync_backend, "find_yt_dlp",
+                               return_value=r"C:\Managed\yt-dlp.exe"), \
+                mock.patch.object(stub, "_is_managed_ytdlp",
+                                  return_value=True), \
+                mock.patch.object(
+                    stub, "_queue_ytdlp_update",
+                    return_value={"ok": True, "pending": True}) as queue_update:
+            stub._ytdlp_update_monitor_once(now=now)
+
+        queue_update.assert_called_once_with(
+            yt=r"C:\Managed\yt-dlp.exe", channel="stable",
+            automatic=True, latest="2026.08.20", record_check=True)
+
+    def test_monitor_discards_in_memory_update_for_old_channel(self):
+        now = 2_000_000.0
+        stub = self._stub(
+            "2026.08.19", days=2, last_check=now,
+            mode="automatic", channel="nightly")
+        stub._ensure_ytdlp_update_runtime()
+        stub._ytdlp_update_pending = {
+            "yt": r"C:\Managed\yt-dlp.exe",
+            "channel": "stable",
+            "automatic": True,
+        }
+
+        stub._ytdlp_update_monitor_once(now=now)
+
+        self.assertIsNone(stub._ytdlp_update_pending)
+
+    def test_automatic_update_requires_two_idle_samples(self):
+        stub = self._stub("2026.08.19", mode="automatic")
+        stub._ensure_ytdlp_update_runtime()
+        stub._ytdlp_update_pending = {
+            "yt": r"C:\Managed\yt-dlp.exe",
+            "channel": "stable",
+            "automatic": True,
+            "latest": "2026.08.20",
+            "current": "2026.08.19",
+            "record_check": True,
+            "attempt": 0,
+            "not_before": 0.0,
+            "idle_sampled": False,
+        }
+        with mock.patch.object(stub, "_ytdlp_update_busy",
+                               return_value=False):
+            result = stub._maybe_start_ytdlp_update(now=100.0)
+
+        self.assertTrue(result["confirming_idle"])
+        self.assertTrue(stub._ytdlp_update_pending["idle_sampled"])
+        self.assertEqual(stub._ytdlp_update_pending["not_before"], 103.0)
+
+    def test_stable_selection_can_replace_newer_nightly_build(self):
+        now = 2_000_000.0
+        stub = self._stub(
+            "2026.08.20.123456", mode="notify", channel="stable")
+        response = self._Response("2026.08.19")
+        with mock.patch("time.time", return_value=now), \
+                mock.patch.object(settings_mixin.threading, "Thread",
+                                  self._ImmediateThread), \
+                mock.patch("urllib.request.urlopen", return_value=response):
+            stub.check_ytdlp_update()
+
+        self.assertIn("2026.08.19 is available",
+                      str(stub._fake_stream.lines))
+
+    def test_automatic_update_verifies_installed_version_before_success(self):
+        stub = self._stub("2026.08.19", mode="automatic")
+        stub._ensure_ytdlp_update_runtime()
+        stub._ytdlp_update_running = True
+
+        class FakeProc:
+            stdout = ["updated\n"]
+            returncode = 0
+
+            def wait(self):
+                return self.returncode
+
+        payload = {
+            "yt": r"C:\Managed\yt-dlp.exe",
+            "channel": "stable",
+            "automatic": True,
+            "latest": "2026.08.20",
+            "current": "2026.08.19",
+            "record_check": True,
+            "attempt": 0,
+        }
+        with mock.patch("subprocess.Popen", return_value=FakeProc()), \
+                mock.patch("backend.process_runner.PROCESS_REGISTRY"), \
+                mock.patch.object(
+                    stub, "ytdlp_version",
+                    return_value={"ok": True, "version": "2026.08.20"}), \
+                mock.patch.object(
+                    stub, "_record_ytdlp_update_check",
+                    return_value=True) as record_check:
+            stub._run_ytdlp_update(payload)
+
+        record_check.assert_called_once()
+        self.assertFalse(stub._ytdlp_update_running)
+        self.assertIsNone(stub._ytdlp_update_pending)
+        self.assertIn("no restart required", str(stub._fake_stream.lines))
+
+    def test_automatic_update_accepts_newer_same_channel_release(self):
+        stub = self._stub("2026.08.19", mode="automatic")
+        stub._ensure_ytdlp_update_runtime()
+        stub._ytdlp_update_running = True
+
+        class FakeProc:
+            stdout = []
+            returncode = 0
+
+            def wait(self):
+                return self.returncode
+
+        payload = {
+            "yt": r"C:\Managed\yt-dlp.exe",
+            "channel": "stable",
+            "automatic": True,
+            "latest": "2026.08.20",
+            "current": "2026.08.19",
+            "record_check": True,
+            "attempt": 0,
+        }
+        with mock.patch("subprocess.Popen", return_value=FakeProc()), \
+                mock.patch("backend.process_runner.PROCESS_REGISTRY"), \
+                mock.patch.object(
+                    stub, "ytdlp_version",
+                    return_value={"ok": True, "version": "2026.08.21"}), \
+                mock.patch.object(
+                    stub, "_record_ytdlp_update_check",
+                    return_value=True) as record_check:
+            stub._run_ytdlp_update(payload)
+
+        record_check.assert_called_once()
+        self.assertIsNone(stub._ytdlp_update_pending)
+        self.assertIn("2026.08.21", str(stub._fake_stream.lines))
+
+    def test_running_old_channel_update_does_not_stamp_new_channel(self):
+        stub = self._stub(
+            "2026.08.19", mode="automatic", channel="stable")
+        stub._ensure_ytdlp_update_runtime()
+        stub._ytdlp_update_running = True
+
+        class FakeProc:
+            stdout = []
+            returncode = 0
+
+            def wait(self_inner):
+                stub._config["ytdlp_channel"] = "nightly"
+                return self_inner.returncode
+
+        payload = {
+            "yt": r"C:\Managed\yt-dlp.exe",
+            "channel": "stable",
+            "automatic": True,
+            "latest": "2026.08.20",
+            "record_check": True,
+            "attempt": 0,
+        }
+        with mock.patch("subprocess.Popen", return_value=FakeProc()), \
+                mock.patch("backend.process_runner.PROCESS_REGISTRY"), \
+                mock.patch.object(
+                    stub, "ytdlp_version",
+                    return_value={"ok": True, "version": "2026.08.20"}):
+            stub._run_ytdlp_update(payload)
+
+        self.assertEqual(stub._config["last_ytdlp_update_check_ts"], 0)
+        self.assertTrue(any(
+            "new channel remains due" in line
+            for line in stub._fake_stream.dim))
+
+    def test_automatic_update_retries_when_version_did_not_change(self):
+        stub = self._stub("2026.08.19", mode="automatic")
+        stub._ensure_ytdlp_update_runtime()
+        stub._ytdlp_update_running = True
+
+        class FakeProc:
+            stdout = []
+            returncode = 0
+
+            def wait(self):
+                return self.returncode
+
+        payload = {
+            "yt": r"C:\Managed\yt-dlp.exe",
+            "channel": "stable",
+            "automatic": True,
+            "latest": "2026.08.20",
+            "current": "2026.08.19",
+            "record_check": True,
+            "attempt": 0,
+        }
+        with mock.patch("subprocess.Popen", return_value=FakeProc()), \
+                mock.patch("backend.process_runner.PROCESS_REGISTRY"), \
+                mock.patch.object(
+                    stub, "ytdlp_version",
+                    return_value={"ok": True, "version": "2026.08.19"}):
+            stub._run_ytdlp_update(payload)
+
+        self.assertFalse(stub._ytdlp_update_running)
+        self.assertIs(stub._ytdlp_update_pending, payload)
+        self.assertGreater(payload["not_before"], 0)
+        self.assertIn("expected stable release 2026.08.20 or newer",
+                      str(stub._fake_stream.lines))
+
+    def test_automatic_update_stops_burst_retries_after_five_attempts(self):
+        stub = self._stub("2026.08.19", mode="automatic")
+        stub._config.update({
+            "ytdlp_update_pending_version": "2026.08.20",
+            "ytdlp_update_pending_channel": "stable",
+        })
+        stub._ensure_ytdlp_update_runtime()
+        stub._ytdlp_update_running = True
+
+        class FakeProc:
+            stdout = []
+            returncode = 2
+
+            def wait(self):
+                return self.returncode
+
+        payload = {
+            "yt": r"C:\Managed\yt-dlp.exe",
+            "channel": "stable",
+            "automatic": True,
+            "latest": "2026.08.20",
+            "record_check": True,
+            "attempt": 4,
+        }
+        with mock.patch("subprocess.Popen", return_value=FakeProc()), \
+                mock.patch("backend.process_runner.PROCESS_REGISTRY"):
+            stub._run_ytdlp_update(payload)
+
+        self.assertIsNone(stub._ytdlp_update_pending)
+        self.assertEqual(stub._config["ytdlp_update_pending_version"], "")
+        self.assertIn("failed after 5 attempts", str(stub._fake_stream.lines))
+
+    def test_failed_running_update_does_not_retry_after_mode_changes(self):
+        stub = self._stub("2026.08.19", mode="automatic")
+        stub._ensure_ytdlp_update_runtime()
+        stub._ytdlp_update_running = True
+
+        class FakeProc:
+            stdout = []
+            returncode = 2
+
+            def wait(self_inner):
+                stub._config["ytdlp_update_mode"] = "off"
+                return self_inner.returncode
+
+        payload = {
+            "yt": r"C:\Managed\yt-dlp.exe",
+            "channel": "stable",
+            "automatic": True,
+            "latest": "2026.08.20",
+            "record_check": True,
+            "attempt": 0,
+        }
+        with mock.patch("subprocess.Popen", return_value=FakeProc()), \
+                mock.patch("backend.process_runner.PROCESS_REGISTRY"):
+            stub._run_ytdlp_update(payload)
+
+        self.assertIsNone(stub._ytdlp_update_pending)
+        self.assertIn("settings changed", str(stub._fake_stream.lines))
+
+    def test_manual_update_success_clears_persisted_automatic_request(self):
+        stub = self._stub("2026.08.19", mode="automatic")
+        stub._config.update({
+            "ytdlp_update_pending_version": "2026.08.20",
+            "ytdlp_update_pending_channel": "stable",
+        })
+        stub._ensure_ytdlp_update_runtime()
+        stub._ytdlp_update_running = True
+
+        class FakeProc:
+            stdout = []
+            returncode = 0
+
+            def wait(self):
+                return self.returncode
+
+        payload = {
+            "yt": r"C:\Managed\yt-dlp.exe",
+            "channel": "stable",
+            "automatic": False,
+            "record_check": True,
+            "attempt": 0,
+        }
+        with mock.patch("subprocess.Popen", return_value=FakeProc()), \
+                mock.patch("backend.process_runner.PROCESS_REGISTRY"):
+            stub._run_ytdlp_update(payload)
+
+        self.assertEqual(stub._config["ytdlp_update_pending_version"], "")
+        self.assertEqual(stub._config["ytdlp_update_pending_channel"], "")
+        self.assertGreater(stub._config["last_ytdlp_update_check_ts"], 0)
+
+    def test_manual_update_requests_check_timestamp_recording(self):
+        stub = self._stub("2026.08.19", mode="automatic")
+        with mock.patch.object(settings_mixin.sync_backend, "find_yt_dlp",
+                               return_value=r"C:\Managed\yt-dlp.exe"), \
+                mock.patch.object(
+                    stub, "_queue_ytdlp_update",
+                    return_value={"ok": True, "started": True}) as queue:
+            result = stub.ytdlp_update()
+
+        self.assertTrue(result["started"])
+        queue.assert_called_once_with(
+            yt=r"C:\Managed\yt-dlp.exe", channel="stable",
+            automatic=False, record_check=True)
 
     def test_failed_remote_check_is_retried_next_launch(self):
         stub = self._stub("2026.08.19")

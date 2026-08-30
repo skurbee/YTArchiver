@@ -1719,6 +1719,11 @@ def main():
             return False
 
         try:
+            # Stop the long-lived yt-dlp update scheduler before cancelling
+            # workers or killing child processes. This prevents a due timer
+            # from launching an updater during shutdown teardown.
+            try: api.stop_ytdlp_update_monitor()
+            except Exception as e: _log.debug("swallowed: %s", e)
             # 0. Signal cancel FIRST so the sync worker has a chance to
             # tear down cleanly before we start killing subprocesses
             # underneath it (audit: main.py:1131-1227). Old order
@@ -1995,7 +2000,10 @@ def main():
         _start_dark_titlebar_thread()
         try: api.check_dependencies()
         except Exception as e: _log.debug("swallowed: %s", e)
-        try: api.check_ytdlp_update()
+        # Start one persistent monitor: it checks immediately when overdue,
+        # then keeps honoring the configured elapsed-day interval for apps
+        # that remain open for days or weeks.
+        try: api.start_ytdlp_update_monitor()
         except Exception as e: _log.debug("swallowed: %s", e)
         # Do not touch YouTube merely because the app opened.  Session health
         # is checked lazily by operations that actually need the network, so

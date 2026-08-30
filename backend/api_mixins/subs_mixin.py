@@ -14,6 +14,7 @@ import threading
 from backend import archive_scan, youtube_traffic
 from backend import subs as subs_backend
 from backend import sync as sync_backend
+from backend.process_runner import run_ytdlp
 from backend.ytarchiver_config import (
     channels_for_subs_ui,
     config_is_writable,
@@ -190,7 +191,7 @@ class SubsMixin:
                     raise RuntimeError(
                         permission.get("error")
                         or "YouTube traffic governor cancelled")
-                r = _sp.run(cmd, capture_output=True, text=True,
+                r = run_ytdlp(cmd, capture_output=True, text=True,
                             timeout=_SUBS_PROBE_TIMEOUT_SEC,
                             startupinfo=sync_backend._startupinfo,
                             creationflags=(0x08000000 if os.name == "nt" else 0))
@@ -558,7 +559,7 @@ class SubsMixin:
                     "error": permission.get("error")
                     or "YouTube traffic governor cancelled",
                 }
-            r1 = _sp.run([yt, "--flat-playlist", "--playlist-end", "1",
+            r1 = run_ytdlp([yt, "--flat-playlist", "--playlist-end", "1",
                          "--print", "channel", "--no-warnings", "--quiet",
                          *cookies, normalized],
                         capture_output=True, text=True,
@@ -573,7 +574,7 @@ class SubsMixin:
                     "error": permission.get("error")
                     or "YouTube traffic governor cancelled",
                 }
-            r2 = _sp.run([yt, "--flat-playlist", "--print", "%(playlist_count)s",
+            r2 = run_ytdlp([yt, "--flat-playlist", "--print", "%(playlist_count)s",
                          "--playlist-end", "1", "--no-warnings", "--quiet",
                          *cookies, normalized],
                         capture_output=True, text=True,

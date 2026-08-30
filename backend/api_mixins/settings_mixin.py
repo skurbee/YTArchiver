@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import threading
+import time
 
 from backend import sync as sync_backend
 from backend import youtube_traffic
@@ -202,8 +203,16 @@ class SettingsMixin:
             # yt-dlp release channel the updater targets: "stable" or
             # "nightly" (beta). Surfaced by the Health > Tools yt-dlp row.
             "ytdlp_channel": (cfg.get("ytdlp_channel") or "stable"),
+            "ytdlp_update_mode": (
+                cfg.get("ytdlp_update_mode")
+                if cfg.get("ytdlp_update_mode") in
+                ("automatic", "notify", "off")
+                else ("off" if int(
+                    cfg.get("ytdlp_update_check_days", 1) or 0) == 0
+                      else "automatic")
+            ),
             "ytdlp_update_check_days": int(
-                cfg.get("ytdlp_update_check_days", 7) or 0),
+                cfg.get("ytdlp_update_check_days", 1) or 0),
             "last_ytdlp_update_check_ts": float(
                 cfg.get("last_ytdlp_update_check_ts", 0) or 0),
             # Index tab surfaces these directly — must round-trip.
@@ -256,7 +265,7 @@ class SettingsMixin:
     # window_state.save firing while the user clicked Save in Settings)
     # could both load_config, mutate independent copies, and the loser
     # silently overwrote the winner (audit: settings_mixin.py:99-196).
-    _settings_save_lock = threading.Lock()
+    _settings_save_lock = threading.RLock()
 
     def settings_save(self, data):
         if not config_is_writable():
@@ -266,6 +275,9 @@ class SettingsMixin:
 
     def _settings_save_inner(self, data):
         cfg = self._settings_fresh_config()
+        _old_ytdlp_channel = str(
+            cfg.get("ytdlp_channel") or "stable").strip().lower()
+        _old_update_mode = self._normalize_ytdlp_update_mode(cfg)
         # Track the OLD whisper model so we can hot-apply a change to
         # the running TranscribeManager (audit U-7). Settings_save was
         # persisting the new model + reloading config, but the
@@ -282,11 +294,32 @@ class SettingsMixin:
             cfg["legacy_subs_tab"] = bool(data["legacy_subs_tab"])
         # yt-dlp release channel — only accept the two known values.
         if data.get("ytdlp_channel") in ("stable", "nightly"):
+            if data["ytdlp_channel"] != cfg.get("ytdlp_channel"):
+                # A channel switch needs a fresh remote comparison even when
+                # the previous channel was checked moments ago.
+                cfg["last_ytdlp_update_check_ts"] = 0.0
+                cfg["ytdlp_update_pending_version"] = ""
+                cfg["ytdlp_update_pending_channel"] = ""
             cfg["ytdlp_channel"] = data["ytdlp_channel"]
+        if data.get("ytdlp_update_mode") in ("automatic", "notify", "off"):
+            cfg["ytdlp_update_mode"] = data["ytdlp_update_mode"]
+            if data["ytdlp_update_mode"] != "automatic":
+                cfg["ytdlp_update_pending_version"] = ""
+                cfg["ytdlp_update_pending_channel"] = ""
+            if (data["ytdlp_update_mode"] != "off"
+                    and data["ytdlp_update_mode"] != _old_update_mode):
+                # Enabling checks should take effect now, not after the old
+                # interval happens to expire.
+                cfg["last_ytdlp_update_check_ts"] = 0.0
+                try:
+                    if int(cfg.get("ytdlp_update_check_days", 0) or 0) < 1:
+                        cfg["ytdlp_update_check_days"] = 1
+                except (TypeError, ValueError):
+                    cfg["ytdlp_update_check_days"] = 1
         if "ytdlp_update_check_days" in data:
             try:
                 cfg["ytdlp_update_check_days"] = max(
-                    0, min(365, int(data["ytdlp_update_check_days"])))
+                    1, min(365, int(data["ytdlp_update_check_days"])))
             except Exception as e:
                 _log.debug("swallowed: %s", e)
         # Index-tab persistence: archive roots + auto-index toggle + threshold.
@@ -383,6 +416,23 @@ class SettingsMixin:
         if not self._settings_save_config(cfg):
             return {"ok": False, "error": "Save failed"}
         self._reload_config()
+        _new_ytdlp_channel = str(
+            cfg.get("ytdlp_channel") or "stable").strip().lower()
+        _new_update_mode = self._normalize_ytdlp_update_mode(cfg)
+        if (_new_ytdlp_channel != _old_ytdlp_channel
+                or _new_update_mode != _old_update_mode):
+            # A request waiting for an idle window must not outlive the
+            # setting that created it. Running updates are allowed to finish;
+            # only not-yet-started work is invalidated here.
+            self._ensure_ytdlp_update_runtime()
+            with self._ytdlp_update_state_lock:
+                pending = self._ytdlp_update_pending
+                if (pending is not None
+                        and (str(pending.get("channel") or "stable").lower()
+                             != _new_ytdlp_channel
+                             or (pending.get("automatic")
+                                 and _new_update_mode != "automatic"))):
+                    self._ytdlp_update_pending = None
         # Push log mode into LogStreamer
         self._settings_log_stream().simple_mode = (cfg["log_mode"] == "Simple")
         # Audit U-7: hot-apply Whisper model change so the next job
@@ -403,6 +453,15 @@ class SettingsMixin:
                         f" (whisper model swap deferred until restart: {_e})")
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
+        if any(key in data for key in (
+                "ytdlp_channel", "ytdlp_update_mode",
+                "ytdlp_update_check_days")):
+            # Wake the long-lived monitor so a newly-enabled or shortened
+            # interval is applied immediately without restarting the app.
+            try:
+                self.wake_ytdlp_update_monitor()
+            except Exception as e:
+                _log.debug("yt-dlp update monitor wake failed: %s", e)
         return {
             "ok": True,
             "budget_autosync_disabled": _budget_autosync_disabled,
@@ -427,6 +486,7 @@ class SettingsMixin:
     _ytdlp_version_cache: dict[str, dict] = {}
     _ytdlp_update_check_lock = threading.Lock()
     _ytdlp_update_check_running = False
+    _ytdlp_runtime_init_lock = threading.Lock()
     _ytdlp_release_apis = {
         "stable": "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
         "nightly": (
@@ -434,6 +494,7 @@ class SettingsMixin:
             "yt-dlp-nightly-builds/releases/latest"
         ),
     }
+    _ytdlp_update_max_attempts = 5
 
     def ytdlp_version(self):
         """Return current yt-dlp version string."""
@@ -448,7 +509,13 @@ class SettingsMixin:
             r = _sp.run([yt, "--version"], capture_output=True, text=True,
                         timeout=10, startupinfo=sync_backend._startupinfo)
             ver = (r.stdout or "").strip().split("\n")[0] or "unknown"
-            _result = {"ok": True, "version": ver, "path": yt}
+            _result = {
+                "ok": True,
+                "version": ver,
+                "path": yt,
+                "managed": self._is_managed_ytdlp(yt),
+                "auto_updatable": self._can_auto_update_ytdlp(yt),
+            }
             SettingsMixin._ytdlp_version_cache[yt] = _result
             return _result
         except Exception as e:
@@ -466,43 +533,540 @@ class SettingsMixin:
         except ValueError:
             return ()
 
-    def _record_ytdlp_update_check(self, checked_at):
-        """Persist a successful remote check without disturbing other fields."""
+    @staticmethod
+    def _normalize_ytdlp_update_mode(cfg):
+        mode = str((cfg or {}).get("ytdlp_update_mode") or "").strip().lower()
+        if mode in ("automatic", "notify", "off"):
+            return mode
+        try:
+            return ("off" if int(
+                (cfg or {}).get("ytdlp_update_check_days", 1) or 0) == 0
+                    else "automatic")
+        except (TypeError, ValueError):
+            return "automatic"
+
+    @staticmethod
+    def _is_managed_ytdlp(path):
+        """True only for YTArchiver's app-data-managed executable."""
+        if not path:
+            return False
+        try:
+            from backend.ytarchiver_config import APP_DATA_DIR
+            actual = os.path.normcase(os.path.abspath(os.fspath(path)))
+            managed = os.path.normcase(os.path.abspath(os.fspath(
+                APP_DATA_DIR / "bin" / "yt-dlp.exe")))
+            return actual == managed
+        except Exception:
+            return False
+
+    def _can_auto_update_ytdlp(self, path):
+        """True for app-managed or recognizable standalone yt-dlp builds.
+
+        Official Windows standalone builds are multi-megabyte PE files and
+        implement yt-dlp's own ``--update-to`` command even when the user has
+        placed them somewhere else on PATH. Pip-generated console launchers
+        are tiny wrappers and must remain under their package manager.
+        """
+        if self._is_managed_ytdlp(path):
+            return True
+        if not path:
+            return False
+        try:
+            actual = os.path.realpath(os.fspath(path))
+            if not os.path.isfile(actual) or os.path.getsize(actual) < 1_000_000:
+                return False
+            if os.name == "nt":
+                if not actual.lower().endswith(".exe"):
+                    return False
+                with open(actual, "rb") as executable:
+                    return executable.read(2) == b"MZ"
+            return os.access(actual, os.X_OK)
+        except OSError:
+            return False
+
+    def _ensure_ytdlp_update_runtime(self):
+        if hasattr(self, "_ytdlp_update_state_lock"):
+            return
+        with SettingsMixin._ytdlp_runtime_init_lock:
+            if hasattr(self, "_ytdlp_update_state_lock"):
+                return
+            self._ytdlp_update_state_lock = threading.Lock()
+            self._ytdlp_update_pending = None
+            self._ytdlp_update_running = False
+            self._ytdlp_monitor_wake = threading.Event()
+            self._ytdlp_monitor_stop = threading.Event()
+            self._ytdlp_monitor_thread = None
+            self._ytdlp_check_not_before = 0.0
+
+    def wake_ytdlp_update_monitor(self):
+        self._ensure_ytdlp_update_runtime()
+        self._ytdlp_monitor_wake.set()
+        return {"ok": True}
+
+    def start_ytdlp_update_monitor(self):
+        """Start the persistent due-check/idle-install monitor once."""
+        self._ensure_ytdlp_update_runtime()
+        with self._ytdlp_update_state_lock:
+            thread = self._ytdlp_monitor_thread
+            if thread is not None and thread.is_alive():
+                self._ytdlp_monitor_wake.set()
+                return {"ok": True, "started": False, "running": True}
+            self._ytdlp_monitor_stop.clear()
+            thread = threading.Thread(
+                target=self._ytdlp_update_monitor_loop,
+                name="ytdlp-update-monitor", daemon=True)
+            self._ytdlp_monitor_thread = thread
+            thread.start()
+        return {"ok": True, "started": True}
+
+    def stop_ytdlp_update_monitor(self):
+        """Stop future checks/installs during application shutdown."""
+        if not hasattr(self, "_ytdlp_monitor_stop"):
+            return {"ok": True, "stopped": False}
+        self._ytdlp_monitor_stop.set()
+        self._ytdlp_monitor_wake.set()
+        thread = getattr(self, "_ytdlp_monitor_thread", None)
+        if (thread is not None and thread.is_alive()
+                and thread is not threading.current_thread()):
+            thread.join(timeout=1.0)
+        return {"ok": True, "stopped": True}
+
+    def _ytdlp_update_monitor_loop(self):
+        while not self._ytdlp_monitor_stop.is_set():
+            try:
+                wait_seconds = self._ytdlp_update_monitor_once()
+            except Exception as exc:
+                _log.debug("yt-dlp update monitor tick failed: %s", exc)
+                wait_seconds = 900.0
+            self._ytdlp_monitor_wake.wait(
+                timeout=max(1.0, min(float(wait_seconds), 900.0)))
+            self._ytdlp_monitor_wake.clear()
+
+    def _ytdlp_update_monitor_once(self, now=None):
+        """Run one scheduler tick; separated for deterministic tests."""
+        self._ensure_ytdlp_update_runtime()
+        now = time.time() if now is None else float(now)
+        cfg = self._settings_fresh_config()
+        mode = self._normalize_ytdlp_update_mode(cfg)
+        configured_channel = str(
+            cfg.get("ytdlp_channel") or "stable").strip().lower()
+
+        with self._ytdlp_update_state_lock:
+            pending = self._ytdlp_update_pending
+            if (pending and pending.get("automatic")
+                    and (mode != "automatic"
+                         or str(pending.get("channel") or "stable").lower()
+                         != configured_channel)):
+                self._ytdlp_update_pending = None
+                pending = None
+
+        # Rehydrate an update discovered before a crash/restart. The remote
+        # check timestamp is deliberately not advanced until it installs.
+        persisted_version = str(
+            cfg.get("ytdlp_update_pending_version") or "").strip()
+        persisted_channel = str(
+            cfg.get("ytdlp_update_pending_channel") or "").strip().lower()
+        if (mode == "automatic" and persisted_version
+                and persisted_channel == configured_channel
+                and pending is None):
+            yt = sync_backend.find_yt_dlp()
+            if yt and self._can_auto_update_ytdlp(yt):
+                self._queue_ytdlp_update(
+                    yt=yt, channel=persisted_channel,
+                    automatic=True, latest=persisted_version,
+                    record_check=True)
+
+        with self._ytdlp_update_state_lock:
+            pending = self._ytdlp_update_pending
+            running = self._ytdlp_update_running
+        if running:
+            return 30.0
+        if pending:
+            result = self._maybe_start_ytdlp_update(now=now)
+            if result.get("started"):
+                return 30.0
+            with self._ytdlp_update_state_lock:
+                pending = self._ytdlp_update_pending or {}
+                not_before = float(pending.get("not_before") or 0.0)
+            return max(3.0, min(60.0, not_before - now))
+
+        if mode == "off":
+            return 900.0
+        try:
+            days = max(1, min(365, int(
+                cfg.get("ytdlp_update_check_days", 1) or 1)))
+            last_check = float(
+                cfg.get("last_ytdlp_update_check_ts", 0) or 0)
+        except (TypeError, ValueError):
+            days, last_check = 1, 0.0
+        due_at = last_check + (days * 86_400) if last_check > 0 else now
+        not_before = max(due_at, float(self._ytdlp_check_not_before or 0.0))
+        if now >= not_before:
+            result = self.check_ytdlp_update()
+            return 60.0 if result.get("started") else 900.0
+        return max(1.0, min(900.0, not_before - now))
+
+    def _ytdlp_update_busy(self):
+        """Conservative idle check before replacing the yt-dlp executable."""
+        stop = getattr(self, "_ytdlp_monitor_stop", None)
+        if stop is not None and stop.is_set():
+            return True
+        for method_name in ("sync_is_running", "archive_single_is_running"):
+            try:
+                method = getattr(self, method_name, None)
+                if callable(method) and method():
+                    return True
+            except Exception:
+                pass
+        try:
+            from backend.sync.active_state import is_sync_work_active
+            if is_sync_work_active():
+                return True
+        except Exception:
+            pass
+        try:
+            from backend.process_runner import PROCESS_REGISTRY
+            if PROCESS_REGISTRY.alive_count() > 0:
+                return True
+        except Exception:
+            pass
+        # Some older specialized paths still launch yt-dlp directly instead
+        # of registering it. Scan this app's child tree as a second guard.
+        try:
+            import psutil
+            parent = psutil.Process(os.getpid())
+            for child in parent.children(recursive=True):
+                try:
+                    name = (child.name() or "").lower()
+                    if "yt-dlp" in name or "yt_dlp" in name:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    def _push_ytdlp_update_status(self, status, message, version=""):
+        window = getattr(self, "_window", None)
+        if window is None:
+            return
+        try:
+            import json as _json
+            payload = _json.dumps({
+                "status": str(status),
+                "message": str(message),
+                "version": str(version or ""),
+            })
+            window.evaluate_js(
+                "window._onYtdlpUpdateStatus && "
+                f"window._onYtdlpUpdateStatus({payload});")
+        except Exception as exc:
+            _log.debug("yt-dlp update UI push failed: %s", exc)
+
+    def _record_ytdlp_update_check(self, checked_at, *, clear_pending=True):
+        """Persist a completed check/update without disturbing other fields."""
         with SettingsMixin._settings_save_lock:
             cfg = self._settings_fresh_config()
             cfg["last_ytdlp_update_check_ts"] = float(checked_at)
+            if clear_pending:
+                cfg["ytdlp_update_pending_version"] = ""
+                cfg["ytdlp_update_pending_channel"] = ""
             if not self._settings_save_config(cfg):
                 return False
             cached = getattr(self, "_config", None)
             if isinstance(cached, dict):
                 cached["last_ytdlp_update_check_ts"] = float(checked_at)
+                if clear_pending:
+                    cached["ytdlp_update_pending_version"] = ""
+                    cached["ytdlp_update_pending_channel"] = ""
             return True
+
+    def _record_ytdlp_pending_update(self, latest, channel):
+        """Persist a discovered automatic update until install succeeds."""
+        with SettingsMixin._settings_save_lock:
+            cfg = self._settings_fresh_config()
+            cfg["ytdlp_update_pending_version"] = str(latest or "")
+            cfg["ytdlp_update_pending_channel"] = str(channel or "stable")
+            if not self._settings_save_config(cfg):
+                return False
+            cached = getattr(self, "_config", None)
+            if isinstance(cached, dict):
+                cached["ytdlp_update_pending_version"] = str(latest or "")
+                cached["ytdlp_update_pending_channel"] = str(
+                    channel or "stable")
+            return True
+
+    def _queue_ytdlp_update(self, *, yt, channel, automatic,
+                            latest="", current="", record_check=False):
+        """Coalesce one update request and start it when safely idle."""
+        self._ensure_ytdlp_update_runtime()
+        payload = {
+            "yt": str(yt),
+            "channel": channel if channel in ("stable", "nightly")
+                       else "stable",
+            "automatic": bool(automatic),
+            "latest": str(latest or ""),
+            "current": str(current or ""),
+            "record_check": bool(record_check),
+            "attempt": 0,
+            "not_before": 0.0,
+            "idle_sampled": False,
+        }
+        with self._ytdlp_update_state_lock:
+            if self._ytdlp_update_running:
+                return {"ok": True, "started": False, "running": True}
+            existing = self._ytdlp_update_pending
+            if existing is not None:
+                # A user-clicked request takes priority over an automatic one;
+                # otherwise keep the newest release identity/channel.
+                if existing.get("automatic") is False and automatic:
+                    return {"ok": True, "started": False, "pending": True}
+                payload["attempt"] = int(existing.get("attempt") or 0)
+            self._ytdlp_update_pending = payload
+        self._ytdlp_monitor_wake.set()
+        return self._maybe_start_ytdlp_update()
+
+    def _maybe_start_ytdlp_update(self, now=None):
+        """Start the coalesced request after a stable idle window."""
+        self._ensure_ytdlp_update_runtime()
+        now = time.time() if now is None else float(now)
+        with self._ytdlp_update_state_lock:
+            if self._ytdlp_update_running:
+                return {"ok": True, "started": False, "running": True}
+            payload = self._ytdlp_update_pending
+            if payload is None:
+                return {"ok": True, "started": False, "pending": False}
+            if now < float(payload.get("not_before") or 0.0):
+                return {"ok": True, "started": False, "pending": True}
+
+        if self._ytdlp_update_busy():
+            with self._ytdlp_update_state_lock:
+                if self._ytdlp_update_pending is payload:
+                    payload["idle_sampled"] = False
+                    payload["not_before"] = now + 60.0
+            return {"ok": True, "started": False, "pending": True,
+                    "busy": True}
+
+        # Automatic installs take two idle samples three seconds apart. This
+        # closes most races with older raw yt-dlp call sites that have not yet
+        # entered PROCESS_REGISTRY. Windows' executable lock remains the final
+        # safety net and a failed replacement is retained for retry.
+        if payload.get("automatic") and not payload.get("idle_sampled"):
+            with self._ytdlp_update_state_lock:
+                if self._ytdlp_update_pending is payload:
+                    payload["idle_sampled"] = True
+                    payload["not_before"] = now + 3.0
+            return {"ok": True, "started": False, "pending": True,
+                    "confirming_idle": True}
+
+        # Atomically block every new yt-dlp launch, then repeat the broad idle
+        # check while that block is held. A normal launch that won the race is
+        # registered before this reservation can succeed; a launch that loses
+        # waits until the updater releases the executable.
+        from backend.process_runner import YTDLP_UPDATE_GATE
+        if not YTDLP_UPDATE_GATE.try_reserve_update(self._ytdlp_update_busy):
+            with self._ytdlp_update_state_lock:
+                if self._ytdlp_update_pending is payload:
+                    payload["idle_sampled"] = False
+                    payload["not_before"] = now + 60.0
+            return {"ok": True, "started": False, "pending": True,
+                    "busy": True}
+        payload["gate_reserved"] = True
+
+        with self._ytdlp_update_state_lock:
+            if (self._ytdlp_update_pending is not payload
+                    or self._ytdlp_update_running):
+                YTDLP_UPDATE_GATE.release_update()
+                payload["gate_reserved"] = False
+                return {"ok": True, "started": False, "pending": True}
+            self._ytdlp_update_pending = None
+            self._ytdlp_update_running = True
+        try:
+            thread = threading.Thread(
+                target=lambda: self._run_ytdlp_update(payload),
+                daemon=True)
+            thread.start()
+            return {"ok": True, "started": True,
+                    "automatic": bool(payload.get("automatic"))}
+        except Exception as exc:
+            if payload.get("gate_reserved"):
+                YTDLP_UPDATE_GATE.release_update()
+                payload["gate_reserved"] = False
+            with self._ytdlp_update_state_lock:
+                self._ytdlp_update_running = False
+                self._ytdlp_update_pending = payload
+            return {"ok": False, "started": False, "error": str(exc)}
+
+    def _run_ytdlp_update(self, payload):
+        import subprocess as _sp
+
+        yt = payload["yt"]
+        channel = payload["channel"]
+        automatic = bool(payload.get("automatic"))
+        label = "beta (nightly)" if channel == "nightly" else "stable"
+        log_stream = self._settings_log_stream()
+        prefix = "Automatic" if automatic else "Manual"
+        log_stream.emit([
+            ["[Update] ", "update_head"],
+            [f"{prefix} yt-dlp update to {label}...\n", "update_sep"],
+        ])
+        proc = None
+        registry = None
+        success = False
+        retry_automatic = False
+        try:
+            proc = _sp.Popen([yt, "--update-to", channel],
+                             stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                             encoding="utf-8", errors="replace", bufsize=1,
+                             startupinfo=sync_backend._startupinfo)
+            try:
+                from backend.process_runner import PROCESS_REGISTRY
+                registry = PROCESS_REGISTRY
+                registry.register(proc)
+            except Exception:
+                registry = None
+            for line in proc.stdout:
+                log_stream.emit_dim(" " + line.rstrip())
+            proc.wait()
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"yt-dlp updater exited with code {proc.returncode}")
+
+            SettingsMixin._ytdlp_version_cache.pop(yt, None)
+            latest = payload.get("latest") or ""
+            installed = latest
+            if automatic and latest:
+                verified = self.ytdlp_version()
+                if not verified.get("ok"):
+                    raise RuntimeError(
+                        "the updater exited successfully but the installed "
+                        "version could not be verified")
+                installed = str(verified.get("version") or "").strip()
+                expected_tuple = self._ytdlp_version_tuple(latest)
+                installed_tuple = self._ytdlp_version_tuple(installed)
+                correct_channel_shape = (
+                    len(installed_tuple) > 3 if channel == "nightly"
+                    else len(installed_tuple) == 3
+                )
+                if (not expected_tuple or not installed_tuple
+                        or not correct_channel_shape
+                        or installed_tuple < expected_tuple):
+                    raise RuntimeError(
+                        "the updater exited successfully but reported "
+                        f"version {installed or 'unknown'}; expected {channel} "
+                        f"release {latest} or newer")
+            success = True
+            if payload.get("record_check"):
+                with SettingsMixin._settings_save_lock:
+                    fresh_cfg = self._settings_fresh_config()
+                    fresh_channel = str(
+                        fresh_cfg.get("ytdlp_channel") or "stable"
+                    ).strip().lower()
+                    if fresh_channel == channel:
+                        self._record_ytdlp_update_check(time.time())
+                    else:
+                        # A channel switch made while the updater was already
+                        # running remains due. Do not let the old channel's
+                        # success postpone the newly selected one.
+                        log_stream.emit_dim(
+                            " [Update] Channel changed while updating; the "
+                            "new channel remains due for a check.")
+            display_version = installed or "the latest release"
+            message = (f"yt-dlp updated to {display_version}; "
+                       "no restart required.")
+            log_stream.emit([["[Update] ", "update_head"],
+                             [message + "\n", "update_sep"]])
+            self._push_ytdlp_update_status("success", message,
+                                            installed or "")
+        except Exception as exc:
+            if automatic:
+                next_attempt = int(payload.get("attempt") or 0) + 1
+                stopping = self._ytdlp_monitor_stop.is_set()
+                fresh_cfg = self._settings_fresh_config()
+                fresh_channel = str(
+                    fresh_cfg.get("ytdlp_channel") or "stable"
+                ).strip().lower()
+                settings_current = (
+                    self._normalize_ytdlp_update_mode(fresh_cfg) == "automatic"
+                    and fresh_channel == channel)
+                retry_automatic = (
+                    not stopping
+                    and settings_current
+                    and next_attempt < SettingsMixin._ytdlp_update_max_attempts)
+                if retry_automatic:
+                    delay = min(
+                        21_600.0, 900.0 * (2 ** min(next_attempt - 1, 5)))
+                    payload["attempt"] = next_attempt
+                    payload["idle_sampled"] = False
+                    payload["not_before"] = time.time() + delay
+                    wait_label = (
+                        f"{int(delay // 3600)} hour(s)" if delay >= 3600
+                        else f"{int(delay // 60)} minutes")
+                    message = (f"Automatic yt-dlp update failed: {exc}. "
+                               f"Retrying automatically in {wait_label}.")
+                elif stopping:
+                    message = f"Automatic yt-dlp update stopped: {exc}."
+                elif not settings_current:
+                    message = (
+                        f"Automatic yt-dlp update failed: {exc}. It will not "
+                        "retry because the update settings changed.")
+                else:
+                    if payload.get("record_check"):
+                        self._record_ytdlp_update_check(time.time())
+                    message = (
+                        f"Automatic yt-dlp update failed after {next_attempt} "
+                        f"attempts: {exc}. Automatic retries are paused until "
+                        "the next scheduled check; you can update manually in "
+                        "Health → Tools.")
+                log_stream.emit_error(message)
+                self._push_ytdlp_update_status(
+                    "deferred" if retry_automatic else "error", message)
+            else:
+                message = f"yt-dlp update failed: {exc}"
+                log_stream.emit_error(message)
+                self._push_ytdlp_update_status("error", message)
+        finally:
+            if registry is not None and proc is not None:
+                try:
+                    registry.unregister(proc)
+                except Exception:
+                    pass
+            if payload.get("gate_reserved"):
+                try:
+                    from backend.process_runner import YTDLP_UPDATE_GATE
+                    YTDLP_UPDATE_GATE.release_update()
+                finally:
+                    payload["gate_reserved"] = False
+            log_stream.flush()
+            with self._ytdlp_update_state_lock:
+                self._ytdlp_update_running = False
+                if automatic and not success and retry_automatic:
+                    self._ytdlp_update_pending = payload
+            self._ytdlp_monitor_wake.set()
 
     def check_ytdlp_update(self, force=False):
         """Check the selected yt-dlp channel for a newer release.
 
-        The startup caller uses the configured day interval and returns
-        immediately while the network request runs in a daemon thread. A
-        successful request records its timestamp; failed requests are retried
-        on the next launch. This only checks and notifies — it never installs
-        an update automatically.
+        The persistent monitor calls this whenever the configured elapsed-day
+        interval is due. The network request remains asynchronous. Automatic
+        mode persists a discovered managed-copy update and hands it to the
+        idle-time coordinator; notify mode only reports it.
         """
-        import time as _time
-
         cfg = self._settings_fresh_config()
+        mode = self._normalize_ytdlp_update_mode(cfg)
         try:
             interval_days = max(
-                0, min(365, int(cfg.get("ytdlp_update_check_days", 7) or 0)))
+                1, min(365, int(cfg.get("ytdlp_update_check_days", 1) or 1)))
         except (TypeError, ValueError):
-            interval_days = 7
-        now = _time.time()
+            interval_days = 1
+        now = time.time()
         try:
             last_check = float(cfg.get("last_ytdlp_update_check_ts", 0) or 0)
         except (TypeError, ValueError):
             last_check = 0.0
 
         if not force:
-            if interval_days == 0:
+            if mode == "off":
                 return {"ok": True, "started": False, "disabled": True}
             interval_seconds = interval_days * 86_400
             if 0 < last_check <= now and now - last_check < interval_seconds:
@@ -540,31 +1104,97 @@ class SettingsMixin:
                 if not latest_tuple:
                     raise RuntimeError("release service returned no version")
 
-                self._record_ytdlp_update_check(now)
-                if latest_tuple > current_tuple:
-                    label = "beta (nightly)" if channel == "nightly" else "stable"
-                    self._settings_log_stream().emit([
-                        ["⚠ ", "red"],
-                        [f"yt-dlp {latest} is available on the {label} channel "
-                         f"(installed: {current}). Update it in Health → Tools "
-                         "→ yt-dlp → Update.\n", "red"],
-                    ])
-                    self._settings_log_stream().flush()
+                # Stable builds have a three-part date. Nightly builds add a
+                # build-time component; selecting Stable is an explicit
+                # request to switch back even when that numeric tuple sorts
+                # below the installed nightly build.
+                channel_switch = channel == "stable" and len(current_tuple) > 3
+                update_available = latest_tuple > current_tuple or channel_switch
+                # Settings may change while GitHub is responding. Hold the
+                # same lock as settings_save while validating and recording
+                # this result so an old Automatic/Stable request cannot land
+                # after the user has selected Off, Notify, or Nightly.
+                with SettingsMixin._settings_save_lock:
+                    fresh_cfg = self._settings_fresh_config()
+                    fresh_mode = self._normalize_ytdlp_update_mode(fresh_cfg)
+                    fresh_channel = str(
+                        fresh_cfg.get("ytdlp_channel") or "stable"
+                    ).strip().lower()
+                    if fresh_channel not in SettingsMixin._ytdlp_release_apis:
+                        fresh_channel = "stable"
+                    if fresh_mode == "off" or fresh_channel != channel:
+                        self._ytdlp_check_not_before = 0.0
+                        return
+
+                    if not update_available:
+                        self._record_ytdlp_update_check(now)
+                        self._ytdlp_check_not_before = 0.0
+                        return
+
+                    label = (
+                        "beta (nightly)" if channel == "nightly" else "stable")
+                    yt_path = (
+                        info.get("path") or sync_backend.find_yt_dlp() or "")
+                    auto_updatable = self._can_auto_update_ytdlp(yt_path)
+                    if fresh_mode == "automatic" and auto_updatable:
+                        self._record_ytdlp_pending_update(latest, channel)
+                        queued = self._queue_ytdlp_update(
+                            yt=yt_path, channel=channel, automatic=True,
+                            latest=latest, current=current, record_check=True)
+                        self._settings_log_stream().emit([
+                            ["[Update] ", "update_head"],
+                            [f"yt-dlp {latest} is available on the {label} "
+                             f"channel (installed: {current}). Automatic "
+                             "update queued for the next idle window.\n",
+                             "update_sep"],
+                        ])
+                        self._push_ytdlp_update_status(
+                            "pending",
+                            "yt-dlp update queued until YouTube work is idle.",
+                            latest)
+                        if queued.get("started"):
+                            self._settings_log_stream().emit_dim(
+                                " [Update] Idle window confirmed; updater "
+                                "started.")
+                    else:
+                        self._record_ytdlp_update_check(now)
+                        reason = ""
+                        if fresh_mode == "automatic" and not auto_updatable:
+                            reason = (
+                                " This yt-dlp installation is controlled by "
+                                "a package manager or is not a standalone "
+                                "build, so it will not be changed "
+                                "automatically.")
+                        notice = (
+                            f"yt-dlp {latest} is available on the {label} "
+                            f"channel (installed: {current}).{reason} Update "
+                            "it in Health → Tools → yt-dlp → Update.")
+                        self._settings_log_stream().emit([
+                            ["⚠ ", "red"], [notice + "\n", "red"],
+                        ])
+                        self._settings_log_stream().flush()
+                        self._push_ytdlp_update_status(
+                            "available", notice, latest)
+                self._ytdlp_check_not_before = 0.0
             except Exception as e:
+                self._ytdlp_check_not_before = time.time() + 3_600.0
                 try:
                     self._settings_log_stream().emit_dim(
-                        f"[Update] yt-dlp check skipped: {e}")
+                        f"[Update] yt-dlp check skipped: {e}; retrying later.")
                 except Exception as log_error:
                     _log.debug("ytdlp update check log failed: %s", log_error)
             finally:
                 with SettingsMixin._ytdlp_update_check_lock:
                     SettingsMixin._ytdlp_update_check_running = False
+                wake = getattr(self, "_ytdlp_monitor_wake", None)
+                if wake is not None:
+                    wake.set()
 
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "started": True, "due": True}
 
     def ytdlp_update(self):
-        """Update yt-dlp in a background thread; stream output to the log.
+        """Queue a user-requested update through the shared coordinator.
 
         Targets the configured release channel via `--update-to <channel>`
         (stable or nightly). Using `--update-to` rather than the older `-U`
@@ -578,42 +1208,12 @@ class SettingsMixin:
         channel = (cfg.get("ytdlp_channel") or "stable").strip().lower()
         if channel not in ("stable", "nightly"):
             channel = "stable"
-        _label = "beta (nightly)" if channel == "nightly" else "stable"
-        def _run():
-            import subprocess as _sp
-            log_stream = self._settings_log_stream()
-            log_stream.emit([
-                ["[Update] ", "update_head"],
-                [f"Updating yt-dlp to {_label}...\n", "update_sep"],
-            ])
-            try:
-                proc = _sp.Popen([yt, "--update-to", channel],
-                                  stdout=_sp.PIPE, stderr=_sp.STDOUT,
-                                  encoding="utf-8", errors="replace", bufsize=1,
-                                  startupinfo=sync_backend._startupinfo)
-                for line in proc.stdout:
-                    log_stream.emit_dim(" " + line.rstrip())
-                proc.wait()
-                # check proc.returncode before declaring
-                # success. Old code always emitted "update complete"
-                # even on non-zero exit (most common cause: the yt-dlp
-                # exe is locked by a running sync, so the self-update
-                # fails but the banner still claimed it worked).
-                if proc.returncode == 0:
-                    SettingsMixin._ytdlp_version_cache.pop(yt, None)
-                    log_stream.emit([["[Update] ", "update_head"],
-                                     ["yt-dlp update complete.\n", "update_sep"]])
-                else:
-                    log_stream.emit_error(
-                        f"yt-dlp update failed (exit code {proc.returncode}). "
-                        "If a sync is running, stop it and try again — the "
-                        ".exe can't be replaced while it's open.")
-            except Exception as e:
-                log_stream.emit_error(f"yt-dlp update failed: {e}")
-            finally:
-                log_stream.flush()
-        threading.Thread(target=_run, daemon=True).start()
-        return {"ok": True, "started": True}
+        result = self._queue_ytdlp_update(
+            yt=yt, channel=channel, automatic=False, record_check=True)
+        if result.get("pending") and result.get("busy"):
+            self._settings_log_stream().emit_dim(
+                "[Update] yt-dlp update queued until current work is idle.")
+        return result
 
 
     def set_parent_folder(self, path):

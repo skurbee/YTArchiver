@@ -30,16 +30,30 @@
               </select>
             </div>
 
-            <label class="edit-gl">Auto-check</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <span class="settings-control-caption">At launch every</span>
-              <input type="number" min="0" max="365" step="1"
-                     class="ctl-input edit-num"
-                     id="settings-ytdlp-check-days" value="7"
-                     title="Check the selected yt-dlp release channel at launch when this many days have passed. Use 0 to disable." />
-              <span class="settings-control-unit">days</span>
-              <span class="settings-inline-note" id="settings-ytdlp-check-status">0 disables</span>
+            <label class="edit-gl">Update behavior</label>
+            <div class="edit-gv-stack">
+              <select class="ctl-select" id="settings-ytdlp-update-mode"
+                      title="Automatic updates apply to standalone yt-dlp executables. Package-manager installations remain notify-only.">
+                <option value="automatic">Install automatically (recommended)</option>
+                <option value="notify">Notify only</option>
+                <option value="off">Off</option>
+              </select>
+              <span class="settings-inline-note" id="settings-ytdlp-update-note">Installs when YouTube work is idle; no restart required</span>
             </div>
+
+            <label class="edit-gl">Check interval</label>
+            <div class="edit-gv-inline edit-gap-6">
+              <span class="settings-control-caption">Every</span>
+              <input type="number" min="1" max="365" step="1"
+                     class="ctl-input edit-num"
+                     id="settings-ytdlp-check-days" value="1"
+                     title="Check the selected yt-dlp release channel after this many elapsed days, including while YTArchiver stays open." />
+              <span class="settings-control-unit">days</span>
+              <span class="settings-inline-note" id="settings-ytdlp-check-status">never checked</span>
+            </div>
+
+            <div class="edit-gl"></div>
+            <div class="settings-inline-note">Checks at launch when overdue and continues in the background while YTArchiver stays open. Automatic updates wait for an idle window.</div>
 
           </div>
 

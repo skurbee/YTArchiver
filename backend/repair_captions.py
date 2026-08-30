@@ -40,6 +40,7 @@ from pathlib import Path
 
 from . import youtube_traffic
 from .log import get_logger
+from .process_runner import popen_ytdlp
 from .sync import _find_cookie_source, _startupinfo, find_yt_dlp
 from .transcribe import _parse_vtt, _replace_jsonl_entry
 from .transcribe.transcribe_files import parse_transcript_header
@@ -273,7 +274,7 @@ def _fetch_vtt(yt_dlp: str, video_id: str,
         return None, (
             permission.get("error") or "traffic governor cancelled")
     try:
-        proc = subprocess.Popen(
+        proc = popen_ytdlp(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True,
             startupinfo=_startupinfo, creationflags=_CREATE_NO_WINDOW,

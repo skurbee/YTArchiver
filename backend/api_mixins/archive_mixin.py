@@ -16,6 +16,7 @@ from datetime import datetime
 from backend import sync as sync_backend
 from backend import youtube_traffic
 from backend.log import swallow
+from backend.process_runner import popen_ytdlp
 from backend.ytarchiver_config import load_config
 
 from ._shared import _log
@@ -604,7 +605,7 @@ class ArchiveMixin:
                         or "YouTube traffic governor cancelled")
                     return
             try:
-                proc = _sp.Popen(cmd, stdin=_sp.DEVNULL,
+                proc = popen_ytdlp(cmd, stdin=_sp.DEVNULL,
                                  stdout=_sp.PIPE, stderr=_sp.STDOUT,
                                  encoding="utf-8", errors="replace",
                                  bufsize=1, startupinfo=sync_backend._startupinfo)

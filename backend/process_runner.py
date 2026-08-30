@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 
@@ -161,6 +162,81 @@ class ProcessRegistry:
 
 # Module-level singleton — the rest of the codebase imports this.
 PROCESS_REGISTRY = ProcessRegistry()
+
+
+# ── yt-dlp update launch gate ─────────────────────────────────────────────
+
+class YtDlpUpdateGate:
+    """Atomically hand the yt-dlp executable to its self-updater.
+
+    Ordinary launches briefly enter ``launch_slot`` while they create and
+    register a child process.  The updater reserves the exclusive side only
+    after no launch is between those two steps, then re-checks the process
+    registry while new launches are blocked.  This closes the otherwise tiny
+    check-then-spawn race without serializing normal yt-dlp processes.
+    """
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._launchers = 0
+        self._update_reserved = False
+
+    @contextmanager
+    def launch_slot(self):
+        with self._condition:
+            while self._update_reserved:
+                self._condition.wait()
+            self._launchers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._launchers = max(0, self._launchers - 1)
+                self._condition.notify_all()
+
+    def try_reserve_update(self, busy_check: Callable[[], bool]) -> bool:
+        """Reserve exclusive launch access when the app is still idle."""
+        with self._condition:
+            if self._update_reserved or self._launchers:
+                return False
+            self._update_reserved = True
+        try:
+            if busy_check():
+                self.release_update()
+                return False
+        except Exception:
+            self.release_update()
+            raise
+        return True
+
+    def release_update(self) -> None:
+        with self._condition:
+            if not self._update_reserved:
+                return
+            self._update_reserved = False
+            self._condition.notify_all()
+
+    def update_reserved(self) -> bool:
+        with self._condition:
+            return self._update_reserved
+
+
+YTDLP_UPDATE_GATE = YtDlpUpdateGate()
+
+
+def popen_ytdlp(*args, registry: ProcessRegistry | None = None, **kwargs):
+    """Launch and register yt-dlp as one update-gate transaction."""
+    target_registry = registry or PROCESS_REGISTRY
+    with YTDLP_UPDATE_GATE.launch_slot():
+        proc = subprocess.Popen(*args, **kwargs)
+        target_registry.register(proc)
+    return proc
+
+
+def run_ytdlp(*args, **kwargs):
+    """Run a synchronous yt-dlp probe without racing self-update."""
+    with YTDLP_UPDATE_GATE.launch_slot():
+        return subprocess.run(*args, **kwargs)
 
 
 # ── yt-dlp locator (re-exports the legacy one for now) ───────────────
@@ -339,7 +415,7 @@ class YtDlpRunner:
             )
             return -1, "", str(reason)
         try:
-            proc = subprocess.Popen(
+            proc = popen_ytdlp(
                 argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -349,10 +425,10 @@ class YtDlpRunner:
                 startupinfo=make_startupinfo(),
                 creationflags=subprocess_creationflags(),
                 env=utf8_env(extra_env or None),
+                registry=self._registry,
             )
         except OSError as e:
             return -1, "", f"launch failed: {e}"
-        self._registry.register(proc)
         try:
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)
@@ -419,7 +495,7 @@ class YtDlpRunner:
                 -1, [str(reason)], cancelled=bool(
                     permission.get("cancelled")))
         try:
-            proc = subprocess.Popen(
+            proc = popen_ytdlp(
                 argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -430,10 +506,10 @@ class YtDlpRunner:
                 startupinfo=make_startupinfo(),
                 creationflags=subprocess_creationflags(),
                 env=utf8_env(extra_env or None),
-        )
+                registry=self._registry,
+            )
         except OSError as e:
             return StreamingRunResult(-1, [f"launch failed: {e}"])
-        self._registry.register(proc)
         from collections import deque
         stderr_tail: deque = deque(maxlen=200)
         cancelled = False

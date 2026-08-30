@@ -11,7 +11,7 @@ from typing import Any
 from .. import utils as _utils
 from .. import youtube_traffic
 from ..log import get_logger, swallow
-from ..process_runner import PROCESS_REGISTRY
+from ..process_runner import PROCESS_REGISTRY, popen_ytdlp
 
 _log = get_logger(__name__)
 
@@ -50,7 +50,7 @@ def popen_ytdlp_process(cmd: list[str], *, startupinfo: Any = None,
     if not permission.get("ok"):
         raise OSError(
             permission.get("error") or "YouTube traffic governor cancelled")
-    proc = subprocess.Popen(
+    proc = popen_ytdlp(
         cmd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -59,10 +59,6 @@ def popen_ytdlp_process(cmd: list[str], *, startupinfo: Any = None,
         startupinfo=startupinfo,
         env=_utils.utf8_subprocess_env(),
     )
-    try:
-        PROCESS_REGISTRY.register(proc)
-    except Exception as exc:
-        swallow("process-registry register", exc)
     return proc
 
 

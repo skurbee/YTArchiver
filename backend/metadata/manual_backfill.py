@@ -34,6 +34,7 @@ from typing import Any
 
 from .. import youtube_traffic
 from ..log import get_logger, swallow
+from ..process_runner import popen_ytdlp
 from ..ytarchiver_config import APP_DATA_DIR
 from .normalize import _normalize_title_for_match
 
@@ -170,7 +171,7 @@ def _ytsearch(yt: str, query: str, n: int,
     if not permission.get("ok"):
         return out
     try:
-        proc = subprocess.Popen(
+        proc = popen_ytdlp(
             cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
             creationflags=_CREATE_NO_WINDOW)

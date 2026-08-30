@@ -30,7 +30,7 @@ from typing import Any
 from .. import utils as _utils
 from .. import youtube_traffic
 from ..log import get_logger, swallow
-from ..process_runner import PROCESS_REGISTRY
+from ..process_runner import PROCESS_REGISTRY, popen_ytdlp, run_ytdlp
 from ..ytarchiver_config import config_transaction
 from .ytdlp_proc import _ensure_videos_tab, _find_cookie_source, find_yt_dlp
 
@@ -116,7 +116,7 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
             "error": permission.get("error") or "traffic governor cancelled",
         }
     try:
-        proc = subprocess.Popen(
+        proc = popen_ytdlp(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             creationflags=(0x08000000 if os.name == "nt" else 0),
@@ -124,10 +124,6 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
         )
     except Exception as e:
         return {"ok": False, "error": str(e)}
-    try:
-        PROCESS_REGISTRY.register(proc)
-    except Exception as e:
-        swallow("process-registry register", e)
     timer = None
     timeout_hit = {"hit": False}
     try:
@@ -286,7 +282,7 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
             "paused": bool(permission.get("paused")),
         }
     try:
-        proc = subprocess.run(
+        proc = run_ytdlp(
             cmd, capture_output=True, text=True, timeout=float(timeout_sec),
             encoding="utf-8", errors="replace",
             # stdin=DEVNULL so a signal sent to the parent doesn't

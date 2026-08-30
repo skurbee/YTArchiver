@@ -33,6 +33,7 @@ from typing import Any
 
 from ..log import get_logger, swallow
 from ..log_stream import LogStreamer
+from ..process_runner import popen_ytdlp
 from ..sync import _find_cookie_source, _startupinfo, find_yt_dlp
 from ..thumbnails import _download_thumbnail, _ensure_thumbnails_dir
 from ..utils import utf8_subprocess_env as _utf8_env
@@ -151,7 +152,7 @@ def _fetch_video_metadata(yt: str, video_id: str,
             _creationflags = 0
             if os.name == "nt":
                 _creationflags = 0x00000200  # CREATE_NEW_PROCESS_GROUP
-            proc = subprocess.Popen(
+            proc = popen_ytdlp(
                 cmd, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 encoding="utf-8", errors="replace",

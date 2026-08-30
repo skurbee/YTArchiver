@@ -6,6 +6,23 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v83.4 - 2026-08-30
+
+### Added
+- **yt-dlp can now stay current automatically while YTArchiver remains open.** Update behavior can be set to Automatic, Notify only, or Off, with a configurable elapsed-day interval that continues across long app sessions and sleep/resume cycles.
+
+### Changed
+- **Automatic updates wait for an idle YouTube window and require no app restart.** Discovered releases remain queued across restarts, and manual and automatic requests share one coordinator.
+- **Standalone and package-managed yt-dlp installations are handled appropriately.** Recognized standalone executables can use their built-in updater wherever they are located; package-manager launchers remain notify-only.
+
+### Fixed
+- **Update checks honor settings changed while a request is in flight.** Switching release channel or update mode invalidates stale queued work, and a completed old-channel update cannot postpone the newly selected channel.
+- **Updater handoff is race-free.** New yt-dlp launches are blocked during executable replacement, version verification accepts a newer same-channel release, pending manual takeovers clear correctly, and repeated failures use bounded backoff instead of retrying indefinitely.
+
+### Validation
+- Release gate passed: 526 tests, definite-bug lint checks, full backend import checks, generated HTML verification, and JavaScript syntax checks.
+- Built with Python 3.13 using `YTArchiver.spec`.
+
 ## v83.3 - 2026-08-29
 
 ### Changed

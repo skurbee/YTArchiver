@@ -1048,16 +1048,16 @@ class SyncResult(dict):
     """Result dict with ok/reason/counts."""
 
 
-def sync_channel(channel: dict[str, Any], stream: LogStreamer,
-                 cancel_event: threading.Event | None = None,
-                 queues=None, transcribe_mgr=None,
-                 pause_event: threading.Event | None = None,
-                 kill_current: threading.Event | None = None,
-                 pass_idx: int = 1,
-                 pass_total: int = 1,
-                 *,
-                 quickcheck_fresh_ids: (list[str] | tuple[str, ...]
-                                        | set[str] | None) = None) -> SyncResult:
+def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
+                       cancel_event: threading.Event | None = None,
+                       queues=None, transcribe_mgr=None,
+                       pause_event: threading.Event | None = None,
+                       kill_current: threading.Event | None = None,
+                       pass_idx: int = 1,
+                       pass_total: int = 1,
+                       *,
+                       quickcheck_fresh_ids: (list[str] | tuple[str, ...]
+                                              | set[str] | None) = None) -> SyncResult:
     """
     Sync one channel: fetch new videos via yt-dlp, stream progress.
 
@@ -1114,13 +1114,6 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     url = opts.url
     resolution = opts.resolution
     auto_tx = opts.auto_transcribe
-    # Mark the channel as "sync in progress" so the transcribe worker's
-    # _flush_batch_stats skips it — sync_channel will emit the final
-    # consolidated [Dwnld] row at its end with the transcribe count
-    # read synchronously from transcribe_mgr. See a bug: fast
-    # auto-captions finish before sync_channel ends, flush fired first
-    # and emitted a duplicate [Trnscr] row.
-    set_sync_active(name)
     min_dur = opts.min_duration
     max_dur = opts.max_duration
     mode = opts.mode
@@ -3858,12 +3851,6 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         except Exception as _ae:
             stream.emit_dim(f" (channel-art refresh skipped: {_ae})")
 
-    # Clear the sync-active flag — allow transcribe._flush_batch_stats to
-    # emit standalone [Trnscr] rows for any transcriptions that slip in
-    # after this point (shouldn't happen for sync-originated jobs since
-    # we already consumed + emitted, but harmless if it does).
-    clear_sync_active(name)
-
     # Post-channel orphan cleanup: any dlrow_<N> we created via a
     # Destination line but never closed via a DLTRACK done emit is an
     # orphan (path-match failure, sidecar-only Destination, etc.). The
@@ -4002,6 +3989,38 @@ from .active_state import (  # noqa: F401
     set_metadata_changed_hook,
     set_sync_active,
 )
+
+
+def sync_channel(channel: dict[str, Any], stream: LogStreamer,
+                 cancel_event: threading.Event | None = None,
+                 queues=None, transcribe_mgr=None,
+                 pause_event: threading.Event | None = None,
+                 kill_current: threading.Event | None = None,
+                 pass_idx: int = 1,
+                 pass_total: int = 1,
+                 *,
+                 quickcheck_fresh_ids: (list[str] | tuple[str, ...]
+                                        | set[str] | None) = None) -> SyncResult:
+    """Run one channel sync while keeping active-state bookkeeping exact."""
+    name = channel.get("name") or channel.get("folder") or "?"
+    set_sync_active(name)
+    try:
+        return _sync_channel_impl(
+            channel,
+            stream,
+            cancel_event=cancel_event,
+            queues=queues,
+            transcribe_mgr=transcribe_mgr,
+            pause_event=pause_event,
+            kill_current=kill_current,
+            pass_idx=pass_idx,
+            pass_total=pass_total,
+            quickcheck_fresh_ids=quickcheck_fresh_ids,
+        )
+    finally:
+        # Every early return and unexpected exception must release the marker.
+        # Otherwise unrelated maintenance remains deferred for the session.
+        clear_sync_active(name)
 
 # sync_all is implemented in sync_all.py and re-imported here so
 # `from backend.sync.core import sync_all` continues to resolve and

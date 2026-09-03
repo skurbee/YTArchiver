@@ -6,6 +6,16 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v83.8 - 2026-09-03
+
+### Fixed
+- **Made Windows recovery and Trash tests compare the folder itself, not its displayed spelling.** Windows may show one folder with either a short name or its full name. The tests now treat those as the same location without weakening the app's path or link protections.
+- **Cleared single-channel sync state on every exit.** If a channel sync stops during setup or hits an unexpected error, YTArchiver no longer keeps treating that channel as active and holding later maintenance work.
+
+### Validation
+- Added regression coverage for early-return and exception cleanup in channel syncs.
+- Reproduced GitHub's Windows short-path environment locally and verified the corrected Trash safety tests there.
+
 ## v83.7 - 2026-09-03
 
 ### Fixed

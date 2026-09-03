@@ -8349,6 +8349,8 @@ class SyncCoreTests(unittest.TestCase):
                 "name": "New Channel",
                 "url": "https://www.youtube.com/@newchannel",
             }
+            active_state.clear_sync_active(channel["name"])
+            self.addCleanup(active_state.clear_sync_active, channel["name"])
 
             with mock.patch.object(sync_core, "find_yt_dlp",
                                    return_value="yt-dlp"), \
@@ -8363,6 +8365,23 @@ class SyncCoreTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["reason"], "write blocked")
             self.assertFalse((root / "New Channel").exists())
+            self.assertFalse(active_state.is_sync_active(channel["name"]))
+
+    def test_sync_channel_exception_clears_active_marker(self) -> None:
+        channel = {
+            "name": "Exploding Channel",
+            "url": "https://www.youtube.com/@explodingchannel",
+        }
+        active_state.clear_sync_active(channel["name"])
+        self.addCleanup(active_state.clear_sync_active, channel["name"])
+
+        with mock.patch.object(
+                sync_core, "_sync_channel_impl",
+                side_effect=RuntimeError("forced sync failure")):
+            with self.assertRaisesRegex(RuntimeError, "forced sync failure"):
+                sync_core.sync_channel(channel, mock.Mock())
+
+        self.assertFalse(active_state.is_sync_active(channel["name"]))
 
     def test_429_auto_pause_uses_locked_process_wide_cooldown(self) -> None:
         stream = mock.Mock()

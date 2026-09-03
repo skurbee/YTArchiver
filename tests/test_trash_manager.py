@@ -26,6 +26,11 @@ from backend.services.job_supervisor import JobSupervisor  # noqa: E402
 from backend.trash_manager import TrashManager, purge_expired  # noqa: E402
 
 
+def _same_resolved_path(first, second) -> bool:
+    """Compare path identity without depending on Windows alias spelling."""
+    return Path(first).resolve() == Path(second).resolve()
+
+
 class TrashManagerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="yta-trash-manager-")
@@ -84,7 +89,13 @@ class TrashManagerTests(unittest.TestCase):
         self.assertEqual(manifest["channel_snapshot"], snapshot)
         self.assertEqual(entry["entry_id"], manifest["entry_id"])
         self.assertEqual(entry["restore_scope"], "full")
-        hide.assert_any_call(str(self.root / ".YTArchiver Trash"))
+        expected_root = (self.root / ".YTArchiver Trash").resolve()
+        hidden_roots = {
+            Path(call.args[0]).resolve()
+            for call in hide.call_args_list
+            if call.args
+        }
+        self.assertIn(expected_root, hidden_roots)
 
     def test_list_includes_summary_size_and_untracked_counts(self):
         _snapshot, _folder, entry, _trash_path = self._channel_entry()
@@ -239,7 +250,7 @@ class TrashManagerTests(unittest.TestCase):
         trash_root = self.root / ".YTArchiver Trash"
 
         def is_junction(path):
-            return Path(path) == trash_root
+            return _same_resolved_path(path, trash_root)
 
         with mock.patch(
             "backend.trash_manager.os.path.isjunction",
@@ -268,7 +279,7 @@ class TrashManagerTests(unittest.TestCase):
         entry = self.manager.list_entries(self.cfg)["entries"][0]
 
         def is_junction(path):
-            return Path(path) == recovery_dir
+            return _same_resolved_path(path, recovery_dir)
 
         with mock.patch(
             "backend.trash_manager.os.path.isjunction",
@@ -294,7 +305,7 @@ class TrashManagerTests(unittest.TestCase):
         recovery_dir.mkdir()
 
         def is_junction(path):
-            return Path(path) == recovery_dir
+            return _same_resolved_path(path, recovery_dir)
 
         with mock.patch(
             "backend.services.file_ops.os.path.isjunction",

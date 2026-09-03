@@ -6,14 +6,23 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v83.7 - 2026-09-03
+
+### Fixed
+- **Corrected a Windows-only folder-recovery test.** Windows can show the same folder using a short name or its full name. The test now recognizes both as the same folder; the app's recovery behavior was not changed.
+
+### Validation
+- Full local release gate passed, including 1,144 Python tests, 16 Node frontend regressions, and 187 Playwright browser behavior tests.
+- The Windows x64 executable was built and verified with Python 3.13.
+
 ## v83.6 - 2026-09-03
 
 ### Fixed
 - **Canonicalized local-media allowlist paths before containment checks.** Equivalent Windows 8.3 and long-path spellings now resolve to the same allowed location, preventing valid thumbnails, channel art, or media from being rejected while links that resolve outside an approved root remain blocked.
 
 ### Validation
-- Full release gate passed, including 1,144 Python tests, 16 Node frontend regressions, and 187 Playwright browser behavior tests.
-- The Windows x64 executable and GitHub Actions workflow were both verified with Python 3.13.
+- Full local release gate passed, including 1,144 Python tests, 16 Node frontend regressions, and 187 Playwright browser behavior tests.
+- The Windows x64 executable was built and verified locally with Python 3.13.
 
 ## v83.5 - 2026-09-03
 

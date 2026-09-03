@@ -298,8 +298,12 @@ class FolderTransactionTests(unittest.TestCase):
         record = transactions.load_channel_transaction(strict=True)
         self.assertEqual(record["state"], "recovery_required")
         self.assertEqual(record["failure_phase"], "rename_rollback")
-        self.assertEqual(record["old_path"], str(old_path.resolve()))
-        self.assertEqual(record["new_path"], str(new_path.resolve()))
+        # Windows may expose the temporary root through an 8.3 alias while
+        # ``Path.resolve()`` expands it to the long spelling.  The journal
+        # deliberately preserves the path used by the file operation, so
+        # compare the folders' resolved identities rather than their text.
+        self.assertEqual(Path(record["old_path"]).resolve(), old_path.resolve())
+        self.assertEqual(Path(record["new_path"]).resolve(), new_path.resolve())
 
     def test_update_returns_clear_busy_error_without_moving_folder(self) -> None:
         old_channel = self._old_channel()

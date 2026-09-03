@@ -1,12 +1,13 @@
-<!-- First-run onboarding wizard. Blocking full-screen overlay shown on
-     first launch (gated on the backend `onboarded` flag) and re-openable
-     from Settings > Tools > "Run setup again". Restores the dependency-
+<!-- Setup wizard. Blocking full-screen overlay shown on first launch
+     (gated on the backend `onboarded` flag) and re-openable from
+     Settings > App behavior > "Run setup again". Restores the dependency-
      install + archive-root setup that was lost in the tkinter -> pywebview
      migration. Controller: web/onboarding.js. -->
 <div id="onboarding-overlay" class="onb-overlay" hidden>
-  <div class="onb-card">
+  <div class="onb-card" role="dialog" aria-modal="true"
+       aria-labelledby="onb-intro-title" tabindex="-1">
     <div class="onb-head">
-      <div class="onb-logo">YT&nbsp;ARCHIVER<span class="onb-logo-sub">first-time setup</span></div>
+      <div class="onb-logo">YT&nbsp;ARCHIVER<span class="onb-logo-sub">setup</span></div>
       <div class="onb-steps" id="onb-steps">
         <span class="onb-dot" data-step="1"></span>
         <span class="onb-dot" data-step="2"></span>
@@ -15,19 +16,19 @@
         <span class="onb-dot" data-step="5"></span>
       </div>
       <!-- Close (X): only shown when the wizard is re-opened from
-           Settings > Tools ("Run setup again"). Genuine first-run keeps
+           Settings > App behavior ("Run setup again"). Genuine first-run keeps
            the wizard non-dismissable (Esc blocked, no X) so setup isn't
            skipped by accident. Wired in onboarding.js. -->
       <button type="button" class="onb-close" id="onb-close"
-              title="Close setup (you can re-run it any time from Settings)"
+              title="Close setup (you can review it any time from Settings)"
               aria-label="Close setup" hidden>&times;</button>
     </div>
 
     <div class="onb-body">
       <!-- Step 1: Welcome -->
-      <section class="onb-step" data-step="1">
-        <h1 class="onb-title">Welcome to YTArchiver</h1>
-        <p class="onb-text">Let's get you set up &mdash; this only takes a minute.</p>
+      <section class="onb-step" data-step="1" aria-labelledby="onb-intro-title">
+        <h1 class="onb-title" id="onb-intro-title" tabindex="-1">Welcome to YTArchiver</h1>
+        <p class="onb-text" id="onb-intro-text">We'll choose your archive folder, traffic limits, and download tools.</p>
         <ul class="onb-list">
           <li>Choose where your archive lives</li>
           <li>Install the download tools (<b>yt-dlp</b> + <b>ffmpeg</b>)</li>
@@ -36,22 +37,22 @@
       </section>
 
       <!-- Step 2: Archive folder -->
-      <section class="onb-step" data-step="2" hidden>
-        <h1 class="onb-title">Pick an archive folder</h1>
+      <section class="onb-step" data-step="2" aria-labelledby="onb-folder-title" hidden>
+        <h1 class="onb-title" id="onb-folder-title" tabindex="-1">Pick an archive folder</h1>
         <p class="onb-text">YTArchiver saves each subscribed channel as a subfolder
           here. Choose an empty folder (or an existing YTArchiver archive). You can
           change it later in Settings.</p>
         <div class="onb-folder-row">
           <input type="text" id="onb-folder-path" class="onb-input" readonly
-                 placeholder="No folder selected" />
+                 placeholder="No folder selected" aria-label="Archive folder" />
           <button class="onb-btn" id="onb-folder-browse">Browse&hellip;</button>
         </div>
         <div class="onb-hint" id="onb-folder-hint"></div>
       </section>
 
       <!-- Step 3: YouTube traffic safety -->
-      <section class="onb-step" data-step="3" hidden>
-        <h1 class="onb-title">Choose a traffic safety level</h1>
+      <section class="onb-step" data-step="3" aria-labelledby="onb-traffic-title" hidden>
+        <h1 class="onb-title" id="onb-traffic-title" tabindex="-1">Choose a traffic safety level</h1>
         <p class="onb-text">YTArchiver stays deliberately low and slow to
           protect your YouTube session. You can change this later in Settings.</p>
         <div class="onb-traffic-grid" id="onb-traffic-grid">
@@ -82,8 +83,8 @@
       </section>
 
       <!-- Step 4: Dependencies -->
-      <section class="onb-step" data-step="4" hidden>
-        <h1 class="onb-title">Install dependencies</h1>
+      <section class="onb-step" data-step="4" aria-labelledby="onb-deps-title" hidden>
+        <h1 class="onb-title" id="onb-deps-title" tabindex="-1">Install dependencies</h1>
 
         <div class="onb-dep-group">
           <div class="onb-dep-group-head">
@@ -137,11 +138,11 @@
       </section>
 
       <!-- Step 5: Done -->
-      <section class="onb-step" data-step="5" hidden>
-        <h1 class="onb-title">You're all set</h1>
-        <p class="onb-text">YTArchiver is ready. Your empty <b>Browse &gt; Channels</b>
-          page will guide you to <b>Add your first channel</b>, or you can paste a
-          video URL on the <b>Download</b> tab to grab a single video.</p>
+      <section class="onb-step" data-step="5" aria-labelledby="onb-done-title" hidden>
+        <h1 class="onb-title" id="onb-done-title" tabindex="-1">You're all set</h1>
+        <p class="onb-text">YTArchiver is ready. Use <b>Browse &gt; Channels</b>
+          to manage subscriptions or add a channel, or paste a video URL on the
+          <b>Download</b> tab to grab a single video.</p>
         <div class="onb-dep-rows" id="onb-done-summary"></div>
         <div class="onb-hint" id="onb-done-warn"></div>
       </section>

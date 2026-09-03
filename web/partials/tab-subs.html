@@ -12,7 +12,8 @@
         <div class="subs-filter-wrap">
           <span class="search-icon" aria-hidden="true">&#128269;</span>
           <input type="text" class="ctl-input subs-filter-input" id="subs-filter"
-                 placeholder="Filter by name&hellip;" />
+                 placeholder="Filter by name&hellip;"
+                 aria-label="Filter subscribed channels by name" />
           <button class="subs-filter-clear" id="subs-filter-clear" hidden
                   title="Clear filter (Esc)" aria-label="Clear filter">&times;</button>
         </div>
@@ -22,7 +23,9 @@
           <span class="queue-pending-count" id="queue-pending-count" hidden></span>
         </button>
         <span class="status-text clickable-total" id="subs-total-size"
-              title="Click to rescan all channel folder sizes">Total: &mdash;</span>
+              role="button" tabindex="0"
+              aria-label="Rescan all channel folder sizes"
+              title="Rescan all channel folder sizes">Total: &mdash;</span>
       </div>
 
       <!-- feature F7: bulk-actions bar. Appears only when ≥2 Subs rows
@@ -52,7 +55,7 @@
         <span class="subs-legend-label">Transcribe / Metadata:</span>
         <span><b>A&nbsp;&#10003;</b> auto&nbsp;on&nbsp;&amp;&nbsp;complete</span>
         <span><b>&#10003;</b> complete&nbsp;(manual)</span>
-        <span><b>&mdash;&nbsp;-N</b> N&nbsp;behind</span>
+        <span><b>-N</b> behind</span>
         <span><b>&mdash;</b> off</span>
         <span class="subs-legend-hint">Click a column header to sort.</span>
       </div>
@@ -126,13 +129,21 @@
                field. -->
           <div class="edit-row">
             <div class="edit-field edit-field-grow">
-              <label class="edit-gl">Channel URL</label>
-              <input type="text" class="ctl-input" id="edit-url" placeholder="https://www.youtube.com/@handle" />
+              <label class="edit-gl" for="edit-url">Channel URL</label>
+              <input type="text" class="ctl-input" id="edit-url"
+                     placeholder="https://www.youtube.com/@handle"
+                     aria-describedby="edit-channel-validation" />
             </div>
             <div class="edit-field edit-field-grow">
-              <label class="edit-gl">Folder Name</label>
-              <input type="text" class="ctl-input" id="edit-folder" placeholder="Auto-fills from the URL" />
+              <label class="edit-gl" for="edit-folder">Folder Name</label>
+              <input type="text" class="ctl-input" id="edit-folder"
+                     placeholder="Auto-fills from the URL"
+                     aria-describedby="edit-channel-validation" />
             </div>
+          </div>
+          <div class="edit-validation-row" id="edit-channel-validation"
+               role="status" aria-live="polite">
+            Enter a YouTube channel URL or @handle. A folder name is also required.
           </div>
 
           <!-- Reverse nudge: pasted-video-URL handoff. Full-width banner,
@@ -150,7 +161,7 @@
           <!-- Row 2: Resolution (+ reset/recheck/continue) + Duration -->
           <div class="edit-row">
             <div class="edit-field">
-              <label class="edit-gl">Resolution</label>
+              <label class="edit-gl" for="edit-resolution">Resolution</label>
               <!-- Display labels carry the `p` suffix ("720p" not "720")
                    so users don't have to guess. `value=` stays as the
                    bare number / keyword the backend expects. Same fix
@@ -162,16 +173,21 @@
                 <option value="240">240p</option>
                 <option value="360">360p</option>
                 <option value="480">480p</option>
-                <option value="720">720p</option>
-                <option value="1080" selected>1080p</option>
+                <option value="720" selected>720p</option>
+                <option value="1080">1080p</option>
                 <option value="1440">1440p</option>
                 <option value="2160">2160p (4K)</option>
                 <option value="best">Best available</option>
               </select>
-              <button class="icon-btn-slim" title="Reset resolution to default" id="edit-res-reset">&#8635;</button>
+              <button class="icon-btn-slim" type="button"
+                      title="Reset channel resolution to your configured default"
+                      aria-label="Reset channel resolution to your configured default"
+                      id="edit-res-reset">&#8635;</button>
               <!-- Scan channel folder with ffprobe + queue redownload for
                    below-target videos. YTArchiver.py:5155. -->
-              <button class="icon-btn-slim" title="Scan archive + queue redownload for videos below target resolution"
+              <button class="icon-btn-slim"
+                      title="Scan archived videos for a different resolution"
+                      aria-label="Recheck archived video resolutions"
                       id="edit-res-recheck" type="button">&#x2713;</button>
               <!-- Continue Redownload &mdash; visible only when a progress file
                    exists. YTArchiver.py:5473 _has_pending_redownload. -->
@@ -187,10 +203,12 @@
                       title="Cancel the in-progress redownload and discard progress">&#x2716; Cancel</button>
             </div>
             <div class="edit-field">
-              <label class="edit-gl">Duration</label>
-              <input type="text" class="ctl-input edit-num" id="edit-min-dur" placeholder="Min" />
+              <span class="edit-gl">Duration</span>
+              <input type="text" class="ctl-input edit-num" id="edit-min-dur"
+                     placeholder="Min" aria-label="Minimum video length in minutes" />
               <span class="edit-dim">&ndash;</span>
-              <input type="text" class="ctl-input edit-num" id="edit-max-dur" placeholder="Max" />
+              <input type="text" class="ctl-input edit-num" id="edit-max-dur"
+                     placeholder="Max" aria-label="Maximum video length in minutes" />
               <span class="edit-dim">min</span>
             </div>
           </div>
@@ -200,11 +218,11 @@
             <div class="edit-field edit-field-full" id="edit-range-group">
               <label class="edit-gl">Range</label>
               <label class="radio-label-inline">
-                <input type="radio" name="edit-range" value="subscribe" />
+                <input type="radio" name="edit-range" value="subscribe" checked />
                 <span class="radio-circle"></span>Subscribe only
               </label>
               <label class="radio-label-inline">
-                <input type="radio" name="edit-range" value="all" checked />
+                <input type="radio" name="edit-range" value="all" />
                 <span class="radio-circle"></span>Entire channel
               </label>
               <label class="radio-label-inline">
@@ -212,11 +230,17 @@
                 <span class="radio-circle"></span>From date
               </label>
               <div class="edit-date-group" id="edit-date-group" hidden>
-                <input type="text" class="ctl-input edit-date-part" id="edit-date-year" placeholder="YYYY" maxlength="4" inputmode="numeric" />
+                <input type="text" class="ctl-input edit-date-part" id="edit-date-year"
+                       placeholder="YYYY" maxlength="4" inputmode="numeric"
+                       aria-label="From date year" />
                 <span class="edit-dim">/</span>
-                <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-month" placeholder="MM" maxlength="2" inputmode="numeric" />
+                <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-month"
+                       placeholder="MM" maxlength="2" inputmode="numeric"
+                       aria-label="From date month" />
                 <span class="edit-dim">/</span>
-                <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-day" placeholder="DD" maxlength="2" inputmode="numeric" />
+                <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-day"
+                       placeholder="DD" maxlength="2" inputmode="numeric"
+                       aria-label="From date day" />
               </div>
             </div>
           </div>
@@ -226,10 +250,10 @@
                The Options field grows to fill remaining space. -->
           <div class="edit-row">
             <div class="edit-field">
-              <label class="edit-gl">Folder Org</label>
+              <label class="edit-gl" for="edit-folder-org">Folder Org</label>
               <select class="ctl-select edit-res" id="edit-folder-org">
-                <option value="flat" selected>None (flat)</option>
-                <option value="years">Years</option>
+                <option value="flat">None (flat)</option>
+                <option value="years" selected>Years</option>
                 <option value="months">Years/Months</option>
               </select>
             </div>
@@ -240,7 +264,7 @@
                 <span>Auto-metadata</span>
               </label>
               <label class="checkbox-label">
-                <input type="checkbox" id="edit-transcribe" checked />
+                <input type="checkbox" id="edit-transcribe" />
                 <span>Auto-transcribe</span>
               </label>
               <label class="checkbox-label">
@@ -254,34 +278,24 @@
                Full-width row so the dropdowns don't crowd the main row. -->
           <div class="edit-row edit-compress-group" id="edit-compress-group" hidden>
             <div class="edit-field">
-              <label class="edit-dim">Res</label>
-              <select class="ctl-select edit-res" id="edit-compress-res">
+              <label class="edit-dim" for="edit-compress-res">Res</label>
+              <select class="ctl-select edit-res" id="edit-compress-res"
+                      aria-label="Compression output resolution">
                 <option value="original">Original</option>
                 <option value="1080">1080p</option>
-                <option value="720">720p</option>
-                <option value="480" selected>480p</option>
+                <option value="720" selected>720p</option>
+                <option value="480">480p</option>
                 <option value="360">360p</option>
                 <option value="240">240p</option>
                 <option value="144">144p</option>
               </select>
             </div>
             <div class="edit-field">
-              <label class="edit-dim">Quality</label>
+              <label class="edit-dim" for="edit-compress-quality">Quality</label>
               <select class="ctl-select edit-res" id="edit-compress-quality">
                 <option value="Generous" selected>Generous</option>
                 <option value="Average">Average</option>
                 <option value="Below Average">Below Average</option>
-              </select>
-            </div>
-            <div class="edit-field">
-              <label class="edit-dim">Batch</label>
-              <select class="ctl-select edit-batch" id="edit-compress-batch">
-                <option>5</option>
-                <option selected>10</option>
-                <option>15</option>
-                <option>20</option>
-                <option>25</option>
-                <option>30</option>
               </select>
             </div>
           </div>

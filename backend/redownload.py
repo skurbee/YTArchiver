@@ -26,12 +26,20 @@ from .log import get_logger
 from .log_stream import LogStreamer
 from .net import block_if_down
 from .process_runner import popen_ytdlp
+from .services.channel_leases import (
+    LeaseOwner,
+    canonical_path,
+    channel_aliases,
+    channel_leases,
+    global_archive_aliases,
+)
 from .sync import (
     _find_cookie_source,
     find_yt_dlp,
 )
 from .utils import sampled_files_equal, ytdlp_embed_tag_args
 from .utils import utf8_subprocess_env as _utf8_env
+from .ytarchiver_config import load_config
 
 # YTArchiver uses .mp4/.mkv/.webm + a few audio/edge cases for local scans
 _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".m4a", ".mov")
@@ -46,6 +54,117 @@ _RES_LADDER_FORMAT = (
     # yt-dlp -f string: bestvideo[height<=H]+bestaudio/best[height<=H]
     "bestvideo[height<={h}]+bestaudio/best[height<={h}]"
 )
+
+
+def _resolve_redownload_target(
+    ch_name: str,
+    ch_url: str,
+    folder: str,
+    only_filepath: str,
+) -> tuple[str, str, str, str, frozenset[str]]:
+    """Resolve current config identity/folder and retain stale path aliases."""
+    supplied_folder = str(folder or "").strip()
+    supplied_paths = [supplied_folder] if supplied_folder else []
+    aliases = set(channel_aliases(url=ch_url, paths=supplied_paths))
+    resolved_name = ch_name
+    resolved_url = ch_url
+    resolved_folder = supplied_folder
+    resolved_file = only_filepath
+    requested_identity = channel_aliases(url=ch_url)
+
+    try:
+        cfg = load_config() or {}
+        base = str(cfg.get("output_dir") or "").strip()
+        from .sync.ytdlp_proc import channel_folder_name
+
+        match = None
+        current_folder = ""
+        for channel in cfg.get("channels") or []:
+            if not isinstance(channel, dict):
+                continue
+            candidate = os.path.join(base, channel_folder_name(channel)) if base else ""
+            live_identity = channel_aliases(channel)
+            identity_match = bool(requested_identity & live_identity)
+            path_match = bool(
+                supplied_folder
+                and candidate
+                and canonical_path(supplied_folder) == canonical_path(candidate)
+            )
+            if identity_match or path_match:
+                match = channel
+                current_folder = candidate
+                break
+
+        if match is not None:
+            resolved_name = str(match.get("name") or ch_name)
+            resolved_url = str(match.get("url") or ch_url)
+            if current_folder:
+                resolved_folder = os.path.realpath(current_folder)
+            paths = [path for path in (supplied_folder, resolved_folder) if path]
+            aliases.update(channel_aliases(match, paths=paths))
+            if only_filepath and supplied_folder and resolved_folder:
+                old_root = os.path.realpath(supplied_folder)
+                file_path = os.path.realpath(only_filepath)
+                try:
+                    inside = canonical_path(os.path.commonpath([old_root, file_path])) \
+                        == canonical_path(old_root)
+                except (OSError, ValueError):
+                    inside = False
+                if inside and canonical_path(old_root) != canonical_path(resolved_folder):
+                    resolved_file = os.path.join(
+                        resolved_folder, os.path.relpath(file_path, old_root))
+    except Exception as exc:
+        _log.debug("redownload lease identity resolution failed: %s", exc)
+
+    if not aliases:
+        aliases.update(global_archive_aliases())
+    return (
+        resolved_name,
+        resolved_url,
+        resolved_folder,
+        resolved_file,
+        frozenset(aliases),
+    )
+
+
+def _requeue_busy_redownload(queues) -> bool:
+    """Return a running queued redownload to Pending before its caller exits."""
+    if queues is None:
+        return False
+    try:
+        current = queues.current_sync
+        if not isinstance(current, dict):
+            return False
+        task_id = str(current.get("task_id") or "").strip()
+        requeue = getattr(type(queues), "sync_requeue_current_front", None)
+        if callable(requeue) and queues.sync_requeue_current_front(current):
+            return True
+        # The durable two-commit handoff can report failure after its first
+        # commit saved the Pending copy. Treat that duplication as recoverable;
+        # the caller's final current-slot clear leaves the Pending row intact.
+        snapshot = getattr(queues, "sync_snapshot", list)()
+        if task_id and any(
+            str(item.get("task_id") or "").strip() == task_id
+            for item in snapshot
+        ):
+            return True
+        # Transitional adapters lack the durable handoff. Their front-requeue
+        # still prevents the caller's unconditional current cleanup from
+        # becoming the only copy's deletion.
+        fallback = getattr(queues, "sync_requeue_front", None)
+        if callable(fallback) and fallback(current):
+            return True
+        snapshot = getattr(queues, "sync_snapshot", list)()
+        return bool(
+            task_id
+            and any(
+                str(item.get("task_id") or "").strip() == task_id
+                for item in snapshot
+            )
+        )
+    except Exception as exc:
+        _log.warning("busy redownload could not be requeued: %s", exc)
+        return False
 
 
 def _progress_path(folder: str) -> str:
@@ -413,6 +532,9 @@ def _build_metadata_index(folder: str) -> dict[str, Any]:
                         try:
                             obj = json.loads(ln)
                         except Exception:
+                            _bad_by_file[_full] = _bad_by_file.get(_full, 0) + 1
+                            continue
+                        if not isinstance(obj, dict):
                             _bad_by_file[_full] = _bad_by_file.get(_full, 0) + 1
                             continue
                         vid = (obj.get("video_id") or "").strip()
@@ -1221,16 +1343,16 @@ def _fmt_mb(size_bytes: float) -> str:
     return f"{mb:.1f} MB"
 
 
-def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
-                       stream: LogStreamer,
-                       cancel_ev: threading.Event,
-                       pause_ev: threading.Event | None = None,
-                       confirm_cb: Callable[[float, str, str, int], str] | None = None,
-                       queues=None,
-                       only_video_id: str = "",
-                       only_filepath: str = "",
-                       only_title: str = "",
-                       ) -> dict[str, Any]:
+def _redownload_channel_impl(ch_name: str, ch_url: str, folder: str, new_res: str,
+                             stream: LogStreamer,
+                             cancel_ev: threading.Event,
+                             pause_ev: threading.Event | None = None,
+                             confirm_cb: Callable[[float, str, str, int], str] | None = None,
+                             queues=None,
+                             only_video_id: str = "",
+                             only_filepath: str = "",
+                             only_title: str = "",
+                             ) -> dict[str, Any]:
     """Run the full redownload pipeline synchronously. Returns a summary.
 
     Caller is responsible for threading + queue bookkeeping.
@@ -2031,3 +2153,70 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
 
     return {"ok": True, "done": n_done, "skipped": n_skipped, "errors": n_err,
             "total": len(matched)}
+
+
+def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
+                       stream: LogStreamer,
+                       cancel_ev: threading.Event,
+                       pause_ev: threading.Event | None = None,
+                       confirm_cb: Callable[[float, str, str, int], str] | None = None,
+                       queues=None,
+                       only_video_id: str = "",
+                       only_filepath: str = "",
+                       only_title: str = "",
+                       ) -> dict[str, Any]:
+    """Run a redownload while holding the channel's live identity/path lease."""
+    (ch_name, ch_url, folder, only_filepath, aliases) = _resolve_redownload_target(
+        ch_name, ch_url, folder, only_filepath)
+    task_id = ""
+    if queues is not None:
+        try:
+            task_id = str((queues.current_sync or {}).get("task_id") or "").strip()
+        except Exception:
+            pass
+    job_id = task_id or f"redownload-{threading.get_ident()}-{time.monotonic_ns()}"
+    owner = LeaseOwner(
+        "redownload", job_id, label=f"Redownload {ch_name}",
+        task_id=task_id, kind="redownload")
+    admission = channel_leases.try_acquire(
+        aliases, owner, cancel_event=cancel_ev)
+    if not admission.ok:
+        if admission.status == "cancelled":
+            return {"ok": False, "cancelled": True, "reason": "cancelled"}
+        requeued = _requeue_busy_redownload(queues)
+        recovery = (
+            " The queued task was returned to Pending for Resume."
+            if requeued else " No files were changed; try again after the active task finishes."
+        )
+        message = (
+            f"Redownload could not start because this channel is busy. "
+            f"{admission.explanation}{recovery}"
+        )
+        try:
+            stream.emit_error(message)
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "busy": True,
+            "requeued": requeued,
+            "reason": "channel_busy",
+            "error": message,
+            "blockers": [item.as_dict() for item in admission.blockers],
+        }
+    assert admission.lease is not None
+    with admission.lease:
+        return _redownload_channel_impl(
+            ch_name,
+            ch_url,
+            folder,
+            new_res,
+            stream,
+            cancel_ev,
+            pause_ev=pause_ev,
+            confirm_cb=confirm_cb,
+            queues=queues,
+            only_video_id=only_video_id,
+            only_filepath=only_filepath,
+            only_title=only_title,
+        )

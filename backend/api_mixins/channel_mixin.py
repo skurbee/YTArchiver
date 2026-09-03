@@ -11,10 +11,22 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import uuid
 
 from backend import reorg as reorg_backend
 from backend import subs as subs_backend
-from backend.ytarchiver_config import load_config
+from backend.services.channel_leases import (
+    LeaseOwner,
+    channel_aliases,
+    channel_leases,
+)
+from backend.services.job_supervisor import WorkAdmissionClosed
+from backend.services.managed_work import (
+    admitted_operation,
+    lease_busy_result,
+    start_managed_task,
+)
+from backend.ytarchiver_config import load_config, update_config
 
 from ._shared import ALLOWED_REDOWNLOAD_RESOLUTIONS, _log
 
@@ -32,7 +44,7 @@ class ChannelMixin:
                        or folder_or_name.get("folder") or "").strip()
         return ""
 
-    def _channel_folder_for_name(self, name, *, use_cached_config=False):
+    def _channel_folder_for_name(self, identity, *, use_cached_config=False):
         """Resolve (channel_dict, absolute folder path) for an already-
         coerced channel name.
 
@@ -43,14 +55,15 @@ class ChannelMixin:
         methods (T347). `use_cached_config` mirrors the in-place handlers that
         read `self._config or load_config()` instead of a fresh load.
         """
-        ch = subs_backend.get_channel({"name": name})
+        lookup = identity if isinstance(identity, dict) else {"name": identity}
+        ch = subs_backend.get_channel(lookup)
         if not ch:
             return {"ok": False, "error": "Channel not found"}
         cfg = ((self._config or load_config())
                if use_cached_config else load_config())
         base = (cfg.get("output_dir") or "").strip()
         if not base:
-            return {"ok": False, "error": "output_dir not set"}
+            return {"ok": False, "error": "No archive folder is configured."}
         from backend.sync import channel_folder_name
         return ch, os.path.join(base, channel_folder_name(ch))
 
@@ -66,7 +79,7 @@ class ChannelMixin:
         cfg = load_config()
         base = (cfg.get("output_dir") or "").strip()
         if not base:
-            return {"ok": False, "error": "output_dir not set"}
+            return {"ok": False, "error": "No archive folder is configured."}
         # Accept a raw folder name (string) or an identity dict
         name = self._coerce_channel_name(folder_or_name)
         if not name:
@@ -149,12 +162,14 @@ class ChannelMixin:
             return {"ok": False, "error": f"Could not list videos: {e}"}
         if not rows:
             return {"ok": False, "error": "No videos found for channel"}
-        # Swap Whisper model just for this batch when one was supplied.
-        if model:
-            try:
-                self.transcribe_swap_model(model, persist=False)
-            except Exception as e:
-                _log.warning("model swap before retranscribe failed (batch will use current model): %s", e)
+        requested_model = (model or "").strip()
+        if requested_model:
+            validator = getattr(self, "_apply_runtime_whisper_model", None)
+            if callable(validator):
+                model_result = validator(requested_model)
+                if not model_result.get("ok"):
+                    return model_result
+                requested_model = model_result.get("model", requested_model)
         queued = 0
         skipped = 0
         for row in rows:
@@ -165,7 +180,8 @@ class ChannelMixin:
                 skipped += 1
                 continue
             res = self.transcribe_retranscribe(fp, t, vid,
-                                               _log_queued=False)
+                                               _log_queued=False,
+                                               model=requested_model)
             if isinstance(res, dict) and res.get("ok"):
                 queued += 1
             else:
@@ -189,10 +205,11 @@ class ChannelMixin:
         runs in a background thread so the UI doesn't block.
         """
         name = self._coerce_channel_name(folder_or_name)
-        resolved = self._channel_folder_for_name(name)  # T347
+        resolved = self._channel_folder_for_name(folder_or_name)  # T347
         if isinstance(resolved, dict):
             return resolved
         ch, folder = resolved
+        name = str(ch.get("name") or ch.get("folder") or name).strip()
 
         # Per-channel in-flight dedupe so rapid clicks don't spawn N
         # concurrent yt-dlp processes hitting the same channel URL and
@@ -210,6 +227,14 @@ class ChannelMixin:
                         "error": "Already fetching art for this channel"}
             self._chan_art_inflight.add(_key)
 
+        task_id = f"channel-art-{uuid.uuid4().hex}"
+        cancel = threading.Event()
+        lease = None
+
+        def _retire() -> None:
+            with self._chan_art_lock:
+                self._chan_art_inflight.discard(_key)
+
         def _run():
             # Surface failures explicitly. Old code let any exception
             # escape the thread silently — the user clicked "Fetch
@@ -217,6 +242,8 @@ class ChannelMixin:
             # network was down or yt-dlp failed (audit:
             # channel_mixin.py:118).
             try:
+                if cancel.is_set():
+                    return
                 from backend import channel_art as _ca
                 _ca.fetch_channel_art(ch.get("url", ""), folder,
                                        force=bool(force))
@@ -230,12 +257,52 @@ class ChannelMixin:
                 _log.debug("chan_fetch_art swallowed: %s", e)
             finally:
                 try:
-                    with self._chan_art_lock:
-                        self._chan_art_inflight.discard(_key)
-                except Exception:
-                    pass
+                    if lease is not None:
+                        lease.release()
+                finally:
+                    _retire()
 
-        threading.Thread(target=_run, daemon=True).start()
+        try:
+            with admitted_operation(
+                self,
+                owner="channel-art",
+                label=f"Fetch channel art for {name}",
+                task_id=task_id,
+                cancel=cancel,
+            ):
+                admission = channel_leases.try_acquire(
+                    channel_aliases(ch, paths=[folder]),
+                    LeaseOwner(
+                        owner="channel-art",
+                        job_id=task_id,
+                        task_id=task_id,
+                        label=f"Fetch channel art for {name}",
+                        kind="maintenance",
+                    ),
+                    cancel_event=cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    _retire()
+                    return lease_busy_result(admission)
+                lease = admission.lease
+                try:
+                    start_managed_task(
+                        self,
+                        owner="channel-art",
+                        label=f"Fetch channel art for {name}",
+                        task_id=task_id,
+                        cancel=cancel,
+                        target=_run,
+                        name="channel-art-fetch",
+                        thread_factory=threading.Thread,
+                    )
+                except Exception:
+                    lease.release()
+                    _retire()
+                    raise
+        except WorkAdmissionClosed as exc:
+            _retire()
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "started": True}
 
 
@@ -393,29 +460,28 @@ class ChannelMixin:
                     [f"  \u2014 dropping unresolved id: {u}\n", "dim"],
                 ])
             try:
-                cfg2 = load_config()
-                for _ch in cfg2.get("channels", []):
-                    if (_ch.get("name") or "") != name:
-                        continue
-                    ids = _ch.get("pending_tx_ids") or []
-                    ids = [x for x in ids if x not in unresolved]
-                    _ch["pending_tx_ids"] = ids
-                    _ch["transcription_pending"] = len(ids)
-                    if not ids:
-                        _ch["transcription_complete"] = True
-                    break
-                from backend.ytarchiver_config import save_config as _sc
-                # check the save result. Without this, a
-                # write-gate-off / disk-full save would silently leave
-                # the stale unresolved IDs on disk; next call reloads
-                # them and the same "unresolved" list comes back.
-                if not _sc(cfg2):
-                    self._log_stream.emit_dim(
-                        " (unresolved-id cleanup not persisted — config write-gate off?)")
-                else:
-                    # Refresh in-memory config so the next caller reads
-                    # the pruned list instead of the pre-prune state.
-                    self._config = cfg2
+                def _prune_unresolved(live_cfg):
+                    for channel in live_cfg.get("channels", []):
+                        if (channel.get("name") or "") != name:
+                            continue
+                        ids = channel.get("pending_tx_ids") or []
+                        ids = [x for x in ids if x not in unresolved]
+                        channel["pending_tx_ids"] = ids
+                        channel["transcription_pending"] = len(ids)
+                        if not ids:
+                            channel["transcription_complete"] = True
+                        break
+
+                _result, cfg2 = update_config(_prune_unresolved)
+                # Refresh in-memory config so the next caller reads the
+                # pruned list instead of the pre-prune state.
+                self._config = cfg2
+            except OSError as e:
+                self._log_stream.emit_dim(
+                    " (missing-ID cleanup could not be saved)")
+                _log.warning(
+                    "unresolved-id prune save failed; stale IDs will "
+                    "persist until next launch: %s", e)
             except Exception as e:
                 _log.warning("unresolved-id prune save failed; stale IDs will persist until next launch: %s", e)
         self._log_stream.flush()
@@ -649,60 +715,81 @@ class ChannelMixin:
             was_queued = False
             progress_removed = False
 
-            # 1. Currently running? Check the active sync task.
-            try:
+            def _matches_task(task):
+                return bool(
+                    isinstance(task, dict)
+                    and (task.get("kind") or "").lower() == "redownload"
+                    and ((task.get("url") or "").strip() == ch_url
+                         or (task.get("channel_url") or "").strip() == ch_url)
+                )
+
+            # Commit the exact QueueState cancellation while the runtime-chain
+            # lock prevents its worker from popping/promoting the same item.
+            # Only after that commit may we signal live work or delete progress.
+            with self._redwnl_lock:
                 cur = self._queues.current_sync or {}
-                if ((cur.get("kind") or "").lower() == "redownload"
-                        and (
-                            (cur.get("url") or "").strip() == ch_url
-                            or (cur.get("channel_url") or "").strip()
-                            == ch_url
-                        )):
-                    was_running = True
-                    # Per-channel cancel sets the REDOWNLOAD event only
-                    # — setting the shared _sync_cancel here killed
-                    # every other queued chain item (the worker passes
-                    # the still-set event into each subsequent run) and
-                    # left later Reorg/Fix-dates ghost-cancelled.
+                was_running = _matches_task(cur)
+                queued_tasks = [
+                    task for task in self._queues.sync_snapshot()
+                    if _matches_task(task)
+                ]
+                queued_ids = [
+                    str(task.get("task_id") or "").strip()
+                    for task in queued_tasks
+                    if str(task.get("task_id") or "").strip()
+                ]
+                if was_running and queued_ids:
+                    return {
+                        "ok": False,
+                        "error": "Redownload queue state is inconsistent; restart before cancelling",
+                    }
+
+                if was_running:
+                    current_id = str(cur.get("task_id") or "").strip()
+                    replace_current = getattr(
+                        type(self._queues),
+                        "replace_current_task_durable", None)
+                    if (not current_id or not callable(replace_current)
+                            or not self._queues.replace_current_task_durable(
+                                "sync", None,
+                                expected_task_id=current_id)):
+                        return {
+                            "ok": False,
+                            "error": "Running redownload cancellation could not be saved",
+                        }
+
+                if queued_ids:
+                    remove_many = getattr(
+                        type(self._queues), "sync_remove_tasks", None)
+                    if callable(remove_many):
+                        removed_ids = self._queues.sync_remove_tasks(
+                            queued_ids, durable=True, require_all=True)
+                        if set(removed_ids) != set(queued_ids):
+                            return {
+                                "ok": False,
+                                "error": "Queued redownload cancellation could not be saved",
+                            }
+                    else:
+                        # Transitional adapters predate bulk exact removal.
+                        if not all(self._queues.sync_remove_task(
+                                task_id, durable=True)
+                                for task_id in queued_ids):
+                            return {
+                                "ok": False,
+                                "error": "Queued redownload cancellation could not be saved",
+                            }
+                    was_queued = True
+
+                before = len(self._redwnl_pending)
+                self._redwnl_pending[:] = [
+                    item for item in self._redwnl_pending
+                    if not _matches_task((item or {}).get("rd_task") or {})
+                ]
+                was_queued = was_queued or len(self._redwnl_pending) < before
+                if was_running:
+                    # Per-channel cancel sets only the redownload event. Later
+                    # chain items retain their own durable rows and fresh event.
                     self._redwnl_cancel.set()
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-
-            # 2. Drop matching items from the internal pending chain.
-            try:
-                with self._redwnl_lock:
-                    before = len(self._redwnl_pending)
-                    self._redwnl_pending = [
-                        it for it in self._redwnl_pending
-                        if (
-                            (it.get("rd_task", {}).get("url") or "").strip()
-                            != ch_url
-                            and (it.get("rd_task", {}).get("channel_url")
-                                 or "").strip() != ch_url
-                        )
-                    ]
-                    if len(self._redwnl_pending) < before:
-                        was_queued = True
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-
-            # 3. Remove from the UI queue (may be there without being
-            # in _redwnl_pending if the worker already popped it).
-            try:
-                if ch_url:
-                    for task in self._queues.sync_snapshot():
-                        if ((task.get("kind") or "").lower() != "redownload"
-                                or (
-                                    (task.get("url") or "").strip() != ch_url
-                                    and (task.get("channel_url") or "").strip()
-                                    != ch_url
-                                )):
-                            continue
-                        removed = self._queues.sync_remove(
-                            (task.get("url") or "").strip())
-                        was_queued = was_queued or bool(removed)
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
 
             # 4. Delete the progress file so the pending state clears.
             try:
@@ -776,13 +863,14 @@ class ChannelMixin:
             cfg = self._config or load_config()
             base = (cfg.get("output_dir") or "").strip()
             if not base:
-                return {"ok": False, "error": "output_dir not set"}
+                return {"ok": False, "error": "No archive folder is configured."}
             from backend.sync import channel_folder_name as _cfn
             folder = os.path.join(base, _cfn(ch))
             if not os.path.isdir(folder):
                 return {"ok": False, "error": f"Folder missing: {folder}"}
 
             token = _uuid.uuid4().hex
+            cancel = threading.Event()
             if not hasattr(self, "_pending_res_scans"):
                 self._pending_res_scans = {}
                 self._pending_res_scans_lock = threading.Lock()
@@ -793,7 +881,11 @@ class ChannelMixin:
                 scanned = 0
                 _exts = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v")
                 for dp, _dns, fns in os.walk(folder):
+                    if cancel.is_set():
+                        break
                     for fn in fns:
+                        if cancel.is_set():
+                            break
                         if not fn.lower().endswith(_exts):
                             continue
                         total += 1
@@ -822,7 +914,9 @@ class ChannelMixin:
                     self._pending_res_scans[token] = {
                         "done": True,
                         "_ts": _t_mod.time(),
-                        "result": {"ok": True, "mismatch": mismatch,
+                        "result": {"ok": not cancel.is_set(),
+                                   "cancelled": cancel.is_set(),
+                                   "mismatch": mismatch,
                                    "total": total, "scanned": scanned,
                                    "target": target_h},
                     }
@@ -839,8 +933,21 @@ class ChannelMixin:
                 for k in _stale:
                     self._pending_res_scans.pop(k, None)
                 self._pending_res_scans[token] = {"done": False, "_ts": _now_ts}
-            threading.Thread(target=_scan_worker, daemon=True,
-                             name="chan_scan_resolution").start()
+            try:
+                start_managed_task(
+                    self,
+                    owner="resolution-scan",
+                    label=f"Scan video resolution for {name}",
+                    task_id=f"resolution-scan-{token}",
+                    cancel=cancel,
+                    target=_scan_worker,
+                    name="chan_scan_resolution",
+                    thread_factory=threading.Thread,
+                )
+            except WorkAdmissionClosed as exc:
+                with self._pending_res_scans_lock:
+                    self._pending_res_scans.pop(token, None)
+                return {"ok": False, "started": False, "error": str(exc)}
             return {"ok": True, "started": True, "token": token}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -864,7 +971,8 @@ class ChannelMixin:
 
 
     def chan_redownload(self, folder_or_name, new_resolution=None,
-                        scope=None, only_video=None):
+                        scope=None, only_video=None, task_id="",
+                        _queue_only=False):
         """Queue a channel's videos for redownload at a new resolution.
 
         Runs the full pipeline in `backend/redownload.py` — scans local files,
@@ -879,6 +987,11 @@ class ChannelMixin:
         Mirrors OLD's per-year / per-month tree-view right-click
         (YTArchiver.py:26498 _browse_redownload_folder).
         """
+        admission = getattr(self, "_work_admission_error", None)
+        if callable(admission):
+            blocked = admission("a channel redownload")
+            if blocked is not None:
+                return blocked
         name = self._coerce_channel_name(folder_or_name)
         if not name:
             return {"ok": False, "error": "channel name required"}
@@ -893,7 +1006,7 @@ class ChannelMixin:
         cfg = load_config()
         base = (cfg.get("output_dir") or "").strip()
         if not base:
-            return {"ok": False, "error": "output_dir not set"}
+            return {"ok": False, "error": "No archive folder is configured."}
         from backend.sync import channel_folder_name as _cfn
         _folder_name = _cfn(ch)
         # Defensive: if the channel ended up with a blank name somehow,
@@ -941,8 +1054,7 @@ class ChannelMixin:
             filepath = str(only_video.get("filepath") or "").strip()
             if not video_id or not filepath:
                 return {"ok": False,
-                        "error": "Single-video redownload needs an indexed "
-                                 "video ID and filepath."}
+                        "error": "YTArchiver could not identify the saved video."}
             video_title = (str(only_video.get("title") or "").strip()
                            or os.path.splitext(os.path.basename(filepath))[0])
             only_video = {
@@ -958,6 +1070,8 @@ class ChannelMixin:
         _rd_task["kind"] = "redownload"
         _rd_task["redownload_res"] = new_res
         _rd_task["scope"] = scope
+        if str(task_id or "").strip():
+            _rd_task["task_id"] = str(task_id).strip()
         if only_video:
             _rd_task.update({
                 "name": only_video["title"],
@@ -979,6 +1093,54 @@ class ChannelMixin:
             "rd_task": _rd_task,
         }
 
+        def _same_redownload(item):
+            task = (item or {}).get("rd_task") or {}
+            task_url = str(task.get("url") or "").strip()
+            task_name = str(
+                task.get("name") or task.get("folder") or "").strip()
+            wanted_url = str(_rd_task.get("url") or "").strip()
+            wanted_name = str(
+                _rd_task.get("name") or _rd_task.get("folder") or "").strip()
+            return ((bool(wanted_url) and task_url == wanted_url)
+                    or (not wanted_url and bool(wanted_name)
+                        and task_name == wanted_name))
+
+        def _stage_redownload_locked():
+            """Claim one durable queue ID before exposing runtime work."""
+            current = self._queues.current_sync or {}
+            current_url = str(current.get("url") or "").strip()
+            current_name = str(
+                current.get("name") or current.get("folder") or "").strip()
+            wanted_url = str(_rd_task.get("url") or "").strip()
+            wanted_name = str(
+                _rd_task.get("name") or _rd_task.get("folder") or "").strip()
+            current_same = (
+                (current.get("kind") or "").lower() == "redownload"
+                and ((bool(wanted_url) and current_url == wanted_url)
+                     or (not wanted_url and bool(wanted_name)
+                         and current_name == wanted_name))
+            )
+            if current_same or any(
+                    _same_redownload(item) for item in self._redwnl_pending):
+                return False, "Redownload is already queued."
+            try:
+                reserve = getattr(
+                    type(self._queues), "sync_reserve_task", None)
+                if callable(reserve):
+                    queued_id = self._queues.sync_reserve_task(_rd_task)
+                else:
+                    # Compatibility for transitional queue adapters/test
+                    # doubles that predate the durable reservation primitive.
+                    queued_id = self._queues.sync_enqueue_with_id(_rd_task)
+            except Exception as exc:
+                _log.warning("redownload queue reservation failed: %s", exc)
+                queued_id = None
+            if not queued_id:
+                return False, "Redownload queue could not be saved."
+            _rd_task["task_id"] = queued_id
+            self._redwnl_pending.append(_pending_item)
+            return True, ""
+
         # Gate behavior:
         #   - If a regular sync is running, queue behind it.
         #   - If a redownload is running, QUEUE this request so the
@@ -993,36 +1155,28 @@ class ChannelMixin:
             if (_cur.get("kind") or "").lower() != "redownload":
                 # A regular sync owns the lane. Persist + expose the request
                 # now; the sync completion hook starts the redownload chain.
-                _task_url = (_rd_task.get("url") or "").strip()
                 with self._redwnl_lock:
-                    _already = any(
-                        (p.get("rd_task") or {}).get("url") == _task_url
-                        for p in self._redwnl_pending
-                    ) if _task_url else False
-                    if not _already:
-                        self._redwnl_pending.append(_pending_item)
-                        try:
-                            self._queues.sync_enqueue(_rd_task)
-                        except Exception as e:
-                            _log.warning(
-                                "redownload sync_enqueue failed; task won't "
-                                "appear in Tasks popover: %s", e)
+                    staged, stage_error = _stage_redownload_locked()
                 try: self._on_queue_changed()
                 except Exception as e: _log.debug("swallowed: %s", e)
-                if _already:
-                    return {"ok": False,
-                            "error": "Redownload is already queued."}
+                if not staged:
+                    return {"ok": False, "error": stage_error}
                 return {"ok": True, "queued": True, "started": False,
                         "resolution": new_res}
             # Fall through into the enqueue path below.
 
         with self._redwnl_lock:
-            # Always enqueue to the internal chain.
-            self._redwnl_pending.append(_pending_item)
-            # Mirror to the sync-queue UI so the Sync Tasks popover
-            # shows queued redownloads alongside the one running.
-            try: self._queues.sync_enqueue(_rd_task)
-            except Exception as e: _log.warning("redownload sync_enqueue failed; task won't appear in Tasks popover: %s", e)
+            staged, stage_error = _stage_redownload_locked()
+            if not staged:
+                return {"ok": False, "error": stage_error}
+
+            # Cold recovery with ordinary sync rows present first reserves all
+            # redownloads in the runtime chain, but lets sync_start_all own the
+            # shared lane. Its completion hook starts this chain afterward.
+            if _queue_only:
+                self._on_queue_changed()
+                return {"ok": True, "queued": True, "started": False,
+                        "resolution": new_res}
 
             # If a worker is already draining the chain, we're done —
             # our item will get picked up when the current one
@@ -1067,18 +1221,34 @@ class ChannelMixin:
                         # the list and sets the event under the same
                         # lock) can't interleave between pop and clear.
                         self._redwnl_cancel.clear()
-                    # Remove the about-to-run item from the sync queue
-                    # UI (moves it from "queued" to "running").
+                    # Atomically promote the about-to-run durable row into the
+                    # crash-resumable current slot.  Removing the pending row
+                    # first left a kill window where neither store owned it.
                     try:
-                        self._queues.sync_remove(
-                            item["rd_task"].get("url", ""))
+                        removed = self._queues.sync_promote_task_to_current(
+                            item["rd_task"].get("task_id", ""))
                     except Exception as e:
-                        _log.debug("swallowed: %s", e)
+                        _log.warning(
+                            "redownload queue transition failed: %s", e)
+                        removed = False
+                    if not removed:
+                        with self._redwnl_lock:
+                            if (not self._redwnl_cancel.is_set()
+                                    and not self._sync_cancel.is_set()):
+                                self._redwnl_pending.insert(0, item)
+                        try:
+                            self._log_stream.emit_error(
+                                "Redownload was not started because its queue "
+                                "transition could not be saved.")
+                        except Exception:
+                            pass
+                        break
                     try:
                         self._run_redownload_one(
                             item["ch"], item["folder"],
                             item["new_res"], item["scope_label"],
-                            only_video=item.get("only_video"))
+                            only_video=item.get("only_video"),
+                            rd_task=item.get("rd_task"))
                     except Exception as _re:
                         try: self._log_stream.emit_error(
                             f"Redownload crashed: {_re}")
@@ -1087,8 +1257,24 @@ class ChannelMixin:
                 self._on_queue_changed()
                 try: self._autorun.notify_sync_done()
                 except Exception as e: _log.warning("autorun notify_sync_done failed after redownload: %s", e)
-                try: threading.Timer(0.5, self._on_queue_changed).start()
-                except Exception as e: _log.debug("swallowed: %s", e)
+                try:
+                    refresh_cancel = threading.Event()
+
+                    def _refresh_after_worker_exit():
+                        if not refresh_cancel.wait(0.5):
+                            self._on_queue_changed()
+
+                    start_managed_task(
+                        self,
+                        owner="sync-followup",
+                        label="Redownload queue-state refresh",
+                        target=_refresh_after_worker_exit,
+                        cancel=refresh_cancel,
+                        name="redownload-queue-refresh",
+                        thread_factory=threading.Thread,
+                    )
+                except Exception as e:
+                    _log.debug("redownload queue refresh not started: %s", e)
 
             if not self._start_sync_thread_locked(_worker):
                 # A regular sync or another redownload worker started
@@ -1113,7 +1299,7 @@ class ChannelMixin:
         cfg = load_config()
         base = (cfg.get("output_dir") or "").strip()
         if not base:
-            return {"ok": False, "error": "output_dir not set"}
+            return {"ok": False, "error": "No archive folder is configured."}
         from backend.sync import channel_folder_name as _cfn
         folder = os.path.join(base, _cfn(ch))
 
@@ -1157,9 +1343,12 @@ class ChannelMixin:
         # ever cancel a running date fix (audit S4).
         _fixdates_cancel = threading.Event()
         self._fixdates_cancel = _fixdates_cancel
-        self._fixdates_running = True
+        task_id = f"fix-dates-{uuid.uuid4().hex}"
+        lease = None
         def _run():
             try:
+                if _fixdates_cancel.is_set():
+                    return
                 reorg_backend.fix_file_dates(folder, self._log_stream,
                                              cancel_event=_fixdates_cancel)
             finally:
@@ -1172,8 +1361,53 @@ class ChannelMixin:
                     if getattr(self, "_fixdates_cancel", None) is _fixdates_cancel:
                         self._fixdates_cancel = None
                     self._fixdates_running = False
+                    if lease is not None:
+                        lease.release()
 
-        threading.Thread(target=_run, daemon=True).start()
+        try:
+            with admitted_operation(
+                self,
+                owner="file-date-maintenance",
+                label=f"Fix file dates for {ch_name or 'channel'}",
+                task_id=task_id,
+                cancel=_fixdates_cancel,
+            ):
+                admission = channel_leases.try_acquire(
+                    channel_aliases(ch, paths=[folder]),
+                    LeaseOwner(
+                        owner="file-date-maintenance",
+                        job_id=task_id,
+                        task_id=task_id,
+                        label=f"Fix file dates for {ch_name or 'channel'}",
+                        kind="maintenance",
+                    ),
+                    cancel_event=_fixdates_cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    self._fixdates_cancel = None
+                    return lease_busy_result(admission)
+                lease = admission.lease
+                self._fixdates_running = True
+                try:
+                    start_managed_task(
+                        self,
+                        owner="file-date-maintenance",
+                        label=f"Fix file dates for {ch_name or 'channel'}",
+                        task_id=task_id,
+                        cancel=_fixdates_cancel,
+                        target=_run,
+                        name="channel-fix-file-dates",
+                        thread_factory=threading.Thread,
+                    )
+                except Exception:
+                    lease.release()
+                    self._fixdates_cancel = None
+                    self._fixdates_running = False
+                    raise
+        except WorkAdmissionClosed as exc:
+            self._fixdates_cancel = None
+            self._fixdates_running = False
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "started": True}
 
 

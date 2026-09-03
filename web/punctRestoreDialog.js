@@ -68,7 +68,8 @@
 
       runBtn.addEventListener("click", async () => {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Punctuation restore API not available.", "warn");
+          window._showToast?.(
+            "YTArchiver is still starting. Try again in a moment.", "warn");
           return;
         }
         const payload = {
@@ -83,9 +84,8 @@
         // previously used rendered as a browser-chrome popup).
         if (!payload.channel && !payload.dry_run) {
           const _ok = await window.askDanger(
-            "Punctuation restore — ALL channels",
-            "Dry-run is OFF. This rewrites every segment in every "
-            + "transcript and can take hours.\n\nProceed?",
+            "Restore punctuation for all channels?",
+            "This will update every transcript in every channel and can take hours.",
             "Run on all channels");
           if (!_ok) return;
         }

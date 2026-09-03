@@ -4,34 +4,6 @@
   <!-- Toast notifications mount -->
   <div id="toast-root" role="status" aria-live="polite" aria-atomic="false"></div>
 
-  <!-- First-launch archive-root picker. Non-dismissable: the user
-       MUST choose a folder before the app becomes usable. -->
-  <div id="welcome-modal" class="yt-modal" role="dialog" aria-modal="true"
-       aria-labelledby="welcome-modal-title" hidden>
-    <div class="yt-modal-backdrop"></div>
-    <div class="yt-modal-body yt-modal-body-welcome">
-      <div class="yt-modal-title" id="welcome-modal-title">Pick an archive folder</div>
-      <div class="yt-modal-sub">
-        YTArchiver saves each subscribed channel as
-        <code>&lt;archive&gt;/&lt;ChannelName&gt;/</code>. Metadata,
-        thumbnails, and transcripts are stored alongside the videos.
-      </div>
-      <div class="yt-modal-sub yt-modal-sub-spaced">
-        Choose an empty folder (or an existing YTArchiver archive).
-        You can change it later in Settings.
-      </div>
-      <div class="yt-modal-path-row">
-        <input type="text" id="welcome-path" class="ctl-input"
-               readonly placeholder="No folder selected" />
-        <button class="yt-modal-btn" id="welcome-browse">Browse&hellip;</button>
-      </div>
-      <div class="yt-modal-buttons">
-        <button class="yt-modal-btn primary" id="welcome-continue"
-                disabled>Continue</button>
-      </div>
-    </div>
-  </div>
-
   <!-- Redownload 10-sample confirm modal. Hidden by default; app.js
        listens for the `yt-control` event (kind=redownload_sample) and
        fills/shows it. Buttons call api.redownload_sample_confirm(). -->

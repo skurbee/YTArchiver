@@ -31,16 +31,18 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from ..executor_utils import WorkResult, run_bounded
 from ..log import get_logger
 from ..thumbnails import (
     _channel_fingerprint,
     _download_thumbnail,
     _ensure_thumbnails_dir,
+    _image_magic_ok,
     _load_thumb_cache,
+    _safe_thumb_stem,
     _save_thumb_cache,
     _thumbnail_exists_for,
 )
@@ -132,14 +134,10 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
                     continue
                 _m = _id_re.search(_fn)
                 if _m:
-                    _candidate = _m.group(1)
-                    # Reject all-alpha 11-char strings — those are
-                    # almost always user-typed labels (e.g.
-                    # "[a-user-channel]") rather than real YouTube
-                    # video IDs which always mix digits + symbols
-                    # (audit: thumbnails_ops H98).
-                    if not _candidate.isalpha():
-                        _all_thumb_vids.add(_candidate)
+                    # YouTube's 11-character alphabet permits all-letter IDs.
+                    # The filename shape is evidence here; do not reject a
+                    # valid ID merely because it lacks a digit or symbol.
+                    _all_thumb_vids.add(_m.group(1))
     except Exception as e:
         _log.warning("thumbnail sweep failed while walking thumbnails "
                      "for %r: %s", name, e)
@@ -275,6 +273,8 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
         orphan_no_db, per_channel: {name: {misaligned, moved, ...}}
       }
     """
+    from backend.sync import channel_folder_name as _channel_folder_name
+
     from .. import index as _idx
     out_dir = (load_config() or {}).get("output_dir") or ""
     if not out_dir:
@@ -282,6 +282,9 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
 
     if channels is None:
         channels = (load_config() or {}).get("channels", []) or []
+
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
 
     # Build vid → mp4_parent map from the DB. When `channels` is
     # narrow (typical case — single-channel realign), prefix-filter
@@ -291,60 +294,65 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
     # archive could make realignment take minutes to start.
     vid_to_mp4_parent: dict[str, str] = {}
     try:
-        conn = _idx._reader_open() or _idx._open()
-        if conn is not None:
-            with _idx._reader_lock:
-                if channels:
-                    # Filter to just the channel folders we'll process.
-                    # LIKE prefix matches normalize via SUBSTR before
-                    # the isfile() check so we only stat files that
-                    # could possibly belong to one of the targeted
-                    # channels.
-                    from backend.sync import channel_folder_name as _cfn
-                    _allowed_prefixes = []
-                    for _ch in channels:
-                        _fn = _cfn(_ch)
-                        if _fn:
-                            _p = os.path.normpath(os.path.join(out_dir, _fn))
-                            _allowed_prefixes.append(
-                                os.path.normcase(_p.rstrip(os.sep)) + os.sep)
-                    for fp, vid in conn.execute(
-                            "SELECT filepath, video_id FROM videos "
-                            "WHERE video_id IS NOT NULL AND video_id<>''"):
-                        if not (fp and vid):
-                            continue
-                        _np = os.path.normpath(fp)
-                        _np_prefix = os.path.normcase(_np) + os.sep
-                        if not any(_np_prefix.startswith(_p)
-                                   for _p in _allowed_prefixes):
-                            continue
-                        # Wrap isfile in try/except so a single path-
-                        # too-long row doesn't abort the whole realign
-                        # (audit: metadata/core.py:194-212). Long paths
-                        # are common in deeply-organized archives.
-                        try:
-                            _is_file = os.path.isfile(_np)
-                        except OSError:
-                            continue
-                        if _is_file:
-                            vid_to_mp4_parent[vid] = os.path.normpath(
-                                os.path.dirname(_np))
-                else:
-                    # No channel filter — fall back to the old scan
-                    # (only used when caller explicitly wants a global
-                    # realign).
-                    for fp, vid in conn.execute(
-                            "SELECT filepath, video_id FROM videos "
-                            "WHERE video_id IS NOT NULL AND video_id<>''"):
-                        if not (fp and vid):
-                            continue
-                        try:
-                            _is_file = os.path.isfile(fp)
-                        except OSError:
-                            continue
-                        if _is_file:
-                            vid_to_mp4_parent[vid] = os.path.normpath(
-                                os.path.dirname(fp))
+        reader_conn = None if _cancelled() else _idx._reader_open()
+        if reader_conn is not None:
+            conn = reader_conn
+            conn_lock = _idx._reader_lock
+        else:
+            conn = None if _cancelled() else _idx._open()
+            # `_open()` returns the shared writer connection. It must remain
+            # protected by `_db_lock`, even though this query is read-only.
+            conn_lock = _idx._db_lock
+
+        # Copy only the lightweight SQLite rows while the shared connection is
+        # locked. Network/pooled-drive stat calls happen after the lock is
+        # released so Browse queries are never stuck behind the disk survey.
+        db_rows: list[tuple[str, str]] = []
+        if conn is not None and not _cancelled():
+            with conn_lock:
+                for fp, vid in conn.execute(
+                        "SELECT filepath, video_id FROM videos "
+                        "WHERE video_id IS NOT NULL AND video_id<>''"):
+                    if _cancelled():
+                        break
+                    db_rows.append((fp, vid))
+
+        allowed_prefixes: list[str] | None = None
+        if channels:
+            # Only stat files that could belong to a targeted channel.
+            allowed_prefixes = []
+            for ch in channels:
+                if _cancelled():
+                    break
+                folder = _channel_folder_name(ch)
+                if folder:
+                    prefix = os.path.normpath(os.path.join(out_dir, folder))
+                    allowed_prefixes.append(
+                        os.path.normcase(prefix.rstrip(os.sep)) + os.sep)
+
+        for fp, vid in db_rows:
+            if _cancelled():
+                break
+            if not (fp and vid):
+                continue
+            norm_path = os.path.normpath(fp)
+            if allowed_prefixes is not None:
+                path_prefix = os.path.normcase(norm_path) + os.sep
+                if not any(path_prefix.startswith(prefix)
+                           for prefix in allowed_prefixes):
+                    continue
+            # Wrap isfile in try/except so one path-too-long row does not
+            # abort the whole realign. Long paths are common in deeply
+            # organized archives.
+            try:
+                is_file = os.path.isfile(norm_path)
+            except OSError:
+                continue
+            if _cancelled():
+                break
+            if is_file:
+                vid_to_mp4_parent[vid] = os.path.normpath(
+                    os.path.dirname(norm_path))
     except Exception as e:
         if stream:
             try: stream.emit_error(f"Couldn't read the archive index for thumbnail repair: {e}")
@@ -364,14 +372,11 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
         except Exception as e:
             _log.warning("thumbnail realign intro emit failed: %s", e)
 
-    def _cancelled() -> bool:
-        return cancel_event is not None and cancel_event.is_set()
-
     for _ci, ch in enumerate(channels, 1):
         if _cancelled():
             break
         name = ch.get("name") or ch.get("folder") or ""
-        folder = ch.get("folder_override") or ch.get("folder") or name
+        folder = _channel_folder_name(ch)
         if not folder:
             continue
         ch_root = os.path.join(out_dir, folder)
@@ -396,6 +401,8 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
                 continue
             thumb_parent = os.path.normpath(os.path.dirname(dp))
             for fn in fns:
+                if _cancelled():
+                    break
                 if not fn.lower().endswith(
                         (".jpg", ".jpeg", ".webp", ".png")):
                     continue
@@ -455,6 +462,8 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
                                 f"realign: failed to move "
                                 f"{source_path} → {target_path}: {e}")
                         except Exception as e: _log.debug("swallowed: %s", e)
+            if _cancelled():
+                break
         if any(v > 0 for v in pc.values()):
             per_channel[name] = pc
 
@@ -607,12 +616,14 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
     for ch in (channels or []):
         if _busy():
             return _merge_cached_rows()
-        folder = _folder_for_channel(ch)
         name = (ch.get("name") or ch.get("folder") or "").lower()
-        if not folder or not folder.exists() or not name:
+        if not name:
             continue
         if name in out:
-            # Already filled by the DB fast path above.
+            # Already filled by the DB fast path above; do not touch storage.
+            continue
+        folder = _folder_for_channel(ch)
+        if not folder or not folder.exists():
             continue
         fp = _channel_fingerprint(folder, stop_if=busy_fn)
         if fp is None:
@@ -645,52 +656,77 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
     def _count_one(item):
         ch, folder, name, fp = item
         if _busy():
-            return (name, fp, None)
+            return (name, fp, None, [])
         total = with_thumb = 0
         # Collect every video_id present in any .Thumbnails/ under
         # this channel folder. One folder walk; cheap.
         all_thumb_vids: set = set()
+        local_thumb_keys: set[tuple[str, str]] = set()
         try:
             id_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
             for dp, _dns, fns in os.walk(str(folder)):
                 if _busy():
-                    return (name, fp, None)
+                    return (name, fp, None, [])
                 if os.path.basename(dp) != ".Thumbnails":
                     continue
                 for fn in fns:
                     if _busy():
-                        return (name, fp, None)
+                        return (name, fp, None, [])
                     if not fn.lower().endswith(
                             (".jpg", ".jpeg", ".png", ".webp")):
                         continue
                     m = id_re.search(fn)
                     if m:
                         all_thumb_vids.add(m.group(1))
+                    local_stem = os.path.splitext(fn)[0]
+                    if (local_stem.lower().endswith(".local")
+                            and _image_magic_ok(os.path.join(dp, fn))):
+                        local_thumb_keys.add((
+                            os.path.normcase(os.path.normpath(
+                                os.path.dirname(dp))),
+                            local_stem.casefold(),
+                        ))
         except Exception as e:
             _log.debug("swallowed: %s", e)
-        # Persist the per-vid has_thumbnail flag so the next call
-        # hits the SQL fast path instead of re-walking. Bulk UPDATE
-        # by `video_id` (channel-scoped to avoid cross-channel
-        # collisions if two channels happen to share an id).
-        rows_for_db: list[tuple[int, str, str]] = []
-        # DB param must be ORIGINAL case — videos.channel has no COLLATE
-        # NOCASE (the lowercased cache key matches zero rows, so the
-        # backfill never sticks). The sibling UPDATEs in this file
-        # (sweep_missing_thumbnails, realign) already pass original case.
-        db_name = ch.get("name") or ch.get("folder") or ""
+        # Persist every physical video by filepath, including manual videos
+        # with no YouTube ID.  Updating by ID cannot make `.local` fallback
+        # coverage durable and can touch an unrelated physical copy.
+        rows_for_db: list[tuple[int, str]] = []
         try:
             for vid_id, _title, _y, _m, path in _scan_channel_videos(folder):
                 if _busy():
-                    return (name, fp, None)
+                    return (name, fp, None, [])
                 total += 1
-                has = 1 if (vid_id and vid_id in all_thumb_vids) else 0
-                if vid_id:
-                    rows_for_db.append((has, vid_id, db_name))
+                local_key = (
+                    os.path.normcase(os.path.normpath(os.path.dirname(path))),
+                    (_safe_thumb_stem(Path(path).stem) + ".local").casefold(),
+                )
+                has = 1 if (
+                    (vid_id and vid_id in all_thumb_vids)
+                    or local_key in local_thumb_keys
+                ) else 0
+                rows_for_db.append((has, os.path.normpath(path)))
                 if has:
                     with_thumb += 1
         except Exception as e:
             _log.debug("swallowed: %s", e)
-        # Write the flag back to the DB. One transaction per channel.
+        return (name, fp, {
+            "total": total,
+            "with_thumb": with_thumb,
+            "missing": max(0, total - with_thumb),
+        }, rows_for_db)
+
+    def _record_count(result: WorkResult) -> None:
+        if result.error is not None or result.value is None:
+            if result.error is not None:
+                _log.debug("thumbnail count worker failed: %s", result.error)
+            return
+        name, fp, stats, rows_for_db = result.value
+        if stats is None or _busy():
+            return
+        # Workers only scan.  Durable writes happen here on the caller thread,
+        # after a final cancellation check, so a non-wait pool shutdown cannot
+        # produce a late DB commit after this function returns.
         try:
             if rows_for_db:
                 from .. import index as _idx
@@ -699,35 +735,30 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
                     with _idx._db_lock:
                         _conn.executemany(
                             "UPDATE videos SET has_thumbnail=? "
-                            "WHERE video_id=? AND channel=?",
+                            "WHERE filepath=? COLLATE NOCASE",
                             rows_for_db)
                         _conn.commit()
         except Exception as e:
             _log.debug("swallowed: %s", e)
-        return (name, fp, {
-            "total": total,
-            "with_thumb": with_thumb,
-            "missing": max(0, total - with_thumb),
-        })
+        if _busy():
+            return
+        out[name] = stats
+        cache[name] = {
+            "fingerprint": fp,
+            "total": stats["total"],
+            "with_thumb": stats["with_thumb"],
+            "missing": stats["missing"],
+            "ts": time.time(),
+        }
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [pool.submit(_count_one, item) for item in needs_walk]
-        for fut in as_completed(futures):
-            try:
-                name, fp, stats = fut.result()
-                if stats is None:
-                    continue
-                out[name] = stats
-                # Update cache with fresh values + fingerprint.
-                cache[name] = {
-                    "fingerprint": fp,
-                    "total": stats["total"],
-                    "with_thumb": stats["with_thumb"],
-                    "missing": stats["missing"],
-                    "ts": time.time(),
-                }
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
+    run_bounded(
+        needs_walk,
+        _count_one,
+        _record_count,
+        max_workers=8,
+        thread_name_prefix="thumbnail-count",
+        is_cancelled=_busy,
+    )
 
     _save_thumb_cache(cache)
     return out
@@ -749,13 +780,15 @@ _video_id_cache_lock = threading.Lock()
 
 
 def count_video_id_status_bulk(channels: list[dict[str, Any]],
-                                  force: bool = False
-                                  ) -> dict[str, dict[str, Any]]:
+                                  force: bool = False,
+                                  include_status: bool = False,
+                                  ) -> dict[str, Any]:
     """Single-query batch version of count_video_id_status.
 
-    Returns {channel_name: {total, with_id, missing, tried_failed}}
-    keyed by channel name (lowercased for case-insensitive lookup).
-    Falls back to per-channel queries if the batch query fails.
+    By default, returns {channel_name: {total, with_id, missing,
+    tried_failed}} keyed by lower-cased channel name.  ``include_status``
+    wraps those rows with an explicit success/error result for callers that
+    must distinguish an empty database from a database read failure.
 
     Why this exists: the per-channel function runs 3 COUNT(*) queries
     against a 9M+ row table, holding the FTS DB lock the whole time.
@@ -765,9 +798,17 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
     the lock. This collapses the work into one GROUP BY query that
     completes in under a second on the same data.
     """
+    def _result(rows: dict[str, dict[str, Any]],
+                error: str | None = None) -> dict[str, Any]:
+        if not include_status:
+            return rows
+        if error:
+            return {"ok": False, "rows": rows, "error": error}
+        return {"ok": True, "rows": rows}
+
     out: dict[str, dict[str, Any]] = {}
     if not channels:
-        return out
+        return _result(out)
     active_keys = _active_channel_keys(channels)
     # TTL cache shortcut: if the same data was computed recently AND
     # the caller didn't ask for a force-refresh, return the cached
@@ -781,10 +822,11 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
                 if cached_rows and age < _VIDEO_ID_CACHE_TTL_SEC:
                     # Return a shallow copy so callers can't mutate
                     # cached state from outside the lock.
-                    return {
+                    cached = {
                         k: v for k, v in cached_rows.items()
                         if not active_keys or k in active_keys
                     }
+                    return _result(cached)
         except Exception as e:
             _log.debug("swallowed: %s", e)
     try:
@@ -796,7 +838,7 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
         # `_conn` if the reader isn't available.
         conn = _idx._reader_open() or _idx._open()
         if conn is None:
-            return out
+            return _result(out, "Metadata status could not be read.")
         # Use GROUP BY on the raw `channel` column (NOT LOWER(channel))
         # so the existing idx_vid_channel index can serve the query.
         # LOWER() forces a full table scan, which on a 9M-row table
@@ -819,7 +861,7 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
                     "  SUM(CASE WHEN removed_from_yt_ts IS NOT NULL "
                     "           THEN 1 ELSE 0 END) AS removed, "
                     "  SUM(CASE WHEN tx_status IN "
-                    "           ('transcribed', 'done', 'no_speech') "
+                    "           ('transcribed', 'done') "
                     "           THEN 1 ELSE 0 END) AS transcribed "
                     f"FROM videos {where_sql} GROUP BY channel",
                     where_args,
@@ -884,8 +926,9 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
                 cur["tried_failed"] += tried
                 cur["removed_from_yt"] = cur.get("removed_from_yt", 0) + removed
                 cur["transcribed"] = cur.get("transcribed", 0) + transcribed
-    except Exception:
-        return {}
+    except Exception as e:
+        _log.warning("metadata status bulk query failed: %s", e)
+        return _result({}, "Metadata status could not be read.")
     # Refresh the TTL cache so the next page-load gets instant data.
     try:
         with _video_id_cache_lock:
@@ -893,7 +936,7 @@ def count_video_id_status_bulk(channels: list[dict[str, Any]],
             _video_id_cache_state["rows"] = out
     except Exception as e:
         _log.debug("swallowed: %s", e)
-    return out
+    return _result(out)
 
 
 def count_video_id_status(channel: dict[str, Any]) -> dict[str, Any]:

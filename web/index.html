@@ -10,29 +10,27 @@
 
   Page structure (top to bottom in the source below):
     1. <header-strip>     App title + version label
-    2. <tab-row>          Top-level tabs: Subs, Browse, Settings
-                          (Recent used to live here too, now under Browse)
+    2. <tab-row>          Top-level tabs: Download, Subs, Browse, Health,
+                          and Settings
     3. <main>             Tab panels, only one visible at a time:
        - #panel-subs         Channel subscriptions table + Sync controls
        - #panel-browse       Library navigation: Channels grid, Search,
                              Graph, Bookmarks, Recent. Has its own
                              left sidebar that swaps the right pane.
-       - #panel-settings     Per-channel + global settings, sync log
+       - #panel-health       Library status, repair tools, and backups
+       - #panel-settings     App preferences
     4. Floating overlays (not in the tab flow):
-       - #welcome-modal      First-launch archive-root picker (modal)
-       - #ask-modal          Generic confirm/prompt modal used by
-                             askConfirm() / askChoice() helpers in app.js
-       - #context-menu       Right-click menu, repurposed per context
-       - .drawer-livestreams Deferred-livestreams drawer slides up
-                             from bottom-right
+       - #onboarding-overlay First-launch setup wizard
+       - .askq-backdrop      Confirmations and long-running tool dialogs
+       - #ctx-menu-root      Right-click menu mount point
        - .mini-log           Tiny "tail of activity" panel docked at the
                              bottom of every tab so the user always
                              sees recent log activity
-       - #sync-tasks-popup / #gpu-tasks-popup   Queue popups anchored
+       - #popover-sync-tasks / #popover-gpu-tasks Queue popups anchored
                              to their respective header badges
     5. <script src="vendor/chart.umd.min.js">  Chart.js for the
                              Browse > Graph charts
-    6. <script src="logs.js"> + <script src="app.js">  The two JS
+    6. Feature scripts loaded in dependency order near the end of the page
                              files that wire everything together — see
                              web/app.js header for its section map.
 
@@ -53,10 +51,10 @@
   <link rel="stylesheet" href="styles-settings.css?v=2" />
   <link rel="stylesheet" href="styles-download-controls.css?v=1" />
   <link rel="stylesheet" href="styles-logs.css?v=1" />
-  <link rel="stylesheet" href="styles-tabs-data.css?v=1" />
+  <link rel="stylesheet" href="styles-tabs-data.css?v=3" />
   <link rel="stylesheet" href="styles-browse.css?v=2" />
-  <link rel="stylesheet" href="styles-browse-grids.css?v=1" />
-  <link rel="stylesheet" href="styles-watch.css?v=1" />
+  <link rel="stylesheet" href="styles-browse-grids.css?v=2" />
+  <link rel="stylesheet" href="styles-watch.css?v=3" />
   <link rel="stylesheet" href="styles-dialogs.css?v=1" />
   <link rel="stylesheet" href="styles-onboarding.css?v=1" />
 </head>
@@ -86,14 +84,10 @@
 
       <!-- Row 1: Video URL -->
       <div class="controls-row">
-        <label class="ctl-label">Video URL:</label>
-        <!-- bug W-2: bind the URL input to a <datalist> populated from
-             url_history so users get autocomplete of recent downloads.
-             The backend api.url_history() returns the list. -->
+        <label class="ctl-label" for="url-input">Video URL:</label>
         <input type="text" class="ctl-input" id="url-input"
-               list="url-history-list"
+               autocomplete="off" spellcheck="false" autocapitalize="none"
                placeholder="Paste a YouTube video URL" />
-        <datalist id="url-history-list"></datalist>
         <!-- "▶ Download" button moved into the video-opts panel below,
              inline with the custom-filename row, vertically spanning
              the two rows above it. -->
@@ -110,13 +104,13 @@
       <fieldset class="video-opts-panel" id="video-opts-panel" hidden>
         <legend>Video options</legend>
         <div class="vo-row">
-          <label class="vo-label">Save to:</label>
+          <label class="vo-label" for="vo-save-to">Save to:</label>
           <input type="text" class="vo-input" id="vo-save-to"
                  placeholder="(use default download folder)" />
           <button class="btn btn-ghost btn-thin" id="vo-save-to-browse">Browse</button>
         </div>
         <div class="vo-row">
-          <label class="vo-label">Resolution:</label>
+          <label class="vo-label" for="vo-resolution">Resolution:</label>
           <select class="vo-select" id="vo-resolution">
             <option value="best">Best available</option>
             <option value="2160">2160p (4K)</option>
@@ -148,11 +142,11 @@
                 <span>Use YT title as filename</span>
               </label>
               <input type="text" class="vo-input vo-custom-name" id="vo-custom-name"
-                     placeholder="Custom filename" disabled />
+                     placeholder="Custom filename" aria-label="Custom filename" disabled />
             </div>
             <div class="vo-row vo-row-checks">
               <label class="vo-check"
-                     title="Also save the video's metadata (.info.json) + thumbnail next to the file, so it gets a grid thumbnail and a Watch-view description. Both stay hidden — the folder still shows only the video.">
+                     title="Also save the video's thumbnail and description so they appear in Browse and Watch. Support files stay hidden.">
                 <input type="checkbox" id="vo-grab-metadata" />
                 <span>Also fetch metadata + thumbnail</span>
               </label>
@@ -185,7 +179,8 @@
           <span>Sync Subbed</span>
         </button>
         <button class="btn btn-icon btn-pause" id="btn-pause"
-                title="Pause / cancel current task">
+                title="Pause all queues (current jobs finish first)"
+                aria-label="Pause all queues">
           <svg class="btn-ico" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
             <rect x="4" y="3" width="3" height="10" rx="0.5"/>
             <rect x="9" y="3" width="3" height="10" rx="0.5"/>
@@ -201,6 +196,7 @@
 
         <!-- Sync Tasks icon button with label + badge -->
         <button class="icon-btn icon-btn-labeled icon-btn-sync" id="btn-sync-tasks"
+                aria-haspopup="dialog" aria-controls="popover-sync-tasks"
                 aria-expanded="false"
                 title="Sync queue &mdash; view pending downloads">
           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
@@ -212,6 +208,7 @@
 
         <!-- GPU Tasks icon button with label + badge -->
         <button class="icon-btn icon-btn-labeled icon-btn-gpu" id="btn-gpu-tasks"
+                aria-haspopup="dialog" aria-controls="popover-gpu-tasks"
                 aria-expanded="false"
                 title="Processing queue &mdash; view transcribe / encode tasks">
           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
@@ -229,7 +226,8 @@
 
       <!-- Row 3: Auto-sync label/dropdown + countdown -->
       <div class="controls-row controls-row-thin">
-        <label class="ctl-label ctl-label-thin" title="Run Sync Subbed automatically on an interval">Auto-sync:</label>
+        <label class="ctl-label ctl-label-thin" for="auto-sync-select"
+               title="Run Sync Subbed automatically on an interval">Auto-sync:</label>
         <select class="ctl-select" id="auto-sync-select"
                 title="How often to auto-run Sync Subbed">
           <option value="Off">Off</option>
@@ -277,11 +275,12 @@
              snooze the drawer so it stops nagging until that time. -->
         <div class="deferred-retry-wrap">
           <button class="btn btn-ghost btn-thin" id="btn-deferred-retry"
-                  title="Retry options">Retry &#x25BE;</button>
-          <div class="deferred-retry-menu" id="deferred-retry-menu" hidden>
-            <button data-retry="now">Now</button>
-            <button data-retry="24h">in 24 hours</button>
-            <button data-retry="1w">in 1 week</button>
+                   title="Retry options" aria-haspopup="menu"
+                   aria-controls="deferred-retry-menu" aria-expanded="false">Retry &#x25BE;</button>
+          <div class="deferred-retry-menu" id="deferred-retry-menu" role="menu" hidden>
+            <button data-retry="now" role="menuitem">Now</button>
+            <button data-retry="24h" role="menuitem">in 24 hours</button>
+            <button data-retry="1w" role="menuitem">in 1 week</button>
           </div>
         </div>
         <button class="btn btn-ghost btn-thin" id="btn-deferred-clear"
@@ -295,7 +294,9 @@
       <div class="activity-log-frame">
         <div class="activity-log" id="activity-log" tabindex="-1"></div>
       </div>
-      <div class="paned-splitter" id="paned-splitter"></div>
+      <div class="paned-splitter" id="paned-splitter" role="separator"
+           aria-orientation="horizontal" aria-label="Resize activity log"
+           tabindex="0"></div>
       <div class="main-log-frame">
         <div class="main-log" id="main-log" tabindex="-1"></div>
       </div>
@@ -317,7 +318,8 @@
         <div class="subs-filter-wrap">
           <span class="search-icon" aria-hidden="true">&#128269;</span>
           <input type="text" class="ctl-input subs-filter-input" id="subs-filter"
-                 placeholder="Filter by name&hellip;" />
+                 placeholder="Filter by name&hellip;"
+                 aria-label="Filter subscribed channels by name" />
           <button class="subs-filter-clear" id="subs-filter-clear" hidden
                   title="Clear filter (Esc)" aria-label="Clear filter">&times;</button>
         </div>
@@ -327,7 +329,9 @@
           <span class="queue-pending-count" id="queue-pending-count" hidden></span>
         </button>
         <span class="status-text clickable-total" id="subs-total-size"
-              title="Click to rescan all channel folder sizes">Total: &mdash;</span>
+              role="button" tabindex="0"
+              aria-label="Rescan all channel folder sizes"
+              title="Rescan all channel folder sizes">Total: &mdash;</span>
       </div>
 
       <!-- feature F7: bulk-actions bar. Appears only when ≥2 Subs rows
@@ -357,7 +361,7 @@
         <span class="subs-legend-label">Transcribe / Metadata:</span>
         <span><b>A&nbsp;&#10003;</b> auto&nbsp;on&nbsp;&amp;&nbsp;complete</span>
         <span><b>&#10003;</b> complete&nbsp;(manual)</span>
-        <span><b>&mdash;&nbsp;-N</b> N&nbsp;behind</span>
+        <span><b>-N</b> behind</span>
         <span><b>&mdash;</b> off</span>
         <span class="subs-legend-hint">Click a column header to sort.</span>
       </div>
@@ -431,13 +435,21 @@
                field. -->
           <div class="edit-row">
             <div class="edit-field edit-field-grow">
-              <label class="edit-gl">Channel URL</label>
-              <input type="text" class="ctl-input" id="edit-url" placeholder="https://www.youtube.com/@handle" />
+              <label class="edit-gl" for="edit-url">Channel URL</label>
+              <input type="text" class="ctl-input" id="edit-url"
+                     placeholder="https://www.youtube.com/@handle"
+                     aria-describedby="edit-channel-validation" />
             </div>
             <div class="edit-field edit-field-grow">
-              <label class="edit-gl">Folder Name</label>
-              <input type="text" class="ctl-input" id="edit-folder" placeholder="Auto-fills from the URL" />
+              <label class="edit-gl" for="edit-folder">Folder Name</label>
+              <input type="text" class="ctl-input" id="edit-folder"
+                     placeholder="Auto-fills from the URL"
+                     aria-describedby="edit-channel-validation" />
             </div>
+          </div>
+          <div class="edit-validation-row" id="edit-channel-validation"
+               role="status" aria-live="polite">
+            Enter a YouTube channel URL or @handle. A folder name is also required.
           </div>
 
           <!-- Reverse nudge: pasted-video-URL handoff. Full-width banner,
@@ -455,7 +467,7 @@
           <!-- Row 2: Resolution (+ reset/recheck/continue) + Duration -->
           <div class="edit-row">
             <div class="edit-field">
-              <label class="edit-gl">Resolution</label>
+              <label class="edit-gl" for="edit-resolution">Resolution</label>
               <!-- Display labels carry the `p` suffix ("720p" not "720")
                    so users don't have to guess. `value=` stays as the
                    bare number / keyword the backend expects. Same fix
@@ -467,16 +479,21 @@
                 <option value="240">240p</option>
                 <option value="360">360p</option>
                 <option value="480">480p</option>
-                <option value="720">720p</option>
-                <option value="1080" selected>1080p</option>
+                <option value="720" selected>720p</option>
+                <option value="1080">1080p</option>
                 <option value="1440">1440p</option>
                 <option value="2160">2160p (4K)</option>
                 <option value="best">Best available</option>
               </select>
-              <button class="icon-btn-slim" title="Reset resolution to default" id="edit-res-reset">&#8635;</button>
+              <button class="icon-btn-slim" type="button"
+                      title="Reset channel resolution to your configured default"
+                      aria-label="Reset channel resolution to your configured default"
+                      id="edit-res-reset">&#8635;</button>
               <!-- Scan channel folder with ffprobe + queue redownload for
                    below-target videos. YTArchiver.py:5155. -->
-              <button class="icon-btn-slim" title="Scan archive + queue redownload for videos below target resolution"
+              <button class="icon-btn-slim"
+                      title="Scan archived videos for a different resolution"
+                      aria-label="Recheck archived video resolutions"
                       id="edit-res-recheck" type="button">&#x2713;</button>
               <!-- Continue Redownload &mdash; visible only when a progress file
                    exists. YTArchiver.py:5473 _has_pending_redownload. -->
@@ -492,10 +509,12 @@
                       title="Cancel the in-progress redownload and discard progress">&#x2716; Cancel</button>
             </div>
             <div class="edit-field">
-              <label class="edit-gl">Duration</label>
-              <input type="text" class="ctl-input edit-num" id="edit-min-dur" placeholder="Min" />
+              <span class="edit-gl">Duration</span>
+              <input type="text" class="ctl-input edit-num" id="edit-min-dur"
+                     placeholder="Min" aria-label="Minimum video length in minutes" />
               <span class="edit-dim">&ndash;</span>
-              <input type="text" class="ctl-input edit-num" id="edit-max-dur" placeholder="Max" />
+              <input type="text" class="ctl-input edit-num" id="edit-max-dur"
+                     placeholder="Max" aria-label="Maximum video length in minutes" />
               <span class="edit-dim">min</span>
             </div>
           </div>
@@ -505,11 +524,11 @@
             <div class="edit-field edit-field-full" id="edit-range-group">
               <label class="edit-gl">Range</label>
               <label class="radio-label-inline">
-                <input type="radio" name="edit-range" value="subscribe" />
+                <input type="radio" name="edit-range" value="subscribe" checked />
                 <span class="radio-circle"></span>Subscribe only
               </label>
               <label class="radio-label-inline">
-                <input type="radio" name="edit-range" value="all" checked />
+                <input type="radio" name="edit-range" value="all" />
                 <span class="radio-circle"></span>Entire channel
               </label>
               <label class="radio-label-inline">
@@ -517,11 +536,17 @@
                 <span class="radio-circle"></span>From date
               </label>
               <div class="edit-date-group" id="edit-date-group" hidden>
-                <input type="text" class="ctl-input edit-date-part" id="edit-date-year" placeholder="YYYY" maxlength="4" inputmode="numeric" />
+                <input type="text" class="ctl-input edit-date-part" id="edit-date-year"
+                       placeholder="YYYY" maxlength="4" inputmode="numeric"
+                       aria-label="From date year" />
                 <span class="edit-dim">/</span>
-                <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-month" placeholder="MM" maxlength="2" inputmode="numeric" />
+                <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-month"
+                       placeholder="MM" maxlength="2" inputmode="numeric"
+                       aria-label="From date month" />
                 <span class="edit-dim">/</span>
-                <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-day" placeholder="DD" maxlength="2" inputmode="numeric" />
+                <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-day"
+                       placeholder="DD" maxlength="2" inputmode="numeric"
+                       aria-label="From date day" />
               </div>
             </div>
           </div>
@@ -531,10 +556,10 @@
                The Options field grows to fill remaining space. -->
           <div class="edit-row">
             <div class="edit-field">
-              <label class="edit-gl">Folder Org</label>
+              <label class="edit-gl" for="edit-folder-org">Folder Org</label>
               <select class="ctl-select edit-res" id="edit-folder-org">
-                <option value="flat" selected>None (flat)</option>
-                <option value="years">Years</option>
+                <option value="flat">None (flat)</option>
+                <option value="years" selected>Years</option>
                 <option value="months">Years/Months</option>
               </select>
             </div>
@@ -545,7 +570,7 @@
                 <span>Auto-metadata</span>
               </label>
               <label class="checkbox-label">
-                <input type="checkbox" id="edit-transcribe" checked />
+                <input type="checkbox" id="edit-transcribe" />
                 <span>Auto-transcribe</span>
               </label>
               <label class="checkbox-label">
@@ -559,34 +584,24 @@
                Full-width row so the dropdowns don't crowd the main row. -->
           <div class="edit-row edit-compress-group" id="edit-compress-group" hidden>
             <div class="edit-field">
-              <label class="edit-dim">Res</label>
-              <select class="ctl-select edit-res" id="edit-compress-res">
+              <label class="edit-dim" for="edit-compress-res">Res</label>
+              <select class="ctl-select edit-res" id="edit-compress-res"
+                      aria-label="Compression output resolution">
                 <option value="original">Original</option>
                 <option value="1080">1080p</option>
-                <option value="720">720p</option>
-                <option value="480" selected>480p</option>
+                <option value="720" selected>720p</option>
+                <option value="480">480p</option>
                 <option value="360">360p</option>
                 <option value="240">240p</option>
                 <option value="144">144p</option>
               </select>
             </div>
             <div class="edit-field">
-              <label class="edit-dim">Quality</label>
+              <label class="edit-dim" for="edit-compress-quality">Quality</label>
               <select class="ctl-select edit-res" id="edit-compress-quality">
                 <option value="Generous" selected>Generous</option>
                 <option value="Average">Average</option>
                 <option value="Below Average">Below Average</option>
-              </select>
-            </div>
-            <div class="edit-field">
-              <label class="edit-dim">Batch</label>
-              <select class="ctl-select edit-batch" id="edit-compress-batch">
-                <option>5</option>
-                <option selected>10</option>
-                <option>15</option>
-                <option>20</option>
-                <option>25</option>
-                <option>30</option>
               </select>
             </div>
           </div>
@@ -633,204 +648,332 @@
   <!-- Recent tab -->
   <!-- (Recent tab moved into Browse as a submode &mdash; see `view-recent`
        inside panel-browse below.) -->
-  <!-- Settings tab: one scrollable settings page. General, Performance, and
-       Appearance are sections instead of separate sub-tabs because the latter
-       two only have a small number of options. -->
+  <!-- Settings: one scannable page, grouped by the thing each preference affects. -->
   <div class="tab-panel" id="panel-settings">
-    <div class="settings-main settings-single-page">
-      <div class="settings-view" id="settings-view-general">
-
-        <label class="subs-section-label">General</label>
-        <div class="edit-grid">
-          <label class="edit-gl">Archive root</label>
-          <div class="edit-gv-stack settings-field-with-help">
-            <div class="edit-gv-inline">
-              <input type="text" class="ctl-input" id="settings-output-dir" readonly />
-              <button class="btn btn-ghost btn-thin" id="settings-browse-output">Browse&hellip;</button>
+    <div class="settings-area settings-preferences-area settings-single-page">
+      <div class="settings-main">
+        <div class="settings-view settings-preferences-view" id="settings-view-preferences">
+          <section class="settings-section" id="settings-section-storage">
+            <div class="settings-section-heading">
+              <h2>Storage &amp; library</h2>
+              <p>Where files are kept and how YTArchiver checks the archive.</p>
             </div>
-            <div class="settings-field-help">
-              New channel downloads are stored here. Existing videos are
-              never moved automatically.
-            </div>
-          </div>
 
-          <label class="edit-gl">Video downloads</label>
-          <div class="edit-gv-stack settings-field-with-help">
-            <div class="edit-gv-inline">
-              <input type="text" class="ctl-input" id="settings-video-dir" readonly />
-              <button class="btn btn-ghost btn-thin" id="settings-browse-video">Browse&hellip;</button>
-            </div>
-            <div class="settings-field-help">
-              Default location for individual URLs downloaded from the
-              Download tab.
-            </div>
-          </div>
-
-          <label class="edit-gl">Default resolution</label>
-          <div class="edit-gv-cell">
-            <select class="ctl-select" id="settings-default-res">
-              <option value="audio">Audio only</option>
-              <option value="144">144p</option>
-              <option value="240">240p</option>
-              <option value="360">360p</option>
-              <option value="480">480p</option>
-              <option value="720" selected>720p</option>
-              <option value="1080">1080p</option>
-              <option value="1440">1440p</option>
-              <option value="2160">2160p (4K)</option>
-              <option value="best">Best available</option>
-            </select>
-          </div>
-
-          <label class="edit-gl">Auto-transcribe model</label>
-          <div class="edit-gv-cell">
-            <select class="ctl-select" id="settings-whisper-model">
-              <option value="tiny">tiny (fastest)</option>
-              <option value="small" selected>small</option>
-              <option value="medium">medium</option>
-              <option value="large-v3">large-v3 (best)</option>
-            </select>
-          </div>
-
-          <label class="edit-gl">When closing window</label>
-          <div class="edit-gv-cell">
-            <select class="ctl-select" id="settings-close-behavior">
-              <option value="ask" selected>Ask each time</option>
-              <option value="tray">Minimize to tray</option>
-              <option value="quit">Quit immediately</option>
-            </select>
-          </div>
-
-          <label class="edit-gl">Auto-sync timing</label>
-          <div class="edit-gv-cell">
-            <select class="ctl-select" id="settings-autorun-mode"
-                    title="Timer resumes its saved countdown after restarts; Clock-aligned uses fixed wall-clock times, with a custom time available for 12- and 24-hour schedules">
-              <option value="timer">Timer (countdown)</option>
-              <option value="clock">Clock-aligned (fixed times)</option>
-            </select>
-          </div>
-
-          <label class="edit-gl">YouTube traffic safety</label>
-          <div class="edit-gv-stack settings-traffic-controls">
-            <select class="ctl-select" id="settings-youtube-traffic-mode">
-              <option value="conservative">Conservative (recommended)</option>
-              <option value="balanced">Balanced</option>
-              <option value="custom">Custom</option>
-              <option value="unlimited">Unlimited</option>
-            </select>
-            <div class="settings-traffic-custom" id="settings-traffic-custom" hidden>
-              <label>24-hour limit <input type="number" class="ctl-input" id="settings-traffic-daily" min="1" max="100000" /></label>
-              <label>Hourly limit <input type="number" class="ctl-input" id="settings-traffic-hourly" min="1" max="10000" /></label>
-              <label>Min gap <input type="number" class="ctl-input" id="settings-traffic-min-gap" min="0" max="3600" /><span>sec</span></label>
-              <label>Max gap <input type="number" class="ctl-input" id="settings-traffic-max-gap" min="0" max="3600" /><span>sec</span></label>
-            </div>
-            <div class="settings-traffic-meter" id="settings-traffic-meter">
-              <span class="settings-traffic-usage">
-                <strong id="settings-traffic-hourly-usage">&mdash;</strong>
-                <small>This hour</small>
-              </span>
-              <span class="settings-traffic-usage">
-                <strong id="settings-traffic-daily-usage">&mdash;</strong>
-                <small>Last 24 hours</small>
-              </span>
-              <span class="settings-traffic-cooldown"
-                    id="settings-traffic-cooldown" hidden></span>
-            </div>
-            <div class="settings-traffic-insight" id="settings-traffic-recommendation">
-              <span class="settings-traffic-insight-icon" aria-hidden="true">&#10003;</span>
-              <div class="settings-traffic-insight-copy">
-                <div class="settings-traffic-insight-heading">
-                  <span>Recommended cadence</span>
-                  <strong id="settings-traffic-cadence">Calculating&hellip;</strong>
+            <div class="edit-grid">
+              <label class="edit-gl" for="settings-output-dir">Archive folder</label>
+              <div class="edit-gv-stack settings-field-with-help">
+                <div class="edit-gv-inline">
+                  <input type="text" class="ctl-input" id="settings-output-dir" readonly />
+                  <button class="btn btn-ghost btn-thin" id="settings-browse-output">Browse&hellip;</button>
                 </div>
-                <div class="settings-traffic-insight-detail"
-                     id="settings-traffic-recommendation-detail">
-                  Checking your channels and enabled features.
+                <div class="settings-field-help">
+                  New channel downloads go here. Existing files are not moved.
                 </div>
-                <div class="settings-traffic-insight-note"
-                     id="settings-traffic-recommendation-note" hidden></div>
+              </div>
+
+              <label class="edit-gl" for="settings-video-dir">Individual video folder</label>
+              <div class="edit-gv-stack settings-field-with-help">
+                <div class="edit-gv-inline">
+                  <input type="text" class="ctl-input" id="settings-video-dir" readonly />
+                  <button class="btn btn-ghost btn-thin" id="settings-browse-video">Browse&hellip;</button>
+                </div>
+                <div class="settings-field-help">
+                  Default folder for individual videos from the Download tab.
+                </div>
+              </div>
+
+              <label class="edit-gl" for="settings-archive-capacity-mode">Drive-space warning</label>
+              <div class="edit-gv-inline edit-gap-6 settings-archive-capacity-row">
+                <span class="settings-control-caption">Warn by</span>
+                <select class="ctl-select" id="settings-archive-capacity-mode">
+                  <option value="percent" selected>Percent full</option>
+                  <option value="free_gb">GB free</option>
+                </select>
+                <input type="text" class="ctl-input edit-num settings-archive-capacity-input"
+                       id="settings-archive-capacity-threshold" value="90"
+                       aria-label="Drive-space warning threshold" />
+                <span class="settings-control-unit" id="settings-archive-capacity-unit">% full</span>
+              </div>
+
+              <label class="edit-gl" for="settings-trash-retention-days">Trash cleanup</label>
+              <div class="edit-gv-stack settings-field-with-help">
+                <select class="ctl-select" id="settings-trash-retention-days"
+                        title="Choose how long Trash items are kept before YTArchiver permanently deletes them.">
+                  <option value="0">Off — keep until I delete them</option>
+                  <option value="7">Delete after 7 days</option>
+                  <option value="14">Delete after 14 days</option>
+                  <option value="30" selected>Delete after 30 days</option>
+                  <option value="60">Delete after 60 days</option>
+                  <option value="90">Delete after 90 days</option>
+                  <option value="180">Delete after 180 days</option>
+                  <option value="365">Delete after 365 days</option>
+                </select>
+                <div class="settings-field-help">
+                  Turning cleanup on or shortening the wait takes effect after 24 hours.
+                </div>
+              </div>
+
+              <label class="edit-gl">Additional archive folders</label>
+              <div class="edit-gv-stack settings-field-with-help settings-archive-folders">
+                <div class="settings-field-help">
+                  Your main archive folder is always included. Add other folders here if Search should include them too.
+                </div>
+                <div class="index-roots-list" id="settings-roots-list"
+                     aria-label="Archive folders included in Search"></div>
+                <div class="index-section-buttons">
+                  <button class="btn btn-ghost btn-thin" id="btn-settings-add-root">Add Folder&hellip;</button>
+                  <button class="btn btn-ghost btn-thin" id="btn-settings-remove-root">Remove Selected</button>
+                </div>
               </div>
             </div>
-          </div>
 
-          <label class="edit-gl">Auto-backup</label>
-          <div class="edit-gv-stack settings-field-with-help">
-            <select class="ctl-select" id="settings-auto-backup"
-                    title="Automatically exports the app's full backup (settings, subscriptions, download history, queue) into the 'YTArchiver Info' folder inside the archive root — alongside a README describing the archive format and a copy of the app itself. The newest 4 backups are kept; older ones move to the archive trash.">
-              <option value="off" selected>Off</option>
-              <option value="daily">Daily</option>
-              <option value="weekly">Weekly</option>
-              <option value="monthly">Monthly</option>
-            </select>
-            <div class="settings-field-help">
-              Keeps the archive self-contained with settings, subscriptions,
-              download history, a format README, and a copy of YTArchiver.
+            <details class="settings-details-card" id="settings-background-checks">
+              <summary>Background checks</summary>
+              <div class="settings-details-intro">
+                Controls for finding archive changes that happened outside the normal download flow.
+              </div>
+              <div class="edit-grid">
+                <label class="edit-gl">Search checks</label>
+                <div class="edit-gv-stack settings-field-with-help">
+                  <label class="edit-gv-inline settings-checkbox-row settings-auto-index-row">
+                    <input type="checkbox" id="settings-auto-index-enabled" />
+                    <span>Check automatically every</span>
+                    <input type="text" class="ctl-input edit-num index-auto-threshold"
+                           id="settings-auto-index-threshold" value="10"
+                           aria-label="Downloads between automatic Search checks" />
+                    <span>downloads</span>
+                  </label>
+                  <div class="settings-field-help">
+                    New downloads are added to Search right away. This extra check catches files that were missed.
+                  </div>
+                </div>
+
+                <label class="edit-gl">Archive rescans</label>
+                <div class="edit-gv-inline edit-gap-6">
+                  <span class="settings-control-caption">Check again after</span>
+                  <input type="text" class="ctl-input edit-num settings-disk-staleness-input"
+                         id="settings-disk-staleness" value="24"
+                         aria-label="Hours between archive rescans" />
+                  <span class="settings-control-unit">hours</span>
+                  <span class="settings-inline-note">0 = every time</span>
+                </div>
+              </div>
+            </details>
+          </section>
+
+          <section class="settings-section" id="settings-section-downloads">
+            <div class="settings-section-heading">
+              <h2>Downloads &amp; YouTube</h2>
+              <p>Defaults for new work and limits on requests to YouTube.</p>
             </div>
-          </div>
 
-          <label class="edit-gl">Launch at boot</label>
-          <div class="edit-gv-stack">
-            <label class="edit-gv-inline settings-checkbox-row">
-              <input type="checkbox" id="settings-launch-at-boot" />
-              <span>Start YTArchiver when Windows signs in</span>
-            </label>
-            <label class="edit-gv-inline settings-checkbox-row" id="settings-boot-minimized-wrap" hidden>
-              <input type="checkbox" id="settings-boot-minimized" />
-              <span>Start minimized to tray</span>
-            </label>
-          </div>
-        </div>
+            <div class="edit-grid">
+              <label class="edit-gl" for="settings-default-res">Default video quality</label>
+              <div class="edit-gv-cell">
+                <select class="ctl-select" id="settings-default-res"
+                        title="Used for individual video downloads and as the starting quality for new channels">
+                  <option value="audio">Audio only</option>
+                  <option value="144">144p</option>
+                  <option value="240">240p</option>
+                  <option value="360">360p</option>
+                  <option value="480">480p</option>
+                  <option value="720" selected>720p</option>
+                  <option value="1080">1080p</option>
+                  <option value="1440">1440p</option>
+                  <option value="2160">2160p (4K)</option>
+                  <option value="best">Best available</option>
+                </select>
+              </div>
 
-        <label class="subs-section-label">Performance</label>
-        <div class="edit-grid">
-          <label class="edit-gl">Disk scan</label>
-          <div class="edit-gv-inline edit-gap-6">
-            <span class="settings-control-caption">Rescan when cache is older than</span>
-            <input type="text" class="ctl-input edit-num settings-disk-staleness-input"
-                   id="settings-disk-staleness" value="24" />
-            <span class="settings-control-unit">hours</span>
-            <span class="settings-inline-note">0 always rescans</span>
-          </div>
+              <label class="edit-gl" for="settings-whisper-model">Default transcription model</label>
+              <div class="edit-gv-cell">
+                <select class="ctl-select" id="settings-whisper-model">
+                  <option value="tiny">tiny (fastest)</option>
+                  <option value="small" selected>small</option>
+                  <option value="medium">medium</option>
+                  <option value="large-v3">large-v3 (best)</option>
+                </select>
+              </div>
 
-          <label class="edit-gl">Archive drive warning</label>
-          <div class="edit-gv-inline edit-gap-6 settings-archive-capacity-row">
-            <span class="settings-control-caption">Measure by</span>
-            <select class="ctl-select" id="settings-archive-capacity-mode">
-              <option value="percent" selected>Percent full</option>
-              <option value="free_gb">GB free</option>
-            </select>
-            <input type="text" class="ctl-input edit-num settings-archive-capacity-input"
-                   id="settings-archive-capacity-threshold" value="90" />
-            <span class="settings-control-unit" id="settings-archive-capacity-unit">% full</span>
-          </div>
-        </div>
+              <label class="edit-gl" for="settings-autorun-mode">Auto-sync timing</label>
+              <div class="edit-gv-stack settings-field-with-help">
+                <select class="ctl-select" id="settings-autorun-mode"
+                        title="Choose whether interval schedules run at fixed times or count from the previous sync">
+                  <option value="clock" selected>Fixed times</option>
+                  <option value="timer">Timer since last sync</option>
+                </select>
+                <div class="settings-field-help">
+                  Applies to interval schedules. Fixed 12- and 24-hour schedules show a time picker beside Auto-sync on Download.
+                </div>
+              </div>
 
-        <label class="subs-section-label">Appearance</label>
-        <div class="edit-grid">
-          <label class="edit-gl">Dense Sub Tab</label>
-          <div class="edit-gv-stack settings-appearance-choice">
-            <label class="edit-gv-inline settings-checkbox-row">
-              <input type="checkbox" id="settings-legacy-subs-tab" />
-              <span>Show dense Subs tab</span>
-            </label>
-            <span class="settings-inline-note">Adds a dense-view &ldquo;Subs&rdquo; tab for easy channel editing.</span>
-          </div>
+              <label class="edit-gl" for="settings-youtube-traffic-mode">YouTube traffic protection</label>
+              <div class="edit-gv-stack settings-traffic-controls">
+                <select class="ctl-select" id="settings-youtube-traffic-mode">
+                  <option value="conservative">Conservative (recommended)</option>
+                  <option value="balanced">Balanced</option>
+                  <option value="custom">Custom</option>
+                  <option value="unlimited">Unlimited</option>
+                </select>
+                <div class="settings-traffic-custom" id="settings-traffic-custom" hidden>
+                  <label>24-hour limit <input type="number" class="ctl-input" id="settings-traffic-daily" min="1" max="100000" /></label>
+                  <label>Hourly limit <input type="number" class="ctl-input" id="settings-traffic-hourly" min="1" max="10000" /></label>
+                  <label>Min gap <input type="number" class="ctl-input" id="settings-traffic-min-gap" min="0" max="3600" /><span>sec</span></label>
+                  <label>Max gap <input type="number" class="ctl-input" id="settings-traffic-max-gap" min="0" max="3600" /><span>sec</span></label>
+                </div>
+                <div class="settings-traffic-meter" id="settings-traffic-meter">
+                  <span class="settings-traffic-usage">
+                    <strong id="settings-traffic-hourly-usage">&mdash;</strong>
+                    <small>This hour</small>
+                  </span>
+                  <span class="settings-traffic-usage">
+                    <strong id="settings-traffic-daily-usage">&mdash;</strong>
+                    <small>Last 24 hours</small>
+                  </span>
+                  <span class="settings-traffic-cooldown"
+                        id="settings-traffic-cooldown" hidden></span>
+                </div>
+                <div class="settings-traffic-insight" id="settings-traffic-recommendation">
+                  <span class="settings-traffic-insight-icon" aria-hidden="true">&#10003;</span>
+                  <div class="settings-traffic-insight-copy">
+                    <div class="settings-traffic-insight-heading">
+                      <span>Recommended auto-sync</span>
+                      <strong id="settings-traffic-cadence">Calculating&hellip;</strong>
+                    </div>
+                    <div class="settings-traffic-insight-detail"
+                         id="settings-traffic-recommendation-detail">
+                      Checking your channels and enabled features.
+                    </div>
+                    <div class="settings-traffic-insight-note"
+                         id="settings-traffic-recommendation-note" hidden></div>
+                  </div>
+                </div>
+              </div>
+            </div>
 
-          <label class="edit-gl" id="settings-subs-table-label" hidden>Legacy Subs table</label>
-          <div class="edit-gv-stack" id="settings-subs-table-options" hidden>
-            <label class="edit-gv-inline settings-checkbox-row">
-              <input type="checkbox" id="settings-show-avg-size" />
-              <span>Show Avg filesize in Subs tab</span>
-            </label>
-          </div>
+            <details class="settings-details-card" id="settings-downloader-updates">
+              <summary>Downloader updates</summary>
+              <div class="edit-grid">
+                <label class="edit-gl">Download tool</label>
+                <div class="edit-gv-inline edit-gap-8">
+                  <span class="edit-dim" id="settings-ytdlp-version">checking&hellip;</span>
+                  <button class="btn btn-ghost btn-thin" id="btn-ytdlp-update"
+                          title="Check for and install a yt-dlp update">Update now</button>
+                </div>
 
-          <label class="edit-gl">Log mode</label>
-          <div class="edit-gv-cell">
-            <select class="ctl-select" id="settings-log-mode">
-              <option value="Simple" selected>Simple</option>
-              <option value="Verbose">Verbose</option>
-            </select>
-          </div>
+                <label class="edit-gl" for="settings-ytdlp-channel">Release track</label>
+                <div class="edit-gv-cell">
+                  <select class="ctl-select" id="settings-ytdlp-channel"
+                          title="Stable is safest. Beta receives YouTube fixes earlier.">
+                    <option value="stable">Stable</option>
+                    <option value="nightly">Beta (nightly)</option>
+                  </select>
+                </div>
+
+                <label class="edit-gl" for="settings-ytdlp-update-mode">Update behavior</label>
+                <div class="edit-gv-stack">
+                  <select class="ctl-select" id="settings-ytdlp-update-mode"
+                          title="Package-manager installations remain notify-only.">
+                    <option value="automatic">Install automatically (recommended)</option>
+                    <option value="notify">Notify only</option>
+                    <option value="off">Off</option>
+                  </select>
+                  <span class="settings-inline-note" id="settings-ytdlp-update-note">Installs when YouTube work is idle</span>
+                </div>
+
+                <label class="edit-gl">Check interval</label>
+                <div class="edit-gv-inline edit-gap-6">
+                  <span class="settings-control-caption">Every</span>
+                  <input type="number" min="1" max="365" step="1"
+                         class="ctl-input edit-num"
+                         id="settings-ytdlp-check-days" value="1"
+                          title="Check for updates after this many days"
+                          aria-label="Downloader update check interval in days" />
+                  <span class="settings-control-unit">days</span>
+                  <span class="settings-inline-note" id="settings-ytdlp-check-status">never checked</span>
+                </div>
+              </div>
+            </details>
+          </section>
+
+          <section class="settings-section" id="settings-section-app">
+            <div class="settings-section-heading">
+              <h2>App behavior</h2>
+              <p>How YTArchiver starts, closes, and presents information.</p>
+            </div>
+
+            <div class="edit-grid">
+              <label class="edit-gl">Windows startup</label>
+              <div class="edit-gv-stack">
+                <label class="edit-gv-inline settings-checkbox-row">
+                  <input type="checkbox" id="settings-launch-at-boot" />
+                  <span>Start YTArchiver when Windows signs in</span>
+                </label>
+                <label class="edit-gv-inline settings-checkbox-row" id="settings-boot-minimized-wrap" hidden>
+                  <input type="checkbox" id="settings-boot-minimized" />
+                  <span>Start minimized to tray</span>
+                </label>
+              </div>
+
+              <label class="edit-gl" for="settings-close-behavior">Closing the window</label>
+              <div class="edit-gv-cell">
+                <select class="ctl-select" id="settings-close-behavior">
+                  <option value="ask" selected>Ask each time</option>
+                  <option value="tray">Minimize to tray</option>
+                  <option value="quit">Quit immediately</option>
+                </select>
+              </div>
+
+              <label class="edit-gl">Channel list</label>
+              <div class="edit-gv-stack settings-appearance-choice">
+                <label class="edit-gv-inline settings-checkbox-row">
+                  <input type="checkbox" id="settings-legacy-subs-tab" />
+                  <span>Show compact Subs tab</span>
+                </label>
+                <span class="settings-inline-note">Useful for editing many channels at once</span>
+              </div>
+
+              <label class="edit-gl" id="settings-subs-table-label" hidden>Compact Subs details</label>
+              <div class="edit-gv-stack" id="settings-subs-table-options" hidden>
+                <label class="edit-gv-inline settings-checkbox-row">
+                  <input type="checkbox" id="settings-show-avg-size" />
+                  <span>Show average file size</span>
+                </label>
+              </div>
+
+              <label class="edit-gl" for="settings-log-mode">Activity log detail</label>
+              <div class="edit-gv-cell">
+                <select class="ctl-select" id="settings-log-mode">
+                  <option value="Simple" selected>Simple</option>
+                  <option value="Verbose">Detailed</option>
+                </select>
+              </div>
+            </div>
+
+            <details class="settings-details-card settings-support-details"
+                     id="settings-about-troubleshooting">
+              <summary>About &amp; troubleshooting</summary>
+              <div class="edit-grid">
+                <label class="edit-gl">About YTArchiver</label>
+                <div class="edit-gv-inline edit-gap-6">
+                  <button class="btn btn-ghost btn-thin" id="btn-about"
+                          title="App version and settings information">Open&hellip;</button>
+                </div>
+
+                <label class="edit-gl">Diagnostics</label>
+                <div class="edit-gv-inline edit-gap-6">
+                  <button class="btn btn-ghost btn-thin" id="btn-diagnostics"
+                          title="Check download tools, ffmpeg, Python, GPU, and other app dependencies">Run diagnostics&hellip;</button>
+                </div>
+
+                <label class="edit-gl">Setup</label>
+                <div class="edit-gv-inline edit-gap-6">
+                  <button class="btn btn-ghost btn-thin" id="btn-run-setup"
+                          title="Review or change setup">Run setup again&hellip;</button>
+                </div>
+              </div>
+            </details>
+          </section>
         </div>
 
         <div class="settings-actions" id="settings-actions-footer">
@@ -844,425 +987,346 @@
       <div class="main-log mini-log" id="settings-mini-log" tabindex="-1"></div>
     </div>
   </div>
-  <!-- Health tab: library maintenance + status. Metadata / Index / Tools
-       live here because they are actions and dashboards, not preferences. -->
+  <!-- Health: current status, library repair, and app-state recovery. -->
   <div class="tab-panel" id="panel-health">
-    <div class="settings-area">
+    <div class="settings-area health-condensed-area">
       <div class="settings-sidebar">
-        <div class="settings-subnav-label">LIBRARY</div>
-        <div class="settings-subnav-btn active" data-settings-view="metadata">Metadata</div>
-        <div class="settings-subnav-btn" data-settings-view="index">Index</div>
-        <div class="settings-subnav-btn" data-settings-view="tools">Tools</div>
+        <div class="settings-subnav-label">HEALTH</div>
+        <div class="settings-subnav-btn active" data-settings-view="overview">Overview</div>
+        <div class="settings-subnav-btn" data-settings-view="library">Library</div>
+        <div class="settings-subnav-btn" data-settings-view="backups">Backups</div>
       </div>
       <div class="settings-main">
 
-        <!-- Tools &mdash; yt-dlp, import/export, bulk metadata -->
-        <div class="settings-view" id="settings-view-tools" hidden>
-          <label class="subs-section-label">Dependencies</label>
-          <div class="edit-grid">
-            <label class="edit-gl">yt-dlp</label>
-            <div class="edit-gv-inline edit-gap-8">
-              <span class="edit-dim" id="settings-ytdlp-version">checking&hellip;</span>
-              <button class="btn btn-ghost btn-thin" id="btn-ytdlp-update"
-                      title="Update yt-dlp to the latest release on the selected channel">Update</button>
+        <div class="settings-view" id="settings-view-overview">
+          <label class="subs-section-label">Overview</label>
+          <div class="health-overview-panel">
+            <div class="health-overview-heading">
+              <div>
+                <h2>Library health</h2>
+                <p>A quick check of your archive, metadata, search index, backups, and download tools.</p>
+              </div>
+              <button class="btn btn-ghost btn-thin" id="btn-health-overview-refresh"
+                      type="button">Refresh</button>
             </div>
+            <div class="health-overview-status" id="health-overview-status"
+                 role="status" aria-live="polite">Waiting to check&hellip;</div>
 
-            <label class="edit-gl">Release channel</label>
-            <div class="edit-gv-inline edit-gap-8">
-              <select class="ctl-select" id="settings-ytdlp-channel"
-                      title="Stable is safest. Beta (nightly) carries YouTube fixes days-to-weeks ahead of stable — switch to it if downloads start failing with 403 errors while Stable is already up to date.">
-                <option value="stable">Stable</option>
-                <option value="nightly">Beta (nightly)</option>
-              </select>
+            <section class="health-attention" aria-labelledby="health-attention-heading">
+              <div class="health-attention-heading" id="health-attention-heading">Needs attention</div>
+              <div class="health-attention-list" id="health-attention-list">
+                <div class="health-attention-empty">Checking&hellip;</div>
+              </div>
+            </section>
+
+            <div class="health-overview-grid">
+              <button class="health-summary-card" type="button"
+                      data-health-target="library" data-health-anchor="health-library-archive">
+                <span class="health-summary-label">Archive files</span>
+                <strong id="health-overview-archive-value">Checking&hellip;</strong>
+                <span id="health-overview-archive-detail">Reading the library summary</span>
+              </button>
+              <button class="health-summary-card" type="button"
+                      data-health-target="library" data-health-anchor="health-library-metadata">
+                <span class="health-summary-label">Metadata</span>
+                <strong id="health-overview-metadata-value">Checking&hellip;</strong>
+                <span id="health-overview-metadata-detail">Checking channel details</span>
+              </button>
+              <button class="health-summary-card" type="button"
+                      data-health-target="library" data-health-anchor="health-library-index">
+                <span class="health-summary-label">Search index</span>
+                <strong id="health-overview-index-value">Checking&hellip;</strong>
+                <span id="health-overview-index-detail">Reading searchable transcript totals</span>
+              </button>
+              <button class="health-summary-card" type="button"
+                      data-health-target="library" data-health-anchor="health-library-transcripts">
+                <span class="health-summary-label">Transcripts</span>
+                <strong id="health-overview-transcripts-value">Checking&hellip;</strong>
+                <span id="health-overview-transcripts-detail">Checking transcript coverage</span>
+              </button>
+              <button class="health-summary-card" type="button"
+                      data-health-target="backups">
+                <span class="health-summary-label">Backups</span>
+                <strong id="health-overview-backup-value">Checking&hellip;</strong>
+                <span id="health-overview-backup-detail">Reading the last successful backup time</span>
+              </button>
+              <button class="health-summary-card" type="button"
+                      data-health-target="settings" data-settings-section="downloads">
+                <span class="health-summary-label">Download tool</span>
+                <strong id="health-overview-system-value">Checking&hellip;</strong>
+                <span id="health-overview-system-detail">Checking yt-dlp</span>
+              </button>
             </div>
+          </div>
+        </div>
 
-            <label class="edit-gl">Update behavior</label>
-            <div class="edit-gv-stack">
-              <select class="ctl-select" id="settings-ytdlp-update-mode"
-                      title="Automatic updates apply to standalone yt-dlp executables. Package-manager installations remain notify-only.">
-                <option value="automatic">Install automatically (recommended)</option>
-                <option value="notify">Notify only</option>
-                <option value="off">Off</option>
-              </select>
-              <span class="settings-inline-note" id="settings-ytdlp-update-note">Installs when YouTube work is idle; no restart required</span>
-            </div>
-
-            <label class="edit-gl">Check interval</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <span class="settings-control-caption">Every</span>
-              <input type="number" min="1" max="365" step="1"
-                     class="ctl-input edit-num"
-                     id="settings-ytdlp-check-days" value="1"
-                     title="Check the selected yt-dlp release channel after this many elapsed days, including while YTArchiver stays open." />
-              <span class="settings-control-unit">days</span>
-              <span class="settings-inline-note" id="settings-ytdlp-check-status">never checked</span>
-            </div>
-
-            <div class="edit-gl"></div>
-            <div class="settings-inline-note">Checks at launch when overdue and continues in the background while YTArchiver stays open. Automatic updates wait for an idle window.</div>
-
+        <div class="settings-view health-library-view" id="settings-view-library" hidden>
+          <label class="subs-section-label">Library</label>
+          <div class="health-view-intro">
+            Review the information YTArchiver has about the archive and run repairs when something looks wrong.
           </div>
 
-          <label class="subs-section-label">Backup and Migration</label>
-          <div class="edit-grid">
-            <label class="edit-gl">Channels</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <button class="btn btn-ghost btn-thin" id="btn-export-channels"
-                      title="Save your channel list to a JSON file">Export&hellip;</button>
-              <button class="btn btn-ghost btn-thin" id="btn-import-channels"
-                      title="Merge a saved channel list into your current subs">Import&hellip;</button>
+          <details class="health-library-details"
+                   id="health-library-metadata" data-health-section="metadata">
+            <summary>
+              <span>Channel information</span>
+              <small>Coverage and refresh history for each saved channel.</small>
+            </summary>
+            <div class="metadata-panel">
+              <div class="metadata-totals" id="metadata-totals" hidden>
+                <div class="md-total-card">
+                  <div class="md-total-label">Channels</div>
+                  <div class="md-total-value" id="md-tot-channels">&mdash;</div>
+                </div>
+                <div class="md-total-card"
+                     title="Videos YTArchiver tracks in its catalog and can check for IDs, transcripts, and YouTube availability.">
+                  <div class="md-total-label">Videos</div>
+                  <div class="md-total-value" id="md-tot-videos">&mdash;</div>
+                </div>
+                <div class="md-total-card" id="md-tot-card-ids"
+                     title="Across the whole archive: how many saved videos have a YouTube video ID recorded.">
+                  <div class="md-total-label">Video IDs</div>
+                  <div class="md-total-value" id="md-tot-ids">&mdash;</div>
+                </div>
+                <div class="md-total-card" id="md-tot-card-thumbs"
+                     title="Across the whole archive: how many saved videos have a thumbnail image.">
+                  <div class="md-total-label">Thumbnails</div>
+                  <div class="md-total-value" id="md-tot-thumbs">&mdash;</div>
+                </div>
+                <div class="md-total-card" id="md-tot-card-onyt"
+                     title="Across the whole archive: how many videos are still publicly listed on YouTube. Updated when bulk views/likes refresh runs.">
+                  <div class="md-total-label">Still on YT</div>
+                  <div class="md-total-value" id="md-tot-onyt">&mdash;</div>
+                </div>
+                <div class="md-total-card" id="md-tot-card-transcribed"
+                     title="Across the whole archive: how many on-disk videos have an actual transcript. Videos where Whisper found no speech are not counted.">
+                  <div class="md-total-label">Transcribed</div>
+                  <div class="md-total-value" id="md-tot-transcribed">&mdash;</div>
+                </div>
+              </div>
+
+              <div class="metadata-bulk-row">
+                <button class="btn btn-ghost btn-thin" id="btn-md-refresh-all-views"
+                        title="Choose a recent-upload time range, then queue a views/likes refresh for every subscribed channel">
+                  Refresh views/likes &mdash; all channels
+                </button>
+                <button class="btn btn-ghost btn-thin" id="btn-md-refresh-all-comments"
+                        title="Queue a comments refresh for every channel. Prompts for scope: 1 month / 1 year / all.">
+                  Refresh comments &mdash; all channels
+                </button>
+                <button class="btn btn-ghost btn-thin" id="btn-md-backfill-all-ids"
+                        title="Try to find and record missing YouTube video IDs for every channel. This is especially useful for older imported archives.">
+                  Fix missing video IDs &mdash; all channels
+                </button>
+                <button class="btn btn-ghost btn-thin" id="btn-md-refetch-all-thumbs"
+                        title="Download missing thumbnail images for every channel using saved YouTube information. Runs in the background; progress appears in the log.">
+                  Refetch missing thumbnails &mdash; all channels
+                </button>
+                <button class="btn btn-ghost btn-thin" id="btn-md-recheck-thumbs"
+                        title="Bypass caches and recompute every stat from scratch. Use if numbers look stale or you edited files outside the app.">
+                  Force recheck &mdash; all stats
+                  <span class="md-recheck-progress" id="md-recheck-progress" hidden></span>
+                </button>
+                <div class="spacer"></div>
+                <button class="btn btn-ghost btn-thin" id="btn-md-reload"
+                        title="Re-query per-channel refresh times">Reload</button>
+              </div>
+
+              <div class="metadata-table-wrap">
+                <table class="metadata-table" id="metadata-table">
+                  <thead>
+                    <tr>
+                      <th class="md-col-name" data-sort="name">Channel</th>
+                      <th class="md-col-num" data-sort="videos"
+                          title="Videos YTArchiver tracks in its catalog and can check for IDs, transcripts, and YouTube availability.">Videos</th>
+                      <th class="md-col-ids" data-sort="ids"
+                          title="A checkmark means every saved video has a YouTube video ID recorded. A warning means YTArchiver should try to find missing IDs.">Video IDs</th>
+                      <th class="md-col-ids" data-sort="thumbs"
+                          title="How many saved videos have a thumbnail image. Right-click a channel row to download missing thumbnails.">Thumbnails</th>
+                      <th class="md-col-ids" data-sort="transcribed"
+                          title="How many of this channel's on-disk videos have an actual transcript.">Transcribed</th>
+                      <th class="md-col-onyt" data-sort="onyt"
+                          title="How many videos in your archive are still on YouTube. Detected during bulk views/likes refresh.">Still on YT</th>
+                      <th class="md-col-ts" data-sort="views" data-sort-active
+                          title="Last time views/likes were bulk-refreshed for this channel">Views refreshed</th>
+                      <th class="md-col-ts" data-sort="comments"
+                          title="Last time comments were refreshed for this channel">Comments refreshed</th>
+                      <th class="md-col-act"></th>
+                    </tr>
+                  </thead>
+                  <tbody id="metadata-tbody">
+                    <tr><td colspan="9" class="md-empty">Loading&hellip;</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </details>
+
+          <section class="health-library-section" id="health-library-index" data-health-section="index">
+            <div class="health-library-heading">
+              <h2>Search index</h2>
+              <p>Powers Browse &rarr; Search and Graph. New downloads are added automatically.</p>
+            </div>
+            <div class="settings-index-grid">
+              <div class="index-section">
+                <div class="index-section-label">Statistics</div>
+                <pre class="index-stats-text" id="index-stats-text">&mdash;</pre>
+              </div>
+              <div class="index-section index-actions-row">
+                <button class="btn btn-sync" id="btn-idx-build">Build / Update Index</button>
+                <span class="status-text" id="idx-progress">&nbsp;</span>
+              </div>
+              <details class="health-advanced index-section">
+                <summary>Advanced index repair</summary>
+                <div class="health-advanced-body">
+                  <p>Use a full rebuild only when the existing index is damaged or badly out of date.</p>
+                  <button class="btn btn-ghost" id="btn-idx-rebuild">Rebuild from Scratch</button>
+                </div>
+              </details>
+              <div class="index-section index-log-section">
+                <div class="index-section-label">Log</div>
+                <div class="index-log-frame">
+                  <div class="main-log" id="index-log"></div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <details class="health-library-details" id="health-library-archive"
+                   data-health-section="archive-files">
+            <summary>
+              <span>Archive-file repairs</span>
+              <small>Scan, organize, and repair files already stored in the archive.</small>
+            </summary>
+            <div class="edit-grid">
+              <label class="edit-gl">Archive catalog</label>
+              <div class="edit-gv-inline edit-gap-6">
+                <button class="btn btn-ghost btn-thin" id="btn-scan-archive"
+                        title="Re-scan archive folders for new files added outside the app">Rescan archive&hellip;</button>
+              </div>
+
+              <label class="edit-gl">Hidden support files</label>
+              <div class="edit-gv-inline edit-gap-6">
+                <button class="btn btn-ghost btn-thin" id="btn-hide-sidecars"
+                        title="Hide support files so normal folder views show only videos and the combined transcript. Nothing is moved or deleted.">Scan &amp; repair&hellip;</button>
+              </div>
+
+              <label class="edit-gl">Embedded file details</label>
+              <div class="edit-gv-inline edit-gap-6">
+                <button class="btn btn-ghost btn-thin" id="btn-provenance"
+                        title="Embed title, channel, upload date, and watch URL in each MP4 without re-encoding">Embed details&hellip;</button>
+              </div>
+
+              <label class="edit-gl">Compression estimate</label>
+              <div class="edit-gv-inline edit-gap-6">
+                <button class="btn btn-ghost btn-thin" id="btn-compress-dry-run"
+                        title="Project disk savings at each quality tier without compressing anything">Estimate savings&hellip;</button>
+              </div>
+
+              <label class="edit-gl">Thumbnail locations</label>
+              <div class="edit-gv-inline edit-gap-6">
+                <button class="btn btn-ghost btn-thin" id="btn-thumb-realign"
+                        title="Move thumbnails that drifted into the wrong year folder back next to their video. Shows a preview first.">Check locations&hellip;</button>
+              </div>
+
+              <label class="edit-gl">Missing video lengths</label>
+              <div class="edit-gv-inline edit-gap-6">
+                <button class="btn btn-ghost btn-thin" id="btn-fix-video-lengths"
+                        title="Read the true length from each video file. You can stop and run it again later to resume.">Check / fix&hellip;</button>
+              </div>
             </div>
 
-            <label class="edit-gl">Full backup</label>
-            <div class="edit-gv-stack">
+            <details class="health-advanced health-nested-details">
+              <summary>Advanced repairs</summary>
+              <div class="edit-grid">
+                <label class="edit-gl">Channel sync history</label>
+                <div class="edit-gv-inline edit-gap-6">
+                  <button class="btn btn-ghost btn-thin" id="btn-reset-sync-state"
+                          title="Forget this channel's saved sync progress so the next sync checks the whole channel again">Reset channel&hellip;</button>
+                </div>
+              </div>
+            </details>
+          </details>
+
+          <details class="health-library-details" id="health-library-transcripts"
+                   data-health-section="transcripts">
+            <summary>
+              <span>Transcript repairs</span>
+              <small>Check that transcript files and Search agree.</small>
+            </summary>
+            <div class="edit-grid">
+              <label class="edit-gl">Transcript consistency</label>
+              <div class="edit-gv-inline edit-gap-6">
+                <button class="btn btn-ghost btn-thin" id="btn-drift-scan"
+                        title="Compare a channel's transcript files with the Search Index and offer to repair any differences">Scan &amp; fix&hellip;</button>
+              </div>
+            </div>
+
+            <details class="health-advanced health-nested-details">
+              <summary>Legacy transcript repairs</summary>
+              <div class="edit-grid">
+                <label class="edit-gl">YouTube captions</label>
+                <div class="edit-gv-inline edit-gap-6">
+                  <button class="btn btn-ghost btn-thin" id="btn-repair-yt-captions"
+                          title="Re-parse YouTube auto-captions archived before v64.7">Repair old captions&hellip;</button>
+                </div>
+                <label class="edit-gl">Punctuation</label>
+                <div class="edit-gv-inline edit-gap-6">
+                  <button class="btn btn-ghost btn-thin" id="btn-punct-restore"
+                          title="Add sentence punctuation and capitalization to legacy YouTube-captioned transcripts locally">Restore&hellip;</button>
+                </div>
+              </div>
+            </details>
+          </details>
+        </div>
+
+        <div class="settings-view" id="settings-view-backups" hidden>
+          <label class="subs-section-label">Backups</label>
+          <div class="health-view-intro">
+            Backups save YTArchiver's settings, subscriptions, queues, and app history. They do not copy downloaded videos or transcripts.
+          </div>
+          <div class="edit-grid health-backup-grid">
+            <label class="edit-gl" for="settings-auto-backup">Automatic backups</label>
+            <div class="edit-gv-stack settings-field-with-help">
+              <select class="ctl-select" id="settings-auto-backup"
+                      title="Save YTArchiver's app state automatically while the app is open">
+                <option value="off" selected>Off</option>
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+                <option value="monthly">Every 30 days</option>
+              </select>
+              <div class="settings-field-help">
+                While YTArchiver is open, saves that same backup in the archive's YTArchiver Info folder. Keeps the newest four.
+              </div>
+              <span class="settings-inline-note backup-age-note" id="backup-auto-age-display"></span>
+            </div>
+
+            <label class="edit-gl">Full app backup</label>
+            <div class="edit-gv-stack settings-field-with-help">
               <div class="edit-gv-inline edit-gap-6">
                 <button class="btn btn-ghost btn-thin" id="btn-export-backup"
-                        title="Save config + queue state + all journals to a zip">Export&hellip;</button>
+                        title="Save app settings, unfinished work, and activity history to a zip file">Save backup&hellip;</button>
                 <button class="btn btn-ghost btn-thin" id="btn-import-backup"
-                        title="Restore a backup zip (snapshots current config first)">Restore&hellip;</button>
+                        title="Restore a backup zip after safely saving the current app settings">Restore&hellip;</button>
               </div>
-              <span id="backup-age-display" style="font-size:var(--fs-xs);color:var(--c-dim);line-height:1.4"></span>
-            </div>
-
-            <!-- "Metadata (all channels)" row removed &mdash; a dedicated
-                 Metadata tab now hosts these actions + per-channel
-                 refresh status, making this Tools duplication
-                 redundant. btn-metadata-queue-all and btn-metadata-
-                 refresh-all still exist on the Metadata tab itself. -->
-
-            <!-- Moved from the Browse toolbar (issue #135) &mdash; it was
-                 an odd fit up there with per-channel navigation and
-                 users asked for it grouped with the other archive-
-                 wide Tools actions. Button id stays `btn-scan-archive`
-                 so `initScanArchive()` in app.js finds it unchanged. -->
-          </div>
-
-          <label class="subs-section-label">Archive Integrity</label>
-          <div class="edit-grid">
-            <label class="edit-gl">Archive</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <button class="btn btn-ghost btn-thin" id="btn-scan-archive"
-                      title="Re-scan archive folders for new files added outside the app">Rescan archive&hellip;</button>
-            </div>
-
-            <!-- Bug 5: enforce the hidden-sidecars contract. Walks every
-                 channel folder + the archive root and sets the Windows
-                 HIDDEN attribute on any visible sidecar (.info.json,
-                 .description, stray thumbs, .jsonl, etc.) so each folder
-                 shows only the videos + the conjoined Transcript.txt when
-                 Explorer's "show hidden files" is off. Non-destructive —
-                 only flips the hidden bit; never moves or deletes. -->
-            <label class="edit-gl">Hidden sidecars</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <button class="btn btn-ghost btn-thin" id="btn-hide-sidecars"
-                      title="Scan the whole archive and hide any stray sidecar files (.info.json, leftover thumbnails, .jsonl, etc.) so each folder shows only the videos + the Transcript.txt. Only sets the Windows hidden attribute — nothing is moved or deleted.">Scan &amp; repair&hellip;</button>
-            </div>
-
-            <!-- v80 provenance backfill: retrofit existing archive files
-                 with the same embedded identity new downloads now get —
-                 MP4 container tags (title / channel / upload date /
-                 watch URL) and (youtu.be/<id>) fields in the aggregated
-                 Transcript.txt headers. Stream-copy remux, no re-encode;
-                 file mtimes are preserved. -->
-            <label class="edit-gl">File provenance</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <button class="btn btn-ghost btn-thin" id="btn-provenance"
-                      title="Embed each video's identity (title, channel, upload date, watch URL) inside the MP4 file itself, and add video IDs to Transcript.txt headers. No re-encode — streams are byte-copied and file dates are preserved. Queues as a Sync Task.">Embed file tags&hellip;</button>
-            </div>
-
-            <!-- bug W-3: About + Diagnostics dialogs existed in the
-                 HTML + JS but had no UI buttons to trigger them. Both
-                 handlers (app.js:6436 / 6471) use getElementById which
-                 silently no-ops when the elements are absent. -->
-          </div>
-
-          <label class="subs-section-label">App Info and Setup</label>
-          <div class="edit-grid">
-            <label class="edit-gl">Info &amp; Self-check</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <button class="btn btn-ghost btn-thin" id="btn-about"
-                      title="App version and config info">About&hellip;</button>
-              <button class="btn btn-ghost btn-thin" id="btn-diagnostics"
-                      title="Check yt-dlp, ffmpeg, Python 3.11, GPU, etc.">Diagnostics&hellip;</button>
-            </div>
-
-            <!-- Re-open the first-run setup wizard (archive folder picker +
-                 dependency installer for yt-dlp / ffmpeg / Whisper). -->
-            <label class="edit-gl">Setup</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <button class="btn btn-ghost btn-thin" id="btn-run-setup"
-                      title="Re-run first-time setup: archive folder + install yt-dlp / ffmpeg / Whisper">Run setup again&hellip;</button>
-            </div>
-
-            <!-- feature F8: projected compress savings dry-run.
-                 Reads duration + size from the index DB and shows how
-                 much disk would be saved at each quality tier &mdash; no
-                 actual compression runs. -->
-            <label class="edit-gl">Compress</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <button class="btn btn-ghost btn-thin" id="btn-compress-dry-run"
-                      title="Project disk savings at each quality tier without compressing anything">Dry-run savings&hellip;</button>
-            </div>
-
-            <!-- Realign misplaced thumbnails. Walks every channel's
-                 .Thumbnails/ dir, finds thumbs whose [video_id] points
-                 to an mp4 in a DIFFERENT year/month folder, and moves
-                 them next to their mp4. Reports a dry-run preview
-                 first; user confirms before any files move. -->
-            <label class="edit-gl">Thumbnails</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <button class="btn btn-ghost btn-thin" id="btn-thumb-realign"
-                      title="Move thumbnails that drifted into the wrong year folder back next to their video file. Shows a dry-run preview before doing anything.">Realign misplaced&hellip;</button>
-            </div>
-
-            <!-- feature H-2: transcript drift scan + fix. Cross-
-                 references .txt / .jsonl / FTS for a channel and
-                 reports mismatches. Fix rebuilds missing .txt entries
-                 from .jsonl data, queues Whisper retranscribe for
-                 entries that only exist in .txt, and cleans up FTS5
-                 phantom rows (C-9). -->
-          </div>
-
-          <label class="subs-section-label">Transcript Repair</label>
-          <div class="edit-grid">
-            <label class="edit-gl">Transcript drift</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <button class="btn btn-ghost btn-thin" id="btn-drift-scan"
-                      title="Scan a channel's .txt / .jsonl / FTS for drift and offer a repair">Scan &amp; fix&hellip;</button>
-            </div>
-
-            <!-- Repair YT auto-captions for videos archived before v64.7
-                 (the parser-fix release). Re-fetches each video's VTT,
-                 re-parses with the fixed parser, rewrites the per-word
-                 array in the JSONL + DB. Whisper-transcribed videos
-                 are auto-skipped. Slow (hits YT per video) — progress
-                 streams to the main log. -->
-            <label class="edit-gl">YT auto-captions</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <button class="btn btn-ghost btn-thin" id="btn-repair-yt-captions"
-                      title="Re-parse YT auto-captions for videos archived before v64.7 to fix dropped words and segment-boundary duplications">Repair&hellip;</button>
-            </div>
-
-            <!-- Restore transcript punctuation for legacy YT-captioned
-                 videos whose per-segment text was never run through
-                 punct restoration at ingest. Reads from segments.text,
-                 runs each through PunctuationManager, writes back to
-                 DB + JSONL. No YT calls. -->
-            <label class="edit-gl">Transcript punctuation</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <button class="btn btn-ghost btn-thin" id="btn-punct-restore"
-                      title="Add sentence punctuation + capitalization to per-segment text for legacy YT-captioned videos. Local CPU/GPU only, no YT calls.">Restore&hellip;</button>
-            </div>
-
-            <!-- audit SM-1: reset sync state for a specific channel.
-                 Clears initialized/sync_complete/batch_resume_index/
-                 init_batch_after/last_sync so the next sync starts
-                 a fresh bootstrap. Useful if the user deleted a
-                 channel folder manually, or wants to re-walk the
-                 whole catalog after a filter change. -->
-          </div>
-
-          <label class="subs-section-label">Advanced State Repair</label>
-          <div class="edit-grid">
-            <label class="edit-gl">Channel sync state</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <button class="btn btn-ghost btn-thin" id="btn-reset-sync-state"
-                      title="Reset a channel's bootstrap/sync state so the next sync walks from scratch">Reset channel&hellip;</button>
-            </div>
-
-            <!-- Fill missing video lengths by ffprobing each file locally
-                 (no YouTube). The disk-sweep / import paths register videos
-                 without a duration, so the Videos grid shows no length badge
-                 for them; this reads the true runtime from the file itself.
-                 Local only; progress streams to the main log; stoppable and
-                 resumable (re-run picks up the rest). -->
-            <label class="edit-gl">Video lengths</label>
-            <div class="edit-gv-inline edit-gap-6">
-              <button class="btn btn-ghost btn-thin" id="btn-fix-video-lengths"
-                      title="Read each video's true length with ffprobe (local, no YouTube) to fill in missing lengths shown in Browse &gt; Videos. Progress streams to the log; you can Stop and re-run to resume.">Check / fix&hellip;</button>
-            </div>
-          </div>
-        </div>
-
-        <!-- Metadata &mdash; per-channel refresh status + quick actions.
-             Added 2026-04-23 after the bulk views-refresh path landed.
-             Rows show when each channel's views/likes and comments
-             were last refreshed; sort defaults to "oldest first" so
-             stale channels float to the top and are easy to spot. -->
-        <div class="settings-view" id="settings-view-metadata">
-          <label class="subs-section-label">Metadata</label>
-          <div class="metadata-panel">
-            <div class="metadata-hint">
-              Per-channel metadata refresh status. <b>Views/likes</b>
-              uses the fast bulk path (one yt-dlp call per channel)
-              and only re-fetches videos whose counts actually changed.
-              <b>Comments</b> is slower (per-video yt-dlp calls &mdash; no
-              bulk mode exists) so scope it to recent uploads when
-              possible.
-            </div>
-
-            <!-- Archive-wide totals strip. Aggregates every channel's
-                 stats into one snapshot so the user can see the
-                 archive's overall health at a glance without scanning
-                 the per-channel table. Populated on every table
-                 refresh (incl. force-recheck). -->
-            <div class="metadata-totals" id="metadata-totals" hidden>
-              <div class="md-total-card">
-                <div class="md-total-label">Channels</div>
-                <div class="md-total-value" id="md-tot-channels">&mdash;</div>
+              <div class="settings-field-help">
+                Saves the same backup once to a location you choose.
               </div>
-              <div class="md-total-card">
-                <div class="md-total-label">Videos</div>
-                <div class="md-total-value" id="md-tot-videos">&mdash;</div>
+              <span class="settings-inline-note backup-age-note" id="backup-age-display"></span>
+            </div>
+
+            <label class="edit-gl">Channel list</label>
+            <div class="edit-gv-stack settings-field-with-help">
+              <div class="edit-gv-inline edit-gap-6">
+                <button class="btn btn-ghost btn-thin" id="btn-export-channels"
+                        title="Save your channel list to a JSON file">Export list&hellip;</button>
+                <button class="btn btn-ghost btn-thin" id="btn-import-channels"
+                        title="Merge a saved channel list into your current subscriptions">Import list&hellip;</button>
               </div>
-              <div class="md-total-card" id="md-tot-card-ids"
-                   title="Across the whole archive: how many on-disk videos have a resolvable video_id stored in the index DB.">
-                <div class="md-total-label">Video IDs</div>
-                <div class="md-total-value" id="md-tot-ids">&mdash;</div>
-              </div>
-              <div class="md-total-card" id="md-tot-card-thumbs"
-                   title="Across the whole archive: how many on-disk videos have a thumbnail sidecar.">
-                <div class="md-total-label">Thumbnails</div>
-                <div class="md-total-value" id="md-tot-thumbs">&mdash;</div>
-              </div>
-              <div class="md-total-card" id="md-tot-card-onyt"
-                   title="Across the whole archive: how many videos are still publicly listed on YouTube. Updated when bulk views/likes refresh runs.">
-                <div class="md-total-label">Still on YT</div>
-                <div class="md-total-value" id="md-tot-onyt">&mdash;</div>
-              </div>
-              <div class="md-total-card" id="md-tot-card-transcribed"
-                   title="Across the whole archive: how many on-disk videos have an actual transcript (YouTube captions or Whisper). Videos where Whisper found no speech are not counted.">
-                <div class="md-total-label">Transcribed</div>
-                <div class="md-total-value" id="md-tot-transcribed">&mdash;</div>
+              <div class="settings-field-help">
+                Moves only the subscribed-channel list between YTArchiver installs.
               </div>
             </div>
-
-            <!-- Bulk row -->
-            <div class="metadata-bulk-row">
-              <button class="btn btn-ghost btn-thin" id="btn-md-refresh-all-views"
-                      title="Choose a recent-upload time range, then queue a views/likes refresh for every subscribed channel">
-                Refresh views/likes &mdash; all channels
-              </button>
-              <button class="btn btn-ghost btn-thin" id="btn-md-refresh-all-comments"
-                      title="Queue a comments refresh for every channel. Prompts for scope: 1 month / 1 year / all.">
-                Refresh comments &mdash; all channels
-              </button>
-              <button class="btn btn-ghost btn-thin" id="btn-md-backfill-all-ids"
-                      title="For every channel missing video_ids, do a one-time flat-playlist + title-match pass to fill them in. Essential for older archives imported without video IDs.">
-                Fix missing video IDs &mdash; all channels
-              </button>
-              <button class="btn btn-ghost btn-thin" id="btn-md-refetch-all-thumbs"
-                      title="Walk every channel and download any missing thumbnail sidecars from URLs cached in metadata.jsonl. Runs in the background; progress appears in the log.">
-                Refetch missing thumbnails &mdash; all channels
-              </button>
-              <button class="btn btn-ghost btn-thin" id="btn-md-recheck-thumbs"
-                      title="Bypass caches and recompute every stat from scratch. Use if numbers look stale or you edited files outside the app.">
-                Force recheck &mdash; all stats
-                <span class="md-recheck-progress" id="md-recheck-progress" hidden></span>
-              </button>
-              <div class="spacer"></div>
-              <button class="btn btn-ghost btn-thin" id="btn-md-reload"
-                      title="Re-query per-channel refresh times">Reload</button>
-            </div>
-
-            <!-- Per-channel table -->
-            <div class="metadata-table-wrap">
-              <table class="metadata-table" id="metadata-table">
-                <thead>
-                  <tr>
-                    <th class="md-col-name" data-sort="name">Channel</th>
-                    <th class="md-col-num" data-sort="videos">Videos</th>
-                    <th class="md-col-ids" data-sort="ids"
-                        title="Checkmark means every on-disk video has a resolvable video_id stored in the index DB (fast views/likes refresh works). Warn/X means a video_id backfill is recommended &mdash; click Fix IDs on the row.">Video IDs</th>
-                    <th class="md-col-ids" data-sort="thumbs"
-                        title="Coverage of per-video thumbnail sidecars. Right-click a channel row → 'Refetch missing thumbnails' to backfill.">Thumbnails</th>
-                    <th class="md-col-ids" data-sort="transcribed"
-                        title="How many of this channel's on-disk videos have an actual transcript (YouTube captions or Whisper). Videos where Whisper found no speech are not counted.">Transcribed</th>
-                    <th class="md-col-onyt" data-sort="onyt"
-                        title="How many videos in your archive are still on YouTube. Detected during bulk views/likes refresh &mdash; files whose video_id is no longer in the channel's flat-playlist response are flagged as removed.">Still on YT</th>
-                    <th class="md-col-ts" data-sort="views" data-sort-active
-                        title="Last time views/likes were bulk-refreshed for this channel (or the channel was bootstrapped)">Views refreshed</th>
-                    <th class="md-col-ts" data-sort="comments"
-                        title="Last time comments were refreshed for this channel (or the channel was bootstrapped)">Comments refreshed</th>
-                    <th class="md-col-act"></th>
-                  </tr>
-                </thead>
-                <tbody id="metadata-tbody">
-                  <tr><td colspan="9" class="md-empty">Loading&hellip;</td></tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-
-        <!-- Index management -->
-        <div class="settings-view" id="settings-view-index" hidden>
-          <label class="subs-section-label">Index</label>
-          <div class="settings-index-grid">
-
-            <!-- Explainer &mdash; short note on what Index is so Settings
-                 doesn't just drop you into "Build / Update Index" with
-                 no context. -->
-            <div class="index-section index-explainer">
-              <div class="index-section-hint">
-                The <b>Index</b> is a searchable catalog of every transcript
-                in your archive. The Browse &rarr; Search tab queries it to
-                find spoken phrases across channels. New downloads get
-                indexed automatically &mdash; use the buttons below to
-                refresh stats, add extra archive folders, or rebuild from
-                scratch after large external changes.
-              </div>
-            </div>
-
-            <!-- Stats -->
-            <div class="index-section">
-              <div class="index-section-label">Statistics</div>
-              <pre class="index-stats-text" id="index-stats-text">&mdash;</pre>
-            </div>
-
-            <!-- Actions + progress -->
-            <div class="index-section index-actions-row">
-              <button class="btn btn-sync" id="btn-idx-build">Build / Update Index</button>
-              <button class="btn btn-ghost" id="btn-idx-rebuild">Rebuild from Scratch</button>
-              <span class="status-text" id="idx-progress">&nbsp;</span>
-            </div>
-
-            <!-- Additional archive roots beyond the primary Archive root.
-                 Right-click a root entry for "Delete all transcriptions" -->
-            <div class="index-section">
-              <div class="index-section-label">Additional archive roots</div>
-              <div class="index-section-hint">
-                The primary <b>Archive root</b> (set in the Settings tab) is
-                always indexed. Use this list to index extra folders too.
-                Right-click a root &rarr; Delete All Transcriptions.
-              </div>
-              <div class="index-roots-list" id="settings-roots-list" tabindex="0"></div>
-              <div class="index-section-buttons">
-                <button class="btn btn-ghost btn-thin" id="btn-settings-add-root">Add Folder&hellip;</button>
-                <button class="btn btn-ghost btn-thin" id="btn-settings-remove-root">Remove Selected</button>
-              </div>
-            </div>
-
-            <!-- Auto-update on every N downloads -->
-            <div class="index-section">
-              <div class="index-section-label">Auto-update</div>
-              <label class="index-auto-label">
-                <input type="checkbox" id="settings-auto-index-enabled" />
-                <span>Re-index automatically every</span>
-              </label>
-              <input type="text" class="ctl-input edit-num index-auto-threshold"
-                     id="settings-auto-index-threshold" value="10" />
-              <span class="edit-dim">downloads</span>
-            </div>
-
-            <!-- Log -->
-            <div class="index-section index-log-section">
-              <div class="index-section-label">Log</div>
-              <div class="index-log-frame">
-                <div class="main-log" id="index-log"></div>
-              </div>
-            </div>
-
           </div>
         </div>
       </div>
@@ -1286,14 +1350,20 @@
         <div class="submode-btn" data-submode="graph">Graph</div>
         <div class="submode-btn" data-submode="bookmarks">Bookmarks</div>
         <div class="submode-btn" data-submode="manual">Manual</div>
+        <button class="submode-btn submode-btn-with-count trash-submode-btn"
+                type="button" data-submode="trash">
+          <span>Trash</span>
+          <span class="trash-nav-count" id="trash-nav-count"
+                aria-label="0 items in Trash" hidden>0</span>
+        </button>
         <div class="library-stats">
           <!-- Placeholder '&mdash;' until api.browse_stats populates
                real counts. NEVER hardcode realistic-looking numbers
                here: on first paint users would see counts that don't
                reflect their actual archive (audit E-25 + UI sweep). -->
-          <div><span id="stat-segments">&mdash;</span> segments</div>
-          <div><span id="stat-videos">&mdash;</span> videos</div>
-          <div><span id="stat-channels">&mdash;</span> channels</div>
+          <div><span id="stat-segments">&mdash;</span><span class="library-stat-label">segments</span></div>
+          <div><span id="stat-videos">&mdash;</span><span class="library-stat-label">videos</span></div>
+          <div><span id="stat-channels">&mdash;</span><span class="library-stat-label">channels</span></div>
         </div>
       </div>
 
@@ -1314,7 +1384,7 @@
                default Browse view; browseNavigate()/showView() hide it when
                switching to other submodes/views. -->
           <div class="browse-sort-wrap" id="browse-channel-sort-wrap">
-            <label class="ctl-label ctl-label-thin">Sort:</label>
+            <label class="ctl-label ctl-label-thin" for="browse-channel-sort">Sort:</label>
             <select class="ctl-select" id="browse-channel-sort">
               <option value="name">A&ndash;Z</option>
               <option value="recent">Recently downloaded</option>
@@ -1324,7 +1394,7 @@
             </select>
           </div>
           <div class="browse-sort-wrap" id="browse-sort-wrap" hidden>
-            <label class="ctl-label ctl-label-thin">Sort:</label>
+            <label class="ctl-label ctl-label-thin" for="browse-sort">Sort:</label>
             <select class="ctl-select" id="browse-sort">
               <option value="newest">Newest</option>
               <option value="oldest">Oldest</option>
@@ -1347,7 +1417,8 @@
           </div>
           <div class="browse-find-wrap">
             <span class="search-icon">&#128269;</span>
-            <input type="text" class="ctl-input find-input" id="browse-filter" placeholder="Filter&hellip;" />
+            <input type="text" class="ctl-input find-input" id="browse-filter"
+                   aria-label="Filter channels or videos" placeholder="Filter&hellip;" />
           </div>
         </div>
 
@@ -1361,12 +1432,12 @@
             <span class="bsb-sep">·</span>
             <span class="bsb-val" id="bsb-total-channels">&mdash;</span><span class="bsb-unit">channels total</span>
           </div>
-          <div class="channel-grid" id="channel-grid">
+          <div class="channel-grid" id="channel-grid" aria-busy="true">
             <!-- Loading placeholder shown until renderChannelGrid replaces
                  innerHTML with the actual cards. Without this the user sees
                  a fully blank tab for ~10s during startup. -->
-            <div class="grid-loading">
-              <div class="grid-spinner"></div>
+            <div class="grid-loading" role="status" aria-live="polite">
+              <div class="grid-spinner" aria-hidden="true"></div>
               <span class="grid-loading-label">Loading channels&hellip;</span>
             </div>
           </div>
@@ -1389,7 +1460,8 @@
               <button class="btn btn-ghost btn-thin" id="cph-folder" type="button"
                       title="Open the channel folder">Open folder</button>
               <button class="btn btn-ghost btn-thin" id="cph-more" type="button"
-                      aria-haspopup="true" aria-label="More channel actions">&#8942;</button>
+                      aria-haspopup="menu" aria-expanded="false"
+                      aria-label="More channel actions">&#8942;</button>
             </div>
           </div>
           <div class="video-grid" id="video-grid"></div>
@@ -1441,6 +1513,7 @@
                 <button class="btn btn-ghost btn-thin" id="btn-bookmark-now"
                         title="Bookmark current segment (B)">Bookmark</button>
                 <button class="btn btn-ghost btn-thin watch-more-btn" id="btn-watch-more"
+                        aria-haspopup="menu" aria-expanded="false"
                         title="More actions (Redownload, Re-transcribe, Refresh metadata)">More&hellip;</button>
                 <!-- Hidden originals kept in the DOM so the existing
                      click handlers in watchActions.js can keep firing
@@ -1452,7 +1525,7 @@
                 <button class="hidden-action" id="btn-watch-refresh-meta" aria-hidden="true" tabindex="-1"></button>
               </div>
               <div class="watch-actions watch-actions-row2">
-                <label class="ctl-label ctl-label-thin">Speed:</label>
+                <label class="ctl-label ctl-label-thin" for="watch-speed">Speed:</label>
                 <select class="ctl-select" id="watch-speed"
                         title="Playback speed">
                   <option value="0.5">0.5×</option>
@@ -1497,11 +1570,6 @@
                     </select>
                   </span>
                 </div>
-                <div class="spacer"></div>
-                <label class="checkbox-label" title="Keep transcript scrolled to current line">
-                  <input type="checkbox" id="watch-autofollow" checked />
-                  <span>Follow playback</span>
-                </label>
               </div>
               <!-- Metadata drawer &mdash; description + views/likes/comments.
                    Mirrors YTArchiver.py:31164 _player_drawer_frame. Lives
@@ -1527,8 +1595,11 @@
             <!-- .txt request: drag-resize splitter between the video
                  column and the transcript pane. Stored width persists
                  via settings.transcript_pane_width. -->
-            <div class="watch-splitter" id="watch-splitter"
-                 title="Drag to resize transcript pane"></div>
+            <div class="watch-splitter" id="watch-splitter" role="separator"
+                 tabindex="0" aria-label="Resize transcript pane"
+                 aria-orientation="vertical" aria-controls="watch-transcript"
+                 aria-valuemin="240" aria-valuemax="1400" aria-valuenow="420"
+                 title="Drag or use Left and Right Arrow keys to resize the transcript pane"></div>
             <div class="watch-transcript-wrap">
               <div class="watch-transcript-header">
                 <span>Transcript</span>
@@ -1552,7 +1623,7 @@
                         id="btn-tx-nonspeech" type="button" aria-pressed="false"
                         title="Hide non-speech cues like [Music] and [Applause] from the transcript">Hide &#9834;</button>
                 <div class="spacer"></div>
-                <label class="find-label">Find:</label>
+                <label class="find-label" for="watch-find">Find:</label>
                 <input type="text" class="ctl-input find-input" id="watch-find"
                        title="Enter = next match, Shift+Enter = previous match" />
                 <!-- Match-count indicator + prev/next buttons. Matches
@@ -1580,11 +1651,12 @@
               <span class="unindexed-warning-icon">&#x26A0;</span>
               <span class="unindexed-warning-text" id="search-unindexed-text"></span>
               <button class="btn btn-ghost btn-thin" id="search-rescan-btn"
-                      title="Walk every channel folder and ingest any new transcripts into the FTS index">Rescan now</button>
+                      title="Check channel folders for transcripts that are missing from Search">Rescan now</button>
             </div>
             <div class="search-inputs">
-              <input type="text" class="ctl-input search-main-input" id="search-query"
-                     placeholder="Search videos &mdash; title or transcript" />
+               <input type="text" class="ctl-input search-main-input" id="search-query"
+                      aria-label="Search video titles and transcripts"
+                      placeholder="Search videos &mdash; title or transcript" />
               <div class="search-in-group" id="search-in-group"
                    title="Choose what to match against. Uncheck Transcripts to do title-only search; the AND/OR/NOT operators apply to the transcript leg only.">
                 <label class="search-in-opt">
@@ -1598,12 +1670,15 @@
               </div>
               <div class="search-channel-multi" id="search-channel-multi">
                 <button type="button" class="ctl-select search-channel-trigger"
-                        id="search-channel-trigger"
+                        id="search-channel-trigger" aria-label="Choose search channels"
+                        aria-haspopup="dialog" aria-controls="search-channel-panel"
+                        aria-expanded="false"
                         title="Scope the search to specific channels. Default: all channels.">
                   <span class="search-channel-label" id="search-channel-label">All channels</span>
                   <span class="search-channel-caret">&#x25BE;</span>
                 </button>
-                <div class="search-channel-panel" id="search-channel-panel" hidden>
+                <div class="search-channel-panel" id="search-channel-panel"
+                     role="dialog" aria-label="Choose search channels" hidden>
                   <label class="search-channel-opt search-channel-all-row">
                     <input type="checkbox" id="search-channel-all" checked />
                     <span>All channels</span>
@@ -1639,11 +1714,13 @@
               <button class="search-op-btn" data-op="*"
                       title="Append * for prefix match (e.g. bake* matches baker, bakery, baking)">word*</button>
               <span class="search-hint-label search-hint-spaced">Year:</span>
-              <input type="text" class="ctl-input search-year-input" id="search-year-from" placeholder="from"
+               <input type="text" class="ctl-input search-year-input" id="search-year-from"
+                      aria-label="Search from year" placeholder="from"
                      title="Limit to segments from this year onward" />
-              <input type="text" class="ctl-input search-year-input" id="search-year-to" placeholder="to"
+               <input type="text" class="ctl-input search-year-input" id="search-year-to"
+                      aria-label="Search through year" placeholder="to"
                      title="Limit to segments through this year" />
-              <span class="search-hint-label search-hint-spaced">Sort:</span>
+               <label class="search-hint-label search-hint-spaced" for="search-sort">Sort:</label>
               <select class="ctl-select" id="search-sort"
                       title="How to order the result list">
                 <option value="relevance" selected>Relevance</option>
@@ -1692,17 +1769,18 @@
               <span class="unindexed-warning-icon">&#x26A0;</span>
               <span class="unindexed-warning-text" id="graph-unindexed-text"></span>
               <button class="btn btn-ghost btn-thin" id="graph-rescan-btn"
-                      title="Walk every channel folder and ingest any new transcripts into the FTS index">Rescan now</button>
+                      title="Check channel folders for transcripts that are missing from Search">Rescan now</button>
             </div>
             <!-- Row 1: word, channel, bucket, plot button -->
             <div class="graph-controls">
-              <label class="ctl-label" title="Comma-separate to compare multiple words">Word:</label>
+               <label class="ctl-label" for="graph-word"
+                      title="Comma-separate to compare multiple words">Word:</label>
               <input type="text" class="ctl-input" id="graph-word" value=""
                      placeholder="Word, or comma-separated: cat, dog, bird"
                      title="Enter one word, or comma-separate to compare: cat, dog, bird" />
-              <label class="ctl-label">Channel:</label>
+               <label class="ctl-label" for="graph-channel">Channel:</label>
               <select class="ctl-select" id="graph-channel"><option>All</option></select>
-              <label class="ctl-label">Bucket:</label>
+               <label class="ctl-label" for="graph-bucket">Bucket:</label>
               <select class="ctl-select" id="graph-bucket">
                 <option value="month">Month</option>
                 <option value="year">Year</option>
@@ -1714,14 +1792,18 @@
                  Graph sub-mode: Line / Bar / Word Cloud types, normalize-
                  by-1000-segments toggle, click-graph-to-drill-into-search. -->
             <div class="graph-controls graph-controls-row2">
-              <label class="ctl-label">Chart:</label>
-              <div class="graph-chart-type-group" role="group">
-                <button class="chart-type-btn active" data-type="line"
-                        title="Line chart &mdash; best for showing trends over time">Line</button>
-                <button class="chart-type-btn" data-type="bar"
-                        title="Bar chart &mdash; best for comparing discrete buckets">Bar</button>
-                <button class="chart-type-btn" data-type="wordcloud"
-                        title="Word cloud &mdash; shows the N most-spoken words across the selected scope">Word cloud</button>
+               <span class="ctl-label" id="graph-chart-type-label">Chart:</span>
+               <div class="graph-chart-type-group" role="group"
+                    aria-labelledby="graph-chart-type-label">
+                 <button class="chart-type-btn active" data-type="line"
+                         aria-pressed="true"
+                         title="Line chart &mdash; best for showing trends over time">Line</button>
+                 <button class="chart-type-btn" data-type="bar"
+                         aria-pressed="false"
+                         title="Bar chart &mdash; best for comparing discrete buckets">Bar</button>
+                 <button class="chart-type-btn" data-type="wordcloud"
+                         aria-pressed="false"
+                         title="Word cloud &mdash; shows the N most-spoken words across the selected scope">Word cloud</button>
               </div>
               <label class="vo-check vo-check-spaced">
                 <input type="checkbox" id="graph-normalize"
@@ -1734,9 +1816,17 @@
               <span class="co-hint" id="graph-drill-hint">Click a point to drill into search</span>
             </div>
             <div class="graph-canvas-wrap">
-              <canvas id="graph-canvas" width="800" height="360"></canvas>
-              <div class="graph-empty" id="graph-empty">Pick a word + channel + bucket, then Plot.</div>
-            </div>
+               <canvas id="graph-canvas" width="800" height="360" role="img"
+                       aria-label="Word-frequency chart"
+                       aria-describedby="graph-drill-hint"></canvas>
+               <div class="graph-empty" id="graph-empty">Pick a word + channel + bucket, then Plot.</div>
+             </div>
+             <div class="graph-controls graph-drill-controls" id="graph-drill-controls" hidden>
+               <label class="ctl-label" for="graph-drill-select">Chart point:</label>
+               <select class="ctl-select" id="graph-drill-select"></select>
+               <button class="btn btn-ghost btn-thin" id="btn-graph-drill"
+                       type="button">Open in Search</button>
+             </div>
           </div>
         </div>
 
@@ -1747,10 +1837,11 @@
               <span class="subs-section-label">Bookmarked videos &amp; moments</span>
               <div class="spacer"></div>
               <button class="btn btn-ghost btn-thin" id="btn-bookmarks-export"
-                      title="Download all bookmarks as a CSV file (title, channel, timestamp, segment text)">Export CSV</button>
+                      title="Download all bookmarks as a CSV file (title, channel, timestamp, segment text)"
+                      disabled>Export CSV</button>
             </div>
-            <div class="bookmarks-list" id="bookmarks-list">
-              <div class="browse-empty">No bookmarks yet. Right-click a transcript segment in Watch view to bookmark it.</div>
+            <div class="bookmarks-list" id="bookmarks-list" aria-live="polite" aria-busy="true">
+              <div class="browse-empty">Loading bookmarks&hellip;</div>
             </div>
           </div>
         </div>
@@ -1767,11 +1858,13 @@
                    so it matches across every page, not just loaded cards). -->
               <div class="browse-find-wrap">
                 <span class="search-icon">&#128269;</span>
-                <input type="text" class="ctl-input find-input" id="videos-filter"
+                 <input type="text" class="ctl-input find-input" id="videos-filter"
+                        aria-label="Filter archived videos"
                        placeholder="Filter by title or channel&hellip;"
                        title="Filter every video in the archive by title or channel name" />
               </div>
-              <label class="ctl-label ctl-label-thin browse-toolbar-spaced">Sort:</label>
+               <label class="ctl-label ctl-label-thin browse-toolbar-spaced"
+                      for="videos-sort">Sort:</label>
               <select class="ctl-select" id="videos-sort"
                       title="Sort every video in the archive">
                 <option value="recent">Recently downloaded</option>
@@ -1808,7 +1901,8 @@
               <span class="recent-label" id="manual-folder-label">Single-video downloads</span>
               <span class="manual-bulk-status" id="manual-bulk-status" hidden></span>
               <div class="spacer"></div>
-              <label class="ctl-label ctl-label-thin browse-toolbar-spaced">Sort:</label>
+               <label class="ctl-label ctl-label-thin browse-toolbar-spaced"
+                      for="manual-sort">Sort:</label>
               <select class="ctl-select" id="manual-sort">
                 <option value="newest">Newest first</option>
                 <option value="oldest">Oldest first</option>
@@ -1843,7 +1937,46 @@
           </div>
         </div>
 
-        <!-- Index view removed from Browse (moved to Settings > Index
+        <!-- Trash: app-managed files that were removed from the library but
+             have not yet been permanently deleted. Driven by trashView.js. -->
+        <div class="browse-view" id="view-trash" hidden>
+          <section class="trash-panel" aria-labelledby="trash-view-heading">
+            <div class="trash-toolbar">
+              <div class="trash-toolbar-copy">
+                <span class="subs-section-label" id="trash-view-heading">Trash items</span>
+                <span class="trash-help">
+                  <button class="trash-help-button" type="button"
+                          aria-label="About Trash"
+                          aria-describedby="trash-help-popover">?</button>
+                  <span class="trash-help-popover" id="trash-help-popover"
+                        role="tooltip">
+                    <strong>Removed files can be restored from here.</strong>
+                    <span class="trash-retention-note" id="trash-retention-note">
+                      Checking the automatic cleanup schedule&hellip;
+                    </span>
+                  </span>
+                </span>
+                <span class="trash-summary-text" id="trash-summary-text">Checking Trash&hellip;</span>
+              </div>
+              <div class="trash-toolbar-actions">
+                <button class="btn btn-ghost btn-thin" id="trash-open-folder"
+                        type="button">Open folder</button>
+                <button class="btn btn-thin trash-danger" id="trash-empty-btn"
+                        type="button" disabled>Empty Trash&hellip;</button>
+              </div>
+            </div>
+            <div class="trash-attention-banner" id="trash-attention-banner"
+                 role="status" hidden></div>
+            <div class="trash-list" id="trash-list"
+                 aria-live="polite" aria-busy="true">
+              <div class="browse-empty">
+                <span class="spinner-inline"></span>Loading Trash&hellip;
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <!-- Index view removed from Browse (moved to Health > Library
              sub-tab per project convention). -->
 
 
@@ -1863,11 +1996,15 @@
        indicator line, two popover buttons, and the tray. Sync/Processing
        segments open their queue popovers; Log jumps to the full log. -->
   <div class="global-status-bar" id="global-status-bar">
-    <button type="button" class="gsb-seg" id="gsb-sync" title="Sync queue — click for details">
+    <button type="button" class="gsb-seg" id="gsb-sync" title="Sync queue — click for details"
+            aria-haspopup="dialog" aria-controls="popover-sync-tasks"
+            aria-expanded="false">
       <span class="gsb-dot gsb-dot-sync"></span><span class="gsb-text" id="gsb-sync-text">Sync idle</span>
     </button>
     <span class="gsb-sep"></span>
-    <button type="button" class="gsb-seg" id="gsb-gpu" title="Processing queue — click for details">
+    <button type="button" class="gsb-seg" id="gsb-gpu" title="Processing queue — click for details"
+            aria-haspopup="dialog" aria-controls="popover-gpu-tasks"
+            aria-expanded="false">
       <span class="gsb-dot gsb-dot-gpu"></span><span class="gsb-text" id="gsb-gpu-text">Processing idle</span>
     </button>
     <span class="gsb-seg gsb-index" id="gsb-index" hidden>
@@ -1882,7 +2019,8 @@
     <button type="button" class="gsb-seg gsb-errors" id="gsb-errors" hidden
             aria-haspopup="dialog" aria-controls="popover-session-errors"
             title="Errors this session — click for details">
-      <span id="gsb-errors-count">0</span> errors
+      <span id="gsb-errors-count">0</span>
+      <span id="gsb-errors-label">errors</span>
     </button>
     <span class="gsb-traffic" id="gsb-traffic" hidden
           title="YouTube request limits. If either limit is reached, YTArchiver waits and continues automatically.">
@@ -1949,8 +2087,10 @@
         <span>Cancel</span>
       </button>
       <div class="spacer"></div>
-      <button class="icon-btn-slim" id="btn-manual-transcribe"
-              title="Manual Transcription">&#128193;</button>
+      <button type="button" class="queue-btn" id="btn-manual-transcribe"
+              title="Open manual transcription">
+        <span>Manual transcription…</span>
+      </button>
     </div>
   </div>
 
@@ -1978,8 +2118,9 @@
 
   <!-- About dialog -->
   <div class="askq-backdrop" id="about-backdrop" hidden>
-    <div class="askq-dialog askq-dialog-about">
-      <div class="askq-header">About YTArchiver</div>
+    <div class="askq-dialog askq-dialog-about" role="dialog" aria-modal="true"
+         aria-labelledby="about-title">
+      <div class="askq-header" id="about-title">About YTArchiver</div>
       <div class="askq-body" id="about-body">Loading&hellip;</div>
       <div class="askq-buttons">
         <button class="btn btn-primary" id="about-close">Close</button>
@@ -1992,14 +2133,15 @@
        a user-chosen output resolution. Read-only; does not trigger any
        compression. -->
   <div class="askq-backdrop" id="compress-dry-backdrop" hidden>
-    <div class="askq-dialog askq-dialog-wide">
+    <div class="askq-dialog askq-dialog-wide" role="dialog" aria-modal="true"
+         aria-labelledby="compress-dry-title">
       <div class="askq-header">
-        <span>Compress savings &mdash; dry run</span>
+        <span id="compress-dry-title">Compression savings preview</span>
         <span class="status-text dialog-summary-spacer" id="compress-dry-summary"></span>
       </div>
       <div class="askq-body askq-body-compact-pad">
         <div class="edit-gv-inline askq-form-row">
-          <label class="edit-gl askq-label-static">Output resolution:</label>
+          <label class="edit-gl askq-label-static" for="compress-dry-res">Output resolution:</label>
           <select class="ctl-select askq-select-auto" id="compress-dry-res">
             <option value="480">480p</option>
             <option value="720" selected>720p</option>
@@ -2023,14 +2165,15 @@
 
   <!-- Transcript drift scan/fix modal (feature H-2) -->
   <div class="askq-backdrop" id="drift-backdrop" hidden>
-    <div class="askq-dialog askq-dialog-wide">
+    <div class="askq-dialog askq-dialog-wide" role="dialog" aria-modal="true"
+         aria-labelledby="drift-title">
       <div class="askq-header">
-        <span>Transcript drift &mdash; scan &amp; fix</span>
+        <span id="drift-title">Transcript consistency &mdash; scan &amp; fix</span>
         <span class="status-text dialog-summary-spacer" id="drift-summary"></span>
       </div>
       <div class="askq-body askq-body-compact-pad">
         <div class="edit-gv-inline askq-form-row">
-          <label class="edit-gl askq-label-static">Channel:</label>
+          <label class="edit-gl askq-label-static" for="drift-channel">Channel:</label>
           <select class="ctl-select askq-select-flex-wide" id="drift-channel"></select>
           <!-- Primary action for this modal — green so the "go" is obvious. -->
           <button class="btn btn-primary btn-thin" id="drift-scan-btn">Scan</button>
@@ -2044,7 +2187,7 @@
              after the scan completes. Stays disabled until the scan
              finishes and surfaces something fixable. -->
         <button class="btn btn-primary" id="drift-fix-btn" disabled
-                title="Apply all three fixes: rebuild missing .txt entries, queue Whisper retranscribe for .txt-only entries, rebuild FTS if phantoms found">Fix all</button>
+                 title="Repair missing transcript text and details, then rebuild the search index if needed">Fix all</button>
         <button class="btn btn-ghost" id="drift-close">Close</button>
       </div>
     </div>
@@ -2055,25 +2198,26 @@
        JSONL + DB. Long-running — kicks off a background thread; progress
        streams to the main log so the user can close the modal. -->
   <div class="askq-backdrop" id="repair-yt-backdrop" hidden>
-    <div class="askq-dialog askq-dialog-narrow">
+    <div class="askq-dialog askq-dialog-narrow" role="dialog" aria-modal="true"
+         aria-labelledby="repair-yt-title">
       <div class="askq-header">
-        <span>Repair YT auto-captions</span>
+        <span id="repair-yt-title">Repair YT auto-captions</span>
       </div>
       <div class="askq-body askq-body-small-pad">
         <div class="askq-help-text"
-             title="Re-parses YouTube auto-captions for already-archived videos to fix the pre-v64.7 parser bugs (dropped rolled-in words; segment-boundary duplications). Hits YouTube once per video, queues as a Sync Task, pausable/cancellable/resumable. Whisper-transcribed videos are auto-skipped, as are YT+PUNCTUATION videos where the new VTT comes back lowercase (would downgrade punctuation).">
-          Re-parses YT captions to fix the pre-v64.7 word-drop and
-          segment-boundary duplication bugs. Queues as a Sync Task.
+             title="Repairs older YouTube captions with missing or repeated words. Uses one YouTube request per video, runs in the Sync queue, and can be paused or resumed. Videos transcribed with Whisper are skipped.">
+          Repairs older YouTube captions with missing or repeated words.
+          Runs in the Sync queue.
           <span class="askq-help-details">Details</span>
         </div>
         <div class="edit-grid askq-compact-grid">
-          <label class="edit-gl">Scope</label>
+          <label class="edit-gl" for="repair-yt-channel">Scope</label>
           <select class="ctl-select askq-select-max" id="repair-yt-channel"></select>
 
-          <label class="edit-gl">Dry-run</label>
+          <label class="edit-gl">Preview only</label>
           <label class="askq-small-label">
             <input type="checkbox" id="repair-yt-dryrun" />
-            Fetch + parse only, don't write
+            Check what would change without saving
           </label>
         </div>
       </div>
@@ -2089,25 +2233,26 @@
        for YT-captioned videos, runs each through the punctuation model,
        writes the punctuated form back to DB + JSONL. -->
   <div class="askq-backdrop" id="punct-restore-backdrop" hidden>
-    <div class="askq-dialog askq-dialog-narrow">
+    <div class="askq-dialog askq-dialog-narrow" role="dialog" aria-modal="true"
+         aria-labelledby="punct-restore-title">
       <div class="askq-header">
-        <span>Restore transcript punctuation</span>
+        <span id="punct-restore-title">Restore transcript punctuation</span>
       </div>
       <div class="askq-body askq-body-small-pad">
         <div class="askq-help-text"
-             title="Walks per-segment text for YT-captioned videos in scope, runs each segment through the PunctuationManager (the same punct-restoration worker the Whisper path uses), and writes the punctuated form back to segments.text + the JSONL. The per-word array used by the video overlay is left as raw lowercase so the overlay captions stay readable in short chunks. Already-punctuated videos are skipped automatically.">
-          Adds sentence punctuation + capitalization to legacy
-          YT-captioned transcripts. Queues as a Sync Task.
+             title="Adds sentence punctuation and capitalization to older YouTube-caption transcripts. Already repaired videos are skipped. The pass runs locally and can be paused or resumed.">
+          Adds sentence punctuation and capitalization to older
+          YouTube-caption transcripts. Runs in the Sync queue.
           <span class="askq-help-details">Details</span>
         </div>
         <div class="edit-grid askq-compact-grid">
-          <label class="edit-gl">Scope</label>
+          <label class="edit-gl" for="punct-restore-channel">Scope</label>
           <select class="ctl-select askq-select-max" id="punct-restore-channel"></select>
 
-          <label class="edit-gl">Dry-run</label>
+          <label class="edit-gl">Preview only</label>
           <label class="askq-small-label">
             <input type="checkbox" id="punct-restore-dryrun" />
-            Load model + parse, don't write
+            Check what would change without saving
           </label>
         </div>
       </div>
@@ -2123,24 +2268,25 @@
        existing files with the embedded identity new downloads get:
        MP4 container tags + (youtu.be/<id>) Transcript.txt headers. -->
   <div class="askq-backdrop" id="provenance-backdrop" hidden>
-    <div class="askq-dialog askq-dialog-narrow">
+    <div class="askq-dialog askq-dialog-narrow" role="dialog" aria-modal="true"
+         aria-labelledby="provenance-title">
       <div class="askq-header">
-        <span>Embed file tags</span>
+        <span id="provenance-title">Embed file details</span>
       </div>
       <div class="askq-body askq-body-small-pad">
         <div class="askq-help-text"
-             title="MP4 tags: each known-ID video is stream-copy remuxed (no re-encode, no quality change) to embed its title, channel, upload date, and watch URL inside the file container — visible in Explorer's Details pane and any media player, and it survives renames, moves, and copies. File modified-dates are preserved. Transcript headers: legacy header lines gain a (youtu.be/<id>) field when the hidden .jsonl sidecar knows the video's ID unambiguously. A ledger makes re-runs skip already-tagged files, so the pass is safe to pause, cancel, and resume any time.">
-          Writes each video's identity (title, channel, upload date,
+             title="Saves the title, channel, upload date, and YouTube link inside each video file and adds YouTube IDs to transcript headers. Video quality and file dates stay unchanged. Re-running skips files that are already tagged.">
+          Writes each video's details (title, channel, upload date,
           watch URL) inside the MP4 file itself, and adds video IDs to
           Transcript.txt headers. No re-encode; file dates are
-          preserved. Queues as a Sync Task.
+          preserved. Runs in the Sync queue.
           <span class="askq-help-details">Details</span>
         </div>
         <div class="edit-grid askq-compact-grid">
-          <label class="edit-gl">Scope</label>
+          <label class="edit-gl" for="provenance-channel">Scope</label>
           <select class="ctl-select askq-select-max" id="provenance-channel"></select>
 
-          <label class="edit-gl">Phases</label>
+          <label class="edit-gl">What to update</label>
           <label class="askq-small-label">
             <input type="checkbox" id="provenance-do-txt" checked />
             Add video IDs to Transcript.txt headers
@@ -2149,13 +2295,13 @@
           <label class="edit-gl"></label>
           <label class="askq-small-label">
             <input type="checkbox" id="provenance-do-mp4" checked />
-            Embed tags in MP4 files (remux, no re-encode)
+            Embed details in MP4 files (no quality change)
           </label>
 
-          <label class="edit-gl">Dry-run</label>
+          <label class="edit-gl">Preview only</label>
           <label class="askq-small-label">
             <input type="checkbox" id="provenance-dryrun" />
-            Count what would change, write nothing
+            Count what would change without saving
           </label>
         </div>
       </div>
@@ -2169,18 +2315,22 @@
 
   <!-- Diagnostics dialog -->
   <div class="askq-backdrop" id="diag-backdrop" hidden>
-    <div class="askq-dialog askq-dialog-diagnostics">
+    <div class="askq-dialog askq-dialog-diagnostics" role="dialog" aria-modal="true"
+         aria-labelledby="diag-title">
       <div class="askq-header">
-        <span>Diagnostics</span>
+        <span id="diag-title">Diagnostics</span>
         <span class="status-text dialog-summary-spacer" id="diag-summary"></span>
       </div>
       <div class="askq-body askq-body-diagnostics" id="diag-body">
         <div class="diag-rows" id="diag-rows">
-          <div class="browse-empty askq-empty-padded">Running self-check&hellip;</div>
+          <div class="browse-empty askq-empty-padded">Checking&hellip;</div>
         </div>
+        <div class="diag-integrity-results" id="diag-integrity-results" hidden></div>
       </div>
       <div class="askq-buttons">
         <button class="btn btn-ghost" id="diag-close">Close</button>
+        <button class="btn btn-ghost" id="diag-integrity"
+                title="Read every integrity source and show proposed repairs without changing anything">Integrity preview</button>
         <!-- Re-run is the primary action when the user wants to retry
              a failed check. Painted green to match the rest of the app. -->
         <button class="btn btn-primary" id="diag-refresh">Re-run</button>
@@ -2191,11 +2341,12 @@
   <!-- Manual Transcribe dialog &mdash; supports both single-file AND folder-walk
        modes, matching YTArchiver.py:16083 _start_manual_transcription. -->
   <div class="askq-backdrop" id="manual-tx-backdrop" hidden>
-    <div class="askq-dialog askq-dialog-manual">
-      <div class="askq-header">Manual Transcribe</div>
+    <div class="askq-dialog askq-dialog-manual" role="dialog" aria-modal="true"
+         aria-labelledby="manual-tx-title">
+      <div class="askq-header" id="manual-tx-title">Manual Transcribe</div>
       <div class="askq-body">
         <div class="edit-grid askq-manual-grid">
-          <label class="edit-gl">Video file</label>
+          <label class="edit-gl" for="manual-tx-path">Video file</label>
           <div class="edit-gv-inline askq-form-row-tight">
             <input type="text" class="ctl-input askq-input-fill" id="manual-tx-path" readonly placeholder="Click Browse&hellip;" />
             <button class="btn btn-ghost btn-thin" id="manual-tx-browse">Browse&hellip;</button>
@@ -2206,13 +2357,6 @@
                     title="Pick a folder &mdash; every video/audio file under it will be queued">Pick folder &amp; queue all&hellip;</button>
             <span class="co-hint">(recurses subfolders)</span>
           </div>
-          <label class="edit-gl">Model</label>
-          <select class="ctl-select" id="manual-tx-model">
-            <option value="tiny">tiny (fastest)</option>
-            <option value="small" selected>small</option>
-            <option value="medium">medium</option>
-            <option value="large-v3">large-v3 (best)</option>
-          </select>
         </div>
       </div>
       <div class="askq-buttons">
@@ -2224,15 +2368,17 @@
 
   <!-- Autorun history full-view dialog -->
   <div class="askq-backdrop" id="autorun-history-backdrop" hidden>
-    <div class="askq-dialog askq-dialog-history">
+    <div class="askq-dialog askq-dialog-history" role="dialog" aria-modal="true"
+         aria-labelledby="autorun-history-title">
       <div class="askq-header">
-        <span>Autorun history</span>
+        <span id="autorun-history-title">Autorun history</span>
         <span class="status-text dialog-summary-spacer" id="autorun-history-count"></span>
       </div>
       <div class="askq-body askq-body-history">
         <div class="ah-filter-row askq-history-filter-row">
           <input type="text" class="ctl-input askq-filter-input"
-                 id="autorun-history-filter" placeholder="Filter&hellip;" />
+                 id="autorun-history-filter" placeholder="Filter&hellip;"
+                 aria-label="Filter autorun history" />
         </div>
         <div class="ah-entries askq-history-entries" id="autorun-history-entries"></div>
       </div>
@@ -2268,34 +2414,6 @@
 
   <!-- Toast notifications mount -->
   <div id="toast-root" role="status" aria-live="polite" aria-atomic="false"></div>
-
-  <!-- First-launch archive-root picker. Non-dismissable: the user
-       MUST choose a folder before the app becomes usable. -->
-  <div id="welcome-modal" class="yt-modal" role="dialog" aria-modal="true"
-       aria-labelledby="welcome-modal-title" hidden>
-    <div class="yt-modal-backdrop"></div>
-    <div class="yt-modal-body yt-modal-body-welcome">
-      <div class="yt-modal-title" id="welcome-modal-title">Pick an archive folder</div>
-      <div class="yt-modal-sub">
-        YTArchiver saves each subscribed channel as
-        <code>&lt;archive&gt;/&lt;ChannelName&gt;/</code>. Metadata,
-        thumbnails, and transcripts are stored alongside the videos.
-      </div>
-      <div class="yt-modal-sub yt-modal-sub-spaced">
-        Choose an empty folder (or an existing YTArchiver archive).
-        You can change it later in Settings.
-      </div>
-      <div class="yt-modal-path-row">
-        <input type="text" id="welcome-path" class="ctl-input"
-               readonly placeholder="No folder selected" />
-        <button class="yt-modal-btn" id="welcome-browse">Browse&hellip;</button>
-      </div>
-      <div class="yt-modal-buttons">
-        <button class="yt-modal-btn primary" id="welcome-continue"
-                disabled>Continue</button>
-      </div>
-    </div>
-  </div>
 
   <!-- Redownload 10-sample confirm modal. Hidden by default; app.js
        listens for the `yt-control` event (kind=redownload_sample) and
@@ -2337,11 +2455,11 @@
     </div>
   </div>
 
-  <!-- First-run onboarding wizard. Blocking full-screen overlay shown on
+  <!-- Setup wizard. Blocking full-screen overlay shown on first launch
 
-       first launch (gated on the backend `onboarded` flag) and re-openable
+       (gated on the backend `onboarded` flag) and re-openable from
 
-       from Settings > Tools > "Run setup again". Restores the dependency-
+       Settings > App behavior > "Run setup again". Restores the dependency-
 
        install + archive-root setup that was lost in the tkinter -> pywebview
 
@@ -2349,11 +2467,13 @@
 
   <div id="onboarding-overlay" class="onb-overlay" hidden>
 
-    <div class="onb-card">
+    <div class="onb-card" role="dialog" aria-modal="true"
+
+         aria-labelledby="onb-intro-title" tabindex="-1">
 
       <div class="onb-head">
 
-        <div class="onb-logo">YT&nbsp;ARCHIVER<span class="onb-logo-sub">first-time setup</span></div>
+        <div class="onb-logo">YT&nbsp;ARCHIVER<span class="onb-logo-sub">setup</span></div>
 
         <div class="onb-steps" id="onb-steps">
 
@@ -2371,7 +2491,7 @@
 
         <!-- Close (X): only shown when the wizard is re-opened from
 
-             Settings > Tools ("Run setup again"). Genuine first-run keeps
+             Settings > App behavior ("Run setup again"). Genuine first-run keeps
 
              the wizard non-dismissable (Esc blocked, no X) so setup isn't
 
@@ -2379,7 +2499,7 @@
 
         <button type="button" class="onb-close" id="onb-close"
 
-                title="Close setup (you can re-run it any time from Settings)"
+                title="Close setup (you can review it any time from Settings)"
 
                 aria-label="Close setup" hidden>&times;</button>
 
@@ -2390,11 +2510,11 @@
 
         <!-- Step 1: Welcome -->
 
-        <section class="onb-step" data-step="1">
+        <section class="onb-step" data-step="1" aria-labelledby="onb-intro-title">
 
-          <h1 class="onb-title">Welcome to YTArchiver</h1>
+          <h1 class="onb-title" id="onb-intro-title" tabindex="-1">Welcome to YTArchiver</h1>
 
-          <p class="onb-text">Let's get you set up &mdash; this only takes a minute.</p>
+          <p class="onb-text" id="onb-intro-text">We'll choose your archive folder, traffic limits, and download tools.</p>
 
           <ul class="onb-list">
 
@@ -2411,9 +2531,9 @@
 
         <!-- Step 2: Archive folder -->
 
-        <section class="onb-step" data-step="2" hidden>
+        <section class="onb-step" data-step="2" aria-labelledby="onb-folder-title" hidden>
 
-          <h1 class="onb-title">Pick an archive folder</h1>
+          <h1 class="onb-title" id="onb-folder-title" tabindex="-1">Pick an archive folder</h1>
 
           <p class="onb-text">YTArchiver saves each subscribed channel as a subfolder
 
@@ -2425,7 +2545,7 @@
 
             <input type="text" id="onb-folder-path" class="onb-input" readonly
 
-                   placeholder="No folder selected" />
+                   placeholder="No folder selected" aria-label="Archive folder" />
 
             <button class="onb-btn" id="onb-folder-browse">Browse&hellip;</button>
 
@@ -2438,9 +2558,9 @@
 
         <!-- Step 3: YouTube traffic safety -->
 
-        <section class="onb-step" data-step="3" hidden>
+        <section class="onb-step" data-step="3" aria-labelledby="onb-traffic-title" hidden>
 
-          <h1 class="onb-title">Choose a traffic safety level</h1>
+          <h1 class="onb-title" id="onb-traffic-title" tabindex="-1">Choose a traffic safety level</h1>
 
           <p class="onb-text">YTArchiver stays deliberately low and slow to
 
@@ -2501,9 +2621,9 @@
 
         <!-- Step 4: Dependencies -->
 
-        <section class="onb-step" data-step="4" hidden>
+        <section class="onb-step" data-step="4" aria-labelledby="onb-deps-title" hidden>
 
-          <h1 class="onb-title">Install dependencies</h1>
+          <h1 class="onb-title" id="onb-deps-title" tabindex="-1">Install dependencies</h1>
 
 
           <div class="onb-dep-group">
@@ -2606,15 +2726,15 @@
 
         <!-- Step 5: Done -->
 
-        <section class="onb-step" data-step="5" hidden>
+        <section class="onb-step" data-step="5" aria-labelledby="onb-done-title" hidden>
 
-          <h1 class="onb-title">You're all set</h1>
+          <h1 class="onb-title" id="onb-done-title" tabindex="-1">You're all set</h1>
 
-          <p class="onb-text">YTArchiver is ready. Your empty <b>Browse &gt; Channels</b>
+          <p class="onb-text">YTArchiver is ready. Use <b>Browse &gt; Channels</b>
 
-            page will guide you to <b>Add your first channel</b>, or you can paste a
+            to manage subscriptions or add a channel, or paste a video URL on the
 
-            video URL on the <b>Download</b> tab to grab a single video.</p>
+            <b>Download</b> tab to grab a single video.</p>
 
           <div class="onb-dep-rows" id="onb-done-summary"></div>
 
@@ -2642,23 +2762,24 @@
   <script src="vendor/chart.umd.min.js"></script>
   <!-- UI helper modules load before logs.js + app.js so their exports are ready. -->
   <script src="util.js?v=1"></script>
-  <script src="bridge.js?v=1"></script>
+  <script src="bridge.js?v=3"></script>
+  <script src="eventState.js?v=1"></script>
   <script src="browseState.js?v=1"></script>
   <script src="toasts.js?v=1"></script>
   <script src="modals.js?v=1"></script>
-  <script src="contextMenu.js?v=1"></script>
+  <script src="contextMenu.js?v=3"></script>
   <script src="dropdown.js?v=1"></script>
   <script src="chrome.js?v=1"></script>
   <script src="logContextMenu.js?v=1"></script>
   <script src="shortcuts.js?v=1"></script>
   <script src="graphTab.js?v=1"></script>
   <script src="queueBlink.js?v=1"></script>
-  <script src="watchActions.js?v=1"></script>
+  <script src="watchActions.js?v=4"></script>
   <script src="editChannel.js?v=1"></script>
   <script src="browseSearch.js?v=1"></script>
-  <script src="browseContextMenus.js?v=1"></script>
+  <script src="browseContextMenus.js?v=5"></script>
   <script src="columnSort.js?v=1"></script>
-  <script src="downloadUrl.js?v=1"></script>
+  <script src="downloadUrl.js?v=2"></script>
   <script src="downloadDragDrop.js?v=1"></script>
   <script src="clearButton.js?v=1"></script>
   <script src="autoSync.js?v=1"></script>
@@ -2667,18 +2788,20 @@
   <script src="syncSubbed.js?v=1"></script>
   <script src="indexControls.js?v=3"></script>
   <script src="settingsInfra.js?v=1"></script>
+  <script src="healthOverview.js?v=1"></script>
   <script src="metadataTab.js?v=2"></script>
   <script src="settingsTab.js?v=2"></script>
   <script src="driftScanDialog.js?v=1"></script>
   <script src="compressDryRunDialog.js?v=1"></script>
   <script src="repairCaptionsDialog.js?v=1"></script>
-  <script src="punctRestoreDialog.js?v=1"></script>
+  <script src="punctRestoreDialog.js?v=2"></script>
   <script src="provenanceDialog.js?v=1"></script>
   <script src="aboutDialog.js?v=1"></script>
-  <script src="diagnosticsDialog.js?v=1"></script>
+  <script src="diagnosticsDialog.js?v=2"></script>
   <script src="manualTranscribe.js?v=1"></script>
   <script src="queuePopovers.js?v=1"></script>
   <script src="browseView.js?v=1"></script>
+  <script src="navigationHistory.js?v=1"></script>
   <script src="browseContent.js?v=1"></script>
   <script src="autorunHistory.js?v=1"></script>
   <script src="logMode.js?v=1"></script>
@@ -2690,14 +2813,15 @@
   <script src="missingFolders.js?v=1"></script>
   <script src="redownloadSampleModal.js?v=1"></script>
   <script src="appDialogs.js?v=1"></script>
-  <script src="logs.js?v=34"></script>
+  <script src="logs.js?v=35"></script>
   <script src="queueRender.js?v=1"></script>
   <script src="tables.js?v=1"></script>
   <script src="browseGrids.js?v=1"></script>
   <script src="videosView.js?v=1"></script>
   <script src="manualView.js?v=1"></script>
+  <script src="trashView.js?v=1"></script>
   <script src="manualReview.js?v=1"></script>
-  <script src="watchView.js?v=1"></script>
+  <script src="watchView.js?v=3"></script>
   <script src="uxPolish.js?v=1"></script>
   <script src="removeChannel.js?v=1"></script>
   <script src="queuePending.js?v=1"></script>
@@ -2705,6 +2829,6 @@
   <script src="smallInits.js?v=2"></script>
   <script src="statusBar.js?v=3"></script>
   <script src="commandPalette.js?v=1"></script>
-  <script src="app.js?v=79"></script>
+  <script src="app.js?v=80"></script>
 </body>
 </html>

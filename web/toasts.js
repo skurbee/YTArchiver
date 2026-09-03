@@ -4,7 +4,8 @@
  * Extracted from app.js. Exposes:
  *   window._showToast(msg | opts, kind?)
  *
- * Where `opts` is { msg, kind: "ok"|"error"|"warn", action: {label, onClick}, ttlMs }.
+ * Where `opts` is { msg, kind: "ok"|"error"|"warn",
+ * action: {label, onClick}, ttlMs, persist }.
  *
  * Error-kind messages run through a sanitizer that strips Python exception
  * prefixes ("TypeError: …", "pywebview.JavascriptException: …") and caps
@@ -81,7 +82,7 @@
   // Usage: window._showToast({ msg, kind, action: {label, onClick}, ttlMs })
   window._showToast = function (msgOrOpts, kind) {
     const root = document.getElementById("toast-root");
-    if (!root) return;
+    if (!root) return null;
     const opts = typeof msgOrOpts === "string"
       ? { msg: msgOrOpts, kind }
       : (msgOrOpts || {});
@@ -131,9 +132,16 @@
     let remaining = ttl;
     let startedAt = Date.now();
     let timer = null;
-    const dismiss = () => {
+    let dismissed = false;
+    const dismiss = (immediate = false) => {
+      if (dismissed) return;
+      dismissed = true;
       if (timer) { clearTimeout(timer); timer = null; }
       document.removeEventListener("visibilitychange", onVis);
+      if (immediate) {
+        el.remove();
+        return;
+      }
       el.style.transition = "opacity 0.25s, transform 0.25s";
       el.style.opacity = "0";
       el.style.transform = "translateX(20px)";
@@ -154,12 +162,15 @@
           timer = null;
           remaining = Math.max(0, remaining - (Date.now() - startedAt));
         }
-      } else if (!timer && el.isConnected) {
+      } else if (!opts.persist && !timer && el.isConnected) {
         schedule();
       }
     };
     document.addEventListener("visibilitychange", onVis);
-    if (document.visibilityState !== "hidden") schedule();
+    // A persistent toast is useful for operations whose duration is unknown.
+    // Its owner dismisses it through the returned handle when the work ends.
+    if (!opts.persist && document.visibilityState !== "hidden") schedule();
     if (_wireActionBtn) _wireActionBtn(dismiss);
+    return { dismiss, element: el };
   };
 })();

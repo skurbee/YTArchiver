@@ -52,7 +52,7 @@
     banner.hidden = true;
     banner.innerHTML = [
       '<div class="boot-issue-main">',
-      '  <strong>UI started with issues</strong>',
+      '  <strong>Some features did not finish loading</strong>',
       '  <span id="boot-issue-summary"></span>',
       '</div>',
       '<div class="boot-issue-actions">',
@@ -73,10 +73,10 @@
           throw new Error("Clipboard API unavailable");
         }
         await navigator.clipboard?.writeText(details);
-        window._showToast?.("Boot issue details copied.", "ok");
+        window._showToast?.("Startup issue details copied.", "ok");
       } catch {
         console.warn("[boot issues]", details);
-        window._showToast?.("Boot issue details written to console.", "warn");
+        window._showToast?.("Could not copy the startup issue details.", "warn");
       }
     });
     banner.querySelector("#boot-issue-close")?.addEventListener("click", () => {
@@ -89,9 +89,10 @@
     if (!YT.bootIssues.length || !document.body) return;
     const banner = _ensureBootIssueBanner();
     const summary = banner.querySelector("#boot-issue-summary");
-    const names = YT.bootIssues.slice(-3).map((issue) => issue.name).join(", ");
     if (summary) {
-      summary.textContent = `${YT.bootIssues.length} boot warning(s): ${names}`;
+      const count = YT.bootIssues.length;
+      summary.textContent = `${count} startup ${count === 1 ? "issue" : "issues"}. `
+        + "Some features may not be available.";
     }
     banner.hidden = false;
   }
@@ -112,7 +113,8 @@
       _renderBootIssues();
     }
     if (typeof window._showToast === "function") {
-      window._showToast("UI started with issues. See the banner for details.", "warn");
+      window._showToast(
+        "Some features did not finish loading. See the banner for details.", "warn");
     }
   };
 
@@ -150,8 +152,8 @@
       if (_tries >= _max) {
         console.warn("[bridge] pywebview never came up — running in browser-only mode");
         window._reportBootIssue?.(
-          "pywebview bridge",
-          "Native bridge did not become ready; desktop data may not load.",
+          "App connection",
+          "The app connection did not finish starting, so some data may not load.",
           { level: "error" },
         );
         _markReady();  // resolve to undefined so callers can fall back
@@ -167,7 +169,7 @@
   // silently swallow the second one (audit: bridge.js H146).
   const _lastToastAtBy = new Map();
   function _toastNativeRequired(msg) {
-    const text = msg || "Native mode required.";
+    const text = msg || "YTArchiver isn't ready yet. Try again in a moment.";
     const now = Date.now();
     const _prev = _lastToastAtBy.get(text) || 0;
     if (now - _prev < 1000) return;
@@ -221,7 +223,7 @@
         _toastNativeRequired();
         return Promise.resolve({
           ok: false,
-          error: "Native mode required",
+          error: "YTArchiver isn't ready yet. Try again in a moment.",
           code: "NATIVE_BRIDGE_UNAVAILABLE",
         });
       };
@@ -246,6 +248,283 @@
       try { return await fn.apply(this, args); }
       finally { busy = false; }
     };
+  }
+
+  // One truthful user-facing contract for every "Sync now" entry point.
+  // The backend distinguishes newly queued, already queued, actively started,
+  // and queued-behind-pause. Keeping the wording here prevents individual
+  // screens from silently dropping a valid result or claiming an existing
+  // task was added again.
+  function reportSyncOneResult(result, fallbackName = "") {
+    const name = String(result?.name || fallbackName || "").trim();
+    let message;
+    let kind;
+    if (!result?.ok) {
+      message = result?.error || "Sync failed to start.";
+      kind = "error";
+    } else if (result.started) {
+      message = name ? `Sync started for "${name}".` : "Sync started.";
+      kind = "ok";
+    } else if (result.paused && result.queued) {
+      message = name
+        ? `Added "${name}" to the sync queue. The queue is paused.`
+        : "Sync queued - queue is paused.";
+      kind = "warn";
+    } else if (result.paused) {
+      message = name
+        ? `"${name}" is already in the sync queue. The queue is paused.`
+        : "Already queued - queue is paused.";
+      kind = "warn";
+    } else if (result.queued) {
+      message = name
+        ? `Added "${name}" to the sync queue.`
+        : "Sync queued.";
+      kind = "ok";
+    } else {
+      message = name
+        ? `"${name}" is already in the sync queue.`
+        : "Already queued.";
+      kind = "warn";
+    }
+    window._showToast?.(message, kind);
+    return { message, kind };
+  }
+
+  // ── Catalog-read coordinator ───────────────────────────────────
+  // Several Browse/Settings screens read through the same serialized SQLite
+  // connection. Starting another request whenever a user changes a sort or
+  // revisits a tab does not make that connection faster; it only leaves more
+  // invisible Python work queued behind it. Keep one request running in the
+  // default catalog lane, retain only the newest follow-up for each screen,
+  // and identify superseded results so callers never paint them. Long-running
+  // disk-only maintenance may opt into a separate lane so it does not hold up
+  // ordinary catalog screens. This deliberately does NOT promise cancellation:
+  // a pywebview call already executing in Python must finish.
+  const _catalogReadSlots = new Map();
+  const _catalogReadRunning = new Map();
+  let _catalogReadOrder = 0;
+
+  function _catalogElapsed(ms) {
+    const seconds = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const tail = String(seconds % 60).padStart(2, "0");
+    return hours
+      ? `${hours}h ${minutes}m ${tail}s`
+      : `${minutes}m ${tail}s`;
+  }
+
+  function _catalogSlowStatus(label, elapsedMs) {
+    const elapsed = _catalogElapsed(elapsedMs);
+    const events = window.YT?.eventState;
+    const queue = events?.snapshot?.("queue-state") || {};
+    const indicator = events?.snapshot?.("indicator") || {};
+    const syncActive = !!queue?.sync?.running;
+    const gpuActive = !!queue?.gpu?.running;
+    if (syncActive || gpuActive) {
+      return {
+        state: "other-work",
+        text: `Other downloads or processing are active; still loading ${label} (${elapsed}).`,
+        announcement: `Other downloads or processing are active; still loading ${label}.`,
+      };
+    }
+    if (indicator?.slot === "sweep" && String(indicator.text || "").trim()) {
+      return {
+        state: "maintenance",
+        text: `Library maintenance is active; still loading ${label} (${elapsed}).`,
+        announcement: `Library maintenance is active; still loading ${label}.`,
+      };
+    }
+    return {
+      state: "slow",
+      text: `Still loading ${label} (${elapsed}).`,
+      announcement: `Still loading ${label}.`,
+    };
+  }
+
+  function _catalogWaitingStatus(slot, request, elapsedMs) {
+    const elapsed = _catalogElapsed(elapsedMs);
+    const running = _catalogReadRunning.get(slot.lane);
+    const label = request.options.label || "library data";
+    const blocker = running?.slot === slot
+      ? `an earlier request for ${label}`
+      : "another library view";
+    const tail = elapsedMs < 1000 ? "…" : ` (${elapsed}).`;
+    return {
+      text: `Waiting to refresh ${label} while ${blocker} finishes${tail}`,
+      announcement: `Waiting to refresh ${label} while ${blocker} finishes.`,
+    };
+  }
+
+  function _catalogStatus(slot, request, phase) {
+    if (request.generation !== slot.generation) return;
+    const onStatus = request.options.onStatus;
+    if (typeof onStatus !== "function") return;
+    const phaseStartedAt = phase === "waiting"
+      ? request.queuedAt
+      : (request.startedAt || request.queuedAt);
+    const elapsedMs = Math.max(0, Date.now() - phaseStartedAt);
+    const label = request.options.label || "library data";
+    const slow = phase === "slow"
+      ? _catalogSlowStatus(label, elapsedMs)
+      : null;
+    const waiting = phase === "waiting"
+      ? _catalogWaitingStatus(slot, request, elapsedMs)
+      : null;
+    const text = waiting?.text || slow?.text
+      || (phase === "loading" ? `Loading ${label}…` : "");
+    const announcementState = slow ? `slow:${slow.state}` : phase;
+    const announce = request.announcementState !== announcementState;
+    if (announce) request.announcementState = announcementState;
+    const announcement = waiting?.announcement || slow?.announcement
+      || (phase === "loading" ? `Loading ${label}.` : "");
+    try {
+      onStatus({
+        phase,
+        text,
+        elapsedMs,
+        generation: request.generation,
+        announce,
+        announcement,
+      });
+    } catch (error) {
+      console.warn(`[catalog read: ${slot.key}] status callback failed`, error);
+    }
+  }
+
+  function _startCatalogStatusTimers(slot, request) {
+    const slowAfterMs = Math.max(0,
+      Number(request.options.slowAfterMs ?? 3000));
+    const tickMs = Math.max(25, Number(request.options.tickMs ?? 1000));
+    const startSlowUpdates = () => {
+      _catalogStatus(slot, request, "slow");
+      request.slowInterval = setInterval(
+        () => _catalogStatus(slot, request, "slow"), tickMs);
+    };
+    request.slowTimer = setTimeout(startSlowUpdates, slowAfterMs);
+  }
+
+  function _startCatalogWaitingTimer(slot, request) {
+    const tickMs = Math.max(25, Number(request.options.tickMs ?? 1000));
+    request.waitInterval = setInterval(
+      () => _catalogStatus(slot, request, "waiting"), tickMs);
+  }
+
+  function _stopCatalogStatusTimers(request) {
+    clearTimeout(request?.slowTimer);
+    clearInterval(request?.slowInterval);
+    clearInterval(request?.waitInterval);
+    if (request) {
+      request.slowTimer = null;
+      request.slowInterval = null;
+      request.waitInterval = null;
+    }
+  }
+
+  function _nextCatalogReadSlot(lane) {
+    let next = null;
+    for (const slot of _catalogReadSlots.values()) {
+      if (slot.lane !== lane) continue;
+      if (!slot.queued) continue;
+      if (!next || slot.queued.order > next.queued.order) next = slot;
+    }
+    return next;
+  }
+
+  async function _pumpCatalogRead(lane) {
+    if (_catalogReadRunning.has(lane)) return;
+    const slot = _nextCatalogReadSlot(lane);
+    if (!slot) return;
+    const request = slot.queued;
+    slot.queued = null;
+    slot.running = request;
+    _catalogReadRunning.set(lane, { slot, request });
+    _stopCatalogStatusTimers(request);
+    request.startedAt = Date.now();
+    _catalogStatus(slot, request, "loading");
+    _startCatalogStatusTimers(slot, request);
+
+    const context = Object.freeze({
+      generation: request.generation,
+      isCurrent: () => request.generation === slot.generation,
+    });
+    try {
+      const value = await request.task(context);
+      request.resolve({
+        stale: request.generation !== slot.generation,
+        skipped: false,
+        value,
+      });
+    } catch (error) {
+      if (request.generation !== slot.generation) {
+        request.resolve({ stale: true, skipped: false, error });
+      } else {
+        request.reject(error);
+      }
+    } finally {
+      _stopCatalogStatusTimers(request);
+      if (request.generation === slot.generation) {
+        _catalogStatus(slot, request, "done");
+      }
+      slot.running = null;
+      _catalogReadRunning.delete(lane);
+      // All of these screens ultimately share the same SQLite reader. Start
+      // the most recently requested screen next, but retain one newest request
+      // for every other screen so useful background refreshes are not lost.
+      _pumpCatalogRead(lane);
+    }
+  }
+
+  function catalogRead(key, task, options) {
+    key = String(key || "").trim();
+    if (!key) throw new TypeError("catalog read key is required");
+    if (typeof task !== "function") {
+      throw new TypeError("catalog read task must be a function");
+    }
+    options = options || {};
+    const lane = String(options.lane || "catalog").trim() || "catalog";
+    const slotId = `${lane}\u0000${key}`;
+    let slot = _catalogReadSlots.get(slotId);
+    if (!slot) {
+      slot = { key, lane, generation: 0, running: null, queued: null };
+      _catalogReadSlots.set(slotId, slot);
+    }
+    const generation = ++slot.generation;
+    if (slot.queued) {
+      _stopCatalogStatusTimers(slot.queued);
+      slot.queued.resolve({ stale: true, skipped: true, value: undefined });
+    }
+    const promise = new Promise((resolve, reject) => {
+      slot.queued = {
+        generation,
+        task,
+        options,
+        resolve,
+        reject,
+        queuedAt: Date.now(),
+        startedAt: null,
+        order: ++_catalogReadOrder,
+        announcementState: null,
+        slowTimer: null,
+        slowInterval: null,
+        waitInterval: null,
+      };
+    });
+    if (_catalogReadRunning.has(lane)) {
+      _catalogStatus(slot, slot.queued, "waiting");
+      _startCatalogWaitingTimer(slot, slot.queued);
+    }
+    _pumpCatalogRead(lane);
+    return promise;
+  }
+
+  function catalogReadBusy(key) {
+    key = String(key || "").trim();
+    for (const slot of _catalogReadSlots.values()) {
+      if (slot.key === key && (slot.running || slot.queued)) return true;
+    }
+    return false;
   }
 
   // ── Ready-gate ──────────────────────────────────────────────────
@@ -321,6 +600,9 @@
     ready: readyPromise,
     isUp: _isBridgeUp,
     inFlight,
+    reportSyncOneResult,
+    catalogRead,
+    catalogReadBusy,
     setReady,
     bridgeCall,
     _toastNativeRequired,

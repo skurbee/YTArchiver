@@ -112,6 +112,13 @@ class PunctuationManager:
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True, bufsize=1, startupinfo=_startupinfo, env=env,
             )
+            try:
+                from ..process_runner import PROCESS_REGISTRY
+                PROCESS_REGISTRY.register(
+                    self._proc, owner="processing",
+                    task_id=str(self._job_tag or ""), role="punctuation")
+            except Exception as exc:
+                _log.debug("punctuation process registration failed: %s", exc)
             # Wait for ready
             ready: list[str | None] = [None]
             def _read():
@@ -160,10 +167,16 @@ class PunctuationManager:
     def _stop(self):
         with self._lock:
             if self._proc is not None:
+                proc = self._proc
                 try:
-                    self._proc.kill()
+                    from ..process_runner import PROCESS_REGISTRY
+                    PROCESS_REGISTRY.terminate_process(proc, timeout=2.0)
                 except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                    _log.debug("owned punctuation stop failed: %s", e)
+                    try:
+                        proc.kill()
+                    except Exception as kill_exc:
+                        _log.debug("punctuation kill failed: %s", kill_exc)
                 self._proc = None
 
     def punctuate(self, text: str, timeout_sec: float = 60.0) -> str:
@@ -206,11 +219,7 @@ class PunctuationManager:
                     # Wedged — kill subprocess to unblock the reader
                     # thread (its readline will return empty once stdout
                     # closes) and treat as failed pass.
-                    try:
-                        self._proc.kill()
-                    except Exception as e:
-                        _log.debug("swallowed: %s", e)
-                    self._proc = None
+                    self._stop()
                     self.last_was_timeout = True
                     self._stream.emit_dim(
                         f" (punctuation timed out after {timeout_sec:.0f}s)")

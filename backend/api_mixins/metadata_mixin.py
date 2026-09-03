@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid
 from typing import Any
 
 from backend import archive_scan
 from backend import subs as subs_backend
+from backend.services.job_supervisor import WorkAdmissionClosed
+from backend.services.managed_work import admitted_operation, start_managed_task
 from backend.ytarchiver_config import load_config
 
 from ._shared import _api_err, _log
@@ -111,6 +114,40 @@ class MetadataMixin:
     # ─── Metadata (manual "Recheck" from context menu) ──────────────────
 
     def metadata_recheck_channel(self, identity):
+        """Keep the legacy choose-missing-or-refresh flow for older callers."""
+        return self._metadata_channel_request(identity, prompt_if_existing=True)
+
+
+    def metadata_fill_missing_channel(self, identity):
+        """Queue only missing metadata/thumbnail work for one channel.
+
+        Browse exposes statistics refresh as its own clearly scoped action, so
+        this endpoint deliberately skips the legacy "Refresh Counts" prompt.
+        """
+        return self._metadata_channel_request(identity, prompt_if_existing=False)
+
+
+    def _metadata_channel_request(self, identity, *, prompt_if_existing):
+        task_id = f"metadata-recheck-{uuid.uuid4().hex}"
+        cancel = threading.Event()
+        try:
+            with admitted_operation(
+                self,
+                owner="queue-maintenance",
+                label=("Choose channel metadata refresh"
+                       if prompt_if_existing
+                       else "Queue missing channel information"),
+                task_id=task_id,
+                cancel=cancel,
+            ):
+                return self._metadata_recheck_channel_owned(
+                    identity, task_id=task_id, cancel=cancel,
+                    prompt_if_existing=prompt_if_existing)
+        except WorkAdmissionClosed as exc:
+            return {"ok": False, "queued": False, "error": str(exc)}
+
+    def _metadata_recheck_channel_owned(
+            self, identity, *, task_id, cancel, prompt_if_existing=True):
         """Slow-path playlist walk + fetch missing metadata.
 
         Enqueues a `kind: "metadata"` item on the sync queue so the
@@ -122,10 +159,10 @@ class MetadataMixin:
         is on, sync_start_all kicks it off; otherwise the item sits
         queued until the user resumes.
 
-        When pre-existing metadata is detected on disk, pops the 3-button
-        dialog OLD YTArchiver uses (Check for New / Refresh Counts / Cancel)
-        so the user can pick between fast-skip-existing and slow-refresh-all.
-        Matches YTArchiver.py:26669 _metadata_choice_dialog.
+        Legacy callers can still request the old three-button choice when
+        metadata already exists. Browse's dedicated "Fix missing information"
+        action passes ``prompt_if_existing=False`` and always queues the safe,
+        skip-existing mode; its separate statistics action owns count refresh.
         """
         ch = subs_backend.get_channel(identity or {})
         if not ch:
@@ -135,7 +172,7 @@ class MetadataMixin:
         cfg = self._metadata_config()
         base = (cfg.get("output_dir") or "").strip()
         existing_count = 0
-        if base:
+        if prompt_if_existing and base:
             try:
                 from backend.metadata import _read_metadata_jsonl as _rmj
                 from backend.sync import channel_folder_name as _cfn
@@ -152,6 +189,8 @@ class MetadataMixin:
         def _enqueue_task(refresh_mode):
             """Drop a `kind: "metadata"` item on the sync queue and
             fire the sync worker if needed."""
+            if cancel.is_set():
+                return
             task = dict(ch)
             task["kind"] = "metadata"
             task["refresh"] = bool(refresh_mode)
@@ -174,8 +213,10 @@ class MetadataMixin:
 
         # If there's existing metadata, prompt the user. Otherwise, just
         # enqueue a normal fetch-new-only pass.
-        if existing_count > 0:
+        if prompt_if_existing and existing_count > 0:
             def _prompt_then_enqueue():
+                if cancel.is_set():
+                    return
                 choice = (self._prompt_metadata_already_downloaded(
                     ch_name, existing_count) or {}).get("choice", "skip")
                 if choice in ("skip", "cancel"):
@@ -188,7 +229,19 @@ class MetadataMixin:
                 # "append" = Check for New (fast, skip-existing)
                 # "overwrite" = Refresh Counts (re-hit every video)
                 _enqueue_task(choice == "overwrite")
-            threading.Thread(target=_prompt_then_enqueue, daemon=True).start()
+            try:
+                start_managed_task(
+                    self,
+                    owner="queue-maintenance",
+                    label=f"Choose metadata refresh mode for {ch_name}",
+                    task_id=task_id,
+                    cancel=cancel,
+                    target=_prompt_then_enqueue,
+                    name="metadata-refresh-prompt",
+                    thread_factory=threading.Thread,
+                )
+            except WorkAdmissionClosed as exc:
+                return {"ok": False, "queued": False, "error": str(exc)}
         else:
             _enqueue_task(False)
         return {"ok": True, "queued": True}
@@ -247,7 +300,7 @@ class MetadataMixin:
 
     # ─── Settings > Metadata tab: per-channel refresh status ─────────────
 
-    def get_channel_metadata_status(self, force=False):
+    def get_channel_metadata_status(self, force=False, report_errors=False):
         """Return per-channel metadata refresh status for Settings > Metadata.
 
         Powers the table in settings-view-metadata (index.html:753). Each
@@ -261,7 +314,10 @@ class MetadataMixin:
         backend/metadata.py when those paths finish successfully.
 
         Returns list[dict] with keys: name, folder, url, video_count,
-        last_views_refresh_ts, last_comments_refresh_ts.
+        last_views_refresh_ts, last_comments_refresh_ts.  Existing callers get
+        the same list/zero fallback as before.  When ``report_errors`` is true,
+        a failed database read returns an error object so Health can show the
+        check as unavailable instead of treating it as real zero coverage.
         """
         cfg = self._metadata_config()
         channels = list(cfg.get("channels", []) or [])
@@ -296,7 +352,29 @@ class MetadataMixin:
             )
         except Exception:
             _cvids_bulk = None
-        _id_lookup = _cvids_bulk(ch_copy, force=bool(force)) if _cvids_bulk else {}
+        if report_errors:
+            checked = (_cvids_bulk(
+                ch_copy,
+                force=bool(force),
+                include_status=True,
+            ) if _cvids_bulk else {
+                "ok": False,
+                "error": "Metadata status could not be read.",
+            })
+            if not isinstance(checked, dict) or checked.get("ok") is not True:
+                return {
+                    "available": False,
+                    "error": "Metadata status could not be read.",
+                }
+            _id_lookup = checked.get("rows")
+            if not isinstance(_id_lookup, dict):
+                return {
+                    "available": False,
+                    "error": "Metadata status could not be read.",
+                }
+        else:
+            _id_lookup = (_cvids_bulk(ch_copy, force=bool(force))
+                          if _cvids_bulk else {})
         _empty_ids = {"total": 0, "with_id": 0, "missing": 0, "tried_failed": 0}
         rows = []
         for ch in ch_copy:

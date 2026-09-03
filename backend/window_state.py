@@ -21,7 +21,7 @@ import threading
 from typing import Any
 
 from .log import get_logger
-from .ytarchiver_config import load_config, save_config
+from .ytarchiver_config import config_transaction, load_config
 
 _log = get_logger(__name__)
 
@@ -162,14 +162,17 @@ def save_window_state(partial: dict[str, Any]) -> bool:
     contended in practice.
     """
     with _save_lock:
-        cfg = load_config()
-        current = cfg.get("window_state") or {}
-        if not isinstance(current, dict):
-            current = {}
-        # Only accept known keys
-        for k in DEFAULT_STATE.keys():
-            if k in partial:
-                current[k] = partial[k]
-        current = _sanitize_geometry(current)
-        cfg["window_state"] = current
-        return bool(save_config(cfg))
+        try:
+            with config_transaction() as cfg:
+                current = cfg.get("window_state") or {}
+                if not isinstance(current, dict):
+                    current = {}
+                # Only accept known keys.
+                for k in DEFAULT_STATE.keys():
+                    if k in partial:
+                        current[k] = partial[k]
+                cfg["window_state"] = _sanitize_geometry(current)
+            return True
+        except (OSError, ValueError, TypeError) as exc:
+            _log.warning("window state save failed: %s", exc)
+            return False

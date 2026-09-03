@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════
-   metadataTab.js — Settings → Metadata tab
+   metadataTab.js — Health → Library channel-information section
 
    Owns the per-channel metadata refresh workflow:
 
@@ -66,6 +66,8 @@
     // refresh + force-recheck so the indicator shows up again.
     let _thumbsLoaded = false;
     let _thumbStatusInFlight = false;
+    let _thumbStatusError = "";
+    let _catalogLoadError = "";
     let _lastRowsLoadAt = 0;
     let _loadGen = 0;
     let _pendingRefreshTimer = null;
@@ -94,6 +96,9 @@
         || Object.prototype.hasOwnProperty.call(r || {}, "thumb_missing"));
     }
     function _mergeThumbStatus(thRes) {
+      if (!thRes?.ok || !thRes.rows || typeof thRes.rows !== "object") {
+        throw new Error(thRes?.error || "Thumbnail coverage is unavailable.");
+      }
       const thMap = thRes?.rows || {};
       for (const r of _rows) {
         const key = (r.name || r.folder || "").toLowerCase();
@@ -104,6 +109,7 @@
           r.thumb_missing = t.missing || 0;
         }
       }
+      _thumbStatusError = "";
       _thumbsLoaded = true;
       _saveCachedMeta(_rows);
     }
@@ -156,11 +162,24 @@
       return `${floored.toFixed(digits)}%`;
     };
 
+    // This page reports coverage from the catalog (IDs, transcripts, and
+    // YouTube availability), so its visible video count must use that same
+    // denominator. The disk-summary cache can legitimately be absent while
+    // the catalog is populated, which previously made those channels show
+    // "0 Videos" beside non-zero coverage. Keep a fallback for older cached
+    // frontend rows that predate `id_total`.
+    const trackedVideoCount = (r) => {
+      if (r?.id_total !== null && r?.id_total !== undefined) {
+        return Number(r.id_total) || 0;
+      }
+      return Number(r?.video_count) || 0;
+    };
+
     const sortRows = (rows) => {
       const mult = _sortDir === "asc" ? 1 : -1;
       const kfn = {
         name: (r) => (r.name || "").toLowerCase(),
-        videos: (r) => r.video_count || 0,
+        videos: (r) => trackedVideoCount(r),
         // IDs column sorts by ratio of missing ids → worst-first
         // (highest missing fraction) when descending. Channels with
         // nothing on disk (id_total=0) sort as ratio=0 so they don't
@@ -230,7 +249,7 @@
       let onTotChecked = 0, onRemovedChecked = 0;
       let onChannelsChecked = 0;
       for (const r of _rows) {
-        nVideos += (r.video_count || 0);
+        nVideos += trackedVideoCount(r);
         idTot += (r.id_total || 0);
         idWith += (r.id_with_id || 0);
         thTot += (r.thumb_total || 0);
@@ -255,7 +274,7 @@
       // smaller "sub" value below. For percentage tiles, primary
       // is the percent and sub is the count fraction (fits even
       // in a narrow tile, unlike the previous one-line format
-      // which clipped to "98,039/101,9… (96…").
+      // which clipped large six-digit counters mid-value.
       const setCard = (cardId, valId, primary, sub, klass) => {
         const card = document.getElementById(cardId);
         const val = document.getElementById(valId);
@@ -325,9 +344,8 @@
       if (_onyt_card) {
         // Override the static title so the tooltip reflects scope.
         if (onChannelsChecked === 0) {
-          _onyt_card.title = "No channels have been views/likes-refreshed since the "
-            + "removed-from-YouTube detection shipped. Run a bulk "
-            + "Refresh views/likes to populate this column.";
+          _onyt_card.title = "Availability has not been checked yet. Run "
+            + "Refresh views/likes to check which videos are still on YouTube.";
         } else if (onChannelsChecked >= nChannels) {
           const live = Math.max(0, onTotChecked - onRemovedChecked);
           _onyt_card.title = `All ${nChannels} channel(s) have been checked. `
@@ -339,8 +357,8 @@
         } else {
           _onyt_card.title = `${onChannelsChecked} of ${nChannels} channel(s) have been `
             + `checked. The other ${nChannels - onChannelsChecked} have `
-            + `no removal data yet - run Refresh views/likes on them to `
-            + `include them in this number.`;
+            + `not been checked yet. Refresh views/likes for those channels `
+            + `to include them.`;
         }
       }
       if (onChannelsChecked === 0) {
@@ -378,12 +396,21 @@
       _renderTotals();
       // Update th sort indicators.
       table.querySelectorAll("thead th").forEach(th => {
+        if (!th.dataset.sort) {
+          th.removeAttribute("data-sort-active");
+          th.removeAttribute("data-sort-dir");
+          th.removeAttribute("aria-sort");
+          return;
+        }
         if (th.dataset.sort === _sortKey) {
           th.setAttribute("data-sort-active", "");
           th.setAttribute("data-sort-dir", _sortDir);
+          th.setAttribute("aria-sort",
+            _sortDir === "asc" ? "ascending" : "descending");
         } else {
           th.removeAttribute("data-sort-active");
           th.removeAttribute("data-sort-dir");
+          th.setAttribute("aria-sort", "none");
         }
       });
       if (!_rows.length) {
@@ -412,14 +439,14 @@
         const ID_WARN_THRESHOLD = 0.90;
         let idHtml;
         if (idTotal === 0) {
-          idHtml = '<span class="md-id-dim" title="No videos registered in the index DB for this channel">&mdash;</span>';
+          idHtml = '<span class="md-id-dim" title="No downloaded videos are available to check">&mdash;</span>';
         } else {
           const pct = idWith / idTotal;
           const pctStr = fmtPct(idWith, idTotal);
           // Rich tooltip: show the split between "tried but
           // couldn't resolve" (probably genuinely unrecoverable)
           // vs "not yet attempted" (run Fix IDs to pick these up).
-          let detail = `${idWith.toLocaleString()} of ${idTotal.toLocaleString()} video(s) have resolvable video IDs`;
+          let detail = `${idWith.toLocaleString()} of ${idTotal.toLocaleString()} video(s) have YouTube IDs`;
           if (idMissing > 0) {
             detail += ` — ${idMissing.toLocaleString()} missing`;
             if (idTriedFailed > 0 && idNotYet > 0) {
@@ -427,7 +454,7 @@
             } else if (idTriedFailed > 0) {
               detail += ` (all tried — likely renamed or removed from YouTube)`;
             } else {
-              detail += ` (run Fix IDs to backfill)`;
+              detail += ` (run Fix IDs to find them)`;
             }
           }
           if (idMissing === 0) {
@@ -458,17 +485,19 @@
         const thMissing = Math.max(0, thTotal - thWith);
         const TH_WARN_THRESHOLD = 0.90;
         let thumbHtml;
-        if (!_thumbsLoaded) {
+        if (_thumbStatusError) {
+          thumbHtml = `<span class="md-id-dim" title="${escapeHtml(_thumbStatusError)}">unavailable</span>`;
+        } else if (!_thumbsLoaded) {
           // Bulk thumb walk still in flight — show a spinner so the user
           // knows the column is loading, not actually 0%. Was "—" before,
           // which was indistinguishable from "no on-disk videos".
-          thumbHtml = '<span class="md-thumb-loading" title="Counting thumbnail sidecars on disk…"><span class="md-spinner" aria-hidden="true"></span>loading…</span>';
+          thumbHtml = '<span class="md-thumb-loading" title="Counting saved thumbnails…"><span class="md-spinner" aria-hidden="true"></span>loading…</span>';
         } else if (thTotal === 0) {
           thumbHtml = '<span class="md-id-dim" title="No on-disk videos to check">&mdash;</span>';
         } else {
           const pct = thWith / thTotal;
           const pctStr = fmtPct(thWith, thTotal);
-          let detail = `${thWith.toLocaleString()} of ${thTotal.toLocaleString()} video(s) have a thumbnail sidecar`;
+          let detail = `${thWith.toLocaleString()} of ${thTotal.toLocaleString()} video(s) have a saved thumbnail`;
           if (thMissing > 0) {
             detail += ` \u2014 ${thMissing.toLocaleString()} missing. Right-click channel \u2192 "Refetch missing thumbnails"`;
           }
@@ -525,7 +554,7 @@
         if (onTotal === 0) {
           onYtHtml = '<span class="md-id-dim" title="No tracked videos">&mdash;</span>';
         } else if (!_checkedRecently) {
-          onYtHtml = `<span class="md-id-dim" title="No removed-from-YouTube data for this channel yet. Run 'Refresh views/likes' for this row (or the bulk button) to populate.">&mdash;</span>`;
+          onYtHtml = `<span class="md-id-dim" title="Availability has not been checked yet. Run Refresh views/likes.">&mdash;</span>`;
         } else if (onRemoved === 0) {
           // We DID check, found zero removed \u2014 show a real 100%.
           onYtHtml = `<span class="md-id-ok" title="${onTotal.toLocaleString()} video(s) on disk, all still on YouTube as of the last bulk refresh.">\u2713 100%</span>`;
@@ -548,9 +577,9 @@
         // subtle yellow left-border on the row so attention-needing
         // channels still stand out at-a-glance now that the warn-colored
         // \u22EF button is gone.
-        return `<tr data-identity='${escapeHtml(ident)}' class="md-row-clickable${needsFix ? ' md-row-needs-fix' : ''}" title="Click for channel actions (or right-click)">
+        return `<tr data-identity='${escapeHtml(ident)}' class="md-row-clickable${needsFix ? ' md-row-needs-fix' : ''}" tabindex="0" aria-label="Actions for ${escapeHtml(r.name)}" title="Open channel actions">
           <td class="md-col-name">${escapeHtml(r.name)}</td>
-          <td class="md-col-num">${(r.video_count || 0).toLocaleString()}</td>
+          <td class="md-col-num">${trackedVideoCount(r).toLocaleString()}</td>
           <td class="md-col-ids">${idHtml}</td>
           <td class="md-col-ids">${thumbHtml}</td>
           <td class="md-col-ids">${txHtml}</td>
@@ -562,24 +591,35 @@
       }).join("");
     };
 
-    // Compact elapsed formatter — mirrors backend utils.format_elapsed
-    // (rule: never show raw seconds beyond 60 — fold into
-    // "Xm YYs" / "Xh Ym YYs"). Used by the Loading... ticker so the
-    // Metadata tab table doesn't sit silent during a slow DB query.
-    const _fmtElapsed = (s) => {
-      s = Math.max(0, Math.floor(s));
-      if (s < 60) return s + "s";
-      const h = Math.floor(s / 3600);
-      const m = Math.floor((s % 3600) / 60);
-      const ss = s % 60;
-      const pad = (n) => (n < 10 ? "0" + n : "" + n);
-      if (h) return `${h}h ${m}m ${pad(ss)}s`;
-      return `${m}m ${pad(ss)}s`;
+    const _paintMetadataCatalogStatus = (status) => {
+      let note = document.getElementById("metadata-catalog-status");
+      if (!note) {
+        note = document.createElement("span");
+        note.id = "metadata-catalog-status";
+        note.className = "status-text metadata-catalog-status";
+        note.setAttribute("role", "status");
+        note.setAttribute("aria-live", "polite");
+        bReload?.parentElement?.insertBefore(note, bReload);
+      }
+      if (status.phase === "done") {
+        note.hidden = true;
+        note.textContent = "";
+        return;
+      }
+      note.hidden = false;
+      note.setAttribute("aria-live", status.announce === false ? "off" : "polite");
+      note.textContent = status.phase === "loading"
+        ? "Refreshing channel details…"
+        : status.text;
+      const inline = document.getElementById("md-load-info");
+      if (inline) inline.textContent = status.phase === "loading"
+        ? ""
+        : status.text;
     };
 
     window._refreshMetadataTab = async (opts = {}) => {
       if (!nativeBridgeUp()) {
-        tbody.innerHTML = '<tr><td colspan="9" class="md-empty">Native mode required.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" class="md-empty">YTArchiver isn\'t ready yet. Try again in a moment.</td></tr>';
         return;
       }
       const preferCache = !!opts.preferCache;
@@ -597,16 +637,9 @@
         }
       }
       const _myLoadGen = ++_loadGen;
-      // Live "Loading channels..." with elapsed counter so the table
-      // doesn't sit silent during a slow DB query (sometimes the
-      // index DB lock is held by an in-flight sweep / ingest, in
-      // which case this call blocks until they finish).
-      const _t0 = Date.now();
       // Instant paint: if we already have rows (this session or persisted
       // from last), show them immediately and refresh in place. Only the
-      // genuine first-ever load (no cache) falls back to the elapsed
-      // ticker below, which explains a slow index-DB query.
-      let _ticker = null;
+      // genuine first-ever load (no cache) falls back to a status row.
       const _cached = _rows.length ? _rows : _loadCachedMeta();
       if (_cached && _cached.length) {
         _rows = _cached;
@@ -614,43 +647,30 @@
         try { render(); } catch (e) { /* stale cache shape */ }
         if (table) table.classList.add("is-refreshing");
       } else {
-      tbody.innerHTML = '<tr><td colspan="9" class="md-empty">'
-        + 'Loading channels\u2026 <span id="md-load-info" class="md-load-info"></span>'
-        + '</td></tr>';
-      const _info = document.getElementById("md-load-info");
-      const _paint = () => {
-        if (!_info || !_info.isConnected) return;
-        const el = (Date.now() - _t0) / 1000;
-        let msg = `(${_fmtElapsed(el)})`;
-        // After ~10s the call is unusually slow. Tell the user why
-        // so they don't think the app is hung. After ~30s, escalate
-        // — the DB is almost certainly contending with another op
-        // (most often a startup-time metadata task or background sweep that
-        // hasn't finished yet on a large archive).
-        if (el > 30) {
-          msg += " \u00b7 still waiting on the index DB \u2014 a startup "
-                + "metadata or maintenance task is likely holding "
-                + "the lock; this usually clears when that background work "
-                + "finishes";
-        } else if (el > 10) {
-          msg += " \u00b7 querying the index DB\u2026";
-        }
-        _info.textContent = msg;
-      };
-      _paint();
-      _ticker = setInterval(_paint, 1000);
+        tbody.innerHTML = '<tr><td colspan="9" class="md-empty">'
+          + 'Loading channels\u2026 <span id="md-load-info" class="md-load-info"></span>'
+          + '</td></tr>';
       }
       // Mark thumbnails as not-yet-loaded so the column renders a
       // spinner until the bulk walk completes.
       _thumbsLoaded = false;
       _thumbStatusInFlight = false;
+      _thumbStatusError = "";
       try {
-        const rows = await bridgeCall("get_channel_metadata_status");
-        if (_myLoadGen !== _loadGen) {
-          clearInterval(_ticker);
-          return;
+        const outcome = await window.YT.bridge.catalogRead(
+          "metadata",
+          () => bridgeCall("get_channel_metadata_status"),
+          {
+            label: "channel metadata",
+            onStatus: _paintMetadataCatalogStatus,
+          });
+        if (outcome.stale || _myLoadGen !== _loadGen) return;
+        const rows = outcome.value;
+        if (!Array.isArray(rows)) {
+          throw new Error(rows?.error || "Channel information is unavailable.");
         }
         _rows = Array.isArray(rows) ? rows : [];
+        _catalogLoadError = "";
         _lastRowsLoadAt = Date.now();
         _saveCachedMeta(_rows);
         if (table) table.classList.remove("is-refreshing");
@@ -662,23 +682,43 @@
         // the column when it returns.
         if (nativeBridgeUp()) {
           _thumbStatusInFlight = true;
-          bridgeCall("thumbnail_status_bulk").then((thRes) => {
-            if (_myLoadGen !== _loadGen) {
+          window.YT.bridge.catalogRead(
+            "metadata-background",
+            () => bridgeCall("thumbnail_status_bulk"),
+            {
+              lane: "background",
+              label: "thumbnail coverage",
+              onStatus: (status) => {
+                if (_myLoadGen === _loadGen) {
+                  _paintMetadataCatalogStatus(status);
+                }
+              },
+            }).then((thumbOutcome) => {
+            if (thumbOutcome.stale || _myLoadGen !== _loadGen) {
               _thumbStatusInFlight = false;
               return;
             }
             _thumbStatusInFlight = false;
-            _mergeThumbStatus(thRes);
+            try {
+              _mergeThumbStatus(thumbOutcome.value);
+            } catch (error) {
+              _thumbsLoaded = true;
+              _thumbStatusError = error?.message || String(error);
+              window._showToast?.(
+                `Couldn't load thumbnail coverage: ${_thumbStatusError}`,
+                "warn");
+            }
             // Re-render once thumb data is in. Cheap — same rows,
             // just rebuilt with the merged values.
             try { render(); } catch {}
-          }).catch(() => {
+          }).catch((error) => {
             if (_myLoadGen !== _loadGen) {
               _thumbStatusInFlight = false;
               return;
             }
             _thumbStatusInFlight = false;
             _thumbsLoaded = true;
+            _thumbStatusError = error?.message || String(error);
             try { render(); } catch {}
           });
         } else {
@@ -688,7 +728,7 @@
         }
       } catch (e) {
         console.error("get_channel_metadata_status:", e);
-        clearInterval(_ticker);
+        _catalogLoadError = e?.message || String(e);
         if (table) table.classList.remove("is-refreshing");
         // If cached rows are already on screen, keep them and just toast —
         // don't replace real (if stale) data with an error message.
@@ -700,7 +740,6 @@
         }
         return;
       }
-      clearInterval(_ticker);
       render();
     };
 
@@ -709,7 +748,8 @@
     // for numbers + "refresh" columns where "most recent first"
     // reads more naturally).
     table.querySelectorAll("thead th[data-sort]").forEach(th => {
-      th.addEventListener("click", () => {
+      th.tabIndex = 0;
+      const activateSort = () => {
         const key = th.dataset.sort;
         if (key === _sortKey) {
           _sortDir = _sortDir === "asc" ? "desc" : "asc";
@@ -718,6 +758,12 @@
           _sortDir = (key === "name") ? "asc" : "desc";
         }
         render();
+      };
+      th.addEventListener("click", activateSort);
+      th.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        activateSort();
       });
     });
 
@@ -761,14 +807,9 @@
       const fastTxt = _fmtMin(fastSec);
       const thoroughTxt = _fmtMin(thoroughSec);
       const msg = (ctxLabel ? ctxLabel + "\n\n" : "")
-        + "Fast: match by title + duration only. Works great for "
-        + "channels with stable titles and varied durations. "
-        + "Doesn't help when YouTube renamed lots of titles AND "
-        + "many videos share a duration.\n\n"
-        + "Thorough: also re-fetches the upload date for every "
-        + "candidate video so date can disambiguate renamed titles. "
-        + "Hits YouTube hard — one request per candidate (~3s each, "
-        + "parallelized 4-wide). Use when Fast left a lot unresolved.";
+        + "Fast matches by title and duration. Try this first.\n\n"
+        + "Thorough also checks upload dates. It is slower and uses more "
+        + "YouTube requests; use it if Fast leaves videos unmatched.";
       const pick = await window.askChoice({
         title: "Fix missing video IDs",
         message: msg,
@@ -794,7 +835,7 @@
       if (!nativeBridgeUp()) return;
       if (act === "views") {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Native mode required.", "warn"); return;
+          window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn"); return;
         }
         const pickN = parseInt(rowRefs, 10);
         const days = (Number.isFinite(pickN) && pickN > 0) ? pickN : null;
@@ -814,7 +855,7 @@
         }
       } else if (act === "backfill") {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Native mode required.", "warn"); return;
+          window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn"); return;
         }
         // Look up this channel's video count from the cached _rows
         // so the dialog can show real time estimates.
@@ -832,8 +873,8 @@
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
             const head = _mode === "thorough"
-              ? "Queued video_id backfill (thorough)."
-              : "Queued video_id backfill (fast).";
+              ? "Queued missing-ID repair (thorough)."
+              : "Queued missing-ID repair (fast).";
             window._showToast?.(head + _pausedTail(res),
               res?.paused ? "warn" : "ok");
           }
@@ -843,7 +884,7 @@
       } else if (act === "thumbs") {
         // refetch missing thumbnails for one channel.
         if (!nativeBridgeUp()) {
-          window._showToast?.("Native mode required.", "warn"); return;
+          window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn"); return;
         }
         try {
           const res = await bridgeCall("refetch_thumbnails", ident);
@@ -864,12 +905,17 @@
           window._showToast?.("Channel name unavailable.", "error");
           return;
         }
+        const channelIdentity = {
+          name: channelName,
+          folder: row?.folder || ident.folder || "",
+          url: row?.url || ident.url || "",
+        };
         if (typeof window._askTranscribeChannel === "function") {
-          await window._askTranscribeChannel(channelName);
+          await window._askTranscribeChannel(channelIdentity);
           return;
         }
         try {
-          const res = await bridgeCall("chan_transcribe_all", channelName);
+          const res = await bridgeCall("chan_transcribe_all", channelIdentity);
           if (!res?.ok) {
             window._showToast?.(res?.error || "Transcribe failed to start.",
               "error");
@@ -888,7 +934,7 @@
             }) : "follow";
             if (pick === null) return;
             const retry = await bridgeCall(
-              "chan_transcribe_all", channelName, pick === "combined");
+              "chan_transcribe_all", channelIdentity, pick === "combined");
             if (!retry?.ok) {
               window._showToast?.(
                 retry?.error || "Transcribe failed to start.", "error");
@@ -907,7 +953,7 @@
         }
       } else if (act === "comments") {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Native mode required.", "warn"); return;
+          window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn"); return;
         }
         // Caller passes the time-scope directly as the `arg` parameter
         // (set by the context-menu submenu's data-days attribute).
@@ -935,14 +981,21 @@
     // the same dropdown at the click point. Active reference + close
     // helper — only one menu lives at a time.
     let _activeMenu = null;
-    const _closeRowMenu = () => {
+    let _activeMenuTrigger = null;
+    const _closeRowMenu = (restoreFocus = false) => {
+      const trigger = _activeMenuTrigger;
       if (_activeMenu) {
         try { _activeMenu.remove(); } catch {}
         _activeMenu = null;
       }
+      _activeMenuTrigger = null;
+      if (restoreFocus && trigger?.isConnected) {
+        try { trigger.focus(); } catch {}
+      }
     };
     const _openRowMenu = (tr, clientX, clientY) => {
       _closeRowMenu();
+      _activeMenuTrigger = tr;
       let ident = {};
       try { ident = JSON.parse(tr.dataset.identity || "{}"); } catch {}
       const row = _rowForIdent(ident);
@@ -965,6 +1018,7 @@
         const b = document.createElement("button");
         b.type = "button";
         b.className = "md-cm-item" + (opts.warn ? " md-cm-warn" : "");
+        b.setAttribute("role", "menuitem");
         b.dataset.act = act;
         if (opts.days !== undefined) b.dataset.days = String(opts.days);
         b.textContent = label;
@@ -983,9 +1037,14 @@
       const viewsHead = document.createElement("button");
       viewsHead.type = "button";
       viewsHead.className = "md-cm-item md-cm-has-sub";
+      viewsHead.setAttribute("role", "menuitem");
+      viewsHead.setAttribute("aria-haspopup", "menu");
+      viewsHead.setAttribute("aria-expanded", "false");
       viewsHead.innerHTML = "Refresh views/likes<span class=\"md-cm-chev\">›</span>";
       const viewsSub = document.createElement("div");
       viewsSub.className = "md-cm-sub";
+      viewsSub.setAttribute("role", "menu");
+      viewsSub.setAttribute("aria-label", "Refresh views and likes range");
       viewsSub.appendChild(mkItem("Last week", "views", { days: 7 }));
       viewsSub.appendChild(mkItem("Last month", "views", { days: 30 }));
       viewsSub.appendChild(mkItem("Last year", "views", { days: 365 }));
@@ -998,9 +1057,14 @@
       const commentsHead = document.createElement("button");
       commentsHead.type = "button";
       commentsHead.className = "md-cm-item md-cm-has-sub";
+      commentsHead.setAttribute("role", "menuitem");
+      commentsHead.setAttribute("aria-haspopup", "menu");
+      commentsHead.setAttribute("aria-expanded", "false");
       commentsHead.innerHTML = "Refresh comments<span class=\"md-cm-chev\">\u203a</span>";
       const commentsSub = document.createElement("div");
       commentsSub.className = "md-cm-sub";
+      commentsSub.setAttribute("role", "menu");
+      commentsSub.setAttribute("aria-label", "Refresh comments range");
       commentsSub.appendChild(mkItem("Last 7 days", "comments", { days: 7 }));
       commentsSub.appendChild(mkItem("Last 30 days", "comments", { days: 30 }));
       commentsSub.appendChild(mkItem("Last 90 days", "comments", { days: 90 }));
@@ -1023,11 +1087,21 @@
       menu.appendChild(commentsWrap);
       menu.appendChild(thumbsItem);
 
-      // Leaf-item click → close + dispatch. Submenu header is hover-only.
+      // Leaf-item click → close + dispatch. Clicking a submenu header
+      // opens it and moves focus to the first choice, matching keyboard use.
       menu.addEventListener("click", async (ev) => {
         const btn = ev.target.closest(".md-cm-item");
         if (!btn) return;
-        if (btn.classList.contains("md-cm-has-sub")) return;
+        if (btn.classList.contains("md-cm-has-sub")) {
+          const expanded = btn.getAttribute("aria-expanded") === "true";
+          menu.querySelectorAll(".md-cm-has-sub").forEach(head =>
+            head.setAttribute("aria-expanded", "false"));
+          btn.setAttribute("aria-expanded", String(!expanded));
+          if (!expanded) {
+            btn.nextElementSibling?.querySelector(".md-cm-item")?.focus?.();
+          }
+          return;
+        }
         const act = btn.dataset.act;
         const days = btn.dataset.days; // string or undefined
         _closeRowMenu();
@@ -1054,7 +1128,8 @@
       menu.style.top = y + "px";
 
       setTimeout(() => {
-        const first = menu.querySelector(".md-cm-item:not(.md-cm-has-sub)");
+        const first = menu.querySelector(
+          ":scope > .md-cm-item, :scope > .md-cm-sub-wrap > .md-cm-has-sub");
         first?.focus?.();
       }, 0);
     };
@@ -1067,7 +1142,36 @@
     document.addEventListener("keydown", (e) => {
       if (_activeMenu && e.key === "Escape") {
         e.preventDefault();
-        _closeRowMenu();
+        _closeRowMenu(true);
+      } else if (_activeMenu && ["Enter", " ", "ArrowRight"].includes(e.key)
+                 && document.activeElement?.classList?.contains("md-cm-has-sub")) {
+        e.preventDefault();
+        const head = document.activeElement;
+        _activeMenu.querySelectorAll(".md-cm-has-sub").forEach(other =>
+          other.setAttribute("aria-expanded", String(other === head)));
+        head.nextElementSibling?.querySelector(".md-cm-item")?.focus?.();
+      } else if (_activeMenu && e.key === "ArrowLeft"
+                 && document.activeElement?.closest?.(".md-cm-sub")) {
+        e.preventDefault();
+        const sub = document.activeElement.closest(".md-cm-sub");
+        const head = sub?.previousElementSibling;
+        head?.setAttribute("aria-expanded", "false");
+        head?.focus?.();
+      } else if (_activeMenu && ["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
+        const activeSub = document.activeElement?.closest?.(".md-cm-sub");
+        const items = activeSub
+          ? Array.from(activeSub.querySelectorAll(":scope > .md-cm-item"))
+          : Array.from(_activeMenu.querySelectorAll(
+            ":scope > .md-cm-item, :scope > .md-cm-sub-wrap > .md-cm-has-sub"));
+        if (!items.length) return;
+        e.preventDefault();
+        const current = items.indexOf(document.activeElement);
+        let next = 0;
+        if (e.key === "End") next = items.length - 1;
+        else if (e.key === "Home") next = 0;
+        else if (e.key === "ArrowUp") next = current <= 0 ? items.length - 1 : current - 1;
+        else next = current < 0 || current >= items.length - 1 ? 0 : current + 1;
+        items[next].focus();
       }
     });
     window.addEventListener("resize", _closeRowMenu);
@@ -1095,12 +1199,22 @@
       e.preventDefault();
       _openRowMenu(tr, e.clientX, e.clientY);
     });
+    tbody.addEventListener("keydown", (e) => {
+      const tr = e.target.closest("tr.md-row-clickable");
+      if (!tr) return;
+      const openMenu = e.key === "Enter" || e.key === " "
+        || e.key === "ContextMenu" || (e.shiftKey && e.key === "F10");
+      if (!openMenu) return;
+      e.preventDefault();
+      const rect = tr.getBoundingClientRect();
+      _openRowMenu(tr, rect.left + 24, rect.top + Math.min(24, rect.height / 2));
+    });
 
     // Bulk buttons.
     if (bAllViews) {
       bAllViews.addEventListener("click", async () => {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Native mode required.", "warn"); return;
+          window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn"); return;
         }
         const pick = await (window.askChoice ? window.askChoice({
           title: "Refresh views/likes — all channels",
@@ -1134,7 +1248,7 @@
     if (bAllComments) {
       bAllComments.addEventListener("click", async () => {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Native mode required.", "warn"); return;
+          window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn"); return;
         }
         const pick = await (window.askChoice ? window.askChoice({
           title: "Refresh all comments",
@@ -1166,7 +1280,7 @@
     if (bAllBackfill) {
       bAllBackfill.addEventListener("click", async () => {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Native mode required.", "warn"); return;
+          window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn"); return;
         }
         // Show how many channels would be queued BEFORE asking so the
         // user knows whether this is a big operation or a tiny no-op.
@@ -1174,12 +1288,17 @@
         // aggregate count we're holding from the last tab render.
         const needing = _rows.filter(r => (r.id_total || 0) > 0 && (r.id_missing || 0) > 0).length;
         if (needing === 0) {
-          window._showToast?.("All channels already have video_ids \u2014 nothing to do.", "ok");
+          if (_catalogLoadError) {
+            window._showToast?.(
+              `Couldn't verify video IDs: ${_catalogLoadError}`, "error");
+            return;
+          }
+          window._showToast?.("All channels already have YouTube IDs.", "ok");
           return;
         }
         const pick = await (window.askChoice ? window.askChoice({
           title: "Fix missing video IDs?",
-          message: `Will queue ${needing} channel(s) that currently have missing video_ids. Next step asks which match mode to use.`,
+          message: `${needing} channel(s) have videos with missing YouTube IDs. Choose which channels to repair.`,
           choices: [
             { label: `Queue ${needing} channel(s)`, value: "missing", kind: "primary" },
             { label: "Queue ALL channels (force)", value: "all" },
@@ -1225,7 +1344,7 @@
     if (bAllThumbs) {
       bAllThumbs.addEventListener("click", async () => {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Native mode required.", "warn"); return;
+          window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn"); return;
         }
         const nMissing = _rows.reduce(
           (sum, r) => sum + Math.max(
@@ -1234,6 +1353,14 @@
         const nChannels = _rows.filter(r =>
           (r.thumb_total || 0) > (r.thumb_with || 0)).length;
         if (nMissing === 0) {
+          if (_thumbStatusError || !_thumbsLoaded) {
+            window._showToast?.(
+              _thumbStatusError
+                ? `Couldn't verify thumbnails: ${_thumbStatusError}`
+                : "Thumbnail coverage is still loading.",
+              _thumbStatusError ? "error" : "warn");
+            return;
+          }
           window._showToast?.(
             "Every channel already has all its thumbnails.", "ok");
           return;
@@ -1242,8 +1369,8 @@
           title: "Refetch missing thumbnails for all channels?",
           message: `${nMissing.toLocaleString()} thumbnail(s) missing `
             + `across ${nChannels} channel(s). Each missing thumbnail `
-            + `is downloaded from the URL cached in metadata.jsonl. `
-            + `Runs in the background; progress streams to the log. `
+            + `is downloaded from its saved YouTube information. `
+            + `Runs in the background; progress appears in the log. `
             + `(Some thumbnails may be unrecoverable if the source URL `
             + `404s or the video was removed from YouTube.)`,
           choices: [
@@ -1281,7 +1408,7 @@
       bRecheckThumbs.addEventListener("click", async () => {
         if (bRecheckThumbs.disabled) return;
         if (!nativeBridgeUp()) {
-          window._showToast?.("Native mode required.", "warn"); return;
+          window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn"); return;
         }
         bRecheckThumbs.disabled = true;
         if (recheckProgress) {
@@ -1296,21 +1423,34 @@
         const _myLoadGen = ++_loadGen;
         _thumbsLoaded = false;
         try { render(); } catch {}
-        const _t0 = Date.now();
-        const _tick = setInterval(() => {
-          if (!recheckProgress || recheckProgress.hidden) return;
-          const sec = Math.floor((Date.now() - _t0) / 1000);
-          recheckProgress.textContent = ` · rechecking ${sec}s…`;
-        }, 1000);
         try {
-          // Fire both in parallel — they read separate sources (DB
-          // vs filesystem) so they don't contend.
-          const [metaRows, thRes] = await Promise.all([
-            bridgeCall("get_channel_metadata_status", true),
-            bridgeCall("thumbnail_status_bulk", true),
-          ]);
-          if (_myLoadGen !== _loadGen) return;
-          _rows = Array.isArray(metaRows) ? metaRows : [];
+          const outcome = await window.YT.bridge.catalogRead(
+            "metadata-background",
+            async (context) => {
+              const metaRows = await bridgeCall(
+                "get_channel_metadata_status", true);
+              if (!context.isCurrent()) return null;
+              const thRes = await bridgeCall("thumbnail_status_bulk", true);
+              return { metaRows, thRes };
+            },
+            {
+              lane: "background",
+              label: "all metadata statistics",
+              onStatus: (status) => {
+                if (!recheckProgress || status.phase === "done") return;
+                recheckProgress.textContent = ` · ${status.text}`;
+              },
+            });
+          if (outcome.stale || _myLoadGen !== _loadGen || !outcome.value) return;
+          const { metaRows, thRes } = outcome.value;
+          if (!Array.isArray(metaRows)) {
+            throw new Error(metaRows?.error || "Channel information is unavailable.");
+          }
+          if (!thRes?.ok) {
+            throw new Error(thRes?.error || "Thumbnail coverage is unavailable.");
+          }
+          _rows = metaRows;
+          _catalogLoadError = "";
           _lastRowsLoadAt = Date.now();
           _mergeThumbStatus(thRes);
           try { render(); } catch {}
@@ -1325,7 +1465,9 @@
           try { render(); } catch {}
           window._showToast?.(String(e), "error");
         } finally {
-          clearInterval(_tick);
+          if (_myLoadGen === _loadGen && table) {
+            table.classList.remove("is-refreshing");
+          }
           bRecheckThumbs.disabled = false;
           if (recheckProgress) {
             recheckProgress.hidden = true;
@@ -1335,9 +1477,8 @@
       });
     }
 
-    // If the user's initial panel is the Metadata tab (e.g. after a
-    // restart where it was remembered as active), pull data now.
-    const metaView = document.getElementById("settings-view-metadata");
+    // If Library is initially visible, pull channel information now.
+    const metaView = document.getElementById("settings-view-library");
     if (metaView && !metaView.hidden) {
       // Re-check display inside the timeout — if the user clicks
       // away to another tab in the 400ms window, the fetch isn't

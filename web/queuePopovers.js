@@ -35,6 +35,7 @@
       ["btn-sync-tasks", "popover-sync-tasks"],
       ["btn-gpu-tasks", "popover-gpu-tasks"],
     ];
+    const triggerIds = ["btn-sync-tasks", "btn-gpu-tasks", "gsb-sync", "gsb-gpu"];
     for (const [btnId, popId] of pairs) {
       const btn = document.getElementById(btnId);
       const pop = document.getElementById(popId);
@@ -58,12 +59,9 @@
       closeAllQueuePopovers();
       if (!wasOpen) {
         anchorPopover(pop, anchorEl);
+        pop._queueAnchor = anchorEl;
         pop.classList.add("open");
-        for (const [bId, pId] of pairs) {
-          if (pId === popId) {
-            document.getElementById(bId)?.setAttribute("aria-expanded", "true");
-          }
-        }
+        anchorEl.setAttribute("aria-expanded", "true");
       }
     }
     // Public entry point for the status bar. `which` = "sync" | "gpu".
@@ -79,12 +77,19 @@
     // AND the custom-tooltip system (uxPolish.js) skips any element that's
     // aria-expanded, so the button's tooltip can't render on top of the
     // popover it just opened.
-    function closeAllQueuePopovers() {
-      document.querySelectorAll(".queue-popover.open")
-        .forEach(p => p.classList.remove("open"));
-      for (const [bId] of pairs) {
-        document.getElementById(bId)?.setAttribute("aria-expanded", "false");
+    function closeAllQueuePopovers({ restoreFocus = false } = {}) {
+      const open = Array.from(
+        document.querySelectorAll(".queue-popover.open"));
+      const anchor = open.length ? open[open.length - 1]._queueAnchor : null;
+      open.forEach(p => p.classList.remove("open"));
+      triggerIds.forEach((id) => {
+        document.getElementById(id)?.setAttribute("aria-expanded", "false");
+      });
+      if (restoreFocus && anchor?.isConnected && !anchor.disabled) {
+        try { anchor.focus({ preventScroll: true }); }
+        catch { try { anchor.focus(); } catch {} }
       }
+      return open.length;
     }
 
     // Close on outside click — but ignore clicks inside modals /
@@ -104,25 +109,24 @@
       });
       // Reset the trigger flags if any popover actually closed here.
       if (anyClosed) {
-        for (const [bId, pId] of pairs) {
-          const p = document.getElementById(pId);
-          if (p && !p.classList.contains("open")) {
-            document.getElementById(bId)?.setAttribute("aria-expanded", "false");
-          }
-        }
+        triggerIds.forEach((id) => {
+          document.getElementById(id)?.setAttribute("aria-expanded", "false");
+        });
       }
     });
     // Close on Escape
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") closeAllQueuePopovers();
+      if (e.key === "Escape") {
+        closeAllQueuePopovers({ restoreFocus: true });
+      }
     });
     // Reposition on window resize
     window.addEventListener("resize", () => {
-      for (const [btnId, popId] of pairs) {
-        const btn = document.getElementById(btnId);
+      for (const [, popId] of pairs) {
         const pop = document.getElementById(popId);
-        if (btn && pop && pop.classList.contains("open")) {
-          anchorPopover(pop, btn);
+        const anchor = pop?._queueAnchor;
+        if (anchor && pop.classList.contains("open")) {
+          anchorPopover(pop, anchor);
         }
       }
     });
@@ -140,7 +144,7 @@
 
       swap.addEventListener("change", async () => {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Native mode required for model swap.", "warn");
+          window._showToast?.("The model change isn't ready yet. Try again in a moment.", "warn");
           return;
         }
         const prev = swap.dataset.prev || swap.value;

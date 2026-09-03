@@ -12,13 +12,28 @@ import json
 import os
 import threading
 import time
+import uuid
 
 from backend import archive_scan as archive_scan_backend
 from backend import index as index_backend
 from backend import reorg as reorg_backend
 from backend import subs as subs_backend
 from backend.log import swallow
+from backend.services.job_supervisor import WorkAdmissionClosed
+from backend.services.managed_work import (
+    admitted_operation,
+    lease_busy_result,
+    start_managed_task,
+    try_global_archive_lease,
+)
 from backend.ytarchiver_config import load_config
+
+
+def _channel_archive_path(output_dir, channel):
+    """Resolve every maintenance operation through the real disk folder."""
+    from backend.sync import channel_folder_name
+    folder_name = channel_folder_name(channel)
+    return os.path.join(output_dir, folder_name) if folder_name else ""
 
 
 class MediaOpsMixin:
@@ -72,6 +87,8 @@ class MediaOpsMixin:
         self._ensure_archive_rescan_state()
         with self._archive_rescan_lock:
             state = self._archive_rescan_progress
+            previous_current = max(0, int(state.get("current") or 0))
+            previous_percent = max(0, int(state.get("percent") or 0))
             updates = {
                 "running": running,
                 "phase": phase,
@@ -85,12 +102,18 @@ class MediaOpsMixin:
             }
             for key, value in updates.items():
                 if value is not None:
+                    if (key == "current" and state.get("running")
+                            and running is not False):
+                        value = max(previous_current, int(value or 0))
                     state[key] = value
             try:
                 cur = max(0, int(state.get("current") or 0))
                 tot = max(0, int(state.get("total") or 0))
-                state["percent"] = min(100, round(cur * 100 / tot)) \
-                    if tot else 0
+                calculated = min(100, round(cur * 100 / tot)) if tot else 0
+                state["percent"] = (
+                    max(previous_percent, calculated)
+                    if state.get("running") else calculated
+                )
             except Exception:
                 state["percent"] = 0
             snapshot = dict(state)
@@ -105,6 +128,11 @@ class MediaOpsMixin:
         `.fNNN-X` filter landed).
         """
         self._ensure_archive_rescan_state()
+        admission = getattr(self, "_work_admission_error", None)
+        if callable(admission):
+            blocked = admission("an archive rescan")
+            if blocked is not None:
+                return blocked
 
         # Manual maintenance should not be allowed to create the reverse of
         # the autorun collision: if a sync/download or another catalog writer
@@ -127,12 +155,33 @@ class MediaOpsMixin:
             # Old/test index shims may not expose the advisory helper.
             pass
 
+        from backend.services.channel_leases import (
+            LeaseOwner,
+            channel_leases,
+            global_archive_aliases,
+        )
+        task_id = f"archive-rescan-{uuid.uuid4().hex}"
+        cancel = threading.Event()
+        lease_result = channel_leases.try_acquire(
+            global_archive_aliases(),
+            LeaseOwner(
+                "archive-rescan", task_id, label="Archive rescan",
+                task_id=task_id, kind="maintenance"),
+            cancel_event=cancel,
+        )
+        if not lease_result.ok or lease_result.lease is None:
+            return {"ok": False, "started": False, "busy": True,
+                    "error": lease_result.explanation}
+        archive_lease = lease_result.lease
+
         with self._archive_rescan_lock:
             if self._archive_rescan_running:
+                archive_lease.release()
                 return {"ok": True, "started": False,
                         "already_running": True,
                         "state": dict(self._archive_rescan_progress)}
             self._archive_rescan_running = True
+            self._archive_rescan_cancel = cancel
             _started_at = time.time()
             self._archive_rescan_progress = {
                 "running": True,
@@ -152,13 +201,18 @@ class MediaOpsMixin:
         def _run():
             _success = False
             _failure = ""
+            _was_cancelled = False
             _work_total = 1
-            _channel_total = 0
+            _target_total = 0
             try:
+                if cancel.is_set():
+                    _was_cancelled = True
+                    _failure = "Archive rescan cancelled."
+                    return
                 cfg = self._config or load_config()
                 output_dir = (cfg.get("output_dir") or "").strip()
                 if not output_dir:
-                    _failure = "No output_dir configured."
+                    _failure = "No archive folder is configured."
                     self._log_stream.emit_error(_failure)
                     return
                 if not os.path.isdir(output_dir):
@@ -170,11 +224,17 @@ class MediaOpsMixin:
                     self._log_stream.emit_error(_failure)
                     return
                 channels = cfg.get("channels", [])
-                _channel_total = len(channels)
-                # One unit for prune, then one per channel for sweep and size
-                # verification.  This keeps the visible bar monotonic across
-                # all three phases rather than resetting to 0% twice.
-                _work_total = max(1, 1 + (2 * _channel_total))
+                extra_roots = list(cfg.get("tp_archive_roots") or [])
+                scan_targets, _accepted_roots = (
+                    index_backend.build_archive_scan_plan(
+                        output_dir, channels, extra_roots)
+                )
+                _target_total = len(scan_targets)
+                # One unit for prune, then one per actual sweep target for
+                # both scanning and size verification. Additional archive
+                # targets must be included up front or the bar can reach 100%
+                # during scanning and then jump backward for the size pass.
+                _work_total = max(1, 1 + (2 * _target_total))
                 self._set_archive_rescan_progress(
                     running=True, phase="prune", current=0,
                     total=_work_total, phase_current=0, phase_total=1,
@@ -189,6 +249,10 @@ class MediaOpsMixin:
                     "simpleline_blue")
                 self._log_stream.flush()
                 pruned = index_backend.prune_missing_videos()
+                if cancel.is_set():
+                    _was_cancelled = True
+                    _failure = "Archive rescan cancelled."
+                    return
                 if pruned.get("aborted_suspicious"):
                     self._log_stream.emit_error(
                         "Prune skipped: "
@@ -207,7 +271,7 @@ class MediaOpsMixin:
                             f"{pruned['duplicate_id']} duplicate(s) flagged")
                     if pruned.get("fake_id_cleared"):
                         _parts.append(
-                            f"{pruned['fake_id_cleared']} fake video_id(s) cleared")
+                            f"{pruned['fake_id_cleared']} invalid YouTube ID(s) cleared")
                     self._log_stream.emit_text(
                         " \u2014 Pruned: " + ", ".join(_parts) + ".",
                         "simpleline_green")
@@ -217,26 +281,43 @@ class MediaOpsMixin:
                 self._log_stream.flush()
                 # Step 2: sweep for new files.
                 self._log_stream.emit_text(
-                    f"Rescan: scanning {len(channels)} channel folder(s) "
+                    f"Rescan: scanning {_target_total} archive folder(s) "
                     f"for new files...", "simpleline_blue")
                 self._log_stream.flush()
                 self._set_archive_rescan_progress(
                     running=True, phase="scan", current=1,
                     total=_work_total, phase_current=0,
-                    phase_total=_channel_total,
-                    message=f"Rescan: scanning 0/{_channel_total} channels…")
+                    phase_total=_target_total,
+                    message=f"Rescan: scanning 0/{_target_total} folders…")
 
+                _scan_completed = 0
                 def _scan_progress(idx, total, channel_name):
+                    nonlocal _scan_completed
+                    if cancel.is_set():
+                        return
+                    _scan_completed = max(
+                        _scan_completed,
+                        min(_target_total, max(0, int(idx or 0))),
+                    )
                     self._set_archive_rescan_progress(
                         running=True, phase="scan",
-                        current=min(_work_total, 1 + int(idx or 0)),
-                        total=_work_total, phase_current=int(idx or 0),
-                        phase_total=int(total or _channel_total),
-                        message=(f"Rescan: scanning {idx}/{total} — "
+                        current=min(_work_total, 1 + _scan_completed),
+                        total=_work_total, phase_current=_scan_completed,
+                        phase_total=_target_total,
+                        message=(f"Rescan: scanning {_scan_completed}/"
+                                 f"{_target_total} — "
                                  f"{channel_name}"))
 
                 sweep = index_backend.sweep_new_videos(
-                    output_dir, channels, progress_cb=_scan_progress)
+                    output_dir,
+                    channels,
+                    progress_cb=_scan_progress,
+                    extra_roots=extra_roots,
+                )
+                if cancel.is_set():
+                    _was_cancelled = True
+                    _failure = "Archive rescan cancelled."
+                    return
                 # The size button promises a real folder-size rescan. Startup
                 # sweep deliberately skips stat calls for known paths, so it
                 # cannot notice in-place redownload replacements by itself.
@@ -247,34 +328,43 @@ class MediaOpsMixin:
                 _sizes_updated = 0
                 self._set_archive_rescan_progress(
                     running=True, phase="sizes",
-                    current=1 + _channel_total, total=_work_total,
-                    phase_current=0, phase_total=_channel_total,
+                    current=1 + _target_total, total=_work_total,
+                    phase_current=0, phase_total=_target_total,
                     message=(f"Rescan: refreshing sizes 0/"
-                             f"{_channel_total}…"))
-                for _idx, _ch in enumerate(channels, 1):
+                             f"{_target_total}…"))
+                for _idx, _ch in enumerate(scan_targets, 1):
+                    if cancel.is_set():
+                        _was_cancelled = True
+                        _failure = "Archive rescan cancelled."
+                        return
                     _name = (_ch.get("name") or _ch.get("folder") or "").strip()
-                    if not _name:
+                    _folder = str(_ch.get("_root_folder") or "").strip()
+                    if not _folder:
+                        _folder = _channel_archive_path(output_dir, _ch)
+                    if not _name or not _folder:
                         self._set_archive_rescan_progress(
                             running=True, phase="sizes",
-                            current=1 + _channel_total + _idx,
+                            current=1 + _target_total + _idx,
                             total=_work_total, phase_current=_idx,
-                            phase_total=_channel_total,
+                            phase_total=_target_total,
                             message=(f"Rescan: refreshing sizes {_idx}/"
-                                     f"{_channel_total}"))
+                                     f"{_target_total}"))
                         continue
-                    _folder = os.path.join(output_dir, _name)
                     _sr = index_backend.refresh_channel_file_sizes(
                         _name, _folder)
                     _sizes_updated += int(_sr.get("updated", 0))
-                    archive_scan_backend.update_disk_cache_for_channel(
-                        _ch, force_filesystem=not bool(_sr.get("checked")))
+                    if not _ch.get("_extra_root"):
+                        archive_scan_backend.update_disk_cache_for_channel(
+                            _ch,
+                            force_filesystem=not bool(_sr.get("checked")),
+                        )
                     self._set_archive_rescan_progress(
                         running=True, phase="sizes",
-                        current=1 + _channel_total + _idx,
+                        current=1 + _target_total + _idx,
                         total=_work_total, phase_current=_idx,
-                        phase_total=_channel_total,
+                        phase_total=_target_total,
                         message=(f"Rescan: refreshing sizes {_idx}/"
-                                 f"{_channel_total} — {_name}"))
+                                 f"{_target_total} — {_name}"))
                 _agg = sweep.get("agg_ingested", 0)
                 _rec = sweep.get("tx_reconciled", 0)
                 self._log_stream.emit_text(
@@ -301,12 +391,14 @@ class MediaOpsMixin:
             finally:
                 with self._archive_rescan_lock:
                     self._archive_rescan_running = False
+                    if getattr(self, "_archive_rescan_cancel", None) is cancel:
+                        self._archive_rescan_cancel = None
                 if _success:
                     self._set_archive_rescan_progress(
                         running=False, phase="complete",
                         current=_work_total, total=_work_total,
-                        phase_current=_channel_total,
-                        phase_total=_channel_total,
+                        phase_current=_target_total,
+                        phase_total=_target_total,
                         message="Rescan complete.", error="")
                     window = getattr(self, "_window", None)
                     if window is not None:
@@ -316,18 +408,37 @@ class MediaOpsMixin:
                                 "void window._onArchiveRescanComplete();")
                         except Exception as e:
                             swallow("rescan-complete JS callback", e)
+                elif _was_cancelled:
+                    self._set_archive_rescan_progress(
+                        running=False, phase="cancelled",
+                        message="Rescan cancelled.", error="")
                 else:
                     self._set_archive_rescan_progress(
                         running=False, phase="error",
                         message=f"Rescan failed: {_failure or 'unknown error'}",
                         error=_failure or "unknown error")
-                self._log_stream.flush()
+                try:
+                    self._log_stream.flush()
+                finally:
+                    archive_lease.release()
         try:
-            threading.Thread(
-                target=_run, daemon=True, name="archive-rescan").start()
+            thread = start_managed_task(
+                self,
+                owner="archive-rescan",
+                label="Archive rescan",
+                task_id=task_id,
+                cancel=cancel,
+                target=_run,
+                name="archive-rescan",
+                thread_factory=threading.Thread,
+            )
+            self._archive_rescan_thread = thread
         except Exception as e:
+            archive_lease.release()
             with self._archive_rescan_lock:
                 self._archive_rescan_running = False
+                if getattr(self, "_archive_rescan_cancel", None) is cancel:
+                    self._archive_rescan_cancel = None
             self._set_archive_rescan_progress(
                 running=False, phase="error",
                 message=f"Rescan failed to start: {e}", error=str(e))
@@ -351,6 +462,19 @@ class MediaOpsMixin:
         if getattr(self, "_hide_repair_running", False):
             return {"ok": True, "already_running": True}
         self._hide_repair_running = True
+        cancel = threading.Event()
+        task_id = f"hidden-sidecars-{uuid.uuid4().hex}"
+        admission = try_global_archive_lease(
+            owner="archive-maintenance",
+            label="Clean up support files",
+            task_id=task_id,
+            cancel=cancel,
+        )
+        if not admission.ok or admission.lease is None:
+            self._hide_repair_running = False
+            return lease_busy_result(admission)
+        lease = admission.lease
+        self._hide_repair_cancel = cancel
 
         def _run():
             try:
@@ -359,23 +483,25 @@ class MediaOpsMixin:
                 output_dir = (cfg.get("output_dir") or "").strip()
                 if not output_dir or not os.path.isdir(output_dir):
                     self._log_stream.emit_error(
-                        "Hidden-sidecar repair: no valid output_dir configured.")
+                        "Support-file cleanup: no valid archive folder is configured.")
                     return
                 channels = sorted(
                     cfg.get("channels", []) or [],
                     key=lambda c: (c.get("name") or c.get("folder") or "").lower())
                 self._log_stream.emit_text(
-                    f"Hidden-sidecar repair: scanning {len(channels)} channel "
-                    f"folder(s) for visible sidecars…", "simpleline_blue")
+                    f"Support-file cleanup: checking {len(channels)} channel "
+                    f"folder(s) for files that should be hidden…", "simpleline_blue")
                 self._log_stream.flush()
                 total_hidden = 0
                 folders_touched = 0
                 seen_dirs = set()
                 for ch in channels:
+                    if cancel.is_set():
+                        break
                     name = (ch.get("name") or ch.get("folder") or "").strip()
-                    if not name:
+                    folder = _channel_archive_path(output_dir, ch)
+                    if not name or not folder:
                         continue
-                    folder = os.path.join(output_dir, name)
                     if not os.path.isdir(folder):
                         continue
                     key = os.path.normcase(os.path.normpath(folder))
@@ -392,38 +518,64 @@ class MediaOpsMixin:
                         total_hidden += n
                         folders_touched += 1
                         self._log_stream.emit_text(
-                            f"  - {name}: hid {n} sidecar(s)", "simpleline_green")
+                            f"  - {name}: hid {n} support file(s)", "simpleline_green")
                         self._log_stream.flush()
                 # Loose singles + anything directly under the archive root
                 # (non-recursive — channel subfolders were handled above).
-                try:
-                    n_root = _u.hide_stray_sidecars(
-                        output_dir, recursive=False,
-                        hide_per_video_transcripts=True)
-                    if n_root > 0:
-                        total_hidden += n_root
-                        folders_touched += 1
-                except Exception as e:
-                    swallow("root sidecar hide", e)
-                if total_hidden > 0:
+                if not cancel.is_set():
+                    try:
+                        n_root = _u.hide_stray_sidecars(
+                            output_dir, recursive=False,
+                            hide_per_video_transcripts=True)
+                        if n_root > 0:
+                            total_hidden += n_root
+                            folders_touched += 1
+                    except Exception as e:
+                        swallow("root sidecar hide", e)
+                if cancel.is_set():
                     self._log_stream.emit_text(
-                        f"— Hidden-sidecar repair complete: hid "
-                        f"{total_hidden} previously-visible sidecar(s) across "
+                        "— Support-file cleanup cancelled.", "dim")
+                elif total_hidden > 0:
+                    self._log_stream.emit_text(
+                        f"— Support-file cleanup complete: hid "
+                        f"{total_hidden} previously visible file(s) across "
                         f"{folders_touched} folder(s). Archive folders now "
                         f"show only videos + transcripts.", "simpleline_green")
                 else:
                     self._log_stream.emit_text(
-                        "— Hidden-sidecar repair: all clean — every "
-                        "sidecar is already hidden.", "simpleline_green")
+                        "— Support-file cleanup: all support files are already "
+                        "hidden.", "simpleline_green")
                 self._log_stream.flush()
             except Exception as e:
-                self._log_stream.emit_error(f"Hidden-sidecar repair failed: {e}")
+                self._log_stream.emit_error(f"Support-file cleanup failed: {e}")
             finally:
+                lease.release()
                 self._hide_repair_running = False
+                if getattr(self, "_hide_repair_cancel", None) is cancel:
+                    self._hide_repair_cancel = None
                 self._log_stream.flush()
 
-        threading.Thread(target=_run, daemon=True,
-                         name="hide-sidecar-repair").start()
+        try:
+            self._hide_repair_thread = start_managed_task(
+                self,
+                owner="archive-maintenance",
+                label="Clean up support files",
+                task_id=task_id,
+                cancel=cancel,
+                target=_run,
+                name="hide-sidecar-repair",
+                thread_factory=threading.Thread,
+            )
+        except WorkAdmissionClosed as exc:
+            lease.release()
+            self._hide_repair_running = False
+            self._hide_repair_cancel = None
+            return {"ok": False, "started": False, "error": str(exc)}
+        except Exception as exc:
+            lease.release()
+            self._hide_repair_running = False
+            self._hide_repair_cancel = None
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "started": True}
 
 
@@ -455,36 +607,90 @@ class MediaOpsMixin:
             return {"ok": True, "already_running": True}
         self._dur_backfill_running = True
         self._dur_backfill_cancel = threading.Event()
+        task_id = f"duration-backfill-{uuid.uuid4().hex}"
 
         def _run():
+            completion = {
+                "ok": False,
+                "filled": 0,
+                "cancelled": False,
+                "error": "Video-length check did not finish.",
+            }
             try:
                 from ..metadata.core import backfill_missing_durations
                 res = backfill_missing_durations(
                     self._log_stream, self._dur_backfill_cancel)
-                # Always notify the UI on completion so the Settings button
-                # flips back to idle; pass the count filled so the frontend
-                # can refresh the Videos grid only when something changed.
-                if self._window is not None:
-                    try:
-                        _n = int(res.get("resolved") or 0)
-                        self._window.evaluate_js(
-                            "if(window._onVideoLengthsBackfilled)"
-                            f"window._onVideoLengthsBackfilled({_n});")
-                    except Exception as e:
-                        swallow("lengths-backfill JS callback", e)
+                completion = {
+                    "ok": bool(res.get("ok")),
+                    "filled": int(res.get("resolved") or 0),
+                    "cancelled": bool(res.get("cancelled")),
+                    "error": str(res.get("error") or ""),
+                }
             except Exception as e:
+                completion["error"] = str(e)
                 try:
                     self._log_stream.emit_error(f"Video-length fix failed: {e}")
                 except Exception as _e2:
                     swallow("lengths-backfill emit-error", _e2)
             finally:
+                try:
+                    lease.release()
+                except Exception as e:
+                    swallow("lengths-backfill lease release", e)
                 self._dur_backfill_running = False
                 try:
                     self._log_stream.flush()
                 except Exception as e:
                     swallow("lengths-backfill stream flush", e)
+            # Always notify the UI, including exceptions and cancellation, so
+            # the Stop button cannot remain stuck after the worker exits.
+            if self._window is not None:
+                try:
+                    payload = json.dumps(completion, ensure_ascii=False)
+                    self._window.evaluate_js(
+                        "if(window._onVideoLengthsBackfilled)"
+                        f"window._onVideoLengthsBackfilled({payload});")
+                except Exception as e:
+                    swallow("lengths-backfill JS callback", e)
 
-        threading.Thread(target=_run, name="dur-backfill", daemon=True).start()
+        try:
+            with admitted_operation(
+                self,
+                owner="index-maintenance",
+                label="Backfill video durations",
+                task_id=task_id,
+                cancel=self._dur_backfill_cancel,
+            ):
+                admission = try_global_archive_lease(
+                    owner="index-maintenance",
+                    label="Backfill video durations",
+                    task_id=task_id,
+                    cancel=self._dur_backfill_cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    self._dur_backfill_running = False
+                    return lease_busy_result(admission)
+                lease = admission.lease
+                try:
+                    self._dur_backfill_thread = start_managed_task(
+                        self,
+                        owner="index-maintenance",
+                        label="Backfill video durations",
+                        task_id=task_id,
+                        cancel=self._dur_backfill_cancel,
+                        target=_run,
+                        name="dur-backfill",
+                        thread_factory=threading.Thread,
+                    )
+                except Exception:
+                    lease.release()
+                    raise
+        except WorkAdmissionClosed as exc:
+            self._dur_backfill_running = False
+            return {"ok": False, "started": False, "error": str(exc)}
+        except Exception as exc:
+            self._dur_backfill_running = False
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "started": True}
 
     def video_lengths_backfill_cancel(self):
@@ -526,11 +732,12 @@ class MediaOpsMixin:
         cfg = self._config or load_config()
         output_dir = (cfg.get("output_dir") or "").strip()
         if not output_dir:
-            return {"ok": False, "error": "output_dir is not configured"}
+            return {"ok": False, "error": "No archive folder is configured."}
         # Worker thread + token-poll pattern. Same shape as the other
         # async js_api methods (chan_scan_resolution_mismatch et al.).
         import uuid as _uuid
         token = _uuid.uuid4().hex
+        cancel = threading.Event()
         if not hasattr(self, "_drift_scan_results"):
             self._drift_scan_results = {}
         if not hasattr(self, "_drift_scan_lock"):
@@ -560,8 +767,49 @@ class MediaOpsMixin:
                     self._drift_scan_results[token] = {
                         "ok": False, "error": str(e),
                         "_ts": _t_mod.time()}
-        threading.Thread(target=_run, daemon=True,
-                         name="drift-scan-channel").start()
+            finally:
+                lease.release()
+        try:
+            with admitted_operation(
+                self,
+                owner="index-maintenance",
+                label="Scan transcript drift",
+                task_id=token,
+                cancel=cancel,
+            ):
+                admission = try_global_archive_lease(
+                    owner="index-maintenance",
+                    label="Scan transcript drift",
+                    task_id=token,
+                    cancel=cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    with self._drift_scan_lock:
+                        self._drift_scan_results.pop(token, None)
+                    return lease_busy_result(admission)
+                lease = admission.lease
+                try:
+                    start_managed_task(
+                        self,
+                        owner="index-maintenance",
+                        label="Scan transcript drift",
+                        task_id=token,
+                        cancel=cancel,
+                        target=_run,
+                        name="drift-scan-channel",
+                        thread_factory=threading.Thread,
+                    )
+                except Exception:
+                    lease.release()
+                    raise
+        except WorkAdmissionClosed as exc:
+            with self._drift_scan_lock:
+                self._drift_scan_results.pop(token, None)
+            return {"ok": False, "started": False, "error": str(exc)}
+        except Exception as exc:
+            with self._drift_scan_lock:
+                self._drift_scan_results.pop(token, None)
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "pending": True, "token": token}
 
     def drift_scan_channel_poll(self, token):
@@ -589,7 +837,7 @@ class MediaOpsMixin:
           B. Reconstruct TXT entries from .jsonl segments for each
              JSONL-without-TXT entry (body = concat of segment text,
              date = .jsonl mtime, src_tag = "RECOVERED-FROM-JSONL").
-          C. Rebuild FTS if phantom count > 0.
+          C. Atomically rebuild both FTS shadows if integrity is unhealthy.
 
         Runs a fresh scan internally so the apply always acts on current
         state."""
@@ -600,12 +848,15 @@ class MediaOpsMixin:
         cfg = self._config or load_config()
         output_dir = (cfg.get("output_dir") or "").strip()
         if not output_dir:
-            return {"ok": False, "error": "output_dir is not configured"}
+            return {"ok": False, "error": "No archive folder is configured."}
 
         # Hook: queue a Whisper retranscribe. Wraps self.transcribe_retranscribe
         # so the drift_scan module stays decoupled from the Api class.
         def _enqueue_retranscribe(filepath, title, video_id):
-            self.transcribe_retranscribe(filepath, title, video_id)
+            # Preserve the backend's authoritative {ok, error} result.  The
+            # drift layer must not count a rejected/durability-failed enqueue
+            # merely because the bridge call returned without raising.
+            return self.transcribe_retranscribe(filepath, title, video_id)
 
         # Spawn the apply on a worker thread + token-poll. drift_apply
         # walks every drift entry and calls _enqueue_retranscribe per
@@ -614,6 +865,7 @@ class MediaOpsMixin:
         # pattern as drift_scan_channel above.
         import uuid as _uuid
         token = _uuid.uuid4().hex
+        cancel = threading.Event()
         if not hasattr(self, "_drift_apply_results"):
             self._drift_apply_results = {}
         if not hasattr(self, "_drift_apply_lock"):
@@ -639,13 +891,19 @@ class MediaOpsMixin:
                     a = result.get("actions", {})
                     parts = []
                     if a.get("txt_reconstructed"):
-                        parts.append(f"{a['txt_reconstructed']} .txt rebuilt")
+                        parts.append(
+                            f"{a['txt_reconstructed']} readable transcript(s) rebuilt")
                     if a.get("retranscribe_queued"):
-                        parts.append(f"{a['retranscribe_queued']} queued for Whisper")
+                        parts.append(
+                            f"{a['retranscribe_queued']} queued for transcription")
                     if a.get("retranscribe_skipped"):
                         parts.append(f"{a['retranscribe_skipped']} skipped (video file missing)")
+                    if a.get("ambiguous_skipped"):
+                        parts.append(
+                            f"{a['ambiguous_skipped']} could not be matched "
+                            "automatically")
                     if a.get("fts_rebuilt"):
-                        parts.append("FTS rebuilt")
+                        parts.append("search index rebuilt")
                     ch_name = ch.get("name") or ch.get("folder", "")
                     if parts:
                         self._log_stream.emit_text(
@@ -675,8 +933,49 @@ class MediaOpsMixin:
             except Exception as e:
                 with self._drift_apply_lock:
                     self._drift_apply_results[token] = {"ok": False, "error": str(e)}
-        threading.Thread(target=_run, daemon=True,
-                         name="drift-apply-channel").start()
+            finally:
+                lease.release()
+        try:
+            with admitted_operation(
+                self,
+                owner="index-maintenance",
+                label="Repair transcript drift",
+                task_id=token,
+                cancel=cancel,
+            ):
+                admission = try_global_archive_lease(
+                    owner="index-maintenance",
+                    label="Repair transcript drift",
+                    task_id=token,
+                    cancel=cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    with self._drift_apply_lock:
+                        self._drift_apply_results.pop(token, None)
+                    return lease_busy_result(admission)
+                lease = admission.lease
+                try:
+                    start_managed_task(
+                        self,
+                        owner="index-maintenance",
+                        label="Repair transcript drift",
+                        task_id=token,
+                        cancel=cancel,
+                        target=_run,
+                        name="drift-apply-channel",
+                        thread_factory=threading.Thread,
+                    )
+                except Exception:
+                    lease.release()
+                    raise
+        except WorkAdmissionClosed as exc:
+            with self._drift_apply_lock:
+                self._drift_apply_results.pop(token, None)
+            return {"ok": False, "started": False, "error": str(exc)}
+        except Exception as exc:
+            with self._drift_apply_lock:
+                self._drift_apply_results.pop(token, None)
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "pending": True, "token": token}
 
 
@@ -723,7 +1022,7 @@ class MediaOpsMixin:
         cfg = self._config or load_config()
         output_dir = (cfg.get("output_dir") or "").strip()
         if not output_dir:
-            return {"ok": False, "error": "output_dir is not configured"}
+            return {"ok": False, "error": "No archive folder is configured."}
         payload = payload or {}
         channel = (payload.get("channel") or "").strip()
         video_id = (payload.get("video_id") or "").strip()
@@ -789,7 +1088,7 @@ class MediaOpsMixin:
         cfg = self._config or load_config()
         output_dir = (cfg.get("output_dir") or "").strip()
         if not output_dir:
-            return {"ok": False, "error": "output_dir is not configured"}
+            return {"ok": False, "error": "No archive folder is configured."}
         payload = payload or {}
         channel = (payload.get("channel") or "").strip()
         video_id = (payload.get("video_id") or "").strip()
@@ -853,7 +1152,7 @@ class MediaOpsMixin:
         cfg = self._config or load_config()
         output_dir = (cfg.get("output_dir") or "").strip()
         if not output_dir:
-            return {"ok": False, "error": "output_dir is not configured"}
+            return {"ok": False, "error": "No archive folder is configured."}
         payload = payload or {}
         channel = (payload.get("channel") or "").strip()
         do_txt = bool(payload.get("do_txt", True))
@@ -995,7 +1294,7 @@ class MediaOpsMixin:
         the user manually kicks the queue).
         """
         if not filepath:
-            return {"ok": False, "error": "filepath required"}
+            return {"ok": False, "error": "Select a saved video first."}
         try:
             title = os.path.splitext(os.path.basename(filepath))[0]
         except Exception:
@@ -1044,13 +1343,18 @@ class MediaOpsMixin:
         `recheck_dates=True` re-reads .info.json sidecars and fixes file mtimes
         before grouping (matches YTArchiver's Re-check Dates option).
         """
+        admission = getattr(self, "_work_admission_error", None)
+        if callable(admission):
+            blocked = admission("a channel reorganization")
+            if blocked is not None:
+                return blocked
         ch = subs_backend.get_channel(identity or {})
         if not ch:
             return {"ok": False, "error": "Channel not found"}
         cfg = load_config()
         base = (cfg.get("output_dir") or "").strip()
         if not base:
-            return {"ok": False, "error": "output_dir not set"}
+            return {"ok": False, "error": "No archive folder is configured."}
         from backend.sync import channel_folder_name
         folder = os.path.join(base, channel_folder_name(ch))
         if not hasattr(self, "_sync_start_lock"):
@@ -1114,6 +1418,7 @@ class MediaOpsMixin:
         _reorg_cancel = threading.Event()
         self._reorg_cancel = _reorg_cancel
         self._reorg_running = True
+        task_id = f"reorganization-{uuid.uuid4().hex}"
         def _run():
             try:
                 reorg_backend.reorg_channel(folder,
@@ -1134,7 +1439,17 @@ class MediaOpsMixin:
                     except Exception:
                         self._reorg_running = False
         try:
-            threading.Thread(target=_run, daemon=True).start()
+            thread = start_managed_task(
+                self,
+                owner="reorganization",
+                label=f"Reorganize {ch_name or 'channel'}",
+                task_id=task_id,
+                cancel=_reorg_cancel,
+                target=_run,
+                name="channel-reorganization",
+                thread_factory=threading.Thread,
+            )
+            self._reorg_thread = thread
         except Exception as e:
             self._reorg_cancel = None
             self._reorg_running = False

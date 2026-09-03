@@ -1,201 +1,329 @@
-  <!-- Settings tab: one scrollable settings page. General, Performance, and
-       Appearance are sections instead of separate sub-tabs because the latter
-       two only have a small number of options. -->
+  <!-- Settings: one scannable page, grouped by the thing each preference affects. -->
   <div class="tab-panel" id="panel-settings">
-    <div class="settings-main settings-single-page">
-      <div class="settings-view" id="settings-view-general">
-
-        <label class="subs-section-label">General</label>
-        <div class="edit-grid">
-          <label class="edit-gl">Archive root</label>
-          <div class="edit-gv-stack settings-field-with-help">
-            <div class="edit-gv-inline">
-              <input type="text" class="ctl-input" id="settings-output-dir" readonly />
-              <button class="btn btn-ghost btn-thin" id="settings-browse-output">Browse&hellip;</button>
+    <div class="settings-area settings-preferences-area settings-single-page">
+      <div class="settings-main">
+        <div class="settings-view settings-preferences-view" id="settings-view-preferences">
+          <section class="settings-section" id="settings-section-storage">
+            <div class="settings-section-heading">
+              <h2>Storage &amp; library</h2>
+              <p>Where files are kept and how YTArchiver checks the archive.</p>
             </div>
-            <div class="settings-field-help">
-              New channel downloads are stored here. Existing videos are
-              never moved automatically.
-            </div>
-          </div>
 
-          <label class="edit-gl">Video downloads</label>
-          <div class="edit-gv-stack settings-field-with-help">
-            <div class="edit-gv-inline">
-              <input type="text" class="ctl-input" id="settings-video-dir" readonly />
-              <button class="btn btn-ghost btn-thin" id="settings-browse-video">Browse&hellip;</button>
-            </div>
-            <div class="settings-field-help">
-              Default location for individual URLs downloaded from the
-              Download tab.
-            </div>
-          </div>
-
-          <label class="edit-gl">Default resolution</label>
-          <div class="edit-gv-cell">
-            <select class="ctl-select" id="settings-default-res">
-              <option value="audio">Audio only</option>
-              <option value="144">144p</option>
-              <option value="240">240p</option>
-              <option value="360">360p</option>
-              <option value="480">480p</option>
-              <option value="720" selected>720p</option>
-              <option value="1080">1080p</option>
-              <option value="1440">1440p</option>
-              <option value="2160">2160p (4K)</option>
-              <option value="best">Best available</option>
-            </select>
-          </div>
-
-          <label class="edit-gl">Auto-transcribe model</label>
-          <div class="edit-gv-cell">
-            <select class="ctl-select" id="settings-whisper-model">
-              <option value="tiny">tiny (fastest)</option>
-              <option value="small" selected>small</option>
-              <option value="medium">medium</option>
-              <option value="large-v3">large-v3 (best)</option>
-            </select>
-          </div>
-
-          <label class="edit-gl">When closing window</label>
-          <div class="edit-gv-cell">
-            <select class="ctl-select" id="settings-close-behavior">
-              <option value="ask" selected>Ask each time</option>
-              <option value="tray">Minimize to tray</option>
-              <option value="quit">Quit immediately</option>
-            </select>
-          </div>
-
-          <label class="edit-gl">Auto-sync timing</label>
-          <div class="edit-gv-cell">
-            <select class="ctl-select" id="settings-autorun-mode"
-                    title="Timer resumes its saved countdown after restarts; Clock-aligned uses fixed wall-clock times, with a custom time available for 12- and 24-hour schedules">
-              <option value="timer">Timer (countdown)</option>
-              <option value="clock">Clock-aligned (fixed times)</option>
-            </select>
-          </div>
-
-          <label class="edit-gl">YouTube traffic safety</label>
-          <div class="edit-gv-stack settings-traffic-controls">
-            <select class="ctl-select" id="settings-youtube-traffic-mode">
-              <option value="conservative">Conservative (recommended)</option>
-              <option value="balanced">Balanced</option>
-              <option value="custom">Custom</option>
-              <option value="unlimited">Unlimited</option>
-            </select>
-            <div class="settings-traffic-custom" id="settings-traffic-custom" hidden>
-              <label>24-hour limit <input type="number" class="ctl-input" id="settings-traffic-daily" min="1" max="100000" /></label>
-              <label>Hourly limit <input type="number" class="ctl-input" id="settings-traffic-hourly" min="1" max="10000" /></label>
-              <label>Min gap <input type="number" class="ctl-input" id="settings-traffic-min-gap" min="0" max="3600" /><span>sec</span></label>
-              <label>Max gap <input type="number" class="ctl-input" id="settings-traffic-max-gap" min="0" max="3600" /><span>sec</span></label>
-            </div>
-            <div class="settings-traffic-meter" id="settings-traffic-meter">
-              <span class="settings-traffic-usage">
-                <strong id="settings-traffic-hourly-usage">&mdash;</strong>
-                <small>This hour</small>
-              </span>
-              <span class="settings-traffic-usage">
-                <strong id="settings-traffic-daily-usage">&mdash;</strong>
-                <small>Last 24 hours</small>
-              </span>
-              <span class="settings-traffic-cooldown"
-                    id="settings-traffic-cooldown" hidden></span>
-            </div>
-            <div class="settings-traffic-insight" id="settings-traffic-recommendation">
-              <span class="settings-traffic-insight-icon" aria-hidden="true">&#10003;</span>
-              <div class="settings-traffic-insight-copy">
-                <div class="settings-traffic-insight-heading">
-                  <span>Recommended cadence</span>
-                  <strong id="settings-traffic-cadence">Calculating&hellip;</strong>
+            <div class="edit-grid">
+              <label class="edit-gl" for="settings-output-dir">Archive folder</label>
+              <div class="edit-gv-stack settings-field-with-help">
+                <div class="edit-gv-inline">
+                  <input type="text" class="ctl-input" id="settings-output-dir" readonly />
+                  <button class="btn btn-ghost btn-thin" id="settings-browse-output">Browse&hellip;</button>
                 </div>
-                <div class="settings-traffic-insight-detail"
-                     id="settings-traffic-recommendation-detail">
-                  Checking your channels and enabled features.
+                <div class="settings-field-help">
+                  New channel downloads go here. Existing files are not moved.
                 </div>
-                <div class="settings-traffic-insight-note"
-                     id="settings-traffic-recommendation-note" hidden></div>
+              </div>
+
+              <label class="edit-gl" for="settings-video-dir">Individual video folder</label>
+              <div class="edit-gv-stack settings-field-with-help">
+                <div class="edit-gv-inline">
+                  <input type="text" class="ctl-input" id="settings-video-dir" readonly />
+                  <button class="btn btn-ghost btn-thin" id="settings-browse-video">Browse&hellip;</button>
+                </div>
+                <div class="settings-field-help">
+                  Default folder for individual videos from the Download tab.
+                </div>
+              </div>
+
+              <label class="edit-gl" for="settings-archive-capacity-mode">Drive-space warning</label>
+              <div class="edit-gv-inline edit-gap-6 settings-archive-capacity-row">
+                <span class="settings-control-caption">Warn by</span>
+                <select class="ctl-select" id="settings-archive-capacity-mode">
+                  <option value="percent" selected>Percent full</option>
+                  <option value="free_gb">GB free</option>
+                </select>
+                <input type="text" class="ctl-input edit-num settings-archive-capacity-input"
+                       id="settings-archive-capacity-threshold" value="90"
+                       aria-label="Drive-space warning threshold" />
+                <span class="settings-control-unit" id="settings-archive-capacity-unit">% full</span>
+              </div>
+
+              <label class="edit-gl" for="settings-trash-retention-days">Trash cleanup</label>
+              <div class="edit-gv-stack settings-field-with-help">
+                <select class="ctl-select" id="settings-trash-retention-days"
+                        title="Choose how long Trash items are kept before YTArchiver permanently deletes them.">
+                  <option value="0">Off — keep until I delete them</option>
+                  <option value="7">Delete after 7 days</option>
+                  <option value="14">Delete after 14 days</option>
+                  <option value="30" selected>Delete after 30 days</option>
+                  <option value="60">Delete after 60 days</option>
+                  <option value="90">Delete after 90 days</option>
+                  <option value="180">Delete after 180 days</option>
+                  <option value="365">Delete after 365 days</option>
+                </select>
+                <div class="settings-field-help">
+                  Turning cleanup on or shortening the wait takes effect after 24 hours.
+                </div>
+              </div>
+
+              <label class="edit-gl">Additional archive folders</label>
+              <div class="edit-gv-stack settings-field-with-help settings-archive-folders">
+                <div class="settings-field-help">
+                  Your main archive folder is always included. Add other folders here if Search should include them too.
+                </div>
+                <div class="index-roots-list" id="settings-roots-list"
+                     aria-label="Archive folders included in Search"></div>
+                <div class="index-section-buttons">
+                  <button class="btn btn-ghost btn-thin" id="btn-settings-add-root">Add Folder&hellip;</button>
+                  <button class="btn btn-ghost btn-thin" id="btn-settings-remove-root">Remove Selected</button>
+                </div>
               </div>
             </div>
-          </div>
 
-          <label class="edit-gl">Auto-backup</label>
-          <div class="edit-gv-stack settings-field-with-help">
-            <select class="ctl-select" id="settings-auto-backup"
-                    title="Automatically exports the app's full backup (settings, subscriptions, download history, queue) into the 'YTArchiver Info' folder inside the archive root — alongside a README describing the archive format and a copy of the app itself. The newest 4 backups are kept; older ones move to the archive trash.">
-              <option value="off" selected>Off</option>
-              <option value="daily">Daily</option>
-              <option value="weekly">Weekly</option>
-              <option value="monthly">Monthly</option>
-            </select>
-            <div class="settings-field-help">
-              Keeps the archive self-contained with settings, subscriptions,
-              download history, a format README, and a copy of YTArchiver.
+            <details class="settings-details-card" id="settings-background-checks">
+              <summary>Background checks</summary>
+              <div class="settings-details-intro">
+                Controls for finding archive changes that happened outside the normal download flow.
+              </div>
+              <div class="edit-grid">
+                <label class="edit-gl">Search checks</label>
+                <div class="edit-gv-stack settings-field-with-help">
+                  <label class="edit-gv-inline settings-checkbox-row settings-auto-index-row">
+                    <input type="checkbox" id="settings-auto-index-enabled" />
+                    <span>Check automatically every</span>
+                    <input type="text" class="ctl-input edit-num index-auto-threshold"
+                           id="settings-auto-index-threshold" value="10"
+                           aria-label="Downloads between automatic Search checks" />
+                    <span>downloads</span>
+                  </label>
+                  <div class="settings-field-help">
+                    New downloads are added to Search right away. This extra check catches files that were missed.
+                  </div>
+                </div>
+
+                <label class="edit-gl">Archive rescans</label>
+                <div class="edit-gv-inline edit-gap-6">
+                  <span class="settings-control-caption">Check again after</span>
+                  <input type="text" class="ctl-input edit-num settings-disk-staleness-input"
+                         id="settings-disk-staleness" value="24"
+                         aria-label="Hours between archive rescans" />
+                  <span class="settings-control-unit">hours</span>
+                  <span class="settings-inline-note">0 = every time</span>
+                </div>
+              </div>
+            </details>
+          </section>
+
+          <section class="settings-section" id="settings-section-downloads">
+            <div class="settings-section-heading">
+              <h2>Downloads &amp; YouTube</h2>
+              <p>Defaults for new work and limits on requests to YouTube.</p>
             </div>
-          </div>
 
-          <label class="edit-gl">Launch at boot</label>
-          <div class="edit-gv-stack">
-            <label class="edit-gv-inline settings-checkbox-row">
-              <input type="checkbox" id="settings-launch-at-boot" />
-              <span>Start YTArchiver when Windows signs in</span>
-            </label>
-            <label class="edit-gv-inline settings-checkbox-row" id="settings-boot-minimized-wrap" hidden>
-              <input type="checkbox" id="settings-boot-minimized" />
-              <span>Start minimized to tray</span>
-            </label>
-          </div>
-        </div>
+            <div class="edit-grid">
+              <label class="edit-gl" for="settings-default-res">Default video quality</label>
+              <div class="edit-gv-cell">
+                <select class="ctl-select" id="settings-default-res"
+                        title="Used for individual video downloads and as the starting quality for new channels">
+                  <option value="audio">Audio only</option>
+                  <option value="144">144p</option>
+                  <option value="240">240p</option>
+                  <option value="360">360p</option>
+                  <option value="480">480p</option>
+                  <option value="720" selected>720p</option>
+                  <option value="1080">1080p</option>
+                  <option value="1440">1440p</option>
+                  <option value="2160">2160p (4K)</option>
+                  <option value="best">Best available</option>
+                </select>
+              </div>
 
-        <label class="subs-section-label">Performance</label>
-        <div class="edit-grid">
-          <label class="edit-gl">Disk scan</label>
-          <div class="edit-gv-inline edit-gap-6">
-            <span class="settings-control-caption">Rescan when cache is older than</span>
-            <input type="text" class="ctl-input edit-num settings-disk-staleness-input"
-                   id="settings-disk-staleness" value="24" />
-            <span class="settings-control-unit">hours</span>
-            <span class="settings-inline-note">0 always rescans</span>
-          </div>
+              <label class="edit-gl" for="settings-whisper-model">Default transcription model</label>
+              <div class="edit-gv-cell">
+                <select class="ctl-select" id="settings-whisper-model">
+                  <option value="tiny">tiny (fastest)</option>
+                  <option value="small" selected>small</option>
+                  <option value="medium">medium</option>
+                  <option value="large-v3">large-v3 (best)</option>
+                </select>
+              </div>
 
-          <label class="edit-gl">Archive drive warning</label>
-          <div class="edit-gv-inline edit-gap-6 settings-archive-capacity-row">
-            <span class="settings-control-caption">Measure by</span>
-            <select class="ctl-select" id="settings-archive-capacity-mode">
-              <option value="percent" selected>Percent full</option>
-              <option value="free_gb">GB free</option>
-            </select>
-            <input type="text" class="ctl-input edit-num settings-archive-capacity-input"
-                   id="settings-archive-capacity-threshold" value="90" />
-            <span class="settings-control-unit" id="settings-archive-capacity-unit">% full</span>
-          </div>
-        </div>
+              <label class="edit-gl" for="settings-autorun-mode">Auto-sync timing</label>
+              <div class="edit-gv-stack settings-field-with-help">
+                <select class="ctl-select" id="settings-autorun-mode"
+                        title="Choose whether interval schedules run at fixed times or count from the previous sync">
+                  <option value="clock" selected>Fixed times</option>
+                  <option value="timer">Timer since last sync</option>
+                </select>
+                <div class="settings-field-help">
+                  Applies to interval schedules. Fixed 12- and 24-hour schedules show a time picker beside Auto-sync on Download.
+                </div>
+              </div>
 
-        <label class="subs-section-label">Appearance</label>
-        <div class="edit-grid">
-          <label class="edit-gl">Dense Sub Tab</label>
-          <div class="edit-gv-stack settings-appearance-choice">
-            <label class="edit-gv-inline settings-checkbox-row">
-              <input type="checkbox" id="settings-legacy-subs-tab" />
-              <span>Show dense Subs tab</span>
-            </label>
-            <span class="settings-inline-note">Adds a dense-view &ldquo;Subs&rdquo; tab for easy channel editing.</span>
-          </div>
+              <label class="edit-gl" for="settings-youtube-traffic-mode">YouTube traffic protection</label>
+              <div class="edit-gv-stack settings-traffic-controls">
+                <select class="ctl-select" id="settings-youtube-traffic-mode">
+                  <option value="conservative">Conservative (recommended)</option>
+                  <option value="balanced">Balanced</option>
+                  <option value="custom">Custom</option>
+                  <option value="unlimited">Unlimited</option>
+                </select>
+                <div class="settings-traffic-custom" id="settings-traffic-custom" hidden>
+                  <label>24-hour limit <input type="number" class="ctl-input" id="settings-traffic-daily" min="1" max="100000" /></label>
+                  <label>Hourly limit <input type="number" class="ctl-input" id="settings-traffic-hourly" min="1" max="10000" /></label>
+                  <label>Min gap <input type="number" class="ctl-input" id="settings-traffic-min-gap" min="0" max="3600" /><span>sec</span></label>
+                  <label>Max gap <input type="number" class="ctl-input" id="settings-traffic-max-gap" min="0" max="3600" /><span>sec</span></label>
+                </div>
+                <div class="settings-traffic-meter" id="settings-traffic-meter">
+                  <span class="settings-traffic-usage">
+                    <strong id="settings-traffic-hourly-usage">&mdash;</strong>
+                    <small>This hour</small>
+                  </span>
+                  <span class="settings-traffic-usage">
+                    <strong id="settings-traffic-daily-usage">&mdash;</strong>
+                    <small>Last 24 hours</small>
+                  </span>
+                  <span class="settings-traffic-cooldown"
+                        id="settings-traffic-cooldown" hidden></span>
+                </div>
+                <div class="settings-traffic-insight" id="settings-traffic-recommendation">
+                  <span class="settings-traffic-insight-icon" aria-hidden="true">&#10003;</span>
+                  <div class="settings-traffic-insight-copy">
+                    <div class="settings-traffic-insight-heading">
+                      <span>Recommended auto-sync</span>
+                      <strong id="settings-traffic-cadence">Calculating&hellip;</strong>
+                    </div>
+                    <div class="settings-traffic-insight-detail"
+                         id="settings-traffic-recommendation-detail">
+                      Checking your channels and enabled features.
+                    </div>
+                    <div class="settings-traffic-insight-note"
+                         id="settings-traffic-recommendation-note" hidden></div>
+                  </div>
+                </div>
+              </div>
+            </div>
 
-          <label class="edit-gl" id="settings-subs-table-label" hidden>Legacy Subs table</label>
-          <div class="edit-gv-stack" id="settings-subs-table-options" hidden>
-            <label class="edit-gv-inline settings-checkbox-row">
-              <input type="checkbox" id="settings-show-avg-size" />
-              <span>Show Avg filesize in Subs tab</span>
-            </label>
-          </div>
+            <details class="settings-details-card" id="settings-downloader-updates">
+              <summary>Downloader updates</summary>
+              <div class="edit-grid">
+                <label class="edit-gl">Download tool</label>
+                <div class="edit-gv-inline edit-gap-8">
+                  <span class="edit-dim" id="settings-ytdlp-version">checking&hellip;</span>
+                  <button class="btn btn-ghost btn-thin" id="btn-ytdlp-update"
+                          title="Check for and install a yt-dlp update">Update now</button>
+                </div>
 
-          <label class="edit-gl">Log mode</label>
-          <div class="edit-gv-cell">
-            <select class="ctl-select" id="settings-log-mode">
-              <option value="Simple" selected>Simple</option>
-              <option value="Verbose">Verbose</option>
-            </select>
-          </div>
+                <label class="edit-gl" for="settings-ytdlp-channel">Release track</label>
+                <div class="edit-gv-cell">
+                  <select class="ctl-select" id="settings-ytdlp-channel"
+                          title="Stable is safest. Beta receives YouTube fixes earlier.">
+                    <option value="stable">Stable</option>
+                    <option value="nightly">Beta (nightly)</option>
+                  </select>
+                </div>
+
+                <label class="edit-gl" for="settings-ytdlp-update-mode">Update behavior</label>
+                <div class="edit-gv-stack">
+                  <select class="ctl-select" id="settings-ytdlp-update-mode"
+                          title="Package-manager installations remain notify-only.">
+                    <option value="automatic">Install automatically (recommended)</option>
+                    <option value="notify">Notify only</option>
+                    <option value="off">Off</option>
+                  </select>
+                  <span class="settings-inline-note" id="settings-ytdlp-update-note">Installs when YouTube work is idle</span>
+                </div>
+
+                <label class="edit-gl">Check interval</label>
+                <div class="edit-gv-inline edit-gap-6">
+                  <span class="settings-control-caption">Every</span>
+                  <input type="number" min="1" max="365" step="1"
+                         class="ctl-input edit-num"
+                         id="settings-ytdlp-check-days" value="1"
+                          title="Check for updates after this many days"
+                          aria-label="Downloader update check interval in days" />
+                  <span class="settings-control-unit">days</span>
+                  <span class="settings-inline-note" id="settings-ytdlp-check-status">never checked</span>
+                </div>
+              </div>
+            </details>
+          </section>
+
+          <section class="settings-section" id="settings-section-app">
+            <div class="settings-section-heading">
+              <h2>App behavior</h2>
+              <p>How YTArchiver starts, closes, and presents information.</p>
+            </div>
+
+            <div class="edit-grid">
+              <label class="edit-gl">Windows startup</label>
+              <div class="edit-gv-stack">
+                <label class="edit-gv-inline settings-checkbox-row">
+                  <input type="checkbox" id="settings-launch-at-boot" />
+                  <span>Start YTArchiver when Windows signs in</span>
+                </label>
+                <label class="edit-gv-inline settings-checkbox-row" id="settings-boot-minimized-wrap" hidden>
+                  <input type="checkbox" id="settings-boot-minimized" />
+                  <span>Start minimized to tray</span>
+                </label>
+              </div>
+
+              <label class="edit-gl" for="settings-close-behavior">Closing the window</label>
+              <div class="edit-gv-cell">
+                <select class="ctl-select" id="settings-close-behavior">
+                  <option value="ask" selected>Ask each time</option>
+                  <option value="tray">Minimize to tray</option>
+                  <option value="quit">Quit immediately</option>
+                </select>
+              </div>
+
+              <label class="edit-gl">Channel list</label>
+              <div class="edit-gv-stack settings-appearance-choice">
+                <label class="edit-gv-inline settings-checkbox-row">
+                  <input type="checkbox" id="settings-legacy-subs-tab" />
+                  <span>Show compact Subs tab</span>
+                </label>
+                <span class="settings-inline-note">Useful for editing many channels at once</span>
+              </div>
+
+              <label class="edit-gl" id="settings-subs-table-label" hidden>Compact Subs details</label>
+              <div class="edit-gv-stack" id="settings-subs-table-options" hidden>
+                <label class="edit-gv-inline settings-checkbox-row">
+                  <input type="checkbox" id="settings-show-avg-size" />
+                  <span>Show average file size</span>
+                </label>
+              </div>
+
+              <label class="edit-gl" for="settings-log-mode">Activity log detail</label>
+              <div class="edit-gv-cell">
+                <select class="ctl-select" id="settings-log-mode">
+                  <option value="Simple" selected>Simple</option>
+                  <option value="Verbose">Detailed</option>
+                </select>
+              </div>
+            </div>
+
+            <details class="settings-details-card settings-support-details"
+                     id="settings-about-troubleshooting">
+              <summary>About &amp; troubleshooting</summary>
+              <div class="edit-grid">
+                <label class="edit-gl">About YTArchiver</label>
+                <div class="edit-gv-inline edit-gap-6">
+                  <button class="btn btn-ghost btn-thin" id="btn-about"
+                          title="App version and settings information">Open&hellip;</button>
+                </div>
+
+                <label class="edit-gl">Diagnostics</label>
+                <div class="edit-gv-inline edit-gap-6">
+                  <button class="btn btn-ghost btn-thin" id="btn-diagnostics"
+                          title="Check download tools, ffmpeg, Python, GPU, and other app dependencies">Run diagnostics&hellip;</button>
+                </div>
+
+                <label class="edit-gl">Setup</label>
+                <div class="edit-gv-inline edit-gap-6">
+                  <button class="btn btn-ghost btn-thin" id="btn-run-setup"
+                          title="Review or change setup">Run setup again&hellip;</button>
+                </div>
+              </div>
+            </details>
+          </section>
         </div>
 
         <div class="settings-actions" id="settings-actions-footer">

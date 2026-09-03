@@ -21,37 +21,60 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
+  let _seedComplete = false;
+  let _seedInFlight = null;
+  let _retryOnBridgeReady = false;
+  let _lastSeedFailure = "";
+  const _seedStepsDone = new Set();
+
+  function clearSeedRetry() {
+    document.getElementById("boot-issue-retry-seed")?.remove();
+    _lastSeedFailure = "";
+  }
+
+  function offerSeedRetry(message) {
+    const text = String(message || "Startup data could not load.");
+    if (_lastSeedFailure !== text) {
+      _lastSeedFailure = text;
+      window._reportBootIssue?.("Startup data", text, { level: "error" });
+    }
+    const actions = document.querySelector("#boot-issue-banner .boot-issue-actions");
+    if (!actions || document.getElementById("boot-issue-retry-seed")) return;
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.id = "boot-issue-retry-seed";
+    retry.className = "btn btn-thin";
+    retry.textContent = "Retry startup load";
+    retry.addEventListener("click", () => {
+      retry.disabled = true;
+      Promise.resolve(seedLogs()).finally(() => { retry.disabled = false; });
+    });
+    actions.prepend(retry);
+  }
+
   // ─── Seed logs from the Python bridge ───────────────────────────────
   //
   // pywebview-only — the Phase 0 browser-preview fallback that fetched
   // sample.json was retired once the real backends were wired up.
-  async function seedLogs() {
-    // Give pywebview a brief window to register its API before falling back.
-    const pywebviewReady = () =>
-      new Promise((resolve) => {
-        if (nativeBridgeUp()) {
-          resolve(true);
-          return;
-        }
-        let settled = false;
-        const finish = (ok) => {
-          if (settled) return;
-          settled = true;
-          resolve(ok);
-        };
-        window.addEventListener("pywebviewready",
-          () => finish(true), { once: true });
-        setTimeout(() => finish(nativeBridgeUp()), 600);
-      });
-
-    const ready = await pywebviewReady();
-
+  async function runSeedLogs() {
     try {
-      if (ready) {
+      // Use the app's canonical readiness gate.  The old private 600 ms race
+      // permanently skipped hydration on slower WebView startups.
+      if (!nativeBridgeUp()) await window.YT?.bridge?.ready;
+      if (nativeBridgeUp()) {
         // Each API call is isolated — one failure does NOT cascade.
+        const failedSteps = [];
         const step = async (name, fn) => {
-          try { await fn(); }
-          catch (e) { console.error(`[seed] ${name} failed:`, e); }
+          if (_seedStepsDone.has(name)) return true;
+          try {
+            await fn();
+            _seedStepsDone.add(name);
+            return true;
+          } catch (e) {
+            failedSteps.push(name);
+            console.error(`[seed] ${name} failed:`, e);
+            return false;
+          }
         };
 
         // Fire startup_ready FIRST (non-blocking — it just kicks off a
@@ -63,13 +86,15 @@
         // the user as a multi-second wait before the indicator appeared.
         // The Python side guards re-entry via `_startup_fired`, so the
         // duplicate call at the end is a harmless no-op.
-        step("startup_ready_early", async () => {
+        await step("startup_ready_early", async () => {
           await bridgeCall("startup_ready");
         });
 
         await step("runtime_info", async () => {
           const info = await bridgeCall("get_runtime_info");
-          if (!info) return;
+          if (!info || typeof info !== "object" || Array.isArray(info)) {
+            throw new Error("runtime information was not returned");
+          }
           console.info("[api] runtime_info:", info);
           const sel = document.getElementById("log-mode-select");
           if (sel && info.log_mode) sel.value = info.log_mode;
@@ -111,17 +136,21 @@
 
         await step("activity_log_history", async () => {
           const history = await bridgeCall("get_activity_log_history");
-          window.renderActivityLog(history || []);
+          if (!Array.isArray(history)) {
+            throw new Error("activity history was not returned");
+          }
+          window.renderActivityLog(history);
           window._syncActivityLogVisibility?.();
         });
 
         await step("subs_channels", async () => {
           const subsData = await bridgeCall("get_subs_channels");
-          if (Array.isArray(subsData) && subsData.length === 2) {
-            window.renderSubsTable(subsData[0], subsData[1]);
-            window._primeBrowse(subsData[0]);
-            window._populateIndexTable?.(subsData[0]);
+          if (!Array.isArray(subsData) || subsData.length !== 2) {
+            throw new Error("subscription data was not returned");
           }
+          window.renderSubsTable(subsData[0], subsData[1]);
+          window._primeBrowse(subsData[0]);
+          window._populateIndexTable?.(subsData[0]);
         });
 
         // (Recent-downloads boot render removed — the Videos view now
@@ -129,31 +158,62 @@
 
         await step("index_summary", async () => {
           const idx = await bridgeCall("get_index_summary");
-          if (idx) window._applyIndexSummary?.(idx);
+          if (!idx || typeof idx !== "object" || Array.isArray(idx)) {
+            throw new Error("index summary was not returned");
+          }
+          window._applyIndexSummary?.(idx);
         });
 
         await step("queues", async () => {
           const q = await bridgeCall("get_queues");
-          if (q) window.renderQueues(q);
+          if (!q || typeof q !== "object" || Array.isArray(q)) {
+            throw new Error("queue state was not returned");
+          }
+          window.renderQueues(q);
         });
 
         await step("startup_ready", async () => {
           await bridgeCall("startup_ready");
         });
+
+        if (failedSteps.length) {
+          offerSeedRetry(
+            "Some startup data did not load. Use Retry startup load to try again.",
+          );
+          return false;
+        }
+        _seedComplete = true;
+        clearSeedRetry();
+        return true;
       } else {
-        window._reportBootIssue?.(
-          "seedLogs",
-          "pywebview bridge not detected; startup data could not load.",
-          { level: "error" },
+        offerSeedRetry(
+          "YTArchiver did not finish loading its startup data. " +
+          "Use Retry startup load in a moment.",
         );
-        // pywebview never came up — log and bail. Phase 0's sample.json
-        // browser fallback was removed; the app is desktop-only now.
-        console.warn("[seed] pywebview bridge not detected — UI will stay empty");
+        // If the bridge arrives after its canonical timeout, retry
+        // automatically as well as leaving the visible manual retry.
+        if (!_retryOnBridgeReady) {
+          _retryOnBridgeReady = true;
+          window.addEventListener("pywebviewready", () => {
+            _retryOnBridgeReady = false;
+            seedLogs();
+          }, { once: true });
+        }
+        console.warn("[seed] pywebview bridge not detected — startup load is retryable");
+        return false;
       }
     } catch (e) {
-      window._reportBootIssue?.("seedLogs", e, { level: "error" });
+      offerSeedRetry(`Startup data load failed: ${e?.message || e}`);
       console.error("seedLogs failed:", e);
+      return false;
     }
+  }
+
+  function seedLogs() {
+    if (_seedComplete) return Promise.resolve(true);
+    if (_seedInFlight) return _seedInFlight;
+    _seedInFlight = runSeedLogs().finally(() => { _seedInFlight = null; });
+    return _seedInFlight;
   }
 
   window.seedLogs = seedLogs;

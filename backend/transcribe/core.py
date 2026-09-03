@@ -24,6 +24,7 @@ Output file layout (must match YTArchiver.py for drop-in replacement):
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import queue
@@ -33,10 +34,12 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from ..log_stream import LogStreamer
+from ..queues import make_task_id
 
 # startupinfo now comes from subprocess_util (one
 # source of truth shared with compress.py and sync.py).
@@ -50,6 +53,7 @@ __all__ = [
 ]
 
 _startupinfo = _make_startupinfo()
+_SUPPORTED_WHISPER_MODELS = frozenset({"tiny", "small", "medium", "large-v3"})
 
 
 # ── OLD YTArchiver-compatible transcript file helpers ──────────────────
@@ -85,6 +89,12 @@ from .helpers import (  # noqa: F401
     find_python311,
     ytarchiver_config_output_dir,
 )
+from .job_execution import (
+    TranscriptionJobExecutor,
+    apply_control_signals,
+    execution_decision,
+)
+from .job_execution import WorkerOutcome as _WorkerOutcome
 from .paths import (  # noqa: F401
     _get_jsonl_sidecar,
     _get_transcript_filename,
@@ -106,6 +116,7 @@ from .transcribe_files import (
 
 # ── VTT caption path ──────────────────────────────────────────────────
 from .transcribe_vtt import (  # noqa: F401  (re-exports for backend.transcribe surface)
+    _CaptionOutcome,
     _parse_vtt,
     _try_auto_captions,
 )
@@ -192,6 +203,36 @@ def _build_transcription_done_segments(job: dict, title: str, channel: str,
     return segs
 
 
+def _build_transcription_finalizing_segments(
+        job: dict, title: str, *, lead: str | None = None) -> list:
+    """Build the tagged phase line shared by short and chunked jobs."""
+    video_id = str(job.get("video_id") or "").strip()
+    marker = f"tx_done_{video_id}" if video_id else ""
+    job_tag = str(job.get("job_tag") or "").strip()
+    tags = lambda *extra: [
+        value for value in (marker, job_tag, *extra) if value
+    ]
+    if lead is None:
+        lead = "      " if job.get("from_download") else " "
+    return [
+        [f"{lead}— ", tags("whisper_bracket")],
+        ["Finalizing transcript", tags("whisper_finalizing")],
+        [f' "{(title or "")[:40].rstrip()}"', tags()],
+        ["...\n", tags()],
+    ]
+
+
+_JOB_EXECUTOR = TranscriptionJobExecutor()
+
+
+def _coerce_caption_outcome(value: Any) -> _CaptionOutcome:
+    """Normalize legacy bool mocks/extensions to the detailed contract."""
+    if isinstance(value, _CaptionOutcome):
+        return value
+    return (_CaptionOutcome.SUCCESS if value
+            else _CaptionOutcome.UNAVAILABLE)
+
+
 class TranscribeManager:
     """Manages the whisper subprocess + a GPU queue."""
 
@@ -206,6 +247,9 @@ class TranscribeManager:
     def __init__(self, stream: LogStreamer, model: str = "large-v3"):
         self._stream = stream
         self._model = model
+        # ``_model`` is only the default for jobs queued in the future.
+        # Running provenance is tied to the model loaded in the child process.
+        self._loaded_model = ""
         self._proc: subprocess.Popen | None = None
         self._proc_lock = threading.Lock()
         self._line_queue: queue.Queue | None = None
@@ -230,6 +274,16 @@ class TranscribeManager:
         # Queue of jobs. Each job = {path, title, cb, cancel_event}
         self._jobs: list[dict[str, Any]] = []
         self._jobs_lock = threading.Lock()
+        # Every recovery-journal transition is serialized from runtime-state
+        # snapshot through atomic replace. RLock lets a state transition hold
+        # the boundary while calling the public persistence helper (which is
+        # intentionally patchable in tests/extensions).
+        self._journal_lock = threading.RLock()
+        # Synchronous native-caption ingestion runs on the sync thread rather
+        # than the GPU worker. Keep its pre-write recovery marker outside the
+        # runnable queue while still including it in every durable snapshot.
+        self._inline_caption_jobs: list[dict[str, Any]] = []
+        self._active_inline_promotion: dict[str, Any] | None = None
         # flipped True when OOM forces a subprocess into
         # CPU mode. After the next successful transcribe completes,
         # we reset WHISPER_DEVICE back to "cuda" and force a restart
@@ -243,6 +297,10 @@ class TranscribeManager:
         self._pending_model_restart = False
         self._worker_thread: threading.Thread | None = None
         self._cancel_all = threading.Event()
+        # Shutdown is intentionally distinct from user "Clear all". Clear is
+        # a terminal drop and erases both recovery stores; shutdown must keep
+        # the exact current task recoverable and merely stop taking new work.
+        self._shutdown_requested = threading.Event()
         self._paused = threading.Event()
         # One-shot "Start" drain. When set, the worker processes the current
         # backlog even though the Auto checkbox (autorun_gpu) is OFF, then
@@ -404,27 +462,173 @@ class TranscribeManager:
             return _matches(self._current_job) or any(
                 _matches(job) for job in self._jobs)
 
-    def _finish_successful_job(self, job: dict[str, Any], result: Any) -> None:
-        """Run non-GPU completion hooks and queue a persisted compress follow-up."""
-        if job.get("cb"):
-            try:
-                job["cb"](result)
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
+    def _finish_successful_job(
+            self, job: dict[str, Any], result: Any,
+            terminal_outcome: _WorkerOutcome = _WorkerOutcome.SUCCESS) -> bool:
+        """Checkpoint completion, run its callback once, and commit follow-up.
 
-        followup = job.get("compress_after") or {}
-        if not followup:
-            return
+        The transcription output is already durable when this method runs. Its
+        job must remain as a completion-only recovery marker until a requested
+        compression job is itself committed. Otherwise ``compress_enqueue``
+        returning False lets the worker remove the transcription and silently
+        loses that follow-up. The marker also prevents a retry from re-running
+        transcript writers or the callback.
+        """
+        followup = dict(job.get("compress_after") or {})
+        job["_output_complete"] = True
+        job["_completed_outcome"] = terminal_outcome.value
+        if result is not None:
+            # Runtime-only: if the completion checkpoint itself transiently
+            # fails, a same-process retry can still deliver the original
+            # callback payload. It is deliberately excluded from the journal.
+            job["_completion_result"] = result
+        if followup and not job.get("_followup_enqueued"):
+            job["_followup_pending"] = True
+
+        with self._jobs_lock:
+            tracked = (self._current_job is job
+                       or any(existing is job for existing in self._jobs)
+                       or any(existing is job
+                              for existing in self._inline_caption_jobs))
+        if tracked and not self._persist_pending():
+            self._stream.emit_error(
+                "Transcription output finished, but its completion recovery "
+                "state could not be saved. Follow-up work was not started.")
+            return False
+
+        if not job.get("_callback_done"):
+            # Mark before invoking external callback code so re-entrant or
+            # same-process recovery paths cannot call it twice. Callbacks are
+            # not serializable and therefore are intentionally absent after a
+            # process restart.
+            job["_callback_done"] = True
+            callback = job.get("cb")
+            callback_result = job.pop("_completion_result", result)
+            if callback:
+                try:
+                    callback(callback_result)
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+        else:
+            job.pop("_completion_result", None)
+
+        if not followup or job.get("_followup_enqueued"):
+            job.pop("_followup_pending", None)
+            return True
+
+        # Set the committed-side flags before calling compress_enqueue. Its
+        # own atomic journal snapshot then contains BOTH this completion marker
+        # and the new compression job. A crash immediately after replace sees
+        # `_followup_enqueued` and cannot enqueue a duplicate on recovery.
+        job["_followup_enqueued"] = True
+        job.pop("_followup_pending", None)
         try:
-            self.compress_enqueue(
+            queued = self.compress_enqueue(
                 job.get("path", ""),
                 title=job.get("title", ""),
                 channel=job.get("channel", ""),
                 quality=followup.get("quality", "Average"),
                 output_res=str(followup.get("output_res", "720")),
             )
-        except Exception as e:
-            self._stream.emit_error(f"Couldn't queue video compression: {e}")
+        except Exception as exc:
+            _log.warning("compression follow-up enqueue failed: %s", exc)
+            queued = False
+        if queued:
+            return True
+
+        job.pop("_followup_enqueued", None)
+        job["_followup_pending"] = True
+        self._stream.emit_error(
+            "Transcription finished, but video compression could not be saved "
+            "in Processing. The completion task was kept for retry.")
+        return False
+
+    def _retry_completed_followup(
+            self, job: dict[str, Any]) -> _WorkerOutcome:
+        """Resume only completion handoff; never run transcript output again."""
+        try:
+            terminal = _WorkerOutcome(
+                job.get("_completed_outcome") or _WorkerOutcome.SUCCESS)
+        except ValueError:
+            terminal = _WorkerOutcome.SUCCESS
+        if not self._finish_successful_job(
+                job, None, terminal_outcome=terminal):
+            return _WorkerOutcome.CLEANUP_FAILED
+        return terminal
+
+    def _stage_inline_caption_recovery(
+            self, marker: dict[str, Any]) -> tuple[bool, bool]:
+        """Persist a non-runnable caption marker before sync-side writes.
+
+        Returns ``(staged, duplicate)``. The marker stays in the ordinary
+        pending journal, so a process interruption reloads it as a native
+        caption recovery job even though it is not exposed to the live worker
+        until the synchronous attempt finishes or fails.
+        """
+        wanted = self._job_path_key(marker.get("path", ""))
+        with self._journal_lock:
+            with self._jobs_lock:
+                existing = [*self._inline_caption_jobs, *self._jobs]
+                if self._current_job:
+                    existing.append(self._current_job)
+                if any(self._job_path_key(j.get("path", "")) == wanted
+                       for j in existing):
+                    return False, True
+                self._inline_caption_jobs.append(marker)
+            if self._persist_pending():
+                return True, False
+            with self._jobs_lock:
+                self._inline_caption_jobs = [
+                    job for job in self._inline_caption_jobs
+                    if job is not marker
+                ]
+            return False, False
+
+    def _clear_inline_caption_recovery(self, marker: dict[str, Any]) -> bool:
+        """Clear a marker only after caption files and index all committed."""
+        with self._journal_lock:
+            with self._jobs_lock:
+                if not any(job is marker for job in self._inline_caption_jobs):
+                    return False
+                self._inline_caption_jobs = [
+                    job for job in self._inline_caption_jobs
+                    if job is not marker
+                ]
+            if self._persist_pending():
+                return True
+            # The old on-disk snapshot still contains the marker. Restore the
+            # runtime representation so a later promotion/retry matches it.
+            with self._jobs_lock:
+                self._inline_caption_jobs.append(marker)
+            return False
+
+    def _promote_inline_caption_recovery(
+            self, marker: dict[str, Any]) -> bool:
+        """Move an already-durable marker into the runnable GPU queue."""
+        with self._journal_lock:
+            with self._jobs_lock:
+                if not any(job is marker
+                           for job in self._inline_caption_jobs):
+                    return False
+            # Preserve the public enqueue call shape. While this journal
+            # boundary is held, enqueue recognizes the active marker and moves
+            # its already-durable record inline->runnable without a second
+            # persistence gap.
+            self._active_inline_promotion = marker
+            try:
+                queued = self.enqueue(
+                    marker.get("path", ""),
+                    marker.get("title", ""),
+                    channel=marker.get("channel", ""),
+                    video_id=marker.get("video_id", ""),
+                    from_download=True,
+                    compress_after=dict(marker.get("compress_after") or {}),
+                )
+            finally:
+                self._active_inline_promotion = None
+            if queued:
+                return True
+            return False
 
     def route_download_transcription(
             self, path: str, title: str, channel: str = "",
@@ -434,37 +638,84 @@ class TranscribeManager:
 
         Returns ``"inline"`` when already-punctuated local YouTube captions
         were ingested immediately, ``"processing"`` when punctuation/Whisper
-        work was queued, or ``"duplicate"`` when that path was already queued.
+        work was queued, ``"duplicate"`` when that path was already queued,
+        or ``"failed"`` when recovery state could not be made durable.
         """
-        completed_inline = _try_auto_captions(
-            path, title, channel, self._stream,
-            punct_mgr=None,
-            video_id_hint=video_id,
-            from_download=True,
-            allow_fetch=False,
-            prepunctuated_only=True,
-            update_pending=False,
-        )
         followup = dict(compress_after or {})
-        if completed_inline:
-            self.record_inline_transcription(channel)
-            self._finish_successful_job({
-                "path": path,
-                "title": title,
-                "channel": channel,
-                "compress_after": followup,
-            }, {"auto_captions": True})
-            return "inline"
+        marker = {
+            "task_id": make_task_id("gpu"),
+            "kind": "transcribe",
+            "path": str(path),
+            "title": title or os.path.basename(path),
+            "channel": channel,
+            "video_id": (video_id or "").strip(),
+            "combined_override": None,
+            "retranscribe": False,
+            "bulk_id": "",
+            "bulk_total": 0,
+            "bulk_index": 0,
+            "from_download": True,
+            "compress_after": followup,
+            "requested_model": str(self._model or "").strip(),
+            "actual_model": "",
+            "cb": None,
+            "cancel": threading.Event(),
+            "_retry_required": True,
+            "_write_intent": True,
+            "_caption_recovery": True,
+            # Inline work never reserved the ordinary Processing counter.
+            # If the process dies before promotion, recovery must neither
+            # increment nor later decrement that cosmetic counter.
+            "_skip_pending_counter": True,
+        }
+        staged, duplicate = self._stage_inline_caption_recovery(marker)
+        if duplicate:
+            return "duplicate"
+        if not staged:
+            self._stream.emit_error(
+                "Could not save native-caption recovery state; caption files "
+                "were left untouched.")
+            return "failed"
 
+        try:
+            caption_outcome = _coerce_caption_outcome(_try_auto_captions(
+                path, title, channel, self._stream,
+                punct_mgr=None,
+                video_id_hint=video_id,
+                from_download=True,
+                allow_fetch=False,
+                prepunctuated_only=True,
+                update_pending=False,
+            ))
+        except Exception as exc:
+            _log.warning("synchronous auto-caption attempt failed: %s", exc)
+            caption_outcome = _CaptionOutcome.FAILED
+
+        if caption_outcome is _CaptionOutcome.SUCCESS:
+            # Keep the caption marker durable until any requested compression
+            # follow-up has committed too. Clearing it first made a transient
+            # compress_enqueue(False) silently lose that requested work.
+            followup_committed = self._finish_successful_job(
+                marker, {"auto_captions": True})
+            if (followup_committed
+                    and self._clear_inline_caption_recovery(marker)):
+                self.record_inline_transcription(channel)
+                return "inline"
+
+        # The marker was committed before the first possible sidecar write.
+        # Promote that same durable record rather than enqueueing a second job;
+        # native-caption retry is idempotent by v2 video id and can safely
+        # recover TXT-only, TXT+JSONL, or index-only interruption points.
         if on_processing_queued is not None:
             try:
                 on_processing_queued()
             except Exception as e:
                 _log.debug("processing-queued callback failed: %s", e)
-        queued = self.enqueue(
-            path, title, channel=channel, video_id=video_id,
-            from_download=True, compress_after=followup)
-        return "processing" if queued else "duplicate"
+        if not self._promote_inline_caption_recovery(marker):
+            self._stream.emit_error(
+                "Native-caption recovery is saved, but could not be added to "
+                "the live Processing queue. It will be restored on restart.")
+        return "processing"
 
     def _auto_enabled(self) -> bool:
         """True if the GPU Auto checkbox says "go". When False, the
@@ -521,10 +772,11 @@ class TranscribeManager:
 
     def start_subprocess(self, model: str | None = None) -> bool:
         """Start the persistent whisper worker. Returns True when ready."""
+        desired_model = (model or self._model or "").strip()
         wait_for_start = False
         with self._proc_lock:
             if self._proc is not None and self._proc.poll() is None:
-                return True
+                return self._loaded_model == desired_model
             if self._starting:
                 wait_for_start = True
             else:
@@ -538,7 +790,7 @@ class TranscribeManager:
             if not self._python311:
                 self._stream.emit_error("Transcription requires Python 3.11. Install it from python.org.")
                 return False
-            m = model or self._model
+            m = desired_model
             self._stream.emit_text(
                 f" Transcribing — Loading Whisper model ({m}) on GPU...",
                 "transcribe_using")
@@ -570,6 +822,16 @@ class TranscribeManager:
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, bufsize=1, startupinfo=_startupinfo, env=env,
             )
+            try:
+                from ..process_runner import PROCESS_REGISTRY
+                with self._jobs_lock:
+                    task_id = str(
+                        (self._current_job or {}).get("task_id") or "")
+                PROCESS_REGISTRY.register(
+                    self._proc, owner="processing", task_id=task_id,
+                    role="whisper")
+            except Exception as exc:
+                _log.debug("Whisper process registration failed: %s", exc)
 
             # drain stderr on a background thread. Without
             # this, whisper subprocess can DEADLOCK when it writes enough
@@ -642,6 +904,23 @@ class TranscribeManager:
                 self._stop_subprocess()
                 return False
 
+            # The child, not the launch environment, is authoritative about
+            # what it loaded.  Requiring the worker-owned value closes a
+            # provenance gap where a stale/wrong child could be labelled with
+            # the model the parent merely *asked* it to load.
+            reported_model = str(info.get("model") or "").strip()
+            if (reported_model not in _SUPPORTED_WHISPER_MODELS
+                    or reported_model != m):
+                self._stream.emit_error(
+                    "Transcription tool reported the wrong Whisper model "
+                    f"(requested {m!r}, worker reported "
+                    f"{reported_model or '<missing>'!r}). Task kept for retry."
+                )
+                self._emit_whisper_stderr_tail()
+                self._stop_subprocess()
+                return False
+            self._loaded_model = reported_model
+
             dev = info.get("device", "?").upper()
             # Verbose-only subprocess-spawn diagnostic. PRIMARY tag
             # must be `transcribe_using` (in VERBOSE_ONLY_TAGS) so
@@ -653,7 +932,7 @@ class TranscribeManager:
             # "no new videos" row, persisting there forever.
             self._stream.emit([
                 [" \u2014 \u2713 ", "transcribe_using"],
-                [f"Whisper model loaded ({m}, {dev}).\n", "transcribe_using"],
+                [f"Whisper model loaded ({reported_model}, {dev}).\n", "transcribe_using"],
             ])
             if info.get("cuda_fallback_reason"):
                 self._stream.emit_dim(
@@ -689,6 +968,7 @@ class TranscribeManager:
     def _stop_subprocess(self, force: bool = False):
         with self._proc_lock:
             if self._proc is None:
+                self._loaded_model = ""
                 return
             # Close stdin BEFORE terminating so the worker's blocking
             # `for line in sys.stdin:` reader sees EOF and exits its
@@ -700,14 +980,15 @@ class TranscribeManager:
                     self._proc.stdin.close()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
+            proc = self._proc
             try:
                 if force:
-                    self._proc.kill()
+                    proc.kill()
                 else:
                     try:
-                        self._proc.terminate()
+                        proc.terminate()
                     except Exception:
-                        self._proc.kill()
+                        proc.kill()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             # Push a None sentinel onto the queue if a consumer is
@@ -739,8 +1020,83 @@ class TranscribeManager:
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             self._stderr_drain_thread = None
+            try:
+                from ..process_runner import PROCESS_REGISTRY
+                try:
+                    proc.wait(timeout=0.25 if force else 1.0)
+                except Exception:
+                    PROCESS_REGISTRY.terminate_process(proc, timeout=2.0)
+                if proc.poll() is not None:
+                    PROCESS_REGISTRY.unregister(proc)
+            except Exception as exc:
+                _log.debug("Whisper process unregister failed: %s", exc)
             self._proc = None
             self._line_queue = None
+            self._loaded_model = ""
+
+    def _prepare_job_model(self, job: dict[str, Any]) -> bool:
+        """Load the immutable model captured by one transcription job."""
+        requested = str(
+            job.get("requested_model") or self._model or "").strip()
+        if requested not in _SUPPORTED_WHISPER_MODELS:
+            self._stream.emit_error(
+                f"Transcription task has unsupported model: {requested!r}")
+            return False
+        job["requested_model"] = requested
+        if self._loaded_model and self._loaded_model != requested:
+            self._stop_subprocess()
+        if not self.start_subprocess(model=requested):
+            return False
+        return self._accept_worker_model_report(
+            {"model": self._loaded_model},
+            job,
+            phase="ready handshake",
+        )
+
+    def _accept_worker_model_report(
+        self,
+        payload: dict[str, Any],
+        job: dict[str, Any],
+        *,
+        phase: str,
+    ) -> bool:
+        """Validate and durably record child-reported model provenance."""
+        reported = str(payload.get("model") or "").strip()
+        requested = str(job.get("requested_model") or "").strip()
+        loaded = str(self._loaded_model or "").strip()
+        if (reported not in _SUPPORTED_WHISPER_MODELS
+                or reported != requested
+                or (loaded and reported != loaded)):
+            self._stream.emit_error(
+                f"Whisper {phase} model mismatch: requested "
+                f"{requested or '<missing>'!r}, loaded "
+                f"{loaded or '<missing>'!r}, worker reported "
+                f"{reported or '<missing>'!r}. Task kept for retry."
+            )
+            return False
+
+        previous = str(job.get("actual_model") or "").strip()
+        if previous == reported:
+            return True
+        job["actual_model"] = reported
+        if not self._persist_pending():
+            if previous:
+                job["actual_model"] = previous
+            else:
+                job.pop("actual_model", None)
+            self._stream.emit_error(
+                "Could not save the worker-reported Whisper model; task kept "
+                "for retry before writing any transcript."
+            )
+            return False
+        if self._queues is not None:
+            try:
+                self._queues.set_current_gpu(self._queue_payload_for_job(job))
+            except Exception as exc:
+                _log.warning(
+                    "could not refresh current GPU model provenance: %s", exc
+                )
+        return True
 
     # ── Queue + worker loop ──────────────────────────────────────────
 
@@ -754,7 +1110,24 @@ class TranscribeManager:
                 bulk_total: int = 0,
                 bulk_index: int = 0,
                 from_download: bool = False,
-                compress_after: dict[str, str] | None = None) -> bool:
+                compress_after: dict[str, str] | None = None,
+                requested_model: str = "",
+                on_state: Callable | None = None,
+                _retry_required: bool = False,
+                _retry_as_replace: bool = False,
+                _write_intent: bool = False,
+                _caption_recovery: bool = False,
+                _skip_pending_counter: bool = False,
+                _cleanup_only: bool = False,
+                _no_speech_pending: bool = False,
+                _stats_tallied: bool = False,
+                _output_complete: bool = False,
+                _callback_done: bool = False,
+                _followup_pending: bool = False,
+                _followup_enqueued: bool = False,
+                _completed_outcome: str = "",
+                _task_id: str = "",
+                _restoring: bool = False) -> bool:
         """Queue a video for transcription.
 
         `channel` is optional; if provided it's stored on the job so the
@@ -777,75 +1150,170 @@ class TranscribeManager:
         aggregated files gets surgically swapped (matches `_run_retranscribe_job`). `video_id` is used
         by the replace-jsonl pass to catch title-drifted duplicates.
         """
+        if self._shutdown_requested.is_set():
+            self._stream.emit_error(
+                "Processing is shutting down; the new task was not accepted.")
+            return False
         path = str(path)
         if not os.path.isfile(path):
             self._stream.emit_error(f"Transcribe: file not found: {path}")
             return False
         _job_title = title or os.path.basename(path)
         _path_key = os.path.normcase(os.path.normpath(os.path.abspath(path)))
-        with self._jobs_lock:
-            def _same_transcribe_path(job: dict[str, Any] | None) -> bool:
-                if not job or (job.get("kind") or "transcribe") != "transcribe":
-                    return False
-                job_path = job.get("path") or ""
-                if not job_path:
-                    return False
-                return (
-                    os.path.normcase(os.path.normpath(os.path.abspath(job_path)))
-                    == _path_key
-                )
-
-            if any(_same_transcribe_path(j) for j in self._jobs) \
-                    or _same_transcribe_path(self._current_job):
+        promotion = self._active_inline_promotion
+        if (promotion is not None
+                and self._job_path_key(promotion.get("path", "")) != _path_key):
+            promotion = None
+        if promotion is not None:
+            # The identical durable marker is changing only runtime ownership.
+            # Preserve every restart-semantic field from that marker.
+            combined = promotion.get("combined_override")
+            retranscribe = bool(promotion.get("retranscribe"))
+            bulk_id = promotion.get("bulk_id", "") or ""
+            bulk_total = int(promotion.get("bulk_total", 0) or 0)
+            bulk_index = int(promotion.get("bulk_index", 0) or 0)
+            _retry_required = bool(promotion.get("_retry_required"))
+            _retry_as_replace = bool(promotion.get("_retry_as_replace"))
+            _write_intent = bool(promotion.get("_write_intent"))
+            _caption_recovery = bool(promotion.get("_caption_recovery"))
+            _skip_pending_counter = bool(
+                promotion.get("_skip_pending_counter"))
+            _output_complete = bool(promotion.get("_output_complete"))
+            _callback_done = bool(promotion.get("_callback_done"))
+            _followup_pending = bool(promotion.get("_followup_pending"))
+            _followup_enqueued = bool(promotion.get("_followup_enqueued"))
+            _completed_outcome = str(
+                promotion.get("_completed_outcome") or "")
+            _task_id = str(promotion.get("task_id") or _task_id or "")
+            requested_model = str(
+                promotion.get("requested_model") or requested_model or "")
+        def _same_transcribe_path(job: dict[str, Any] | None) -> bool:
+            if not job or (job.get("kind") or "transcribe") != "transcribe":
                 return False
-            self._jobs.append({
-                "path": path,
-                "title": _job_title,
-                "channel": channel,
-                "combined_override": combined,
-                "cb": on_complete,
-                "cancel": threading.Event(),
-                "retranscribe": bool(retranscribe),
-                "video_id": (video_id or "").strip(),
-                "bulk_id": bulk_id or "",
-                "bulk_total": int(bulk_total or 0),
-                "bulk_index": int(bulk_index or 0),
-                "from_download": bool(from_download),
-                "compress_after": dict(compress_after or {}),
-            })
-        # Mirror the job into the shared GPU queue so the Tasks popover
-        # shows the pending work. this was flagged: auto-transcribe on
-        # a channel would write to our internal `_jobs` list but the
-        # popover stayed empty, so there was no visible record of the
-        # transcription being queued. `kind=transcribe` + `title`
-        # matches the shape `_task_label_gpu` reads.
-        # `bulk_id`/`bulk_total` carry a coalesce hint — when N videos from
-        # the same channel are queued in one "Queue Pending" / "Transcribe
-        # All" click, they all share a bulk_id and the popover collapses
-        # them into a single "Transcribing {ch} (X videos)" row.
-        if self._queues is not None:
-            try:
-                self._queues.gpu_enqueue({
-                    "kind": "transcribe",
-                    "title": _job_title,
-                    "path": path,
-                    "channel": channel,
-                    "combined_override": combined,
-                    "retranscribe": bool(retranscribe),
-                    "video_id": (video_id or "").strip(),
-                    "bulk_id": bulk_id,
-                    "bulk_total": int(bulk_total or 0),
-                    "bulk_index": int(bulk_index or 0),
-                    "from_download": bool(from_download),
-                    "compress_after": dict(compress_after or {}),
-                })
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
+            job_path = job.get("path") or ""
+            if not job_path:
+                return False
+            return (
+                os.path.normcase(os.path.normpath(os.path.abspath(job_path)))
+                == _path_key
+            )
+
+        job = {
+            "task_id": str(_task_id or "").strip() or make_task_id("gpu"),
+            "kind": "transcribe",
+            "path": path,
+            "title": _job_title,
+            "channel": channel,
+            "combined_override": combined,
+            "cb": on_complete,
+            # Runtime-only Watch feedback. Journal snapshots deliberately
+            # omit callbacks; a restarted window reconstructs its own state.
+            "state_cb": on_state,
+            "cancel": threading.Event(),
+            "retranscribe": bool(retranscribe),
+            "video_id": (video_id or "").strip(),
+            "bulk_id": bulk_id or "",
+            "bulk_total": int(bulk_total or 0),
+            "bulk_index": int(bulk_index or 0),
+            "from_download": bool(from_download),
+            "compress_after": dict(compress_after or {}),
+            # Freeze the model at enqueue time. Later settings or one-off
+            # choices apply only to jobs queued after that change.
+            "requested_model": str(
+                requested_model or self._model or "").strip(),
+            "actual_model": str(
+                (promotion or {}).get("actual_model") or "").strip(),
+            # Recovery-only flags. A failed job must bypass the normal
+            # "already transcribed" restore filter. Caption recovery keeps
+            # the native sidecar retry path; other write intent retries use
+            # the surgical replacement writers.
+            "_retry_required": bool(_retry_required),
+            "_retry_as_replace": bool(_retry_as_replace),
+            "_write_intent": bool(_write_intent),
+            "_caption_recovery": bool(_caption_recovery),
+            "_skip_pending_counter": bool(_skip_pending_counter),
+            "_cleanup_only": bool(_cleanup_only),
+            "_no_speech_pending": bool(_no_speech_pending),
+            "_stats_tallied": bool(_stats_tallied),
+            "_output_complete": bool(_output_complete),
+            "_callback_done": bool(_callback_done),
+            "_followup_pending": bool(_followup_pending),
+            "_followup_enqueued": bool(_followup_enqueued),
+            "_completed_outcome": str(_completed_outcome or ""),
+        }
+        # Reserve one durable visible identity before the job may start.  A
+        # stale QueueState row for this logical path is adopted instead of
+        # creating a second hidden ID.  If the journal's second commit fails,
+        # the reservation is rolled back before returning.
+        reservation = None
+        with self._journal_lock:
+            with self._jobs_lock:
+                if (any(_same_transcribe_path(j) for j in self._jobs)
+                        or any(_same_transcribe_path(j)
+                               for j in self._inline_caption_jobs
+                               if j is not promotion)
+                        or _same_transcribe_path(self._current_job)):
+                    return False
+                reserved_ids = {
+                    str(existing.get("task_id") or "").strip()
+                    for existing in [
+                        *self._jobs, *self._inline_caption_jobs,
+                        self._current_job,
+                    ]
+                    if existing is not None and existing is not promotion
+                    and str(existing.get("task_id") or "").strip()
+                }
+            if self._queues is not None:
+                try:
+                    reservation = self._queues.gpu_reserve_task(
+                        self._queue_payload_for_job(job),
+                        reserved_task_ids=reserved_ids,
+                        required_task_id=(job["task_id"] if promotion is not None
+                                          else ""),
+                    )
+                except Exception as exc:
+                    _log.warning("Processing queue reservation failed: %s", exc)
+                    reservation = None
+                if not isinstance(reservation, dict):
+                    self._stream.emit_error(
+                        "Could not save the visible Processing queue; task was "
+                        "not started.")
+                    return False
+                job["task_id"] = str(
+                    reservation.get("task_id") or "").strip()
+                if not job["task_id"]:
+                    return False
+            with self._jobs_lock:
+                self._jobs.append(job)
+                if promotion is not None:
+                    self._inline_caption_jobs = [
+                        existing for existing in self._inline_caption_jobs
+                        if existing is not promotion
+                    ]
+            if not self._persist_pending():
+                with self._jobs_lock:
+                    if job in self._jobs:
+                        self._jobs.remove(job)
+                    if (promotion is not None
+                            and not any(existing is promotion
+                                        for existing in self._inline_caption_jobs)):
+                        self._inline_caption_jobs.append(promotion)
+                if reservation is not None:
+                    try:
+                        self._queues.gpu_rollback_reservation(reservation)
+                    except Exception as exc:
+                        _log.warning(
+                            "Processing reservation rollback failed: %s", exc)
+                self._stream.emit_error(
+                    "Could not save the transcription queue; task was not "
+                    "started. Check that the app data folder is writable.")
+                return False
         # Bump `transcription_pending` for the channel so the Subs-tab
         # auto-indicator stays in sync with OLD's behavior (YTArchiver.py:
         # 14629 and friends set this counter during sync → transcribe flow).
-        _bump_transcription_pending(channel, 1)
-        self._persist_pending()
+        if (not _restoring and not _cleanup_only
+                and not _skip_pending_counter):
+            _bump_transcription_pending(channel, 1)
         # Auto-clear a launch-time pause when a NEW job arrives AND the
         # GPU Auto checkbox is on. The launch-time pause is meant to
         # stop RESTORED items from auto-firing, not to block fresh
@@ -859,7 +1327,8 @@ class TranscribeManager:
             # paused=True when we thought we'd just cleared it
             # (audit: transcribe/core.py H67).
             with self._jobs_lock:
-                if (self._auto_enabled() and self._paused.is_set()
+                if (not _restoring and self._auto_enabled()
+                        and self._paused.is_set()
                         and self._queues is not None
                         and getattr(self._queues, "gpu_paused", False)
                         and getattr(self._queues, "gpu_pause_restored", False)):
@@ -893,6 +1362,10 @@ class TranscribeManager:
           - multiple compresses serialize on the same GPU instead of
             stampeding into parallel NVENC sessions.
         """
+        if self._shutdown_requested.is_set():
+            self._stream.emit_error(
+                "Processing is shutting down; the new task was not accepted.")
+            return False
         path = str(path)
         if not os.path.isfile(path):
             self._stream.emit_error(f"Compress: file not found: {path}")
@@ -911,36 +1384,156 @@ class TranscribeManager:
                 "Compress: could not verify archive containment.")
             return False
         _job_title = title or os.path.splitext(os.path.basename(path))[0]
-        with self._jobs_lock:
-            self._jobs.append({
-                "kind": "compress",
-                "path": path,
-                "title": _job_title,
-                "channel": channel,
-                "quality": quality,
-                "output_res": str(output_res),
-                "cb": on_complete,
-                "cancel": threading.Event(),
-            })
-        if self._queues is not None:
-            try:
-                self._queues.gpu_enqueue({
-                    "kind": "compress",
-                    "title": _job_title,
-                    "path": path,
-                    "channel": channel,
-                    "quality": quality,
-                    "output_res": str(output_res),
-                })
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-        self._persist_pending()
+        job = {
+            "task_id": make_task_id("gpu"),
+            "kind": "compress",
+            "path": path,
+            "title": _job_title,
+            "channel": channel,
+            "quality": quality,
+            "output_res": str(output_res),
+            "cb": on_complete,
+            "cancel": threading.Event(),
+        }
+        reservation = None
+        with self._journal_lock:
+            with self._jobs_lock:
+                reserved_ids = {
+                    str(existing.get("task_id") or "").strip()
+                    for existing in [
+                        *self._jobs, *self._inline_caption_jobs,
+                        self._current_job,
+                    ]
+                    if existing is not None
+                    and str(existing.get("task_id") or "").strip()
+                }
+                duplicate = any(
+                    self._job_identity_key(existing)
+                    == self._job_identity_key(job)
+                    for existing in [*self._jobs, self._current_job]
+                    if existing is not None
+                )
+            if duplicate:
+                return False
+            if self._queues is not None:
+                try:
+                    reservation = self._queues.gpu_reserve_task(
+                        self._queue_payload_for_job(job),
+                        reserved_task_ids=reserved_ids,
+                    )
+                except Exception as exc:
+                    _log.warning("Compression queue reservation failed: %s", exc)
+                    reservation = None
+                if not isinstance(reservation, dict):
+                    self._stream.emit_error(
+                        "Could not save the visible compression queue; task "
+                        "was not started.")
+                    return False
+                job["task_id"] = str(
+                    reservation.get("task_id") or "").strip()
+            with self._jobs_lock:
+                self._jobs.append(job)
+            if not self._persist_pending():
+                with self._jobs_lock:
+                    if job in self._jobs:
+                        self._jobs.remove(job)
+                if reservation is not None:
+                    try:
+                        self._queues.gpu_rollback_reservation(reservation)
+                    except Exception as exc:
+                        _log.warning(
+                            "Compression reservation rollback failed: %s", exc)
+                self._stream.emit_error(
+                    "Could not save the compression queue; task was not "
+                    "started. Check that the app data folder is writable.")
+                return False
         self._ensure_worker()
         return True
 
     # ── Pending journal (survives restart) ──
 
-    def drop_running_from_journal(self):
+    @staticmethod
+    def _snapshot_pending_job(j: dict[str, Any]) -> dict[str, Any]:
+        """Return the restart-safe, JSON-serializable portion of one job."""
+        return {
+            "task_id": j.get("task_id", ""),
+            "path": j.get("path", ""),
+            "title": j.get("title", ""),
+            "channel": j.get("channel", ""),
+            "video_id": j.get("video_id", ""),
+            "retranscribe": bool(j.get("retranscribe")),
+            "combined_override": j.get("combined_override"),
+            "bulk_id": j.get("bulk_id", ""),
+            "bulk_total": int(j.get("bulk_total", 0) or 0),
+            "bulk_index": int(j.get("bulk_index", 0) or 0),
+            "kind": j.get("kind", "transcribe"),
+            "from_download": bool(j.get("from_download")),
+            "quality": j.get("quality", "Average"),
+            "output_res": str(j.get("output_res", "720")),
+            "compress_after": dict(j.get("compress_after") or {}),
+            "requested_model": str(j.get("requested_model") or ""),
+            "actual_model": str(j.get("actual_model") or ""),
+            "retry_required": bool(j.get("_retry_required")),
+            "retry_as_replace": bool(j.get("_retry_as_replace")),
+            "write_intent": bool(j.get("_write_intent")),
+            "caption_recovery": bool(j.get("_caption_recovery")),
+            "skip_pending_counter": bool(j.get("_skip_pending_counter")),
+            "cleanup_only": bool(j.get("_cleanup_only")),
+            "no_speech_pending": bool(j.get("_no_speech_pending")),
+            "stats_tallied": bool(j.get("_stats_tallied")),
+            "output_complete": bool(j.get("_output_complete")),
+            "callback_done": bool(j.get("_callback_done")),
+            "followup_pending": bool(j.get("_followup_pending")),
+            "followup_enqueued": bool(j.get("_followup_enqueued")),
+            "completed_outcome": str(j.get("_completed_outcome") or ""),
+            "defer_requested": bool(j.get("_defer_requested")),
+        }
+
+    def _pending_snapshot(self, *, include_current: bool = True) -> list[dict]:
+        """Snapshot every durable job while the journal boundary is held."""
+        snap = self._snapshot_pending_job
+        with self._jobs_lock:
+            snapshot = [snap(j) for j in self._inline_caption_jobs]
+            snapshot.extend(snap(j) for j in self._jobs)
+            if include_current and self._current_job:
+                snapshot.insert(0, snap(self._current_job))
+        return snapshot
+
+    @staticmethod
+    def _write_pending_snapshot(snapshot: list[dict]) -> bool:
+        """Fsync and atomically replace the journal using a unique temp."""
+        tmp = ""
+        fd = -1
+        try:
+            import tempfile as _tempfile
+
+            p = _pending_journal_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = _tempfile.mkstemp(
+                prefix=f".{p.name}.", suffix=".tmp", dir=str(p.parent))
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = -1
+                json.dump(snapshot, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, p)
+            tmp = ""
+            return True
+        except Exception as e:
+            _log.warning("could not persist transcription recovery journal: %s", e)
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            return False
+
+    def drop_running_from_journal(self) -> bool:
         """Rewrite the pending journal as if the currently-running job
         doesn't exist. Used by `gpu_skip_current` as belt-and-suspenders
         cleanup: if the worker reaches its normal `finally` block this
@@ -955,97 +1548,19 @@ class TranscribeManager:
         via its own finally; this method doesn't touch that field to
         avoid racing the worker thread.
         """
-        try:
-            import json as _json
-            def _snap(j: dict[str, Any]) -> dict[str, Any]:
-                return {
-                    "path": j.get("path", ""),
-                    "title": j.get("title", ""),
-                    "channel": j.get("channel", ""),
-                    "video_id": j.get("video_id", ""),
-                    "retranscribe": bool(j.get("retranscribe")),
-                    "combined_override": j.get("combined_override"),
-                    "bulk_id": j.get("bulk_id", ""),
-                    "bulk_total": int(j.get("bulk_total", 0) or 0),
-                    "bulk_index": int(j.get("bulk_index", 0) or 0),
-                    "kind": j.get("kind", "transcribe"),
-                    "from_download": bool(j.get("from_download")),
-                    "quality": j.get("quality", "Average"),
-                    "output_res": str(j.get("output_res", "720")),
-                    "compress_after": dict(j.get("compress_after") or {}),
-                }
-            with self._jobs_lock:
-                snapshot = [_snap(j) for j in self._jobs]
-            # Note: current_job is INTENTIONALLY excluded.
-            p = _pending_journal_path()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = str(p) + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                _json.dump(snapshot, f, indent=2)
-            os.replace(tmp, p)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+        with self._journal_lock:
+            return self._write_pending_snapshot(
+                self._pending_snapshot(include_current=False))
 
-    def clear_pending_journal(self):
+    def clear_pending_journal(self) -> bool:
         """Persist an empty pending-transcribe journal."""
-        try:
-            import json as _json
-            p = _pending_journal_path()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = str(p) + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                _json.dump([], f, indent=2)
-            os.replace(tmp, p)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+        with self._journal_lock:
+            return self._write_pending_snapshot([])
 
-    def _persist_pending(self):
-        """Write current pending jobs to disk so a crash/restart recovers them."""
-        try:
-            import json as _json
-            # serialize ALL job fields needed to rehydrate
-            # correctly on restart. Before this, only (path, title,
-            # channel) were written — so a killed-mid-retranscribe job
-            # came back as a regular transcribe (retranscribe flag
-            # lost), which took the auto-captions fast path and left
-            # the old Whisper entry duplicated in the .txt/.jsonl.
-            # Same risk for video_id (used by replace_*_entry helpers
-            # to catch title-drifted stale entries) and for
-            # combined_override / bulk_id which affect path resolution
-            # and batch tracking.
-            def _snap(j: dict[str, Any]) -> dict[str, Any]:
-                return {
-                    "path": j.get("path", ""),
-                    "title": j.get("title", ""),
-                    "channel": j.get("channel", ""),
-                    "video_id": j.get("video_id", ""),
-                    "retranscribe": bool(j.get("retranscribe")),
-                    "combined_override": j.get("combined_override"),
-                    "bulk_id": j.get("bulk_id", ""),
-                    # Persist bulk batch metadata so the popover tooltip
-                    # ("Transcribing X (3 of 5)") reflects the original
-                    # batch on recovery, not just the surviving items.
-                    "bulk_total": int(j.get("bulk_total", 0) or 0),
-                    "bulk_index": int(j.get("bulk_index", 0) or 0),
-                    "kind": j.get("kind", "transcribe"),
-                    "from_download": bool(j.get("from_download")),
-                    "compress_after": dict(j.get("compress_after") or {}),
-                    "quality": j.get("quality", "Average"),
-                    "output_res": str(j.get("output_res", "720")),
-                }
-            with self._jobs_lock:
-                snapshot = [_snap(j) for j in self._jobs]
-            # Include in-flight job at top
-            if self._current_job:
-                snapshot.insert(0, _snap(self._current_job))
-            p = _pending_journal_path()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = str(p) + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                _json.dump(snapshot, f, indent=2)
-            os.replace(tmp, p)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+    def _persist_pending(self) -> bool:
+        """Durably write pending jobs; report whether the journal committed."""
+        with self._journal_lock:
+            return self._write_pending_snapshot(self._pending_snapshot())
 
     def load_pending(self) -> int:
         """Load any jobs left behind from a previous session. Returns count.
@@ -1057,13 +1572,6 @@ class TranscribeManager:
         """
         try:
             import json as _json
-            p = _pending_journal_path()
-            if not p.exists():
-                return 0
-            with p.open("r", encoding="utf-8") as f:
-                jobs = _json.load(f)
-            if not isinstance(jobs, list):
-                return 0
 
             # Cache existing-title sets per channel so we don't re-walk the
             # folder N times.
@@ -1141,62 +1649,294 @@ class TranscribeManager:
                 # `titles` is a dict keyed by the normalized title form.
                 return _norm_title(title) in titles
 
-            recovered = 0
-            for j in jobs:
-                path = j.get("path") or ""
-                if not path or not os.path.isfile(path):
-                    continue
-                kind = (j.get("kind") or "transcribe").lower()
-                # A RE-transcribe job intentionally targets an
-                # already-transcribed video, so the "already transcribed?"
-                # skip must NOT drop it — otherwise a channel re-transcribe
-                # paused-and-restarted lost every remaining job on reload
-                # (they showed in the popover but never ran on Start).
-                # Only plain transcribe jobs skip when the transcript exists.
-                if (kind == "transcribe" and not j.get("retranscribe")
-                        and _already_transcribed(
-                            path, j.get("title", ""), j.get("channel", ""),
-                            j.get("video_id", ""))):
+            # Treat startup recovery as one journal transaction. Re-enqueueing
+            # each saved job through the public helpers used to replace an
+            # N-item journal with the first recovered item; a crash midway
+            # through the loop then permanently lost the remaining N-1 jobs.
+            # Holding this boundary from read through the single replacement
+            # also prevents a concurrent fresh enqueue from being overwritten
+            # by a stale startup snapshot.
+            with self._journal_lock:
+                p = _pending_journal_path()
+                if not p.exists():
+                    return 0
+                with p.open("r", encoding="utf-8") as f:
+                    jobs = _json.load(f)
+                if not isinstance(jobs, list):
+                    return 0
+
+                queue_snapshot: list[dict[str, Any]] = []
+                queue_task_ids: dict[tuple[str, str], str] = {}
+                queue_id_owners: dict[str, tuple[str, str]] = {}
+                queue_order: dict[tuple[str, str], int] = {}
+                queue_snapshot_loaded = True
+                if self._queues is not None:
+                    try:
+                        queue_snapshot = self._queues.gpu_snapshot()
+                        for queue_index, queued in enumerate(queue_snapshot):
+                            key = self._job_identity_key(queued)
+                            task_id = str(
+                                queued.get("task_id") or "").strip()
+                            if key is not None:
+                                queue_order.setdefault(key, queue_index)
+                            if key is not None and task_id:
+                                queue_task_ids.setdefault(key, task_id)
+                                queue_id_owners.setdefault(task_id, key)
+                    except Exception as exc:
+                        _log.debug("GPU identity migration snapshot failed: %s",
+                                   exc)
+                        queue_snapshot_loaded = False
+                if not queue_snapshot_loaded:
+                    self._stream.emit_error(
+                        "Could not read the durable Processing queue; startup "
+                        "recovery remains paused for the next launch.")
+                    return 0
+
+                stale_queue_task_ids: list[str] = []
+                candidates: list[dict[str, Any]] = []
+                with self._jobs_lock:
+                    existing = [*self._inline_caption_jobs, *self._jobs]
+                    if self._current_job:
+                        existing.append(self._current_job)
+                    known_jobs = {
+                        key for job in existing
+                        if (key := self._job_identity_key(job)) is not None
+                    }
+                    assigned_ids = {
+                        str(job.get("task_id") or "").strip()
+                        for job in existing
+                        if str(job.get("task_id") or "").strip()
+                    }
+
+                for saved in jobs:
+                    if not isinstance(saved, dict):
+                        continue
+                    path = str(saved.get("path") or "")
+                    if not path or not os.path.isfile(path):
+                        continue
+                    kind = str(saved.get("kind") or "transcribe").lower()
+                    job_key = (kind, self._job_path_key(path))
+                    if not job_key[1] or job_key in known_jobs:
+                        continue
+                    queue_task_id = queue_task_ids.get(job_key, "")
+                    saved_task_id = str(
+                        saved.get("task_id") or "").strip()
+                    task_id = ""
+                    if (queue_task_id
+                            and queue_task_id not in assigned_ids
+                            and queue_id_owners.get(queue_task_id) == job_key):
+                        task_id = queue_task_id
+                    elif (saved_task_id
+                          and saved_task_id not in assigned_ids
+                          and queue_id_owners.get(saved_task_id, job_key)
+                          == job_key):
+                        task_id = saved_task_id
+                    while not task_id or task_id in assigned_ids:
+                        task_id = make_task_id("gpu")
+                        # A journal-only recovery row must not steal an ID
+                        # from a QueueState row that has yet to be reconciled.
+                        if task_id in queue_id_owners:
+                            task_id = ""
+
+                    # A RE-transcribe or recovery job intentionally targets an
+                    # already-transcribed video. Only an ordinary stale
+                    # transcribe entry may be dropped during startup cleanup.
+                    if (kind != "compress" and not saved.get("retranscribe")
+                            and not saved.get("retry_required")
+                            and not saved.get("write_intent")
+                            and not saved.get("cleanup_only")
+                            and not saved.get("no_speech_pending")
+                            and not saved.get("output_complete")
+                            and _already_transcribed(
+                                path, saved.get("title", ""),
+                                saved.get("channel", ""),
+                                saved.get("video_id", ""))):
+                        if queue_task_id:
+                            stale_queue_task_ids.append(
+                                queue_task_id)
+                        continue
+
+                    title = saved.get("title") or os.path.basename(path)
+                    if kind == "compress":
+                        # Preserve compress_enqueue's archive-containment
+                        # fail-closed behavior without exposing a partially
+                        # restored job to its public enqueue/start side effects.
+                        try:
+                            from ..utils import is_within_managed_roots
+                            if not is_within_managed_roots(path):
+                                continue
+                        except Exception as exc:
+                            _log.warning(
+                                "compress recovery containment check failed "
+                                "for %s: %s", path, exc)
+                            continue
+                        runtime_job: dict[str, Any] = {
+                            "task_id": task_id,
+                            "kind": "compress",
+                            "path": os.path.normpath(path),
+                            "title": title,
+                            "channel": saved.get("channel", ""),
+                            "quality": saved.get("quality", "Average"),
+                            "output_res": str(saved.get("output_res", "720")),
+                            "cb": None,
+                            "cancel": threading.Event(),
+                        }
+                    else:
+                        caption_recovery = bool(
+                            saved.get("caption_recovery"))
+                        write_intent = bool(saved.get("write_intent"))
+                        runtime_job = {
+                            "task_id": task_id,
+                            "kind": "transcribe",
+                            "path": path,
+                            "title": title,
+                            "channel": saved.get("channel", ""),
+                            "combined_override": saved.get(
+                                "combined_override"),
+                            "cb": None,
+                            "cancel": threading.Event(),
+                            "retranscribe": bool(saved.get("retranscribe")),
+                            "video_id": (
+                                saved.get("video_id") or "").strip(),
+                            "bulk_id": saved.get("bulk_id", "") or "",
+                            "bulk_total": int(
+                                saved.get("bulk_total", 0) or 0),
+                            "bulk_index": int(
+                                saved.get("bulk_index", 0) or 0),
+                            "from_download": bool(
+                                saved.get("from_download")),
+                            "compress_after": dict(
+                                saved.get("compress_after") or {}),
+                            "requested_model": str(
+                                saved.get("requested_model")
+                                or self._model or ""),
+                            "actual_model": str(
+                                saved.get("actual_model") or ""),
+                            "_retry_required": bool(
+                                saved.get("retry_required")
+                                or write_intent
+                                or saved.get("cleanup_only")
+                                or saved.get("no_speech_pending")),
+                            "_retry_as_replace": bool(
+                                saved.get("retry_as_replace")
+                                or (write_intent and not caption_recovery)),
+                            "_write_intent": write_intent,
+                            "_caption_recovery": caption_recovery,
+                            "_skip_pending_counter": bool(
+                                saved.get("skip_pending_counter")),
+                            "_cleanup_only": bool(
+                                saved.get("cleanup_only")),
+                            "_no_speech_pending": bool(
+                                saved.get("no_speech_pending")),
+                            "_stats_tallied": bool(
+                                saved.get("stats_tallied")),
+                            "_output_complete": bool(
+                                saved.get("output_complete")),
+                            "_callback_done": bool(
+                                saved.get("callback_done")),
+                            "_followup_pending": bool(
+                                saved.get("followup_pending")),
+                            "_followup_enqueued": bool(
+                                saved.get("followup_enqueued")),
+                            "_completed_outcome": str(
+                                saved.get("completed_outcome") or ""),
+                        }
+
+                    candidates.append(runtime_job)
+                    known_jobs.add(job_key)
+                    assigned_ids.add(task_id)
+
+                # QueueState is authoritative for visible order.  A deferred
+                # current job is durably moved to the tail before cancellation,
+                # while the pre-crash journal may still list it first.  The
+                # stable sort preserves journal order for journal-only rows.
+                candidates.sort(key=lambda job: queue_order.get(
+                    self._job_identity_key(job), len(queue_order)))
+
+                # Reconcile QueueState first, then atomically replace the
+                # normalized journal, and only then expose jobs to the worker.
+                # If either durable store fails, restore the exact QueueState
+                # snapshot and leave the old journal/runtime untouched.
+                queue_reconciled = True
+                if self._queues is not None:
+                    try:
+                        if stale_queue_task_ids:
+                            removed = self._queues.gpu_remove_tasks(
+                                stale_queue_task_ids,
+                                durable=True,
+                                require_all=True,
+                            )
+                            queue_reconciled = (
+                                set(removed) == set(stale_queue_task_ids))
+                        reserved_ids = {
+                            str(job.get("task_id") or "").strip()
+                            for job in existing
+                            if str(job.get("task_id") or "").strip()
+                        }
+                        for job in candidates:
+                            if not queue_reconciled:
+                                break
+                            wanted_id = str(
+                                job.get("task_id") or "").strip()
+                            token = self._queues.gpu_reserve_task(
+                                self._queue_payload_for_job(job),
+                                reserved_task_ids=reserved_ids,
+                                required_task_id=wanted_id,
+                            )
+                            queue_reconciled = (
+                                isinstance(token, dict)
+                                and str(token.get("task_id") or "").strip()
+                                == wanted_id)
+                            if queue_reconciled:
+                                reserved_ids.add(wanted_id)
+                    except Exception as exc:
+                        _log.warning(
+                            "Processing queue reconciliation failed: %s", exc)
+                        queue_reconciled = False
+                    if not queue_reconciled:
+                        try:
+                            self._queues.restore_pending_snapshot(
+                                "gpu", queue_snapshot)
+                        except Exception as exc:
+                            _log.warning(
+                                "Processing queue compensation failed: %s",
+                                exc)
+                        self._stream.emit_error(
+                            "Could not reconcile restored Processing tasks; "
+                            "startup recovery remains paused for the next "
+                            "launch.")
+                        return 0
+
+                snap = self._snapshot_pending_job
+                with self._jobs_lock:
+                    normalized_journal = [
+                        snap(job) for job in self._inline_caption_jobs
+                    ]
+                    normalized_journal.extend(
+                        snap(job) for job in [*self._jobs, *candidates])
+                    if self._current_job:
+                        normalized_journal.insert(
+                            0, snap(self._current_job))
+                if not self._write_pending_snapshot(normalized_journal):
                     if self._queues is not None:
                         try:
-                            self._queues.gpu_remove(path)
-                        except Exception as e:
-                            _log.debug("stale GPU queue remove failed: %s", e)
-                    continue
-                # rehydrate all saved job fields (retranscribe,
-                # video_id, combined_override, bulk_*) so a restarted
-                # retranscribe stays a retranscribe and title-drifted
-                # stale entries get caught via video_id lookup.
-                if kind == "compress":
-                    added = self.compress_enqueue(
-                        path,
-                        title=j.get("title", ""),
-                        channel=j.get("channel", ""),
-                        quality=j.get("quality", "Average"),
-                        output_res=str(j.get("output_res", "720")),
-                    )
-                else:
-                    added = self.enqueue(
-                        path,
-                        title=j.get("title", ""),
-                        channel=j.get("channel", ""),
-                        combined=j.get("combined_override"),
-                        retranscribe=bool(j.get("retranscribe")),
-                        video_id=j.get("video_id", ""),
-                        bulk_id=j.get("bulk_id", ""),
-                        bulk_total=int(j.get("bulk_total", 0) or 0),
-                        bulk_index=int(j.get("bulk_index", 0) or 0),
-                        from_download=bool(j.get("from_download")),
-                        compress_after=dict(j.get("compress_after") or {}),
-                    )
-                if added:
-                    recovered += 1
-            # Keep the recovery journal synchronized with the runtime list.
-            # Previously this unlinked the file after enqueue() had just
-            # rewritten it, recreating the split state the journal is meant
-            # to prevent.
-            self._persist_pending()
-            return recovered
+                            self._queues.restore_pending_snapshot(
+                                "gpu", queue_snapshot)
+                        except Exception as exc:
+                            _log.warning(
+                                "Processing queue compensation failed: %s",
+                                exc)
+                    self._stream.emit_error(
+                        "Could not save restored Processing tasks; startup "
+                        "recovery was left unchanged for the next launch.")
+                    return 0
+
+                with self._jobs_lock:
+                    self._jobs.extend(candidates)
+
+            # Both durable stores now describe the same exact jobs and IDs.
+            # Restored jobs remain paused until an explicit Start or enqueue.
+            return len(candidates)
         except Exception:
             return 0
 
@@ -1206,6 +1946,309 @@ class TranscribeManager:
         if self._current_job:
             n += 1
         return n
+
+    def remove_pending_task_ids_coordinated(
+            self, task_ids: set[str], mirror_remove: Callable[[], bool],
+            mirror_restore: Callable[[], bool]) -> bool:
+        """Remove exact pending jobs only if both durable stores commit.
+
+        QueueState commits while the candidate jobs are absent in memory, then
+        the transcription journal commits the same state.  If the journal
+        replacement fails, QueueState is restored and the in-memory jobs were
+        never allowed to escape the journal boundary.
+        """
+        wanted = {
+            str(task_id or "").strip() for task_id in task_ids
+            if str(task_id or "").strip()
+        }
+        if not wanted or not callable(mirror_remove):
+            return False
+        removed_jobs: list[dict[str, Any]] = []
+        with self._journal_lock:
+            with self._jobs_lock:
+                original = list(self._jobs)
+                keep = []
+                for job in self._jobs:
+                    if str(job.get("task_id") or "").strip() in wanted:
+                        removed_jobs.append(job)
+                    else:
+                        keep.append(job)
+                self._jobs[:] = keep
+            try:
+                mirror_saved = bool(mirror_remove())
+            except Exception as exc:
+                _log.warning("Processing queue removal mirror failed: %s", exc)
+                mirror_saved = False
+            if not mirror_saved:
+                with self._jobs_lock:
+                    self._jobs[:] = original
+                return False
+            if removed_jobs and not self._persist_pending():
+                with self._jobs_lock:
+                    self._jobs[:] = original
+                try:
+                    restored = bool(mirror_restore())
+                except Exception as exc:
+                    _log.warning(
+                        "Processing queue removal rollback failed: %s", exc)
+                    restored = False
+                if not restored:
+                    self._stream.emit_error(
+                        "Could not restore the visible Processing queue after "
+                        "a journal failure. Work remains in recovery and queue "
+                        "actions are disabled until saving succeeds.")
+                self._stream.emit_error(
+                    "Could not save task removal; Processing work was kept "
+                    "for recovery.")
+                return False
+        for job in removed_jobs:
+            try:
+                if (not job.get("retranscribe")
+                        and not job.get("_pending_decremented")
+                        and not job.get("_skip_pending_counter")):
+                    _bump_transcription_pending(
+                        job.get("channel") or "", -1)
+                    job["_pending_decremented"] = True
+            except Exception as exc:
+                _log.debug("pending counter cleanup failed: %s", exc)
+        self._notify_jobs_cancelled(removed_jobs)
+        return True
+
+    def reorder_pending_task_coordinated(
+            self, task_id: str, new_index: int,
+            mirror_reorder: Callable[[], bool],
+            mirror_restore: Callable[[], bool]) -> bool:
+        """Reorder one exact job only if QueueState and journal agree."""
+        ident = str(task_id or "").strip()
+        if not ident or not callable(mirror_reorder):
+            return False
+        try:
+            target_index = int(new_index)
+        except (TypeError, ValueError):
+            return False
+        with self._journal_lock:
+            with self._jobs_lock:
+                original = list(self._jobs)
+                idx = next(
+                    (i for i, job in enumerate(self._jobs)
+                     if str(job.get("task_id") or "").strip() == ident),
+                    -1,
+                )
+                if idx >= 0:
+                    if target_index < 0 or target_index >= len(self._jobs):
+                        return False
+                    job = self._jobs.pop(idx)
+                    self._jobs.insert(target_index, job)
+            try:
+                mirror_saved = bool(mirror_reorder())
+            except Exception as exc:
+                _log.warning("Processing queue reorder mirror failed: %s", exc)
+                mirror_saved = False
+            if not mirror_saved:
+                with self._jobs_lock:
+                    self._jobs[:] = original
+                return False
+            if idx >= 0 and not self._persist_pending():
+                with self._jobs_lock:
+                    self._jobs[:] = original
+                try:
+                    restored = bool(mirror_restore())
+                except Exception as exc:
+                    _log.warning(
+                        "Processing queue reorder rollback failed: %s", exc)
+                    restored = False
+                if not restored:
+                    self._stream.emit_error(
+                        "Could not restore the visible Processing order after "
+                        "a journal failure. Queue actions are disabled until "
+                        "saving succeeds.")
+                self._stream.emit_error(
+                    "Could not save Processing order; the previous order was "
+                    "kept.")
+                return False
+        return True
+
+    @staticmethod
+    def _pending_path_within(path: str, root: str) -> bool:
+        """Return whether a queued media path belongs to one channel root."""
+        try:
+            candidate = os.path.normcase(os.path.abspath(str(path or "")))
+            boundary = os.path.normcase(os.path.abspath(str(root or "")))
+            return bool(candidate and boundary
+                        and os.path.commonpath([candidate, boundary]) == boundary
+                        and candidate != boundary)
+        except (OSError, ValueError):
+            return False
+
+    def reconcile_pending_channel_path(
+            self, old_root: str, new_root: str = "", *,
+            old_channel: str = "", new_channel: str = "") -> dict[str, Any]:
+        """Remap or remove pending work after a channel-folder mutation.
+
+        A rename supplies ``new_root`` and keeps the same task IDs and order.
+        Moving a channel to Trash leaves ``new_root`` empty, which removes its
+        queued Processing work. QueueState and the transcription recovery
+        journal are committed together and both roll back if either save fails.
+        """
+        raw_old_root = str(old_root or "").strip()
+        if not raw_old_root:
+            return {"ok": False, "error": "Old channel folder is required."}
+        old_root = os.path.abspath(raw_old_root)
+        new_root = os.path.abspath(str(new_root or "")) if new_root else ""
+
+        def _matches(job: dict[str, Any] | None) -> bool:
+            return bool(job and self._pending_path_within(
+                str(job.get("path") or ""), old_root))
+
+        def _new_path(path: str) -> str:
+            relative = os.path.relpath(os.path.abspath(path), old_root)
+            return os.path.normpath(os.path.join(new_root, relative))
+
+        with self._journal_lock:
+            with self._jobs_lock:
+                if _matches(self._current_job) or any(
+                        _matches(job) for job in self._inline_caption_jobs):
+                    return {
+                        "ok": False,
+                        "busy": True,
+                        "error": (
+                            "Processing is currently using this channel. "
+                            "Pause or cancel that task and try again."
+                        ),
+                    }
+                original_jobs = list(self._jobs)
+                original_fields = [
+                    (job, job.get("path", ""), job.get("channel", ""))
+                    for job in self._jobs if _matches(job)
+                ]
+                if new_root:
+                    for job, path, _channel in original_fields:
+                        job["path"] = _new_path(str(path))
+                        if new_channel:
+                            job["channel"] = new_channel
+                else:
+                    self._jobs[:] = [job for job in self._jobs
+                                     if not _matches(job)]
+
+            queue_before: list[dict[str, Any]] = []
+            queue_after: list[dict[str, Any]] = []
+            queue_changed = 0
+            if self._queues is not None:
+                try:
+                    queue_before = self._queues.gpu_snapshot()
+                    for item in queue_before:
+                        if not _matches(item):
+                            queue_after.append(item)
+                            continue
+                        queue_changed += 1
+                        if new_root:
+                            changed = dict(item)
+                            changed["path"] = _new_path(
+                                str(item.get("path") or ""))
+                            if new_channel:
+                                changed["channel"] = new_channel
+                            queue_after.append(changed)
+                    if queue_changed and not self._queues.restore_pending_snapshot(
+                            "gpu", queue_after):
+                        raise OSError("Could not save the Processing queue.")
+                except Exception as exc:
+                    with self._jobs_lock:
+                        self._jobs[:] = original_jobs
+                        for job, path, channel in original_fields:
+                            job["path"] = path
+                            job["channel"] = channel
+                    return {"ok": False, "error": str(exc)}
+
+            runtime_changed = len(original_fields)
+            if (runtime_changed or queue_changed) and not \
+                    self._write_pending_snapshot(self._pending_snapshot()):
+                with self._jobs_lock:
+                    self._jobs[:] = original_jobs
+                    for job, path, channel in original_fields:
+                        job["path"] = path
+                        job["channel"] = channel
+                queue_rollback_ok = True
+                if self._queues is not None and queue_changed:
+                    try:
+                        queue_rollback_ok = bool(
+                            self._queues.restore_pending_snapshot(
+                                "gpu", queue_before))
+                    except Exception as exc:
+                        _log.warning(
+                            "Processing queue path rollback failed: %s", exc)
+                        queue_rollback_ok = False
+                return {
+                    "ok": False,
+                    "recovery_required": not queue_rollback_ok,
+                    "error": (
+                        "Could not save the Processing recovery journal."
+                        + (" The Processing queue also could not be restored; "
+                           "restart YTArchiver before changing this channel "
+                           "folder."
+                           if not queue_rollback_ok else "")
+                    ),
+                }
+
+        return {
+            "ok": True,
+            "changed": max(runtime_changed, queue_changed),
+            "removed": 0 if new_root else max(runtime_changed, queue_changed),
+        }
+
+    @contextmanager
+    def pending_path_mutation_boundary(self):
+        """Prevent a queued task from starting during a folder mutation.
+
+        Path reconciliation and the filesystem/config transaction must be one
+        boundary. Otherwise the worker can pop a newly remapped task after the
+        journal save but before the folder itself has moved.
+        """
+        with self._journal_lock:
+            yield
+
+    @contextmanager
+    def pending_channel_path_mutation(
+            self, old_root: str, new_root: str = "", *,
+            old_channel: str = "", new_channel: str = ""):
+        """Hold Processing's journal boundary around a folder transaction.
+
+        The yielded dict contains ``result`` and a ``commit`` flag. Callers set
+        ``commit`` only after their config/filesystem transaction succeeds;
+        otherwise the exact pre-mutation Processing state is restored.
+        """
+        with self._journal_lock:
+            with self._jobs_lock:
+                original_jobs = list(self._jobs)
+                original_fields = [
+                    (job, job.get("path", ""), job.get("channel", ""))
+                    for job in self._jobs
+                ]
+            queue_before = (self._queues.gpu_snapshot()
+                            if self._queues is not None else [])
+            result = self.reconcile_pending_channel_path(
+                old_root, new_root,
+                old_channel=old_channel, new_channel=new_channel)
+            control = {"result": result, "commit": False}
+            try:
+                yield control
+            finally:
+                if result.get("ok") and not control.get("commit"):
+                    with self._jobs_lock:
+                        self._jobs[:] = original_jobs
+                        for job, path, channel in original_fields:
+                            job["path"] = path
+                            job["channel"] = channel
+                    queue_ok = True
+                    if self._queues is not None:
+                        queue_ok = self._queues.restore_pending_snapshot(
+                            "gpu", queue_before)
+                    journal_ok = self._write_pending_snapshot(
+                        self._pending_snapshot())
+                    if not queue_ok or not journal_ok:
+                        raise RuntimeError(
+                            "Could not restore Processing tasks after the "
+                            "channel-folder operation was cancelled."
+                        )
 
     def remove_pending_jobs(self, predicate) -> int:
         """Remove pending jobs from `_jobs` where predicate(job) is True.
@@ -1224,33 +2267,40 @@ class TranscribeManager:
         """
         if not callable(predicate):
             return 0
-        removed = 0
-        with self._jobs_lock:
-            keep = []
-            for j in self._jobs:
-                try:
-                    match = bool(predicate(j))
-                except Exception:
-                    match = False
-                if match:
-                    removed += 1
+        removed_jobs: list[dict[str, Any]] = []
+        with self._journal_lock:
+            with self._jobs_lock:
+                original = list(self._jobs)
+                keep = []
+                for job in self._jobs:
                     try:
-                        if (not j.get("retranscribe")
-                                and not j.get("_pending_decremented")):
-                            _bump_transcription_pending(
-                                j.get("channel") or "", -1)
-                            j["_pending_decremented"] = True
-                    except Exception as e:
-                        _log.debug("swallowed: %s", e)
-                else:
-                    keep.append(j)
-            self._jobs[:] = keep
-        if removed:
+                        match = bool(predicate(job))
+                    except Exception:
+                        match = False
+                    if match:
+                        removed_jobs.append(job)
+                    else:
+                        keep.append(job)
+                self._jobs[:] = keep
+            if removed_jobs and not self._persist_pending():
+                with self._jobs_lock:
+                    self._jobs[:] = original
+                self._stream.emit_error(
+                    "Could not save task removal; Processing work was kept "
+                    "for recovery.")
+                return 0
+        for job in removed_jobs:
             try:
-                self._persist_pending()
+                if (not job.get("retranscribe")
+                        and not job.get("_pending_decremented")
+                        and not job.get("_skip_pending_counter")):
+                    _bump_transcription_pending(
+                        job.get("channel") or "", -1)
+                    job["_pending_decremented"] = True
             except Exception as e:
-                _log.debug("swallowed: %s", e)
-        return removed
+                _log.debug("pending counter cleanup failed: %s", e)
+        self._notify_jobs_cancelled(removed_jobs)
+        return len(removed_jobs)
 
     def reorder_pending_job(self, identifier: str, new_index: int) -> bool:
         """Mirror a GPU popover reorder into the manager's pending jobs."""
@@ -1261,60 +2311,256 @@ class TranscribeManager:
             target_index = int(new_index)
         except (TypeError, ValueError):
             return False
-        with self._jobs_lock:
-            if target_index < 0 or target_index >= len(self._jobs):
+        with self._journal_lock:
+            with self._jobs_lock:
+                if target_index < 0 or target_index >= len(self._jobs):
+                    return False
+                original = list(self._jobs)
+                idx = next(
+                    (
+                        i for i, job in enumerate(self._jobs)
+                        if str(job.get("task_id") or "").strip() == ident
+                    ),
+                    -1,
+                )
+                if idx < 0:
+                    # Internal migration compatibility for a runtime list
+                    # created from a pre-ID journal. The current frontend
+                    # never sends paths; it sends the opaque ID above.
+                    idx = next(
+                        (i for i, job in enumerate(self._jobs)
+                         if not str(job.get("task_id") or "").strip()
+                         and str(job.get("path") or "").strip() == ident),
+                        -1,
+                    )
+                if idx < 0:
+                    return False
+                job = self._jobs.pop(idx)
+                self._jobs.insert(target_index, job)
+            if self._persist_pending():
+                return True
+            with self._jobs_lock:
+                self._jobs[:] = original
+            self._stream.emit_error(
+                "Could not save Processing order; the previous order was kept.")
+            return False
+
+    def cancel_all(self, *, clear_visible: bool = True) -> bool:
+        """Durably clear all Processing work before signalling cancellation.
+
+        QueueState and the recovery journal are separate crash-recovery
+        stores.  Neither the cancel event nor the subprocess kill is exposed
+        until both stores have committed.  On a peer-store failure the first
+        commit is compensated and the live worker remains untouched.
+        """
+        discarded_jobs: list[dict[str, Any]] = []
+        with self._journal_lock:
+            # Hold the journal boundary through the QueueState transaction so
+            # the worker cannot pop/finalize a job between the two stores.
+            queue_snapshot: list[dict[str, Any]] = []
+            recovery_snapshot: dict[str, Any] | None = None
+            if clear_visible and self._queues is not None:
+                try:
+                    queue_snapshot = self._queues.gpu_snapshot()
+                    recovery_snapshot = copy.deepcopy(
+                        self._queues.current_gpu)
+                    if recovery_snapshot is None:
+                        recovery_snapshot = copy.deepcopy(
+                            self._queues.get_loaded_resuming().get("gpu"))
+                    if self._queues.gpu_clear() < 0:
+                        return False
+                    if not self._queues.clear_resuming_slots(
+                            "gpu", clear_current=True):
+                        self._queues.restore_pending_snapshot(
+                            "gpu", queue_snapshot)
+                        return False
+                except Exception as exc:
+                    _log.warning("Processing queue clear failed: %s", exc)
+                    try:
+                        self._queues.restore_pending_snapshot(
+                            "gpu", queue_snapshot)
+                    except Exception:
+                        pass
+                    return False
+
+            if not self.clear_pending_journal():
+                if clear_visible and self._queues is not None:
+                    try:
+                        self._queues.restore_pending_snapshot(
+                            "gpu", queue_snapshot)
+                        if recovery_snapshot is not None:
+                            self._queues.replace_current_task_durable(
+                                "gpu", recovery_snapshot,
+                                expected_task_id="",
+                            )
+                    except Exception as exc:
+                        _log.warning(
+                            "Processing clear compensation failed: %s", exc)
+                self._paused.set()
+                self._stream.emit_error(
+                    "Could not save queue cancellation; pending recovery work "
+                    "was kept. Retry Clear after the app data folder is "
+                    "writable.")
                 return False
-            idx = next(
-                (
-                    i for i, job in enumerate(self._jobs)
-                    if (job.get("id") or job.get("path") or "") == ident
-                ),
-                -1,
-            )
-            if idx < 0:
-                return False
-            job = self._jobs.pop(idx)
-            self._jobs.insert(target_index, job)
-        try:
-            self._persist_pending()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+
+            # Both durable stores are empty.  Only now mutate runtime state or
+            # signal the worker; a reported failure can never have cancelled
+            # work whose recovery rows were retained.
+            self._cancel_all.set()
+            self._manual_drain.clear()
+            with self._jobs_lock:
+                discarded_jobs = [
+                    *self._jobs,
+                    *self._inline_caption_jobs,
+                ]
+                self._jobs.clear()
+                self._inline_caption_jobs.clear()
+                job = self._current_job
+                if job:
+                    job["_cancel_drop_requested"] = True
+                if job and "cancel" in job:
+                    job["cancel"].set()
+                # Keep the job lock through subprocess stop so the worker
+                # cannot finalize/pop between our signal and the kill.
+                if job:
+                    try:
+                        self._stop_subprocess(force=True)
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
+        self._notify_jobs_cancelled(discarded_jobs)
         return True
 
-    def cancel_all(self):
-        self._cancel_all.set()
-        # Drop any pending one-shot drain intent — the queue is being emptied.
+    def begin_shutdown(self) -> bool:
+        """Close admission and durably defer the active task, if any.
+
+        This never calls ``cancel_all``: quitting is not user authorization to
+        discard queued work.  ``defer_current`` first reserves the same stable
+        task ID at the pending tail in both stores, then cooperatively cancels
+        only the active attempt.
+        """
+        self._shutdown_requested.set()
         self._manual_drain.clear()
         with self._jobs_lock:
-            self._jobs.clear()
-            job = self._current_job
-            if job and "cancel" in job:
-                job["cancel"].set()
-            # Keep the job lock through the subprocess stop so the
-            # worker cannot clear _current_job, pop the next job, and
-            # start a new subprocess between our cancel signal and kill.
-            if job:
-                try:
-                    self._stop_subprocess(force=True)
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-        # also clear the shared GPU popover queue so the UI
-        # doesn't keep showing phantom "pending" rows for tasks that
-        # have been cancelled. The worker's finally-path would normally
-        # do this one-at-a-time, but on cancel_all the worker breaks
-        # out of the loop immediately and the popover stays stale.
-        if self._queues is not None:
+            current = self._current_job
+            task_id = str((current or {}).get("task_id") or "").strip()
+        if not task_id:
+            return self._persist_pending()
+        if self.defer_current(task_id):
+            return True
+        # Even if tail reservation failed, both the existing journal current
+        # record and QueueState resuming slot remain authoritative. Signal the
+        # attempt only after a final journal checkpoint succeeds.
+        if not self._persist_pending():
+            return False
+        with self._jobs_lock:
+            current = self._current_job
+            if current is not None:
+                current["_shutdown_retry"] = True
+                cancel = current.get("cancel")
+                if cancel is not None:
+                    cancel.set()
+        try:
+            self._send_cancel_command()
+        except Exception as exc:
+            _log.debug("shutdown cooperative cancel failed: %s", exc)
+        return True
+
+    def join_shutdown(self, timeout: float) -> bool:
+        """Wait a bounded duration for the processing worker to checkpoint."""
+        worker = self._worker_thread
+        if worker is None or not worker.is_alive():
+            return True
+        worker.join(timeout=max(0.0, float(timeout)))
+        return not worker.is_alive()
+
+    def force_shutdown(self) -> bool:
+        """Stop only this manager's owned children after checkpointing."""
+        if not self._shutdown_requested.is_set() and not self.begin_shutdown():
+            return False
+        with self._jobs_lock:
+            current = self._current_job
+            if current is not None:
+                current["_shutdown_retry"] = True
+                cancel = current.get("cancel")
+                if cancel is not None:
+                    cancel.set()
+        try:
+            self._stop_subprocess(force=True)
+        except Exception as exc:
+            _log.warning("forced Whisper shutdown failed: %s", exc)
+        punct = getattr(self, "_punct", None)
+        if punct is not None and getattr(punct, "_proc", None):
             try:
-                self._queues.gpu_clear()
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-        self.clear_pending_journal()
+                from backend.utils import kill_process
+                kill_process(punct._proc)
+            except Exception as exc:
+                _log.warning("forced punctuation shutdown failed: %s", exc)
+        try:
+            from ..process_runner import PROCESS_REGISTRY
+            PROCESS_REGISTRY.terminate_owner("processing", timeout=2.0)
+        except Exception as exc:
+            _log.warning("forced processing-child shutdown failed: %s", exc)
+        return True
+
+    def shutdown_snapshot(self) -> dict[str, Any]:
+        with self._jobs_lock:
+            current = self._current_job
+            return {
+                "owner": "processing",
+                "accepting": not self._shutdown_requested.is_set(),
+                "worker_alive": bool(
+                    self._worker_thread is not None
+                    and self._worker_thread.is_alive()),
+                "current_task_id": str(
+                    (current or {}).get("task_id") or ""),
+                "pending": len(self._jobs) + len(self._inline_caption_jobs),
+            }
+
+    @staticmethod
+    def _notify_job_runtime_state(job: dict[str, Any] | None,
+                                  state: str, **details: Any) -> None:
+        """Notify an attached UI without consuming the success callback."""
+        if not isinstance(job, dict):
+            return
+        callback = job.get("state_cb")
+        if not callable(callback):
+            return
+        payload = {
+            "state": str(state or ""),
+            "video_id": str(job.get("video_id") or ""),
+            "filepath": os.path.normpath(str(job.get("path") or "")),
+            **details,
+        }
+        try:
+            callback(payload)
+        except Exception as exc:
+            _log.debug("transcription state callback failed: %s", exc)
+
+    @classmethod
+    def _notify_jobs_cancelled(cls, jobs: list[dict[str, Any]]) -> None:
+        """Clear UI state for jobs removed before the worker can see them."""
+        notified: set[int] = set()
+        for job in jobs:
+            identity = id(job)
+            if identity in notified:
+                continue
+            notified.add(identity)
+            cls._notify_job_runtime_state(
+                job, "cancelled", message="Re-transcription cancelled")
 
     def pause(self):
         self._paused.set()
+        with self._jobs_lock:
+            current = self._current_job
+        self._notify_job_runtime_state(
+            current, "paused", message="Paused — resume from Processing")
 
     def resume(self):
         self._paused.clear()
+        with self._jobs_lock:
+            current = self._current_job
+        self._notify_job_runtime_state(
+            current, "resuming", message="Resuming transcription…")
 
     @staticmethod
     def _job_path_key(path: str) -> str:
@@ -1322,6 +2568,63 @@ class TranscribeManager:
             return ""
         return os.path.normcase(
             os.path.normpath(os.path.abspath(str(path))))
+
+    @classmethod
+    def _job_identity_key(
+            cls, job: dict[str, Any] | None) -> tuple[str, str] | None:
+        if not job:
+            return None
+        path_key = cls._job_path_key(job.get("path") or "")
+        if not path_key:
+            return None
+        kind = str(job.get("kind") or "transcribe").strip().lower()
+        return kind, path_key
+
+    @staticmethod
+    def _queue_payload_for_job(job: dict[str, Any]) -> dict[str, Any]:
+        """Return the persisted/UI queue representation of a runtime job."""
+        payload = {
+            "task_id": job.get("task_id", ""),
+            "kind": (job.get("kind") or "transcribe").lower(),
+            "title": job.get("title", ""),
+            "path": job.get("path", ""),
+            "channel": job.get("channel", ""),
+            "bulk_id": job.get("bulk_id", ""),
+            "bulk_total": int(job.get("bulk_total", 0) or 0),
+            "bulk_index": int(job.get("bulk_index", 0) or 0),
+            "retry_required": bool(job.get("_retry_required")),
+            "retry_as_replace": bool(job.get("_retry_as_replace")),
+            "write_intent": bool(job.get("_write_intent")),
+            "caption_recovery": bool(job.get("_caption_recovery")),
+            "skip_pending_counter": bool(
+                job.get("_skip_pending_counter")),
+            "cleanup_only": bool(job.get("_cleanup_only")),
+            "no_speech_pending": bool(job.get("_no_speech_pending")),
+            "stats_tallied": bool(job.get("_stats_tallied")),
+            "output_complete": bool(job.get("_output_complete")),
+            "callback_done": bool(job.get("_callback_done")),
+            "followup_pending": bool(job.get("_followup_pending")),
+            "followup_enqueued": bool(job.get("_followup_enqueued")),
+            "completed_outcome": str(
+                job.get("_completed_outcome") or ""),
+        }
+        if payload["kind"] == "compress":
+            payload.update({
+                "quality": job.get("quality", "Average"),
+                "output_res": str(job.get("output_res", "720")),
+            })
+        else:
+            payload.update({
+                "combined_override": job.get("combined_override"),
+                "retranscribe": bool(job.get("retranscribe")),
+                "video_id": (job.get("video_id") or "").strip(),
+                "from_download": bool(job.get("from_download")),
+                "compress_after": dict(job.get("compress_after") or {}),
+                "requested_model": str(
+                    job.get("requested_model") or ""),
+                "actual_model": str(job.get("actual_model") or ""),
+            })
+        return payload
 
     def _restore_runtime_jobs_from_queue(self) -> int:
         """Merge persisted GPU tasks into the worker's runtime queue.
@@ -1340,65 +2643,132 @@ class TranscribeManager:
             return 0
 
         restored = 0
-        with self._jobs_lock:
-            known = {
-                self._job_path_key(job.get("path") or "")
-                for job in self._jobs
-                if job.get("path")
-            }
-            if self._current_job and self._current_job.get("path"):
-                known.add(self._job_path_key(self._current_job["path"]))
-
-            for item in persisted:
-                path = str(item.get("path") or "")
-                key = self._job_path_key(path)
-                if not key or key in known or not os.path.isfile(path):
-                    continue
-                kind = (item.get("kind") or "transcribe").lower()
-                job: dict[str, Any] = {
-                    "kind": kind,
-                    "path": path,
-                    "title": item.get("title") or os.path.basename(path),
-                    "channel": item.get("channel", ""),
-                    "cb": None,
-                    "cancel": threading.Event(),
+        with self._journal_lock:
+            with self._jobs_lock:
+                original_runtime_jobs = list(self._jobs)
+                known = {
+                    self._job_identity_key(job)
+                    for job in [*self._inline_caption_jobs, *self._jobs]
+                    if self._job_identity_key(job) is not None
                 }
-                if kind == "compress":
-                    job.update({
-                        "quality": item.get("quality", "Average"),
-                        "output_res": str(item.get("output_res", "720")),
-                    })
-                else:
-                    job.update({
-                        "kind": "transcribe",
-                        "combined_override": item.get("combined_override"),
-                        "retranscribe": bool(item.get("retranscribe")),
-                        "video_id": (item.get("video_id") or "").strip(),
-                        "bulk_id": item.get("bulk_id", "") or "",
-                        "bulk_total": int(item.get("bulk_total", 0) or 0),
-                        "bulk_index": int(item.get("bulk_index", 0) or 0),
-                        "from_download": bool(item.get("from_download")),
-                        "compress_after": dict(item.get("compress_after") or {}),
-                    })
-                self._jobs.append(job)
-                known.add(key)
-                restored += 1
+                if self._job_identity_key(self._current_job) is not None:
+                    known.add(self._job_identity_key(self._current_job))
 
+                for item in persisted:
+                    path = str(item.get("path") or "")
+                    kind = (item.get("kind") or "transcribe").lower()
+                    key = (kind, self._job_path_key(path))
+                    if not key[1] or key in known or not os.path.isfile(path):
+                        continue
+                    job: dict[str, Any] = {
+                        "task_id": (str(item.get("task_id") or "").strip()
+                                    or make_task_id("gpu")),
+                        "kind": kind,
+                        "path": path,
+                        "title": item.get("title") or os.path.basename(path),
+                        "channel": item.get("channel", ""),
+                        "cb": None,
+                        "cancel": threading.Event(),
+                    }
+                    if kind == "compress":
+                        job.update({
+                            "quality": item.get("quality", "Average"),
+                            "output_res": str(item.get("output_res", "720")),
+                        })
+                    else:
+                        job.update({
+                            "kind": "transcribe",
+                            "combined_override": item.get("combined_override"),
+                            "retranscribe": bool(item.get("retranscribe")),
+                            "video_id": (item.get("video_id") or "").strip(),
+                            "bulk_id": item.get("bulk_id", "") or "",
+                            "bulk_total": int(item.get("bulk_total", 0) or 0),
+                            "bulk_index": int(item.get("bulk_index", 0) or 0),
+                            "from_download": bool(item.get("from_download")),
+                            "compress_after": dict(
+                                item.get("compress_after") or {}),
+                            "requested_model": str(
+                                item.get("requested_model")
+                                or self._model or ""),
+                            "actual_model": str(
+                                item.get("actual_model") or ""),
+                            "_retry_required": bool(
+                                item.get("retry_required")),
+                            "_retry_as_replace": bool(
+                                item.get("retry_as_replace")),
+                            "_write_intent": bool(item.get("write_intent")),
+                            "_caption_recovery": bool(
+                                item.get("caption_recovery")),
+                            "_skip_pending_counter": bool(
+                                item.get("skip_pending_counter")),
+                            "_cleanup_only": bool(item.get("cleanup_only")),
+                            "_no_speech_pending": bool(
+                                item.get("no_speech_pending")),
+                            "_stats_tallied": bool(
+                                item.get("stats_tallied")),
+                            "_output_complete": bool(
+                                item.get("output_complete")),
+                            "_callback_done": bool(
+                                item.get("callback_done")),
+                            "_followup_pending": bool(
+                                item.get("followup_pending")),
+                            "_followup_enqueued": bool(
+                                item.get("followup_enqueued")),
+                            "_completed_outcome": str(
+                                item.get("completed_outcome") or ""),
+                        })
+                    self._jobs.append(job)
+                    known.add(key)
+                    restored += 1
+
+                # QueueState owns the user-visible pending order. Reconcile
+                # the complete runtime tail (not merely newly-added orphans)
+                # so a partial/missing journal cannot undo a pre-crash defer.
+                persisted_order = {
+                    str(item.get("task_id") or "").strip(): index
+                    for index, item in enumerate(persisted)
+                    if str(item.get("task_id") or "").strip()
+                }
+                stable_fallback = {
+                    id(job): index for index, job in enumerate(self._jobs)
+                }
+                self._jobs.sort(key=lambda job: (
+                    persisted_order.get(
+                        str(job.get("task_id") or "").strip(),
+                        len(persisted_order)),
+                    stable_fallback[id(job)],
+                ))
+                reordered = any(
+                    before is not after
+                    for before, after in zip(
+                        original_runtime_jobs, self._jobs, strict=False)
+                )
+
+            if (restored or reordered) and not self._persist_pending():
+                with self._jobs_lock:
+                    self._jobs[:] = original_runtime_jobs
+                self._stream.emit_error(
+                    "Could not save restored Processing tasks; they were not "
+                    "started and remain in the durable task queue.")
+                return -1
         if restored:
-            self._persist_pending()
             _log.info("restored %d GPU task(s) into runtime queue", restored)
         return restored
 
-    def request_drain(self):
+    def request_drain(self) -> bool:
         """One-shot 'Start': drain the queued jobs now even though the Auto
         checkbox is off, WITHOUT turning Auto back on. Clears any lingering
         pause, arms the manual-drain gate, and (re)starts the worker. The
         worker self-clears the gate the instant the queue empties, so future
         arrivals keep queuing until the user clicks Start again."""
-        self._restore_runtime_jobs_from_queue()
+        if self._shutdown_requested.is_set():
+            return False
+        if self._restore_runtime_jobs_from_queue() < 0:
+            return False
         self._paused.clear()
         self._manual_drain.set()
         self._ensure_worker()
+        return True
 
     def is_active(self) -> bool:
         """True if a GPU job is currently running OR jobs remain queued.
@@ -1440,30 +2810,258 @@ class TranscribeManager:
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
 
+    def cancel_current_durable(
+            self, task_id: str,
+            clear_visible: Callable[[], bool]) -> bool:
+        """Cancel one exact running job after both recovery stores commit."""
+        wanted = str(task_id or "").strip()
+        if not wanted or not callable(clear_visible):
+            return False
+        with self._journal_lock:
+            with self._jobs_lock:
+                job = self._current_job
+                if (not job
+                        or str(job.get("task_id") or "").strip() != wanted
+                        or "cancel" not in job):
+                    return False
+
+            # Commit the journal removal first.  The job is still running and
+            # its QueueState current slot remains recoverable until the peer
+            # store commits below.
+            if not self._write_pending_snapshot(
+                    self._pending_snapshot(include_current=False)):
+                return False
+            try:
+                visible_saved = bool(clear_visible())
+            except Exception as exc:
+                _log.warning(
+                    "Processing current-slot cancellation failed: %s", exc)
+                visible_saved = False
+            if not visible_saved:
+                # Restore the first durable store before returning failure.
+                # If this compensation itself cannot be saved, QueueState's
+                # still-present current slot remains sufficient for recovery.
+                self._write_pending_snapshot(
+                    self._pending_snapshot(include_current=True))
+                return False
+
+            # The worker's outcome must remain a deliberate terminal drop even
+            # if cancellation races with an unrelated failure.
+            job["_cancel_drop_requested"] = True
+            job["cancel"].set()
+            try:
+                self._send_cancel_command()
+            except Exception as exc:
+                _log.debug("cooperative Processing cancel failed: %s", exc)
+            return True
+
+    def defer_current(self, task_id: str) -> bool:
+        """Cancel the exact running task and place that same ID at the tail."""
+        wanted = str(task_id or "").strip()
+        if not wanted:
+            return False
+        reservation = None
+        with self._journal_lock:
+            with self._jobs_lock:
+                job = self._current_job
+                if (not job
+                        or str(job.get("task_id") or "").strip() != wanted
+                        or "cancel" not in job):
+                    return False
+                reserved_ids = {
+                    str(existing.get("task_id") or "").strip()
+                    for existing in [*self._jobs, *self._inline_caption_jobs]
+                    if str(existing.get("task_id") or "").strip()
+                }
+            if self._queues is None:
+                return False
+            try:
+                reservation = self._queues.gpu_reserve_task(
+                    self._queue_payload_for_job(job),
+                    reserved_task_ids=reserved_ids,
+                    required_task_id=wanted,
+                )
+            except Exception as exc:
+                _log.warning("GPU defer queue reservation failed: %s", exc)
+                reservation = None
+            if not isinstance(reservation, dict):
+                return False
+            job["_defer_requested"] = True
+            if not self._persist_pending():
+                job.pop("_defer_requested", None)
+                try:
+                    self._queues.gpu_rollback_reservation(reservation)
+                except Exception as exc:
+                    _log.warning("GPU defer reservation rollback failed: %s", exc)
+                self._stream.emit_error(
+                    "Could not save the deferred Processing task; the running "
+                    "task was not cancelled.")
+                return False
+            job["cancel"].set()
+            try:
+                self._send_cancel_command()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+        return True
+
     def _ensure_worker(self):
+        if self._shutdown_requested.is_set():
+            return
         if self._worker_thread is None or not self._worker_thread.is_alive():
             self._cancel_all.clear()
             self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
             self._worker_thread.start()
 
-    def _worker_loop(self):
-        # Whisper env sanity check only — NOT the model load. The actual
-        # `start_subprocess()` (which loads the model onto GPU and prints
-        # the "Loading Whisper model..." banner) is deferred to
-        # `_transcribe_one`, which only fires it after the auto-captions
-        # fast-path misses. On channels where YouTube auto-captions cover
-        # everything (most podcasts / news / interview content), we never
-        # load Whisper at all — OLD YTArchiver's _fetch_auto_captions path
-        # has the same short-circuit.
-        if not self.is_available():
+    def _arm_output_write_intent(self, job: dict[str, Any] | None) -> bool:
+        """Durably mark a job recoverable before its first sidecar mutation."""
+        if not isinstance(job, dict):
+            return True
+        if job.get("_write_intent"):
+            # Loaded recovery jobs can only carry this flag because it already
+            # existed in the committed journal. The current first attempt also
+            # calls this helper only once, before any output mutation.
+            return True
+        job["_write_intent"] = True
+        job["_retry_required"] = True
+        # Do not switch the current first attempt to replacement. If the
+        # process dies after this marker, load_pending maps write_intent to
+        # replacement before any recovered work can append.
+        with self._jobs_lock:
+            tracked = (self._current_job is job
+                       or any(existing is job for existing in self._jobs))
+        if tracked and not self._persist_pending():
+            # No output has changed yet. Remove the in-memory authorization so
+            # a later manual retry must successfully persist it before writing.
+            job.pop("_write_intent", None)
             self._stream.emit_error(
-                "Whisper: Python 3.11 not found. Install from python.org "
-                "to enable transcription.")
-            with self._jobs_lock:
-                self._jobs.clear()
-            return
+                "Could not save transcription recovery state; transcript "
+                "files were left untouched and the task was kept for retry.")
+            return False
+        return True
 
-        while not self._cancel_all.is_set():
+    def _restore_job_after_outcome(self, job: dict[str, Any],
+                                   outcome: _WorkerOutcome) -> None:
+        """Put retryable work back in both durable queue representations."""
+        if outcome not in {
+                _WorkerOutcome.FAILED,
+                _WorkerOutcome.RETRY,
+                _WorkerOutcome.CLEANUP_FAILED}:
+            return
+        if self._cancel_all.is_set():
+            return
+        deferred = bool(job.pop("_defer_requested", False))
+        if deferred:
+            job["cancel"] = threading.Event()
+        elif outcome is _WorkerOutcome.FAILED:
+            job["_retry_required"] = True
+            if (job.get("_write_intent")
+                    and not job.get("_caption_recovery")
+                    and not job.get("_no_speech_pending")
+                    and not job.get("_cleanup_only")):
+                job["_retry_as_replace"] = True
+        elif outcome is _WorkerOutcome.CLEANUP_FAILED:
+            job["_cleanup_only"] = True
+            # A cancelled work item may still need its durable pending-ID
+            # cleanup retried; give that cleanup-only item a fresh event.
+            job["cancel"] = threading.Event()
+        with self._jobs_lock:
+            if not any(existing is job for existing in self._jobs):
+                if deferred:
+                    self._jobs.append(job)
+                else:
+                    self._jobs.insert(0, job)
+        if self._queues is not None:
+            try:
+                self._queues.gpu_enqueue(self._queue_payload_for_job(job))
+                target = 0
+                if deferred:
+                    target = max(0, len(self._queues.gpu_snapshot()) - 1)
+                self._queues.gpu_reorder(job.get("task_id", ""), target)
+            except Exception as e:
+                _log.warning("could not restore failed GPU queue item: %s", e)
+
+    @staticmethod
+    def _pending_id_present(video_id: str) -> bool | None:
+        """Return whether config still contains *video_id*, or None on error."""
+        try:
+            from .. import ytarchiver_config as _cfg
+            cfg = _cfg.load_config()
+            for channel in cfg.get("channels", []) or []:
+                ids = channel.get("pending_tx_ids")
+                if isinstance(ids, list) and video_id in ids:
+                    return True
+            return False
+        except Exception as exc:
+            _log.warning("could not verify pending transcription id %s: %s",
+                         video_id, exc)
+            return None
+
+    def _finish_terminal_pending(self, job: dict[str, Any]) -> bool:
+        """Durably drain terminal bookkeeping; return whether it is complete."""
+        if ((job.get("kind") or "transcribe") == "compress"
+                or job.get("retranscribe")
+                or job.get("_pending_decremented")):
+            return True
+        try:
+            channel = (job.get("channel") or "").strip()
+            video_id = (job.get("video_id") or "").strip()
+            skip_counter = bool(job.get("_skip_pending_counter"))
+            if video_id:
+                from .. import ytarchiver_config as _cfg
+                removed = _cfg.remove_pending_tx_id(video_id)
+                if not removed:
+                    if self._pending_id_present(video_id) is not False:
+                        _log.warning(
+                            "pending transcription id %s remains after "
+                            "completion; retaining cleanup-only recovery",
+                            video_id)
+                        return False
+                    # The ID was never in the authoritative list (for example
+                    # a manual right-click transcribe), so balance enqueue's
+                    # legacy cosmetic counter explicitly.
+                    if channel and not skip_counter:
+                        _bump_transcription_pending(channel, -1)
+            elif channel and not skip_counter:
+                # Legacy jobs without an authoritative ID still use the
+                # cosmetic counter. ID-bearing jobs are recalculated by
+                # remove_pending_tx_id in one config transaction.
+                _bump_transcription_pending(channel, -1)
+            job["_pending_decremented"] = True
+            job.pop("_cleanup_only", None)
+            return True
+        except Exception as e:
+            _log.warning("could not finish transcription bookkeeping: %s", e)
+            return False
+
+    @staticmethod
+    def _mark_no_speech_durable(video_path: str) -> bool:
+        try:
+            from .. import index as _idx
+            return bool(_idx.mark_video_no_speech(video_path))
+        except Exception as exc:
+            _log.warning("mark_video_no_speech(%s) failed: %s",
+                         video_path, exc)
+            return False
+
+    def _retry_no_speech_classification(
+            self, job: dict[str, Any]) -> _WorkerOutcome:
+        """Retry only the durable no-speech marker, never Whisper output."""
+        if not self._mark_no_speech_durable(job.get("path", "")):
+            return _WorkerOutcome.FAILED
+        job.pop("_no_speech_pending", None)
+        if not self._finish_successful_job(
+                job, {"no_speech": True},
+                terminal_outcome=_WorkerOutcome.NO_SPEECH):
+            return _WorkerOutcome.CLEANUP_FAILED
+        return _WorkerOutcome.NO_SPEECH
+
+    def _worker_loop(self):
+        # Whisper availability is checked only after native captions miss in
+        # `_transcribe_one`. Cleanup-only recovery, durable no-speech retries,
+        # compression, and local caption ingest do not need the 3.11 worker and
+        # must remain able to drain when that optional environment is missing.
+        while (not self._cancel_all.is_set()
+               and not self._shutdown_requested.is_set()):
             # Two gates at the top of the loop before popping a job:
             # 1. `_paused` — set by queue_pause("gpu") or disk-watchdog.
             # Parks the worker thread without draining the queue,
@@ -1480,7 +3078,8 @@ class TranscribeManager:
             # outer Auto-disabled gate doesn't count as a "pause" —
             # only the explicit _paused flag does.
             _signaled_paused_active = False
-            while (not self._cancel_all.is_set() and
+            while (not self._cancel_all.is_set()
+                   and not self._shutdown_requested.is_set() and
                    (self._paused.is_set()
                     or not (self._auto_enabled()
                             or self._manual_drain.is_set()))):
@@ -1499,7 +3098,8 @@ class TranscribeManager:
             if _signaled_paused_active and self._queues is not None:
                 try: self._queues.set_gpu_paused_active(False)
                 except Exception as e: _log.debug("swallowed: %s", e)
-            if self._cancel_all.is_set():
+            if (self._cancel_all.is_set()
+                    or self._shutdown_requested.is_set()):
                 break
             # Apply a deferred model swap now that we're idle (no job in
             # flight): stop the old-model subprocess so the next job's
@@ -1512,37 +3112,64 @@ class TranscribeManager:
                     self._stop_subprocess()
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
-            with self._jobs_lock:
-                if not self._jobs:
-                    # Queue drained. If this was a one-shot manual "Start"
-                    # (Auto still off), disarm it now so future arrivals
-                    # queue again instead of auto-draining.
-                    self._manual_drain.clear()
-                    break
-                job = self._jobs.pop(0)
-                self._current_job = job
-            # Journal the in-flight job state IMMEDIATELY so a crash
-            # between here and the finally-end _persist_pending call
-            # doesn't lose the in-flight job (audit: transcribe/
-            # core.py:912-934). Best-effort — failure here doesn't
-            # disturb the actual transcription path.
-            try:
-                self._persist_pending()
-            except Exception as _pe:
-                _log.debug("swallowed: %s", _pe)
+            pop_persisted = False
+            with self._journal_lock:
+                with self._jobs_lock:
+                    if not self._jobs:
+                        # Queue drained. If this was a one-shot manual "Start"
+                        # (Auto still off), disarm it now so future arrivals
+                        # queue again instead of auto-draining.
+                        self._manual_drain.clear()
+                        break
+                    job = self._jobs.pop(0)
+                    self._current_job = job
+                # A worker may not execute a job until the queued->current
+                # transition is durable. On failure, restore the exact runtime
+                # state represented by the still-authoritative old journal.
+                pop_persisted = self._persist_pending()
+                if not pop_persisted:
+                    with self._jobs_lock:
+                        if self._current_job is job:
+                            self._current_job = None
+                        self._jobs.insert(0, job)
+            if not pop_persisted:
+                self._manual_drain.clear()
+                self._paused.set()
+                if self._queues is not None:
+                    try:
+                        self._queues.set_gpu_paused(True)
+                    except Exception as e:
+                        _log.warning("could not pause unpersisted GPU queue: %s", e)
+                self._stream.emit_error(
+                    "Could not save the running-task recovery snapshot; no "
+                    "processing was started. Press Start to retry after the "
+                    "app data folder is writable.")
+                break
             # Reflect "now running" in the shared GPU queue: pop the
             # matching popover entry off `queues.gpu` and stamp it as
             # `current_gpu` so the popover's top row switches to
             # "Transcribing X" / "Compressing X" while the rest shrink
             # upward. Label verb comes from the job's `kind`.
             _job_kind = job.get("kind") or "transcribe"
+            _was_cleanup_only = bool(job.get("_cleanup_only"))
+            if (_job_kind == "transcribe"
+                    and not job.get("_callback_done")):
+                if job.get("_output_complete"):
+                    self._notify_job_runtime_state(
+                        job, "finalizing", message="Finishing transcript…")
+                elif (job.get("_retry_required")
+                      and not _was_cleanup_only):
+                    self._notify_job_runtime_state(
+                        job, "resuming", message="Resuming transcription…")
             if self._queues is not None:
                 try:
                     self._queues.gpu_pop_matching(
+                        task_id=job.get("task_id", ""),
                         expected_path=job.get("path", ""),
                         expected_bulk_id=job.get("bulk_id", ""),
                     )
                     self._queues.set_current_gpu({
+                        "task_id": job.get("task_id", ""),
                         "kind": _job_kind,
                         "title": job.get("title", ""),
                         "path": job.get("path", ""),
@@ -1550,6 +3177,9 @@ class TranscribeManager:
                         "bulk_id": job.get("bulk_id", ""),
                         "bulk_total": int(job.get("bulk_total") or 0),
                         "bulk_index": int(job.get("bulk_index") or 0),
+                        "requested_model": str(
+                            job.get("requested_model") or ""),
+                        "actual_model": str(job.get("actual_model") or ""),
                     })
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
@@ -1563,48 +3193,42 @@ class TranscribeManager:
                 else:
                     stats = self._batch_stats.setdefault(ch_name,
                         {"start": time.time(), "done": 0, "err": 0})
-            crashed = False
-            try:
-                if _job_kind == "compress":
-                    self._compress_one(job)
-                else:
+            outcome = _WorkerOutcome.FAILED
+            stop_after_job = False
+            from ..process_runner import process_owner_scope
+            _process_scope = process_owner_scope(
+                "processing", str(job.get("task_id") or ""))
+            _process_scope.__enter__()
+            def _execute_job(job=job, job_kind=_job_kind):
+                if job.get("_output_complete"):
+                    return self._retry_completed_followup(job)
+                if job.get("_cleanup_only"):
+                    return (
+                        _WorkerOutcome.SUCCESS
+                        if self._finish_terminal_pending(job)
+                        else _WorkerOutcome.CLEANUP_FAILED)
+                if job.get("_no_speech_pending"):
+                    return self._retry_no_speech_classification(job)
+                if job_kind == "compress":
+                    return self._compress_one(job)
+                return (
                     self._transcribe_one(job)
-            except RuntimeError as _empty_e:
-                # "Whisper returned an empty transcript" — this is a
-                # SUCCESSFUL but speechless run (silent intro, music-
-                # only video, vad_filter rejected everything), not a
-                # crash. Surface as a calm dim line, NOT a scary red
-                # "Transcribe crashed" entry (audit: transcribe/
-                # core.py:1881-1886).
-                _msg_lower = str(_empty_e).lower()
-                if "cancelled before write" in _msg_lower:
-                    # "Cancel All" raced into _write_outputs — silent.
-                    # Counts as done so the err counter doesn't bump.
-                    crashed = False
-                elif "empty transcript" in _msg_lower:
-                    _vid_for_empty = (job.get("video_id") or "").strip()
-                    _empty_marker = f"tx_done_{_vid_for_empty}" if _vid_for_empty else ""
-                    _empty_tags = [t for t in (
-                        _empty_marker, "dim", job.get("job_tag", "")) if t]
-                    self._stream.emit([[
-                        f" — no speech detected in {job.get('title') or 'video'}.\n",
-                        _empty_tags,
-                    ]])
-                    # Not a crash — counts as done (avoids polluting
-                    # the error counter for a benign outcome).
-                    crashed = False
-                else:
-                    # Genuine RuntimeError — treat as a crash.
-                    _vid_for_err = (job.get("video_id") or "").strip()
-                    _marker = f"tx_done_{_vid_for_err}" if _vid_for_err else ""
-                    _err_tags = [t for t in (
-                        _marker, "red", job.get("job_tag", "")) if t]
-                    self._stream.emit([[
-                        f"{_job_kind.capitalize()} crashed: {_empty_e}\n",
-                        _err_tags,
-                    ]])
-                    crashed = True
-            except Exception as e:
+                    if self._prepare_job_model(job)
+                    else _WorkerOutcome.FAILED
+                )
+
+            def _invalid_result(returned, job_kind=_job_kind) -> None:
+                self._stream.emit_error(
+                    f"{job_kind.capitalize()} ended without an explicit "
+                    "outcome; task left queued for retry.")
+                _log.error("%s worker returned invalid outcome %r",
+                           job_kind, returned)
+
+            def _execution_error(
+                error: BaseException,
+                job=job,
+                job_kind=_job_kind,
+            ) -> None:
                 # audit SR-3 (user screenshot): if a transcribe
                 # job crashes, the error line must still REPLACE the
                 # sync.py-reserved `tx_done_<vid>` placeholder under
@@ -1619,41 +3243,192 @@ class TranscribeManager:
                 # Use the structured emit form so we can carry the
                 # marker; emit_error doesn't accept tag lists.
                 self._stream.emit([[
-                    f"{_job_kind.capitalize()} crashed: {e}\n",
+                    f"{job_kind.capitalize()} crashed: {error}\n",
                     _err_tags,
                 ]])
-                crashed = True
+
+            try:
+                outcome = _JOB_EXECUTOR.run(
+                    _execute_job,
+                    on_invalid=_invalid_result,
+                    on_error=_execution_error,
+                )
             finally:
-                _requeued_no_tally = bool(job.get("_requeued_no_tally"))
-                if _requeued_no_tally:
-                    job.pop("_requeued_no_tally", None)
-                else:
-                    with self._stats_lock:
-                        if crashed:
-                            stats["err"] += 1
-                        else:
-                            stats["done"] += 1
-                # if a transcribe job crashed or early-returned
-                # without reaching the success-path decrement, the pending
-                # counter would leak (-1, -2, -3 stuck on the Subs row
-                # forever). Any non-retranscribe transcribe job that didn't
-                # set `_pending_decremented` gets drained here.
-                if (_job_kind != "compress"
-                        and not job.get("retranscribe")
-                        and not job.get("_pending_decremented")):
+                _process_scope.__exit__(None, None, None)
+                # A user Skip/Cancel that races with an error is still an
+                # intentional drop, not work we should resurrect.
+                shutdown_retry = (
+                    self._shutdown_requested.is_set()
+                    and not job.get("_cancel_drop_requested")
+                    and not job.get("_output_complete")
+                )
+                if shutdown_retry:
+                    # A quit/restart cancellation is a retryable interruption,
+                    # never a terminal user cancellation.  Keep the job in the
+                    # journal even if the child reports "cancelled" first.
+                    job["_shutdown_retry"] = True
+                outcome = apply_control_signals(
+                    outcome,
+                    shutdown_requested=self._shutdown_requested.is_set(),
+                    cancel_drop_requested=bool(
+                        job.get("_cancel_drop_requested")),
+                    defer_requested=bool(job.get("_defer_requested")),
+                    cancel_requested=bool(
+                        job["cancel"].is_set() or self._cancel_all.is_set()),
+                    output_complete=bool(job.get("_output_complete")),
+                    write_intent=bool(job.get("_write_intent")),
+                )
+
+                tally_outcome = outcome
+                if execution_decision(outcome).terminal:
+                    if not self._finish_terminal_pending(job):
+                        job["_cleanup_only"] = True
+                        outcome = _WorkerOutcome.CLEANUP_FAILED
+
+                if tally_outcome is _WorkerOutcome.NO_SPEECH:
+                    _vid_for_empty = (job.get("video_id") or "").strip()
+                    _empty_marker = (
+                        f"tx_done_{_vid_for_empty}" if _vid_for_empty else "")
+                    _empty_tags = [t for t in (
+                        _empty_marker, "dim", job.get("job_tag", "")) if t]
+                    self._stream.emit([[
+                        f" — no speech detected in "
+                        f"{job.get('title') or 'video'}.\n",
+                        _empty_tags,
+                    ]])
+
+                terminal_finished = execution_decision(outcome).terminal
+                terminal_checkpoint_saved = True
+                if terminal_finished:
+                    # Before removing either recovery store, checkpoint that
+                    # all output/callback work is terminal. If QueueState's
+                    # current-slot clear then fails, the journal retry performs
+                    # cleanup only and cannot re-run a transcript/compression.
+                    job["_cleanup_only"] = True
+                    # Successful transcription/no-speech paths already
+                    # checkpoint `_output_complete` before returning. Every
+                    # other terminal path (including a cancelled transcription)
+                    # must commit the cleanup-only marker before its visible
+                    # current slot is cleared; otherwise a crash can replay the
+                    # old journal entry as executable work.
+                    needs_terminal_checkpoint = not job.get("_output_complete")
+                    if (needs_terminal_checkpoint
+                            and not self._persist_pending()):
+                        terminal_checkpoint_saved = False
+                        outcome = _WorkerOutcome.CLEANUP_FAILED
+
+                visible_current_cleared = True
+                if terminal_finished and not terminal_checkpoint_saved:
+                    # The current QueueState slot is still the authoritative
+                    # recovery copy. Never clear it after the peer journal
+                    # refused the terminal checkpoint.
+                    visible_current_cleared = False
+                elif self._queues is not None:
                     try:
-                        ch_for_decrement = (job.get("channel") or "").strip()
-                        if ch_for_decrement:
-                            _bump_transcription_pending(ch_for_decrement, -1)
-                        _vid = job.get("video_id") or ""
-                        if _vid:
-                            from .. import ytarchiver_config as _cfg
-                            _cfg.remove_pending_tx_id(_vid)
-                    except Exception as e:
-                        _log.debug("swallowed: %s", e)
-                with self._jobs_lock:
-                    if self._current_job is job:
-                        self._current_job = None
+                        visible = self._queues.current_gpu
+                        if isinstance(visible, dict):
+                            visible_id = str(
+                                visible.get("task_id") or "").strip()
+                            job_id = str(job.get("task_id") or "").strip()
+                            durable_replace = getattr(
+                                type(self._queues),
+                                "replace_current_task_durable", None)
+                            if visible_id != job_id or not job_id:
+                                visible_current_cleared = False
+                            elif callable(durable_replace):
+                                visible_current_cleared = bool(
+                                    self._queues.replace_current_task_durable(
+                                        "gpu", None,
+                                        expected_task_id=job_id))
+                            else:
+                                # Transitional queue adapters do not expose a
+                                # synchronous commit result. Preserve their old
+                                # behavior without weakening real QueueState.
+                                self._queues.set_current_gpu(None)
+                    except Exception as exc:
+                        _log.warning(
+                            "could not durably finalize Processing current "
+                            "slot: %s", exc)
+                        visible_current_cleared = False
+                if terminal_finished and not visible_current_cleared:
+                    outcome = _WorkerOutcome.CLEANUP_FAILED
+
+                self._restore_job_after_outcome(job, outcome)
+                if execution_decision(outcome).pause_for_retry:
+                    # A deterministic failure must not hot-loop. The task
+                    # remains first in both queues; Start/Resume retries it.
+                    stop_after_job = True
+                    self._manual_drain.clear()
+                    self._paused.set()
+                    if self._queues is not None:
+                        try:
+                            self._queues.set_gpu_paused(True)
+                        except Exception as e:
+                            _log.warning("could not pause failed GPU queue: %s", e)
+                    if outcome is _WorkerOutcome.CLEANUP_FAILED:
+                        if job.get("_followup_pending"):
+                            self._stream.emit_error(
+                                "Transcription finished, but its compression "
+                                "follow-up could not be saved — completion "
+                                "task kept in Processing. Press Start to retry.")
+                        else:
+                            self._stream.emit_error(
+                                "Transcription finished, but pending-list "
+                                "cleanup could not be saved — cleanup task "
+                                "kept in Processing. Press Start to retry.")
+                    else:
+                        self._stream.emit_error(
+                            f"{_job_kind.capitalize()} failed — task kept in "
+                            "Processing. Press Start to retry.")
+
+                if (not job.get("_stats_tallied")
+                        and tally_outcome in {_WorkerOutcome.SUCCESS,
+                                              _WorkerOutcome.NO_SPEECH}):
+                    with self._stats_lock:
+                        stats["done"] += 1
+                    job["_stats_tallied"] = True
+                elif (not job.get("_stats_tallied")
+                      and tally_outcome is _WorkerOutcome.FAILED):
+                    with self._stats_lock:
+                        stats["err"] += 1
+                journal_saved = False
+                with self._journal_lock:
+                    with self._jobs_lock:
+                        if self._current_job is job:
+                            self._current_job = None
+                    journal_saved = self._persist_pending()
+                    if not journal_saved and not self._cancel_all.is_set():
+                        with self._jobs_lock:
+                            if not any(existing is job for existing in self._jobs):
+                                if tally_outcome in {
+                                        _WorkerOutcome.SUCCESS,
+                                        _WorkerOutcome.NO_SPEECH,
+                                        _WorkerOutcome.CANCELLED}:
+                                    # Outputs/callbacks already completed. A
+                                    # journal-clear retry must never run them a
+                                    # second time; it only retries durable task
+                                    # removal on the next manual Start.
+                                    job["_cleanup_only"] = True
+                                    job["cancel"] = threading.Event()
+                                self._jobs.insert(0, job)
+                if not journal_saved and not self._cancel_all.is_set():
+                    stop_after_job = True
+                    self._manual_drain.clear()
+                    self._paused.set()
+                    if self._queues is not None:
+                        try:
+                            self._queues.gpu_enqueue(
+                                self._queue_payload_for_job(job))
+                            self._queues.gpu_reorder(
+                                job.get("task_id", ""), 0)
+                            self._queues.set_gpu_paused(True)
+                        except Exception as e:
+                            _log.warning(
+                                "could not expose journal recovery task: %s", e)
+                    self._stream.emit_error(
+                        "Task output finished, but its recovery journal could "
+                        "not be finalized — task kept in Processing. Press "
+                        "Start to retry journal cleanup.")
                 # audit D-10 / if the previous job had been
                 # forced into CPU mode via OOM fallback, reset the env
                 # back to CUDA regardless of whether the fallback job
@@ -1664,7 +3439,8 @@ class TranscribeManager:
                 # restart (user reports "transcription mysteriously
                 # slow until I relaunch").
                 if (self._cpu_fallback_active
-                        and _job_kind != "compress"):
+                        and _job_kind != "compress"
+                        and outcome is not _WorkerOutcome.RETRY):
                     self._cpu_fallback_active = False
                     try:
                         # No global env pop needed any more — the
@@ -1674,7 +3450,7 @@ class TranscribeManager:
                         self._stop_subprocess(force=True)
                         _reset_label = (
                             "\u21A9 Resetting to GPU mode for next job."
-                            if not crashed else
+                            if outcome is not _WorkerOutcome.FAILED else
                             "\u21A9 Resetting to GPU mode (fallback job crashed "
                             "\u2014 giving GPU another try).")
                         self._stream.emit_text(
@@ -1684,12 +3460,49 @@ class TranscribeManager:
                 # Clear the "running" slot on completion so the popover
                 # returns to idle (or shows the next queued item as the
                 # next iteration sets its own current_gpu).
-                if self._queues is not None:
+                if (self._queues is not None
+                        and not callable(getattr(
+                            type(self._queues),
+                            "replace_current_task_durable", None))):
                     try:
                         self._queues.set_current_gpu(None)
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
-                self._persist_pending()
+
+                # A successful job consumes its completion callback and clears
+                # Watch state there. Outcomes that do not consume that callback
+                # need a separate signal so the UI cannot remain on a stale
+                # active phase. A cleanup-only retry after cancellation has no
+                # success callback by design, so clear it as cancelled once the
+                # durable cleanup succeeds.
+                if (_job_kind == "transcribe"
+                        and _was_cleanup_only
+                        and outcome is _WorkerOutcome.SUCCESS
+                        and not job.get("_output_complete")
+                        and not job.get("_callback_done")):
+                    self._notify_job_runtime_state(
+                        job, "cancelled",
+                        message="Re-transcription cancelled")
+                elif (_job_kind == "transcribe"
+                      and not job.get("_callback_done")):
+                    if outcome in {
+                            _WorkerOutcome.FAILED,
+                            _WorkerOutcome.CLEANUP_FAILED}:
+                        self._notify_job_runtime_state(
+                            job, "needs_attention",
+                            message=("Needs attention — retry from "
+                                     "Processing"))
+                    elif outcome is _WorkerOutcome.CANCELLED:
+                        self._notify_job_runtime_state(
+                            job, "cancelled",
+                            message="Re-transcription cancelled")
+                    elif outcome is _WorkerOutcome.RETRY:
+                        self._notify_job_runtime_state(
+                            job, "queued",
+                            message="Waiting to retry")
+
+            if stop_after_job:
+                break
 
         # Flush per-channel batch stats to autorun_history + activity log.
         # One row per channel processed in this worker session.
@@ -1699,31 +3512,132 @@ class TranscribeManager:
             _log.debug("swallowed: %s", e)
         self._stream.flush()
 
-    def _compress_one(self, job: dict[str, Any]):
+    def _channel_aliases_for_job(self, job: dict[str, Any]):
+        """Resolve the same channel root aliases used by sync/reorganization."""
+        from backend.services.channel_leases import channel_aliases
+
+        path = os.path.abspath(str(job.get("path") or ""))
+        cfg = self._cfg_loader() if callable(self._cfg_loader) else {}
+        cfg = cfg if isinstance(cfg, dict) else {}
+        output_dir = os.path.abspath(str(cfg.get("output_dir") or "")) \
+            if cfg.get("output_dir") else ""
+        requested_name = str(job.get("channel") or "").strip().casefold()
+        matched = None
+        root = ""
+        try:
+            from ..sync import channel_folder_name
+            for channel in cfg.get("channels", []) or []:
+                folder_name = channel_folder_name(channel)
+                candidate = (os.path.join(output_dir, folder_name)
+                             if output_dir and folder_name else "")
+                names = {
+                    str(channel.get(key) or "").strip().casefold()
+                    for key in ("name", "folder", "folder_override")
+                }
+                path_matches = bool(
+                    candidate and os.path.commonpath([path, candidate])
+                    == os.path.commonpath([candidate]))
+                if (requested_name and requested_name in names) or path_matches:
+                    matched = channel
+                    root = candidate
+                    break
+        except (OSError, ValueError):
+            matched = None
+            root = ""
+        if not root and output_dir:
+            try:
+                relative = os.path.relpath(path, output_dir)
+                first = relative.split(os.sep, 1)[0]
+                if first not in {"", ".", ".."} and not relative.startswith(
+                        ".." + os.sep):
+                    root = os.path.join(output_dir, first)
+            except (OSError, ValueError):
+                pass
+        if not root:
+            root = os.path.dirname(path) or path
+        return channel_aliases(matched, paths=[root])
+
+    def _run_under_channel_lease(self, job: dict[str, Any], callback):
+        from backend.services.channel_leases import LeaseOwner, channel_leases
+
+        task_id = str(job.get("task_id") or make_task_id("gpu"))
+        aliases = self._channel_aliases_for_job(job)
+        owner = LeaseOwner(
+            "processing", task_id,
+            label="GPU processing", task_id=task_id,
+            kind=str(job.get("kind") or "transcribe"))
+        waiting_reported = False
+        while True:
+            result = channel_leases.acquire(
+                aliases,
+                owner,
+                # A download can legitimately own this channel for longer
+                # than five seconds.  Use a bounded wait so cancellation stays
+                # responsive, then keep waiting instead of turning ordinary
+                # sync/Processing overlap into a failed, paused queue.
+                timeout=5.0,
+                cancel_event=job.get("cancel"),
+            )
+            if result.ok and result.lease is not None:
+                with result.lease:
+                    return callback(job)
+            if self._shutdown_requested.is_set():
+                return _WorkerOutcome.RETRY
+            if job.get("cancel") is not None and job["cancel"].is_set():
+                return _WorkerOutcome.CANCELLED
+            if result.status == "timeout":
+                if not waiting_reported:
+                    self._stream.emit_text(
+                        "Processing is waiting for another task on this "
+                        "channel to finish.\n",
+                        "simpleline_blue",
+                    )
+                    waiting_reported = True
+                continue
+            self._stream.emit_error(
+                "Processing could not start: " + result.explanation)
+            return _WorkerOutcome.FAILED
+
+    def _compress_one(self, job: dict[str, Any]) -> _WorkerOutcome:
+        return self._run_under_channel_lease(job, self._compress_one_unleased)
+
+    def _compress_one_unleased(self, job: dict[str, Any]) -> _WorkerOutcome:
         """Run one compress job from the GPU queue — delegates to
         backend.compress.compress_video(). Shares the same worker
         thread as transcribe so only one GPU task runs at a time."""
         if job["cancel"].is_set():
-            return
+            return _WorkerOutcome.CANCELLED
         try:
             from .. import compress as _cmp
         except Exception as e:
             self._stream.emit_error(f"Compress: import failed: {e}")
-            return
+            return _WorkerOutcome.FAILED
         try:
-            res = _cmp.compress_video(
-                job["path"],
-                self._stream,
-                quality=job.get("quality", "Average"),
-                output_res=str(job.get("output_res", "720")),
-                cancel_event=job["cancel"],
-            )
+            from ..process_runner import process_owner_scope
+            with process_owner_scope(
+                    "processing", str(job.get("task_id") or "")):
+                res = _cmp.compress_video(
+                    job["path"],
+                    self._stream,
+                    quality=job.get("quality", "Average"),
+                    output_res=str(job.get("output_res", "720")),
+                    cancel_event=job["cancel"],
+                    process_owner="processing",
+                    task_id=str(job.get("task_id") or ""),
+                )
         except Exception as e:
             self._stream.emit_error(f"Compress: {e}")
-            return
+            return _WorkerOutcome.FAILED
+        if not isinstance(res, dict) or not res.get("ok"):
+            if (job["cancel"].is_set()
+                    or (isinstance(res, dict)
+                        and res.get("reason") == "cancelled")):
+                return _WorkerOutcome.CANCELLED
+            return _WorkerOutcome.FAILED
         if job.get("cb"):
             try: job["cb"](res)
             except Exception as e: _log.debug("swallowed: %s", e)
+        return _WorkerOutcome.SUCCESS
 
     def _flush_batch_stats(self):
         """Emit [Trnscr] autorun_history rows for MANUAL transcribe-only
@@ -1859,11 +3773,19 @@ class TranscribeManager:
             except Exception as e:
                 _log.debug("swallowed: %s", e)
 
-    def _transcribe_one(self, job: dict[str, Any]):
+    def _transcribe_one(self, job: dict[str, Any]) -> _WorkerOutcome:
+        return self._run_under_channel_lease(job, self._transcribe_one_unleased)
+
+    def _transcribe_one_unleased(self, job: dict[str, Any]) -> _WorkerOutcome:
         path = job["path"]
         title = job["title"]
+        # ``_retried_cpu`` is scoped to one GPU->CPU execution cycle. A
+        # downstream write/index failure retains the job, but must not make a
+        # later manual retry permanently ineligible for CPU fallback.
+        if not self._cpu_fallback_active:
+            job.pop("_retried_cpu", None)
         if job["cancel"].is_set():
-            return
+            return _WorkerOutcome.CANCELLED
 
         # if GPU Auto was unchecked AFTER this job was
         # popped but BEFORE we started processing, re-park it at the
@@ -1874,9 +3796,7 @@ class TranscribeManager:
         # (self._manual_drain) is an explicit request to process the
         # backlog now, so it overrides the Auto-off re-park.
         if not (self._auto_enabled() or self._manual_drain.is_set()):
-            with self._jobs_lock:
-                self._jobs.insert(0, job)
-            return
+            return _WorkerOutcome.RETRY
 
         # Unique-per-job inplace kind. Every emit from this job's
         # lifecycle (Loading punctuation model, Adding punctuation,
@@ -1914,16 +3834,40 @@ class TranscribeManager:
         if _punct_for_captions is not None:
             try: _punct_for_captions._job_tag = job_tag
             except Exception as e: _log.debug("swallowed: %s", e)
-        if (not job.get("retranscribe") and
-                _try_auto_captions(path, title, job.get("channel", ""),
-                                   self._stream,
-                                   punct_mgr=_punct_for_captions,
-                                   job_tag=job_tag,
-                                   video_id_hint=job.get("video_id", ""),
-                                   from_download=bool(job.get("from_download")))):
-            job["_pending_decremented"] = True
-            self._finish_successful_job(job, {"auto_captions": True})
-            return
+        caption_outcome = _CaptionOutcome.UNAVAILABLE
+        if (not job.get("retranscribe")
+                and (job.get("_caption_recovery")
+                     or not job.get("_retry_as_replace"))):
+            if self._current_job is job:
+                if not self._arm_output_write_intent(job):
+                    return _WorkerOutcome.FAILED
+            caption_outcome = _coerce_caption_outcome(_try_auto_captions(
+                path, title, job.get("channel", ""), self._stream,
+                punct_mgr=_punct_for_captions,
+                job_tag=job_tag,
+                video_id_hint=job.get("video_id", ""),
+                from_download=bool(job.get("from_download")),
+                update_pending=False))
+            if caption_outcome is _CaptionOutcome.SUCCESS:
+                if not self._finish_successful_job(
+                        job, {"auto_captions": True}):
+                    return _WorkerOutcome.CLEANUP_FAILED
+                return _WorkerOutcome.SUCCESS
+            if caption_outcome in {
+                    _CaptionOutcome.FAILED, _CaptionOutcome.PARTIAL}:
+                job["_retry_required"] = True
+                if (caption_outcome is _CaptionOutcome.PARTIAL
+                        and not job.get("_caption_recovery")):
+                    job["_retry_as_replace"] = True
+                self._persist_pending()
+                return _WorkerOutcome.FAILED
+
+        if (job.get("_caption_recovery")
+                and caption_outcome is _CaptionOutcome.UNAVAILABLE):
+            # If the local caption source disappeared after the interruption,
+            # Whisper may recover the job, but it must use surgical replacement
+            # because TXT and/or JSONL could already have committed.
+            job["_retry_as_replace"] = True
 
         # Auto-captions path missed — either no .vtt available, yt-dlp
         # couldn't fetch captions for this video, or the VTT parse came
@@ -1933,15 +3877,23 @@ class TranscribeManager:
         # sees Whisper take over instead of the transcription just
         # vanishing. Uses the `whisper_progress` inplace family so the
         # final "— ✓ Transcription" done line replaces this too.
-        if not job.get("retranscribe"):
+        if (not job.get("retranscribe")
+                and caption_outcome is _CaptionOutcome.UNAVAILABLE):
             self._stream.emit([[
                 " No auto-captions available \u2014 using Whisper\u2026\n",
                 ["transcribe_using", job_tag],
             ]])
 
+        if not self.is_available():
+            self._stream.emit_error(
+                "Whisper: Python 3.11 not found. Install from python.org "
+                "to enable transcription. Task kept for retry.")
+            return _WorkerOutcome.FAILED
+
         proc, _line_q = self._snapshot_worker_io()
         if proc is None or proc.poll() is not None:
-            if not self.start_subprocess():
+            if not self.start_subprocess(
+                    model=str(job.get("requested_model") or self._model)):
                 # Subprocess failed to start — emit an error so the
                 # user knows why the transcription silently died
                 # (Python 3.11 missing, GPU driver wrong, model
@@ -1952,10 +3904,7 @@ class TranscribeManager:
                     f"Whisper failed to start \u2014 transcription for "
                     f"\"{title}\" skipped. Check Python 3.11 install "
                     f"+ CUDA drivers.")
-                if job.get("cb"):
-                    try: job["cb"]({"ok": False, "reason": "whisper_start_failed"})
-                    except Exception as e: _log.debug("swallowed: %s", e)
-                return
+                return _WorkerOutcome.FAILED
 
         # ── Chunked path for long videos (>~2 hours) ──
         # Splits the file into overlapping WAV chunks with ffmpeg, transcribes
@@ -1987,8 +3936,7 @@ class TranscribeManager:
                 pass
         job["_duration_is_real"] = _duration_is_real
         if duration >= _CHUNK_MIN_DURATION:
-            self._transcribe_chunked(job, duration)
-            return
+            return self._transcribe_chunked(job, duration)
 
         # Progress line — ports but rewritten
         # per 2026-04-23 user feedback notes on the 3rd screenshot:
@@ -2045,7 +3993,9 @@ class TranscribeManager:
         }) + "\n"
         proc, q = self._snapshot_worker_io()
         if proc is None or q is None:
-            return
+            if job["cancel"].is_set() or self._cancel_all.is_set():
+                return _WorkerOutcome.CANCELLED
+            return _WorkerOutcome.FAILED
         try:
             proc.stdin.write(req)
             proc.stdin.flush()
@@ -2056,7 +4006,9 @@ class TranscribeManager:
             if not (job["cancel"].is_set() or self._cancel_all.is_set()):
                 self._stream.emit_error(f"Write to whisper failed: {e}")
             self._stop_subprocess()
-            return
+            if job["cancel"].is_set() or self._cancel_all.is_set():
+                return _WorkerOutcome.CANCELLED
+            return _WorkerOutcome.FAILED
 
         # Read responses until we get "ok" or "error"
         last_pct = -1
@@ -2080,21 +4032,21 @@ class TranscribeManager:
                     self._stop_subprocess(force=True)
                 elif not self._graceful_cancel_current():
                     self._stop_subprocess(force=True)
-                return
+                return _WorkerOutcome.CANCELLED
             try:
                 _proc_snapshot, q = self._snapshot_worker_io()
                 if q is None:
                     if job["cancel"].is_set() or self._cancel_all.is_set():
-                        return
+                        return _WorkerOutcome.CANCELLED
                     self._stream.emit_error("Transcription stopped unexpectedly. Try again.")
-                    return
+                    return _WorkerOutcome.FAILED
                 line = q.get(timeout=0.5)
             except queue.Empty:
                 continue
             if line is None:
                 self._stream.emit_error("Transcription stopped unexpectedly. Try again.")
                 self._emit_whisper_stderr_tail()
-                return
+                return _WorkerOutcome.FAILED
             try:
                 msg = json.loads(line.strip())
             except json.JSONDecodeError:
@@ -2109,19 +4061,24 @@ class TranscribeManager:
             if status == "starting":
                 continue
             if status == "cancelled":
-                return
+                return _WorkerOutcome.CANCELLED
             if status == "ok":
+                if not self._accept_worker_model_report(
+                    msg,
+                    job,
+                    phase="result",
+                ):
+                    return _WorkerOutcome.FAILED
                 result = msg
                 # Recognition is complete, but punctuation, transcript writes,
                 # and FTS indexing still remain. Do not leave the last 99% tick
                 # on screen during that work -- it makes a healthy finalization
                 # phase look like Whisper itself has hung.
-                self._stream.emit([
-                    [f"{_prog_lead}\u2014 ", _tag("whisper_bracket")],
-                    ["Finalizing transcript", _tag()],
-                    [f' "{_disp_title}"', _tag()],
-                    ["...\n", _tag()],
-                ])
+                # Machine-readable phase tag lets the Watch progress control
+                # leave its last 99% value behind while punctuation,
+                # transcript writes, and indexing run.
+                self._stream.emit(_build_transcription_finalizing_segments(
+                    job, _disp_title, lead=_prog_lead))
                 break
             if status == "error":
                 err = msg.get('text', 'unknown')
@@ -2140,26 +4097,15 @@ class TranscribeManager:
                     # H51) — global mutation would leak into any
                     # sibling subprocess spawned in between.
                     self._cpu_fallback_active = True
-                    # Requeue this job (but not in a loop — bail if it fails again)
+                    # Retry once on CPU. The worker owns the requeue so pending
+                    # counters/journal/UI state all stay in one place.
                     if not job.get("_retried_cpu"):
                         job["_retried_cpu"] = True
-                        # Mark the pending-counter as already
-                        # decremented for THIS failed attempt so the
-                        # outer worker-loop's per-iteration finally
-                        # skips the decrement. Without this flag the
-                        # finally block decrements pending for both
-                        # the failed CUDA attempt AND the CPU retry,
-                        # causing transcription_pending to underflow
-                        # to 0 prematurely while the retry is still
-                        # running.
-                        job["_pending_decremented"] = True
-                        job["_requeued_no_tally"] = True
-                        with self._jobs_lock:
-                            self._jobs.insert(0, job)
-                    return
+                        return _WorkerOutcome.RETRY
+                    return _WorkerOutcome.FAILED
                 self._stream.emit_error(f"Transcription error: {err}")
                 self._emit_whisper_traceback(msg)
-                return
+                return _WorkerOutcome.FAILED
 
         # Write output files + ingest into FTS index
         if result:
@@ -2198,23 +4144,22 @@ class TranscribeManager:
                             result["_punct_success"] = True
                 except Exception as _pe:
                     self._stream.emit_dim(f" (punctuation pass skipped: {_pe})")
-            self._write_outputs(path, result, title=title, channel=channel,
-                                combined_override=job.get("combined_override"),
-                                retranscribe=bool(job.get("retranscribe")),
-                                video_id_hint=job.get("video_id", ""),
-                                job=job)
-            # audit A-1 real fix: set _pending_decremented on the job
-            # dict HERE (caller scope, where `job` actually exists)
-            # instead of inside _write_outputs which doesn't take job
-            # as a parameter. Previously this line lived at
-            # _write_outputs:2973 and raised NameError on every
-            # Whisper transcription — the .txt/.jsonl wrote fine but
-            # the done line, FTS ingest, and pending-counter
-            # bookkeeping all got skipped. Mirrors the cleaner fix I
-            # described in the audit; the edit just never actually
-            # landed the first time around.
-            if not job.get("retranscribe"):
-                job["_pending_decremented"] = True
+            replace_existing = bool(
+                job.get("retranscribe") or job.get("_retry_as_replace"))
+            output_outcome = self._write_outputs(
+                path, result, title=title, channel=channel,
+                combined_override=job.get("combined_override"),
+                retranscribe=replace_existing,
+                video_id_hint=job.get("video_id", ""),
+                job=job)
+            if output_outcome is _WorkerOutcome.NO_SPEECH:
+                if not self._finish_successful_job(
+                        job, {"no_speech": True},
+                        terminal_outcome=_WorkerOutcome.NO_SPEECH):
+                    return _WorkerOutcome.CLEANUP_FAILED
+                return output_outcome
+            if output_outcome is not _WorkerOutcome.SUCCESS:
+                return output_outcome
             # Done line — in-place replaces the sync.py-reserved
             # `tx_done_<vid>` placeholder under the channel's block
             # (`_inplaceKind` prioritizes `tx_done_` over `whisper_job_`),
@@ -2228,7 +4173,10 @@ class TranscribeManager:
             # include the model name and realtime ratio so
             # the done line reads "Transcription (Whisper small, took
             # 55sec, 12.3x realtime)" instead of just "(took 55sec)".
-            _model_label = (self._model or "").strip()
+            _model_label = str(
+                job.get("actual_model")
+                or job.get("requested_model")
+                or self._loaded_model or "").strip()
             # Only emit a realtime ratio when we have a real ffprobe
             # duration — otherwise the displayed "Nx realtime" is
             # derived from a chunking-routing sentinel, not the actual
@@ -2276,9 +4224,14 @@ class TranscribeManager:
                 dim_tags=_dim_tags, em_tags=_em_tags, lbl_tags=_lbl_tags,
                 txt_tags=_txt_tags, detail_tags=_detail_tags)
             self._stream.emit(_segs)
-            self._finish_successful_job(job, result)
+            if not self._finish_successful_job(job, result):
+                return _WorkerOutcome.CLEANUP_FAILED
+            return _WorkerOutcome.SUCCESS
 
-    def _transcribe_chunked(self, job: dict[str, Any], total_duration: float):
+        return _WorkerOutcome.FAILED
+
+    def _transcribe_chunked(self, job: dict[str, Any],
+                            total_duration: float) -> _WorkerOutcome:
         """Port of YTArchiver.py:11139 _whisper_transcribe_chunked.
 
         ffmpeg splits the audio into 2h windows with 30s of overlap; each
@@ -2308,7 +4261,7 @@ class TranscribeManager:
         try:
             for ci in range(n_chunks):
                 if cancel.is_set() or self._cancel_all.is_set():
-                    break
+                    return _WorkerOutcome.CANCELLED
                 # Respect pause between chunks. A 2h chunk could keep the
                 # user waiting many minutes; signal "actually paused" so
                 # the Resume button stops blinking once we land here.
@@ -2321,8 +4274,8 @@ class TranscribeManager:
                     if self._queues is not None:
                         try: self._queues.set_gpu_paused_active(False)
                         except Exception as e: _log.debug("swallowed: %s", e)
-                if cancel.is_set():
-                    break
+                if cancel.is_set() or self._cancel_all.is_set():
+                    return _WorkerOutcome.CANCELLED
 
                 start_sec = ci * _CHUNK_DURATION_SECS
                 if ci > 0:
@@ -2362,26 +4315,32 @@ class TranscribeManager:
                         f"Section {ci+1}/{n_chunks} split timed out after "
                         f"{int(_ff_timeout)}s — aborting chunked transcribe "
                         f"to avoid silent gaps in the merged transcript.")
-                    return
+                    return _WorkerOutcome.FAILED
                 except Exception as e:
                     self._stream.emit_error(
                         f"Section {ci+1}/{n_chunks} split failed: {e} "
                         f"— aborting chunked transcribe to avoid silent gaps "
                         f"in the merged transcript.")
-                    return
+                    return _WorkerOutcome.FAILED
 
                 # Hand the chunk to Whisper via the persistent subprocess.
                 section_prefix = f" Section {ci+1}/{n_chunks},"
                 t_start = time.time()
-                result = self._transcribe_single_file(chunk_path, job,
-                                                      _log_prefix=section_prefix)
+                chunk_outcome, result = self._transcribe_single_file(
+                    chunk_path, job, _log_prefix=section_prefix)
                 t_elapsed = time.time() - t_start
                 try: os.remove(chunk_path)
                 except Exception as e: _log.debug("swallowed: %s", e)
 
-                if not result:
-                    if cancel.is_set():
-                        return
+                if chunk_outcome is _WorkerOutcome.CANCELLED:
+                    return _WorkerOutcome.CANCELLED
+                if chunk_outcome is not _WorkerOutcome.SUCCESS:
+                    return _WorkerOutcome.FAILED
+                if not result or not (
+                        (result.get("text") or "").strip()
+                        or any((seg.get("t") or seg.get("text") or "").strip()
+                               for seg in (result.get("segments") or [])
+                               if isinstance(seg, dict))):
                     self._stream.emit([
                         [f" Section {ci+1}/{n_chunks} \u2014 no speech\n", "simpleline"],
                     ])
@@ -2419,9 +4378,9 @@ class TranscribeManager:
                     segs = [s for s in segs if s.get("s", 0) >= overlap_boundary]
                 all_segments.extend(segs)
 
-            # Merge result
-            if not all_segments and not all_text_parts:
-                return
+            # Merge result. An all-silent video deliberately flows through the
+            # output classifier below so it becomes terminal NO_SPEECH instead
+            # of an ambiguous normal return.
             # Rebuild text from deduped segments, NOT from all_text_parts.
             # all_text_parts contains each chunk's full body including the
             # 30s overlap window, so joining them duplicated ~60s of
@@ -2441,6 +4400,12 @@ class TranscribeManager:
                 "text": merged_text,
                 "segments": all_segments,
             }
+            # Recognition for every chunk is complete, but merged punctuation,
+            # sidecar writes, and search indexing still remain. Match the
+            # short-video Watch state instead of leaving the last section's
+            # percentage on screen throughout that work.
+            self._stream.emit(_build_transcription_finalizing_segments(
+                job, _disp_title_chunked))
             # Optional punctuation pass on the merged text (same as single-pass).
             # also iterate each segment and punctuate its text
             # so the .jsonl (source of Watch-view karaoke + FTS search)
@@ -2462,16 +4427,22 @@ class TranscribeManager:
                         _punct_align_segments(punct, merged["segments"])
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
-            self._write_outputs(path, merged, title=title, channel=channel,
-                                combined_override=job.get("combined_override"),
-                                retranscribe=bool(job.get("retranscribe")),
-                                video_id_hint=job.get("video_id", ""),
-                                job=job)
-            # audit A-1 real fix: same as the single-pass caller above.
-            # Flag belongs on the `job` dict in caller scope; never
-            # inside _write_outputs (which has no `job` param).
-            if not job.get("retranscribe"):
-                job["_pending_decremented"] = True
+            replace_existing = bool(
+                job.get("retranscribe") or job.get("_retry_as_replace"))
+            output_outcome = self._write_outputs(
+                path, merged, title=title, channel=channel,
+                combined_override=job.get("combined_override"),
+                retranscribe=replace_existing,
+                video_id_hint=job.get("video_id", ""),
+                job=job)
+            if output_outcome is _WorkerOutcome.NO_SPEECH:
+                if not self._finish_successful_job(
+                        job, {"no_speech": True},
+                        terminal_outcome=_WorkerOutcome.NO_SPEECH):
+                    return _WorkerOutcome.CLEANUP_FAILED
+                return output_outcome
+            if output_outcome is not _WorkerOutcome.SUCCESS:
+                return output_outcome
             # Done line — REPLACES the last whisper_progress chunk line
             # in place via `whisper_progress` inplace kind. Matches OLD
             # YTArchiver.py:16495 format with (chunked) suffix to
@@ -2503,16 +4474,19 @@ class TranscribeManager:
                 dim_tags=_dim_tag, em_tags=_em_tag, lbl_tags=_lbl_tag,
                 txt_tags=_txt_tag, detail_tags=_dim_tag)
             self._stream.emit(_segs_c)
-            self._finish_successful_job(job, merged)
+            if not self._finish_successful_job(job, merged):
+                return _WorkerOutcome.CLEANUP_FAILED
+            return _WorkerOutcome.SUCCESS
         finally:
             try: shutil.rmtree(chunk_dir, ignore_errors=True)
             except Exception as e: _log.debug("swallowed: %s", e)
 
     def _transcribe_single_file(self, path: str, job: dict[str, Any],
-                                 _log_prefix: str = "") -> dict[str, Any] | None:
+                                 _log_prefix: str = "") -> tuple[
+                                     _WorkerOutcome, dict[str, Any] | None]:
         """Send one file to the persistent whisper subprocess and collect the
         result. Used by the chunked path to do each section. Returns the
-        parsed JSON from the worker (keys: text, segments) or None.
+        explicit outcome plus the parsed worker JSON when successful.
 
         emits in-place progress ticks tagged with the
         current job's `job_tag` + the section prefix. Before this,
@@ -2524,11 +4498,12 @@ class TranscribeManager:
         """
         proc, _line_q = self._snapshot_worker_io()
         if proc is None or proc.poll() is not None:
-            if not self.start_subprocess():
-                return None
+            if not self.start_subprocess(
+                    model=str(job.get("requested_model") or self._model)):
+                return _WorkerOutcome.FAILED, None
             proc, _line_q = self._snapshot_worker_io()
         if proc is None:
-            return None
+            return _WorkerOutcome.FAILED, None
         try:
             # Pass ffprobe duration as fallback so the worker can still
             # render progress on chunks where info.duration is 0
@@ -2542,7 +4517,9 @@ class TranscribeManager:
             proc.stdin.flush()
         except Exception as e:
             self._stream.emit_error(f"Write to whisper failed: {e}")
-            return None
+            if job["cancel"].is_set() or self._cancel_all.is_set():
+                return _WorkerOutcome.CANCELLED, None
+            return _WorkerOutcome.FAILED, None
         _last_pct = -1
         _job_tag_p = (job.get("job_tag") or "") if isinstance(job, dict) else ""
         _prefix_str = (_log_prefix or "").strip()
@@ -2552,7 +4529,7 @@ class TranscribeManager:
                     self._stop_subprocess(force=True)
                 elif not self._graceful_cancel_current():
                     self._stop_subprocess(force=True)
-                return None
+                return _WorkerOutcome.CANCELLED, None
             # pause also polled inside the read loop so a
             # long chunk mid-transcription can actually pause, not
             # just at chunk boundaries. Signal "actually paused" so the
@@ -2575,21 +4552,21 @@ class TranscribeManager:
                     self._stop_subprocess(force=True)
                 elif not self._graceful_cancel_current():
                     self._stop_subprocess(force=True)
-                return None
+                return _WorkerOutcome.CANCELLED, None
             try:
                 _proc_snapshot, q = self._snapshot_worker_io()
                 if q is None:
                     if job["cancel"].is_set() or self._cancel_all.is_set():
-                        return None
+                        return _WorkerOutcome.CANCELLED, None
                     self._stream.emit_error("Transcription stopped unexpectedly. Try again.")
-                    return None
+                    return _WorkerOutcome.FAILED, None
                 line = q.get(timeout=0.5)
             except queue.Empty:
                 continue
             if line is None:
                 self._stream.emit_error("Transcription stopped unexpectedly. Try again.")
                 self._emit_whisper_stderr_tail()
-                return None
+                return _WorkerOutcome.FAILED, None
             try:
                 msg = json.loads(line.strip())
             except json.JSONDecodeError:
@@ -2616,22 +4593,28 @@ class TranscribeManager:
             if status == "starting":
                 continue
             if status == "cancelled":
-                return None
+                return _WorkerOutcome.CANCELLED, None
             if status == "ok":
-                return msg
+                if not self._accept_worker_model_report(
+                    msg,
+                    job,
+                    phase="result",
+                ):
+                    return _WorkerOutcome.FAILED, None
+                return _WorkerOutcome.SUCCESS, msg
             if status == "error":
                 self._stream.emit_error(
                     f"Whisper error{(' (' + _log_prefix.strip() + ')') if _log_prefix else ''}: "
                     f"{msg.get('text', 'unknown')}")
                 self._emit_whisper_traceback(msg)
-                return None
+                return _WorkerOutcome.FAILED, None
 
     def _write_outputs(self, video_path: str, result: dict[str, Any],
                        title: str = "", channel: str = "",
                        combined_override: bool | None = None,
                        retranscribe: bool = False,
                        video_id_hint: str = "",
-                       job: dict | None = None):
+                       job: dict | None = None) -> _WorkerOutcome:
         """Write a transcript entry to the aggregated {ch} Transcript.txt
         + hidden JSONL sidecar. Matches YTArchiver.py:15449-15478 output
         layout exactly, so OLD YTArchiver can read transcripts written
@@ -2656,13 +4639,11 @@ class TranscribeManager:
         # transcribe H60 — previously only `_cancel_all` was checked,
         # letting a per-job `job["cancel"]` slip past).
         if self._cancel_all.is_set():
-            raise RuntimeError("cancelled before write")
+            return _WorkerOutcome.CANCELLED
         try:
             _job_cancel_ev = (job or {}).get("cancel") if isinstance(job, dict) else None
             if _job_cancel_ev is not None and _job_cancel_ev.is_set():
-                raise RuntimeError("cancelled before write (per-job skip)")
-        except RuntimeError:
-            raise
+                return _WorkerOutcome.CANCELLED
         except Exception:
             pass
         if not title:
@@ -2724,37 +4705,53 @@ class TranscribeManager:
             (s.get("t") or s.get("text") or "").strip()
             for s in segs if isinstance(s, dict))
         if not text and not _has_any_seg_text:
+            # A re-transcribe is a proposed replacement for content the user
+            # already has. If the new Whisper run hears nothing, keep that
+            # known-good transcript and its searchable/indexed state instead
+            # of relabeling the video no-speech while stale words remain.
+            if retranscribe:
+                result["_existing_transcript_kept"] = True
+                self._stream.emit_text(
+                    f" \u26a0 No speech was detected in "
+                    f"{os.path.basename(video_path)}; existing transcript kept.",
+                    "yellow")
+                return _WorkerOutcome.SUCCESS
             # Persist a TERMINAL 'no_speech' status so this silent / music-
             # only video is not re-attempted by auto + bulk transcribe passes,
             # and so the Watch view can say "No speech detected" instead of the
             # generic "No transcript available." We STILL raise below so the
             # worker loop emits the benign "no speech detected" line and counts
-            # the job as done (not an error). Best-effort: a DB hiccup here
-            # must not turn a benign empty result into a hard crash.
-            try:
-                from .. import index as _idx
-                _idx.mark_video_no_speech(video_path)
-            except Exception as _nse:
-                _log.debug("mark_video_no_speech(%s) failed: %s",
-                           video_path, _nse)
-            raise RuntimeError(
-                "Whisper returned an empty transcript "
-                "(no text, no non-empty segments) — refusing to "
-                "write an empty .txt/.jsonl and mark the video "
-                "transcribed. Audio may be silent or unreadable.")
+            # the job as done (not an error). The classification itself is
+            # required durable state: without it, auto/bulk passes will queue
+            # this silent video forever. Retain a classification-only retry
+            # instead of re-running Whisper when the DB write fails.
+            if self._mark_no_speech_durable(video_path):
+                if isinstance(job, dict):
+                    job.pop("_no_speech_pending", None)
+                return _WorkerOutcome.NO_SPEECH
+            if isinstance(job, dict):
+                job["_no_speech_pending"] = True
+                job["_retry_required"] = True
+                self._persist_pending()
+            self._stream.emit_error(
+                f"No speech was detected, but its durable status could not "
+                f"be saved for {os.path.basename(video_path)}. Task kept for "
+                "classification retry.")
+            return _WorkerOutcome.FAILED
 
         # Extract video id — OLD-compat filenames don't carry the `[id]`
         # suffix. Order: hint -> filename `[id]` -> FTS `videos` table.
         # consolidated into _extract_video_id helper.
         vid_id = _extract_video_id(video_path, hint=video_id_hint or "")
 
-        # Source tag: use the manager's active model so the Transcript.txt
-        # header carries the right "(WHISPER:<model>)" tag even when
-        # whisper_worker.py's response dict doesn't include "model"
-        # (which it doesn't — only status/text/segments come back).
-        # Without this, the Watch view banner shows just "Whisper
-        # transcription" with no model name. this was flagged
-        model_name = (result.get("model") or self._model or "").strip()
+        # Source tag: prefer the validated model reported by the worker.  The
+        # durable job value is the fallback for a merged chunk result built in
+        # this parent process after each child response was validated.
+        model_name = str(
+            result.get("model")
+            or (job or {}).get("actual_model")
+            or (job or {}).get("requested_model")
+            or self._loaded_model or "").strip()
         # when punctuation was attempted but failed, append
         # "+NO-PUNCT" to the source tag so the Watch banner accurately
         # reflects that the transcript is unpunctuated. Otherwise the
@@ -2783,7 +4780,10 @@ class TranscribeManager:
             _log.debug("swallowed: %s", e)
 
         duration = segs[-1].get("end", segs[-1].get("e", 0)) if segs else 0
+        if not self._arm_output_write_intent(job):
+            return _WorkerOutcome.FAILED
 
+        _jsonl_replacement_receipt: dict[str, Any] = {}
         if retranscribe:
             # Surgically swap the old entries in both aggregated files.
             # Mirrors YTArchiver.py:16462-16474: jsonl FIRST so its
@@ -2798,7 +4798,6 @@ class TranscribeManager:
             # .txt fails, surface a prominent error and attempt a
             # roll-back by re-reading the backup we captured first.
             _jsonl_backup: bytes | None = None
-            _backup_failed = False
             try:
                 with open(jsonl_path, "rb") as _jb:
                     _jsonl_backup = _jb.read()
@@ -2809,7 +4808,6 @@ class TranscribeManager:
                 _jsonl_backup = None
             except OSError as _bke:
                 _jsonl_backup = None
-                _backup_failed = True
                 # Fail FAST before touching the .jsonl when we can't
                 # capture a backup — otherwise a .txt failure later
                 # would leave new .jsonl + old .txt with no way to
@@ -2818,22 +4816,25 @@ class TranscribeManager:
                     f"Refusing retranscribe of "
                     f"{os.path.basename(jsonl_path)}: backup capture "
                     f"failed ({_bke}). Files left untouched.")
-                return
+                return _WorkerOutcome.FAILED
             try:
                 extra_titles = _replace_jsonl_entry(
-                    jsonl_path, title, vid_id, segs) or set()
+                    jsonl_path, title, vid_id, segs,
+                    receipt_out=_jsonl_replacement_receipt) or set()
             except Exception as _je:
                 self._stream.emit_error(
                     f"Could not update {os.path.basename(jsonl_path)}: {_je}"
                     f" — .txt left unchanged to avoid split-state.")
-                return
+                return _WorkerOutcome.FAILED
             try:
                 _old_txt_candidates = _jsonl_text_candidates_from_bytes(
                     _jsonl_backup, title, vid_id)
                 _replace_txt_entry(txt_path, title, text, source_tag,
                                    extra_titles_to_remove=extra_titles,
                                    old_text_candidates=_old_txt_candidates,
-                                   video_id=vid_id)
+                                   video_id=vid_id,
+                                   upload_date=upload_date,
+                                   duration_secs=duration)
             except Exception as _te:
                 self._stream.emit_error(
                     f"Could not update {os.path.basename(txt_path)}: {_te}"
@@ -2842,6 +4843,7 @@ class TranscribeManager:
                 # consistent. If the roll-back itself fails the user
                 # is notified with a clear message.
                 if _jsonl_backup is not None:
+                    _rb_tmp = ""
                     try:
                         # Atomic, hidden-aware roll-back. The old
                         # in-place open('wb') NEVER worked here:
@@ -2858,11 +4860,8 @@ class TranscribeManager:
                             dir=os.path.dirname(jsonl_path) or ".")
                         with os.fdopen(_fd, "wb") as _jw:
                             _jw.write(_jsonl_backup)
-                            try:
-                                _jw.flush()
-                                os.fsync(_jw.fileno())
-                            except OSError:
-                                pass
+                            _jw.flush()
+                            os.fsync(_jw.fileno())
                         try: _rb_hide(_rb_tmp)
                         except Exception: pass
                         os.replace(_rb_tmp, jsonl_path)
@@ -2874,34 +4873,62 @@ class TranscribeManager:
                             f"when {os.path.basename(txt_path)} is "
                             f"writable.")
                     except OSError as _re:
+                        if _rb_tmp:
+                            try: os.remove(_rb_tmp)
+                            except OSError: pass
                         self._stream.emit_error(
                             f"Roll-back of {os.path.basename(jsonl_path)} "
                             f"FAILED: {_re}. Files may be out of sync; "
                             f"retry retranscribe when writable.")
+                else:
+                    # The replacement created a brand-new JSONL. Restoring the
+                    # prior "missing" state means deleting it when the paired
+                    # TXT replacement fails.
+                    try:
+                        from ..utils import unhide_file_win as _rb_unhide
+                        _rb_unhide(os.path.normpath(jsonl_path))
+                        os.remove(jsonl_path)
+                        self._stream.emit_error(
+                            f"Removed newly-created "
+                            f"{os.path.basename(jsonl_path)} during roll-back "
+                            "— files consistent; retry when TXT is writable.")
+                    except FileNotFoundError:
+                        pass
+                    except OSError as _re:
+                        self._stream.emit_error(
+                            f"Roll-back delete of "
+                            f"{os.path.basename(jsonl_path)} FAILED: {_re}. "
+                            "Files may be out of sync; retry when writable.")
                 # Either way, do NOT fall through to the FTS ingest —
                 # the txt update failed, so indexing the new segments
                 # (or re-marking the video transcribed) would certify
                 # a state the visible transcript doesn't match.
-                return
+                return _WorkerOutcome.FAILED
             _hide_per_video_transcript_txt_if_needed(video_path, txt_path)
         else:
             if not _write_transcript_entry(txt_path, title, upload_date,
                                            duration, source_tag, text,
                                            video_id=vid_id):
                 self._stream.emit_error(f"Could not write transcript to {txt_path}")
-                return
+                return _WorkerOutcome.FAILED
+            if isinstance(job, dict) and not job.get("retranscribe"):
+                # From this point a retry must replace, not append. Persisting
+                # this stage makes a JSONL/index failure restart-safe without
+                # duplicating the already-written TXT entry.
+                job["_retry_as_replace"] = True
+                job["_retry_required"] = True
+                self._persist_pending()
             _hide_per_video_transcript_txt_if_needed(video_path, txt_path)
             if not _write_jsonl_entry(jsonl_path, vid_id, title, segs):
                 self._stream.emit_error(
                     f"Could not write transcript JSONL to {jsonl_path} "
                     f"— not marking {os.path.basename(video_path)} transcribed")
-                return
+                return _WorkerOutcome.FAILED
 
-        # Ingest into FTS index — `ingest_jsonl` does a DELETE WHERE
-        # jsonl_path=? first, so re-ingesting after a retranscribe
-        # wipes + rebuilds the segments for the WHOLE aggregated file
-        # (harmless for the other videos sharing it — their lines in
-        # the .jsonl are untouched and get re-inserted as-is).
+        # Ingest into the search index. A verified re-transcribe receipt lets
+        # us replace only this video's rows. If its identity, file generation,
+        # or prior index tracker cannot be proven, fall back to the established
+        # full validated ingest of the current aggregate.
         try:
             from .. import index as _idx
             # Use a dedicated writer connection. The shared ingest path first
@@ -2915,9 +4942,29 @@ class TranscribeManager:
             if _ingest_conn is None:
                 raise RuntimeError("could not open an independent index connection")
             try:
-                _ingested = _idx.ingest_jsonl(
-                    video_path, jsonl_path, title, channel,
-                    _conn_override=_ingest_conn)
+                _ingested = 0
+                if (retranscribe and vid_id
+                        and _jsonl_replacement_receipt):
+                    _delta = _idx.replace_video_segments(
+                        video_path, channel, _jsonl_replacement_receipt,
+                        _conn_override=_ingest_conn)
+                    if _delta.get("ok"):
+                        _ingested = int(_delta.get("count") or 0)
+                    elif _delta.get("can_fallback", True):
+                        self._stream.emit_dim(
+                            " (using full transcript index refresh: "
+                            f"{_delta.get('reason') or 'verification unavailable'})")
+                        _ingested = _idx.ingest_jsonl(
+                            video_path, jsonl_path, title, channel,
+                            _conn_override=_ingest_conn, force=True)
+                    else:
+                        raise RuntimeError(
+                            "per-video index update failed: "
+                            f"{_delta.get('reason') or 'database write failed'}")
+                else:
+                    _ingested = _idx.ingest_jsonl(
+                        video_path, jsonl_path, title, channel,
+                        _conn_override=_ingest_conn)
             finally:
                 _ingest_conn.close()
             if not _ingested:
@@ -2931,29 +4978,6 @@ class TranscribeManager:
             self._stream.emit_text(
                 f" \u26a0 FTS index sync failed for {os.path.basename(video_path)}: {e}",
                 "red")
+            return _WorkerOutcome.FAILED
 
-        # Decrement transcription_pending / set transcription_complete on 0.
-        # Matches YTArchiver.py:14629-14630. Skip the decrement on
-        # retranscribe — it wasn't incremented when the Re-transcribe
-        # button was clicked (unlike a normal sync-triggered transcribe).
-        if not retranscribe:
-            _bump_transcription_pending(channel, -1)
-            # Drain the authoritative pending-ID list too.
-            if vid_id:
-                try:
-                    from .. import ytarchiver_config as _cfg
-                    _cfg.remove_pending_tx_id(vid_id)
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-            # mark decrement-done so the worker-loop's
-            # exception finally doesn't decrement AGAIN on the success
-            # path. The finally's decrement exists only for error paths
-            # (Whisper crash, OOM, venv missing) that used to leak the
-            # counter and leave the Subs row stuck at `-N`.
-            # the flag-set moved to the CALLERS because
-            # _write_outputs doesn't take `job` as a parameter —
-            # referencing it here raised NameError on every Whisper
-            # transcription. See the two `job["_pending_decremented"]
-            # = True` assignments in _transcribe_one / _transcribe_chunked.
-            # (No code here — this comment is just a tombstone so
-            # `git log -S job\[` and future greps find it.)
+        return _WorkerOutcome.SUCCESS

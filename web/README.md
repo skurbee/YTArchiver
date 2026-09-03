@@ -53,6 +53,7 @@ startup and only rewrites `index.html` when generated content changes.
 |------|---------|
 | `util.js`        | Tiny shared utilities (`escapeHtml`, `escapeAttr`, `_formatTs`, `onceIdempotent`). |
 | `bridge.js`      | `pywebview.api` readiness helper + `bridgeCall` plumbing. |
+| `eventState.js`  | Stable named-topic state/event owner (`publish`, `subscribe`, `snapshot`) for bridge-pushed values with more than one consumer. |
 | `browseState.js` | Canonical `window._browseState` (loaded early so every extracted module captures the same object reference). |
 | `toasts.js`      | Toast notifications + error-message sanitizer. |
 | `modals.js`      | `askQuestion / askConfirm / askChoice / askDanger / askTextInput`. |
@@ -89,6 +90,7 @@ startup and only rewrites `index.html` when generated content changes.
 | `browseContextMenus.js` | Browse   | Right-click menus on channel and video cards. |
 | `videosView.js`         | Browse   | Archive-wide Videos grid with lazy loading, sorting, and title/channel filtering. |
 | `bookmarks.js`          | Browse   | Bookmarks sub-mode + week summary + redownload prompt. |
+| `trashView.js`          | Browse   | Trash list, authoritative count, restore, open-folder, and permanent-delete actions. |
 | `watchActions.js`       | Browse → Watch | Every interactive control on the watch view (incl. retranscribe). |
 | `graphTab.js`           | Browse → Graph | Word-frequency charts + word cloud via Chart.js. |
 | `settingsTab.js`        | Settings | Main settings form (archive paths, yt-dlp updater, backup export/import). |
@@ -130,9 +132,34 @@ Api class (or one of the mixins in `backend/api_mixins/`).
 **Python → JS:** Python evaluates JS in the window via
 `self._window.evaluate_js("window.<funcName>(<args>)")`. The frontend exposes
 named globals via `window.<name> = ...` at the bottom of each module's IIFE.
+`BridgeEventBus` centralizes safe JSON serialization for common backend pushes.
 
 **Log push:** the backend `LogStreamer` batches log lines and pushes them
 every ~60ms via `window._logBatch(payload)` (defined in `logs.js`).
+
+### Shared bridge-pushed state
+
+Do not let multiple modules repeatedly wrap or replace the same backend-facing
+global callback. Give the callback one stable owner in `eventState.js`, publish
+a named topic, and let each consumer subscribe independently:
+
+```js
+const unsubscribe = window.YT.eventState.subscribe(
+    "queue-state",
+    (state) => renderMyIndicator(state),
+);
+```
+
+Subscriptions replay the latest value by default and return an unsubscribe
+function. Listener exceptions are isolated, so one broken consumer does not
+block the others. `window.setQueueState` is the stable backend endpoint for
+`queue-state`; `queueRender.js` publishes `queue-payload`; `logs.js` publishes
+`indicator`. `queueBlink.js` and `statusBar.js` consume those topics without
+owning or replacing the bridge endpoints.
+
+Use a direct `window.<function>` for a push with exactly one clear rendering
+owner. Use `YT.eventState` when state is shared, should replay to a late
+subscriber, or has multiple independent consumers.
 
 ## Adding a UI feature
 
@@ -185,7 +212,7 @@ try {
 }
 ```
 
-### Receiving a push from Python
+### Receiving a single-owner push from Python
 
 In Python:
 ```python
@@ -203,9 +230,34 @@ window.renderSubsTable = function(rows) {
 
 ## Testing
 
-No automated test suite for the frontend. Run `python main.py` directly
-and exercise the feature in the UI. The DevTools (F12 in pywebview)
-work for inspecting elements and the console.
+Frontend verification has two automated layers:
+
+```powershell
+# Fast module-level regressions
+node --test tests/test_frontend_patch1.js tests/test_frontend_patch3_queue.js tests/test_frontend_patch3_reporting.js
+
+# Real assembled page with a deterministic pywebview bridge stub
+npm ci --ignore-scripts
+npm run test:browser
+```
+
+The Playwright suite loads the real generated `index.html` and exercises modal
+safety, delayed bridge startup, exact queue identity, stale async Watch
+responses, hidden-player shortcuts, backend failure reporting, and isolated
+event-state subscribers. Browser tests are serialized (`workers: 1`) so the
+shared page lifecycle stays deterministic.
+
+Before submitting frontend changes, also run:
+
+```powershell
+py -3.13 scripts/check_generated_html.py
+py -3.13 scripts/check_bridge_contract.py
+```
+
+The full Windows gate (`scripts/check.ps1`) adds JavaScript syntax checks,
+Python tests, privacy scanning, and a verified executable build. Manual UI
+testing remains useful for visual polish, but it is no longer the only
+frontend safety net.
 
 ## Known accessibility gaps
 

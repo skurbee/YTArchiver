@@ -97,8 +97,26 @@
     return null;
   }
 
-  async function _confirmRecoverIds() {
-    const s = await _manualBulkSummary();
+  async function _manualBulkSummaryWithFeedback(button) {
+    const oldText = button?.textContent || "";
+    const wasDisabled = !!button?.disabled;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Checking\u2026";
+      button.setAttribute("aria-busy", "true");
+    }
+    try {
+      return await _manualBulkSummary();
+    } finally {
+      if (button) {
+        button.textContent = oldText;
+        button.disabled = wasDisabled;
+        button.removeAttribute("aria-busy");
+      }
+    }
+  }
+
+  async function _confirmRecoverIds(s) {
     if (!s) return false;
     if (!s.total) {
       window._showToast?.("No manual downloads found.", "warn");
@@ -128,8 +146,7 @@
       : true;
   }
 
-  async function _confirmRefreshMetadata() {
-    const s = await _manualBulkSummary();
+  async function _confirmRefreshMetadata(s) {
     if (!s) return false;
     if (!s.total) {
       window._showToast?.("No manual downloads found.", "warn");
@@ -153,8 +170,7 @@
       : true;
   }
 
-  async function _confirmTranscribeMissing() {
-    const s = await _manualBulkSummary();
+  async function _confirmTranscribeMissing(s) {
     if (!s) return false;
     if (!s.total) {
       window._showToast?.("No manual downloads found.", "warn");
@@ -343,16 +359,16 @@
         tx_status: r.tx_status || "",
         removed_from_yt: !!r.removed_from_yt,
         show_channel: true,
+        tracked: false,
       };
       const onClick = (vv) => {
         if (typeof window._openVideoInWatch === "function")
           window._openVideoInWatch(vv);
-        else if (vv.filepath && nativeBridgeUp())
-          bridgeCall("browse_open_video", vv.filepath);
+        else if (vv.filepath) window._openVideoExternally?.(vv.filepath);
       };
       const card = build(v, onClick);
       if (card) {
-        card.dataset.tracked = "1";
+        card.dataset.tracked = "0";
         return _decorateManualCard(card, r);
       }
     }
@@ -360,9 +376,15 @@
     const el = document.createElement("div");
     el.className = "video-card";
     el.style.cssText = "padding:8px;cursor:pointer;";
+    el.setAttribute("role", "button");
+    el.tabIndex = 0;
+    el.setAttribute("aria-haspopup", "menu");
+    el.setAttribute("aria-expanded", "false");
+    el.setAttribute("aria-keyshortcuts", "Shift+F10");
     const nameEl = document.createElement("div");
     nameEl.className = "video-card-title";
     nameEl.textContent = r.title || r.filepath || "(untitled)";
+    el.setAttribute("aria-label", nameEl.textContent);
     el.appendChild(nameEl);
     if (r.size_bytes) {
       const sz = document.createElement("div");
@@ -371,9 +393,14 @@
       el.appendChild(sz);
     }
     el.addEventListener("click", () => {
-      if (r.filepath && nativeBridgeUp())
-        bridgeCall("browse_open_video", r.filepath);
+      if (r.filepath) window._openVideoExternally?.(r.filepath);
     });
+    el.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      el.click();
+    });
+    el.dataset.tracked = "0";
     return _decorateManualCard(el, r);
   }
 
@@ -453,12 +480,37 @@
     }
   }
 
+  function _paintManualCatalogStatus(status, reset) {
+    const g = grid();
+    if (!g) return;
+    if (!reset) {
+      const label = $("manual-load-more")?.querySelector(".grid-loading-label");
+      if (label && status.phase !== "done") label.textContent = status.text;
+      return;
+    }
+    let note = $("manual-catalog-status");
+    if (status.phase === "done") {
+      note?.remove();
+      return;
+    }
+    if (!note) {
+      note = document.createElement("div");
+      note.id = "manual-catalog-status";
+      note.className = "catalog-read-status";
+      note.setAttribute("role", "status");
+      note.setAttribute("aria-live", "polite");
+      g.prepend(note);
+    }
+    note.setAttribute("aria-live", status.announce === false ? "off" : "polite");
+    note.textContent = status.text;
+  }
+
   async function loadPage(reset) {
     if (!nativeBridgeUp()) return;
-    if (_loading) return;
     _loading = true;
     const myId = ++_seq;
     if (reset) { _offset = 0; _hasMore = true; }
+    const sortAtCall = _sort;
     const g = grid();
     const moreEl = $("manual-load-more");
     if (reset && g) {
@@ -469,9 +521,18 @@
       if (cached && cached.length) { _paintRows(g, cached); g.classList.add("is-refreshing"); }
       else { g.innerHTML = _skeletonHtml(8); }
     } else if (moreEl) { moreEl.hidden = false; }
+    const pageOffset = _offset;
     try {
-      const res = await bridgeCall("list_manual_videos", _sort, PAGE, _offset);
-      if (myId !== _seq) return;
+      const outcome = await window.YT.bridge.catalogRead(
+        "manual",
+        () => bridgeCall("list_manual_videos", sortAtCall, PAGE, pageOffset),
+        {
+          label: "manual downloads",
+          onStatus: (status) => _paintManualCatalogStatus(status, reset),
+        });
+      if (outcome.stale || myId !== _seq) return false;
+      const res = outcome.value;
+      if (res?.error) throw new Error(res.error);
       const rows = (res && res.rows) || [];
       _mergeEarlyBackgroundPatches(rows);
       if (reset) {
@@ -499,14 +560,28 @@
           ? `<div class="browse-empty">No video files found in<br><code>${
               folder.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))
             }</code>.</div>`
-          : '<div class="browse-empty">Set a "Video downloads" folder in Settings &gt; General to see manual downloads here.</div>';
+          : '<div class="browse-empty">Set an Individual video folder in Settings &gt; Storage &amp; library to see manual downloads here.</div>';
       }
+      if (res?.warning) {
+        window._showToast?.(res.warning, "warn");
+      }
+      return true;
     } catch (e) {
       console.error("[manual] load failed", e);
-      if (reset && g) g.innerHTML = '<div class="browse-empty">Couldn’t load files.</div>';
+      if (myId === _seq && reset && g) {
+        g.classList.remove("is-refreshing");
+        g.innerHTML = "";
+        const error = document.createElement("div");
+        error.className = "browse-empty";
+        error.textContent = `Couldn’t load files. ${e?.message || e}`;
+        g.appendChild(error);
+      }
+      return false;
     } finally {
-      _loading = false;
-      if (moreEl) moreEl.hidden = true;
+      if (myId === _seq) {
+        _loading = false;
+        if (moreEl) moreEl.hidden = true;
+      }
     }
   }
 
@@ -553,7 +628,8 @@
         if (recBtn.dataset.confirming === "1") return;
         recBtn.dataset.confirming = "1";
         try {
-          const proceed = await _confirmRecoverIds();
+          const summary = await _manualBulkSummaryWithFeedback(recBtn);
+          const proceed = await _confirmRecoverIds(summary);
           if (!proceed) return;
           // Real run: resolves IDs, registers them in the index, and pulls
           // metadata. Confident matches are written; ambiguous ones go to the
@@ -581,7 +657,8 @@
         metaBtn.dataset.confirming = "1";
         let proceed = false;
         try {
-          proceed = await _confirmRefreshMetadata();
+          const summary = await _manualBulkSummaryWithFeedback(metaBtn);
+          proceed = await _confirmRefreshMetadata(summary);
         } finally {
           metaBtn.dataset.confirming = "0";
         }
@@ -618,7 +695,8 @@
         txBtn.dataset.confirming = "1";
         let proceed = false;
         try {
-          proceed = await _confirmTranscribeMissing();
+          const summary = await _manualBulkSummaryWithFeedback(txBtn);
+          proceed = await _confirmTranscribeMissing(summary);
         } finally {
           txBtn.dataset.confirming = "0";
         }
@@ -657,10 +735,12 @@
     window.addEventListener("scroll", onScroll, { passive: true });
   }
 
-  window._loadManualView = function () {
-    wireOnce(); loadPage(true);
-    if (typeof window._refreshManualReviewCount === "function")
-      window._refreshManualReviewCount();
+  window._loadManualView = async function () {
+    wireOnce();
+    const loaded = await loadPage(true);
+    if (loaded && isActive()
+        && typeof window._refreshManualReviewCount === "function")
+      await window._refreshManualReviewCount();
   };
 
   // Reset the Recover-IDs button when the backend run finishes (the backend
@@ -752,7 +832,13 @@
     if (!nativeBridgeUp()) return;
     const sortAtCall = _sort;
     try {
-      const res = await bridgeCall("list_manual_videos", sortAtCall, PAGE, 0);
+      const outcome = await window.YT.bridge.catalogRead(
+        "manual",
+        () => bridgeCall("list_manual_videos", sortAtCall, PAGE, 0),
+        { label: "manual downloads" });
+      if (outcome.stale) return;
+      const res = outcome.value;
+      if (res?.error) throw new Error(res.error);
       if (sortAtCall !== _sort || _loading) return;
       const rows = (res && res.rows) || [];
       const newSig = _pageSig(rows);

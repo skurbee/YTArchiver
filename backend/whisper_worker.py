@@ -16,9 +16,10 @@ Environment inputs:
 
 Protocol:
     → stdin: { "path": "/full/path.mp4", "duration": 123.4 }
-    ← stdout: { "status": "starting" }
-              { "status": "progress", "pct": 42 }
-              { "status": "ok", "text": "full text...", "segments": [...] }
+    ← stdout: { "status": "ready", "model": "small", ... }
+              { "status": "starting", "model": "small" }
+              { "status": "progress", "model": "small", "pct": 42 }
+              { "status": "ok", "model": "small", "text": "...", ... }
               or { "status": "error", "text": "reason" }
 """
 
@@ -87,7 +88,15 @@ except Exception as _cuda_err:
 # Restore stderr for real errors during transcription
 sys.stderr = sys.__stderr__
 
-_ready_msg = {"status": "ready", "device": _device}
+_actual_model_name = str(_model_name).strip()
+
+
+def _worker_response(status, **fields):
+    """Attach worker-owned model provenance to every post-load response."""
+    return {"status": status, "model": _actual_model_name, **fields}
+
+
+_ready_msg = _worker_response("ready", device=_device)
 if _cuda_fallback_reason:
     _ready_msg["cuda_fallback_reason"] = _cuda_fallback_reason
 _out.write(json.dumps(_ready_msg) + "\n")
@@ -127,10 +136,10 @@ def _stdin_reader():
             # the request/response stream (audit: whisper_worker H49).
             # Emit an error response and drop the line.
             try:
-                sys.stdout.write(json.dumps({
-                    "status": "error",
-                    "text": "malformed request (not valid JSON)",
-                }) + "\n")
+                sys.stdout.write(json.dumps(_worker_response(
+                    "error",
+                    text="malformed request (not valid JSON)",
+                )) + "\n")
                 sys.stdout.flush()
             except Exception:
                 pass
@@ -176,7 +185,7 @@ while True:
         continue
 
     try:
-        _out.write(json.dumps({"status": "starting"}) + "\n")
+        _out.write(json.dumps(_worker_response("starting")) + "\n")
         _out.flush()
 
         segments_gen, info = model.transcribe(
@@ -212,10 +221,11 @@ while True:
                 pct = min(99, int(seg.end / total_dur * 100))
                 if pct > last_pct:
                     last_pct = pct
-                    _out.write(json.dumps({"status": "progress", "pct": pct}) + "\n")
+                    _out.write(json.dumps(_worker_response(
+                        "progress", pct=pct)) + "\n")
                     _out.flush()
         if _cancelled:
-            _out.write(json.dumps({"status": "cancelled"}) + "\n")
+            _out.write(json.dumps(_worker_response("cancelled")) + "\n")
             _out.flush()
             continue
 
@@ -319,7 +329,8 @@ while True:
                     ce = round(min(seg.end, seg.start + (ci + 1) * chunk_dur), 2)
                     seg_data.append({"s": cs, "e": ce, "t": chunk_text, "w": []})
 
-        _out.write(json.dumps({"status": "ok", "text": text, "segments": seg_data}) + "\n")
+        _out.write(json.dumps(_worker_response(
+            "ok", text=text, segments=seg_data)) + "\n")
         _out.flush()
     except Exception as e:
         _trace = traceback.format_exc()[:2000]
@@ -329,9 +340,9 @@ while True:
             _real_err.flush()
         except Exception:
             pass
-        _out.write(json.dumps({
-            "status": "error",
-            "text": _text,
-            "traceback": _trace,
-        }) + "\n")
+        _out.write(json.dumps(_worker_response(
+            "error",
+            text=_text,
+            traceback=_trace,
+        )) + "\n")
         _out.flush()

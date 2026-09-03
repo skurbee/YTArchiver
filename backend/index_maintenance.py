@@ -29,7 +29,7 @@ import threading
 from typing import Any
 
 from . import index as _idx
-from .fs_search import is_partial_artifact
+from .fs_search import MEDIA_EXTS_TUPLE, is_partial_artifact
 from .log import get_logger
 
 _log = get_logger(__name__)
@@ -61,8 +61,117 @@ def _coalesced_sweep_result() -> dict[str, int | bool]:
     }
 
 
+def _archive_path_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+
+
+def _archive_path_is_under(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([
+            _archive_path_key(path), _archive_path_key(root)
+        ]) == _archive_path_key(root)
+    except (OSError, ValueError):
+        return False
+
+
+def build_archive_scan_plan(
+        output_dir: str,
+        channels: list,
+        extra_roots: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Return the exact channel targets and extra roots a sweep will use.
+
+    Rescan progress and size verification consume this same plan so their
+    totals cannot drift from the actual catalog sweep.
+    """
+    scan_channels: list[dict[str, Any]] = [
+        dict(channel) for channel in channels if isinstance(channel, dict)
+    ]
+    primary_root = (
+        os.path.abspath(os.path.normpath(output_dir)) if output_dir else ""
+    )
+    candidate_roots: list[str] = []
+    seen_candidate_roots: set[str] = set()
+    for raw_root in extra_roots or []:
+        raw_value = str(raw_root or "").strip()
+        if not raw_value:
+            continue
+        root = os.path.abspath(os.path.normpath(raw_value))
+        root_key = _archive_path_key(root)
+        if not os.path.isdir(root) or root_key in seen_candidate_roots:
+            continue
+        # A folder inside the primary archive is already covered. An ancestor
+        # is allowed; the walker prunes the primary subtree while still finding
+        # separate sibling archives beneath that ancestor.
+        if primary_root and _archive_path_is_under(root, primary_root):
+            continue
+        seen_candidate_roots.add(root_key)
+        candidate_roots.append(root)
+
+    # Prefer the broadest configured root so nested entries cannot be scanned
+    # twice under different synthetic channel names.
+    accepted_roots: list[str] = []
+    for root in sorted(
+            candidate_roots, key=lambda value: len(_archive_path_key(value))):
+        if any(_archive_path_is_under(root, known)
+               for known in accepted_roots):
+            continue
+        accepted_roots.append(root)
+
+        direct_media = False
+        child_dirs: list[str] = []
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if entry.name.casefold() not in {
+                                ".ytarchiver trash",
+                                ".ytarchiver-restore-recovery",
+                            }:
+                                if (not primary_root
+                                        or _archive_path_key(entry.path)
+                                        != _archive_path_key(primary_root)):
+                                    child_dirs.append(entry.path)
+                        elif (entry.name.lower().endswith(MEDIA_EXTS_TUPLE)
+                              and not is_partial_artifact(entry.name, root)):
+                            direct_media = True
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+        year_layout = bool(child_dirs) and all(
+            os.path.basename(path).isdigit()
+            and len(os.path.basename(path)) == 4
+            for path in child_dirs
+        )
+        if year_layout or not child_dirs:
+            target_specs = [(root, [])]
+        elif direct_media:
+            target_specs = [
+                (root, child_dirs),
+                *((child, []) for child in child_dirs),
+            ]
+        else:
+            target_specs = [(child, []) for child in child_dirs]
+        for target, excluded_roots in target_specs:
+            name = os.path.basename(os.path.normpath(target)) \
+                or os.path.basename(os.path.normpath(root)) \
+                or "Additional archive"
+            scan_channels.append({
+                "name": name,
+                "folder": name,
+                "url": "extra-root::" + _archive_path_key(target),
+                "_root_folder": target,
+                "_extra_root": True,
+                "_excluded_roots": excluded_roots,
+            })
+    return scan_channels, accepted_roots
+
+
 def sweep_new_videos(output_dir: str, channels: list,
-                     progress_cb=None, gpu_busy_fn=None) -> dict:
+                     progress_cb=None, gpu_busy_fn=None,
+                     extra_roots: list[str] | None = None) -> dict:
     """Run one archive sweep process-wide and coalesce concurrent callers."""
     global _sweep_running
     with _sweep_singleflight:
@@ -74,7 +183,7 @@ def sweep_new_videos(output_dir: str, channels: list,
     try:
         return _sweep_new_videos_impl(
             output_dir, channels, progress_cb=progress_cb,
-            gpu_busy_fn=gpu_busy_fn)
+            gpu_busy_fn=gpu_busy_fn, extra_roots=extra_roots)
     finally:
         with _sweep_singleflight:
             _sweep_running = False
@@ -155,7 +264,8 @@ def _reconcile_tx_status_from_transcript_titles(
         folder_name = _folder_name(ch)
         if not folder_name:
             continue
-        folder = os.path.join(output_dir, folder_name)
+        folder = str(ch.get("_root_folder") or
+                     os.path.join(output_dir, folder_name))
         if not os.path.isdir(folder):
             continue
 
@@ -179,7 +289,10 @@ def _reconcile_tx_status_from_transcript_titles(
 
         _maybe_wait()
         already = _scan_existing_transcript_titles(
-            folder, ch_name or folder_name)
+            folder,
+            ch_name or folder_name,
+            excluded_roots=ch.get("_excluded_roots") or [],
+        )
         if not already:
             continue
         done_vids = {
@@ -234,7 +347,8 @@ def _reconcile_tx_status_from_transcript_titles(
 
 def _sweep_new_videos_impl(output_dir: str, channels: list,
                            progress_cb=None,
-                           gpu_busy_fn=None) -> dict:
+                           gpu_busy_fn=None,
+                           extra_roots: list[str] | None = None) -> dict:
     """Walk each channel folder under `output_dir`, register any video
     file not already in the videos table, and ingest any paired .jsonl
     that isn't in segments yet.
@@ -325,6 +439,12 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
     from .archive_scan import load_disk_cache as _load_dc
     from .archive_scan import save_disk_cache as _save_dc
     _fp_cache = _load_dc()
+
+    _abs_norm = _archive_path_key
+    _under = _archive_path_is_under
+    primary_root = _os.path.abspath(_os.path.normpath(output_dir))
+    scan_channels, accepted_roots = build_archive_scan_plan(
+        output_dir, channels, extra_roots)
     # Map channel URL → folder_fingerprint stored in the disk cache.
     def _folder_fingerprint(ch_folder: _Path) -> float:
         """Return max mtime across the channel folder + immediate
@@ -369,9 +489,9 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
             pass
         return mx
 
-    total_ch = len(channels)
+    total_ch = len(scan_channels)
     skipped_unchanged = 0
-    for i_ch, ch in enumerate(channels):
+    for i_ch, ch in enumerate(scan_channels):
         ch_name = ch.get("name") or ch.get("folder", "")
         if not ch_name:
             continue
@@ -381,9 +501,21 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
         if progress_cb is not None:
             try: progress_cb(i_ch + 1, total_ch, ch_name)
             except Exception as e: _log.debug("swallowed: %s", e)
-        folder = _Path(output_dir) / ch_name
+        if ch.get("_root_folder"):
+            folder = _Path(str(ch["_root_folder"]))
+        else:
+            try:
+                from .sync import channel_folder_name as _channel_folder_name
+                folder = _Path(output_dir) / _channel_folder_name(ch)
+            except Exception:
+                folder = _Path(output_dir) / ch_name
         if not folder.is_dir():
             continue
+        scan_excluded_roots = {
+            _abs_norm(str(path))
+            for path in (ch.get("_excluded_roots") or [])
+            if str(path or "").strip()
+        }
         # Fingerprint-skip: if this channel's folder tree hasn't been
         # touched (by file add/remove) since the last successful
         # sweep, skip the walk entirely. Drops a 4-minute full sweep
@@ -392,7 +524,8 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
         current_fp = _folder_fingerprint(folder)
         last_fp_cache_entry = _fp_cache.get(ch_url, {}) if ch_url else {}
         last_fp = float(last_fp_cache_entry.get("sweep_fingerprint", 0) or 0)
-        if current_fp > 0 and last_fp > 0 and current_fp <= last_fp:
+        if (not ch.get("_extra_root") and current_fp > 0 and last_fp > 0
+                and current_fp <= last_fp):
             skipped_unchanged += 1
             continue
         # Either never swept before or the folder changed — walk it.
@@ -449,6 +582,14 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
                         _wait_while_busy()
                     try:
                         if entry.is_dir(follow_symlinks=False):
+                            if entry.name in {
+                                ".YTArchiver Trash",
+                                ".ytarchiver-restore-recovery",
+                            } or _abs_norm(entry.path) in (
+                                scan_excluded_roots
+                                | {_abs_norm(primary_root)}
+                            ):
+                                continue
                             stack.append(entry.path)
                             continue
                     except OSError:
@@ -538,10 +679,18 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
         if _walk_complete:
             _folder_abs = _os.path.normcase(_os.path.abspath(str(folder)))
 
-            def _under_folder(_path: str, _root: str = _folder_abs) -> bool:
+            def _under_folder(
+                    _path: str,
+                    _root: str = _folder_abs,
+                    _excluded=frozenset(scan_excluded_roots)) -> bool:
                 try:
                     _p = _os.path.normcase(_os.path.abspath(_path))
-                    return _os.path.commonpath([_root, _p]) == _root
+                    if _os.path.commonpath([_root, _p]) != _root:
+                        return False
+                    return not any(
+                        _under(_p, excluded)
+                        for excluded in _excluded
+                    )
                 except (OSError, ValueError):
                     return False
 
@@ -556,7 +705,7 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
             # Only rows that were previously marked missing need a restore
             # write.  The old code issued one UPDATE for every seen file in a
             # channel (usually thousands of no-ops), holding SQLite's sole
-            # writer slot for minutes on the 36 GB production index.
+            # writer slot for minutes on a large index.
             _restore = _seen_existing & known_missing
             if _restore:
                 _restored_cur = sweep_conn.executemany(
@@ -591,7 +740,7 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
         # populate; next sweep will walk this channel again, which is
         # cheap compared to the bug.
         post_walk_fp = _folder_fingerprint(folder)
-        if ch_url:
+        if ch_url and not ch.get("_extra_root"):
             existing_row = _fp_cache.get(ch_url)
             # tightened to `and` — update_disk_cache_for_channel
             # always writes BOTH fields together, so a row with only one
@@ -617,28 +766,44 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
     # predate the stamped fingerprints).
     agg_ingested = 0
     try:
-        for dp, _dns, fns in _os.walk(output_dir):
-            for fn in fns:
-                if not (fn.startswith(".")
-                        and fn.endswith("Transcript.jsonl")):
-                    continue
-                _wait_while_busy()
-                jp = _os.path.normpath(_os.path.join(dp, fn))
-                if not _jsonl_needs_ingest(sweep_conn, jp):
-                    continue
-                rel = _os.path.relpath(dp, output_dir)
-                agg_ch = rel.split(_os.sep)[0] if rel != "." else ""
-                # `.Foo Transcript.jsonl` -> visible `Foo Transcript.txt`
-                root_name = fn[1:-len(".jsonl")]
-                txt_fp = _os.path.join(dp, root_name + ".txt")
-                try:
-                    if _idx.ingest_jsonl(txt_fp, jp, root_name, agg_ch,
-                                         _conn_override=sweep_conn):
-                        agg_ingested += 1
-                        ingested += 1
-                except Exception as e:
-                    _log.debug("aggregated jsonl ingest failed (%s): %s",
-                               jp, e)
+        aggregate_roots = [output_dir, *accepted_roots]
+        seen_aggregate_roots: set[str] = set()
+        for aggregate_root in aggregate_roots:
+            root_key = _abs_norm(aggregate_root)
+            if root_key in seen_aggregate_roots:
+                continue
+            seen_aggregate_roots.add(root_key)
+            for dp, _dns, fns in _os.walk(aggregate_root):
+                _dns[:] = [
+                    d for d in _dns
+                    if d not in {
+                        ".YTArchiver Trash", ".ytarchiver-restore-recovery"}
+                    and _abs_norm(_os.path.join(dp, d))
+                    != _abs_norm(primary_root)
+                ]
+                for fn in fns:
+                    if not (fn.startswith(".")
+                            and fn.endswith("Transcript.jsonl")):
+                        continue
+                    _wait_while_busy()
+                    jp = _os.path.normpath(_os.path.join(dp, fn))
+                    if not _jsonl_needs_ingest(sweep_conn, jp):
+                        continue
+                    rel = _os.path.relpath(dp, aggregate_root)
+                    agg_ch = rel.split(_os.sep)[0] if rel != "." else \
+                        (_os.path.basename(_os.path.normpath(aggregate_root))
+                         or "Additional archive")
+                    # `.Foo Transcript.jsonl` -> visible `Foo Transcript.txt`
+                    root_name = fn[1:-len(".jsonl")]
+                    txt_fp = _os.path.join(dp, root_name + ".txt")
+                    try:
+                        if _idx.ingest_jsonl(txt_fp, jp, root_name, agg_ch,
+                                             _conn_override=sweep_conn):
+                            agg_ingested += 1
+                            ingested += 1
+                    except Exception as e:
+                        _log.debug("aggregated jsonl ingest failed (%s): %s",
+                                   jp, e)
     except Exception as e:
         _log.warning("aggregated transcript sweep failed: %s", e)
 
@@ -672,7 +837,7 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
     title_reconciled = 0
     try:
         title_reconciled = _reconcile_tx_status_from_transcript_titles(
-            sweep_conn, output_dir, channels, _wait_while_busy)
+            sweep_conn, output_dir, scan_channels, _wait_while_busy)
         if title_reconciled:
             _log.info("tx_status title reconcile: flipped %d video(s) to "
                       "'transcribed' (matched existing Transcript.txt)",
@@ -721,6 +886,159 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
             "tx_reconciled_by_title": title_reconciled,
             "skipped_unchanged": skipped_unchanged,
             "walked": total_ch - skipped_unchanged}
+
+
+def restore_channel_catalog(
+    channel: dict[str, Any],
+    folder_path: str,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    """Rebuild catalog state for exactly one restored channel folder.
+
+    The normal archive sweep intentionally performs global reconciliation and
+    may walk every aggregated transcript in the archive.  Trash restore is a
+    foreground user action, so it gets a bounded path that cannot fan out into
+    an all-channel Z: drive scan.
+    """
+    folder = os.path.abspath(str(folder_path or ""))
+    channel_name = str(
+        (channel or {}).get("name") or (channel or {}).get("folder") or ""
+    ).strip()
+    if not channel_name or not os.path.isdir(folder):
+        return {
+            "ok": False,
+            "registered": 0,
+            "ingested": 0,
+            "error": "Restored channel folder is unavailable.",
+        }
+
+    _ = _idx._open()
+    conn = _idx._open_independent()
+    if conn is None:
+        return {"ok": False, "registered": 0, "ingested": 0,
+                "error": "Index database is unavailable."}
+
+    registered = 0
+    ingested = 0
+    cancelled = False
+    try:
+        for dirpath, dirnames, filenames in os.walk(folder):
+            # Never re-index nested app quarantine data if an unusual legacy
+            # layout happens to contain its own Trash directory.
+            dirnames[:] = [
+                name for name in dirnames
+                if name not in {".YTArchiver Trash", ".ytarchiver-restore-recovery"}
+            ]
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
+            for filename in filenames:
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
+                lower = filename.lower()
+                if not lower.endswith(MEDIA_EXTS_TUPLE):
+                    continue
+                if is_partial_artifact(filename, dirpath):
+                    continue
+                filepath = os.path.normpath(os.path.join(dirpath, filename))
+                try:
+                    if os.path.getsize(filepath) <= 0:
+                        continue
+                except OSError:
+                    continue
+                if _idx.register_video(
+                    filepath,
+                    channel_name,
+                    _conn_override=conn,
+                ):
+                    registered += 1
+                jsonl_path = os.path.splitext(filepath)[0] + ".jsonl"
+                if os.path.isfile(jsonl_path):
+                    title = os.path.splitext(filename)[0]
+                    if _idx.ingest_jsonl(
+                        filepath,
+                        jsonl_path,
+                        title,
+                        channel_name,
+                        _conn_override=conn,
+                    ):
+                        ingested += 1
+            if cancelled:
+                break
+
+        # Channel-level aggregate sidecars are not paired to media filenames.
+        # Walk only the restored folder, never output_dir.
+        if not cancelled:
+            for dirpath, _dirnames, filenames in os.walk(folder):
+                for filename in filenames:
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancelled = True
+                        break
+                    if not (filename.startswith(".")
+                            and filename.endswith("Transcript.jsonl")):
+                        continue
+                    jsonl_path = os.path.normpath(
+                        os.path.join(dirpath, filename))
+                    root_name = filename[1:-len(".jsonl")]
+                    text_path = os.path.join(dirpath, root_name + ".txt")
+                    if _idx.ingest_jsonl(
+                        text_path,
+                        jsonl_path,
+                        root_name,
+                        channel_name,
+                        _conn_override=conn,
+                    ):
+                        ingested += 1
+                if cancelled:
+                    break
+
+        # Scope the denormalized status repair to this one channel.
+        reconciled = 0
+        if not cancelled:
+            cursor = conn.execute(
+                "UPDATE videos SET tx_status='transcribed' "
+                "WHERE channel=? COLLATE NOCASE "
+                "AND tx_status!='transcribed' "
+                "AND trim(COALESCE(video_id, ''))!='' "
+                "AND EXISTS (SELECT 1 FROM segments s "
+                "            WHERE s.video_id=videos.video_id)",
+                (channel_name,),
+            )
+            reconciled = max(0, cursor.rowcount or 0)
+            conn.commit()
+    except (OSError, sqlite3.Error, UnicodeError, ValueError) as exc:
+        return {"ok": False, "registered": registered,
+                "ingested": ingested, "error": str(exc)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    size_result = refresh_channel_file_sizes(channel_name, folder)
+    _idx.invalidate_channel_videos(channel_name)
+    try:
+        from . import archive_scan
+
+        channel_url = str((channel or {}).get("url") or "").strip()
+        if channel_url:
+            archive_scan.invalidate_channel(channel_url)
+        archive_scan.update_disk_cache_for_channel(
+            channel, force_filesystem=True)
+    except Exception as exc:
+        _log.debug("restored channel disk-cache refresh failed: %s", exc)
+
+    return {
+        "ok": not cancelled,
+        "cancelled": cancelled,
+        "registered": registered,
+        "ingested": ingested,
+        "tx_reconciled": reconciled,
+        "size": size_result,
+        "error": "Catalog rebuild was cancelled." if cancelled else "",
+    }
 
 
 def refresh_channel_file_sizes(channel: str, folder: str = "") -> dict[str, int]:
@@ -799,8 +1117,9 @@ def refresh_channel_file_sizes(channel: str, folder: str = "") -> dict[str, int]
 def prune_missing_videos() -> dict[str, int]:
     """Delete stale/phantom video rows from the DB. Cleanup categories:
 
-      1. `missing` — filepath no longer exists on disk. Dead
-                      `(1)` duplicates, deleted files, etc.
+      1. `missing` — filepath was confirmed absent on two complete checks.
+                      The first check marks it unavailable; the second can
+                      remove the stale catalog row.
       2. `zero_byte` — file exists but is 0 bytes. Phantom
                        placeholders from failed downloads can be
                        mis-assigned to another video's id, producing
@@ -816,10 +1135,13 @@ def prune_missing_videos() -> dict[str, int]:
     conn = _idx._open()
     if conn is None:
         return {"videos_removed": 0, "segments_removed": 0,
-                "missing": 0, "zero_byte": 0, "duplicate_id": 0}
+                "missing": 0, "zero_byte": 0, "duplicate_id": 0,
+                "pending_missing": 0, "availability_restored": 0,
+                "unavailable": 0}
     videos_removed = 0
     segs_removed = 0
     n_missing = n_zero = n_dup = n_fake_id = 0
+    n_pending_missing = n_unavailable = n_restored = 0
     affected_channels: set = set()
     try:
         # Category 1 + 2: collect missing / zero-byte files without
@@ -830,31 +1152,54 @@ def prune_missing_videos() -> dict[str, int]:
         reader_lock = (_idx._reader_lock if reader is not conn
                        else _idx._db_lock)
         with reader_lock:
-            rows = reader.execute("SELECT filepath FROM videos").fetchall()
-        to_delete_fps = []
-        for r in rows:
-            fp = (r[0] or "").strip()
+            rows = reader.execute(
+                "SELECT id, filepath, availability, channel FROM videos"
+            ).fetchall()
+        to_delete_fps: list[tuple[str, str]] = []
+        to_delete_row_ids: list[int] = []
+        to_mark_missing: list[tuple[str, str]] = []
+        to_restore: list[tuple[str, str]] = []
+        confirmed_missing = 0
+        for row_id, filepath, availability, row_channel in rows:
+            fp = (filepath or "").strip()
             if not fp:
-                continue
-            if not _os.path.isfile(fp):
-                to_delete_fps.append((fp, "missing"))
+                to_delete_row_ids.append(int(row_id))
                 continue
             try:
-                if _os.path.getsize(fp) == 0:
-                    to_delete_fps.append((fp, "zero_byte"))
-            except OSError:
-                # An I/O failure is not evidence that the file was deleted.
-                # A transient filesystem/device error must never turn into a
-                # destructive catalog prune.
+                file_stat = _os.stat(fp)
+            except FileNotFoundError:
+                confirmed_missing += 1
+                # `availability='missing'` is the durable first observation.
+                # It may have been set by a prior prune or by a complete
+                # archive sweep.  A new/legacy available row gets marked but
+                # is deliberately not deleted on this pass.
+                if (availability or "available") == "missing":
+                    to_delete_fps.append((fp, "missing"))
+                else:
+                    to_mark_missing.append((fp, row_channel or ""))
                 continue
+            except OSError:
+                # Permission failures, disconnected/network I/O errors, and
+                # every other stat failure are UNKNOWN, not proof of deletion.
+                # In particular, do not delete an already-marked row when its
+                # second check is inconclusive.
+                n_unavailable += 1
+                continue
+            if file_stat.st_size == 0:
+                to_delete_fps.append((fp, "zero_byte"))
+            elif (availability or "available") == "missing":
+                to_restore.append((fp, row_channel or ""))
 
+        suspicious_count = confirmed_missing + sum(
+            1 for _fp, category in to_delete_fps
+            if category == "zero_byte")
         total_rows = len(rows)
-        if (total_rows >= 50 and to_delete_fps
-                and len(to_delete_fps) / total_rows > 0.20):
+        if (total_rows >= 50 and suspicious_count
+                and suspicious_count / total_rows > 0.20):
             _log.warning(
-                "prune aborted: %d of %d files look missing (>20%%) — "
-                "archive drive may be offline; nothing was deleted.",
-                len(to_delete_fps), total_rows)
+                "prune aborted: %d of %d files look missing/empty (>20%%) — "
+                "archive drive may be offline; nothing was changed.",
+                suspicious_count, total_rows)
             return {
                 "videos_removed": 0,
                 "segments_removed": 0,
@@ -862,10 +1207,39 @@ def prune_missing_videos() -> dict[str, int]:
                 "zero_byte": 0,
                 "duplicate_id": 0,
                 "fake_id_cleared": 0,
-                "aborted_suspicious": len(to_delete_fps),
+                "pending_missing": 0,
+                "availability_restored": 0,
+                "unavailable": n_unavailable,
+                "aborted_suspicious": suspicious_count,
             }
 
         with _idx._db_lock:
+            for row_id in to_delete_row_ids:
+                result = _idx._delete_media_copy_row_locked(conn, row_id)
+                affected_channels.update(result["channels"])
+                segs_removed += int(result["segments"] or 0)
+                deleted_here = int(result["videos"] or 0)
+                videos_removed += deleted_here
+                n_missing += deleted_here
+            for fp, row_channel in to_mark_missing:
+                cur = conn.execute(
+                    "UPDATE videos SET availability='missing' "
+                    "WHERE filepath=? COLLATE NOCASE AND "
+                    "COALESCE(availability, 'available')!='missing'",
+                    (fp,))
+                changed = max(0, cur.rowcount or 0)
+                n_pending_missing += changed
+                if changed and row_channel:
+                    affected_channels.add(row_channel)
+            for fp, row_channel in to_restore:
+                cur = conn.execute(
+                    "UPDATE videos SET availability='available' "
+                    "WHERE filepath=? COLLATE NOCASE AND availability='missing'",
+                    (fp,))
+                changed = max(0, cur.rowcount or 0)
+                n_restored += changed
+                if changed and row_channel:
+                    affected_channels.add(row_channel)
             # Category 0: null out all-alphabetic video_ids. These are
             # filename-suffix parse errors (channel files ending in a
             # bracketed non-YouTube token that matched `[A-Za-z0-9_-]{11}` but
@@ -903,67 +1277,18 @@ def prune_missing_videos() -> dict[str, int]:
                         _chl.replace(" ", "_")):
                     conn.execute(
                         "UPDATE videos SET video_id=NULL, "
-                        "video_url=NULL WHERE id=?", (rid,))
+                        "video_url=NULL, is_duplicate_of=NULL WHERE id=?", (rid,))
+                    repair = _idx._repair_video_copy_group_locked(conn, _v)
+                    affected_channels.update(repair["channels"])
                     n_fake_id += 1
                     if _ch:
                         affected_channels.add(_ch)
 
             for fp, cat in to_delete_fps:
-                vid_row = conn.execute(
-                    "SELECT video_id, channel FROM videos WHERE filepath=? "
-                    "COLLATE NOCASE LIMIT 1", (fp,)).fetchone()
-                vid = (vid_row[0] if vid_row else "") or ""
-                _ch = (vid_row[1] if vid_row and len(vid_row) > 1 else "") or ""
-                if _ch:
-                    affected_channels.add(_ch)
-                # Only drop segments if this is the LAST row holding
-                # that video_id — otherwise we'd orphan search hits
-                # from the surviving real-file row.
-                if vid:
-                    other = conn.execute(
-                        "SELECT COUNT(*) FROM videos WHERE video_id=? "
-                        "AND filepath != ? COLLATE NOCASE",
-                        (vid, fp)).fetchone()
-                    if not other or other[0] == 0:
-                        # Cascade the segment delete into the FTS
-                        # external-content table using the proper
-                        # 'delete' command (which requires rowid + text).
-                        # The previous DELETE FROM segments_fts WHERE
-                        # rowid IN (...) pattern only removed the entry
-                        # mapping; the tokens stayed indexed and could
-                        # still match search queries via phantom hits.
-                        # Worse, SQLite recycles rowids after DELETE, so
-                        # a later INSERT could land on a recycled id and
-                        # inherit the stale FTS tokens — making a brand
-                        # new video's text alias under an old text's
-                        # search hits. Mirrors index.py:564 pattern.
-                        # Skip the segments DELETE if the FTS detach
-                        # failed — otherwise we leave orphan FTS rows
-                        # whose rowids will be recycled by a later
-                        # INSERT, aliasing a new video's text under
-                        # the deleted one's search hits (audit:
-                        # index_maintenance H113).
-                        _fts_ok = False
-                        try:
-                            conn.execute(
-                                "INSERT INTO segments_fts(segments_fts, rowid, text) "
-                                "SELECT 'delete', id, text FROM segments "
-                                "WHERE video_id=?",
-                                (vid,))
-                            _fts_ok = True
-                        except Exception as e:
-                            _log.warning("FTS detach failed for %s: %s — "
-                                         "skipping segments DELETE to avoid "
-                                         "orphan FTS rows", vid, e)
-                        if _fts_ok:
-                            c1 = conn.execute(
-                                "DELETE FROM segments WHERE video_id=?",
-                                (vid,))
-                            segs_removed += c1.rowcount or 0
-                c2 = conn.execute(
-                    "DELETE FROM videos WHERE filepath=? COLLATE NOCASE",
-                    (fp,))
-                deleted_here = c2.rowcount or 0
+                result = _idx._delete_media_copy_locked(conn, fp)
+                affected_channels.update(result["channels"])
+                segs_removed += int(result["segments"] or 0)
+                deleted_here = int(result["videos"] or 0)
                 videos_removed += deleted_here
                 if cat == "missing":
                     n_missing += deleted_here
@@ -978,26 +1303,9 @@ def prune_missing_videos() -> dict[str, int]:
             # The Browse grid filter hides these so it matches what
             # YouTube shows (one entry per video), while the files
             # stay on disk for the user to manage manually.
-            dup_vids = [r[0] for r in conn.execute(
-                "SELECT video_id FROM videos "
-                "WHERE video_id IS NOT NULL AND video_id != '' "
-                "AND is_duplicate_of IS NULL "
-                "GROUP BY video_id HAVING COUNT(*) > 1").fetchall()]
-            for vid in dup_vids:
-                rows = conn.execute(
-                    "SELECT id, filepath, size_bytes, channel FROM videos "
-                    "WHERE video_id=? AND is_duplicate_of IS NULL "
-                    "ORDER BY COALESCE(size_bytes, 0) DESC, id ASC",
-                    (vid,)).fetchall()
-                keep_fp = rows[0][1]
-                for rid, _fp, _sz, _ch in rows[1:]:
-                    c = conn.execute(
-                        "UPDATE videos SET is_duplicate_of=? WHERE id=?",
-                        (keep_fp, rid))
-                    flagged = c.rowcount or 0
-                    n_dup += flagged
-                    if _ch:
-                        affected_channels.add(_ch)
+            repair = _idx._repair_all_video_copy_groups_locked(conn)
+            n_dup += int(repair["repaired"] or 0)
+            affected_channels.update(repair["channels"])
             conn.commit()
         # Drop the Browse grid cache for every channel that had a
         # row removed or flagged — the cache is keyed by
@@ -1012,76 +1320,144 @@ def prune_missing_videos() -> dict[str, int]:
                 _log.warning("Browse cache invalidation failed after prune "
                              "for %r: %s", _ch, e)
     except Exception as e:
+        _idx._rollback_quietly(conn, "prune_missing_videos error")
         _log.warning("prune_missing_videos failed: %s", e)
     return {"videos_removed": videos_removed,
             "segments_removed": segs_removed,
             "missing": n_missing, "zero_byte": n_zero,
             "duplicate_id": n_dup,
-            "fake_id_cleared": n_fake_id}
+            "fake_id_cleared": n_fake_id,
+            "pending_missing": n_pending_missing,
+            "availability_restored": n_restored,
+            "unavailable": n_unavailable}
 
 
-# ── Rebuild FTS index from scratch (rebuild button on Index tab) ────────
+# ── FTS health + rebuild (Index-tab maintenance) ────────────────────────
+
+def fts_health_check() -> dict[str, Any]:
+    """Verify raw FTS tokens against both external-content source tables.
+
+    ``COUNT``/``LEFT JOIN`` checks are insufficient for external-content FTS:
+    they can read a recycled row's current content while an old token still
+    points at that rowid.  FTS5's ``integrity-check`` with ``rank=1`` compares
+    the actual shadow vocabulary to the content table and catches that case.
+    """
+    conn = _idx._open_independent()
+    if conn is None:
+        return {"ok": False, "error": "DB unavailable", "indexes": {}}
+    checks: dict[str, dict[str, Any]] = {}
+    sources = {"segments_fts": "segments", "videos_fts": "videos"}
+    try:
+        for table, source in sources.items():
+            try:
+                _idx._fts_external_content_integrity_check(conn, table)
+                source_rows = int(conn.execute(
+                    f"SELECT COUNT(*) FROM {source}").fetchone()[0] or 0)
+                checks[table] = {"ok": True, "source_rows": source_rows}
+            except sqlite3.Error as exc:
+                checks[table] = {"ok": False, "error": str(exc)}
+            finally:
+                # The integrity command is expressed as INSERT but does not
+                # mutate content.  End its implicit transaction before the
+                # next independent check, especially after an error.
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+        return {"ok": all(item.get("ok") for item in checks.values()),
+                "indexes": checks}
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
 
 def rebuild_fts_index() -> dict[str, Any]:
-    """Drop segments_fts virtual table and rebuild it by reinserting every
-    row from segments. Safe to run — preserves the segments table itself.
-    Returns {ok, rows_indexed} or {ok: False, error}.
-    Use when FTS seems broken (search returns nothing despite visible segments)
-    or after a DB schema migration.
+    """Atomically rebuild and verify transcript and video-title FTS.
+
+    Source tables and trigger definitions are preserved.  If either rebuild
+    or either external-content integrity check fails, both shadows roll back
+    together.  ``rows_indexed`` remains the transcript count for API
+    compatibility; ``video_rows_indexed`` reports the title-index count.
     """
-    conn = _idx._open()
-    if conn is None:
-        return {"ok": False, "error": "DB unavailable"}
-    try:
-        with _idx._db_lock:
-            conn.execute("DROP TABLE IF EXISTS segments_fts")
-            conn.execute("""CREATE VIRTUAL TABLE segments_fts USING fts5(
-                text,
-                content=segments,
-                content_rowid=id
-            )""")
-            conn.execute(
-                "INSERT INTO segments_fts (rowid, text) "
-                "SELECT id, text FROM segments"
-            )
-            rows = conn.execute("SELECT COUNT(*) FROM segments_fts").fetchone()[0]
-            # `indexed_files` (the table used to compute the
-            # "unindexed transcripts" warning banner) is only populated
-            # by _idx.ingest_jsonl. A pure FTS rebuild would leave the banner
-            # claiming "N unindexed" even though every segment just got
-            # re-indexed. Refresh indexed_files from the segments table
-            # so the banner reflects reality.
+    conn: sqlite3.Connection | None = None
+    with _idx._db_lock:
+        try:
+            # The shared connection may belong to a caller's surrounding
+            # transaction.  Rebuilding on it used to commit that unrelated
+            # work on success and leave it open after a savepoint rollback on
+            # failure.  Initialize the schema through the shared handle, then
+            # own a fresh connection and its complete transaction lifecycle.
+            shared = _idx._open()
+            if shared is None:
+                return {"ok": False, "error": "DB unavailable"}
+            if shared.in_transaction:
+                return {
+                    "ok": False,
+                    "error": (
+                        "FTS rebuild deferred because the shared index "
+                        "connection has an active transaction"
+                    ),
+                }
+            conn = _idx._open_independent()
+            if conn is None:
+                return {"ok": False, "error": "DB unavailable"}
+            conn.execute("BEGIN IMMEDIATE")
+            _idx._install_fts_sync_triggers(conn)
+            _idx._rebuild_all_fts(conn)
+            rows = conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
+            video_rows = conn.execute(
+                "SELECT COUNT(*) FROM videos").fetchone()[0]
+            # `indexed_files` records the last on-disk version actually read by
+            # _idx.ingest_jsonl. Reconcile its path/count membership with the
+            # rebuilt source rows without inventing evidence that a newer file
+            # was ingested.
             #
-            # Stamp the on-disk mtime of each jsonl_path. The old
-            # mtime=0 placeholder caused the next sweep to treat every
-            # jsonl as needing re-ingest (every "current mtime" is
-            # greater than 0), doing huge redundant work after every
-            # FTS rebuild.
+            # Rebuilding FTS reads the existing `segments` rows, not the JSONL
+            # files themselves.  Therefore only a previously recorded ingest
+            # mtime is evidence that a file's current contents were ingested.
+            # Stamping os.path.getmtime here falsely certified externally
+            # changed JSONLs while rebuilding stale DB text, causing every
+            # future sweep to skip the changed file.  Preserve known ingest
+            # mtimes, discard tracker rows with no source segments, and use 0
+            # for paths whose segments predate tracking so the sweep is forced
+            # to ingest them from disk.
+            tracked_mtimes: dict[str, float | None] = {}
+            for tracked_path, tracked_mtime in conn.execute(
+                    "SELECT path, mtime FROM indexed_files").fetchall():
+                if not tracked_path:
+                    continue
+                key = os.path.normcase(os.path.normpath(str(tracked_path)))
+                tracked_mtimes[key] = tracked_mtime
             conn.execute("DELETE FROM indexed_files")
-            jsonl_paths = [r[0] for r in conn.execute(
-                "SELECT DISTINCT jsonl_path FROM segments "
-                "WHERE jsonl_path IS NOT NULL").fetchall()]
-            for _jp in jsonl_paths:
+            jsonl_rows = conn.execute(
+                "SELECT jsonl_path, COUNT(*) FROM segments "
+                "WHERE jsonl_path IS NOT NULL AND jsonl_path != '' "
+                "GROUP BY jsonl_path"
+            ).fetchall()
+            for _jp, n in jsonl_rows:
                 if not _jp:
                     continue
-                try:
-                    _mt = os.path.getmtime(_jp)
-                except OSError:
-                    _mt = 0.0
-                try:
-                    n = conn.execute(
-                        "SELECT COUNT(*) FROM segments WHERE jsonl_path=?",
-                        (_jp,)).fetchone()[0]
-                except sqlite3.Error:
-                    n = 0
-                try:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO indexed_files"
-                        "(path, mtime, segment_count) VALUES(?, ?, ?)",
-                        (_jp, float(_mt), int(n)))
-                except sqlite3.Error as e:
-                    _log.debug("swallowed: %s", e)
+                key = os.path.normcase(os.path.normpath(str(_jp)))
+                # Legacy tracker rows can contain NULL.  NULL means the same
+                # thing as a missing tracker timestamp: this rebuild cannot
+                # certify the on-disk JSONL, so force the next sweep to read
+                # it by storing the durable unknown sentinel.
+                _mt = tracked_mtimes.get(key) or 0.0
+                conn.execute(
+                    "INSERT OR REPLACE INTO indexed_files"
+                    "(path, mtime, segment_count) VALUES(?, ?, ?)",
+                    (_jp, _mt, int(n)))
             conn.commit()
-        return {"ok": True, "rows_indexed": int(rows)}
-    except sqlite3.Error as e:
-        return {"ok": False, "error": str(e)}
+            return {"ok": True, "rows_indexed": int(rows),
+                    "video_rows_indexed": int(video_rows)}
+        except Exception as exc:
+            _idx._rollback_quietly(conn, "rebuild_fts_index")
+            return {"ok": False, "error": str(exc)}
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass

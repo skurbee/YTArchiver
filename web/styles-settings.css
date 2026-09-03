@@ -450,6 +450,14 @@
   overflow-y: auto;
   overflow-x: hidden;
 }
+.yt-dd.open-up .yt-dd-menu {
+  top: auto;
+  bottom: calc(100% + 4px);
+}
+.yt-dd-menu.align-right {
+  left: auto;
+  right: 0;
+}
 .yt-dd-menu[hidden] { display: none; }
 .yt-dd-option {
   padding: 7px 12px;
@@ -458,7 +466,8 @@
   cursor: pointer;
   white-space: nowrap;
 }
-.yt-dd-option:hover { background: rgba(255, 255, 255, 0.05); }
+.yt-dd-option:hover,
+.yt-dd-option.active { background: rgba(255, 255, 255, 0.08); }
 .yt-dd-option[data-tooltip] {
   display: flex;
   align-items: center;
@@ -494,6 +503,7 @@
 }
 .yt-dd-option.disabled { opacity: 0.45; cursor: default; }
 .yt-dd-option.disabled:hover { background: transparent; }
+.yt-dd.disabled .yt-dd-trigger { opacity: 0.55; cursor: not-allowed; }
 .yt-dd-option.selected {
   background: rgba(160, 170, 187, 0.1);
   color: var(--c-text);
@@ -621,6 +631,158 @@
   font-size: var(--fs-xs);
   letter-spacing: 1.2px;
 }
+
+/* Settings is one scrollable page. Three task-based sections replace the old
+   collection of tiny sub-pages; less-used controls stay with their subject in
+   native disclosure cards. */
+#panel-settings .settings-view {
+  flex: 0 0 auto;
+}
+#panel-settings .settings-preferences-view {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0 28px 30px;
+}
+#panel-settings .settings-section {
+  width: 100%;
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 26px 0 4px;
+  box-sizing: border-box;
+}
+#panel-settings .settings-section + .settings-section {
+  margin-top: 18px;
+  border-top: 1px solid var(--c-border);
+}
+#panel-settings .settings-section-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 22px;
+}
+#panel-settings .settings-section-heading h2 {
+  margin: 0;
+  color: var(--c-text);
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+#panel-settings .settings-section-heading p {
+  margin: 0;
+  max-width: 520px;
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+  text-align: right;
+}
+#panel-settings .settings-section > .edit-grid {
+  margin-top: 12px;
+}
+#panel-settings .settings-details-card {
+  width: 100%;
+  margin: 12px auto 0;
+  box-sizing: border-box;
+  border: 1px solid var(--c-border);
+  border-radius: 8px;
+  background: var(--c-surface, #16181b);
+  color: var(--c-text);
+}
+#panel-settings .settings-details-card > summary {
+  position: relative;
+  padding: 12px 16px;
+  padding-right: 42px;
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+#panel-settings .settings-details-card > summary::-webkit-details-marker {
+  display: none;
+}
+#panel-settings .settings-details-card > summary::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  right: 18px;
+  width: 7px;
+  height: 7px;
+  box-sizing: border-box;
+  border: solid currentColor;
+  border-width: 0 2px 2px 0;
+  color: var(--c-accent);
+  pointer-events: none;
+  transform: translateY(-50%) rotate(-45deg);
+  transform-origin: center;
+  transition: transform 150ms ease, color 120ms ease, opacity 120ms ease;
+}
+#panel-settings .settings-details-card > summary:hover,
+#panel-settings .settings-details-card > summary:focus-visible,
+#panel-settings .settings-details-card[open] > summary {
+  color: var(--c-text);
+}
+#panel-settings .settings-details-card > summary:hover,
+#panel-settings .settings-details-card > summary:focus-visible {
+  background: var(--c-hover);
+}
+#panel-settings .settings-details-card[open] > summary::after {
+  transform: translateY(-50%) rotate(45deg);
+}
+#panel-settings .settings-details-card[open] > summary {
+  border-bottom: 1px solid var(--c-border);
+}
+#panel-settings .settings-details-intro {
+  padding: 12px 16px 0;
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+}
+#panel-settings .settings-details-card > .edit-grid {
+  width: calc(100% - 24px);
+  margin: 12px;
+}
+#panel-settings .settings-actions {
+  flex: 0 0 auto;
+  position: sticky;
+  bottom: 0;
+  z-index: 4;
+  min-height: 32px;
+  padding: 8px 28px 10px;
+  justify-content: flex-start;
+  background: var(--c-bg);
+  border-top: 1px solid var(--c-border);
+}
+
+@media (max-width: 1100px) {
+  #panel-settings .settings-preferences-view {
+    padding-left: 22px;
+    padding-right: 22px;
+  }
+  #panel-settings .settings-section-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+  #panel-settings .settings-section-heading p {
+    text-align: left;
+  }
+  #panel-settings .edit-grid,
+  #panel-settings .edit-grid > *,
+  #panel-settings .edit-gv-stack {
+    min-width: 0;
+    max-width: 100%;
+  }
+  #panel-settings .edit-gv-inline {
+    flex-wrap: wrap;
+  }
+  #panel-settings .settings-inline-note {
+    max-width: 100%;
+    white-space: normal;
+    text-align: right;
+  }
+}
 /* (Second .settings-subnav-btn block + !important overrides were
    consolidated into the canonical rule above — audit #28.) */
 
@@ -658,15 +820,57 @@
   flex-wrap: wrap;
 }
 .metadata-bulk-row .spacer { flex: 1 1 auto; }
-/* Archive-wide totals strip. Five compact stat cards spaced evenly
+.metadata-catalog-status {
+  max-width: 520px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--c-dim);
+  font-size: var(--fs-xs);
+  font-style: italic;
+}
+/* Archive-wide totals strip. Six compact stat cards spaced evenly
    across the panel width. Mirrors the dense, slightly-elevated
    "stat tile" treatment used elsewhere in Settings so the visual
    language is consistent. */
 .metadata-totals {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 8px;
   margin-bottom: 4px;
+}
+
+/* At the app's native minimum width the Health sidebar leaves roughly
+   790px for the page. Three useful-width tiles per row read much better
+   there than six squeezed tiles (and avoids the old accidental 5 + 1
+   layout). */
+@media (max-width: 1100px) {
+  .metadata-totals {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  /* Tools has several value rows made from multiple small controls and
+     status notes. Let those pieces wrap instead of making the settings
+     pane wider than the window and clipping its right edge. */
+  #panel-health .settings-view .edit-grid,
+  #panel-health .settings-view .edit-grid > *,
+  #panel-health .settings-view .edit-gv-stack {
+    min-width: 0;
+    max-width: 100%;
+  }
+  #panel-health .settings-view .edit-gv-inline {
+    flex-wrap: wrap;
+  }
+  #panel-health .settings-view .settings-inline-note {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-align: right;
+  }
+  #panel-health .settings-view .edit-grid > .settings-inline-note {
+    justify-self: stretch;
+    margin: 10px 22px 10px 24px;
+  }
 }
 .metadata-totals .md-total-card {
   background: var(--c-surface);
@@ -698,7 +902,7 @@
 }
 /* Two-line layout for percentage tiles: big percent on top, smaller
    "X of Y" count below. Prevents the long "X/Y (Z%)" form from
-   getting clipped in a narrow tile (audit found "98,039/101,919
+   getting clipped in a narrow tile (audit found a large ratio
    (96…" truncation at the typical Settings panel width). */
 .metadata-totals .md-total-value .md-total-primary {
   display: block;
@@ -886,7 +1090,8 @@
   display: none;
 }
 .md-cm-sub-wrap:hover > .md-cm-sub,
-.md-cm-sub-wrap:focus-within > .md-cm-sub {
+.md-cm-sub-wrap:focus-within > .md-cm-sub,
+.md-cm-has-sub[aria-expanded="true"] + .md-cm-sub {
   display: block;
 }
 .md-cm-sub-wrap:hover > .md-cm-has-sub {
@@ -1150,4 +1355,435 @@
   display: flex;
   flex-direction: column;
   overflow-y: auto;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Health information architecture
+
+   Health has three destinations: Overview, Library, and Backups. Library uses
+   one scroll surface for status and repairs instead of making each tool its
+   own page.
+   ═══════════════════════════════════════════════════════════════════ */
+#panel-health .settings-sidebar {
+  gap: 0;
+  overflow-y: auto;
+  padding: 16px 0 18px !important;
+}
+#panel-health .health-nav-group + .health-nav-group {
+  margin-top: 16px;
+}
+#panel-health .settings-subnav-label {
+  padding: 0 22px 5px;
+  font-size: var(--fs-2xs);
+  letter-spacing: 1.1px;
+}
+#panel-health .settings-subnav-btn {
+  padding: 7px 22px;
+  font-size: var(--fs-md);
+  line-height: 1.25;
+}
+#panel-health .settings-subnav-btn.active {
+  padding-left: 19px;
+}
+#panel-health .settings-main {
+  scrollbar-gutter: stable;
+}
+
+#panel-health .health-view-intro {
+  width: 100%;
+  max-width: 920px;
+  box-sizing: border-box;
+  margin: 0 auto -4px;
+  padding: 0 28px;
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+}
+
+#panel-health .health-library-view {
+  padding-bottom: 28px;
+}
+#panel-health .health-library-section,
+#panel-health .health-library-details {
+  width: 100%;
+  max-width: 920px;
+  margin-left: auto;
+  margin-right: auto;
+  box-sizing: border-box;
+  scroll-margin-top: 18px;
+}
+#panel-health .health-library-section {
+  padding-top: 26px;
+}
+#panel-health .health-library-section + .health-library-section {
+  margin-top: 26px;
+  border-top: 1px solid var(--c-border);
+}
+#panel-health .health-library-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 0 2px;
+}
+#panel-health .health-library-heading h2 {
+  margin: 0;
+  color: var(--c-text);
+  font-size: var(--fs-xl);
+  font-weight: 600;
+  line-height: 1.3;
+}
+#panel-health .health-library-heading p {
+  margin: 0;
+  max-width: 610px;
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+  text-align: right;
+}
+#panel-health .health-library-section > .metadata-panel,
+#panel-health .health-library-section > .settings-index-grid {
+  margin-top: 12px;
+}
+#panel-health .health-library-details {
+  margin-top: 18px;
+  border: 1px solid var(--c-border);
+  border-radius: 8px;
+  background: var(--c-surface, #16181b);
+  color: var(--c-text);
+}
+#panel-health .health-library-details > summary {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px 16px;
+  padding-right: 44px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  transition: background-color 120ms ease;
+}
+#panel-health .health-library-details > summary::-webkit-details-marker {
+  display: none;
+}
+#panel-health .health-library-details > summary::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  right: 18px;
+  width: 8px;
+  height: 8px;
+  box-sizing: border-box;
+  border: solid currentColor;
+  border-width: 0 2px 2px 0;
+  color: var(--c-accent);
+  pointer-events: none;
+  transform: translateY(-50%) rotate(-45deg);
+  transform-origin: center;
+  transition: transform 150ms ease, color 120ms ease, opacity 120ms ease;
+}
+#panel-health .health-library-details > summary:hover,
+#panel-health .health-library-details > summary:focus-visible {
+  background: var(--c-hover);
+}
+#panel-health .health-library-details[open] > summary::after {
+  transform: translateY(-50%) rotate(45deg);
+}
+#panel-health .health-library-details > summary > span {
+  color: var(--c-text);
+  font-size: var(--fs-lg);
+  font-weight: 600;
+}
+#panel-health .health-library-details > summary > small {
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  line-height: 1.4;
+}
+#panel-health .health-library-details[open] > summary {
+  border-bottom: 1px solid var(--c-border);
+}
+#panel-health .health-library-details > .edit-grid {
+  width: calc(100% - 24px);
+  margin: 12px;
+}
+#panel-health .health-library-details > .metadata-panel {
+  width: calc(100% - 24px);
+  margin: 12px;
+}
+#panel-health .health-nested-details {
+  margin: 0 12px 12px;
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+  background: var(--c-raised);
+}
+#panel-health .health-nested-details > .edit-grid {
+  width: calc(100% - 24px);
+  margin: 12px;
+}
+#panel-health .health-backup-grid {
+  margin-bottom: 28px;
+}
+#panel-health .backup-age-note {
+  align-self: stretch;
+  min-height: 18px;
+  text-align: left;
+}
+
+#panel-health .health-overview-panel {
+  width: 100%;
+  max-width: 920px;
+  margin: 16px auto 24px;
+  padding: 22px;
+  box-sizing: border-box;
+  background: var(--c-surface, #16181b);
+  border: 1px solid var(--c-border);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+#panel-health .health-overview-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+#panel-health .health-overview-heading h2 {
+  margin: 0;
+  color: var(--c-text);
+  font-size: var(--fs-xl);
+  font-weight: 600;
+}
+#panel-health .health-overview-heading p {
+  margin: 5px 0 0;
+  max-width: 650px;
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+}
+#panel-health .health-overview-status {
+  min-height: 18px;
+  color: var(--c-dim);
+  font-size: var(--fs-xs);
+}
+#panel-health .health-overview-status.is-warn {
+  color: var(--c-warn-fg);
+}
+
+#panel-health .health-attention {
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+  background: var(--c-raised);
+  overflow: hidden;
+}
+#panel-health .health-attention-heading {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--c-border);
+  color: var(--c-text);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+#panel-health .health-attention-list {
+  display: flex;
+  flex-direction: column;
+}
+#panel-health .health-attention-item {
+  appearance: none;
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 0;
+  background: transparent;
+  color: var(--c-text);
+  padding: 10px 12px;
+  text-align: left;
+  font: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+#panel-health .health-attention-item:last-child {
+  border-bottom: 0;
+}
+#panel-health .health-attention-item:hover,
+#panel-health .health-attention-item:focus-visible {
+  background: rgba(255, 255, 255, 0.06);
+  outline: none;
+}
+#panel-health .health-attention-item::after {
+  content: "\203A";
+  float: right;
+  color: var(--c-dim);
+  font-size: var(--fs-lg);
+}
+#panel-health .health-attention-empty {
+  padding: 11px 12px;
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+}
+#panel-health .health-attention-empty.is-ok {
+  color: var(--c-ok-fg);
+}
+
+#panel-health .health-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+#panel-health .health-summary-card {
+  appearance: none;
+  min-width: 0;
+  min-height: 112px;
+  padding: 13px 14px;
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+  background: var(--c-raised);
+  color: var(--c-text);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+  transition: border-color 0.12s, background 0.12s;
+}
+#panel-health .health-summary-card:hover,
+#panel-health .health-summary-card:focus-visible {
+  border-color: var(--c-accent);
+  background: rgba(74, 158, 122, 0.08);
+  outline: none;
+}
+#panel-health .health-summary-card.is-warn {
+  border-left: 3px solid var(--c-warn-fg);
+}
+#panel-health .health-summary-card.is-bad {
+  border-left: 3px solid var(--c-bad-fg);
+}
+#panel-health .health-summary-card.is-unavailable {
+  opacity: 0.72;
+}
+#panel-health .health-summary-label {
+  color: var(--c-dim);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.45px;
+}
+#panel-health .health-summary-card strong {
+  max-width: 100%;
+  color: var(--c-text);
+  font-size: var(--fs-lg);
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+#panel-health .health-summary-card > span:last-child {
+  color: var(--c-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.35;
+}
+
+#panel-health .health-advanced {
+  color: var(--c-text);
+}
+#panel-health .health-advanced-card {
+  width: 100%;
+  max-width: 920px;
+  margin: 16px auto 24px;
+  box-sizing: border-box;
+  border: 1px solid var(--c-border);
+  border-radius: 8px;
+  background: var(--c-surface, #16181b);
+}
+#panel-health .health-advanced > summary {
+  position: relative;
+  padding: 12px 14px;
+  padding-right: 40px;
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+#panel-health .health-advanced > summary::-webkit-details-marker {
+  display: none;
+}
+#panel-health .health-advanced > summary::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  right: 16px;
+  width: 7px;
+  height: 7px;
+  box-sizing: border-box;
+  border: solid currentColor;
+  border-width: 0 2px 2px 0;
+  color: var(--c-accent);
+  pointer-events: none;
+  transform: translateY(-50%) rotate(-45deg);
+  transform-origin: center;
+  transition: transform 150ms ease, color 120ms ease, opacity 120ms ease;
+}
+#panel-health .health-advanced > summary:hover,
+#panel-health .health-advanced > summary:focus-visible {
+  color: var(--c-text);
+  background: var(--c-hover);
+}
+#panel-health .health-advanced[open] > summary::after {
+  transform: translateY(-50%) rotate(45deg);
+}
+#panel-health .health-advanced[open] > summary {
+  color: var(--c-text);
+  border-bottom: 1px solid var(--c-border);
+}
+#panel-health .health-advanced-card > .edit-grid {
+  margin: 12px !important;
+  width: calc(100% - 24px);
+}
+#panel-health .health-advanced.index-section {
+  padding: 0;
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+}
+#panel-health .health-advanced-body {
+  padding: 12px 14px 14px;
+}
+#panel-health .health-advanced-body p {
+  margin: 0 0 10px;
+  color: var(--c-dim);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+}
+
+/* The old long heading overflowed its narrow fixed column and visually ran
+   into Video IDs. The visible label is now "Videos"; wrapping remains a
+   fail-safe for localized or user-scaled text. */
+#panel-health .metadata-table th.md-col-num {
+  white-space: normal;
+  overflow: hidden;
+  line-height: 1.15;
+}
+
+@media (max-width: 1100px) {
+  #panel-health .health-overview-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  #panel-health .health-view-intro {
+    padding-left: 22px;
+    padding-right: 22px;
+  }
+  #panel-health .health-library-section,
+  #panel-health .health-library-details {
+    max-width: calc(100% - 44px);
+  }
+  #panel-health .health-library-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+  #panel-health .health-library-heading p {
+    text-align: left;
+  }
 }

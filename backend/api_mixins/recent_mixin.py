@@ -14,7 +14,14 @@ import threading
 
 from backend import index as index_backend
 from backend.log import swallow
-from backend.ytarchiver_config import config_is_writable, load_config, recent_for_ui, save_config
+from backend.services.managed_work import start_managed_task
+from backend.ytarchiver_config import (
+    config_is_writable,
+    load_config,
+    recent_for_ui,
+    save_config,
+    update_config,
+)
 
 from ._shared import _log
 
@@ -40,11 +47,46 @@ class RecentMixin:
             return services.save_config(cfg)
         return save_config(cfg)
 
+    def _recent_update_config(self, mutator):
+        """Commit one recent-list patch without a stale whole-file save."""
+        services = self._recent_services()
+        mutate = (getattr(services, "mutate_config", None)
+                  if services is not None else None)
+        if callable(mutate):
+            return mutate(mutator)
+        return update_config(mutator)
+
     def _recent_log_stream(self):
         services = self._recent_services()
         stream = (getattr(services, "log_stream", None)
                   if services is not None else None)
         return stream if stream is not None else self._log_stream
+
+    def _archive_video_roots(self):
+        """Configured channel/import roots shown by Browse > Videos.
+
+        Individual downloads have their own Manual view.  In particular, a
+        catalog row for an old custom Save-to path must not make an unrelated
+        external file appear under "All videos in the archive".
+        """
+        cfg = self._recent_config() or {}
+        candidates = [
+            cfg.get("output_dir"),
+            *(cfg.get("tp_archive_roots") or []),
+        ]
+        roots = []
+        seen = set()
+        for candidate in candidates:
+            value = str(candidate or "").strip()
+            if not value:
+                continue
+            normalized = os.path.normpath(value)
+            key = os.path.normcase(normalized)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            roots.append(normalized)
+        return roots
 
 
     def get_recent_downloads(self):
@@ -75,11 +117,26 @@ class RecentMixin:
             # indefinitely when a USB/pool member is timing out. Returning the
             # rows first lets the UI paint usable cards immediately; the
             # separate queue_video_thumbnails worker fills images afterward.
-            return index_backend.list_all_videos(
+            result = index_backend.list_all_videos(
                 sort=str(sort or "recent"),
                 limit=_limit, offset=_offset,
                 include_thumbs=False,
-                query=str(query or ""))
+                query=str(query or ""),
+                archive_roots=self._archive_video_roots())
+            if result.get("error"):
+                return result
+            cfg = self._recent_config() or {}
+            tracked_names = {
+                str(value or "").strip().casefold()
+                for channel in cfg.get("channels", [])
+                for value in (channel.get("name"), channel.get("folder"))
+                if str(value or "").strip()
+            }
+            for row in result.get("rows", []):
+                row["tracked"] = (
+                    str(row.get("channel") or "").strip().casefold()
+                    in tracked_names)
+            return result
         except Exception as e:
             return {"rows": [], "has_more": False, "offset": _offset,
                     "error": str(e)}
@@ -91,13 +148,15 @@ class RecentMixin:
                 self._video_thumb_pending = set()
                 self._video_thumb_lock = threading.Lock()
                 self._video_thumb_worker = None
+                self._video_thumb_cancel = None
 
     def _resolve_video_thumbnail_page(self, request):
         sort, limit, offset, query = request
         with index_backend.foreground_browse():
             result = index_backend.list_all_videos(
                 sort=sort, limit=limit, offset=offset,
-                include_thumbs=False, query=query)
+                include_thumbs=False, query=query,
+                archive_roots=self._archive_video_roots())
         for row in (result.get("rows") or []):
             filepath = str(row.get("filepath") or "")
             video_id = str(row.get("video_id") or "")
@@ -123,24 +182,44 @@ class RecentMixin:
                 swallow("Videos thumbnail push", exc)
                 return
 
-    def _run_video_thumbnail_queue(self):
-        while True:
-            try:
-                request = self._video_thumb_queue.get(timeout=2.0)
-            except queue.Empty:
-                with self._video_thumb_lock:
-                    if self._video_thumb_queue.empty():
-                        self._video_thumb_worker = None
-                        return
-                continue
-            try:
-                self._resolve_video_thumbnail_page(request)
-            except Exception as exc:
-                swallow("Videos thumbnail background resolve", exc)
-            finally:
-                with self._video_thumb_lock:
+    def _run_video_thumbnail_queue(self, cancel_event=None):
+        cancel = cancel_event or threading.Event()
+        abandoned = []
+        try:
+            while not cancel.is_set():
+                try:
+                    request = self._video_thumb_queue.get(timeout=0.25)
+                except queue.Empty:
+                    with self._video_thumb_lock:
+                        if self._video_thumb_queue.empty():
+                            return
+                    continue
+                try:
+                    if not cancel.is_set():
+                        self._resolve_video_thumbnail_page(request)
+                except Exception as exc:
+                    swallow("Videos thumbnail background resolve", exc)
+                finally:
+                    with self._video_thumb_lock:
+                        self._video_thumb_pending.discard(request)
+                    self._video_thumb_queue.task_done()
+        finally:
+            # A lifecycle cancellation abandons read-only thumbnail requests;
+            # never let them leak into a post-restore generation.
+            if cancel.is_set():
+                while True:
+                    try:
+                        abandoned.append(self._video_thumb_queue.get_nowait())
+                    except queue.Empty:
+                        break
+                    else:
+                        self._video_thumb_queue.task_done()
+            with self._video_thumb_lock:
+                for request in abandoned:
                     self._video_thumb_pending.discard(request)
-                self._video_thumb_queue.task_done()
+                if self._video_thumb_cancel is cancel:
+                    self._video_thumb_worker = None
+                    self._video_thumb_cancel = None
 
     def queue_video_thumbnails(self, sort="recent", limit=60, offset=0,
                                query=""):
@@ -160,19 +239,40 @@ class RecentMixin:
             _offset = 0
         request = (
             str(sort or "recent"), _limit, _offset, str(query or ""))
+        admission = getattr(self, "_work_admission_error", None)
+        if callable(admission):
+            blocked = admission("thumbnail discovery")
+            if blocked is not None:
+                return blocked
         self._ensure_video_thumbnail_queue()
         with self._video_thumb_lock:
             if request in self._video_thumb_pending:
                 return {"ok": True, "queued": False, "already_queued": True}
+            worker = self._video_thumb_worker
+            cancel = self._video_thumb_cancel
+            if (worker is None or not worker.is_alive()
+                    or cancel is None or cancel.is_set()):
+                cancel = threading.Event()
+                try:
+                    worker = start_managed_task(
+                        self,
+                        owner="thumbnail-discovery",
+                        label="Video thumbnail discovery",
+                        target=lambda: self._run_video_thumbnail_queue(cancel),
+                        cancel=cancel,
+                        name="videos-thumbnail-resolver",
+                        thread_factory=threading.Thread,
+                    )
+                except Exception as exc:
+                    return {"ok": False, "queued": False,
+                            "error": str(exc)}
+                self._video_thumb_worker = worker
+                self._video_thumb_cancel = cancel
+            # Publish the request only after a new worker has been admitted
+            # and registered.  Closing admission can therefore never leave a
+            # hidden queued request that a later session unexpectedly runs.
             self._video_thumb_pending.add(request)
             self._video_thumb_queue.put(request)
-            worker = self._video_thumb_worker
-            if worker is None or not worker.is_alive():
-                worker = threading.Thread(
-                    target=self._run_video_thumbnail_queue,
-                    name="videos-thumbnail-resolver", daemon=True)
-                self._video_thumb_worker = worker
-                worker.start()
         return {"ok": True, "queued": True}
 
 
@@ -185,11 +285,8 @@ class RecentMixin:
         equivalent. Returns {ok: bool, error?: str}.
         """
         try:
-            cfg = self._recent_config()
-            cfg["recent_downloads"] = []
-            ok = self._recent_save_config(cfg)
-            if not ok:
-                return {"ok": False, "error": "Config write failed."}
+            self._recent_update_config(
+                lambda cfg: cfg.__setitem__("recent_downloads", []))
             try: self._reload_config()
             except Exception as e: swallow("config reload after clear", e)
             return {"ok": True}
@@ -398,7 +495,8 @@ class RecentMixin:
             r, _cfg = self._recent_find_entry(ident)
             if isinstance(r, dict) and r.get("_ambiguous"):
                 return {"ok": False,
-                        "error": "Recent entry is ambiguous; select a row with filepath/video_id."}
+                        "error": ("YTArchiver could not identify that Recent "
+                                  "item. Select it again and retry.")}
             if r:
                 url = (r.get("video_url") or "").strip()
                 if not url:
@@ -470,7 +568,21 @@ class RecentMixin:
                         vid = row[0]
             except Exception as e:
                 swallow("index video-id lookup", e)
-        return {"ok": True, "filepath": fp, "video_id": vid}
+        cfg = self._recent_config() or {}
+        tracked_names = {
+            str(value or "").strip().casefold()
+            for item in cfg.get("channels", [])
+            for value in (item.get("name"), item.get("folder"))
+            if str(value or "").strip()
+        }
+        return {
+            "ok": True,
+            "filepath": fp,
+            "video_id": vid,
+            "tracked": (
+                str(ident.get("channel") or "").strip().casefold()
+                in tracked_names),
+        }
 
 
     def recent_show_in_explorer(self, title, channel=None):
@@ -499,7 +611,8 @@ class RecentMixin:
             r, _cfg = self._recent_find_entry(ident)
             if isinstance(r, dict) and r.get("_ambiguous"):
                 return {"ok": False,
-                        "error": "Recent entry is ambiguous; select a row with video_id."}
+                        "error": ("YTArchiver could not identify that Recent "
+                                  "item. Select it again and retry.")}
             if r:
                 vid = (r.get("video_id") or "").strip()
                 if vid and _re.fullmatch(r"[A-Za-z0-9_-]{11}", vid):
@@ -523,16 +636,41 @@ class RecentMixin:
         ident = self._recent_identity(title, channel)
         if self._recent_is_ambiguous_legacy(ident):
             return {"ok": False,
-                    "error": "Recent entry is ambiguous; select a row with filepath/video_id."}
-        fp = self._recent_lookup_path_from_identity(ident)
+                    "error": ("YTArchiver could not identify that Recent "
+                              "item. Select it again and retry.")}
+        explicit_fp = str(ident.get("filepath") or "").strip()
+        if explicit_fp:
+            # Destructive actions must honor the selected physical copy.
+            # Falling back by video-id/title when that exact path is missing
+            # can silently delete a different surviving copy.
+            fp = explicit_fp if os.path.isfile(explicit_fp) else ""
+        else:
+            fp = self._recent_lookup_path_from_identity(ident)
         if not fp:
-            return {"ok": False, "error": "File not found"}
+            return {
+                "ok": False,
+                "error": ("The selected file no longer exists; no other "
+                          "copy was deleted."),
+            }
         # Defense-in-depth: refuse to os.remove a path resolving OUTSIDE the
         # archive roots this app manages (audit: recent_mixin containment).
+        prepared = index_backend.prepare_media_copy_deletion(fp)
+        if not prepared.get("ok"):
+            return {
+                "ok": False,
+                "error": prepared.get("error") or
+                         "Could not preserve the logical transcript.",
+            }
         from backend.services.file_ops import safe_trash_video_file
         trashed = safe_trash_video_file(
-            fp, require_config_writable=True, reason="recent_delete_file")
+            fp, require_config_writable=True, reason="recent_delete_file",
+            excluded_sidecar_paths=prepared.get("preserved_sidecar_paths"),
+            catalog_context=prepared.get("row_identity"))
         if not trashed.get("ok"):
+            if trashed.get("rollback_failed"):
+                index_backend.finalize_copy_deletion_preparation(prepared)
+            else:
+                index_backend.rollback_copy_deletion_preparation(prepared)
             return trashed
         # Refuse the destructive os.remove if config writes are blocked
         # — otherwise we delete the file but can't update the
@@ -548,25 +686,21 @@ class RecentMixin:
         index_warning = ""
         try:
             from backend import index as _idx
-            # FTS-safe, video_id-keyed segment removal (works in the
-            # aggregated layout; the old per-video jsonl_path DELETE
-            # matched zero rows there and skipped the FTS5 'delete'
-            # sync on legacy rows). Must run BEFORE the videos row is
-            # dropped — the helper resolves video_id from it.
-            _idx.delete_segments_for_video(fp)
-            _conn = _idx._open()
-            if _conn is not None:
-                with _idx._db_lock:
-                    _conn.execute(
-                        "DELETE FROM videos WHERE filepath = ? COLLATE NOCASE",
-                        (fp,))
-                    _conn.commit()
+            _prepared_kw = ({"prepared": prepared}
+                            if prepared.get("row_identity") else {})
+            cleanup = _idx.delete_media_copy(fp, **_prepared_kw)
+            if not cleanup.get("ok"):
+                raise RuntimeError(
+                    cleanup.get("error") or "Index cleanup failed")
         except Exception as _e:
+            index_backend.finalize_copy_deletion_preparation(prepared)
             index_warning = (
-                "File moved to trash but index cleanup failed; run Rescan "
-                f"to remove stale Browse/Search entries. ({_e})"
+                "The file was moved to Trash, but Browse and Search could "
+                "not be updated. Run Rescan archive to finish cleanup."
             )
-            _log.debug("recent_delete_file index cleanup failed: %s", _e)
+            _log.warning("recent_delete_file index cleanup failed: %s", _e)
+        else:
+            index_backend.finalize_copy_deletion_preparation(prepared)
         # Remove from recent_downloads (if writable)
         if config_is_writable():
             try:
@@ -577,18 +711,21 @@ class RecentMixin:
                     cfg["recent_downloads"] = [
                         r for r in cfg.get("recent_downloads", [])
                         if not (
-                            (target_fp and self._norm_recent_path(
-                                r.get("filepath", "")) == target_fp)
-                            or (target_vid and (r.get("video_id") or "").strip()
-                                == target_vid)
-                            or (not target_fp and not target_vid
-                                and r.get("title") == ident.get("title")
-                                and r.get("channel") == ident.get("channel"))
+                            (self._norm_recent_path(r.get("filepath", ""))
+                             == target_fp)
+                            if target_fp else
+                            ((r.get("video_id") or "").strip() == target_vid)
+                            if target_vid else
+                            (r.get("title") == ident.get("title")
+                             and r.get("channel") == ident.get("channel"))
                         )
                     ]
-            except Exception:
+            except Exception as exc:
+                _log.warning(
+                    "recent_delete_file recent-list cleanup failed: %s", exc)
                 return {"ok": False, "file_trashed": True,
-                        "error": "File moved to trash but config write failed; recent_downloads may show stale entry",
+                        "error": ("The file was moved to Trash, but Browse may "
+                                  "keep showing the old entry until it refreshes."),
                         "trashed_file_path": trashed.get("trashed_file_path"),
                         "trashed_folder_path": trashed.get("trashed_folder_path")}
         if index_warning:

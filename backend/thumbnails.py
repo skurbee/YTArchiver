@@ -45,6 +45,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,14 @@ def _ensure_thumbnails_dir(subfolder: str) -> str:
 def _safe_thumb_stem(title: str) -> str:
     safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', title or "")
     return safe.rstrip(". ")[:100] or "untitled"
+
+
+def _mark_thumbnail_changed(path: str) -> None:
+    try:
+        from .local_fileserver import mark_file_changed
+        mark_file_changed(path)
+    except Exception as exc:
+        _log.debug("thumbnail cache revision update failed: %s", exc)
 
 
 def _image_magic_ok(path: str) -> bool:
@@ -108,8 +117,56 @@ def _find_ffmpeg() -> str | None:
     return None
 
 
+def _run_thumbnail_command(cmd: list[str], *, timeout: float,
+                           cancel_event=None) -> bool:
+    """Run one short ffmpeg command with registry-backed cancellation."""
+    if cancel_event is None:
+        try:
+            completed = subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                startupinfo=make_startupinfo(),
+                creationflags=subprocess_creationflags(),
+            )
+            return completed.returncode == 0
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            _log.debug("thumbnail ffmpeg command failed: %s", exc)
+            return False
+    if cancel_event is not None and cancel_event.is_set():
+        return False
+    from .process_runner import supervise_streaming_process
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            startupinfo=make_startupinfo(),
+            creationflags=subprocess_creationflags(),
+        )
+    except OSError as exc:
+        _log.debug("thumbnail ffmpeg launch failed: %s", exc)
+        return False
+    result = supervise_streaming_process(
+        proc,
+        cancel_event=cancel_event,
+        timeout=timeout,
+        role="thumbnail-frame",
+    )
+    return bool(
+        result.returncode == 0
+        and not result.cancelled
+        and not result.timed_out
+    )
+
+
 def _extract_thumbnail_frame(ffmpeg: str, source: str, output: str,
-                             seek: str) -> bool:
+                             seek: str, *, cancel_event=None) -> bool:
     cmd = [
         ffmpeg,
         "-y",
@@ -121,19 +178,13 @@ def _extract_thumbnail_frame(ffmpeg: str, source: str, output: str,
         "-vf", "thumbnail,scale=640:-2",
         output,
     ]
-    subprocess.run(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        timeout=20,
-        startupinfo=make_startupinfo(),
-        creationflags=subprocess_creationflags(),
-    )
-    return _image_magic_ok(output)
+    ran = _run_thumbnail_command(
+        cmd, timeout=20, cancel_event=cancel_event)
+    return ran and _image_magic_ok(output)
 
 
 def _write_h264_color_repair_clip(ffmpeg: str, source: str,
-                                  output: str) -> bool:
+                                  output: str, *, cancel_event=None) -> bool:
     """Copy a short H.264 clip while normalizing bad/unknown color metadata."""
     cmd = [
         ffmpeg,
@@ -150,14 +201,9 @@ def _write_h264_color_repair_clip(ffmpeg: str, source: str,
         "transfer_characteristics=1:matrix_coefficients=1",
         output,
     ]
-    subprocess.run(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        timeout=25,
-        startupinfo=make_startupinfo(),
-        creationflags=subprocess_creationflags(),
-    )
+    if not _run_thumbnail_command(
+            cmd, timeout=25, cancel_event=cancel_event):
+        return False
     try:
         return os.path.getsize(output) > 0
     except OSError:
@@ -167,14 +213,27 @@ def _write_h264_color_repair_clip(ffmpeg: str, source: str,
 def _generate_local_thumbnail(video_filepath: str, thumb_dir: str,
                               title: str = "",
                               video_id: str = "",
-                              stream=None) -> str | None:
+                              stream=None,
+                              commit_allowed: Callable[[], bool] | None = None,
+                              cancel_event=None,
+                              force: bool = False) -> str | None:
     """Create a hidden thumbnail sidecar from the local video file.
 
     This is for imported/manual libraries when YouTube metadata has not been
     recovered yet. The `.local` suffix makes these fallback images lose to
     real YouTube thumbnails once metadata recovery downloads one.
     """
-    if not video_filepath or not os.path.isfile(video_filepath):
+    def _may_commit() -> bool:
+        try:
+            return (
+                (cancel_event is None or not cancel_event.is_set())
+                and (commit_allowed is None or bool(commit_allowed()))
+            )
+        except Exception:
+            return False
+
+    if (not _may_commit() or not video_filepath
+            or not os.path.isfile(video_filepath)):
         return None
     try:
         os.makedirs(thumb_dir, exist_ok=True)
@@ -184,7 +243,7 @@ def _generate_local_thumbnail(video_filepath: str, thumb_dir: str,
 
     stem = _safe_thumb_stem(Path(video_filepath).stem) + ".local"
     target = os.path.join(thumb_dir, stem + ".jpg")
-    if _image_magic_ok(target):
+    if not force and _image_magic_ok(target) and _may_commit():
         return os.path.normpath(target)
 
     ffmpeg = _find_ffmpeg()
@@ -195,24 +254,53 @@ def _generate_local_thumbnail(video_filepath: str, thumb_dir: str,
             tmp_path = os.path.join(td, stem + ".tmp.jpg")
             made = False
             for seek in ("5", "1", "0"):
+                if not _may_commit():
+                    return None
                 if _extract_thumbnail_frame(
-                        ffmpeg, video_filepath, tmp_path, seek):
+                        ffmpeg, video_filepath, tmp_path, seek,
+                        cancel_event=cancel_event):
                     made = True
                     break
 
             if not made:
                 repair_clip = os.path.join(td, stem + ".h264-color.mp4")
                 if _write_h264_color_repair_clip(
-                        ffmpeg, video_filepath, repair_clip):
+                        ffmpeg, video_filepath, repair_clip,
+                        cancel_event=cancel_event):
                     for seek in ("5", "1", "0"):
+                        if not _may_commit():
+                            return None
                         if _extract_thumbnail_frame(
-                                ffmpeg, repair_clip, tmp_path, seek):
+                                ffmpeg, repair_clip, tmp_path, seek,
+                                cancel_event=cancel_event):
                             made = True
                             break
 
-            if not made or not _image_magic_ok(tmp_path):
+            if (not made or not _image_magic_ok(tmp_path)
+                    or not _may_commit()):
                 return None
-            shutil.copyfile(tmp_path, target)
+            target_tmp = target + ".tmp"
+            try:
+                shutil.copyfile(tmp_path, target_tmp)
+                with open(target_tmp, "rb") as copied:
+                    try:
+                        os.fsync(copied.fileno())
+                    except OSError:
+                        pass
+                if not _may_commit():
+                    try:
+                        os.remove(target_tmp)
+                    except OSError:
+                        pass
+                    return None
+                os.replace(target_tmp, target)
+                _mark_thumbnail_changed(target)
+            except Exception:
+                try:
+                    os.remove(target_tmp)
+                except OSError:
+                    pass
+                raise
         try:
             from .utils import hide_file_win
             hide_file_win(target)
@@ -255,7 +343,11 @@ def _thumbnail_url_candidates(url: str, video_id: str) -> list[str]:
 
 def _download_thumbnail(url: str, thumb_dir: str,
                         title: str, video_id: str,
-                        stream=None) -> bool:
+                        stream=None,
+                        commit_allowed: Callable[[], bool] | None = None,
+                        force: bool = False,
+                        result_out: dict[str, Any] | None = None,
+                        ) -> bool:
     """Download a thumbnail to `{thumb_dir}/{safe_title} [{video_id}].jpg`.
     Dedupes against an existing file with the same [{video_id}] bracket.
     Matches YTArchiver.py:26784 exactly.
@@ -265,6 +357,14 @@ def _download_thumbnail(url: str, thumb_dir: str,
     thumbnail in Browse view was impossible to diagnose because
     the exception was silently swallowed.
     """
+    def _may_commit() -> bool:
+        try:
+            return commit_allowed is None or bool(commit_allowed())
+        except Exception:
+            return False
+
+    if not _may_commit():
+        return False
     if not url or not video_id:
         return False
     # Also strip control chars (incl. NUL) and trim trailing dots /
@@ -274,8 +374,9 @@ def _download_thumbnail(url: str, thumb_dir: str,
     safe_title = _safe_thumb_stem(title or "")
     fname = f"{safe_title} [{video_id}].jpg"
     fpath = os.path.join(thumb_dir, fname)
-    if os.path.isfile(fpath):
+    if not force and _image_magic_ok(fpath):
         return True
+    invalid_exact_target = os.path.isfile(fpath)
 
     # Dedup: if a thumb with this [{video_id}] already exists under a
     # different title (YT renamed the video), rename it instead of writing
@@ -296,6 +397,11 @@ def _download_thumbnail(url: str, thumb_dir: str,
                     continue
                 if bracket in existing and existing != fname:
                     existing_path = os.path.join(thumb_dir, existing)
+                    if not _image_magic_ok(existing_path):
+                        # Preserve the bad file until a replacement commits;
+                        # the success path below then removes it.
+                        _stale_old_thumb = existing_path
+                        break
                     _is_recent = False
                     try:
                         import time as _t
@@ -303,12 +409,17 @@ def _download_thumbnail(url: str, thumb_dir: str,
                                       ) < (30 * 86400)
                     except OSError:
                         pass
-                    if _is_recent:
+                    if _is_recent and not invalid_exact_target and not force:
+                        if not _may_commit():
+                            return False
                         existing_ext = os.path.splitext(existing)[1]
                         new_fname = f"{safe_title} [{video_id}]{existing_ext}"
                         new_path = os.path.join(thumb_dir, new_fname)
                         try:
                             os.replace(existing_path, new_path)
+                            _mark_thumbnail_changed(new_path)
+                            if result_out is not None:
+                                result_out["committed_path"] = new_path
                             return True
                         except OSError:
                             pass
@@ -337,6 +448,8 @@ def _download_thumbnail(url: str, thumb_dir: str,
         img_data = None
         _last_error: Exception | None = None
         for candidate_url in _thumbnail_url_candidates(url, video_id):
+            if not _may_commit():
+                return False
             try:
                 req = urllib.request.Request(
                     candidate_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -368,8 +481,12 @@ def _download_thumbnail(url: str, thumb_dir: str,
                 break
             except Exception as _candidate_error:
                 _last_error = _candidate_error
+                if not _may_commit():
+                    return False
         if img_data is None:
             raise _last_error or ValueError("thumbnail unavailable")
+        if not _may_commit():
+            return False
         tmp_path = fpath + ".tmp"
         try:
             with open(tmp_path, "wb") as f:
@@ -379,7 +496,16 @@ def _download_thumbnail(url: str, thumb_dir: str,
                     os.fsync(f.fileno())
                 except OSError:
                     pass
+            if not _may_commit():
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                return False
             os.replace(tmp_path, fpath)
+            _mark_thumbnail_changed(fpath)
+            if result_out is not None:
+                result_out["committed_path"] = fpath
         except Exception:
             # Clean up the orphan .tmp file before re-raising so a
             # disk-full / permission failure doesn't leave a half-
@@ -408,11 +534,17 @@ def _download_thumbnail(url: str, thumb_dir: str,
         # titled variant for the same [video_id] (deferred from the
         # dedup pass above so a failed fetch can never destroy the
         # only surviving copy).
-        if _stale_old_thumb and _stale_old_thumb != fpath:
+        if (_may_commit() and _stale_old_thumb
+                and _stale_old_thumb != fpath):
             try:
                 os.remove(_stale_old_thumb)
-            except OSError:
+            except FileNotFoundError:
                 pass
+            except OSError as exc:
+                _log.debug(
+                    "thumbnail replacement committed but stale blocker "
+                    "could not be retired: %s", exc)
+                return False
         return True
     except Exception as _te:
         # Non-fatal, but no longer invisible: emit a verbose-only

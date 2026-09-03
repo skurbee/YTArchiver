@@ -200,6 +200,8 @@ def compress_video(input_path: str, stream: LogStreamer,
                    replace_original: bool = True,
                    progress_cb: Callable[[int], None] | None = None,
                    dry_run: bool = False,
+                   process_owner: str = "processing",
+                   task_id: str = "",
                    ) -> dict[str, Any]:
     """
     Encode one video with av1_nvenc at quality+res preset.
@@ -372,7 +374,12 @@ def compress_video(input_path: str, stream: LogStreamer,
             # shutdown's kill_all() reaps it even if the encode is mid-flight.
             try:
                 from .process_runner import PROCESS_REGISTRY
-                PROCESS_REGISTRY.register(proc)
+                PROCESS_REGISTRY.register(
+                    proc,
+                    owner=process_owner,
+                    task_id=task_id,
+                    role="compression",
+                )
             except Exception:
                 pass
         except OSError as e:
@@ -708,6 +715,7 @@ def compress_videos_batch(paths, stream: LogStreamer,
                           batch_total: int = 1,
                           channel_name: str = "",
                           dry_run: bool = False,
+                          emit_history: bool = True,
                           ) -> dict[str, Any]:
     """Compress a list of videos sequentially.
 
@@ -737,7 +745,8 @@ def compress_videos_batch(paths, stream: LogStreamer,
                 chunk, stream, quality=quality, output_res=output_res,
                 cancel_event=cancel_event, redo_on_larger=redo_on_larger,
                 batch_size=0, batch_num=i + 1, batch_total=n_splits,
-                dry_run=dry_run,
+                channel_name=channel_name, dry_run=dry_run,
+                emit_history=False,
             )
             agg["done"] += r.get("done", 0)
             agg["grew"] += r.get("grew", 0)
@@ -755,7 +764,18 @@ def compress_videos_batch(paths, stream: LogStreamer,
             agg["saved_pct"] = 100.0 * (1.0 - agg["sum_new"] / agg["sum_orig"])
         else:
             agg["saved_pct"] = 0.0
-        agg["ok"] = True
+        agg["ok"] = not agg["cancelled"] and agg["errors"] == 0
+        if agg["cancelled"]:
+            # A cancellation between chunks can follow one or more green
+            # child summaries. Emit an explicit aggregate outcome so the last
+            # visible state never implies the entire split job succeeded.
+            stream.emit([
+                [" \u26d4 ", "red"],
+                ["Batch cancelled: ", "red"],
+                [f"{agg['done']}/{len(paths)} compressed \u00b7 "
+                 f"{agg['errors']} errors \u00b7 "
+                 f"saved {agg['saved_pct']:.1f}%\n", "simpleline"],
+            ])
         # Aggregated [Cmprss] activity-log row. Each recursive chunk
         # passes batch_num != batch_total so the per-chunk emit at
         # line 788 is suppressed — we emit ONCE here with the full
@@ -798,6 +818,7 @@ def compress_videos_batch(paths, stream: LogStreamer,
     n_err = 0
     sum_orig = 0
     sum_new = 0
+    cancelled = False
 
     # Sticky active status line pinned at the bottom during the batch
     # compress pass — mirrors classic's `mode="compress"` anim
@@ -833,6 +854,7 @@ def compress_videos_batch(paths, stream: LogStreamer,
     for i, path in enumerate(paths, 1):
         if cancel_event is not None and cancel_event.is_set():
             stream.emit_text(" \u26d4 Batch cancelled.", "red")
+            cancelled = True
             break
         stream.emit([
             [f"[{i}/{len(paths)}] ", "compress_bracket"],
@@ -847,6 +869,9 @@ def compress_videos_batch(paths, stream: LogStreamer,
             n_done += 1
             sum_orig += res.get("orig_bytes", 0)
             sum_new += res.get("new_bytes", 0)
+        elif res.get("reason") == "cancelled":
+            cancelled = True
+            break
         elif res.get("reason") == "grew" and redo_on_larger:
             # Step down one tier and retry
             n_grew += 1
@@ -876,6 +901,9 @@ def compress_videos_batch(paths, stream: LogStreamer,
                     n_done += 1
                     sum_orig += res2.get("orig_bytes", 0)
                     sum_new += res2.get("new_bytes", 0)
+                elif res2.get("reason") == "cancelled":
+                    cancelled = True
+                    break
                 else:
                     n_err += 1
             else:
@@ -890,11 +918,18 @@ def compress_videos_batch(paths, stream: LogStreamer,
     _clear_active()
 
     saved = (1 - sum_new / sum_orig) * 100.0 if sum_orig else 0.0
-    # Done summary — green checkmark + white body (body was
-    # fully-compress-colored before; matches classic painter rule now).
+    # Reserve the green check for an actually successful batch. A cancelled
+    # or partially failed batch must not present a contradictory success icon
+    # or success color even though useful work may have completed.
+    if cancelled:
+        summary_icon, summary_label, summary_tag = " \u26d4 ", "Batch cancelled: ", "red"
+    elif n_err:
+        summary_icon, summary_label, summary_tag = " \u26a0 ", "Batch failed: ", "red"
+    else:
+        summary_icon, summary_label, summary_tag = " \u2713 ", "Batch done: ", "simpleline_green"
     stream.emit([
-        [" \u2713 ", "simpleline_green"],
-        ["Batch done: ", "simpleline"],
+        [summary_icon, summary_tag],
+        [summary_label, "red" if (cancelled or n_err) else "simpleline"],
         [f"{n_done}/{len(paths)} compressed \u00b7 {n_grew} redone \u00b7 "
          f"{n_err} errors \u00b7 saved {saved:.1f}%\n", "simpleline"],
     ])
@@ -902,7 +937,7 @@ def compress_videos_batch(paths, stream: LogStreamer,
     # autorun_history [Cmprss] row — matches YTArchiver.py:22602
     # _record_compression. Only emit when something actually happened
     # (matches OLD's behavior + the "only log real work" rule).
-    if (n_done > 0 or n_err > 0) and batch_num == batch_total:
+    if emit_history and (n_done > 0 or n_err > 0):
         try:
             elapsed = time.time() - t_batch_start
             from . import autorun as _ar
@@ -930,5 +965,7 @@ def compress_videos_batch(paths, stream: LogStreamer,
             })
         except Exception as e:
             _log.debug("swallowed: %s", e)
-    return {"ok": True, "done": n_done, "grew": n_grew, "errors": n_err,
-            "saved_pct": saved}
+    return {"ok": not cancelled and n_err == 0,
+            "done": n_done, "grew": n_grew, "errors": n_err,
+            "sum_orig": sum_orig, "sum_new": sum_new,
+            "cancelled": cancelled, "saved_pct": saved}

@@ -57,9 +57,19 @@
   function _pageSig(rows) {
     return (rows || []).map(r => [
       r.video_id || r.filepath || "",
+      r.title || "",
+      r.channel || "",
+      r.filepath || "",
       r.thumbnail_url || "",
       r.duration || "",
       r.tx_status || "",
+      r.uploaded || "",
+      Number(r.upload_ts || 0),
+      Number(r.view_count || 0),
+      Number(r.like_count || 0),
+      Number(r.size_bytes || 0),
+      r.removed_from_yt ? "1" : "0",
+      r.tracked === false ? "0" : "1",
     ].join("~")).join("|");
   }
 
@@ -83,6 +93,7 @@
       // large per-channel/grouped grids keep their lazy/batched behavior.
       eager_thumbnail: true,
       tx_status: r.tx_status || "", removed_from_yt: !!r.removed_from_yt,
+      tracked: r.tracked !== false,
       // Cross-channel view — always show the channel line on each card.
       show_channel: true,
     };
@@ -93,11 +104,10 @@
     }
     const onClick = (vv) => {
       if (typeof window._openVideoInWatch === "function") window._openVideoInWatch(vv);
-      else if (vv.filepath && nativeBridgeUp())
-        bridgeCall("browse_open_video", vv.filepath);
+      else if (vv.filepath) window._openVideoExternally?.(vv.filepath);
     };
     const card = build(v, onClick);
-    if (card) card.dataset.tracked = "1";
+    if (card) card.dataset.tracked = v.tracked ? "1" : "0";
     return card;
   }
 
@@ -144,12 +154,19 @@
     }
   };
 
+  function _paintVideosCatalogStatus(status) {
+    if (status.phase === "done") return;
+    const label = grid()?.querySelector(".grid-loading-label");
+    if (label) label.textContent = status.text;
+  }
+
   async function loadPage(reset) {
     if (!nativeBridgeUp()) return;
-    if (_loading) return;
     _loading = true;
     const myId = ++_seq;
     if (reset) { _offset = 0; _hasMore = true; }
+    const sortAtCall = _sort;
+    const filterAtCall = _filter;
     const g = grid();
     const moreEl = $("videos-load-more");
     if (reset && g) {
@@ -158,8 +175,17 @@
     } else if (moreEl) { moreEl.hidden = false; }
     const pageOffset = _offset;
     try {
-      const res = await bridgeCall("list_all_videos", _sort, PAGE, _offset, _filter);
-      if (myId !== _seq) return;  // superseded by a newer sort/reset
+      const outcome = await window.YT.bridge.catalogRead(
+        "videos",
+        () => bridgeCall(
+          "list_all_videos", sortAtCall, PAGE, pageOffset, filterAtCall),
+        {
+          label: "videos",
+          onStatus: _paintVideosCatalogStatus,
+        });
+      if (outcome.stale || myId !== _seq) return;
+      const res = outcome.value;
+      if (res?.error) throw new Error(res.error);
       const rows = (res && res.rows) || [];
       if (reset) {
         _firstPageSig = _pageSig(rows);
@@ -170,19 +196,27 @@
       if (g) g.appendChild(frag);
       _offset += rows.length;
       _hasMore = !!(res && res.has_more);
-      _queueThumbnailPage(_sort, pageOffset, _filter, rows.length);
+      _queueThumbnailPage(sortAtCall, pageOffset, filterAtCall, rows.length);
       if (g && _offset === 0) {
-        g.innerHTML = _filter
-          ? `<div class="browse-empty">No videos match “${_filter
+        g.innerHTML = filterAtCall
+          ? `<div class="browse-empty">No videos match “${filterAtCall
               .replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}”.</div>`
           : '<div class="browse-empty">No videos in the archive yet.</div>';
       }
     } catch (e) {
       console.error("[videos] load failed", e);
-      if (reset && g) g.innerHTML = '<div class="browse-empty">Couldn’t load videos.</div>';
+      if (myId === _seq && reset && g) {
+        g.innerHTML = "";
+        const error = document.createElement("div");
+        error.className = "browse-empty";
+        error.textContent = `Couldn’t load videos: ${e?.message || e}`;
+        g.appendChild(error);
+      }
     } finally {
-      _loading = false;
-      if (moreEl) moreEl.hidden = true;
+      if (myId === _seq) {
+        _loading = false;
+        if (moreEl) moreEl.hidden = true;
+      }
     }
   }
 
@@ -267,7 +301,14 @@
     const sortAtCall = _sort;
     const filterAtCall = _filter;
     try {
-      const res = await bridgeCall("list_all_videos", sortAtCall, PAGE, 0, filterAtCall);
+      const outcome = await window.YT.bridge.catalogRead(
+        "videos",
+        () => bridgeCall(
+          "list_all_videos", sortAtCall, PAGE, 0, filterAtCall),
+        { label: "videos" });
+      if (outcome.stale) return;
+      const res = outcome.value;
+      if (res?.error) throw new Error(res.error);
       if (sortAtCall !== _sort || filterAtCall !== _filter || _loading) return;
       const rows = (res && res.rows) || [];
       const newSig = _pageSig(rows);

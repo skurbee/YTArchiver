@@ -31,6 +31,7 @@ postpones to the next tick.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -38,8 +39,10 @@ import shutil
 import sys
 import threading
 import time
+import zipfile
 from datetime import datetime
 
+from .activity_history import ACTIVITY_HISTORY_FILE
 from .log import get_logger, swallow
 from .ytarchiver_config import (
     APP_DATA_DIR,
@@ -84,6 +87,56 @@ _INTERVAL_SECS = {
 }
 
 
+class BackupCancelled(RuntimeError):
+    """A lifecycle coordinator cancelled a backup before commit."""
+
+
+def _raise_if_cancelled(cancel_event) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise BackupCancelled(
+            "backup cancelled during application shutdown or restore")
+
+
+def _write_zip_path_resource(zipped, source_path, arcname, cancel_event=None):
+    """Stream and hash one filesystem resource into an open ZIP."""
+    _raise_if_cancelled(cancel_event)
+    source_path = os.fspath(source_path)
+    info = zipfile.ZipInfo.from_file(source_path, arcname=arcname)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    digest = hashlib.sha256()
+    size = 0
+    with open(source_path, "rb") as source, zipped.open(
+            info, "w", force_zip64=True) as destination:
+        while True:
+            _raise_if_cancelled(cancel_event)
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            destination.write(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+    return {"sha256": digest.hexdigest(), "size": size}
+
+
+def _write_zip_bytes_resource(zipped, content, arcname, cancel_event=None):
+    """Write one already-coherent in-memory resource into an open ZIP."""
+    _raise_if_cancelled(cancel_event)
+    payload = bytes(content)
+    info = zipfile.ZipInfo(
+        arcname,
+        date_time=tuple(datetime.now().timetuple()[:6]),
+    )
+    info.compress_type = zipfile.ZIP_DEFLATED
+    digest = hashlib.sha256()
+    with zipped.open(info, "w", force_zip64=True) as destination:
+        for offset in range(0, len(payload), 1024 * 1024):
+            _raise_if_cancelled(cancel_event)
+            chunk = payload[offset:offset + 1024 * 1024]
+            destination.write(chunk)
+            digest.update(chunk)
+    return {"sha256": digest.hexdigest(), "size": len(payload)}
+
+
 def backup_file_entries():
     """(arcname, Path) pairs for every app-state file worth backing up.
 
@@ -94,6 +147,12 @@ def backup_file_entries():
     return (
         (CONFIG_FILE.name, CONFIG_FILE),
         (QUEUE_FILE.name, QUEUE_FILE),
+        # Current in-flight work is committed independently from the larger
+        # queue document.  Omitting this sidecar made a "full" backup restore
+        # a mixed queue generation (or resurrect a stale local sidecar).
+        (f"{QUEUE_FILE.stem}_resuming{QUEUE_FILE.suffix or '.json'}",
+         QUEUE_FILE.with_name(
+             f"{QUEUE_FILE.stem}_resuming{QUEUE_FILE.suffix or '.json'}")),
         (DISK_CACHE_FILE.name, DISK_CACHE_FILE),
         (SEEN_FILTER_TITLES.name, SEEN_FILTER_TITLES),
         (CHANNEL_ID_CACHE.name, CHANNEL_ID_CACHE),
@@ -106,10 +165,12 @@ def backup_file_entries():
          APP_DATA_DIR / "ytarchiver_livestream_ignore.json"),
         ("ytarchiver_pending_transcribe.json",
          APP_DATA_DIR / "ytarchiver_pending_transcribe.json"),
+        (ACTIVITY_HISTORY_FILE.name, ACTIVITY_HISTORY_FILE),
     )
 
 
-def build_backup_zip(out_path: str) -> dict:
+def build_backup_zip(out_path: str, *, queue_state=None,
+                     cancel_event=None) -> dict:
     """Write the full app-state backup ZIP to `out_path` (atomic via
     .tmp + os.replace). Returns {"files", "fts_included", "fts_size",
     "fts_skipped_reason"}. Raises on failure (tmp cleaned up).
@@ -117,7 +178,35 @@ def build_backup_zip(out_path: str) -> dict:
     Lifted from backup_mixin.export_full_backup so the manual export
     and the scheduled auto-backup share one implementation.
     """
-    import zipfile as _zf
+    _raise_if_cancelled(cancel_event)
+    entries = backup_file_entries()
+    queue_sidecar_name = QUEUE_FILE.with_name(
+        f"{QUEUE_FILE.stem}_resuming{QUEUE_FILE.suffix or '.json'}"
+    ).name
+    queue_resource_names = {QUEUE_FILE.name, queue_sidecar_name}
+    queue_resources: dict[str, bytes] = {}
+    if queue_state is not None:
+        snapshotter = getattr(queue_state, "backup_resource_bytes", None)
+        if not callable(snapshotter):
+            raise TypeError("queue state does not provide backup_resource_bytes")
+        supplied = snapshotter()
+        if not isinstance(supplied, dict):
+            raise TypeError("queue backup snapshot must be a resource mapping")
+        try:
+            queue_resources = {
+                name: bytes(supplied[name]) for name in queue_resource_names
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "queue backup snapshot omitted a required generation member"
+            ) from exc
+    elif any(
+            path.exists() for name, path in entries
+            if name in queue_resource_names):
+        # Reading these independently is never safe: the current-task sidecar
+        # deliberately advances ahead of the debounced main queue file.
+        raise RuntimeError(
+            "live queue state is required for a coherent full backup")
 
     fts_skipped_reason = ""
     fts_size = 0
@@ -129,19 +218,26 @@ def build_backup_zip(out_path: str) -> dict:
                 include_fts = True
             else:
                 fts_skipped_reason = (
-                    f"FTS DB skipped — too large "
-                    f"({fts_size / (1024**3):.1f} GB > 2 GB). "
-                    f"Back up manually if needed.")
+                    f"The search index was not included because it is larger "
+                    f"than 2 GB ({fts_size / (1024**3):.1f} GB). It can be "
+                    f"rebuilt from saved transcripts after a restore.")
     except OSError:
         pass
 
     n = 0
+    resources: dict[str, dict[str, int | str]] = {}
     tmp_path = out_path + ".tmp"
     try:
-        with _zf.ZipFile(tmp_path, "w", _zf.ZIP_DEFLATED) as zf:
-            for arcname, p in backup_file_entries():
-                if p.exists():
-                    zf.write(str(p), arcname=arcname)
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for arcname, p in entries:
+                _raise_if_cancelled(cancel_event)
+                if arcname in queue_resources:
+                    resources[arcname] = _write_zip_bytes_resource(
+                        zf, queue_resources[arcname], arcname, cancel_event)
+                    n += 1
+                elif arcname not in queue_resource_names and p.exists():
+                    resources[arcname] = _write_zip_path_resource(
+                        zf, p, arcname, cancel_event)
                     n += 1
             if include_fts:
                 # Consistent point-in-time snapshot of the live
@@ -158,22 +254,41 @@ def build_backup_zip(out_path: str) -> dict:
                     try:
                         _dst = _sq3.connect(_snap)
                         try:
-                            _src.backup(_dst)
+                            def _backup_progress(_status, _remaining, _total):
+                                _raise_if_cancelled(cancel_event)
+
+                            _raise_if_cancelled(cancel_event)
+                            _src.backup(
+                                _dst,
+                                pages=1024,
+                                progress=_backup_progress,
+                                sleep=0.05,
+                            )
                         finally:
                             _dst.close()
                     finally:
                         _src.close()
-                    zf.write(_snap, arcname=TRANSCRIPTION_DB.name)
+                    resources[TRANSCRIPTION_DB.name] = (
+                        _write_zip_path_resource(
+                            zf,
+                            _snap,
+                            TRANSCRIPTION_DB.name,
+                            cancel_event,
+                        )
+                    )
                     n += 1
                 finally:
                     try: os.remove(_snap)
                     except OSError: pass
+            _raise_if_cancelled(cancel_event)
             zf.writestr(BACKUP_MANIFEST_NAME, json.dumps({
+                "manifest_version": 2,
                 "app": "YTArchiver",
                 "backup_type": "app-state",
                 "fts_db_included": bool(include_fts),
                 "fts_db_size": fts_size,
                 "fts_skipped_reason": fts_skipped_reason,
+                "resources": resources,
             }, indent=2, sort_keys=True))
             n += 1
             backup_dir = APP_DATA_DIR / "backups"
@@ -182,9 +297,11 @@ def build_backup_zip(out_path: str) -> dict:
                                key=lambda pp: pp.stat().st_mtime,
                                reverse=True)
                 if snaps:
-                    zf.write(str(snaps[0]),
-                             arcname=f"backups/{snaps[0].name}")
+                    snapshot_name = f"backups/{snaps[0].name}"
+                    resources[snapshot_name] = _write_zip_path_resource(
+                        zf, snaps[0], snapshot_name, cancel_event)
                     n += 1
+        _raise_if_cancelled(cancel_event)
         os.replace(tmp_path, out_path)
     except Exception:
         try: os.remove(tmp_path)
@@ -283,7 +400,7 @@ THIS FOLDER ("{INFO_DIR_NAME}")
                              settings, channel subscriptions, the
                              downloaded-video-ID list, filters, queue.
                              To restore: run the app, Health tab >
-                             Backup and Migration > Import. The newest
+                             Backups > Restore. The newest
                              {KEEP_BACKUPS} are kept; older scheduled backups
                              are removed automatically.
 
@@ -377,11 +494,14 @@ def _rotate_backups(info_dir: str, output_dir: str) -> int:
     return removed
 
 
-def run_backup(output_dir: str, *, mark_auto: bool = True) -> dict:
+def run_backup(output_dir: str, *, mark_auto: bool = True,
+               queue_state=None, cancel_event=None) -> dict:
     """Refresh the info folder and write one backup zip into it.
     Returns {"ok", "path", "files", "fts_skipped_reason"} or
     {"ok": False, "error"}. Updates last_backup_ts (+
     last_auto_backup_ts when mark_auto) on success."""
+    if cancel_event is not None and cancel_event.is_set():
+        return {"ok": False, "cancelled": True, "error": "backup cancelled"}
     output_dir = os.path.normpath((output_dir or "").strip())
     if not output_dir or not os.path.isdir(output_dir):
         return {"ok": False, "error": f"archive root unavailable: "
@@ -390,10 +510,18 @@ def run_backup(output_dir: str, *, mark_auto: bool = True) -> dict:
         info_dir = refresh_info_folder(output_dir)
     except OSError as e:
         return {"ok": False, "error": f"cannot create info folder: {e}"}
+    if cancel_event is not None and cancel_event.is_set():
+        return {"ok": False, "cancelled": True, "error": "backup cancelled"}
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     out_path = os.path.join(info_dir, f"{BACKUP_PREFIX}{ts}.zip")
     try:
-        stats = build_backup_zip(out_path)
+        stats = build_backup_zip(
+            out_path,
+            queue_state=queue_state,
+            cancel_event=cancel_event,
+        )
+    except BackupCancelled as e:
+        return {"ok": False, "cancelled": True, "error": str(e)}
     except Exception as e:
         return {"ok": False, "error": f"backup zip failed: {e}"}
     _rotate_backups(info_dir, output_dir)
@@ -420,21 +548,30 @@ class AutoBackupScheduler:
     _TICK_S = 900
     _FAIL_EMIT_COOLDOWN_S = 6 * 3600
 
-    def __init__(self, stream=None):
+    def __init__(self, stream=None, queue_state=None):
         self._stream = stream
+        self._queue_state = queue_state
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_fail_emit = 0.0
 
     def start(self):
-        if self._thread is not None:
+        if self._stop.is_set() or self._thread is not None:
             return
         self._thread = threading.Thread(
             target=self._loop, name="auto-backup", daemon=True)
         self._thread.start()
 
-    def stop(self):
+    def stop(self, timeout: float = 5.0) -> bool:
         self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.0, float(timeout)))
+        return thread is None or not thread.is_alive()
+
+    def is_alive(self) -> bool:
+        thread = self._thread
+        return bool(thread is not None and thread.is_alive())
 
     # internals ---------------------------------------------------------
 
@@ -473,7 +610,13 @@ class AutoBackupScheduler:
             # Archive drive offline/unmounted — quietly retry next tick.
             _log.debug("auto-backup due but archive root unavailable")
             return
-        res = run_backup(output_dir)
+        res = run_backup(
+            output_dir,
+            queue_state=self._queue_state,
+            cancel_event=self._stop,
+        )
+        if res.get("cancelled") and self._stop.is_set():
+            return
         if res.get("ok"):
             _log.info("auto-backup written: %s", res.get("path"))
             self._emit([

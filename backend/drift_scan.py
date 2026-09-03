@@ -16,11 +16,9 @@ sidecars and the FTS index, flagging mismatches:
      reconstruct the .txt entry by concatenating the .jsonl segments'
      text + synthesizing a header with best-effort source tag.
 
-  C. FTS phantoms: segments_fts has rowids with no corresponding row in
-     segments (audit C-9 — FTS5 external-content tables don't auto-sync
-     on source DELETE). Not easily scoped per-channel because
-     segments_fts has no channel column, so the phantom count is
-     reported globally. Fix: run a full FTS rebuild (idempotent, cheap).
+  C. FTS integrity: the raw token index for segments or video titles no
+     longer agrees with its external-content source table. This is global,
+     not channel-scoped. Fix: atomically rebuild and verify both FTS shadows.
 
 The module is deliberately stateless and pure-function — callers (the
 js_api side in main.py) decide when to fire scans and fixes.
@@ -105,6 +103,7 @@ def _scan_txt_titles(folder_path: str) -> dict[str, list[dict[str, Any]]]:
     out: dict[str, list[dict[str, Any]]] = {}
     if not folder_path or not os.path.isdir(folder_path):
         return out
+    record_no = 0
     for dirpath, _dirs, files in os.walk(folder_path):
         for f in files:
             if not f.endswith("Transcript.txt"):
@@ -121,14 +120,18 @@ def _scan_txt_titles(folder_path: str) -> dict[str, list[dict[str, Any]]]:
                             continue
                         vid_id = ""
                         im = _ID_BRACKET_RE.search(raw)
-                        if im:
-                            vid_id = im.group(1)
-                        elif m.group(5):
-                            # v2 headers carry the id in the trailing
-                            # (youtu.be/<id>) field.
+                        if m.group(5):
+                            # A v2 header's explicit watch URL is authoritative.
+                            # A real title can itself end in an 11-character
+                            # bracketed label, so that suffix must never outrank
+                            # the separately written youtu.be identity field.
                             vid_id = m.group(5)
+                        elif im:
+                            vid_id = im.group(1)
                         raw_plain = _ID_BRACKET_RE.sub("", raw).strip() or raw
+                        record_no += 1
                         rec = {"raw": raw, "video_id": vid_id, "txt_path": fp,
+                               "record_no": record_no,
                                "date": (m.group(2) or "").strip("()"),
                                "dur": (m.group(3) or "").strip("()"),
                                "src_tag": (m.group(4) or "").strip("()")}
@@ -215,39 +218,209 @@ def _channel_folder(channel: dict[str, Any], output_dir: str) -> str | None:
 
 
 def _count_fts_phantoms() -> int | None:
-    """Global phantom count: FTS5 rowids with no matching segments row.
+    """Compatibility count of unhealthy FTS indexes.
 
-    Returns 0 if the DB is missing or the query fails. This is a global
-    measure (not per-channel) because segments_fts doesn't carry a
-    channel column — phantoms are tracked via rowids only. In practice
-    the fix (rebuild FTS) is global too, so per-channel scoping wouldn't
-    change the fix path."""
+    External-content FTS tables can return the current content row for a stale
+    token attached to a recycled rowid, so a normal ``LEFT JOIN`` cannot
+    diagnose this safely. Delegate to the one authoritative FTS5 integrity
+    check and return the number of unhealthy shadows. ``fts_phantoms`` remains
+    the public result key for compatibility with the existing Drift dialog.
+    """
+    try:
+        from . import index_maintenance as _maintenance
+        health = _maintenance.fts_health_check()
+    except Exception as exc:
+        _log.warning("FTS health check failed: %s", exc)
+        return None
+    if health.get("ok"):
+        return 0
+    indexes = health.get("indexes") or {}
+    unhealthy = sum(
+        1 for result in indexes.values() if not result.get("ok"))
+    if unhealthy:
+        return unhealthy
+    _log.warning("FTS health check unavailable: %s",
+                 health.get("error") or "unknown error")
+    return None
+
+
+def _record_title_keys(rec: dict[str, Any]) -> set[str]:
+    raw = (rec.get("raw") or rec.get("title") or "").strip()
+    keys = {_norm_title(raw)} if raw else set()
+    plain = _ID_BRACKET_RE.sub("", raw).strip()
+    if plain:
+        keys.add(_norm_title(plain))
+    keys.discard("")
+    return keys
+
+
+def _canonical_title_identities(
+        channel_name: str,
+        ) -> dict[str, dict[str, str]] | None:
+    """Return title-keyed logical DB identities for one channel.
+
+    The inner mapping is ``logical_video_key -> video_id`` so two physical
+    copies of one video remain one candidate. ``None`` means the catalog could
+    not be consulted; callers must fail closed rather than write an ID-less
+    transcript entry.
+    """
+    if not channel_name:
+        return {}
     try:
         from . import index as _idx
         conn = _idx._reader_open()
         if conn is None:
-            _log.warning("FTS phantom count unavailable: index reader not open")
             return None
-        # Reader path — COUNT comparison can run in parallel with any
-        # writer (sweep, ingest). Drift Scan is a diagnostic, so making
-        # it block was extra painful.
+        canonical_ctes = _idx.canonical_videos_cte_sql()
         with _idx._reader_lock:
-            # Count phantoms via LEFT JOIN on rowid — that's the only
-            # reliable way. The old simple-subtraction approach (COUNT
-            # segments_fts - COUNT segments) over-reports because FTS5
-            # external-content tables can include deleted-but-not-merged
-            # entries in their COUNT(*) until the next 'merge'/'optimize'
-            # command. LEFT JOIN finds the rowids that genuinely have no
-            # backing segment.
-            row = conn.execute(
-                "SELECT COUNT(*) FROM segments_fts f "
-                "LEFT JOIN segments s ON f.rowid = s.id "
-                "WHERE s.id IS NULL"
-            ).fetchone()
-        return int(row[0]) if row else 0
-    except Exception as e:
-        _log.warning("FTS phantom count failed; index may be locked/corrupt: %s", e)
+            rows = conn.execute(
+                f"WITH {canonical_ctes} "
+                "SELECT title, logical_video_key, video_id "
+                "FROM canonical_videos "
+                "WHERE channel=? COLLATE NOCASE",
+                (channel_name,),
+            ).fetchall()
+    except Exception as exc:
+        _log.warning("canonical drift identity lookup failed for %r: %s",
+                     channel_name, exc)
         return None
+
+    result: dict[str, dict[str, str]] = {}
+    for title, logical_key, video_id in rows:
+        if not logical_key:
+            continue
+        for key in _record_title_keys({"raw": title or ""}):
+            result.setdefault(key, {})[str(logical_key)] = (
+                str(video_id or "").strip())
+    return result
+
+
+def _unique_canonical_video_id(
+        rec: dict[str, Any],
+        candidates_by_title: dict[str, dict[str, str]] | None,
+        ) -> str:
+    """Resolve one usable ID only when title identifies one logical row."""
+    if candidates_by_title is None:
+        return ""
+    logical: dict[str, str] = {}
+    for key in _record_title_keys(rec):
+        logical.update(candidates_by_title.get(key, {}))
+    if len(logical) != 1:
+        return ""
+    video_id = next(iter(logical.values()), "")
+    return video_id if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id) else ""
+
+
+def _unique_records(records_by_title: dict[str, list[dict[str, Any]]],
+                    path_key: str) -> list[dict[str, Any]]:
+    """Flatten alias-keyed scan records without collapsing distinct IDs."""
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, int]] = set()
+    for records in records_by_title.values():
+        for rec in records:
+            key = (rec.get(path_key, ""), rec.get("raw", ""),
+                   rec.get("video_id", ""), int(rec.get("record_no") or 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(rec)
+    return out
+
+
+def _match_transcript_records(
+        txt_records: list[dict[str, Any]],
+        jsonl_records: list[dict[str, Any]],
+        ) -> tuple[set[int], set[int], set[int], set[int]]:
+    """Pair ID-first, then by title only when the pairing is mutual-unique.
+
+    Returns matched TXT/JSONL indices plus ambiguous unmatched indices. Known
+    but different IDs are never title-matched. Any fallback involving a
+    missing ID must identify exactly one candidate in both directions.
+    """
+    matched_txt: set[int] = set()
+    matched_jsonl: set[int] = set()
+
+    txt_by_id: dict[str, list[int]] = {}
+    jsonl_by_id: dict[str, list[int]] = {}
+    for idx, rec in enumerate(txt_records):
+        if vid := (rec.get("video_id") or "").strip():
+            txt_by_id.setdefault(vid, []).append(idx)
+    for idx, rec in enumerate(jsonl_records):
+        if vid := (rec.get("video_id") or "").strip():
+            jsonl_by_id.setdefault(vid, []).append(idx)
+    for vid in txt_by_id.keys() & jsonl_by_id.keys():
+        for txt_idx, jsonl_idx in zip(
+                txt_by_id[vid], jsonl_by_id[vid], strict=False):
+            matched_txt.add(txt_idx)
+            matched_jsonl.add(jsonl_idx)
+
+    def _candidates(rec, other_records, unmatched):
+        rec_id = (rec.get("video_id") or "").strip()
+        rec_keys = _record_title_keys(rec)
+        result = []
+        for idx in unmatched:
+            other = other_records[idx]
+            other_id = (other.get("video_id") or "").strip()
+            if rec_id and other_id and rec_id != other_id:
+                continue
+            if rec_keys & _record_title_keys(other):
+                result.append(idx)
+        return result
+
+    # Mutual uniqueness prevents two same-title/no-ID records from greedily
+    # consuming one another in iteration order.
+    changed = True
+    while changed:
+        changed = False
+        unmatched_txt = set(range(len(txt_records))) - matched_txt
+        unmatched_jsonl = set(range(len(jsonl_records))) - matched_jsonl
+        for txt_idx in sorted(unmatched_txt):
+            candidates = _candidates(
+                txt_records[txt_idx], jsonl_records, unmatched_jsonl)
+            if len(candidates) != 1:
+                continue
+            jsonl_idx = candidates[0]
+            reverse = _candidates(
+                jsonl_records[jsonl_idx], txt_records, unmatched_txt)
+            if reverse != [txt_idx]:
+                continue
+            matched_txt.add(txt_idx)
+            matched_jsonl.add(jsonl_idx)
+            changed = True
+
+    unmatched_txt = set(range(len(txt_records))) - matched_txt
+    unmatched_jsonl = set(range(len(jsonl_records))) - matched_jsonl
+
+    def _ambiguous_indices(own_records, own_unmatched,
+                           other_records, other_unmatched):
+        ambiguous: set[int] = set()
+        for idx in own_unmatched:
+            rec = own_records[idx]
+            rec_id = (rec.get("video_id") or "").strip()
+            keys = _record_title_keys(rec)
+            same_side = [
+                peer_idx for peer_idx, peer in enumerate(own_records)
+                if peer_idx != idx and keys & _record_title_keys(peer)
+            ]
+            candidates = _candidates(rec, other_records, other_unmatched)
+            if not rec_id and same_side:
+                ambiguous.add(idx)
+                continue
+            for other_idx in candidates:
+                other = other_records[other_idx]
+                other_id = (other.get("video_id") or "").strip()
+                reverse = _candidates(other, own_records, own_unmatched)
+                if (not rec_id or not other_id) and (
+                        len(candidates) != 1 or reverse != [idx]):
+                    ambiguous.add(idx)
+                    break
+        return ambiguous
+
+    ambiguous_txt = _ambiguous_indices(
+        txt_records, unmatched_txt, jsonl_records, unmatched_jsonl)
+    ambiguous_jsonl = _ambiguous_indices(
+        jsonl_records, unmatched_jsonl, txt_records, unmatched_txt)
+    return matched_txt, matched_jsonl, ambiguous_txt, ambiguous_jsonl
 
 
 def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
@@ -255,13 +428,16 @@ def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
 
     Returns:
       {
-        "ok": True,
+        "ok": True|False,
+        "partial": True|False,
+        "errors": [...],  # includes an unavailable FTS health check
         "channel": {"name": ..., "folder": ...},
         "folder": absolute_path,
         "txt_without_jsonl": [{"title", "video_id", "txt_path",
                                 "src_tag", "date"}, ...],
         "jsonl_without_txt": [{"title", "video_id", "jsonl_path"}, ...],
-        "fts_phantoms": N,  # global count
+        "fts_health_issues": N,  # unhealthy global FTS shadows
+        "fts_phantoms": N,  # compatibility alias
         "totals": {"txt_titles": X, "jsonl_titles": Y}
       }
     """
@@ -274,50 +450,16 @@ def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
     txt_map = _scan_txt_titles(folder)
     jsonl_map = _scan_jsonl_titles(folder)
 
-    # Pre-compute video_id sets from each side so the cross-check
-    # inside the loop is O(1) instead of O(N) per entry. Iterate unique
-    # records directly instead of materializing extra flattened lists;
-    # large channels can have many raw/plain alias keys pointing at the
-    # same record objects.
-    def _iter_unique_records(m: dict[str, list[dict[str, Any]]],
-                             path_key: str):
-        seen: set[tuple[str, str]] = set()
-        for records in m.values():
-            for rec in records:
-                dedup_key = (rec.get(path_key, ""), rec.get("raw", ""))
-                if dedup_key in seen:
-                    continue
-                seen.add(dedup_key)
-                yield rec
-
-    _jsonl_vids = {r.get("video_id")
-                   for r in _iter_unique_records(jsonl_map, "jsonl_path")
-                   if r.get("video_id")}
-    _txt_vids = {r.get("video_id")
-                 for r in _iter_unique_records(txt_map, "txt_path")
-                 if r.get("video_id")}
-
-    seen_txt_paths: set = set()
-    seen_jsonl_paths: set = set()
+    txt_records = _unique_records(txt_map, "txt_path")
+    jsonl_records = _unique_records(jsonl_map, "jsonl_path")
+    matched_txt, matched_jsonl, ambiguous_txt, ambiguous_jsonl = (
+        _match_transcript_records(txt_records, jsonl_records))
 
     txt_without_jsonl: list[dict[str, Any]] = []
     jsonl_without_txt: list[dict[str, Any]] = []
 
-    # Iterate the unique records so duplicate-title entries are all
-    # checked individually for drift (rather than the previous
-    # setdefault-first-wins behavior that hid drift for re-uploads).
-    for rec in _iter_unique_records(txt_map, "txt_path"):
-        dedup_key = (rec["txt_path"], rec["raw"])
-        if dedup_key in seen_txt_paths:
-            continue
-        seen_txt_paths.add(dedup_key)
-        key = _norm_title(rec["raw"])
-        if key in jsonl_map:
-            continue
-        raw_plain = _ID_BRACKET_RE.sub("", rec["raw"]).strip()
-        if raw_plain and _norm_title(raw_plain) in jsonl_map:
-            continue
-        if rec.get("video_id") and rec["video_id"] in _jsonl_vids:
+    for idx, rec in enumerate(txt_records):
+        if idx in matched_txt:
             continue
         txt_without_jsonl.append({
             "title": rec["raw"],
@@ -325,57 +467,67 @@ def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
             "txt_path": rec["txt_path"],
             "src_tag": rec.get("src_tag", ""),
             "date": rec.get("date", ""),
+            "auto_repair": idx not in ambiguous_txt,
+            "identity_warning": (
+                "ambiguous same-title identity" if idx in ambiguous_txt else ""),
         })
 
-    for rec in _iter_unique_records(jsonl_map, "jsonl_path"):
-        dedup_key = (rec["jsonl_path"], rec["raw"])
-        if dedup_key in seen_jsonl_paths:
+    canonical_title_ids: dict[str, dict[str, str]] | None = None
+    canonical_title_ids_loaded = False
+    for idx, rec in enumerate(jsonl_records):
+        if idx in matched_jsonl:
             continue
-        seen_jsonl_paths.add(dedup_key)
-        key = _norm_title(rec["raw"])
-        if key in txt_map:
-            continue
-        raw_plain = _ID_BRACKET_RE.sub("", rec["raw"]).strip()
-        if raw_plain and _norm_title(raw_plain) in txt_map:
-            continue
-        if rec.get("video_id") and rec["video_id"] in _txt_vids:
-            continue
+        video_id = (rec.get("video_id") or "").strip()
+        auto_repair = idx not in ambiguous_jsonl
+        identity_warning = (
+            "ambiguous same-title identity" if idx in ambiguous_jsonl else "")
+        if auto_repair and not video_id:
+            if not canonical_title_ids_loaded:
+                canonical_title_ids = _canonical_title_identities(
+                    channel.get("name", ""))
+                canonical_title_ids_loaded = True
+            video_id = _unique_canonical_video_id(rec, canonical_title_ids)
+            if not video_id:
+                auto_repair = False
+                identity_warning = "no unique canonical video ID"
         jsonl_without_txt.append({
             "title": rec["raw"],
-            "video_id": rec.get("video_id", ""),
+            "video_id": video_id,
             "jsonl_path": rec["jsonl_path"],
+            "auto_repair": auto_repair,
+            "identity_warning": identity_warning,
         })
 
-    # FTS phantoms — global count (see _count_fts_phantoms docstring).
-    fts_phantoms = _count_fts_phantoms()
+    # FTS integrity is global. The compatibility helper now delegates to the
+    # authoritative raw-token integrity check for both external-content
+    # shadows; its value is an unhealthy-index count, not a row count.
+    fts_health_issues = _count_fts_phantoms()
 
-    # Distinct counts (dedup-safe).
-    # Bug [32]: normalize paths via normcase+normpath so case differences
-    # on Windows ("C:\Path" vs "c:\path") don't produce false-distinct
-    # entries. The same .txt or .jsonl file viewed through symlinks /
-    # mixed-case parents would have inflated the distinct count.
-    def _np(p: str) -> str:
-        try:
-            return os.path.normcase(os.path.normpath(p))
-        except Exception:
-            return p
-    txt_titles_distinct = len({(_np(r["txt_path"]), r["raw"])
-                                for r in _iter_unique_records(
-                                    txt_map, "txt_path")})
-    jsonl_titles_distinct = len({(_np(r["jsonl_path"]), r["raw"])
-                                  for r in _iter_unique_records(
-                                      jsonl_map, "jsonl_path")})
+    # The alias-keyed scan maps were already flattened by _unique_records.
+    # Count identities here, not distinct title strings: two no-ID headers
+    # with the same title must remain visible as two ambiguous records.
+    txt_titles_distinct = len(txt_records)
+    jsonl_titles_distinct = len(jsonl_records)
+
+    health_errors: list[str] = []
+    if fts_health_issues is None:
+        health_errors.append(
+            "FTS health could not be verified; index consistency is unknown.")
 
     return {
-        "ok": True,
+        "ok": not health_errors,
+        "partial": bool(health_errors),
+        "error": health_errors[0] if health_errors else "",
+        "errors": health_errors,
         "channel": {"name": channel.get("name", ""),
                     "folder": channel.get("folder", "")},
         "folder": folder,
         "txt_without_jsonl": txt_without_jsonl,
         "jsonl_without_txt": jsonl_without_txt,
-        "fts_phantoms": fts_phantoms,
+        "fts_health_issues": fts_health_issues,
+        "fts_phantoms": fts_health_issues,
         "fts_phantoms_error": (
-            "unavailable" if fts_phantoms is None else ""),
+            "unavailable" if fts_health_issues is None else ""),
         "totals": {"txt_titles": txt_titles_distinct,
                    "jsonl_titles": jsonl_titles_distinct},
     }
@@ -446,7 +598,7 @@ def _write_transcript_entry_plain(txt_path: str, title: str, date_str: str,
 
 
 def _rebuild_txt_from_jsonl_entries(jsonl_path: str,
-                                    titles_to_recover: list[str]
+                                    titles_to_recover: list[Any]
                                     ) -> dict[str, dict[str, Any]]:
     """Read jsonl_path, group segments by title for each title in
     titles_to_recover, and return
@@ -454,19 +606,23 @@ def _rebuild_txt_from_jsonl_entries(jsonl_path: str,
              "duration_s": approx_seconds}}
     Titles not found in the file are omitted. Other titles in the file
     are ignored."""
-    want: dict[str, str] = {}
-    for raw_title in titles_to_recover or []:
-        requested = (raw_title or "").strip()
+    requests: list[dict[str, str]] = []
+    for item in titles_to_recover or []:
+        if isinstance(item, dict):
+            requested = (item.get("title") or item.get("raw") or "").strip()
+            requested_id = (item.get("video_id") or "").strip()
+        else:
+            requested = (item or "").strip()
+            match = _ID_BRACKET_RE.search(requested)
+            requested_id = match.group(1) if match else ""
         if not requested:
             continue
-        candidates = [requested]
+        keys = {_norm_title(requested)}
         stripped_id = _ID_BRACKET_RE.sub("", requested).strip()
         if stripped_id and stripped_id != requested:
-            candidates.append(stripped_id)
-        for cand in candidates:
-            key = _norm_title(cand)
-            if key and key not in want:
-                want[key] = requested
+            keys.add(_norm_title(stripped_id))
+        requests.append({"title": requested, "video_id": requested_id,
+                         "keys": keys})
     buckets: dict[str, dict[str, Any]] = {}
     try:
         with open(jsonl_path, "r", encoding="utf-8") as fh:
@@ -481,15 +637,30 @@ def _rebuild_txt_from_jsonl_entries(jsonl_path: str,
                 t = (obj.get("title") or "").strip()
                 if not t:
                     continue
-                match_title = want.get(_norm_title(t))
-                if not match_title:
-                    stripped_t = _ID_BRACKET_RE.sub("", t).strip()
-                    match_title = want.get(_norm_title(stripped_t))
+                vid = (obj.get("video_id") or "").strip()
+                row_keys = {_norm_title(t)}
+                stripped_t = _ID_BRACKET_RE.sub("", t).strip()
+                if stripped_t:
+                    row_keys.add(_norm_title(stripped_t))
+                id_matches = [r for r in requests
+                              if vid and r["video_id"] == vid]
+                if len(id_matches) == 1:
+                    request = id_matches[0]
+                else:
+                    title_matches = [
+                        r for r in requests
+                        if r["keys"] & row_keys
+                        and not (vid and r["video_id"]
+                                 and vid != r["video_id"])
+                    ]
+                    if len(title_matches) != 1:
+                        continue
+                    request = title_matches[0]
+                match_title = request["title"]
                 if not match_title:
                     continue
                 seg_text = (obj.get("text") or "").strip()
                 seg_end = float(obj.get("end") or obj.get("e") or 0)
-                vid = (obj.get("video_id") or "").strip()
                 b = buckets.setdefault(match_title, {"parts": [], "end": 0.0,
                                                      "video_id": vid})
                 if seg_text:
@@ -554,14 +725,15 @@ def _recovered_upload_date(channel_name: str, title: str,
         conn = _idx._reader_open()
         if conn is None:
             return ""
+        canonical_ctes = _idx.canonical_videos_cte_sql()
         with _idx._reader_lock:
             if video_id:
                 row = conn.execute(
-                    "SELECT upload_ts, filepath FROM videos "
+                    f"WITH {canonical_ctes} "
+                    "SELECT logical_upload_ts, filepath FROM canonical_videos "
                     "WHERE channel=? COLLATE NOCASE "
                     "AND video_id=? "
-                    "AND is_duplicate_of IS NULL "
-                    "ORDER BY (upload_ts IS NULL) ASC, id ASC LIMIT 1",
+                    "AND is_available_copy=1 LIMIT 1",
                     (channel_name, video_id)).fetchone()
                 if row:
                     date = _date_from_epoch(row[0])
@@ -571,23 +743,26 @@ def _recovered_upload_date(channel_name: str, title: str,
                     if date:
                         return date
             rows = conn.execute(
-                "SELECT title, upload_ts, filepath FROM videos "
+                f"WITH {canonical_ctes} "
+                "SELECT title, logical_upload_ts, filepath FROM canonical_videos "
                 "WHERE channel=? COLLATE NOCASE "
                 "AND filepath IS NOT NULL AND filepath != '' "
-                "AND is_duplicate_of IS NULL",
+                "AND is_available_copy=1",
                 (channel_name,)).fetchall()
+        matching_rows = []
         for db_title, upload_ts, fp in rows:
             db_key = _norm_title(db_title or "")
             db_plain = _norm_title(_ID_BRACKET_RE.sub("", db_title or "").strip())
             if db_key not in {title_key, plain_key} and db_plain not in {
                     title_key, plain_key}:
                 continue
-            date = _date_from_epoch(upload_ts)
-            if date:
-                return date
-            date = _file_mtime_date(fp or "")
-            if date:
-                return date
+            matching_rows.append((upload_ts, fp))
+        # A no-ID title fallback is safe only when exactly one logical
+        # canonical candidate exists. Same-title videos get no guessed date.
+        if len(matching_rows) == 1:
+            upload_ts, fp = matching_rows[0]
+            return (_date_from_epoch(upload_ts)
+                    or _file_mtime_date(fp or ""))
     except Exception as e:
         _log.debug("recovered upload date lookup failed: %s", e)
     return ""
@@ -603,11 +778,14 @@ def apply_channel(channel: dict[str, Any], output_dir: str,
 
     Returns:
       {
-        "ok": True,
+        "ok": True|False,
+        "partial": True|False,
+        "errors": [...],
         "actions": {
           "txt_reconstructed": N,  # entries recovered from .jsonl
           "retranscribe_queued": M,  # orphan .txt queued for Whisper
           "retranscribe_skipped": K,  # orphan .txt with no findable video
+          "retranscribe_failed": F,  # queue explicitly rejected/errored
           "fts_rebuilt": True|False,
         },
         "details": {
@@ -621,38 +799,46 @@ def apply_channel(channel: dict[str, Any], output_dir: str,
     main.py provides to queue a Whisper retranscribe task. If None,
     the retranscribe category is only reported, not acted on.
 
-    `rebuild_fts_fn()` is the hook to rebuild FTS. If None, the phantom
-    category is only reported, not acted on."""
+    `rebuild_fts_fn()` is the hook to rebuild FTS. If None, an unhealthy
+    FTS result is only reported, not acted on."""
 
     if scan_result is None:
         scan_result = scan_channel(channel, output_dir)
-        if not scan_result.get("ok"):
-            return scan_result
+    if not scan_result.get("ok"):
+        # A supplied scan is subject to the same fail-closed contract as a
+        # freshly generated one. In particular, never apply a payload whose
+        # FTS health phase was unavailable/partial.
+        return scan_result
 
     details = {
         "txt_reconstructed_titles": [],
         "retranscribe_queued_titles": [],
         "retranscribe_skipped_titles": [],
+        "retranscribe_failed_titles": [],
+        "ambiguous_skipped_titles": [],
     }
     actions = {
         "txt_reconstructed": 0,
         "retranscribe_queued": 0,
         "retranscribe_skipped": 0,
+        "retranscribe_failed": 0,
+        "ambiguous_skipped": 0,
         "fts_rebuilt": False,
     }
+    errors: list[str] = []
 
     # ─── Fix B: JSONL-without-TXT → reconstruct .txt entries ───────────
     # Group orphans by jsonl_path so we only open each file once.
-    jsonl_orphans: dict[str, list[str]] = {}
+    jsonl_orphans: dict[str, list[dict[str, Any]]] = {}
     for orphan in scan_result.get("jsonl_without_txt", []) or []:
-        jp = orphan["jsonl_path"]
-        jsonl_orphans.setdefault(jp, []).append(orphan["title"])
-
-    for jsonl_path, titles in jsonl_orphans.items():
-        # Reconstruct content from the .jsonl segments.
-        rebuilt = _rebuild_txt_from_jsonl_entries(jsonl_path, titles)
-        if not rebuilt:
+        if orphan.get("auto_repair") is False:
+            actions["ambiguous_skipped"] += 1
+            details["ambiguous_skipped_titles"].append(orphan["title"])
             continue
+        jp = orphan["jsonl_path"]
+        jsonl_orphans.setdefault(jp, []).append(orphan)
+
+    for jsonl_path, orphans in jsonl_orphans.items():
         # Derive the matching .txt path (drop leading dot prefix, swap
         # .jsonl → .txt). Format: {dir}/.{name} Transcript.jsonl →
         # {dir}/{name} Transcript.txt
@@ -662,7 +848,14 @@ def apply_channel(channel: dict[str, Any], output_dir: str,
         if base.endswith(".jsonl"):
             base = base[:-6] + ".txt"
         txt_path = os.path.join(os.path.dirname(jsonl_path), base)
-        for title, data in rebuilt.items():
+        for orphan in orphans:
+            # Resolve each identity independently. This preserves two known
+            # IDs that happen to share a title instead of merging their text.
+            rebuilt = _rebuild_txt_from_jsonl_entries(jsonl_path, [orphan])
+            title = orphan["title"]
+            data = rebuilt.get(title)
+            if not data:
+                continue
             src_tag = "RECOVERED-FROM-JSONL"
             date_str = (
                 _recovered_upload_date(
@@ -682,38 +875,118 @@ def apply_channel(channel: dict[str, Any], output_dir: str,
 
     # ─── Fix A: TXT-without-JSONL → queue retranscribe ─────────────────
     if enqueue_retranscribe_fn is not None:
-        # Need the video file path for each orphan. Look up by title in
-        # the FTS DB's videos table (scoped to this channel).
-        filepaths_by_title = _lookup_video_filepaths(
-            channel.get("name", ""),
-            [o["title"] for o in scan_result.get("txt_without_jsonl", [])])
         for orphan in scan_result.get("txt_without_jsonl", []) or []:
             title = orphan["title"]
-            raw_plain = _ID_BRACKET_RE.sub("", title).strip() or title
-            fp = (filepaths_by_title.get(_norm_title(title))
-                  or filepaths_by_title.get(_norm_title(raw_plain)))
+            if orphan.get("auto_repair") is False:
+                actions["ambiguous_skipped"] += 1
+                details["ambiguous_skipped_titles"].append(title)
+                continue
+            fp = _resolve_video_filepath(
+                channel.get("name", ""), title,
+                orphan.get("video_id", ""))
             if not fp or not os.path.isfile(fp):
                 actions["retranscribe_skipped"] += 1
                 details["retranscribe_skipped_titles"].append(title)
                 continue
             try:
-                enqueue_retranscribe_fn(fp, title, orphan.get("video_id", ""))
-                actions["retranscribe_queued"] += 1
-                details["retranscribe_queued_titles"].append(title)
-            except Exception:
-                actions["retranscribe_skipped"] += 1
-                details["retranscribe_skipped_titles"].append(title)
+                enqueue_result = enqueue_retranscribe_fn(
+                    fp, title, orphan.get("video_id", ""))
+                enqueue_ok = (
+                    enqueue_result.get("ok") is True
+                    if isinstance(enqueue_result, dict)
+                    else enqueue_result is True
+                )
+                if enqueue_ok:
+                    actions["retranscribe_queued"] += 1
+                    details["retranscribe_queued_titles"].append(title)
+                    continue
+                enqueue_error = (
+                    str(enqueue_result.get("error") or "queue rejected the job")
+                    if isinstance(enqueue_result, dict)
+                    else "queue did not confirm the job"
+                )
+                actions["retranscribe_failed"] += 1
+                details["retranscribe_failed_titles"].append(title)
+                errors.append(
+                    f"Could not queue re-transcription for {title}: "
+                    f"{enqueue_error}")
+            except Exception as exc:
+                actions["retranscribe_failed"] += 1
+                details["retranscribe_failed_titles"].append(title)
+                errors.append(
+                    f"Could not queue re-transcription for {title}: {exc}")
 
-    # ─── Fix C: FTS phantoms → rebuild ─────────────────────────────────
-    if (scan_result.get("fts_phantoms") or 0) > 0 and rebuild_fts_fn is not None:
+    # ─── Fix C: unhealthy FTS shadow(s) → atomic dual rebuild ───────────
+    fts_health_issues = scan_result.get(
+        "fts_health_issues", scan_result.get("fts_phantoms")) or 0
+    if fts_health_issues > 0 and rebuild_fts_fn is not None:
         try:
-            rebuild_fts_fn()
-            actions["fts_rebuilt"] = True
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+            rebuild_result = rebuild_fts_fn()
+            actions["fts_rebuilt"] = (
+                bool(rebuild_result.get("ok"))
+                if isinstance(rebuild_result, dict)
+                else bool(rebuild_result)
+            )
+            if not actions["fts_rebuilt"]:
+                rebuild_error = (
+                    str(rebuild_result.get("error") or "rebuild was rejected")
+                    if isinstance(rebuild_result, dict)
+                    else "rebuild was rejected"
+                )
+                errors.append(f"Search index rebuild failed: {rebuild_error}")
+        except Exception as exc:
+            errors.append(f"Search index rebuild failed: {exc}")
 
-    return {"ok": True, "actions": actions, "details": details,
-            "scan": scan_result}
+    return {
+        "ok": not errors,
+        "partial": bool(errors),
+        "error": errors[0] if errors else "",
+        "errors": errors,
+        "actions": actions,
+        "details": details,
+        "scan": scan_result,
+    }
+
+
+def _resolve_video_filepath(channel_name: str, title: str,
+                            video_id: str = "") -> str:
+    """Resolve one repair target by ID, or by one unique logical title."""
+    if not channel_name or not title:
+        return ""
+    try:
+        from . import index as _idx
+        conn = _idx._reader_open()
+        if conn is None:
+            return ""
+        canonical_ctes = _idx.canonical_videos_cte_sql()
+        with _idx._reader_lock:
+            rows = conn.execute(
+                f"WITH {canonical_ctes} "
+                "SELECT title, filepath, video_id FROM canonical_videos "
+                "WHERE channel=? COLLATE NOCASE "
+                "AND filepath IS NOT NULL AND filepath != '' "
+                "AND is_available_copy=1",
+                (channel_name,),
+            ).fetchall()
+        requested_id = (video_id or "").strip()
+        if requested_id:
+            candidates = [row for row in rows
+                          if (row[2] or "").strip() == requested_id]
+        else:
+            requested_keys = _record_title_keys({"raw": title})
+            title_rows = [row for row in rows
+                          if requested_keys & _record_title_keys(
+                              {"raw": row[0] or ""})]
+            if len(title_rows) != 1:
+                return ""
+            candidates = title_rows
+        if not candidates:
+            return ""
+        return candidates[0][1] or ""
+    except Exception as e:
+        _log.warning("video filepath resolution failed for %r: %s",
+                     channel_name, e)
+        return ""
 
 
 def _lookup_video_filepaths(channel_name: str,
@@ -725,86 +998,18 @@ def _lookup_video_filepaths(channel_name: str,
     out: dict[str, str] = {}
     if not channel_name or not titles:
         return out
-    try:
-        from . import index as _idx
-        conn = _idx._reader_open()
-        if conn is None:
-            return out
-        # Reader path — pure SELECT against videos.
-        with _idx._reader_lock:
-            # Pre-fetch all this channel's (title, filepath) so we can
-            # match in Python and handle [id] bracket variants.
-            rows = conn.execute(
-                "SELECT title, filepath FROM videos "
-                "WHERE channel=? COLLATE NOCASE "
-                "AND filepath IS NOT NULL AND filepath != '' "
-                "AND is_duplicate_of IS NULL",
-                (channel_name,)).fetchall()
-        # Build a lookup map keyed by normalized title (with and without
-        # [id] bracket).
-        db_map: dict[str, str] = {}
-        for db_title, fp in rows:
-            if not db_title or not fp:
-                continue
-            db_map[_norm_title(db_title)] = fp
-            raw_plain = _ID_BRACKET_RE.sub("", db_title).strip()
-            if raw_plain:
-                db_map[_norm_title(raw_plain)] = fp
-        for t in titles:
-            key = _norm_title(t)
-            if key in db_map:
-                out[key] = db_map[key]
-                continue
-            raw_plain = _ID_BRACKET_RE.sub("", t).strip()
-            if raw_plain:
-                pkey = _norm_title(raw_plain)
-                if pkey in db_map:
-                    out[pkey] = db_map[pkey]
-    except Exception as e:
-        _log.warning("video filepath lookup failed for %r: %s",
-                     channel_name, e)
+    for title in titles:
+        fp = _resolve_video_filepath(channel_name, title)
+        if fp:
+            out[_norm_title(title)] = fp
     return out
 
 
 def rebuild_fts_index() -> bool:
-    """Run the FTS5 rebuild idiom to clean up external-content phantom
-    rows. Idempotent and cheap (~1s even on large DBs).
-
-    after the rebuild, verify the FTS table is responsive
-    (SELECT COUNT(*) works and returns >= 0) before claiming success.
-    A locked DB or corrupted FTS5 index can silently no-op the
-    rebuild INSERT; the read-back confirms the write actually
-    landed.
-    """
+    """Compatibility shim for the authoritative atomic dual-FTS rebuild."""
     try:
-        from . import index as _idx
-        conn = _idx._open()
-        if conn is None:
-            return False
-        with _idx._db_lock:
-            # Capture pre-rebuild count for sanity check.
-            try:
-                _before = conn.execute(
-                    "SELECT COUNT(*) FROM segments_fts").fetchone()[0]
-            except Exception:
-                _before = None
-            conn.execute(
-                "INSERT INTO segments_fts(segments_fts) VALUES('rebuild')")
-            conn.commit()
-            # Post-rebuild verification: the table should still be
-            # queryable. If this raises, the "success" we'd otherwise
-            # report is a lie — bubble up False so callers can show
-            # a real error.
-            try:
-                _after = conn.execute(
-                    "SELECT COUNT(*) FROM segments_fts").fetchone()[0]
-            except Exception:
-                return False
-            # If the rebuild succeeded, _after should equal or exceed
-            # _before minus phantoms. We don't assert an exact match
-            # (rebuild legitimately removes phantoms). Just confirm
-            # the read worked.
-            _ = (_before, _after)
-        return True
-    except Exception:
+        from . import index_maintenance as _maintenance
+        return bool(_maintenance.rebuild_fts_index().get("ok"))
+    except Exception as exc:
+        _log.warning("FTS rebuild failed: %s", exc)
         return False

@@ -55,10 +55,11 @@ def _scan_channel_videos(folder: Path) -> list[tuple[str, str, int | None, int |
     for every video file.
 
     video_id lookup priority:
-      1. Trailing `[id]` bracket in filename (legacy naming).
-      2. Index DB's `videos` table via filepath (current + OLD's actual
-         naming — `%(title)s.%(ext)s` with NO id bracket, so the DB is
-         the only mapping). users hit this: the metadata recheck saw
+      1. Trailing `[id]` bracket in filename (legacy naming and current
+         duplicate-title collision fallback).
+      2. Index DB's `videos` table via filepath (ordinary current + OLD
+         naming remains title-only, so the DB is the only mapping). users hit
+         this: the metadata recheck saw
          all 642 playlist IDs as "not on disk" because this function
          returned vid_id="" for every file (no bracket to parse), so
          the `by_id` map was empty, the caller treated every ID as
@@ -86,15 +87,10 @@ def _scan_channel_videos(folder: Path) -> list[tuple[str, str, int | None, int |
             _cached = _scan_videos_cache.get(_folder_str)
         if _cached is not None and _cached[0] == _fp:
             return list(_cached[1])
-    # Match a YouTube video_id bracket at the END of the stem. A
-    # separate post-filter rejects matches that are pure letters —
-    # a user's channel archive has 13 files with the filename
-    # suffix `[a-user-channel]` (the channel name), which is exactly
-    # 11 letters and matches the `[A-Za-z0-9_-]{11}` pattern. Real
-    # YouTube video_ids are random 11-char picks from that set and
-    # statistically always include at least one digit/_/-.
+    # Match a YouTube video_id bracket at the END of the stem. All-letter
+    # IDs are valid; ambiguity with a user label must be resolved through the
+    # filepath DB/sidecar evidence rather than rejecting a valid ID shape.
     bracket_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]\s*$")
-    _vid_looks_fake = lambda s: s.isalpha() # all-letters → not a YT id
     # Pre-load videos-table rows for this channel folder so we can
     # fill in missing video_ids without N queries.
     # Use the read-only connection so this scan doesn't contend with
@@ -131,11 +127,15 @@ def _scan_channel_videos(folder: Path) -> list[tuple[str, str, int | None, int |
             fp = os.path.join(dp, fn)
             stem, _ext = os.path.splitext(fn)
             m = bracket_re.search(stem)
-            vid_id = m.group(1) if m else ""
-            if vid_id and _vid_looks_fake(vid_id):
-                vid_id = ""
+            filename_candidate = m.group(1) if m else ""
+            # Exact catalog and yt-dlp sidecar identities outrank the filename
+            # bracket.  This keeps valid all-letter IDs while preventing an
+            # old 11-letter user label from overriding stronger evidence.
+            vid_id = fp_to_id.get(os.path.normpath(fp).lower(), "")
             if not vid_id:
-                vid_id = fp_to_id.get(os.path.normpath(fp).lower(), "")
+                vid_id = _read_info_json_vid(fp)
+            if not vid_id and not filename_candidate.isalpha():
+                vid_id = filename_candidate
             # Strip the trailing `[...]` suffix from the title even
             # if it was a fake one — we still don't want it in the
             # title display.

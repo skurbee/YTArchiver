@@ -32,6 +32,7 @@
     const panel = document.getElementById("panel-settings");
     const browseOut = document.getElementById("settings-browse-output");
     const browseVid = document.getElementById("settings-browse-video");
+    const autorunModeSel = document.getElementById("settings-autorun-mode");
     const ytdlpBtn = document.getElementById("btn-ytdlp-update");
     const ytdlpChannelSel = document.getElementById("settings-ytdlp-channel");
     const ytdlpUpdateModeSel = document.getElementById("settings-ytdlp-update-mode");
@@ -40,6 +41,10 @@
     const bkExpBtn = document.getElementById("btn-export-backup");
     const bkImpBtn = document.getElementById("btn-import-backup");
     if (!panel) return;
+    let _lastAutomaticBackupTs = 0;
+    if (autorunModeSel) {
+      autorunModeSel.dataset.savedValue = autorunModeSel.value || "clock";
+    }
 
     // ─── Auto-save ──────────────────────────────────────────────────
     // No Save button: every editable field persists itself the moment it
@@ -63,29 +68,87 @@
       }, 1600);
     }
     async function saveField(key, value) {
-      if (!nativeBridgeUp()) return;
+      if (!nativeBridgeUp()) {
+        flashSaved(false);
+        window._showToast?.(
+          "YTArchiver is still starting. Try again in a moment.", "warn");
+        return false;
+      }
       try {
         const res = await bridgeCall("settings_save", { [key]: value });
         if (res?.ok) {
           flashSaved(true);
+          return true;
         } else {
           flashSaved(false);
           window._showToast?.(res?.error || "Save failed.", "error");
+          return false;
         }
       } catch (e) {
         flashSaved(false);
         window._showToast?.("Save failed: " + e, "error");
+        return false;
       }
+    }
+    function rememberControl(el, value) {
+      if (!el) return;
+      el.dataset.savedValue = typeof value === "boolean"
+        ? (value ? "true" : "false") : String(value ?? "");
+    }
+    async function persistControl(el, key, value, options = {}) {
+      if (!el) return false;
+      const isChecked = options.checked === true;
+      const fallback = isChecked ? !value : "";
+      const savedRaw = el.dataset.savedValue;
+      const previous = savedRaw === undefined
+        ? fallback
+        : (isChecked ? savedRaw === "true" : savedRaw);
+      el.disabled = true;
+      el._ytddRepaint?.();
+      const ok = await saveField(key, value);
+      if (ok) {
+        rememberControl(el, value);
+        options.onSaved?.(value, previous);
+      } else {
+        if (isChecked) el.checked = !!previous;
+        else el.value = String(previous ?? "");
+        el._ytddRepaint?.();
+        options.onRollback?.(previous);
+      }
+      el.disabled = false;
+      el._ytddRepaint?.();
+      return ok;
     }
     // Last-persisted disk-staleness, so a blur on an invalid/blank value
     // can revert the field instead of saving garbage.
     let _diskLastGood = "24";
     let _ytdlpCheckLastGood = "1";
+    let _trashRetentionLastGood = "30";
     let _ytdlpUpdateMode = "automatic";
     let _ytdlpAutoUpdatable = true;
     let _archiveCapacity = { mode: "percent", percent: 90, free_gb: 100 };
     let _archiveCapacityLastGood = "90";
     let _trafficStatus = null;
+
+    function setTrashRetentionValue(select, value) {
+      if (!select) return;
+      const days = Number(value);
+      const valid = Number.isInteger(days) && days >= 0 && days <= 3650;
+      const normalized = String(valid ? days : 30);
+      select.querySelectorAll("option[data-trash-custom]").forEach((option) => {
+        option.remove();
+      });
+      if (!Array.from(select.options).some((option) => option.value === normalized)) {
+        const option = document.createElement("option");
+        option.value = normalized;
+        option.textContent = `${days.toLocaleString()} days (custom)`;
+        option.dataset.trashCustom = "1";
+        select.appendChild(option);
+      }
+      select.value = normalized;
+      _trashRetentionLastGood = normalized;
+      select._ytddRepaint?.();
+    }
 
     function renderTraffic(status) {
       if (status) _trafficStatus = status;
@@ -133,7 +196,7 @@
         if (cooldown && t.circuit?.active) {
           const until = new Date(t.circuit.cooldown_until * 1000);
           cooldown.textContent =
-            `Emergency cooldown until ${until.toLocaleString()}`;
+            `YouTube requests paused until ${until.toLocaleString()}`;
           cooldown.hidden = false;
         } else if (cooldown) {
           cooldown.textContent = "";
@@ -202,24 +265,34 @@
     }
 
     async function saveTraffic(payload) {
-      if (!nativeBridgeUp()) return;
+      if (!nativeBridgeUp()) {
+        renderTraffic(_trafficStatus);
+        window._showToast?.(
+          "YTArchiver is still starting. Try again in a moment.", "warn");
+        return false;
+      }
       try {
         const res = await bridgeCall("settings_save", payload);
         if (!res?.ok) {
           flashSaved(false);
           window._showToast?.(res?.error || "Save failed.", "error");
-          return;
+          renderTraffic(_trafficStatus);
+          return false;
         }
         flashSaved(true);
         if (res.budget_autosync_disabled) {
           window._showToast?.(
             'Auto-sync was turned Off because "When budget allows" is unavailable in Unlimited mode.',
             "warn");
+          window.dispatchEvent(new Event("autorun-state-changed"));
         }
         await refreshTraffic();
+        return true;
       } catch (e) {
         flashSaved(false);
         window._showToast?.("Save failed: " + e, "error");
+        renderTraffic(_trafficStatus);
+        return false;
       }
     }
 
@@ -264,6 +337,27 @@
         : `Last backup: ${label}`;
     }
 
+    function _fmtAutomaticBackupAge(ts, interval) {
+      if (interval === "off") return "Automatic backups are off.";
+      if (!ts) {
+        return "No automatic backup has run yet. YTArchiver checks while the app is open.";
+      }
+      const days = Math.max(0,
+        Math.floor((Date.now() / 1000 - Number(ts)) / 86400));
+      const label = days === 0 ? "today"
+        : days === 1 ? "yesterday"
+        : `${days} days ago`;
+      return `Last automatic backup: ${label}`;
+    }
+
+    function _renderAutomaticBackupAge(interval) {
+      const status = document.getElementById("backup-auto-age-display");
+      if (status) {
+        status.textContent = _fmtAutomaticBackupAge(
+          _lastAutomaticBackupTs, interval || "off");
+      }
+    }
+
     function _fmtYtdlpCheckAge(ts) {
       if (!ts) return "never checked";
       const wholeDays = Math.max(0,
@@ -294,23 +388,33 @@
       if (!nativeBridgeUp()) return;
       try {
         const s = await bridgeCall("settings_load");
-        document.getElementById("settings-output-dir").value = s.output_dir || "";
-        document.getElementById("settings-video-dir").value = s.video_out_dir || "";
-        document.getElementById("settings-whisper-model").value = s.whisper_model || "small";
-        document.getElementById("settings-default-res").value = s.default_resolution || "720";
-        document.getElementById("settings-log-mode").value = s.log_mode || "Simple";
+        const outputEl = document.getElementById("settings-output-dir");
+        const videoDirEl = document.getElementById("settings-video-dir");
+        const whisperEl = document.getElementById("settings-whisper-model");
+        const defaultResEl = document.getElementById("settings-default-res");
+        const logModeEl = document.getElementById("settings-log-mode");
+        if (outputEl) { outputEl.value = s.output_dir || ""; rememberControl(outputEl, outputEl.value); }
+        if (videoDirEl) { videoDirEl.value = s.video_out_dir || ""; rememberControl(videoDirEl, videoDirEl.value); }
+        if (whisperEl) { whisperEl.value = s.whisper_model || "small"; rememberControl(whisperEl, whisperEl.value); }
+        if (defaultResEl) { defaultResEl.value = s.default_resolution || "720"; rememberControl(defaultResEl, defaultResEl.value); }
+        if (logModeEl) { logModeEl.value = s.log_mode || "Simple"; rememberControl(logModeEl, logModeEl.value); }
         const legacySubsEl = document.getElementById("settings-legacy-subs-tab");
-        if (legacySubsEl) legacySubsEl.checked = !!s.legacy_subs_tab;
+        if (legacySubsEl) {
+          legacySubsEl.checked = !!s.legacy_subs_tab;
+          rememberControl(legacySubsEl, legacySubsEl.checked);
+        }
         window._applyLegacySubsMode?.(!!s.legacy_subs_tab);
         if (ytdlpChannelSel) {
           ytdlpChannelSel.value =
             ["stable", "nightly"].includes(s.ytdlp_channel) ? s.ytdlp_channel : "stable";
+          rememberControl(ytdlpChannelSel, ytdlpChannelSel.value);
           ytdlpChannelSel._ytddRepaint?.();
         }
         _ytdlpUpdateMode = ["automatic", "notify", "off"].includes(s.ytdlp_update_mode)
           ? s.ytdlp_update_mode : "automatic";
         if (ytdlpUpdateModeSel) {
           ytdlpUpdateModeSel.value = _ytdlpUpdateMode;
+          rememberControl(ytdlpUpdateModeSel, _ytdlpUpdateMode);
           ytdlpUpdateModeSel._ytddRepaint?.();
         }
         const ytdlpCheckEl = document.getElementById("settings-ytdlp-check-days");
@@ -319,6 +423,7 @@
             parseInt(s.ytdlp_update_check_days ?? 1, 10) || 1));
           ytdlpCheckEl.value = String(days);
           _ytdlpCheckLastGood = ytdlpCheckEl.value;
+          rememberControl(ytdlpCheckEl, ytdlpCheckEl.value);
         }
         _renderYtdlpUpdateControls();
         const ytdlpCheckStatus = document.getElementById("settings-ytdlp-check-status");
@@ -328,15 +433,28 @@
         }
         // Startup knobs
         const stEl = document.getElementById("settings-disk-staleness");
-        if (stEl) { stEl.value = String(s.disk_scan_staleness_hours ?? 24); _diskLastGood = stEl.value; }
+        if (stEl) {
+          stEl.value = String(s.disk_scan_staleness_hours ?? 24);
+          _diskLastGood = stEl.value;
+          rememberControl(stEl, stEl.value);
+        }
         _archiveCapacity = {
           mode: s.archive_capacity_warning_mode === "free_gb" ? "free_gb" : "percent",
           percent: _capClamp("percent", s.archive_capacity_warning_percent ?? 90) ?? 90,
           free_gb: _capClamp("free_gb", s.archive_capacity_warning_free_gb ?? 100) ?? 100,
         };
         _renderArchiveCapacityControls();
+        rememberControl(
+          document.getElementById("settings-archive-capacity-mode"),
+          _archiveCapacity.mode);
+        rememberControl(
+          document.getElementById("settings-archive-capacity-threshold"),
+          _archiveCapacityLastGood);
         const avgEl = document.getElementById("settings-show-avg-size");
-        if (avgEl) avgEl.checked = (s.show_avg_size !== false);
+        if (avgEl) {
+          avgEl.checked = (s.show_avg_size !== false);
+          rememberControl(avgEl, avgEl.checked);
+        }
         // Apply current toggle to the Subs table right away so opening
         // Settings doesn't require a save to see the effect.
         window._applySubsAvgVisibility?.(s.show_avg_size !== false);
@@ -347,6 +465,7 @@
         if (cbEl) {
           const cb = (s.close_behavior || "ask").toLowerCase();
           cbEl.value = ["ask","tray","quit"].includes(cb) ? cb : "ask";
+          rememberControl(cbEl, cbEl.value);
         }
         // v80 auto-backup cadence — "off" | "daily" | "weekly" | "monthly".
         const abEl = document.getElementById("settings-auto-backup");
@@ -354,6 +473,15 @@
           const ab = (s.auto_backup_interval || "off").toLowerCase();
           abEl.value = ["off","daily","weekly","monthly"].includes(ab)
             ? ab : "off";
+          abEl.dataset.savedValue = abEl.value;
+          _lastAutomaticBackupTs = Number(s.last_auto_backup_ts) || 0;
+          _renderAutomaticBackupAge(abEl.value);
+        }
+        const trashRetentionEl = document.getElementById(
+          "settings-trash-retention-days");
+        if (trashRetentionEl) {
+          setTrashRetentionValue(
+            trashRetentionEl, s.trash_retention_days ?? 30);
         }
         const trafficMode = document.getElementById("settings-youtube-traffic-mode");
         if (trafficMode) {
@@ -370,23 +498,32 @@
           if (el) el.value = String(value);
         });
         if (s.youtube_traffic) renderTraffic(s.youtube_traffic);
-        // Auto-sync timing mode — read from the live scheduler state
-        // (not the settings blob, since it's applied immediately).
+        // Auto-sync timing is controlled by the live scheduler rather than
+        // settings_save, so use its authoritative state when Settings opens.
         try {
-          const amEl = document.getElementById("settings-autorun-mode");
-          if (amEl) {
-            const ast = await bridgeCall("autorun_state");
-            amEl.value = (ast && ast.mode === "clock") ? "clock" : "timer";
+          const state = await bridgeCall("autorun_state");
+          if (autorunModeSel) {
+            const mode = state?.mode === "clock" ? "clock" : "timer";
+            autorunModeSel.value = mode;
+            autorunModeSel.dataset.savedValue = mode;
+            rememberControl(autorunModeSel, mode);
+            autorunModeSel._ytddRepaint?.();
           }
-        } catch (e) { /* ignore */ }
+        } catch (_e) { /* autoSync's periodic refresh can recover */ }
         // Launch at boot — read Registry state, not config.
         try {
           const bootState = await bridgeCall("launch_at_boot_get");
           const labEl = document.getElementById("settings-launch-at-boot");
           const lbmEl = document.getElementById("settings-boot-minimized");
           const lbmWrap = document.getElementById("settings-boot-minimized-wrap");
-          if (labEl) labEl.checked = !!bootState?.enabled;
-          if (lbmEl) lbmEl.checked = !!bootState?.minimized;
+          if (labEl) {
+            labEl.checked = !!bootState?.enabled;
+            rememberControl(labEl, labEl.checked);
+          }
+          if (lbmEl) {
+            lbmEl.checked = !!bootState?.minimized;
+            rememberControl(lbmEl, lbmEl.checked);
+          }
           if (lbmWrap) lbmWrap.hidden = !bootState?.enabled;
         } catch (_e) { /* non-fatal */ }
         // BUG FIX (2026-05-14): the custom `.yt-dd` widget mirrors a
@@ -395,22 +532,15 @@
         // visible trigger label stays stuck at whatever was selected
         // at DOM-ready (the HTML default — `<option selected>`). User
         // saw "Ask each time" forever even with close_behavior=quit in
-        // config. Fix: explicitly call each select's `_ytddRepaint`
-        // after settings_load completes. Belt-and-suspenders: also
-        // dispatch `change` so any listeners reacting to live selection
-        // changes also fire (matches a user clicking the option).
-        // Skip repaint if the Settings panel is hidden — repaint
-        // reads layout sizes that are 0 / wrong while display:none,
-        // so the cached widths would be junk until the next activate
-        // event re-fires it anyway (audit: settingsTab H241).
-        const _settingsPanel = document.getElementById("panel-settings");
-        const _settingsHidden = !_settingsPanel
-          || _settingsPanel.classList.contains("active") === false;
-        if (!_settingsHidden) {
-          document.querySelectorAll(".settings-view .ctl-select").forEach((sel) => {
-            if (sel._ytddRepaint) sel._ytddRepaint();
-          });
-        }
+        // config. Explicitly repaint selects in whichever owning panel is
+        // visible. Hidden-panel layout sizes are zero, so those controls are
+        // repainted when their tab becomes active instead.
+        document.querySelectorAll(".settings-view .ctl-select").forEach((sel) => {
+          const ownerPanel = sel.closest(".tab-panel");
+          if (ownerPanel?.classList.contains("active") && sel._ytddRepaint) {
+            sel._ytddRepaint();
+          }
+        });
         // Backup age (T295)
         const bkAgeEl = document.getElementById("backup-age-display");
         if (bkAgeEl) bkAgeEl.textContent = _fmtBackupAge(s.last_backup_ts || 0);
@@ -428,11 +558,14 @@
     // ── Per-field auto-save wiring ──────────────────────────────────
     // Selects: persist the new value immediately on change.
     document.getElementById("settings-whisper-model")
-      ?.addEventListener("change", (e) => saveField("whisper_model", e.target.value));
+      ?.addEventListener("change", (e) =>
+        persistControl(e.target, "whisper_model", e.target.value));
     document.getElementById("settings-default-res")
-      ?.addEventListener("change", (e) => saveField("default_resolution", e.target.value));
+      ?.addEventListener("change", (e) =>
+        persistControl(e.target, "default_resolution", e.target.value));
     document.getElementById("settings-log-mode")
-      ?.addEventListener("change", (e) => saveField("log_mode", e.target.value));
+      ?.addEventListener("change", (e) =>
+        persistControl(e.target, "log_mode", e.target.value));
     document.getElementById("settings-legacy-subs-tab")
       ?.addEventListener("change", async (e) => {
         const enabled = !!e.target.checked;
@@ -442,20 +575,74 @@
           return;
         }
         window._applyLegacySubsMode?.(enabled);
-        saveField("legacy_subs_tab", enabled);
+        await persistControl(e.target, "legacy_subs_tab", enabled, {
+          checked: true,
+          onRollback: (previous) =>
+            window._applyLegacySubsMode?.(!!previous),
+        });
       });
     document.getElementById("settings-close-behavior")
-      ?.addEventListener("change", (e) => saveField("close_behavior", e.target.value));
+      ?.addEventListener("change", (e) =>
+        persistControl(e.target, "close_behavior", e.target.value));
     document.getElementById("settings-auto-backup")
-      ?.addEventListener("change", (e) => saveField("auto_backup_interval", e.target.value));
+      ?.addEventListener("change", async (e) => {
+        const previous = e.target.dataset.savedValue || "off";
+        const next = e.target.value;
+        e.target.disabled = true;
+        e.target._ytddRepaint?.();
+        try {
+          if (await saveField("auto_backup_interval", next)) {
+            e.target.dataset.savedValue = next;
+            _renderAutomaticBackupAge(next);
+          } else {
+            e.target.value = previous;
+            e.target._ytddRepaint?.();
+            _renderAutomaticBackupAge(previous);
+          }
+        } finally {
+          e.target.disabled = false;
+          e.target._ytddRepaint?.();
+        }
+      });
+    document.getElementById("settings-trash-retention-days")
+      ?.addEventListener("change", async (e) => {
+        const days = Number(e.target.value);
+        const allowed = [0, 7, 14, 30, 60, 90, 180, 365];
+        const isLoadedCustom = !!e.target.selectedOptions?.[0]
+          ?.dataset?.trashCustom;
+        if (!allowed.includes(days) && !isLoadedCustom) {
+          e.target.value = _trashRetentionLastGood;
+          e.target._ytddRepaint?.();
+          window._showToast?.("Choose one of the available Trash time periods.", "warn");
+          return;
+        }
+        const previous = _trashRetentionLastGood;
+        e.target.disabled = true;
+        e.target._ytddRepaint?.();
+        const saved = await saveField("trash_retention_days", days);
+        e.target.disabled = false;
+        e.target._ytddRepaint?.();
+        if (saved) {
+          _trashRetentionLastGood = String(days);
+        } else {
+          e.target.value = previous;
+          e.target._ytddRepaint?.();
+        }
+      });
     ytdlpUpdateModeSel?.addEventListener("change", async (e) => {
+      const previous = e.target.dataset.savedValue || "automatic";
       _ytdlpUpdateMode = ["automatic", "notify", "off"].includes(e.target.value)
         ? e.target.value : "automatic";
       _renderYtdlpUpdateControls();
-      await saveField("ytdlp_update_mode", _ytdlpUpdateMode);
+      await persistControl(e.target, "ytdlp_update_mode", _ytdlpUpdateMode, {
+        onRollback: () => {
+          _ytdlpUpdateMode = previous;
+          _renderYtdlpUpdateControls();
+        },
+      });
     });
     const _ytdlpCheckEl = document.getElementById("settings-ytdlp-check-days");
-    _ytdlpCheckEl?.addEventListener("change", () => {
+    _ytdlpCheckEl?.addEventListener("change", async () => {
       const raw = _ytdlpCheckEl.value;
       const days = parseInt(raw, 10);
       if (raw === "" || !Number.isFinite(days) || days < 1 || days > 365) {
@@ -464,17 +651,24 @@
         return;
       }
       _ytdlpCheckEl.value = String(days);
-      _ytdlpCheckLastGood = _ytdlpCheckEl.value;
-      saveField("ytdlp_update_check_days", days);
+      const saved = await persistControl(
+        _ytdlpCheckEl, "ytdlp_update_check_days", days);
+      if (saved) _ytdlpCheckLastGood = _ytdlpCheckEl.value;
     });
     _ytdlpCheckEl?.addEventListener("keydown", (e) => {
       if (e.key === "Enter") { e.preventDefault(); _ytdlpCheckEl.blur(); }
     });
     document.getElementById("settings-youtube-traffic-mode")
-      ?.addEventListener("change", (e) => {
+      ?.addEventListener("change", async (e) => {
         const mode = e.target.value;
-        window._setBudgetAutosyncAvailable?.(mode !== "unlimited");
-        saveTraffic({ youtube_traffic_mode: mode });
+        e.target.disabled = true;
+        e.target._ytddRepaint?.();
+        try {
+          await saveTraffic({ youtube_traffic_mode: mode });
+        } finally {
+          e.target.disabled = false;
+          e.target._ytddRepaint?.();
+        }
       });
     const trafficInputMap = {
       "settings-traffic-daily": "youtube_traffic_custom_daily",
@@ -484,13 +678,19 @@
     };
     Object.entries(trafficInputMap).forEach(([id, key]) => {
       const el = document.getElementById(id);
-      el?.addEventListener("change", () => {
+      el?.addEventListener("change", async () => {
         const value = parseInt(el.value, 10);
         if (!Number.isFinite(value)) {
+          renderTraffic(_trafficStatus);
           window._showToast?.("Enter a whole number.", "error");
           return;
         }
-        saveTraffic({ [key]: value });
+        el.disabled = true;
+        try {
+          await saveTraffic({ [key]: value });
+        } finally {
+          el.disabled = false;
+        }
       });
       el?.addEventListener("keydown", (e) => {
         if (e.key === "Enter") { e.preventDefault(); el.blur(); }
@@ -499,9 +699,13 @@
 
     // Avg-size toggle: live-apply to the Subs table AND persist.
     document.getElementById("settings-show-avg-size")
-      ?.addEventListener("change", (e) => {
+      ?.addEventListener("change", async (e) => {
         window._applySubsAvgVisibility?.(!!e.target.checked);
-        saveField("show_avg_size", !!e.target.checked);
+        await persistControl(e.target, "show_avg_size", !!e.target.checked, {
+          checked: true,
+          onRollback: (previous) =>
+            window._applySubsAvgVisibility?.(!!previous),
+        });
       });
 
     // Disk-scan staleness: commit on blur (the `change` event) or Enter.
@@ -509,18 +713,19 @@
     // silently mapped to 0 ("always rescan"); now it's rejected and the
     // field reverts to the last persisted value so nothing bad is saved.
     const _diskEl = document.getElementById("settings-disk-staleness");
-    _diskEl?.addEventListener("change", () => {
+    _diskEl?.addEventListener("change", async () => {
       const _v = _diskEl.value;
       const _n = parseInt(_v, 10);
       if (_v == null || _v === "" || !Number.isFinite(_n) || _n < 0) {
         window._showToast?.(
-          "Disk-scan staleness must be a non-negative number.", "error");
+          "Rescan time must be 0 hours or more.", "error");
         _diskEl.value = _diskLastGood;   // revert the bad input
         return;
       }
       _diskEl.value = String(_n);
-      _diskLastGood = _diskEl.value;
-      saveField("disk_scan_staleness_hours", _n);
+      const saved = await persistControl(
+        _diskEl, "disk_scan_staleness_hours", _n);
+      if (saved) _diskLastGood = _diskEl.value;
     });
     _diskEl?.addEventListener("keydown", (e) => {
       if (e.key === "Enter") { e.preventDefault(); _diskEl.blur(); }
@@ -528,12 +733,21 @@
 
     const _capModeEl = document.getElementById("settings-archive-capacity-mode");
     const _capThresholdEl = document.getElementById("settings-archive-capacity-threshold");
-    _capModeEl?.addEventListener("change", (e) => {
+    _capModeEl?.addEventListener("change", async (e) => {
+      const previous = _archiveCapacity.mode;
       _archiveCapacity.mode = e.target.value === "free_gb" ? "free_gb" : "percent";
       _renderArchiveCapacityControls();
-      saveField("archive_capacity_warning_mode", _archiveCapacity.mode);
+      await persistControl(
+        e.target, "archive_capacity_warning_mode", _archiveCapacity.mode, {
+          onSaved: () => rememberControl(
+            _capThresholdEl, _archiveCapacityLastGood),
+          onRollback: () => {
+            _archiveCapacity.mode = previous;
+            _renderArchiveCapacityControls();
+          },
+        });
     });
-    _capThresholdEl?.addEventListener("change", () => {
+    _capThresholdEl?.addEventListener("change", async () => {
       const mode = _capMode();
       const n = _capClamp(mode, _capThresholdEl.value);
       if (n == null) {
@@ -546,13 +760,16 @@
         return;
       }
       _capThresholdEl.value = String(n);
+      const key = mode === "free_gb"
+        ? "archive_capacity_warning_free_gb"
+        : "archive_capacity_warning_percent";
+      const saved = await persistControl(_capThresholdEl, key, n);
+      if (!saved) return;
       _archiveCapacityLastGood = String(n);
       if (mode === "free_gb") {
         _archiveCapacity.free_gb = n;
-        saveField("archive_capacity_warning_free_gb", n);
       } else {
         _archiveCapacity.percent = n;
-        saveField("archive_capacity_warning_percent", n);
       }
     });
     _capThresholdEl?.addEventListener("keydown", (e) => {
@@ -561,44 +778,112 @@
 
     // Launch at boot / start minimized to tray.
     document.getElementById("settings-launch-at-boot")?.addEventListener("change", async (e) => {
-      if (!nativeBridgeUp()) return;
+      const previous = e.target.dataset.savedValue === "true";
+      if (!nativeBridgeUp()) {
+        e.target.checked = previous;
+        window._showToast?.(
+          "YTArchiver is still starting. Try again in a moment.", "warn");
+        return;
+      }
       const minimized = !!document.getElementById("settings-boot-minimized")?.checked;
       const lbmWrap = document.getElementById("settings-boot-minimized-wrap");
       if (lbmWrap) lbmWrap.hidden = !e.target.checked;
+      e.target.disabled = true;
       try {
         const res = await bridgeCall("launch_at_boot_set", !!e.target.checked, minimized);
-        if (res?.ok) flashSaved(true);
-        else { flashSaved(false); window._showToast?.(res?.error || "Boot setting failed.", "error"); }
-      } catch (err) { flashSaved(false); }
+        if (res?.ok) {
+          rememberControl(e.target, e.target.checked);
+          flashSaved(true);
+        } else {
+          throw new Error(res?.error || "Boot setting failed.");
+        }
+      } catch (err) {
+        e.target.checked = previous;
+        if (lbmWrap) lbmWrap.hidden = !previous;
+        flashSaved(false);
+        window._showToast?.(err?.message || String(err), "error");
+      } finally {
+        e.target.disabled = false;
+      }
     });
     document.getElementById("settings-boot-minimized")?.addEventListener("change", async (e) => {
-      if (!nativeBridgeUp()) return;
+      const previous = e.target.dataset.savedValue === "true";
+      if (!nativeBridgeUp()) {
+        e.target.checked = previous;
+        window._showToast?.(
+          "YTArchiver is still starting. Try again in a moment.", "warn");
+        return;
+      }
       const enabled = !!document.getElementById("settings-launch-at-boot")?.checked;
-      if (!enabled) return;
+      if (!enabled) {
+        e.target.checked = previous;
+        return;
+      }
+      e.target.disabled = true;
       try {
         const res = await bridgeCall("launch_at_boot_set", true, !!e.target.checked);
-        if (res?.ok) flashSaved(true);
-        else { flashSaved(false); window._showToast?.(res?.error || "Boot setting failed.", "error"); }
-      } catch (err) { flashSaved(false); }
-    });
-
-    // Auto-sync timing mode — applied immediately via its own scheduler
-    // call (not settings_save), so the countdown/clock label updates right
-    // away. Flash the same "Saved" confirmation for consistency.
-    document.getElementById("settings-autorun-mode")?.addEventListener("change", async (e) => {
-      try {
-        await bridgeCall("autorun_set_mode", e.target.value);
-        window.dispatchEvent(new Event("autorun-state-changed"));
-        flashSaved(true);
+        if (res?.ok) {
+          rememberControl(e.target, e.target.checked);
+          flashSaved(true);
+        } else {
+          throw new Error(res?.error || "Boot setting failed.");
+        }
       } catch (err) {
+        e.target.checked = previous;
         flashSaved(false);
+        window._showToast?.(err?.message || String(err), "error");
+      } finally {
+        e.target.disabled = false;
       }
     });
 
-    // Reload fields whenever the user switches to Settings or Health. The
-    // yt-dlp controls live under Health > Tools, while the rest live here.
-    document.querySelectorAll('.tab[data-tab="settings"], .tab[data-tab="health"]')
-      .forEach((tab) => tab.addEventListener("click", () => { setTimeout(load, 50); }));
+    // Auto-sync timing mode — applied immediately via its own scheduler
+    // call (not settings_save), so the Download countdown/clock label updates
+    // right away while Settings remains the canonical preference location.
+    document.getElementById("settings-autorun-mode")?.addEventListener("change", async (e) => {
+      const select = e.currentTarget;
+      const requested = select.value === "clock" ? "clock" : "timer";
+      const previous = select.dataset.savedValue ||
+        (requested === "clock" ? "timer" : "clock");
+      if (!nativeBridgeUp()) {
+        select.value = previous;
+        select._ytddRepaint?.();
+        window._showToast?.(
+          "YTArchiver is still starting. Try again in a moment.", "warn");
+        return;
+      }
+      select.disabled = true;
+      select._ytddRepaint?.();
+      try {
+        const result = await bridgeCall("autorun_set_mode", requested);
+        if (!result?.ok) {
+          throw new Error(result?.error || "Could not change auto-sync timing.");
+        }
+        select.dataset.savedValue = requested;
+        rememberControl(select, requested);
+        window.dispatchEvent(new Event("autorun-state-changed"));
+        flashSaved(true);
+      } catch (err) {
+        select.value = previous;
+        select._ytddRepaint?.();
+        window.dispatchEvent(new Event("autorun-state-changed"));
+        flashSaved(false);
+        window._showToast?.(
+          err?.message || "Could not change auto-sync timing.", "error");
+      } finally {
+        select.disabled = false;
+        select._ytddRepaint?.();
+      }
+    });
+
+    // Reload persistent preferences whenever the user opens Settings.
+    // Re-read when either preferences or backup controls become visible.
+    // Automatic backup now lives in Health, while the rest stays in Settings.
+    document.querySelector('.tab[data-tab="settings"]')
+      ?.addEventListener("click", () => { setTimeout(load, 50); });
+    document.querySelector('.tab[data-tab="health"]')
+      ?.addEventListener("click", () => { setTimeout(load, 50); });
+    window.YT?.bridge?.ready?.then(load).catch(() => {});
     // Also load once on boot so values are ready if the user switches fast.
     setTimeout(load, 200);
     const _trafficRefreshIv = setInterval(() => {
@@ -633,11 +918,15 @@
       if (metaQueueAll.disabled) return;
       metaQueueAll.disabled = true;
       try {
-        if (!nativeBridgeUp()) { window._showToast?.("Native mode required.", "warn"); return; }
+        if (!nativeBridgeUp()) {
+          window._showToast?.(
+            "YTArchiver is still starting. Try again in a moment.", "warn");
+          return;
+        }
         const ok = await askConfirm("Queue all metadata",
           "Queue a metadata download for EVERY subscribed channel?\n\n" +
-          "For a large library this can run for hours and will hammer the yt-dlp " +
-          "queue. You can cancel mid-pass from the Sync popover.",
+          "Large libraries can take several hours. You can cancel from " +
+          "Sync Tasks.",
           { confirm: "Queue all" });
         if (!ok) return;
         const res = await bridgeCall("metadata_queue_all", false);
@@ -651,12 +940,16 @@
       if (metaRefresh.disabled) return;
       metaRefresh.disabled = true;
       try {
-        if (!nativeBridgeUp()) { window._showToast?.("Native mode required.", "warn"); return; }
+        if (!nativeBridgeUp()) {
+          window._showToast?.(
+            "YTArchiver is still starting. Try again in a moment.", "warn");
+          return;
+        }
         const ok = await askConfirm("Refresh views/likes",
           "Re-fetch view counts and like counts for every video on every channel?\n\n" +
-          "Every on-disk video gets re-hit — previously-skipped failures too " +
-          "(the failure flag is cleared first). Expect one yt-dlp call per video, " +
-          "so this is slow on a 100k-video archive.",
+          "This checks every archived video again, including videos skipped " +
+          "after earlier errors. Large libraries can take several hours. " +
+          "You can cancel from Sync Tasks.",
           { confirm: "Refresh" });
         if (!ok) return;
         const res = await bridgeCall("metadata_queue_all", true);
@@ -703,7 +996,9 @@
 
       btn.addEventListener("click", async () => {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Native mode required.", "warn"); return;
+          window._showToast?.(
+            "YTArchiver is still starting. Try again in a moment.", "warn");
+          return;
         }
         // Mid-pass: the button acts as a Stop control.
         if (stopMode && activeToken) {
@@ -740,21 +1035,20 @@
             "ok");
           return;
         }
-        const top = Object.entries(preview.per_channel || {})
-          .sort((a,b) => (b[1].misaligned||0) - (a[1].misaligned||0))
-          .slice(0, 8)
-          .map(([name, d]) => `  • ${name}: ${d.misaligned}`).join("\n");
-        const msg = `Found ${n.toLocaleString()} misplaced thumbnail(s) across ${chans} channel(s).\n\n`
-          + `Top offenders:\n${top}\n\n`
-          + `Each thumbnail will be moved next to its mp4 via same-volume rename. `
-          + (dups > 0
-              ? `${dups} thumbnail(s) have a duplicate already at the target folder — those will be SKIPPED (left in place, the existing one wins).\n\n`
-              : "")
-          + `Proceed?`;
+        const thumbWord = n === 1 ? "thumbnail" : "thumbnails";
+        const channelWord = chans === 1 ? "channel" : "channels";
+        const duplicateNote = dups > 0
+          ? `\n\n${dups.toLocaleString()} already ${dups === 1 ? "has" : "have"} `
+            + `a thumbnail in the correct folder and will be left alone.`
+          : "";
+        const msg = `Found ${n.toLocaleString()} misplaced ${thumbWord} across `
+          + `${chans.toLocaleString()} ${channelWord}.\n\n`
+          + `Move ${n === 1 ? "it" : "them"} next to the matching `
+          + `${n === 1 ? "video" : "videos"}?${duplicateNote}`;
         const go = await window.askChoice({
           title: "Realign misplaced thumbnails",
           message: msg,
-          choices: [{ label: `Move ${n.toLocaleString()} thumbnail(s)`, value: "go", kind: "primary" }],
+          choices: [{ label: `Move ${n.toLocaleString()} ${thumbWord}`, value: "go", kind: "primary" }],
         });
         if (!go) return;
         // ── Move ──
@@ -800,17 +1094,18 @@
       btn._wired = true;
       btn.addEventListener("click", async () => {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Native mode required.", "warn"); return;
+          window._showToast?.(
+            "YTArchiver is still starting. Try again in a moment.", "warn");
+          return;
         }
         const go = await window.askChoice({
-          title: "Scan & repair hidden sidecars",
+          title: "Repair hidden support files",
           message:
-            "Walk every channel folder + the archive root and hide any stray "
-            + "sidecar files (.info.json, leftover thumbnails, .jsonl, etc.) "
-            + "that are currently visible.\n\n"
-            + "This only sets the Windows ‘hidden’ attribute — no files are "
-            + "moved or deleted, and your videos + Transcript.txt stay "
-            + "visible. Progress streams to the Download log.\n\nProceed?",
+            "Check every archive folder and hide support files that are "
+            + "currently visible.\n\n"
+            + "This changes only the Windows Hidden setting. Nothing is "
+            + "moved or deleted, and videos plus readable transcript files "
+            + "stay visible. Progress appears in the Download log.\n\nContinue?",
           choices: [{ label: "Scan & repair", value: "go", kind: "primary" }],
         });
         if (!go) return;
@@ -824,7 +1119,7 @@
               "A repair pass is already running — see the log.", "warn");
           } else if (res?.ok) {
             window._showToast?.(
-              "Hidden-sidecar repair started — see the Download log for "
+              "Support-file repair started — see the Download log for "
               + "progress.", "ok");
           } else {
             window._showToast?.(res?.error || "Could not start repair.",
@@ -840,20 +1135,18 @@
       });
     })();
 
-    // audit SM-1: reset sync state button in Settings > Tools.
-    // Picks a channel via a simple prompt, confirms, then calls
-    // subs_reset_sync_state which clears the bootstrap flags.
+    // audit SM-1: reset sync state button in Health > Library.
+    // Picks a channel, disambiguates duplicate display names, confirms, then
+    // calls subs_reset_sync_state with the channel's full identity.
     (function wireResetSyncState() {
       const btn = document.getElementById("btn-reset-sync-state");
       if (!btn) return;
       btn.addEventListener("click", async () => {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Native mode required.", "warn");
+          window._showToast?.(
+            "YTArchiver is still starting. Try again in a moment.", "warn");
           return;
         }
-        // Pick a channel. Use a simple prompt instead of a bespoke
-        // modal — this is an infrequent admin op, the prompt is
-        // minimum UI.
         let channels = [];
         let channelLoadError = "";
         try {
@@ -875,9 +1168,8 @@
         const names = channels.map(c => c.name || c.folder || "").filter(Boolean);
         // Use styled askTextInput + askQuestion modals so this flow
         // stays visually consistent with the rest of the app.
-        const head = "Clears: initialized, sync_complete, init_complete, "
-          + "batch_resume_index, init_batch_after, last_sync.\n"
-          + "The next sync will bootstrap the channel from scratch.\n\n"
+        const head = "The next sync will recheck the entire channel from "
+          + "the beginning. No downloaded files are removed.\n\n"
           + "Channels: " + names.slice(0, 60).join(", ")
           + (names.length > 60 ? ` … (+${names.length-60} more)` : "");
         const pick = await (window.askTextInput
@@ -891,18 +1183,36 @@
           : Promise.resolve(null));
         if (!pick || !pick.trim()) return;
         const want = pick.trim().toLowerCase();
-        const ch = channels.find(c => (c.name || c.folder || "").toLowerCase() === want);
-        if (!ch) {
+        const matches = channels.filter(
+          c => (c.name || c.folder || "").toLowerCase() === want);
+        if (!matches.length) {
           window._showToast?.(`No channel matched "${pick}".`, "warn");
           return;
+        }
+        let ch = matches[0];
+        if (matches.length > 1) {
+          const selected = await (window.askChoice
+            ? window.askChoice({
+                title: "Choose the channel",
+                message: `More than one channel is named "${pick}".`,
+                choices: matches.map((candidate, index) => ({
+                  label: `${candidate.name || candidate.folder} — `
+                    + `${candidate.folder || candidate.url || `channel ${index + 1}`}`,
+                  value: String(index),
+                  kind: "primary",
+                })),
+                cancelKind: "ghost",
+              })
+            : Promise.resolve(null));
+          if (selected == null || !matches[Number(selected)]) return;
+          ch = matches[Number(selected)];
         }
         const ok = await (window.askQuestion
           ? window.askQuestion({
               title: "Reset sync state",
               message: `Reset sync state for "${ch.name || ch.folder}"?\n\n`
-                + "This does NOT delete any videos or config — it only "
-                + "clears the flags that gate the fast-path so the next "
-                + "sync walks the whole channel again.",
+                + "No videos or settings will be deleted. The next sync "
+                + "will fully recheck this channel.",
               confirm: "Reset",
               cancel: "Cancel",
               danger: true,
@@ -915,7 +1225,7 @@
           });
           if (res?.ok) {
             window._showToast?.(
-              `Reset ${res.cleared_flags} flag(s) on "${res.channel}".`, "ok");
+              `Sync history reset for "${res.channel}".`, "ok");
           } else {
             window._showToast?.(res?.error || "Reset failed.", "warn");
           }
@@ -925,7 +1235,7 @@
       });
     })();
 
-    // Video-length backfill (Settings > Tools). ffprobes files locally to
+    // Video-length backfill (Health > Library). ffprobes files locally to
     // fill missing lengths in the Videos grid. The button toggles between
     // "Check / fix" and "Stop" depending on whether a pass is running.
     (function wireFixVideoLengths() {
@@ -935,6 +1245,7 @@
       let running = false;
       const setRunning = (r) => {
         running = r;
+        btn.disabled = false;
         btn.textContent = r ? "Stop" : IDLE;
         btn.classList.toggle("btn-danger", r);
       };
@@ -948,39 +1259,67 @@
       })();
       // Backend calls this on completion (with the count filled): flip the
       // button back to idle and refresh the Videos grid if anything changed.
-      window._onVideoLengthsBackfilled = function (filled) {
+      window._onVideoLengthsBackfilled = function (result) {
         setRunning(false);
+        const payload = (result && typeof result === "object")
+          ? result : { ok: true, filled: Number(result) || 0 };
+        const filled = Number(payload.filled) || 0;
         if (filled && window._loadVideosView) {
           try { window._loadVideosView(); } catch (_e) {}
+        }
+        if (!payload.ok && payload.error) {
+          window._showToast?.(
+            `Video-length check failed: ${payload.error}`, "error");
         }
       };
       btn.addEventListener("click", async () => {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Native mode required.", "warn");
+          window._showToast?.(
+            "YTArchiver is still starting. Try again in a moment.", "warn");
           return;
         }
         if (running) {
-          try { await bridgeCall("video_lengths_backfill_cancel"); } catch (_e) {}
-          window._showToast?.("Stopping… lengths filled so far are kept; re-run to resume.", "ok");
-          setRunning(false);
+          btn.disabled = true;
+          btn.textContent = "Stopping…";
+          try {
+            const stopped = await bridgeCall("video_lengths_backfill_cancel");
+            if (!stopped?.ok) {
+              throw new Error(stopped?.error || "Could not stop the check.");
+            }
+            window._showToast?.(
+              "Stopping… lengths filled so far are kept.", "ok");
+          } catch (error) {
+            setRunning(true);
+            window._showToast?.(
+              error?.message || String(error), "error");
+          }
           return;
         }
         let missing = 0;
         try {
           const c = await bridgeCall("video_lengths_missing_count");
-          if (c?.ok) missing = c.missing || 0;
-        } catch (_e) { /* non-fatal */ }
+          if (!c?.ok) {
+            throw new Error(c?.error || "Could not read the video library.");
+          }
+          missing = c.missing || 0;
+        } catch (e) {
+          window._showToast?.(
+            e?.message || "Could not check missing video lengths.", "error");
+          return;
+        }
         if (!missing) {
-          window._showToast?.("Every video already has a length.", "ok");
+          window._showToast?.(
+            "Every available video already has a length.", "ok");
           return;
         }
         const ok = await (window.askConfirm
           ? window.askConfirm("Check / fix video lengths",
-              `${missing.toLocaleString()} video(s) have no stored length.\n\n`
-              + "I'll read the true length from each file locally with ffprobe "
-              + "(no YouTube). It runs in the background — progress shows in "
+              `${missing.toLocaleString()} available video(s) have no stored length.\n\n`
+              + "YTArchiver will read the length directly from each local "
+              + "video file without contacting YouTube. It runs in the "
+              + "background — progress shows in "
               + "the log, and you can Stop any time and re-run to resume.\n\n"
-              + "Large archives can take ~15–30 minutes.",
+              + "Large archives may take 15–30 minutes.",
               { confirm: "Fix now" })
           : Promise.resolve(true));
         if (!ok) return;
@@ -1003,20 +1342,37 @@
     // readonly and only change via the Browse pickers below, so they
     // persist right after a folder is chosen.)
     browseOut?.addEventListener("click", async () => {
-      const cur = document.getElementById("settings-output-dir").value;
-      const res = await bridgeCall("pick_folder", "Archive root", cur);
-      if (res?.ok && res.path) {
-        document.getElementById("settings-output-dir").value = res.path;
-        saveField("output_dir", res.path);
+      const field = document.getElementById("settings-output-dir");
+      const cur = field.value;
+      try {
+        const res = await bridgeCall(
+          "pick_folder", "Select archive folder", cur);
+        if (res?.ok && res.path) {
+          field.value = res.path;
+          await persistControl(field, "output_dir", res.path);
+        } else if (!res?.cancelled) {
+          window._showToast?.(
+            res?.error || "Could not choose an archive folder.", "error");
+        }
+      } catch (error) {
+        window._showToast?.(`Could not choose an archive folder: ${error}`, "error");
       }
     });
     browseVid?.addEventListener("click", async () => {
-      const cur = document.getElementById("settings-video-dir").value;
-      const res = await bridgeCall(
-        "pick_folder", "Single-video downloads", cur);
-      if (res?.ok && res.path) {
-        document.getElementById("settings-video-dir").value = res.path;
-        saveField("video_out_dir", res.path);
+      const field = document.getElementById("settings-video-dir");
+      const cur = field.value;
+      try {
+        const res = await bridgeCall(
+          "pick_folder", "Single-video downloads", cur);
+        if (res?.ok && res.path) {
+          field.value = res.path;
+          await persistControl(field, "video_out_dir", res.path);
+        } else if (!res?.cancelled) {
+          window._showToast?.(
+            res?.error || "Could not choose a video folder.", "error");
+        }
+      } catch (error) {
+        window._showToast?.(`Could not choose a video folder: ${error}`, "error");
       }
     });
 
@@ -1095,7 +1451,7 @@
     // the preference saved; the next Update (or startup nudge) honors it.
     ytdlpChannelSel?.addEventListener("change", async (e) => {
       const channel = e.target.value === "nightly" ? "nightly" : "stable";
-      await saveField("ytdlp_channel", channel);
+      if (!await persistControl(e.target, "ytdlp_channel", channel)) return;
       const label = channel === "nightly" ? "beta (nightly)" : "stable";
       const go = await askConfirm(`Switch to ${label}?`,
         (channel === "nightly"
@@ -1176,7 +1532,6 @@
         // state, and lost any unsaved Settings field edits. Refresh
         // helpers keep everything else intact.
         try { window.refreshSubsTable?.(); } catch {}
-        try { window._primeBrowse?.(); } catch {}
       } else if (!res?.cancelled) {
         window._showToast?.(res?.error || "Import failed.", "error");
       }
@@ -1185,7 +1540,16 @@
     bkExpBtn?.addEventListener("click", async () => {
       const res = await bridgeCall("export_full_backup");
       if (res?.ok) {
-        window._showToast?.(`Backup saved (${res.files} files).`, "ok");
+        if (res.fts_skipped) {
+          window._showToast?.(
+            `Backup saved (${res.files} files), but the Search index was ` +
+              "too large to include. Search can be rebuilt after a restore.",
+            "warn",
+            { ttlMs: 12000 }
+          );
+        } else {
+          window._showToast?.(`Backup saved (${res.files} files).`, "ok");
+        }
         const bkAgeEl = document.getElementById("backup-age-display");
         if (bkAgeEl) bkAgeEl.textContent = _fmtBackupAge(res.last_backup_ts || Date.now() / 1000);
       } else if (!res?.cancelled) {
@@ -1204,8 +1568,8 @@
         // Older backend without preview support \u2014 fall back to legacy
         // one-click flow with the strong-warning askDanger.
         const okLegacy = await askDanger("Restore backup",
-          "Restoring a backup will OVERWRITE your current config, queue state, and journals.\n\n" +
-          "A snapshot of the current config is saved to backups/ first, so you can roll back.",
+          "Restoring replaces your current settings and saved app state.\n\n" +
+          "YTArchiver saves a safety copy of your current settings first.",
           "Pick ZIP\u2026");
         if (!okLegacy) return;
         const res = await bridgeCall("import_full_backup");
@@ -1230,9 +1594,11 @@
           <td class="backup-preview-muted">${_esc(it.modified)}</td>
         </tr>`
       ).join("");
-      const ftsWarn = prev.fts_skipped
+      const backupIndexNote = String(prev.fts_skipped || "")
+        .replace(/\bFTS(?:\s+DB)?\b/gi, "search index");
+      const ftsWarn = backupIndexNote
         ? `<div class="backup-preview-warning">
-             ${_esc(prev.fts_skipped)}
+             ${_esc(backupIndexNote)}
            </div>`
         : "";
       const previewHtml =
@@ -1249,7 +1615,7 @@
          </div>
          <div class="backup-preview-total">
            Total: ${prev.items.length} file(s) \u2014 ${_esc(prev.total_label)}.
-           Your current config will be snapshotted before overwrite.
+           Your current settings are backed up before anything is replaced.
          </div>${ftsWarn}`;
       const confirmRestore = await askQuestion({
         title: "Restore this backup?",
@@ -1274,9 +1640,19 @@
             bridgeCall("app_restart");
           }}}
         );
+      } else if (res?.needs_restart) {
+        window._showToast?.(
+          (res?.error || "Restore could not finish safely.") +
+            " Restart YTArchiver before using it again.",
+          "error",
+          { ttlMs: 0, action: { label: "Restart now", onClick: () => {
+            bridgeCall("app_restart");
+          }}}
+        );
       } else if (res?.write_blocked) {
         window._showToast?.(
-          "Write-gate off \u2014 config changes won't persist to disk.",
+          res?.error ||
+            "Settings are temporarily read-only. Restart YTArchiver and try again.",
           "warn"
         );
       } else if (!res?.cancelled) {

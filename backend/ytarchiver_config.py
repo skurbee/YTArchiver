@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import threading
 import time
@@ -43,6 +44,23 @@ TRANSCRIPTION_DB = APP_DATA_DIR / "transcription_index.db"
 SEEN_FILTER_TITLES = APP_DATA_DIR / "ytarchiver_seen_filters.txt"
 # Per-channel cached video ID lists (so sync skips the slow playlist walk)
 CHANNEL_ID_CACHE = APP_DATA_DIR / "ytarchiver_channel_ids.json"
+
+# Automatic Trash retention is intentionally conservative. A brand-new
+# install uses the 30-day policy immediately, but an existing install that
+# predates the setting receives a full 30-day grace period before the first
+# unattended permanent deletion can be considered.
+TRASH_RETENTION_DEFAULT_DAYS = 30
+TRASH_RETENTION_MAX_DAYS = 3650
+TRASH_RETENTION_UPGRADE_GRACE_SECONDS = 30 * 24 * 60 * 60
+TRASH_RETENTION_CHANGE_GRACE_SECONDS = 24 * 60 * 60
+
+
+def _safe_retention_grace(value: Any) -> float:
+    try:
+        grace = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, grace) if math.isfinite(grace) else 0.0
 
 # Matches YTArchiver.py DEFAULT_CONFIG at line 149
 DEFAULT_CONFIG = {
@@ -134,6 +152,11 @@ DEFAULT_CONFIG = {
     # touch this — the schedule stays honest even if the user also
     # exports by hand).
     "last_auto_backup_ts": 0.0,
+    # App-managed Trash is kept for 30 days by default. 0 means Never.
+    # The grace timestamp is maintained by migrations/settings code and is
+    # deliberately not user-settable through settings_save.
+    "trash_retention_days": TRASH_RETENTION_DEFAULT_DAYS,
+    "trash_retention_grace_until_ts": 0.0,
 }
 
 _config_lock = threading.RLock()  # reentrant so nested
@@ -152,6 +175,8 @@ _config_lock = threading.RLock()  # reentrant so nested
 # under one lock acquisition so RMW is genuinely atomic.
 _config_tx_lock = threading.RLock()
 _in_tx = threading.local()  # .active set True for the duration of a config_transaction
+_config_write_gate_lock = threading.Lock()
+_config_writes_suspended_reason = ""
 
 # periodic backup trigger. Writes a dated snapshot every
 # _BACKUP_EVERY_N_SAVES save_config() calls so recovery windows are
@@ -364,6 +389,14 @@ def load_config() -> dict[str, Any]:
         # that explicit choice while migrating positive intervals to the new
         # automatic long-running monitor.
         _needs_ytdlp_update_mode = "ytdlp_update_mode" not in data
+        # Trash used to require an explicit manual purge. Existing installs
+        # must not begin permanently deleting already-present entries merely
+        # because a new default appeared during an upgrade.
+        _needs_trash_retention_policy = "trash_retention_days" not in data
+        _trash_upgrade_grace_until = (
+            time.time() + TRASH_RETENTION_UPGRADE_GRACE_SECONDS
+            if _needs_trash_retention_policy else 0.0
+        )
 
         # Run migrations exactly once per config, then stamp a flag/key so
         # subsequent load_config calls skip the work. Previously
@@ -372,7 +405,8 @@ def load_config() -> dict[str, Any]:
         # idempotency would silently corrupt state.
         if (not merged.get("_migration_v2_pending_tx_ids")
                 or _needs_dense_subs_default
-                or _needs_ytdlp_update_mode):
+                or _needs_ytdlp_update_mode
+                or _needs_trash_retention_policy):
             # Run the migration on a DEEP COPY first. If save_config
             # fails (antivirus lock, OneDrive sync, disk full), the
             # in-memory `merged` we return must NOT carry the migrated
@@ -397,6 +431,14 @@ def load_config() -> dict[str, Any]:
                     _old_ytdlp_days = 1
                 _candidate["ytdlp_update_mode"] = (
                     "off" if _old_ytdlp_days == 0 else "automatic")
+            if _needs_trash_retention_policy:
+                _candidate["trash_retention_days"] = (
+                    TRASH_RETENTION_DEFAULT_DAYS)
+                _candidate["trash_retention_grace_until_ts"] = max(
+                    _safe_retention_grace(_candidate.get(
+                        "trash_retention_grace_until_ts", 0.0)),
+                    _trash_upgrade_grace_until,
+                )
             if getattr(_in_tx, 'active', False):
                 # Inside a config_transaction: adopt migrated state now;
                 # the outer transaction's exit-save will persist it.
@@ -414,8 +456,26 @@ def load_config() -> dict[str, Any]:
                             "migration save failed; will retry next launch")
                 except Exception as _me:
                     _log.error("migration save exception: %s", _me)
+            if _needs_trash_retention_policy:
+                # Even when the migration write fails, retain just these two
+                # non-destructive values in the session snapshot. Returning
+                # DEFAULT_CONFIG's active 30-day policy with a zero grace
+                # would make a transient disk-full/antivirus error capable of
+                # enabling immediate permanent deletion. A later successful
+                # config save will persist this safe pair together.
+                merged["trash_retention_days"] = (
+                    TRASH_RETENTION_DEFAULT_DAYS)
+                merged["trash_retention_grace_until_ts"] = max(
+                    _safe_retention_grace(merged.get(
+                        "trash_retention_grace_until_ts", 0.0)),
+                    _trash_upgrade_grace_until,
+                )
         with _config_lock:
-            _cache_config(sig, merged)
+            # A successful migration atomically replaced CONFIG_FILE, so the
+            # signature captured before migration is stale. Cache against the
+            # current file signature or the next load needlessly re-reads and
+            # can re-enter migration bookkeeping.
+            _cache_config(_config_file_sig(), merged)
         return copy.deepcopy(merged)
     except (json.JSONDecodeError, OSError) as e:
         _log.warning("failed to load %s: %s", CONFIG_FILE, e)
@@ -446,6 +506,16 @@ def load_config() -> dict[str, Any]:
                             merged["ytdlp_update_mode"] = (
                                 "off" if _old_ytdlp_days == 0
                                 else "automatic")
+                        if "trash_retention_days" not in data:
+                            merged["trash_retention_days"] = (
+                                TRASH_RETENTION_DEFAULT_DAYS)
+                            merged["trash_retention_grace_until_ts"] = max(
+                                _safe_retention_grace(merged.get(
+                                    "trash_retention_grace_until_ts",
+                                    0.0)),
+                                time.time()
+                                + TRASH_RETENTION_UPGRADE_GRACE_SECONDS,
+                            )
                         # Sideline the corrupt file so the next launch uses the snapshot
                         try:
                             # Use a unique timestamp suffix so
@@ -559,17 +629,64 @@ def config_transaction():
         _in_tx.active = _was_in_tx
 
 
+@_ctxlib.contextmanager
+def locked_config_snapshot():
+    """Yield one config snapshot while excluding concurrent app saves.
+
+    This is intentionally read-only.  It lets a destructive operation make
+    its final policy decision and commit its filesystem boundary while the
+    Settings writer is unable to change that policy between those two steps.
+    """
+    with _config_lock:
+        yield load_config()
+
+
+def update_config(mutator):
+    """Run one focused config mutation and return its result + snapshot.
+
+    Feature code should use this instead of loading and later saving a whole
+    document. Disjoint updates then serialize under the same transaction and
+    cannot erase one another with stale snapshots.
+    """
+    if not callable(mutator):
+        raise TypeError("config mutator must be callable")
+    result = None
+    snapshot = None
+    with config_transaction() as cfg:
+        result = mutator(cfg)
+        snapshot = copy.deepcopy(cfg)
+    return result, snapshot
+
+
 def config_file_exists() -> bool:
     return CONFIG_FILE.exists()
 
 
-def config_is_writable() -> bool:
-    """Always writable — kept as a function so existing call sites
-    don't break, but the env-var gate is gone. YTArchiver is the
-    primary app now; there's no side-by-side-with-tkinter scenario
-    to protect against.
+def suspend_config_writes(reason: str = "application state replacement") -> bool:
+    """Permanently freeze this process's stale config writers.
+
+    Backup restore swaps the live config underneath the running process.  The
+    old process must therefore become read-only before that swap; otherwise a
+    late window-state/settings callback can overwrite the restored document.
+    A restart creates a fresh process and naturally reopens the gate.
     """
-    return True
+    global _config_writes_suspended_reason
+    with _config_write_gate_lock:
+        changed = not bool(_config_writes_suspended_reason)
+        _config_writes_suspended_reason = str(
+            reason or "application state replacement")
+        return changed
+
+
+def config_writes_suspended_reason() -> str:
+    with _config_write_gate_lock:
+        return _config_writes_suspended_reason
+
+
+def config_is_writable() -> bool:
+    """Return false once restore freezes this process's stale writers."""
+    with _config_write_gate_lock:
+        return not bool(_config_writes_suspended_reason)
 
 
 def backup_config_on_start(keep: int = 10) -> str | None:
@@ -607,7 +724,22 @@ def backup_config_on_start(keep: int = 10) -> str | None:
 
 
 def save_config(cfg: dict[str, Any]) -> bool:
-    """Save config back to disk. Gated by config_is_writable().
+    """Save config back to disk unless restore has frozen this process.
+
+    The config lock is acquired before the write-gate lock everywhere.  The
+    gate stays held through the atomic replacement, so
+    ``suspend_config_writes`` cannot return while an already-admitted stale
+    writer is still able to replace the restored config.
+    """
+    with _config_lock, _config_write_gate_lock:
+        if _config_writes_suspended_reason:
+            _log.warning("write blocked")
+            return False
+        return _save_config_locked(cfg)
+
+
+def _save_config_locked(cfg: dict[str, Any]) -> bool:
+    """Write one config snapshot while the lock and write gate are held.
 
     fsyncs the temp file before os.replace so a power loss
     or BSOD between write and rename can't commit a zero-byte /
@@ -620,9 +752,6 @@ def save_config(cfg: dict[str, Any]) -> bool:
     snapshot.
     """
     global _save_counter
-    if not config_is_writable():
-        _log.warning("write blocked")
-        return False
     try:
         should_backup = False
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -841,6 +970,7 @@ def channels_for_subs_ui(cfg: dict[str, Any]):
         # tons of small ones. Displayed in MB (most channels are in that
         # range; GB shown when average is over a gig).
         n_v = int(ch.get("n_vids", 0) or 0)
+        size_bytes = int(ch.get("size_bytes", 0) or 0)
         sz_gb = float(ch.get("size_gb", 0) or 0)
         if n_v > 0 and sz_gb > 0:
             avg_mb = (sz_gb * 1024.0) / n_v
@@ -886,8 +1016,10 @@ def channels_for_subs_ui(cfg: dict[str, Any]):
         rows.append({
             "folder": folder,
             "res": res + ("p" if res.isdigit() else ""),
-            "min": f"{min_mins}m" if min_mins else "—",
-            "max": f"{max_mins}m" if max_mins else "—",
+            "min": ("<1m" if min_mins == -1
+                    else f"{min_mins}m" if min_mins else "—"),
+            "max": ("<1m" if max_mins == -1
+                    else f"{max_mins}m" if max_mins else "—"),
             "compress": "\u2713" if ch.get("compress_enabled") else "\u2014",
             # Transcribe / Metadata treat the auto flag itself as "enabled".
             # `_pending_tx_n` is the length of pending_tx_ids: videos that
@@ -898,7 +1030,11 @@ def channels_for_subs_ui(cfg: dict[str, Any]):
             "metadata": _mark("auto_metadata", bool(ch.get("auto_metadata"))),
             "last_sync": ls_str,
             "n_vids": f"{ch.get('n_vids', 0):,}" if ch.get("n_vids") else "—",
-            "size": f"{ch.get('size_gb', 0):.1f} GB" if ch.get("size_gb") else "—",
+            # Small channels used to round down to the misleading "0.0 GB".
+            # Use the shared size formatter so MB-sized archives stay useful.
+            "size": _fmt_size(size_bytes) if size_bytes else "—",
+            "size_bytes": size_bytes,
+            "size_gb": sz_gb,
             "avg_size": avg_str,
             # Queue-Pending badge derives from the authoritative ID lists.
             # `transcription_pending` is kept as a back-compat mirror but

@@ -8,18 +8,65 @@ as fallback state.
 """
 from __future__ import annotations
 
+import copy
 import os
 import re
 import sys
 import threading
 import time
+import uuid
 
 from backend import sync as sync_backend
 from backend import youtube_traffic
 from backend.archive_capacity import normalize_archive_capacity_warning
-from backend.ytarchiver_config import config_is_writable, load_config
+from backend.services.job_supervisor import WorkAdmissionClosed
+from backend.services.managed_work import start_managed_task
+from backend.ytarchiver_config import (
+    TRASH_RETENTION_CHANGE_GRACE_SECONDS,
+    TRASH_RETENTION_DEFAULT_DAYS,
+    TRASH_RETENTION_MAX_DAYS,
+    config_is_writable,
+    load_config,
+)
 
 from ._shared import _api_err, _log
+
+
+def _parse_trash_retention_days(value):
+    """Return a validated retention setting without lossy coercion."""
+    if isinstance(value, bool):
+        raise ValueError("boolean is not a retention period")
+    if isinstance(value, int):
+        days = value
+    elif isinstance(value, float) and value.is_integer():
+        days = int(value)
+    elif isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        days = int(value.strip())
+    else:
+        raise ValueError("retention period must be a whole number")
+    if days != 0 and not 1 <= days <= TRASH_RETENTION_MAX_DAYS:
+        raise ValueError(
+            f"retention period must be 0 or 1-{TRASH_RETENTION_MAX_DAYS}")
+    return days
+
+
+def _stored_trash_retention_days(value, fallback=TRASH_RETENTION_DEFAULT_DAYS):
+    try:
+        return _parse_trash_retention_days(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _stored_trash_retention_grace(value):
+    try:
+        grace = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    # NaN is the only float unequal to itself. Infinity is also unsuitable
+    # for a persisted policy timestamp.
+    if grace != grace or grace in (float("inf"), float("-inf")):
+        return 0.0
+    return max(0.0, grace)
 
 
 class SettingsMixin:
@@ -48,6 +95,41 @@ class SettingsMixin:
         from backend.ytarchiver_config import save_config as _save_config
         return _save_config(cfg)
 
+    def _settings_commit_candidate(self, original, candidate):
+        """Commit only fields changed by this Settings request."""
+        missing = object()
+        updates = {
+            key: copy.deepcopy(value)
+            for key, value in candidate.items()
+            if original.get(key, missing) != value
+        }
+        removals = {
+            key for key in original
+            if key not in candidate
+        }
+
+        def _mutate(live):
+            for key in removals:
+                live.pop(key, None)
+            live.update(copy.deepcopy(updates))
+
+        try:
+            services = self._settings_services()
+            if services is not None and hasattr(services, "mutate_config"):
+                _result, snapshot = services.mutate_config(_mutate)
+            elif services is not None:
+                snapshot = services.fresh_config()
+                _mutate(snapshot)
+                if not services.save_config(snapshot):
+                    raise OSError("config save failed")
+            else:
+                from backend.ytarchiver_config import update_config
+                _result, snapshot = update_config(_mutate)
+            return True, snapshot
+        except Exception as exc:
+            _log.warning("settings transaction failed: %s", exc)
+            return False, candidate
+
     def _settings_log_stream(self):
         services = self._settings_services()
         stream = (getattr(services, "log_stream", None)
@@ -74,8 +156,10 @@ class SettingsMixin:
         with SettingsMixin._settings_save_lock:
             try:
                 cfg = self._settings_fresh_config()
+                original_cfg = copy.deepcopy(cfg)
                 cfg["log_mode"] = mode
-                persisted = bool(self._settings_save_config(cfg))
+                persisted, _saved_cfg = self._settings_commit_candidate(
+                    original_cfg, cfg)
             except Exception as _se:
                 persisted = False
                 save_exc = str(_se)
@@ -201,7 +285,7 @@ class SettingsMixin:
             "log_mode": cfg.get("log_mode", "Simple"),
             "legacy_subs_tab": bool(cfg.get("legacy_subs_tab", False)),
             # yt-dlp release channel the updater targets: "stable" or
-            # "nightly" (beta). Surfaced by the Health > Tools yt-dlp row.
+            # "nightly" (beta). Surfaced under Downloader updates.
             "ytdlp_channel": (cfg.get("ytdlp_channel") or "stable"),
             "ytdlp_update_mode": (
                 cfg.get("ytdlp_update_mode")
@@ -215,20 +299,29 @@ class SettingsMixin:
                 cfg.get("ytdlp_update_check_days", 1) or 0),
             "last_ytdlp_update_check_ts": float(
                 cfg.get("last_ytdlp_update_check_ts", 0) or 0),
-            # Index tab surfaces these directly — must round-trip.
+            # Health > Search Index surfaces these directly — must round-trip.
             "tp_archive_roots": list(cfg.get("tp_archive_roots") or []),
             "auto_index_enabled": bool(cfg.get("auto_index_enabled", False)),
             "auto_index_threshold": int(cfg.get("auto_index_threshold", 10) or 10),
-            # Startup knobs (Settings > General surfaces these too).
+            # Storage/library background-check controls surfaced in Settings.
             "disk_scan_staleness_hours": int(cfg.get("disk_scan_staleness_hours", 24) or 0),
             "archive_capacity_warning_mode": cap["mode"],
             "archive_capacity_warning_percent": cap["percent"],
             "archive_capacity_warning_free_gb": cap["free_gb"],
             "last_disk_scan_ts": float(cfg.get("last_disk_scan_ts", 0) or 0),
             "last_backup_ts": float(cfg.get("last_backup_ts", 0) or 0),
-            # v80 auto-backup cadence (Settings > General).
+            "last_auto_backup_ts": float(
+                cfg.get("last_auto_backup_ts", 0) or 0),
+            # Automatic full-backup cadence shown beside manual backup tools.
             "auto_backup_interval": (cfg.get("auto_backup_interval")
                                      or "off"),
+            "trash_retention_days": _stored_trash_retention_days(
+                cfg.get("trash_retention_days")),
+            # Read-only policy metadata. settings_save always computes this
+            # server-side so a caller cannot bypass a safety grace period.
+            "trash_retention_grace_until_ts": (
+                _stored_trash_retention_grace(
+                    cfg.get("trash_retention_grace_until_ts"))),
             # Subs table column visibility toggles. Default False for
             # new users — the column is optional polish, not core info.
             "show_avg_size": bool(cfg.get("show_avg_size", False)),
@@ -268,16 +361,29 @@ class SettingsMixin:
     _settings_save_lock = threading.RLock()
 
     def settings_save(self, data):
+        admission = getattr(self, "_work_admission_error", None)
+        if callable(admission):
+            blocked = admission("a settings change")
+            if blocked is not None:
+                return blocked
         if not config_is_writable():
-            return {"ok": False, "error": "Write-gate off"}
+            return {
+                "ok": False,
+                "error": ("Settings are temporarily read-only. Restart "
+                          "YTArchiver and try again."),
+            }
         with SettingsMixin._settings_save_lock:
             return self._settings_save_inner(data)
 
     def _settings_save_inner(self, data):
         cfg = self._settings_fresh_config()
+        original_cfg = copy.deepcopy(cfg)
         _old_ytdlp_channel = str(
             cfg.get("ytdlp_channel") or "stable").strip().lower()
         _old_update_mode = self._normalize_ytdlp_update_mode(cfg)
+        _old_trash_retention_days = _stored_trash_retention_days(
+            cfg.get("trash_retention_days"), fallback=0)
+        _trash_retention_changed = False
         # Track the OLD whisper model so we can hot-apply a change to
         # the running TranscribeManager (audit U-7). Settings_save was
         # persisting the new model + reloading config, but the
@@ -324,7 +430,43 @@ class SettingsMixin:
                 _log.debug("swallowed: %s", e)
         # Index-tab persistence: archive roots + auto-index toggle + threshold.
         if isinstance(data.get("tp_archive_roots"), list):
-            cfg["tp_archive_roots"] = [str(r) for r in data["tp_archive_roots"] if r]
+            primary_key = os.path.normcase(os.path.abspath(os.path.normpath(
+                str(cfg.get("output_dir") or "").strip()
+            ))) if cfg.get("output_dir") else ""
+            clean_roots: list[str] = []
+
+            def _within(path: str, root: str) -> bool:
+                if not path or not root:
+                    return False
+                try:
+                    return os.path.commonpath([path, root]) == root
+                except (OSError, ValueError):
+                    return False
+
+            for raw_root in data["tp_archive_roots"]:
+                value = str(raw_root or "").strip()
+                if not value:
+                    continue
+                normalized = os.path.abspath(os.path.normpath(value))
+                key = os.path.normcase(normalized)
+                # The primary archive already covers all of its descendants.
+                if (key == primary_key
+                        or (primary_key and (
+                            _within(key, primary_key)
+                            or _within(primary_key, key)))):
+                    continue
+                clean_keys = [os.path.normcase(path) for path in clean_roots]
+                if key in clean_keys or any(
+                        _within(key, existing) for existing in clean_keys):
+                    continue
+                # If a broader root is added after a nested one, keep only the
+                # broader root. The index sweep walks recursively.
+                clean_roots = [
+                    path for path in clean_roots
+                    if not _within(os.path.normcase(path), key)
+                ]
+                clean_roots.append(normalized)
+            cfg["tp_archive_roots"] = clean_roots
         if "auto_index_enabled" in data:
             cfg["auto_index_enabled"] = bool(data["auto_index_enabled"])
         if "auto_index_threshold" in data:
@@ -341,6 +483,35 @@ class SettingsMixin:
         if data.get("auto_backup_interval") in ("off", "daily", "weekly",
                                                 "monthly"):
             cfg["auto_backup_interval"] = data["auto_backup_interval"]
+        if "trash_retention_days" in data:
+            try:
+                _new_trash_retention_days = _parse_trash_retention_days(
+                    data["trash_retention_days"])
+            except (TypeError, ValueError):
+                return {
+                    "ok": False,
+                    "error": (
+                        "Trash retention must be 0 (Never) or a whole "
+                        f"number from 1 to {TRASH_RETENTION_MAX_DAYS} days."
+                    ),
+                }
+            _trash_retention_changed = (
+                _new_trash_retention_days != _old_trash_retention_days)
+            cfg["trash_retention_days"] = _new_trash_retention_days
+            if _trash_retention_changed:
+                if _new_trash_retention_days == 0:
+                    cfg["trash_retention_grace_until_ts"] = 0.0
+                elif (_old_trash_retention_days == 0
+                      or _new_trash_retention_days
+                      < _old_trash_retention_days):
+                    # Enabling cleanup or shortening its window may make old
+                    # entries newly eligible. Preserve any longer existing
+                    # grace and guarantee at least 24 hours to reconsider.
+                    cfg["trash_retention_grace_until_ts"] = max(
+                        _stored_trash_retention_grace(cfg.get(
+                            "trash_retention_grace_until_ts")),
+                        time.time() + TRASH_RETENTION_CHANGE_GRACE_SECONDS,
+                    )
         if data.get("archive_capacity_warning_mode") in ("percent", "free_gb"):
             cfg["archive_capacity_warning_mode"] = data["archive_capacity_warning_mode"]
         if "archive_capacity_warning_percent" in data:
@@ -413,8 +584,11 @@ class SettingsMixin:
                 < cfg.get("youtube_traffic_custom_min_gap", 10)):
             cfg["youtube_traffic_custom_max_gap"] = int(
                 cfg.get("youtube_traffic_custom_min_gap", 10))
-        if not self._settings_save_config(cfg):
+        saved, committed_cfg = self._settings_commit_candidate(
+            original_cfg, cfg)
+        if not saved:
             return {"ok": False, "error": "Save failed"}
+        cfg = committed_cfg
         self._reload_config()
         _new_ytdlp_channel = str(
             cfg.get("ytdlp_channel") or "stable").strip().lower()
@@ -462,6 +636,20 @@ class SettingsMixin:
                 self.wake_ytdlp_update_monitor()
             except Exception as e:
                 _log.debug("yt-dlp update monitor wake failed: %s", e)
+        if _trash_retention_changed:
+            # The scheduler is optional during tests and early application
+            # construction. Wake it only after the config transaction has
+            # succeeded so failed saves cannot act on an uncommitted policy.
+            scheduler = getattr(self, "_trash_retention", None)
+            if scheduler is None:
+                scheduler = getattr(
+                    self, "_trash_retention_scheduler", None)
+            wake = getattr(scheduler, "wake", None)
+            if callable(wake):
+                try:
+                    wake()
+                except Exception as e:
+                    _log.debug("Trash retention scheduler wake failed: %s", e)
         return {
             "ok": True,
             "budget_autosync_disabled": _budget_autosync_disabled,
@@ -596,7 +784,9 @@ class SettingsMixin:
             self._ytdlp_monitor_wake = threading.Event()
             self._ytdlp_monitor_stop = threading.Event()
             self._ytdlp_monitor_thread = None
+            self._ytdlp_update_thread = None
             self._ytdlp_check_not_before = 0.0
+            self._ytdlp_update_active_cancel = None
 
     def wake_ytdlp_update_monitor(self):
         self._ensure_ytdlp_update_runtime()
@@ -605,6 +795,11 @@ class SettingsMixin:
 
     def start_ytdlp_update_monitor(self):
         """Start the persistent due-check/idle-install monitor once."""
+        admission = getattr(self, "_work_admission_error", None)
+        if callable(admission):
+            blocked = admission("the yt-dlp update monitor")
+            if blocked is not None:
+                return blocked
         self._ensure_ytdlp_update_runtime()
         with self._ytdlp_update_state_lock:
             thread = self._ytdlp_monitor_thread
@@ -612,23 +807,42 @@ class SettingsMixin:
                 self._ytdlp_monitor_wake.set()
                 return {"ok": True, "started": False, "running": True}
             self._ytdlp_monitor_stop.clear()
-            thread = threading.Thread(
-                target=self._ytdlp_update_monitor_loop,
-                name="ytdlp-update-monitor", daemon=True)
+            try:
+                thread = start_managed_task(
+                    self,
+                    owner="monitor-ytdlp",
+                    label="yt-dlp update monitor",
+                    task_id=f"ytdlp-monitor-{uuid.uuid4().hex}",
+                    cancel=self._ytdlp_monitor_stop,
+                    target=self._ytdlp_update_monitor_loop,
+                    name="ytdlp-update-monitor",
+                    thread_factory=threading.Thread,
+                )
+            except WorkAdmissionClosed as exc:
+                self._ytdlp_monitor_stop.set()
+                return {"ok": False, "started": False, "error": str(exc)}
             self._ytdlp_monitor_thread = thread
-            thread.start()
         return {"ok": True, "started": True}
 
-    def stop_ytdlp_update_monitor(self):
+    def stop_ytdlp_update_monitor(self, timeout=1.0):
         """Stop future checks/installs during application shutdown."""
         if not hasattr(self, "_ytdlp_monitor_stop"):
             return {"ok": True, "stopped": False}
         self._ytdlp_monitor_stop.set()
         self._ytdlp_monitor_wake.set()
+        with self._ytdlp_update_state_lock:
+            pending = self._ytdlp_update_pending
+            pending_cancel = (
+                pending.get("cancel_event")
+                if isinstance(pending, dict) else None)
+            active_cancel = self._ytdlp_update_active_cancel
+        for cancel_event in (pending_cancel, active_cancel):
+            if cancel_event is not None:
+                cancel_event.set()
         thread = getattr(self, "_ytdlp_monitor_thread", None)
         if (thread is not None and thread.is_alive()
                 and thread is not threading.current_thread()):
-            thread.join(timeout=1.0)
+            thread.join(timeout=max(0.0, float(timeout)))
         return {"ok": True, "stopped": True}
 
     def _ytdlp_update_monitor_loop(self):
@@ -767,11 +981,14 @@ class SettingsMixin:
         """Persist a completed check/update without disturbing other fields."""
         with SettingsMixin._settings_save_lock:
             cfg = self._settings_fresh_config()
+            original_cfg = copy.deepcopy(cfg)
             cfg["last_ytdlp_update_check_ts"] = float(checked_at)
             if clear_pending:
                 cfg["ytdlp_update_pending_version"] = ""
                 cfg["ytdlp_update_pending_channel"] = ""
-            if not self._settings_save_config(cfg):
+            saved, _snapshot = self._settings_commit_candidate(
+                original_cfg, cfg)
+            if not saved:
                 return False
             cached = getattr(self, "_config", None)
             if isinstance(cached, dict):
@@ -785,9 +1002,12 @@ class SettingsMixin:
         """Persist a discovered automatic update until install succeeds."""
         with SettingsMixin._settings_save_lock:
             cfg = self._settings_fresh_config()
+            original_cfg = copy.deepcopy(cfg)
             cfg["ytdlp_update_pending_version"] = str(latest or "")
             cfg["ytdlp_update_pending_channel"] = str(channel or "stable")
-            if not self._settings_save_config(cfg):
+            saved, _snapshot = self._settings_commit_candidate(
+                original_cfg, cfg)
+            if not saved:
                 return False
             cached = getattr(self, "_config", None)
             if isinstance(cached, dict):
@@ -799,6 +1019,11 @@ class SettingsMixin:
     def _queue_ytdlp_update(self, *, yt, channel, automatic,
                             latest="", current="", record_check=False):
         """Coalesce one update request and start it when safely idle."""
+        admission = getattr(self, "_work_admission_error", None)
+        if callable(admission):
+            blocked = admission("a yt-dlp update")
+            if blocked is not None:
+                return blocked
         self._ensure_ytdlp_update_runtime()
         payload = {
             "yt": str(yt),
@@ -811,6 +1036,8 @@ class SettingsMixin:
             "attempt": 0,
             "not_before": 0.0,
             "idle_sampled": False,
+            "task_id": f"ytdlp-update-{uuid.uuid4().hex}",
+            "cancel_event": threading.Event(),
         }
         with self._ytdlp_update_state_lock:
             if self._ytdlp_update_running:
@@ -882,10 +1109,21 @@ class SettingsMixin:
             self._ytdlp_update_pending = None
             self._ytdlp_update_running = True
         try:
-            thread = threading.Thread(
+            cancel_event = payload.get("cancel_event")
+            if not isinstance(cancel_event, threading.Event):
+                cancel_event = threading.Event()
+                payload["cancel_event"] = cancel_event
+            thread = start_managed_task(
+                self,
+                owner="ytdlp-updater",
+                label="Update the managed yt-dlp executable",
+                task_id=str(payload.get("task_id") or ""),
+                cancel=cancel_event,
                 target=lambda: self._run_ytdlp_update(payload),
-                daemon=True)
-            thread.start()
+                name="ytdlp-update-worker",
+                thread_factory=threading.Thread,
+            )
+            self._ytdlp_update_thread = thread
             return {"ok": True, "started": True,
                     "automatic": bool(payload.get("automatic"))}
         except Exception as exc:
@@ -900,6 +1138,8 @@ class SettingsMixin:
     def _run_ytdlp_update(self, payload):
         import subprocess as _sp
 
+        from backend.process_runner import supervise_streaming_process
+
         yt = payload["yt"]
         channel = payload["channel"]
         automatic = bool(payload.get("automatic"))
@@ -910,27 +1150,56 @@ class SettingsMixin:
             ["[Update] ", "update_head"],
             [f"{prefix} yt-dlp update to {label}...\n", "update_sep"],
         ])
-        proc = None
-        registry = None
+        task_id = str(
+            payload.setdefault(
+                "task_id", f"ytdlp-update-{uuid.uuid4().hex}"))
+        cancel_event = payload.get("cancel_event")
+        if not isinstance(cancel_event, threading.Event):
+            cancel_event = threading.Event()
+            payload["cancel_event"] = cancel_event
+        with self._ytdlp_update_state_lock:
+            self._ytdlp_update_active_cancel = cancel_event
         success = False
         retry_automatic = False
         try:
-            proc = _sp.Popen([yt, "--update-to", channel],
+            # A bare channel switch only changes repositories when yt-dlp
+            # considers the target version newer.  That leaves a newer
+            # nightly build in place when the user has selected Stable and
+            # causes the same "update" to be retried forever.  The release
+            # check already resolved an exact tag, so use it when available;
+            # an explicit channel@tag request supports both upgrades and
+            # intentional downgrades.
+            latest = str(payload.get("latest") or "").strip()
+            update_target = f"{channel}@{latest}" if latest else channel
+            proc = _sp.Popen([yt, "--update-to", update_target],
                              stdout=_sp.PIPE, stderr=_sp.STDOUT,
                              encoding="utf-8", errors="replace", bufsize=1,
                              startupinfo=sync_backend._startupinfo)
+            result = supervise_streaming_process(
+                proc,
+                on_stdout_line=lambda line: log_stream.emit_dim(" " + line),
+                cancel_event=cancel_event,
+                timeout=900,
+                owner="ytdlp-updater",
+                task_id=task_id,
+                role="self-update",
+            )
+            # Finalize already-exited Popen objects. This is non-blocking for a
+            # real child and preserves compatibility with small legacy test
+            # doubles whose state transition occurs in wait().
             try:
-                from backend.process_runner import PROCESS_REGISTRY
-                registry = PROCESS_REGISTRY
-                registry.register(proc)
-            except Exception:
-                registry = None
-            for line in proc.stdout:
-                log_stream.emit_dim(" " + line.rstrip())
-            proc.wait()
-            if proc.returncode != 0:
+                proc.wait(timeout=0)
+            except TypeError:
+                proc.wait()
+            except _sp.TimeoutExpired:
+                pass
+            if result.cancelled:
+                raise RuntimeError("yt-dlp update cancelled")
+            if result.timed_out:
+                raise RuntimeError("yt-dlp updater timed out after 15 minutes")
+            if result.returncode != 0:
                 raise RuntimeError(
-                    f"yt-dlp updater exited with code {proc.returncode}")
+                    f"yt-dlp updater exited with code {result.returncode}")
 
             SettingsMixin._ytdlp_version_cache.pop(yt, None)
             latest = payload.get("latest") or ""
@@ -1026,11 +1295,6 @@ class SettingsMixin:
                 log_stream.emit_error(message)
                 self._push_ytdlp_update_status("error", message)
         finally:
-            if registry is not None and proc is not None:
-                try:
-                    registry.unregister(proc)
-                except Exception:
-                    pass
             if payload.get("gate_reserved"):
                 try:
                     from backend.process_runner import YTDLP_UPDATE_GATE
@@ -1040,6 +1304,8 @@ class SettingsMixin:
             log_stream.flush()
             with self._ytdlp_update_state_lock:
                 self._ytdlp_update_running = False
+                if self._ytdlp_update_active_cancel is cancel_event:
+                    self._ytdlp_update_active_cancel = None
                 if automatic and not success and retry_automatic:
                     self._ytdlp_update_pending = payload
             self._ytdlp_monitor_wake.set()
@@ -1077,8 +1343,13 @@ class SettingsMixin:
                 return {"ok": True, "started": False, "running": True}
             SettingsMixin._ytdlp_update_check_running = True
 
+        task_id = f"ytdlp-update-check-{uuid.uuid4().hex}"
+        cancel = threading.Event()
+
         def _run():
             try:
+                if cancel.is_set():
+                    return
                 import json as _json
                 import urllib.request as _ur
 
@@ -1099,6 +1370,8 @@ class SettingsMixin:
                 )
                 with _ur.urlopen(req, timeout=8) as resp:
                     data = _json.loads(resp.read(1_000_000))
+                if cancel.is_set():
+                    return
                 latest = (data.get("tag_name") or "").strip().lstrip("v")
                 latest_tuple = self._ytdlp_version_tuple(latest)
                 if not latest_tuple:
@@ -1190,7 +1463,21 @@ class SettingsMixin:
                 if wake is not None:
                     wake.set()
 
-        threading.Thread(target=_run, daemon=True).start()
+        try:
+            start_managed_task(
+                self,
+                owner="ytdlp-update-check",
+                label="Check for yt-dlp updates",
+                task_id=task_id,
+                cancel=cancel,
+                target=_run,
+                name="ytdlp-update-check",
+                thread_factory=threading.Thread,
+            )
+        except WorkAdmissionClosed as exc:
+            with SettingsMixin._ytdlp_update_check_lock:
+                SettingsMixin._ytdlp_update_check_running = False
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "started": True, "due": True}
 
     def ytdlp_update(self):
@@ -1243,10 +1530,13 @@ class SettingsMixin:
                     "error": f"Folder isn't writable: {_pe}"}
         with SettingsMixin._settings_save_lock:
             cfg = self._settings_fresh_config()
+            original_cfg = copy.deepcopy(cfg)
             cfg["output_dir"] = path
-            ok = self._settings_save_config(cfg)
+            ok, _snapshot = self._settings_commit_candidate(
+                original_cfg, cfg)
         if ok:
             self._reload_config()
             return {"ok": True, "path": path}
         return {"ok": False, "write_blocked": True, "path": path,
-                "error": "Write-gate off"}
+                "error": ("Settings are temporarily read-only. Restart "
+                          "YTArchiver and try again.")}

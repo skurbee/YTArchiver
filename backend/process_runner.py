@@ -18,10 +18,14 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
+from collections import deque
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from queue import Empty, Full, Queue
 
 from . import youtube_traffic
 from .log import get_logger
@@ -34,16 +38,43 @@ from .subprocess_util import (
 _log = get_logger(__name__)
 
 
+_PROCESS_OWNER_CONTEXT = threading.local()
+
+
+@contextmanager
+def process_owner_scope(owner: str, task_id: str = ""):
+    """Supply default ownership to launches on the current worker thread.
+
+    This lets a top-level worker claim legacy helper launches without making
+    ownership global or risking another thread's unrelated process. Explicit
+    ``popen_ytdlp`` ownership still takes precedence.
+    """
+    previous = getattr(_PROCESS_OWNER_CONTEXT, "value", None)
+    _PROCESS_OWNER_CONTEXT.value = (
+        str(owner or "unowned"), str(task_id or ""))
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                del _PROCESS_OWNER_CONTEXT.value
+            except AttributeError:
+                pass
+        else:
+            _PROCESS_OWNER_CONTEXT.value = previous
+
+
 class StreamingRunResult:
     """Backward-compatible result for YtDlpRunner.run_streaming."""
 
-    __slots__ = ("returncode", "stderr_tail", "cancelled")
+    __slots__ = ("returncode", "stderr_tail", "cancelled", "timed_out")
 
     def __init__(self, returncode: int, stderr_tail: list[str],
-                 cancelled: bool = False):
+                 cancelled: bool = False, timed_out: bool = False):
         self.returncode = returncode
         self.stderr_tail = stderr_tail
         self.cancelled = cancelled
+        self.timed_out = timed_out
 
     def __iter__(self):
         yield self.returncode
@@ -58,36 +89,127 @@ class StreamingRunResult:
 
 # ── ProcessRegistry ───────────────────────────────────────────────────
 
+@dataclass(frozen=True, slots=True)
+class ProcessRecord:
+    """One app-owned process and the job that is allowed to stop it."""
+
+    proc: subprocess.Popen
+    owner: str
+    task_id: str
+    role: str
+    pid: int | None
+    create_time: float | None
+
+
 class ProcessRegistry:
-    """Tracks live child processes for clean shutdown.
+    """Tracks app-owned child processes without guessing from image names.
 
-    Every Popen registered here is killed on `kill_all()` — used at app
-    shutdown to ensure no zombie yt-dlp / ffmpeg / ffprobe lingers.
-    Replaces the psutil child-scanning + name-matching hack in main.py's
-    _shutdown_cleanup.
+    Records carry an owner and stable task ID so a feature-level force stop
+    can target only its own process trees.  ``kill_all`` remains as the
+    backwards-compatible whole-app emergency operation.
 
-    Thread-safe. Idempotent: re-registering or unregistering an unknown
-    proc is a no-op.
+    All waits in one terminate operation run concurrently against one
+    monotonic deadline.  Ten stuck children therefore consume one timeout,
+    not ten timeouts in sequence.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._procs: list[subprocess.Popen] = []
+        self._records: list[ProcessRecord] = []
 
-    def register(self, proc: subprocess.Popen) -> subprocess.Popen:
-        """Track `proc` for shutdown cleanup. Returns the same proc."""
+    @property
+    def _procs(self) -> list[subprocess.Popen]:
+        """Legacy diagnostic view retained for older callers/tests."""
+        with self._lock:
+            return [record.proc for record in self._records]
+
+    @staticmethod
+    def _is_alive(proc: subprocess.Popen) -> bool:
+        try:
+            return proc.poll() is None
+        except Exception:
+            # A broken diagnostic method must not make us forget a process
+            # that may still be running.
+            return True
+
+    @staticmethod
+    def _pid_for(proc: subprocess.Popen) -> int | None:
+        try:
+            pid = getattr(proc, "pid", None)
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                return pid
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _create_time_for(pid: int | None) -> float | None:
+        if pid is None:
+            return None
+        try:
+            import psutil
+            return float(psutil.Process(pid).create_time())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _matches(record: ProcessRecord, *, owner: str | None = None,
+                 task_id: str | None = None,
+                 role: str | None = None,
+                 proc: subprocess.Popen | None = None) -> bool:
+        if proc is not None and record.proc is not proc:
+            return False
+        if owner is not None and record.owner != str(owner):
+            return False
+        if task_id is not None and record.task_id != str(task_id):
+            return False
+        if role is not None and record.role != str(role):
+            return False
+        return True
+
+    def _prune_dead_locked(self) -> int:
+        before = len(self._records)
+        self._records = [
+            record for record in self._records
+            if self._is_alive(record.proc)
+        ]
+        return before - len(self._records)
+
+    def register(self, proc: subprocess.Popen, *, owner: str = "unowned",
+                 task_id: str = "", role: str = "") -> subprocess.Popen:
+        """Track ``proc`` and return it, preserving the old call shape.
+
+        Re-registering the same Popen updates its metadata instead of adding a
+        duplicate.  Calls that have not migrated yet are visibly labelled
+        ``unowned`` rather than being silently attributed to another feature.
+        """
         if proc is None:
             return proc
+        scoped_owner, scoped_task = getattr(
+            _PROCESS_OWNER_CONTEXT, "value", ("unowned", ""))
+        owner_value = str(owner or "unowned")
+        task_value = str(task_id or "")
+        if owner_value == "unowned" and scoped_owner != "unowned":
+            owner_value = str(scoped_owner)
+            if not task_value:
+                task_value = str(scoped_task or "")
+        role_value = str(role or "")
+        pid = self._pid_for(proc)
+        record = ProcessRecord(
+            proc=proc,
+            owner=owner_value,
+            task_id=task_value,
+            role=role_value,
+            pid=pid,
+            create_time=self._create_time_for(pid),
+        )
         with self._lock:
-            still = []
-            for existing in self._procs:
-                try:
-                    if existing.poll() is None:
-                        still.append(existing)
-                except Exception:
-                    still.append(existing)
-            self._procs = still
-            self._procs.append(proc)
+            self._prune_dead_locked()
+            self._records = [
+                existing for existing in self._records
+                if existing.proc is not proc
+            ]
+            self._records.append(record)
         return proc
 
     def unregister(self, proc: subprocess.Popen) -> None:
@@ -96,72 +218,508 @@ class ProcessRegistry:
         if proc is None:
             return
         with self._lock:
-            try:
-                self._procs.remove(proc)
-            except ValueError:
-                pass
+            self._records = [
+                record for record in self._records
+                if record.proc is not proc
+            ]
 
     def reap_dead(self) -> int:
         """Drop already-exited procs from the registry. Returns count
         removed. Optional housekeeping — kill_all is safe regardless."""
-        removed = 0
         with self._lock:
-            still = []
-            for p in self._procs:
-                try:
-                    if p.poll() is None:
-                        still.append(p)
-                    else:
-                        removed += 1
-                except Exception:
-                    still.append(p)
-            self._procs = still
-        return removed
+            return self._prune_dead_locked()
 
-    def alive_count(self) -> int:
-        """Diagnostic: number of currently-tracked, still-running procs."""
+    def snapshot(self, *, owner: str | None = None,
+                 task_id: str | None = None,
+                 role: str | None = None) -> list[ProcessRecord]:
+        """Return a stable metadata snapshot of matching live processes."""
         with self._lock:
-            return sum(1 for p in self._procs if p.poll() is None)
+            self._prune_dead_locked()
+            return [
+                record for record in self._records
+                if self._matches(
+                    record, owner=owner, task_id=task_id, role=role)
+            ]
+
+    def alive_count(self, *, owner: str | None = None,
+                    task_id: str | None = None,
+                    role: str | None = None) -> int:
+        """Return the number of matching live registered roots."""
+        return len(self.snapshot(owner=owner, task_id=task_id, role=role))
+
+    def _take(self, *, owner: str | None = None,
+              task_id: str | None = None,
+              role: str | None = None,
+              proc: subprocess.Popen | None = None) -> list[ProcessRecord]:
+        with self._lock:
+            self._prune_dead_locked()
+            selected: list[ProcessRecord] = []
+            kept: list[ProcessRecord] = []
+            for record in self._records:
+                if self._matches(
+                        record, owner=owner, task_id=task_id,
+                        role=role, proc=proc):
+                    selected.append(record)
+                else:
+                    kept.append(record)
+            self._records = kept
+            return selected
+
+    def _take_many(
+            self, *, owners: Iterable[str] | None = None,
+            processes: Iterable[subprocess.Popen] | None = None,
+    ) -> list[ProcessRecord]:
+        owner_values = (
+            {str(value) for value in owners} if owners is not None else None)
+        process_ids = (
+            {id(value) for value in processes}
+            if processes is not None else None)
+        with self._lock:
+            self._prune_dead_locked()
+            selected: list[ProcessRecord] = []
+            kept: list[ProcessRecord] = []
+            for record in self._records:
+                owner_match = (
+                    owner_values is not None and record.owner in owner_values)
+                process_match = (
+                    process_ids is not None and id(record.proc) in process_ids)
+                if owner_match or process_match:
+                    selected.append(record)
+                else:
+                    kept.append(record)
+            self._records = kept
+            return selected
+
+    @staticmethod
+    def _descendants(record: ProcessRecord) -> list[object]:
+        """Return only descendants of this exact registered process."""
+        if record.pid is None:
+            return []
+        try:
+            import psutil
+            root = psutil.Process(record.pid)
+            if record.create_time is not None:
+                # PIDs are reusable.  Refuse to walk a different process that
+                # acquired this PID after the registered root exited.
+                if abs(float(root.create_time()) - record.create_time) > 0.01:
+                    return []
+            return list(root.children(recursive=True))
+        except Exception:
+            return []
+
+    @staticmethod
+    def _psutil_alive(proc: object) -> bool:
+        try:
+            import psutil
+            return bool(proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _start_root_waiters(records: list[ProcessRecord],
+                            wait_timeout: float):
+        """Wait for roots concurrently so total latency is one deadline."""
+        waiters = []
+        for record in records:
+            done = threading.Event()
+            stopped = threading.Event()
+
+            def _wait(rec=record, done_event=done, stopped_event=stopped):
+                try:
+                    rec.proc.wait(timeout=wait_timeout)
+                except Exception:
+                    pass
+                else:
+                    stopped_event.set()
+                finally:
+                    done_event.set()
+
+            thread = threading.Thread(
+                target=_wait,
+                name=f"process-wait-{record.pid or 'unknown'}",
+                daemon=True,
+            )
+            thread.start()
+            waiters.append((record, thread, done, stopped))
+        return waiters
+
+    @staticmethod
+    def _join_waiters(waiters, deadline: float) -> None:
+        for _record, thread, _done, _stopped in waiters:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            thread.join(timeout=remaining)
+
+    def _restore_survivors(self, records: list[ProcessRecord]) -> None:
+        if not records:
+            return
+        with self._lock:
+            known = {id(record.proc) for record in self._records}
+            for record in records:
+                if id(record.proc) not in known:
+                    self._records.append(record)
+                    known.add(id(record.proc))
+
+    def _terminate_records(self, records: list[ProcessRecord],
+                           timeout: float) -> int:
+        active = [record for record in records if self._is_alive(record.proc)]
+        if not active:
+            return 0
+
+        budget = max(0.0, float(timeout))
+        started = time.monotonic()
+        deadline = started + budget
+        grace_deadline = started + (budget * 0.7)
+
+        # Capture each exact tree before stopping its root.  No image-name or
+        # process-wide descendant scan is involved.
+        trees = {id(record): self._descendants(record) for record in active}
+
+        # Signal every tree before waiting for any one tree.  This is what
+        # makes the timeout global rather than N times the supplied value.
+        for record in active:
+            try:
+                record.proc.terminate()
+            except Exception as exc:
+                _log.debug("process terminate failed: %s", exc)
+        for record in active:
+            for child in reversed(trees[id(record)]):
+                try:
+                    child.terminate()
+                except Exception as exc:
+                    _log.debug("descendant terminate failed: %s", exc)
+
+        waiters = self._start_root_waiters(active, budget)
+        self._join_waiters(waiters, grace_deadline)
+
+        # Escalate every remaining member together, then spend only the
+        # remainder of the same global deadline reaping them.
+        force_wait: list[ProcessRecord] = []
+        waiter_by_record = {id(row[0]): row for row in waiters}
+        for record in active:
+            _rec, _thread, _done, stopped = waiter_by_record[id(record)]
+            if stopped.is_set():
+                continue
+            if not self._is_alive(record.proc):
+                stopped.set()
+                continue
+            try:
+                record.proc.kill()
+                force_wait.append(record)
+            except Exception as exc:
+                _log.debug("process kill failed: %s", exc)
+        for record in active:
+            for child in reversed(trees[id(record)]):
+                if not self._psutil_alive(child):
+                    continue
+                try:
+                    child.kill()
+                except Exception as exc:
+                    _log.debug("descendant kill failed: %s", exc)
+
+        # A waiter that was still blocked in Popen.wait will wake after kill.
+        self._join_waiters(waiters, deadline)
+        # If its first wait already returned TimeoutExpired, reap it with a
+        # second concurrent wait using only the remaining global budget.
+        remaining = max(0.0, deadline - time.monotonic())
+        retry_waiters = self._start_root_waiters(
+            [record for record in force_wait
+             if waiter_by_record[id(record)][2].is_set()
+             and not waiter_by_record[id(record)][3].is_set()],
+            remaining,
+        )
+        self._join_waiters(retry_waiters, deadline)
+        retry_by_record = {id(row[0]): row for row in retry_waiters}
+
+        # Give killed descendants the same remaining deadline, without ever
+        # inspecting siblings or unrelated children.
+        while time.monotonic() < deadline:
+            if not any(
+                    self._psutil_alive(child)
+                    for children in trees.values() for child in children):
+                break
+            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+
+        survivors: list[ProcessRecord] = []
+        for record in active:
+            stopped = waiter_by_record[id(record)][3].is_set()
+            retry = retry_by_record.get(id(record))
+            if retry is not None:
+                stopped = stopped or retry[3].is_set()
+            if not stopped and self._is_alive(record.proc):
+                survivors.append(record)
+        self._restore_survivors(survivors)
+        return len(active)
+
+    def terminate_owner(self, owner: str, timeout: float = 5.0) -> int:
+        """Stop every process owned by ``owner`` within one deadline."""
+        return self._terminate_records(
+            self._take(owner=str(owner)), timeout)
+
+    def terminate_owners(self, owners: Iterable[str],
+                         timeout: float = 5.0) -> int:
+        """Stop an exact owner set within one shared deadline."""
+        return self._terminate_records(
+            self._take_many(owners=owners), timeout)
+
+    def terminate_job(self, task_id: str, timeout: float = 5.0,
+                      *, owner: str | None = None) -> int:
+        """Stop one stable task's process roots, optionally under an owner."""
+        return self._terminate_records(
+            self._take(owner=owner, task_id=str(task_id)), timeout)
+
+    def terminate_process(self, proc: subprocess.Popen,
+                          timeout: float = 5.0) -> int:
+        """Stop the exact registered root and its descendants."""
+        return self._terminate_records(self._take(proc=proc), timeout)
+
+    def terminate_processes(self, processes: Iterable[subprocess.Popen],
+                            timeout: float = 5.0) -> int:
+        """Stop exact registered roots together within one shared deadline."""
+        return self._terminate_records(
+            self._take_many(processes=processes), timeout)
 
     def kill_all(self, timeout: float = 5.0) -> int:
-        """Terminate every tracked process. Returns count terminated.
-
-        Sends terminate to each still-running process, waits up to
-        `timeout` for that process, then kills it if it is still alive.
-        Used in main.py's shutdown path.
-        """
-        with self._lock:
-            procs = list(self._procs)
-            self._procs.clear()
-        if not procs:
-            return 0
-        per_proc_timeout = max(0.0, timeout)
-        terminated = 0
-        for p in procs:
-            try:
-                if p.poll() is not None:
-                    continue
-                terminated += 1
-                p.terminate()
-                try:
-                    p.wait(timeout=per_proc_timeout)
-                except subprocess.TimeoutExpired:
-                    if p.poll() is None:
-                        try:
-                            p.kill()
-                        except Exception as e:
-                            _log.debug("swallowed: %s", e)
-                    try:
-                        p.wait(timeout=0.25)
-                    except Exception as e:
-                        _log.debug("swallowed: %s", e)
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-        return terminated
+        """Whole-app emergency stop, bounded by one global deadline."""
+        return self._terminate_records(self._take(), timeout)
 
 
 # Module-level singleton — the rest of the codebase imports this.
 PROCESS_REGISTRY = ProcessRegistry()
+
+
+def supervise_streaming_process(
+        proc: subprocess.Popen, *,
+        registry: ProcessRegistry | None = None,
+        on_stdout_line: Callable[[str], None] | None = None,
+        on_stderr_line: Callable[[str], None] | None = None,
+        cancel_event: threading.Event | None = None,
+        timeout: float | None = None,
+        owner: str = "unowned",
+        task_id: str = "",
+        role: str = "streaming",
+) -> StreamingRunResult:
+    """Supervise an already-launched streaming child without blocking on I/O.
+
+    This is the process-agnostic half of :meth:`YtDlpRunner.run_streaming`.
+    It is also used by installers and the yt-dlp self-updater, which cannot
+    launch through the ordinary yt-dlp gate. Both pipes are drained through a
+    bounded queue while timeout/cancel checks run on the caller thread.
+    """
+    target_registry = registry or PROCESS_REGISTRY
+    try:
+        target_registry.register(
+            proc, owner=owner, task_id=task_id, role=role)
+    except TypeError:
+        # Preserve compatibility with small embedders implementing the old
+        # one-argument registry protocol.
+        target_registry.register(proc)
+
+    stderr_tail: deque = deque(maxlen=200)
+    cancelled = False
+    timed_out = False
+    output_queue: Queue = Queue(maxsize=512)
+    reader_stop = threading.Event()
+    stdout_done = threading.Event()
+    stderr_done = threading.Event()
+
+    def _drain_pipe(pipe, channel: str, done: threading.Event) -> None:
+        try:
+            if pipe is None:
+                return
+            readline = getattr(pipe, "readline", None)
+            iterator = None if callable(readline) else iter(pipe)
+            while not reader_stop.is_set():
+                if callable(readline):
+                    line = readline()
+                    if not line:
+                        break
+                else:
+                    try:
+                        line = next(iterator)
+                    except StopIteration:
+                        break
+                while not reader_stop.is_set():
+                    try:
+                        output_queue.put((channel, line), timeout=0.05)
+                        break
+                    except Full:
+                        continue
+        except Exception as exc:
+            _log.debug("stream reader stopped: %s", exc)
+        finally:
+            done.set()
+
+    stdout_thread = threading.Thread(
+        target=_drain_pipe,
+        args=(getattr(proc, "stdout", None), "stdout", stdout_done),
+        daemon=True,
+        name=f"process-stdout-{task_id or 'unknown'}",
+    )
+    stderr_thread = threading.Thread(
+        target=_drain_pipe,
+        args=(getattr(proc, "stderr", None), "stderr", stderr_done),
+        daemon=True,
+        name=f"process-stderr-{task_id or 'unknown'}",
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    started = time.monotonic()
+    operation_deadline = (
+        None if timeout is None
+        else started + max(0.0, float(timeout))
+    )
+    post_exit_deadline: float | None = None
+    closed_pipes_deadline: float | None = None
+
+    def _call_line(callback, line: str) -> None:
+        if callback is None:
+            return
+        try:
+            callback(line.rstrip("\n"))
+        except Exception as exc:
+            _log.debug("stream callback failed: %s", exc)
+
+    def _consume(channel: str, line: str, *, callbacks: bool = True) -> None:
+        if channel == "stderr":
+            stderr_tail.append(line.rstrip())
+            if callbacks:
+                _call_line(on_stderr_line, line)
+            return
+        if callbacks:
+            _call_line(on_stdout_line, line)
+
+    def _terminate_owned() -> None:
+        try:
+            target_registry.terminate_process(proc, timeout=2.0)
+        except Exception as exc:
+            _log.debug("owned process termination failed: %s", exc)
+        try:
+            if proc.poll() is not None:
+                return
+        except Exception:
+            pass
+        cleanup_deadline = time.monotonic() + 2.0
+        try:
+            proc.terminate()
+        except Exception as exc:
+            _log.debug("process terminate fallback failed: %s", exc)
+        try:
+            proc.wait(timeout=max(
+                0.0, min(1.4, cleanup_deadline - time.monotonic())))
+            return
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception as exc:
+            _log.debug("process kill fallback failed: %s", exc)
+        try:
+            proc.wait(timeout=max(
+                0.0, cleanup_deadline - time.monotonic()))
+        except Exception as exc:
+            _log.debug("process reap fallback failed: %s", exc)
+
+    def _poll_process():
+        try:
+            return proc.poll()
+        except Exception:
+            # Tiny test doubles and a few legacy embedders expose only the
+            # Popen-compatible ``returncode`` attribute. A non-None value is
+            # just as authoritative as poll() for an already-finished child.
+            return getattr(proc, "returncode", None)
+
+    try:
+        while True:
+            now = time.monotonic()
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                _terminate_owned()
+                break
+            returncode = _poll_process()
+            if (operation_deadline is not None
+                    and now >= operation_deadline
+                    and returncode is None):
+                timed_out = True
+                _terminate_owned()
+                break
+            if returncode is not None:
+                if post_exit_deadline is None:
+                    post_exit_deadline = now + 1.0
+                if (stdout_done.is_set() and stderr_done.is_set()
+                        and output_queue.empty()):
+                    break
+                if now >= post_exit_deadline:
+                    break
+            elif (stdout_done.is_set() and stderr_done.is_set()
+                  and output_queue.empty()):
+                if closed_pipes_deadline is None:
+                    closed_pipes_deadline = now + 10.0
+                elif now >= closed_pipes_deadline:
+                    timed_out = True
+                    _terminate_owned()
+                    break
+
+            poll_slice = 0.1
+            deadlines = [deadline for deadline in (
+                operation_deadline, post_exit_deadline,
+                closed_pipes_deadline) if deadline is not None]
+            if deadlines:
+                poll_slice = min(
+                    poll_slice,
+                    max(0.001, min(deadlines) - time.monotonic()),
+                )
+            try:
+                channel, line = output_queue.get(timeout=poll_slice)
+            except Empty:
+                continue
+            _consume(channel, line)
+    finally:
+        reader_stop.set()
+        reader_deadline = time.monotonic() + 1.0
+        for thread in (stdout_thread, stderr_thread):
+            thread.join(timeout=max(
+                0.0, reader_deadline - time.monotonic()))
+        for pipe, done in (
+                (getattr(proc, "stdout", None), stdout_done),
+                (getattr(proc, "stderr", None), stderr_done)):
+            if not done.is_set():
+                continue
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except Exception as exc:
+                _log.debug("stream pipe close failed: %s", exc)
+        while True:
+            try:
+                channel, line = output_queue.get_nowait()
+            except Empty:
+                break
+            _consume(
+                channel, line,
+                callbacks=not (cancelled or timed_out),
+            )
+        still_alive = _poll_process() is None
+        if still_alive:
+            try:
+                target_registry.register(
+                    proc, owner=owner, task_id=task_id, role=role)
+            except TypeError:
+                target_registry.register(proc)
+            except Exception as exc:
+                _log.debug("survivor re-registration failed: %s", exc)
+        else:
+            target_registry.unregister(proc)
+
+    returncode = getattr(proc, "returncode", None)
+    return StreamingRunResult(
+        returncode if returncode is not None else -1,
+        list(stderr_tail),
+        cancelled=cancelled,
+        timed_out=timed_out,
+    )
 
 
 # ── yt-dlp update launch gate ─────────────────────────────────────────────
@@ -224,12 +782,24 @@ class YtDlpUpdateGate:
 YTDLP_UPDATE_GATE = YtDlpUpdateGate()
 
 
-def popen_ytdlp(*args, registry: ProcessRegistry | None = None, **kwargs):
-    """Launch and register yt-dlp as one update-gate transaction."""
+def popen_ytdlp(*args, registry: ProcessRegistry | None = None,
+                owner: str | None = None, task_id: str = "",
+                role: str = "yt-dlp", **kwargs):
+    """Launch and register yt-dlp as one update-gate transaction.
+
+    Ownership keywords are consumed here and never forwarded to ``Popen``.
+    Existing callers remain source-compatible while migrated callers can be
+    stopped by exact owner or stable task ID.
+    """
     target_registry = registry or PROCESS_REGISTRY
+    scoped_owner, scoped_task_id = getattr(
+        _PROCESS_OWNER_CONTEXT, "value", ("yt-dlp", ""))
+    effective_owner = str(owner) if owner is not None else scoped_owner
+    effective_task_id = str(task_id or scoped_task_id)
     with YTDLP_UPDATE_GATE.launch_slot():
         proc = subprocess.Popen(*args, **kwargs)
-        target_registry.register(proc)
+        target_registry.register(
+            proc, owner=effective_owner, task_id=effective_task_id, role=role)
     return proc
 
 
@@ -464,22 +1034,29 @@ class YtDlpRunner:
 
     def run_streaming(self, argv: Iterable[str],
                       *, on_stdout_line: Callable[[str], None] | None = None,
+                      on_stderr_line: Callable[[str], None] | None = None,
                       cancel_event: threading.Event | None = None,
+                      timeout: float | None = None,
+                      owner: str = "yt-dlp",
+                      task_id: str = "",
                       extra_env: dict | None = None,
                       traffic_kind: str = "yt_dlp_download",
                       ) -> StreamingRunResult:
         """Run yt-dlp and stream stdout line by line via `on_stdout_line`.
 
         Used for long-running passes (channel sync) where the caller
-        wants to react to each progress line as it arrives. If
-        `cancel_event` fires, the process is terminated.
+        wants to react to each progress line as it arrives. Timeout and
+        cancellation are monitored independently of child output, so a silent
+        process cannot hide from either one.
 
-        Stderr is also drained on a background thread (last 200 lines
-        captured for the return tuple's diagnostic list).
+        Reader threads drain both pipes into a bounded queue. The calling
+        thread remains the supervisor and owns callbacks, timeout checks, and
+        exact-tree termination. Stderr's last 200 lines are retained.
 
         Returns a StreamingRunResult. It still unpacks as
         (returncode, stderr_tail), and exposes `.cancelled` so callers can
         distinguish user cancellation from a launch/process failure.
+        `.timed_out` reports the separate timeout outcome.
         """
         argv = list(argv)
         if not argv:
@@ -507,88 +1084,30 @@ class YtDlpRunner:
                 creationflags=subprocess_creationflags(),
                 env=utf8_env(extra_env or None),
                 registry=self._registry,
+                owner=owner,
+                task_id=task_id,
+                role="streaming",
             )
         except OSError as e:
             return StreamingRunResult(-1, [f"launch failed: {e}"])
-        from collections import deque
-        stderr_tail: deque = deque(maxlen=200)
-        cancelled = False
-
-        def _drain_stderr():
-            try:
-                if proc.stderr is None:
-                    return
-                for ln in iter(proc.stderr.readline, ""):
-                    if not ln:
-                        break
-                    stderr_tail.append(ln.rstrip())
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-
-        t = threading.Thread(target=_drain_stderr, daemon=True,
-                             name="yta-ytdlp-stderr")
-        t.start()
-        try:
-            if proc.stdout is not None:
-                for line in iter(proc.stdout.readline, ""):
-                    if cancel_event is not None and cancel_event.is_set():
-                        cancelled = True
-                        try:
-                            proc.terminate()
-                        except Exception:
-                            pass
-                        break
-                    if on_stdout_line:
-                        try:
-                            on_stdout_line(line.rstrip("\n"))
-                        except Exception as e:
-                            _log.debug("swallowed: %s", e)
-            # Full terminate→wait→kill→wait cleanup. Previously after
-            # wait timeout we'd terminate() but never wait/kill again,
-            # leaving a process that ignored SIGTERM running until app
-            # shutdown's kill_all reaped it.
-            try:
-                if cancel_event is not None and cancel_event.is_set():
-                    cancelled = True
-                    if proc.poll() is None:
-                        try:
-                            proc.terminate()
-                        except Exception:
-                            pass
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=2)
-                    except Exception as e:
-                        _log.debug("swallowed: %s", e)
-        finally:
-            self._registry.unregister(proc)
-            # Join the stderr drain thread so its appends to
-            # stderr_tail can't race the list(stderr_tail) snapshot
-            # below. Best-effort; thread is daemon so it'll die with
-            # the process anyway if join times out.
-            try:
-                t.join(timeout=2.0)
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-        rc = proc.returncode if proc.returncode is not None else -1
-        _stderr_result = list(stderr_tail)
+        result = supervise_streaming_process(
+            proc,
+            registry=self._registry,
+            on_stdout_line=on_stdout_line,
+            on_stderr_line=on_stderr_line,
+            cancel_event=cancel_event,
+            timeout=timeout,
+            owner=owner,
+            task_id=task_id,
+            role="streaming",
+        )
         try:
             from .youtube_session import handle_youtube_failure_text
             handle_youtube_failure_text(
-                "\n".join(_stderr_result), context="running yt-dlp")
+                "\n".join(result.stderr_tail), context="running yt-dlp")
         except Exception as e:
             _log.debug("YtDlpRunner streaming session guard failed: %s", e)
-        return StreamingRunResult(
-            rc, _stderr_result, cancelled=cancelled)
+        return result
 
 
 # ── FfmpegRunner ─────────────────────────────────────────────────────
@@ -619,7 +1138,9 @@ class FfmpegRunner:
             return p
 
     def probe_capture(self, argv: Iterable[str],
-                      *, timeout: float = 20.0
+                      *, timeout: float = 20.0,
+                      owner: str = "ffprobe",
+                      task_id: str = "",
                       ) -> tuple[int, str, str]:
         """Run an ffprobe argv (full path included) and capture output.
         Returns (rc, stdout, stderr).
@@ -640,16 +1161,30 @@ class FfmpegRunner:
             )
         except OSError as e:
             return -1, "", f"launch failed: {e}"
-        self._registry.register(proc)
+        self._registry.register(
+            proc, owner=owner, task_id=task_id, role="probe")
         try:
             try:
                 out, err = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
+                out = exc.output or ""
                 try:
-                    proc.kill()
-                except Exception:
-                    pass
-                out, err = proc.communicate()
+                    self._registry.terminate_process(proc, timeout=2.0)
+                except Exception as stop_exc:
+                    _log.debug("ffprobe tree stop failed: %s", stop_exc)
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                # Draining after kill must itself be bounded. A failed kill or
+                # inherited pipe handle previously made this communicate wait
+                # forever.
+                try:
+                    drained_out, _drained_err = proc.communicate(timeout=1.0)
+                    if drained_out:
+                        out = drained_out
+                except Exception as drain_exc:
+                    _log.debug("ffprobe post-kill drain failed: %s", drain_exc)
                 return -1, out or "", "timeout"
         finally:
             self._registry.unregister(proc)

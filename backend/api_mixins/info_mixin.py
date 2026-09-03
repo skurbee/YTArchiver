@@ -14,7 +14,13 @@ import threading
 from datetime import datetime
 
 from backend.version import APP_VERSION, APP_VERSION_DATE
-from backend.ytarchiver_config import CONFIG_FILE, config_is_writable, load_config, save_config
+from backend.ytarchiver_config import (
+    CONFIG_FILE,
+    config_is_writable,
+    load_config,
+    save_config,
+    update_config,
+)
 
 from ._shared import _log
 
@@ -71,6 +77,15 @@ class InfoMixin:
         if services is not None:
             return services.save_config(cfg)
         return save_config(cfg)
+
+    def _info_update_config(self, mutator):
+        """Commit one informational preference against current state."""
+        services = self._info_services()
+        mutate = (getattr(services, "mutate_config", None)
+                  if services is not None else None)
+        if callable(mutate):
+            return mutate(mutator)
+        return update_config(mutator)
 
     def _info_log_stream(self):
         services = self._info_services()
@@ -210,10 +225,9 @@ class InfoMixin:
         return list(cfg.get("url_history", []) or [])[:20]
 
 
-    # Process-wide lock for url_history mutation. Two near-simultaneous
-    # downloads finishing within ms both used to load_config + mutate +
-    # save_config without coordination, so the second save_config could
-    # overwrite the first's append (audit: info_mixin.py:162-171).
+    # Preserve deterministic newest-first ordering for near-simultaneous URL
+    # completions. The config transaction below protects unrelated settings;
+    # this narrower lock defines which URL becomes the newest row.
     _url_history_lock = threading.Lock()
 
 
@@ -221,23 +235,28 @@ class InfoMixin:
         if not config_is_writable():
             return
         with InfoMixin._url_history_lock:
-            cfg = self._info_fresh_config()
-            hist = [u for u in (cfg.get("url_history", []) or []) if u != url]
-            hist.insert(0, url)
-            del hist[20:]
-            cfg["url_history"] = hist
-            _ok = self._info_save_config(cfg)
-            # Don't silently drop the URL if the save fails (write-gate
-            # toggled off mid-call, disk full). Emit a dim line so the
-            # user can investigate why their autocomplete history isn't
-            # updating (audit: info_mixin H13).
-            if not _ok:
+            def _mutate(cfg):
+                hist = [
+                    u for u in (cfg.get("url_history", []) or []) if u != url
+                ]
+                hist.insert(0, url)
+                del hist[20:]
+                cfg["url_history"] = hist
+
+            try:
+                self._info_update_config(_mutate)
+            except Exception as exc:
+                # Don't silently drop the URL if the save fails (write-gate
+                # toggled off mid-call, disk full). Emit a dim line so the
+                # user can investigate why their autocomplete history isn't
+                # updating (audit: info_mixin H13).
                 try:
                     self._info_log_stream().emit_dim(
-                        f"URL history save failed (config write-gate or disk) "
-                        f"— '{(url or '')[:60]}' not added to autocomplete.")
+                        f"URL history could not be saved — "
+                        f"'{(url or '')[:60]}' was not added to autocomplete.")
                 except Exception:
                     pass
+                _log.warning("URL history save failed: %s", exc)
 
 
     # ─── Last Full Sync live label ──────────────────────────────────────

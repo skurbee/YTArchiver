@@ -41,6 +41,16 @@ from pathlib import Path
 from . import youtube_traffic
 from .log import get_logger
 from .process_runner import popen_ytdlp
+from .services.sidecar_store import (
+    SidecarError,
+    atomic_update_text,
+    atomic_write_json_object,
+    begin_reconciliation,
+    read_json_object,
+    read_jsonl,
+    read_text,
+    reconciliation_marker_path,
+)
 from .sync import _find_cookie_source, _startupinfo, find_yt_dlp
 from .transcribe import _parse_vtt, _replace_jsonl_entry
 from .transcribe.transcribe_files import parse_transcript_header
@@ -70,10 +80,9 @@ _RATE_LIMIT_RE = re.compile(
 # survive app restarts. After every video we append the video_id to a
 # per-scope text file under %APPDATA%\YTArchiver\repair_progress\. On
 # the next start of the same scope we load it as a set and skip any
-# already-processed ids. Append-only means we never write more than a
-# single short line per video — none of the "save the whole set every
-# N videos" thrashing.
-# Scope = the task's `url` field ("repair:all" / "repair:channel:Vox" /
+# already-processed ids. Each new id goes through the shared atomic sidecar
+# updater, so a torn append cannot corrupt the resume record.
+# Scope = the task's `url` field ("repair:all" / "repair:channel:Example" /
 # "repair:video:abc"), so partial runs of different scopes coexist
 # without collision.
 
@@ -104,12 +113,14 @@ def _load_progress(scope_url: str) -> set:
     """Return the set of video_ids already processed in prior runs of
     this scope. Empty set on no-file / read-failure."""
     f = _progress_path(scope_url)
-    if not f.exists():
-        return set()
     try:
-        with open(f, "r", encoding="utf-8") as fh:
-            return {line.strip() for line in fh if line.strip()}
-    except OSError:
+        snapshot = read_text(f)
+        if not snapshot.exists:
+            return set()
+        return {line.strip() for line in snapshot.text.splitlines()
+                if line.strip()}
+    except SidecarError as exc:
+        _log.warning("Could not read repair progress %s: %s", f, exc)
         return set()
 
 
@@ -117,9 +128,13 @@ def _append_progress(scope_url: str, video_id: str) -> None:
     """Mark this video as done for the given scope (append one line)."""
     f = _progress_path(scope_url)
     try:
-        with open(f, "a", encoding="utf-8") as fh:
-            fh.write(video_id + "\n")
-    except OSError:
+        def _append(existing: str, _exists: bool) -> str:
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            return existing + video_id + "\n"
+
+        atomic_update_text(f, _append)
+    except SidecarError:
         pass  # non-fatal: we'll just retry the video on resume
 
 
@@ -145,6 +160,14 @@ def _checkpoint_path(scope_url: str) -> Path:
     return _progress_dir() / f"{_scope_slug(scope_url)}.work.json"
 
 
+def _repair_marker_path(jsonl_path: Path, video_id: str) -> Path:
+    return reconciliation_marker_path(
+        _progress_dir(),
+        operation="caption-repair",
+        key=f"{os.path.normcase(os.path.abspath(jsonl_path))}|{video_id}",
+    )
+
+
 def _save_checkpoint(scope_url: str, work: list) -> None:
     """Persist the scanned work list so a future resume can skip the
     scan. `work` is a list of (jsonl_path, video_id, title, src_tag)
@@ -157,14 +180,10 @@ def _save_checkpoint(scope_url: str, work: list) -> None:
         "scanned_at": datetime.now().isoformat(),
         "work": [[str(jp), vid, t, tag] for (jp, vid, t, tag) in work],
     }
-    tmp = str(f) + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False)
-        os.replace(tmp, f)
-    except OSError:
-        try: os.remove(tmp)
-        except OSError: pass
+        atomic_write_json_object(f, payload)
+    except SidecarError as exc:
+        _log.warning("Could not save repair checkpoint %s: %s", f, exc)
 
 
 def _load_checkpoint(scope_url: str) -> list | None:
@@ -173,12 +192,12 @@ def _load_checkpoint(scope_url: str) -> list | None:
     if not scope_url:
         return None
     f = _checkpoint_path(scope_url)
-    if not f.exists():
-        return None
     try:
-        with open(f, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError, ValueError):
+        exists, data = read_json_object(f)
+        if not exists:
+            return None
+    except SidecarError as exc:
+        _log.warning("Could not load repair checkpoint %s: %s", f, exc)
         return None
     out = []
     dropped_missing = 0
@@ -224,13 +243,15 @@ def _parse_txt_sources(txt_path: Path) -> dict:
     """Return `{normalized_title: source_tag}` from a Transcript.txt file."""
     out: dict = {}
     try:
-        with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                parsed = parse_transcript_header(line)
-                if parsed:
-                    title, _date, _dur, src = parsed
-                    out[_norm_title(title)] = src
-    except OSError:
+        snapshot = read_text(txt_path)
+        if not snapshot.exists:
+            return out
+        for line in snapshot.text.splitlines():
+            parsed = parse_transcript_header(line)
+            if parsed:
+                title, _date, _dur, src = parsed
+                out[_norm_title(title)] = src
+    except SidecarError:
         pass
     return out
 
@@ -410,6 +431,68 @@ def _update_db_words(video_id: str,
             conn.close()
 
 
+def _force_reingest_jsonl(jsonl_path: Path, title: str, video_id: str,
+                          conn: sqlite3.Connection | None = None
+                          ) -> tuple[int, str | None]:
+    """Atomically rebuild one transcript file's index after cue drift.
+
+    A words-only UPDATE cannot reconcile inserted, removed, duplicated, or
+    retimed cues.  Reuse index.ingest_jsonl's validated DELETE+INSERT+FTS
+    transaction, then report the rebuilt row count for the repaired video.
+    """
+    owns_conn = False
+    if conn is None:
+        conn = _open_repair_db_conn()
+        if conn is None:
+            return 0, f"DB not found at {TRANSCRIPTION_DB}"
+        owns_conn = True
+    try:
+        jp = os.path.normpath(str(jsonl_path))
+        context = conn.execute(
+            "SELECT channel, title FROM segments WHERE jsonl_path=? "
+            "ORDER BY CASE WHEN video_id=? THEN 0 ELSE 1 END LIMIT 1",
+            (jp, video_id),
+        ).fetchone()
+        if context is None:
+            context = conn.execute(
+                "SELECT channel, title FROM videos WHERE video_id=? LIMIT 1",
+                (video_id,),
+            ).fetchone()
+        channel = (context[0] if context else "") or jsonl_path.parent.name
+        ingest_title = (context[1] if context else "") or title
+
+        # Keep the same synthetic media path used by aggregated transcript
+        # sweeps.  Passing one video's media path here would stamp that
+        # video's year/month onto every entry in a channel-level JSONL.
+        transcript_path = _find_txt_for_jsonl(jsonl_path)
+        from . import index as _index
+        ingested = _index.ingest_jsonl(
+            str(transcript_path), str(jsonl_path), ingest_title, channel,
+            _conn_override=conn, force=True,
+        )
+        # ingest_jsonl returns 0 for validation, read, or transactional
+        # failures.  A stale target row count can coincidentally equal the
+        # expected cue count, so count agreement alone is not proof that the
+        # forced replacement ran.
+        if not isinstance(ingested, int) or ingested <= 0:
+            return 0, "DB forced re-ingest reported no indexed rows"
+        rebuilt = conn.execute(
+            "SELECT COUNT(*) FROM segments "
+            "WHERE video_id=? AND jsonl_path=?",
+            (video_id, jp),
+        ).fetchone()[0]
+        return int(rebuilt or 0), None
+    except (OSError, sqlite3.Error) as e:
+        try:
+            conn.rollback()
+        except Exception as rollback_error:
+            _log.debug("swallowed: %s", rollback_error)
+        return 0, f"DB forced re-ingest: {e}"
+    finally:
+        if owns_conn:
+            conn.close()
+
+
 _PUNCT_CHARS_RE = re.compile(r"[.,!?;:]")
 _CAP_WORD_RE = re.compile(r"\b[A-Z][a-z]+")
 
@@ -511,13 +594,96 @@ def _repair_one_video(yt_dlp: str, jsonl_path: Path, title: str,
                 return False, "skipped: new VTT is lowercase (would downgrade punctuation)", 0, 0
             if dry_run:
                 return True, "DRY-RUN", len(new_segs), total_words
+
+            jsonl_store = f"jsonl:{os.path.normcase(os.path.abspath(jsonl_path))}"
+            db_store = f"sqlite:{os.path.normcase(str(TRANSCRIPTION_DB))}:{video_id}"
+            try:
+                marker = begin_reconciliation(
+                    _repair_marker_path(jsonl_path, video_id),
+                    operation="caption repair JSONL/index commit",
+                    stores=(jsonl_store, db_store),
+                    details={
+                        "video_id": video_id,
+                        "jsonl_path": str(jsonl_path),
+                    },
+                )
+            except SidecarError as exc:
+                return False, f"reconciliation marker: {exc}", 0, 0
+
+            def _record_partial(error: object) -> None:
+                try:
+                    marker.record_failure(error)
+                except SidecarError as marker_exc:
+                    _log.error(
+                        "Could not update caption reconciliation marker %s: %s",
+                        marker.path, marker_exc)
+
             try:
                 _replace_jsonl_entry(str(jsonl_path), title, video_id, new_segs)
             except Exception as e:
+                _record_partial(e)
                 return False, f"JSONL replace: {e}", 0, 0
+            try:
+                marker.mark_committed(jsonl_store)
+            except SidecarError as exc:
+                _record_partial(exc)
+                return (False,
+                        f"partial: JSONL updated; marker update failed: {exc}",
+                        len(new_segs), total_words)
+
             db_rows, db_err = _update_db_words(video_id, new_segs, conn=db_conn)
             if db_err:
-                return True, f"DB skipped: {db_err}", len(new_segs), total_words
+                # JSONL is already updated, but the searchable/watch database
+                # is still stale.  This is a recoverable partial failure, not
+                # a green success: the caller must retain its checkpoint and
+                # retry this video until the two durable stores agree.
+                _record_partial(db_err)
+                return (False,
+                        f"partial: JSONL updated; DB reconcile failed: {db_err}",
+                        len(new_segs), total_words)
+            if db_rows != len(new_segs):
+                # Missing/duplicate/retimed cues cannot converge through
+                # another words-only UPDATE. Force the complete JSONL through
+                # the indexer's validated atomic replacement instead.
+                rebuilt, rebuild_err = _force_reingest_jsonl(
+                    jsonl_path, title, video_id, conn=db_conn)
+                if rebuild_err is None and rebuilt == len(new_segs):
+                    try:
+                        marker.mark_committed(db_store)
+                        marker.finish()
+                    except SidecarError as exc:
+                        _record_partial(exc)
+                        return (
+                            False,
+                            f"partial: stores agree; marker cleanup failed: {exc}",
+                            len(new_segs),
+                            total_words,
+                        )
+                    return (True,
+                            f"{rebuilt} DB rows (forced re-ingest)",
+                            len(new_segs), total_words)
+                detail = (f"forced re-ingest failed: {rebuild_err}"
+                          if rebuild_err else
+                          f"forced re-ingest rebuilt {rebuilt}/{len(new_segs)}")
+                _record_partial(detail)
+                return (
+                    False,
+                    "partial: JSONL updated; DB reconcile updated "
+                    f"{db_rows}/{len(new_segs)} segment rows; {detail}",
+                    len(new_segs),
+                    total_words,
+                )
+            try:
+                marker.mark_committed(db_store)
+                marker.finish()
+            except SidecarError as exc:
+                _record_partial(exc)
+                return (
+                    False,
+                    f"partial: stores agree; marker cleanup failed: {exc}",
+                    len(new_segs),
+                    total_words,
+                )
             return True, f"{db_rows} DB rows", len(new_segs), total_words
         finally:
             try:
@@ -529,10 +695,6 @@ def _repair_one_video(yt_dlp: str, jsonl_path: Path, title: str,
         return _run_repair(tmp_dir)
     with tempfile.TemporaryDirectory(prefix="ytarc_repair_") as tmp:
         return _run_repair(Path(tmp))
-
-
-_VID_RE = re.compile(rb'"video_id"\s*:\s*"([^"]+)"')
-_TITLE_RE = re.compile(rb'"title"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 
 def _file_contains_any(path: Path, needles: tuple[bytes, ...],
@@ -559,12 +721,9 @@ def _collect_yt_videos(jsonl_path: Path) -> list:
     video in `jsonl_path` (both raw and punct-restored). Each video appears
     at most once even though the JSONL stores many segments per video.
 
-    Fast path: jsonl files for large channels are 20MB+ with hundreds of
-    thousands of segment rows. Full `json.loads` per line takes minutes.
-    Instead we regex video_id and title (the only fields we need) and skip
-    consecutive lines that share the same video_id — typical archives
-    group all segments of a video together, so the same-vid skip flies
-    past 99% of the file.
+    Every nonblank row is decoded through the shared sidecar reader before
+    fields are trusted. Consecutive rows still share one video id in normal
+    aggregates, so downstream title/source work is performed once per video.
 
     The downgrade-vs-repair decision is made later, per-video, inside
     `_repair_one_video` — after we've fetched the new VTT and can inspect
@@ -577,31 +736,27 @@ def _collect_yt_videos(jsonl_path: Path) -> list:
     if not sources:
         return []
     seen: dict = {}
-    last_vid = b""
+    last_vid = ""
     try:
-        with open(jsonl_path, "rb") as f:
-            for raw in f:
-                vm = _VID_RE.search(raw)
-                if not vm:
-                    continue
-                vid_b = vm.group(1)
-                if vid_b == last_vid:
-                    continue  # same video as the previous segment row
-                last_vid = vid_b
-                vid = vid_b.decode("ascii", errors="replace")
-                if vid in seen:
-                    continue
-                tm = _TITLE_RE.search(raw)
-                if not tm:
-                    continue
-                # Cheap JSON-escape unescaping — titles only ever contain
-                # \", \\, and Unicode literals which utf-8 decode handles.
-                title = (tm.group(1).decode("utf-8", errors="replace")
-                         .replace('\\"', '"').replace("\\\\", "\\"))
-                tag = sources.get(_norm_title(title), "")
-                if tag in YT_CAPTION_TAGS:
-                    seen[vid] = (title, tag)
-    except OSError:
+        snapshot = read_jsonl(jsonl_path, invalid="skip")
+        if snapshot.invalid_lines:
+            _log.warning(
+                "%s: skipped %d invalid JSONL records while scanning repairs",
+                jsonl_path, len(snapshot.invalid_lines))
+        for record in snapshot.records:
+            vid = str(record.get("video_id") or "").strip()
+            if not vid or vid == last_vid:
+                continue
+            last_vid = vid
+            if vid in seen:
+                continue
+            title = str(record.get("title") or "").strip()
+            if not title:
+                continue
+            tag = sources.get(_norm_title(title), "")
+            if tag in YT_CAPTION_TAGS:
+                seen[vid] = (title, tag)
+    except SidecarError:
         return []
     return [(vid, t, tag) for vid, (t, tag) in seen.items()]
 
@@ -611,12 +766,8 @@ def _find_jsonl_for_video_id(root: Path, video_id: str
     """Scan every JSONL under `root` for an entry with this video_id.
     Returns `(jsonl_path, title)` or `(None, None)`.
 
-    Reads in binary mode and uses _VID_RE.search to detect the id
-    BEFORE parsing JSON per line. Old code json.loads'd every line
-    of every JSONL up front — on a large archive (100k+ lines per
-    channel) that turned single-video repair into a multi-minute
-    startup (audit: repair_captions.py:455). Now: O(jsonls * bytes-
-    to-match) with early-break when the substring shows up.
+    Uses a chunked byte search to reject nonmatching aggregates cheaply, then
+    parses and object-validates the one candidate before returning fields.
     """
     _needle = (b'"video_id": "' + video_id.encode("ascii") + b'"')
     _needle_alt = (b'"video_id":"' + video_id.encode("ascii") + b'"')
@@ -626,16 +777,14 @@ def _find_jsonl_for_video_id(root: Path, video_id: str
             # just to reject a non-match.
             if not _file_contains_any(j, (_needle, _needle_alt)):
                 continue
-            # Found a hit — parse line-by-line to extract the title.
-            with open(j, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if (obj.get("video_id") or "").strip() == video_id:
-                        return j, (obj.get("title") or "").strip()
-        except OSError:
+            # Found a byte-level hit. Parse and object-validate the matching
+            # aggregate before trusting any fields from it.
+            snapshot = read_jsonl(j, invalid="skip")
+            for obj in snapshot.records:
+                if (obj.get("video_id") or "").strip() == video_id:
+                    return j, (obj.get("title") or "").strip()
+        except (SidecarError, OSError) as exc:
+            _log.warning("Could not inspect transcript sidecar %s: %s", j, exc)
             continue
     return None, None
 
@@ -808,7 +957,7 @@ def repair_archive(*, output_dir: str, log_stream,
         f" — {len(work):,} YT-caption video(s) to process.\n",
         "simpleline")
     log_stream.flush()
-    # Per-video lines stay `dim` (Verbose mode only — 80k+ of them
+    # Per-video lines stay `dim` (Verbose mode only — potentially many
     # would drown the Simple log). Emit a `simpleline` milestone every
     # MILESTONE_EVERY videos so Simple-mode users still see steady
     # progress instead of one banner followed by silent hours. Lowered
@@ -855,7 +1004,7 @@ def repair_archive(*, output_dir: str, log_stream,
             db_conn=db_conn, tmp_dir=repair_tmp_dir)
         # Record progress only for a GENUINE success or a deliberate
         # "skipped:" downgrade, so a restart resumes after the last truly-done
-        # video. Do NOT persist hard FAILs, the "DB skipped" partial (JSONL
+        # video. Do NOT persist hard FAILs, a DB-reconcile partial (JSONL
         # written but the DB UPDATE failed), rate-limited aborts, or cancels —
         # those MUST be retried on the next resume rather than silently skipped
         # forever (audit r2). (Permanent fails like "no captions" re-check each
@@ -863,7 +1012,7 @@ def repair_archive(*, output_dir: str, log_stream,
         _persist_this = (
             scope_url and not dry_run
             and (
-                (success and "DB skipped" not in (msg or ""))
+                success
                 or (msg or "").startswith("skipped:")
             )
         )
@@ -948,7 +1097,9 @@ def repair_archive(*, output_dir: str, log_stream,
         _clear_progress(scope_url)
         _clear_checkpoint(scope_url)
 
-    return {"ok": True, "succeeded": ok_count, "skipped": skip_count,
+    return {"ok": fail_count == 0 and not cancelled_early,
+            "partial": fail_count > 0 or cancelled_early,
+            "succeeded": ok_count, "skipped": skip_count,
             "failed": fail_count, "total": len(work),
             "from_prior": skipped_resume,
             "cancelled": cancelled_early}

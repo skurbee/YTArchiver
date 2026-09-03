@@ -74,7 +74,8 @@
 
       runBtn.addEventListener("click", async () => {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Repair API not available.", "warn");
+          window._showToast?.(
+            "YTArchiver is still starting. Try again in a moment.", "warn");
           return;
         }
         const payload = {
@@ -88,9 +89,9 @@
         // a regression.
         if (!payload.channel && !payload.dry_run) {
           const _ok = await window.askDanger(
-            "Repair YT captions — ALL channels",
-            "Dry-run is OFF. This rewrites every YT-captioned transcript "
-            + "in every channel and can take hours.\n\nProceed?",
+            "Repair YouTube captions for all channels?",
+            "This will update every YouTube-captioned transcript in every "
+            + "channel and can take hours.",
             "Run on all channels");
           if (!_ok) return;
         }

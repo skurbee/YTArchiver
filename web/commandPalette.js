@@ -6,7 +6,7 @@
  * Type to filter; ↑/↓ to move, Enter to run, Esc to close.
  *
  * Sources:
- *   - Actions (jump to a tab, sync all, open Tools/Metadata/Index, search…)
+ *   - Actions (jump to a tab, sync all, open Health sections, search…)
  *   - Channels (jump straight to a channel's Browse page)
  *
  * Built entirely in JS (no markup) so it stays self-contained. Triggered by
@@ -18,25 +18,67 @@
 (function () {
   "use strict";
 
+  const displayText = window.YT?.util?.displayText || ((s) => String(s ?? ""));
+
   const $ = (id) => document.getElementById(id);
   const _esc = (s) => (window._escapeHtml || ((x) => String(x ?? "")))(s);
 
   function _clickTab(tab) {
     document.querySelector(`.tab[data-tab="${tab}"]`)?.click();
   }
-  function _healthSub(view) {
+  function _scrollToSection(anchor) {
+    if (!anchor) return;
+    const section = document.getElementById(anchor);
+    if (!section) return;
+    const disclosure = section.matches("details")
+      ? section : section.closest("details");
+    if (disclosure) disclosure.open = true;
+    section.scrollIntoView({ block: "start" });
+  }
+  function _healthSub(view, anchor) {
     _clickTab("health");
+    setTimeout(() => {
+      document.querySelector(
+        `#panel-health .settings-subnav-btn[data-settings-view="${view}"]`)?.click();
+      requestAnimationFrame(() => _scrollToSection(anchor));
+    }, 50);
+  }
+  function _settingsSection(anchor) {
+    _clickTab("settings");
+    setTimeout(() => _scrollToSection(anchor), 50);
+  }
+  function _browseSubmode(mode) {
+    _clickTab("browse");
     setTimeout(() => document.querySelector(
-      `#panel-health .settings-subnav-btn[data-settings-view="${view}"]`)?.click(), 50);
+      `[data-submode="${mode}"]`)?.click(), 50);
   }
   function _jumpChannel(name) {
     _clickTab("browse");
-    // Reuse the exact channel-card click flow after the tab is shown.
+    // Reuse the exact channel-card click flow after the tab is shown. During
+    // first hydration the cards are intentionally masked, but the cheap
+    // subscription identity is still enough to open that channel's videos.
     setTimeout(() => {
       const card = [...document.querySelectorAll("#channel-grid .channel-card")].find(
-        (c) => (c.querySelector(".channel-card-name")?.textContent || "").trim() === name);
-      if (card) card.click();
-      else window._showToast?.(`Couldn't find "${name}" in Browse.`, "warn");
+        (c) => String(c.dataset.channelName || "").trim() === name);
+      if (card) {
+        card.click();
+        return;
+      }
+      const state = window._browseState || {};
+      const candidates = []
+        .concat(Array.isArray(state.channels) ? state.channels : [])
+        .concat(Array.isArray(state.pendingChannels)
+          ? state.pendingChannels : []);
+      const channel = candidates.find((item) =>
+        String(item?.folder || item?.name || "").trim() === name);
+      if (channel && typeof window.loadVideosFor === "function"
+          && typeof window.showView === "function") {
+        state.currentChannel = channel;
+        window.loadVideosFor(channel);
+        window.showView("videos");
+        return;
+      }
+      window._showToast?.(`Couldn't find "${name}" in Browse.`, "warn");
     }, 110);
   }
 
@@ -44,24 +86,22 @@
   function _buildItems() {
     const items = [
       { label: "Sync all subscribed channels", hint: "action", run: () => $("btn-sync-subbed")?.click() },
-      { label: "Search transcripts + titles", hint: "action", run: () => {
-          _clickTab("browse");
-          setTimeout(() => document.querySelector('[data-submode="search"]')?.click(), 50);
-        } },
+      { label: "Search transcripts + titles", hint: "action", run: () => _browseSubmode("search") },
       { label: "Download", hint: "tab", run: () => _clickTab("download") },
-      { label: "Channels — browse and manage", hint: "browse", run: () => {
-          _clickTab("browse");
-          setTimeout(() => document.querySelector('[data-submode="channels"]')?.click(), 50);
-        } },
-      { label: "Videos — Browse library", hint: "browse", run: () => {
-          _clickTab("browse");
-          setTimeout(() => document.querySelector('[data-submode="recent"]')?.click(), 50);
-        } },
-      { label: "Health", hint: "tab", run: () => _clickTab("health") },
+      { label: "Channels — browse and manage", hint: "browse", run: () => _browseSubmode("channels") },
+      { label: "Videos — Browse library", hint: "browse", run: () => _browseSubmode("recent") },
+      { label: "Graph — transcript trends", hint: "browse", run: () => _browseSubmode("graph") },
+      { label: "Bookmarks — saved moments", hint: "browse", run: () => _browseSubmode("bookmarks") },
+      { label: "Manual downloads", hint: "browse", run: () => _browseSubmode("manual") },
+      { label: "Trash — restore or permanently delete files", hint: "browse", run: () => _browseSubmode("trash") },
+      { label: "Health overview", hint: "health", run: () => _healthSub("overview") },
       { label: "Settings", hint: "tab", run: () => _clickTab("settings") },
-      { label: "Tools", hint: "health", run: () => _healthSub("tools") },
-      { label: "Metadata status", hint: "health", run: () => _healthSub("metadata") },
-      { label: "Index & rebuild", hint: "health", run: () => _healthSub("index") },
+      { label: "Metadata status", hint: "health", run: () => _healthSub("library", "health-library-metadata") },
+      { label: "Search Index", hint: "health", run: () => _healthSub("library", "health-library-index") },
+      { label: "Archive Files", hint: "health", run: () => _healthSub("library", "health-library-archive") },
+      { label: "Transcript maintenance", hint: "health", run: () => _healthSub("library", "health-library-transcripts") },
+      { label: "Backups", hint: "health", run: () => _healthSub("backups") },
+      { label: "System & diagnostics", hint: "settings", run: () => _settingsSection("settings-about-troubleshooting") },
       { label: "Keyboard shortcuts", hint: "help", run: () => $("btn-shortcuts-help")?.click() },
     ];
     if (window._legacySubsTabEnabled) {
@@ -71,10 +111,21 @@
         run: () => _clickTab("subs"),
       });
     }
-    const chans = (window._browseState && window._browseState.channels) || [];
+    const state = window._browseState || {};
+    const completeChannels = Array.isArray(state.channels)
+      ? state.channels : [];
+    const pendingChannels = Array.isArray(state.pendingChannels)
+      ? state.pendingChannels : [];
+    const chans = completeChannels.length ? completeChannels : pendingChannels;
     for (const c of chans) {
       const name = (c.folder || c.name || "").trim();
-      if (name) items.push({ label: name, hint: "channel", run: () => _jumpChannel(name) });
+      if (name) {
+        items.push({
+          label: displayText(name),
+          hint: "channel",
+          run: () => _jumpChannel(name),
+        });
+      }
     }
     return items;
   }

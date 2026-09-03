@@ -5,14 +5,10 @@
 
       <!-- Row 1: Video URL -->
       <div class="controls-row">
-        <label class="ctl-label">Video URL:</label>
-        <!-- bug W-2: bind the URL input to a <datalist> populated from
-             url_history so users get autocomplete of recent downloads.
-             The backend api.url_history() returns the list. -->
+        <label class="ctl-label" for="url-input">Video URL:</label>
         <input type="text" class="ctl-input" id="url-input"
-               list="url-history-list"
+               autocomplete="off" spellcheck="false" autocapitalize="none"
                placeholder="Paste a YouTube video URL" />
-        <datalist id="url-history-list"></datalist>
         <!-- "▶ Download" button moved into the video-opts panel below,
              inline with the custom-filename row, vertically spanning
              the two rows above it. -->
@@ -29,13 +25,13 @@
       <fieldset class="video-opts-panel" id="video-opts-panel" hidden>
         <legend>Video options</legend>
         <div class="vo-row">
-          <label class="vo-label">Save to:</label>
+          <label class="vo-label" for="vo-save-to">Save to:</label>
           <input type="text" class="vo-input" id="vo-save-to"
                  placeholder="(use default download folder)" />
           <button class="btn btn-ghost btn-thin" id="vo-save-to-browse">Browse</button>
         </div>
         <div class="vo-row">
-          <label class="vo-label">Resolution:</label>
+          <label class="vo-label" for="vo-resolution">Resolution:</label>
           <select class="vo-select" id="vo-resolution">
             <option value="best">Best available</option>
             <option value="2160">2160p (4K)</option>
@@ -67,11 +63,11 @@
                 <span>Use YT title as filename</span>
               </label>
               <input type="text" class="vo-input vo-custom-name" id="vo-custom-name"
-                     placeholder="Custom filename" disabled />
+                     placeholder="Custom filename" aria-label="Custom filename" disabled />
             </div>
             <div class="vo-row vo-row-checks">
               <label class="vo-check"
-                     title="Also save the video's metadata (.info.json) + thumbnail next to the file, so it gets a grid thumbnail and a Watch-view description. Both stay hidden — the folder still shows only the video.">
+                     title="Also save the video's thumbnail and description so they appear in Browse and Watch. Support files stay hidden.">
                 <input type="checkbox" id="vo-grab-metadata" />
                 <span>Also fetch metadata + thumbnail</span>
               </label>
@@ -104,7 +100,8 @@
           <span>Sync Subbed</span>
         </button>
         <button class="btn btn-icon btn-pause" id="btn-pause"
-                title="Pause / cancel current task">
+                title="Pause all queues (current jobs finish first)"
+                aria-label="Pause all queues">
           <svg class="btn-ico" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
             <rect x="4" y="3" width="3" height="10" rx="0.5"/>
             <rect x="9" y="3" width="3" height="10" rx="0.5"/>
@@ -120,6 +117,7 @@
 
         <!-- Sync Tasks icon button with label + badge -->
         <button class="icon-btn icon-btn-labeled icon-btn-sync" id="btn-sync-tasks"
+                aria-haspopup="dialog" aria-controls="popover-sync-tasks"
                 aria-expanded="false"
                 title="Sync queue &mdash; view pending downloads">
           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
@@ -131,6 +129,7 @@
 
         <!-- GPU Tasks icon button with label + badge -->
         <button class="icon-btn icon-btn-labeled icon-btn-gpu" id="btn-gpu-tasks"
+                aria-haspopup="dialog" aria-controls="popover-gpu-tasks"
                 aria-expanded="false"
                 title="Processing queue &mdash; view transcribe / encode tasks">
           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
@@ -148,7 +147,8 @@
 
       <!-- Row 3: Auto-sync label/dropdown + countdown -->
       <div class="controls-row controls-row-thin">
-        <label class="ctl-label ctl-label-thin" title="Run Sync Subbed automatically on an interval">Auto-sync:</label>
+        <label class="ctl-label ctl-label-thin" for="auto-sync-select"
+               title="Run Sync Subbed automatically on an interval">Auto-sync:</label>
         <select class="ctl-select" id="auto-sync-select"
                 title="How often to auto-run Sync Subbed">
           <option value="Off">Off</option>
@@ -196,11 +196,12 @@
              snooze the drawer so it stops nagging until that time. -->
         <div class="deferred-retry-wrap">
           <button class="btn btn-ghost btn-thin" id="btn-deferred-retry"
-                  title="Retry options">Retry &#x25BE;</button>
-          <div class="deferred-retry-menu" id="deferred-retry-menu" hidden>
-            <button data-retry="now">Now</button>
-            <button data-retry="24h">in 24 hours</button>
-            <button data-retry="1w">in 1 week</button>
+                   title="Retry options" aria-haspopup="menu"
+                   aria-controls="deferred-retry-menu" aria-expanded="false">Retry &#x25BE;</button>
+          <div class="deferred-retry-menu" id="deferred-retry-menu" role="menu" hidden>
+            <button data-retry="now" role="menuitem">Now</button>
+            <button data-retry="24h" role="menuitem">in 24 hours</button>
+            <button data-retry="1w" role="menuitem">in 1 week</button>
           </div>
         </div>
         <button class="btn btn-ghost btn-thin" id="btn-deferred-clear"
@@ -214,7 +215,9 @@
       <div class="activity-log-frame">
         <div class="activity-log" id="activity-log" tabindex="-1"></div>
       </div>
-      <div class="paned-splitter" id="paned-splitter"></div>
+      <div class="paned-splitter" id="paned-splitter" role="separator"
+           aria-orientation="horizontal" aria-label="Resize activity log"
+           tabindex="0"></div>
       <div class="main-log-frame">
         <div class="main-log" id="main-log" tabindex="-1"></div>
       </div>

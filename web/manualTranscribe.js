@@ -28,15 +28,21 @@
     window._manualTxInited = true;
     const backdrop = document.getElementById("manual-tx-backdrop");
     const pathEl = document.getElementById("manual-tx-path");
-    const modelEl = document.getElementById("manual-tx-model");
     const openBtn = document.getElementById("btn-manual-transcribe");
     const browseBtn = document.getElementById("manual-tx-browse");
     const cancelBtn = document.getElementById("manual-tx-cancel");
     const confirmBtn = document.getElementById("manual-tx-confirm");
     if (!backdrop) return;
 
-    const show = () => { backdrop.hidden = false; };
-    const hide = () => { backdrop.hidden = true; if (pathEl) pathEl.value = ""; };
+    const show = () => {
+      backdrop.hidden = false;
+      requestAnimationFrame(() => browseBtn?.focus());
+    };
+    const hide = () => {
+      backdrop.hidden = true;
+      if (pathEl) pathEl.value = "";
+      openBtn?.focus();
+    };
 
     openBtn?.addEventListener("click", show);
     cancelBtn?.addEventListener("click", hide);
@@ -47,29 +53,39 @@
     // under a picked folder. Native folder picker handles the prompt.
     document.getElementById("btn-transcribe-folder")?.addEventListener("click", async () => {
       if (!nativeBridgeUp()) {
-        window._showToast?.("Native mode required.", "warn");
+        window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
         return;
       }
       // Manual → ask Whisper model (60s countdown auto-picks Settings default).
       const model = await (window._askWhisperModel?.("this folder"));
       if (model === null) return;
-      const res = await bridgeCall("transcribe_folder", model);
-      if (res?.ok) {
-        window._showToast?.("Walking folder \u2014 watch the log for queue counts.", "ok");
-      } else if (!res?.cancelled) {
-        window._showToast?.(res?.error || "Folder transcribe failed.", "error");
+      try {
+        const res = await bridgeCall("transcribe_folder", model);
+        if (res?.ok) {
+          window._showToast?.("Walking folder \u2014 watch the log for queue counts.", "ok");
+        } else if (!res?.cancelled) {
+          window._showToast?.(res?.error || "Folder transcribe failed.", "error");
+        }
+      } catch (error) {
+        window._showToast?.(`Folder transcribe failed: ${error}`, "error");
       }
     });
 
     browseBtn?.addEventListener("click", async () => {
       if (!nativeBridgeUp()) {
-        window._showToast?.("Native mode required.", "warn");
+        window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
         return;
       }
-      const res = await bridgeCall("pick_file", "Pick a video to transcribe", null,
-                                       [("Video files (*.mp4;*.mkv;*.webm;*.mov)")]);
-      if (res?.ok && res.path) {
-        pathEl.value = res.path;
+      try {
+        const res = await bridgeCall("pick_file", "Pick a video to transcribe", null,
+                                         [("Video files (*.mp4;*.mkv;*.webm;*.mov)")]);
+        if (res?.ok && res.path) {
+          pathEl.value = res.path;
+        } else if (!res?.cancelled) {
+          window._showToast?.(res?.error || "Could not choose a video.", "error");
+        }
+      } catch (error) {
+        window._showToast?.(`Could not choose a video: ${error}`, "error");
       }
     });
 
@@ -77,7 +93,7 @@
       const path = pathEl?.value || "";
       if (!path) { window._showToast?.("Pick a video file first.", "warn"); return; }
       if (!nativeBridgeUp()) {
-        window._showToast?.("Native mode required.", "warn");
+        window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
         return;
       }
       // Reject non-media files BEFORE the API call — Whisper would
@@ -92,12 +108,16 @@
       // Manual → ask Whisper model (60s countdown auto-picks Settings default).
       const model = await (window._askWhisperModel?.(`"${title}"`));
       if (model === null) return;
-      const res = await bridgeCall("transcribe_enqueue", path, title, model);
-      if (res?.ok) {
-        window._showToast?.("Queued for transcription.", "ok");
-        hide();
-      } else {
-        window._showToast?.("Queue failed.", "error");
+      try {
+        const res = await bridgeCall("transcribe_enqueue", path, title, model);
+        if (res?.ok) {
+          window._showToast?.("Queued for transcription.", "ok");
+          hide();
+        } else {
+          window._showToast?.(res?.error || "Queue failed.", "error");
+        }
+      } catch (error) {
+        window._showToast?.(`Queue failed: ${error}`, "error");
       }
     });
   }

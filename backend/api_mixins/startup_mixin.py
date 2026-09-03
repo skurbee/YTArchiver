@@ -9,6 +9,10 @@ when moving them out of main.py.
 from __future__ import annotations
 
 import threading
+import uuid
+
+from backend.services.job_supervisor import WorkAdmissionClosed
+from backend.services.managed_work import start_managed_task
 
 
 class StartupMixin:
@@ -26,5 +30,36 @@ class StartupMixin:
             if getattr(self, "_startup_fired", False):
                 return {"ok": True, "already": True}
             self._startup_fired = True
-        threading.Thread(target=self._run_startup_sequence, daemon=True).start()
+        cancel = threading.Event()
+        task_id = f"startup-indexing-{uuid.uuid4().hex}"
+        self._startup_cancel = cancel
+
+        def _run():
+            try:
+                self._run_startup_sequence(cancel)
+            finally:
+                if getattr(self, "_startup_cancel", None) is cancel:
+                    self._startup_cancel = None
+
+        try:
+            self._startup_thread = start_managed_task(
+                self,
+                owner="startup-indexing",
+                label="Startup archive checks and indexing",
+                task_id=task_id,
+                cancel=cancel,
+                target=_run,
+                name="startup-indexing",
+                thread_factory=threading.Thread,
+            )
+        except WorkAdmissionClosed as exc:
+            with StartupMixin._startup_lock:
+                self._startup_fired = False
+            self._startup_cancel = None
+            return {"ok": False, "started": False, "error": str(exc)}
+        except Exception as exc:
+            with StartupMixin._startup_lock:
+                self._startup_fired = False
+            self._startup_cancel = None
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True}

@@ -22,6 +22,26 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
+  async function checkedAction(action, {
+    success = "",
+    failure = "Action failed.",
+  } = {}) {
+    try {
+      const result = await action();
+      if (!result?.ok) {
+        window._showToast?.(result?.error || failure, "error");
+      } else if (success) {
+        window._showToast?.(success, "ok");
+      }
+      return result;
+    } catch (error) {
+      window._showToast?.(
+        `${failure.replace(/[.]+$/, "")}: ${error?.message || error}`,
+        "error");
+      return { ok: false, error: String(error) };
+    }
+  }
+
   // ─── Column sort on Subs table ───────────────────────────────────────
   function initColumnSort() {
     // Subs table
@@ -40,12 +60,39 @@
 
   function wireTableSort(thead, tbodyId, kinds) {
     const ths = thead.querySelectorAll("th");
-    let currentSort = { col: null, dir: 1 };
+    window._tableSortState = window._tableSortState || {};
+    let currentSort = window._tableSortState[tbodyId]
+      || { col: null, colIdx: -1, kind: "string", dir: 1 };
+    const paintSortState = () => {
+      ths.forEach((header, index) => {
+        if (header.hasAttribute("data-nosort")) {
+          header.removeAttribute("aria-sort");
+          return;
+        }
+        const active = index === currentSort.colIdx && currentSort.col;
+        header.dataset.arrow = active
+          ? (currentSort.dir > 0 ? "\u25B2" : "\u25BC") : "";
+        header.setAttribute("aria-sort", active
+          ? (currentSort.dir > 0 ? "ascending" : "descending") : "none");
+      });
+    };
+    const applyCurrentSort = () => {
+      currentSort = window._tableSortState[tbodyId] || currentSort;
+      if (currentSort.col && currentSort.colIdx >= 0) {
+        sortTableBody(
+          tbodyId, currentSort.colIdx, currentSort.kind, currentSort.dir);
+      }
+      paintSortState();
+    };
+    if (tbodyId === "subs-table-body") {
+      window._applySubsSort = applyCurrentSort;
+    }
     ths.forEach((th, i) => {
       // Skip non-sortable headers (e.g. the row-actions kebab column) —
       // they carry data-nosort so they don't get a pointer cursor or a
       // click-to-sort handler (sorting by a button column is nonsense).
       if (th.hasAttribute("data-nosort")) return;
+      th.tabIndex = 0;
       // Re-init guard so a hot-reload / repeat initColumnSort call
       // doesn't stack N click handlers on each th — a single click
       // would otherwise trigger N sorts in succession (audit:
@@ -53,7 +100,8 @@
       if (th._sortWired) return;
       th._sortWired = true;
       th.style.cursor = "pointer";
-      th.addEventListener("click", () => {
+      const activate = () => {
+        currentSort = window._tableSortState[tbodyId] || currentSort;
         // The arrow indicator (\u25B2/\u25BC) is stored in data-arrow and
         // rendered via CSS ::after, so th.textContent itself is clean.
         // But if a future change ever appends the arrow into the th's
@@ -66,13 +114,18 @@
           .toLowerCase();
         const col = th.dataset.sort || _txt;
         const dir = (currentSort.col === col) ? -currentSort.dir : 1;
-        currentSort = { col, dir };
-        sortTableBody(tbodyId, i, kinds[col] || "string", dir);
-        // Arrow indicator
-        ths.forEach(x => x.dataset.arrow = "");
-        th.dataset.arrow = dir > 0 ? "\u25B2" : "\u25BC";
+        currentSort = { col, colIdx: i, kind: kinds[col] || "string", dir };
+        window._tableSortState[tbodyId] = currentSort;
+        applyCurrentSort();
+      };
+      th.addEventListener("click", activate);
+      th.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        activate();
       });
     });
+    applyCurrentSort();
   }
 
   function sortTableBody(tbodyId, colIdx, kind, dir) {
@@ -82,6 +135,13 @@
     rows.sort((a, b) => {
       const av = (a.cells[colIdx]?.textContent || "").trim();
       const bv = (b.cells[colIdx]?.textContent || "").trim();
+      const aPlaceholder = isPlaceholderValue(av, kind);
+      const bPlaceholder = isPlaceholderValue(bv, kind);
+      // Unknown values stay at the bottom in either direction. Applying the
+      // descending multiplier to Infinity used to pull them to the top.
+      if (aPlaceholder && bPlaceholder) return 0;
+      if (aPlaceholder) return 1;
+      if (bPlaceholder) return -1;
       const cmp = compareByKind(av, bv, kind);
       return dir > 0 ? cmp : -cmp;
     });
@@ -90,17 +150,23 @@
     tbody.appendChild(frag);
   }
 
+  function isPlaceholderValue(value, kind) {
+    const text = String(value || "").trim();
+    const lower = text.toLowerCase();
+    if (!text || ["—", "-", "–", "n/a", "na", "unknown",
+      "not available"].includes(lower)) return true;
+    if (kind === "age") return !Number.isFinite(parseAge(text));
+    if (kind === "num") {
+      return !Number.isFinite(parseFloat(text.replace(/[^\d.\-]/g, "")));
+    }
+    if (kind === "size") {
+      return !/([\d.]+)\s*(KB|MB|GB|TB|B)/i.test(text);
+    }
+    return false;
+  }
+
   function compareByKind(a, b, kind) {
     if (kind === "num") {
-      // Treat blanks / em-dash placeholders as +Infinity so they
-      // always sort to the END regardless of direction. Previous
-      // `|| 0` collapsed missing values into the middle of the
-      // numeric range and conflated them with actual zero counts.
-      const _aBlank = !a || a === "—" || a === "-" || a === "–";
-      const _bBlank = !b || b === "—" || b === "-" || b === "–";
-      if (_aBlank && _bBlank) return 0;
-      if (_aBlank) return 1;
-      if (_bBlank) return -1;
       const ai = parseFloat(a.replace(/[^\d.\-]/g, ""));
       const bi = parseFloat(b.replace(/[^\d.\-]/g, ""));
       const aN = Number.isFinite(ai) ? ai : Infinity;
@@ -175,6 +241,20 @@
       || (tr.querySelector(".col-folder")?.textContent || "").trim())
       .filter(Boolean);
   }
+  async function _bulkBridgeCall(method, ...args) {
+    try {
+      return await bridgeCall(method, ...args);
+    } catch (error) {
+      window._showToast?.(
+        `Bulk action failed: ${error?.message || error}`, "error");
+      return null;
+    }
+  }
+  function _firstBulkIssue(result) {
+    const issue = Array.isArray(result?.failed) ? result.failed[0] : null;
+    if (!issue) return "";
+    return [issue.name, issue.reason].filter(Boolean).join(": ");
+  }
   function _updateSubsBulkBar() {
     const tbody = document.getElementById("subs-table-body");
     const bar = document.getElementById("subs-bulk-bar");
@@ -225,12 +305,19 @@
           ],
         }) : null);
         if (!pick) return;
-        const res = await bridgeCall("subs_bulk_update", names, { resolution: pick });
+        const res = await _bulkBridgeCall(
+          "subs_bulk_update", names, { resolution: pick });
+        if (!res) return;
         if (res?.ok) {
+          const failed = res.failed?.length || 0;
+          const detail = _firstBulkIssue(res);
           window._showToast?.(
-            `Updated ${res.updated} channel(s) to ${pick}.`, "ok");
+            `Updated ${res.updated} channel(s) to ${pick}.` +
+            (failed ? ` ${failed} could not be updated.` : "") +
+            (detail ? ` First issue: ${detail}` : ""),
+            failed ? "warn" : "ok");
           clear();
-          window.refreshSubsTable?.();
+          await window.refreshSubsTable?.();
         } else {
           window._showToast?.(res?.error || "Bulk update failed.", "error");
         }
@@ -252,12 +339,18 @@
         }) : null);
         if (!pick) return;
         const changes = { auto_transcribe: pick === "on" };
-        const res = await bridgeCall("subs_bulk_update", names, changes);
+        const res = await _bulkBridgeCall("subs_bulk_update", names, changes);
+        if (!res) return;
         if (res?.ok) {
+          const failed = res.failed?.length || 0;
+          const detail = _firstBulkIssue(res);
           window._showToast?.(
-            `Updated ${res.updated} channel(s).`, "ok");
+            `Updated ${res.updated} channel(s).` +
+            (failed ? ` ${failed} could not be updated.` : "") +
+            (detail ? ` First issue: ${detail}` : ""),
+            failed ? "warn" : "ok");
           clear();
-          window.refreshSubsTable?.();
+          await window.refreshSubsTable?.();
         } else {
           window._showToast?.(res?.error || "Bulk update failed.", "error");
         }
@@ -274,10 +367,19 @@
           `fires as soon as the current sync is idle.`,
           { confirm: "Queue all" });
         if (!ok) return;
-        const res = await bridgeCall("subs_bulk_queue_metadata", names, true);
+        const res = await _bulkBridgeCall(
+          "subs_bulk_queue_metadata", names, true);
+        if (!res) return;
         if (res?.ok) {
+          const already = Number(res.already_queued || 0);
+          const failed = res.failed?.length || 0;
+          const detail = _firstBulkIssue(res);
           window._showToast?.(
-            `Queued metadata refresh for ${res.queued} channel(s).`, "ok");
+            `Queued metadata refresh for ${res.queued} channel(s).` +
+            (already ? ` ${already} already queued.` : "") +
+            (failed ? ` ${failed} could not be queued.` : "") +
+            (detail ? ` First issue: ${detail}` : ""),
+            failed ? "warn" : "ok");
           clear();
         } else {
           window._showToast?.(res?.error || "Bulk queue failed.", "error");
@@ -289,28 +391,44 @@
         const names = _selectedSubsNames(tbody);
         if (!names.length) return;
         const choice = await (window.askChoice ? window.askChoice({
-          title: `Delete ${names.length} channel(s)?`,
+          title: `Remove ${names.length} channel(s)?`,
           message: `You're about to unsubscribe from ${names.length} ` +
-                   `channel(s). Keep files = just remove the subscription. ` +
-                   `Delete files = also wipe the on-disk folders (videos, ` +
-                   `transcripts, metadata).`,
+                   `channel(s). You can keep their downloaded files in the ` +
+                   `archive or move those channel folders to YTArchiver Trash.`,
           choices: [
             { label: "Keep files", value: "keep", primary: true },
-            { label: "Delete files too", value: "delete", kind: "danger" },
+            { label: "Move files to Trash", value: "delete", kind: "danger" },
           ],
           cancel: "Cancel",
         }) : null);
         if (!choice) return;
         const deleteFiles = choice === "delete";
-        const res = await bridgeCall("subs_bulk_delete", names, deleteFiles);
-        if (res?.ok) {
+        const res = await _bulkBridgeCall(
+          "subs_bulk_delete", names, deleteFiles);
+        if (!res) return;
+        if (res?.ok && res?.started) {
           window._showToast?.(
-            `Removed ${res.deleted} channel(s).`, "ok");
+            `Removing ${names.length} channel(s)… You’ll be notified when it finishes.`,
+            "warn");
           clear();
-          window.refreshSubsTable?.();
         } else {
-          window._showToast?.(res?.error || "Bulk delete failed.", "error");
+          window._showToast?.(res?.error || "Bulk removal did not start.", "error");
         }
+      });
+  }
+
+  async function _confirmFolderReorg(channel, years, months, label) {
+    const ok = await window.askConfirm?.(
+      "Organize channel folder",
+      `Move the downloaded files in "${channel}" into ${label}?`,
+      { confirm: "Organize", cancel: "Cancel" });
+    if (!ok) return;
+    await checkedAction(
+      () => bridgeCall(
+        "reorg_channel_folder", { name: channel }, years, months, false),
+      {
+        success: "Folder organization started.",
+        failure: "Folder organization did not start.",
       });
   }
 
@@ -332,7 +450,13 @@
     // (wired below in _updateSubsBulkBar).
     tbody.setAttribute("tabindex", "0");
     let _subsLastClickedIdx = -1;
+    let _subsSeenRenderGeneration = tbody.dataset.renderGeneration || "";
     tbody.addEventListener("click", (e) => {
+      const renderGeneration = tbody.dataset.renderGeneration || "";
+      if (renderGeneration !== _subsSeenRenderGeneration) {
+        _subsSeenRenderGeneration = renderGeneration;
+        _subsLastClickedIdx = -1;
+      }
       const tr = e.target.closest("tr");
       if (!tr) return;
       // Kebab (⋮) click → open the SAME menu the right-click uses,
@@ -393,17 +517,7 @@
         window._editChannelFromContext?.(folder);
       } else if (e.key === "Delete") {
         e.preventDefault();
-        const res = await window._removeChannelWithPrompt(folder);
-        // refresh in place instead of reloading the entire
-        // page. `location.reload()` nuked the main log, queue state,
-        // any pending toasts, and — critically — the Undo toast that
-        // the remove path tries to show. Use the same refresh
-        // helpers the right-click Remove path uses so keyboard
-        // Delete behaves consistently.
-        if (res && res.ok) {
-          try { window.refreshSubsTable?.(); } catch {}
-          try { window._primeBrowse?.(); } catch {}
-        }
+        await window._removeChannelWithPrompt(folder);
       } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
         const allTrs = [...tbody.querySelectorAll("tr")];
@@ -460,52 +574,65 @@
                      : _gpuState === "queued" ? "Already queued for transcribe"
                                                : "Transcribe channel";
       const _txDisabled = Boolean(_gpuState);
-      // Removing a channel while a sync/transcribe is active can race the
-      // running pipeline, so block Remove (with an explanatory tooltip) until
-      // the queues are idle. (Previously the item was only cosmetically dimmed
-      // and still fired during a sync.)
-      const _removeBlocked = (window._anySyncRunning?.() || false) || Boolean(_gpuState);
       // Match YTArchiver.py _chan_ctx_menu (line 5596-6180): 15-item menu
       // with sub-menus for organization mode + redownload quality.
       showContextMenu(e.clientX, e.clientY, [
-        { label: _syncLabel, cls: _syncDisabled ? "dim" : "",
+        { label: _syncLabel, disabled: _syncDisabled,
+          title: _syncDisabled ? "This channel is already in Sync tasks." : "",
           action: async () => {
             if (_syncDisabled) return;
-            const r = await bridgeCall("sync_one_channel", { name: chan });
-            if (r?.ok && r?.queued) {
-              window._showToast?.(`Added "${r.name || chan}" to sync queue.`, "ok");
-            } else if (r?.error) {
-              window._showToast?.(r.error, "error");
+            try {
+              const r = await bridgeCall("sync_one_channel", { name: chan });
+              window.YT?.bridge?.reportSyncOneResult?.(r, chan);
+            } catch (error) {
+              window.YT?.bridge?.reportSyncOneResult?.({
+                ok: false,
+                error: "Sync failed: " + (error?.message || error),
+              }, chan);
             }
           }},
         { label: "Edit settings", action: () => window._editChannelFromContext?.(chan) },
-        { label: "Open folder", action: () => bridgeCall("chan_open_folder", chan) },
-        { label: "Open URL in browser", action: () => bridgeCall("chan_open_url", chan) },
+        { label: "Open folder", action: () => checkedAction(
+          () => bridgeCall("chan_open_folder", chan),
+          { failure: "Could not open channel folder." }) },
+        { label: "Open URL in browser", action: () => checkedAction(
+          () => bridgeCall("chan_open_url", chan),
+          { failure: "Could not open the channel URL." }) },
         { sep: true },
         { label: "Reorg folder",
           submenu: [
-            { label: "Flat (no split)", action: () => bridgeCall("reorg_channel_folder", { name: chan }, false, false, false) },
-            { label: "Split by year", action: () => bridgeCall("reorg_channel_folder", { name: chan }, true, false, false) },
-            { label: "Split by year + month", action: () => bridgeCall("reorg_channel_folder", { name: chan }, true, true, false) },
-            { label: "Re-apply organization", action: () => bridgeCall("reorg_channel_folder", { name: chan }, null, null, false) },
+            { label: "Flat (no split)", action: () =>
+              _confirmFolderReorg(chan, false, false, "one folder") },
+            { label: "Split by year", action: () =>
+              _confirmFolderReorg(chan, true, false, "year folders") },
+            { label: "Split by year + month", action: () =>
+              _confirmFolderReorg(
+                chan, true, true, "year and month folders") },
+            { label: "Re-apply organization", action: () =>
+              _confirmFolderReorg(
+                chan, null, null, "its currently saved folder layout") },
             // Recheck-dates + fix-file-dates are long operations — OLD app
             // shows an all-caps warning dialog. YTArchiver.py:5721-5742.
             { label: "Re-check dates + year/month", action: async () => {
               const ok = await askDanger("Re-check dates",
                 `Re-check upload dates for every video in "${chan}" and re-sort into Year/Month folders?\n\n` +
-                `\u26A0\uFE0F WARNING: THIS CAN TAKE MULTIPLE HOURS ON LARGE CHANNELS`,
+                `This may take several hours on a large channel.`,
                 "Re-check dates");
               if (!ok) return;
-              bridgeCall("reorg_channel_folder", { name: chan }, true, true, true);
+              await checkedAction(
+                () => bridgeCall("reorg_channel_folder", { name: chan }, true, true, true),
+                { success: "Date check and reorganization started.", failure: "Date check did not start." });
             }},
             { label: "Fix file dates only", action: async () => {
               const ok = await askDanger("Fix file dates",
                 `Re-fetch upload dates from YouTube for every video in "${chan}" ` +
                 `and stamp each file's mtime to match?\n\n` +
-                `\u26A0\uFE0F WARNING: THIS CAN TAKE MULTIPLE HOURS ON LARGE CHANNELS`,
+                `This may take several hours on a large channel.`,
                 "Fix dates");
               if (!ok) return;
-              bridgeCall("chan_fix_file_dates", { name: chan });
+              await checkedAction(
+                () => bridgeCall("chan_fix_file_dates", { name: chan }),
+                { success: "File-date repair started.", failure: "File-date repair did not start." });
             }},
             { sep: true },
             // Cancel affordance for the long passes above \u2014 both were
@@ -518,7 +645,7 @@
         // redundant — channel art is fetched automatically as part of the
         // full metadata sweep. Removed to keep the menu focused.
         { sep: true },
-        { label: _txLabel, cls: _txDisabled ? "dim" : "",
+        { label: _txLabel, disabled: _txDisabled,
           title: "Transcribe only videos that don't have a transcript yet (YouTube captions first, Whisper fallback)",
           action: () => { if (!_txDisabled) _askTranscribeChannel(chan); }},
         // right-click → re-transcribe entire channel with
@@ -546,7 +673,9 @@
                                 "error");
           }
         }},
-        { label: "Download metadata", action: () => bridgeCall("metadata_recheck_channel", { name: chan }) },
+        { label: "Download metadata", action: () => checkedAction(
+          () => bridgeCall("metadata_recheck_channel", { name: chan }),
+          { success: "Metadata download queued.", failure: "Metadata download was not queued." }) },
         { sep: true },
         // Pending-redownload swap: when `_redownload_progress.json` is
         // present for this channel (flagged by the backend via
@@ -594,46 +723,10 @@
             ]},
         ]),
         { sep: true },
-        { label: "Remove channel",
-          cls: _removeBlocked ? "disabled" : "dim",
-          title: _removeBlocked ? "Can't remove while syncing or processing" : "",
-          action: async () => {
-          if (_removeBlocked) return;
-          // Two-step (subscription → optional disk delete) via shared helper.
-          const res = await window._removeChannelWithPrompt(chan);
-          if (!res || !res.ok) return;
-          // Refresh Subs data without a full page reload, so the undo toast survives
-          if (nativeBridgeUp()) {
-            const data = await bridgeCall("get_subs_channels");
-            if (Array.isArray(data) && data.length === 2) {
-              window.renderSubsTable(data[0], data[1]);
-              window._primeBrowse?.(data[0]);
-            }
-          }
-          if (res?.can_undo) {
-            window._showToast({
-              msg: `Removed "${chan}".`,
-              kind: "warn",
-              ttlMs: 10_000,
-              action: {
-                label: "Undo",
-                onClick: async () => {
-                  const u = await bridgeCall("subs_undo_remove");
-                  if (u?.ok) {
-                    window._showToast?.("Channel restored.", "ok");
-                    const data = await bridgeCall("get_subs_channels");
-                    if (Array.isArray(data) && data.length === 2) {
-                      window.renderSubsTable(data[0], data[1]);
-                      window._primeBrowse?.(data[0]);
-                    }
-                  } else {
-                    window._showToast?.(u?.error || "Undo failed.", "error");
-                  }
-                },
-              },
-            });
-          }
-        }},
+        { label: "Remove channel…",
+          cls: "danger",
+          title: "Stop syncing this channel and choose whether to keep its downloaded files",
+          action: () => window._removeChannelWithPrompt(chan) },
       ]);
     });
   }

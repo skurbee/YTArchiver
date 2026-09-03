@@ -37,7 +37,34 @@ _TOP_WORDS_CACHE_REVISION = 0
 _TOP_WORDS_CACHE: OrderedDict[
     tuple[int, str, int, int], list[dict[str, Any]]
 ] = OrderedDict()
+_BUCKET_TOTALS_CACHE_MAX = 32
+_BUCKET_TOTALS_CACHE: OrderedDict[
+    tuple[int, int, int, int, str, str], dict[str, int]
+] = OrderedDict()
 _TOP_WORDS_CACHE_LOCK = threading.Lock()
+TOP_WORDS_SAMPLE_LIMIT = 500_000
+TOP_WORDS_SAMPLE_LABEL = (
+    "Limited sample: word frequencies use at most the oldest 500,000 "
+    "transcript segments, not the complete archive."
+)
+
+
+def _calendar_bucket_expr(bucket: str) -> str:
+    """SQL bucket using canonical upload time, then segment path metadata."""
+    if bucket == "year":
+        return (
+            "COALESCE("
+            "strftime('%Y', v.logical_upload_ts, 'unixepoch', 'localtime'), "
+            "CASE WHEN s.year IS NOT NULL THEN CAST(s.year AS TEXT) "
+            "ELSE NULL END)"
+        )
+    return (
+        "COALESCE("
+        "strftime('%Y-%m', v.logical_upload_ts, 'unixepoch', 'localtime'), "
+        "CASE WHEN s.year IS NOT NULL AND s.month IS NOT NULL "
+        "THEN CAST(s.year AS TEXT) || '-' || printf('%02d', s.month) "
+        "ELSE NULL END)"
+    )
 
 
 def invalidate_top_words_cache() -> None:
@@ -45,12 +72,63 @@ def invalidate_top_words_cache() -> None:
     with _TOP_WORDS_CACHE_LOCK:
         _TOP_WORDS_CACHE_REVISION += 1
         _TOP_WORDS_CACHE.clear()
+        # Segment ingestion changes both the word-cloud sample and the
+        # denominators used by normalized graphs.  Keep one shared revision so
+        # every existing ingest invalidation site also retires bucket totals.
+        _BUCKET_TOTALS_CACHE.clear()
 
 
 def _index():
     """Lazy import to avoid the index <-> index_graph re-export cycle."""
     from . import index
     return index
+
+
+def _bucket_cache_revision(conn: sqlite3.Connection) -> tuple[int, int, int]:
+    """Return a cheap connection/database revision for bucket-total caching.
+
+    Segment ingestion already bumps the module revision below, but bucket
+    labels also depend on ``videos.upload_ts`` and canonical-copy metadata.
+    Those can change without touching a segment. ``PRAGMA data_version``
+    notices commits made by the separate production writer connection, while
+    ``total_changes`` covers focused tests and any caller that intentionally
+    supplies the same connection for reads and writes. The connection identity
+    prevents a reopened/different database with coincidentally equal counters
+    from inheriting an old result.
+    """
+    try:
+        with _index()._reader_lock:
+            row = conn.execute("PRAGMA data_version").fetchone()
+        data_version = int(row[0] or 0) if row else 0
+    except (sqlite3.Error, TypeError, ValueError):
+        data_version = 0
+    try:
+        total_changes = int(conn.total_changes)
+    except (sqlite3.Error, AttributeError, TypeError, ValueError):
+        total_changes = 0
+    return id(conn), data_version, total_changes
+
+
+def _bucket_cache_lookup(
+    conn: sqlite3.Connection,
+    bucket: str,
+    channel: str | None,
+) -> tuple[tuple[int, int, int, int, str, str], dict[str, int] | None]:
+    connection_id, data_version, total_changes = _bucket_cache_revision(conn)
+    with _TOP_WORDS_CACHE_LOCK:
+        cache_key = (
+            _TOP_WORDS_CACHE_REVISION,
+            connection_id,
+            data_version,
+            total_changes,
+            bucket,
+            channel or "",
+        )
+        cached = _BUCKET_TOTALS_CACHE.get(cache_key)
+        if cached is None:
+            return cache_key, None
+        _BUCKET_TOTALS_CACHE.move_to_end(cache_key)
+        return cache_key, dict(cached)
 
 
 def bucket_totals(bucket: str = "month",
@@ -60,9 +138,55 @@ def bucket_totals(bucket: str = "month",
     volume. Matches YTArchiver.py normalize logic that divides word counts
     by per-bucket total then multiplies by 1000.
     """
+    bucket = bucket if bucket in {"year", "month", "week"} else "month"
+    channel = channel if isinstance(channel, str) and channel else None
     conn = _index()._reader_open()
     if conn is None:
         return {}
+    cache_key, cached = _bucket_cache_lookup(conn, bucket, channel)
+    if cached is not None:
+        return cached
+    canonical_ctes = _index().canonical_videos_cte_sql()
+    # The old query joined every one of the archive's ~55 million transcript
+    # rows to the canonical-video window CTE and evaluated strftime() for every
+    # row.  On the real archive that monopolized the shared reader for minutes
+    # and made a later local Watch page look frozen.
+    #
+    # Segment counts are constant per video, so first collapse the narrow
+    # video_id index to one row per video.  Only then join the ~110k aggregate
+    # rows to canonical video metadata.  MIN(id) supplies one representative
+    # segment for the legacy year/month fallback without reading transcript
+    # text or table rows during the large scan.  All segments for an ingested
+    # transcript carry the same path-derived year/month.
+    seg_source = "segments AS seg"
+    if channel is None:
+        seg_source += " INDEXED BY idx_seg_video_id"
+    count_where = (
+        "seg.video_id IS NOT NULL AND seg.video_id <> ''"
+    )
+    count_args: list[Any] = []
+    if channel:
+        count_where += " AND seg.channel=?"
+        count_args.append(channel)
+    segment_counts_cte = (
+        "segment_counts AS MATERIALIZED ("
+        "SELECT seg.video_id, COUNT(*) AS segment_count, "
+        "MIN(seg.id) AS first_segment_id "
+        f"FROM {seg_source} WHERE {count_where} "
+        "GROUP BY seg.video_id)"
+    )
+
+    def _cache(result: dict[str, int]) -> dict[str, int]:
+        with _TOP_WORDS_CACHE_LOCK:
+            # A revision may have changed while the SQL was running. Cache only
+            # under the snapshot that started this request; a newer caller
+            # naturally misses it rather than observing stale totals.
+            _BUCKET_TOTALS_CACHE[cache_key] = dict(result)
+            _BUCKET_TOTALS_CACHE.move_to_end(cache_key)
+            while len(_BUCKET_TOTALS_CACHE) > _BUCKET_TOTALS_CACHE_MAX:
+                _BUCKET_TOTALS_CACHE.popitem(last=False)
+        return result
+
     if bucket == "week":
         # Week totals MUST be keyed by the same ISO-week label that
         # word_frequency() emits ("YYYY-Www"), computed in Python from
@@ -73,19 +197,24 @@ def bucket_totals(bucket: str = "month",
         # chart rendered all zeros. Mirror word_frequency's week JOIN +
         # isocalendar() bucketing exactly so the keys line up.
         sql = (
-            "SELECT v.upload_ts, COUNT(*) "
-            " FROM segments s "
-            " LEFT JOIN videos v ON s.video_id <> '' AND v.video_id = s.video_id "
-            " WHERE v.upload_ts IS NOT NULL"
+            f"WITH {canonical_ctes}, {segment_counts_cte} "
+            "SELECT v.logical_upload_ts, SUM(sc.segment_count) "
+            "FROM segment_counts sc "
+            "JOIN canonical_videos v ON v.video_id = sc.video_id "
+            "WHERE v.logical_upload_ts IS NOT NULL "
+            "GROUP BY v.logical_upload_ts"
         )
-        args: list[Any] = []
-        if channel:
-            sql += " AND s.channel=?"
-            args.append(channel)
-        sql += " GROUP BY v.upload_ts"
         try:
             with _index()._reader_lock:
-                rows = conn.execute(sql, args).fetchall()
+                # Another caller may have completed the same expensive scan
+                # while this one waited for the shared reader. Re-read both
+                # the SQLite revision and cache under that serialization lock
+                # before doing any aggregate work.
+                cache_key, cached = _bucket_cache_lookup(
+                    conn, bucket, channel)
+                if cached is not None:
+                    return cached
+                rows = conn.execute(sql, count_args).fetchall()
         except sqlite3.Error as exc:
             _log.warning("bucket_totals week query failed: %s", exc)
             return {}
@@ -101,43 +230,64 @@ def bucket_totals(bucket: str = "month",
             except Exception:
                 continue
             totals[key] = totals.get(key, 0) + int(cnt or 0)
-        return totals
+        return _cache(totals)
     # Mirror graph_word_frequency's month bucketing EXACTLY so the Normalize
     # denominator keys line up: prefer the month from videos.upload_ts (the
     # mtime = true upload date), LEFT JOIN so path-only legacy segments fall
     # back to CAST(year AS TEXT) year/month. TEXT keys keep ORDER stable and
     # NULL-safe (date-less segments drop out, never "0000"). See the long
     # note in graph_word_frequency() for why the path month is unreliable.
-    args: list[Any] = []
-    if bucket == "month":
-        # Mirror graph_word_frequency: bucket by true upload_ts month, path
-        # fallback only for orphans, no folder-year sanity check.
-        bucket_expr = (
-            "COALESCE("
-            "strftime('%Y-%m', v.upload_ts, 'unixepoch', 'localtime'), "
+    # Year and month both prefer the selected canonical video's upload date.
+    # Path-derived segment fields are an orphan/unmatched-ID compatibility
+    # fallback.  Truly ID-less rows are counted separately because grouping
+    # every blank ID into one representative row would collapse unrelated
+    # transcripts.
+    bucket_expr = _calendar_bucket_expr(bucket)
+    if bucket == "year":
+        orphan_bucket_expr = (
+            "CASE WHEN s.year IS NOT NULL THEN CAST(s.year AS TEXT) "
+            "ELSE NULL END"
+        )
+    else:
+        orphan_bucket_expr = (
             "CASE WHEN s.year IS NOT NULL AND s.month IS NOT NULL "
             "THEN CAST(s.year AS TEXT) || '-' || printf('%02d', s.month) "
-            "ELSE NULL END)")
-        sql = (f"SELECT {bucket_expr} AS bucket, COUNT(*) "
-               " FROM segments s "
-               " LEFT JOIN videos v "
-               "   ON s.video_id <> '' AND v.video_id = s.video_id")
-        if channel:
-            sql += " WHERE s.channel=?"
-            args.append(channel)
-    else:
-        sql = ("SELECT s.year AS bucket, COUNT(*) FROM segments s")
-        if channel:
-            sql += " WHERE s.channel=?"
-            args.append(channel)
-    sql += " GROUP BY bucket"
+            "ELSE NULL END"
+        )
+    orphan_source = "segments AS s"
+    if channel is None:
+        orphan_source += " INDEXED BY idx_seg_video_id"
+    orphan_where = "(s.video_id IS NULL OR s.video_id = '')"
+    args = list(count_args)
+    if channel:
+        orphan_where += " AND s.channel=?"
+        args.append(channel)
+    sql = (
+        f"WITH {canonical_ctes}, {segment_counts_cte}, "
+        "raw_bucket_totals AS ("
+        f"SELECT {bucket_expr} AS bucket, SUM(sc.segment_count) AS n "
+        "FROM segment_counts sc "
+        "LEFT JOIN canonical_videos v ON v.video_id = sc.video_id "
+        "LEFT JOIN segments s ON s.id = sc.first_segment_id "
+        "GROUP BY bucket "
+        "UNION ALL "
+        f"SELECT {orphan_bucket_expr} AS bucket, COUNT(*) AS n "
+        f"FROM {orphan_source} WHERE {orphan_where} GROUP BY bucket) "
+        "SELECT bucket, SUM(n) FROM raw_bucket_totals "
+        "WHERE bucket IS NOT NULL GROUP BY bucket"
+    )
     try:
         with _index()._reader_lock:
+            cache_key, cached = _bucket_cache_lookup(conn, bucket, channel)
+            if cached is not None:
+                return cached
             rows = conn.execute(sql, args).fetchall()
     except sqlite3.Error as exc:
         _log.warning("bucket_totals query failed: %s", exc)
         return {}
-    return {str(r[0]): int(r[1] or 0) for r in rows if r[0] is not None}
+    return _cache({
+        str(r[0]): int(r[1] or 0) for r in rows if r[0] is not None
+    })
 
 
 # Rough English stop-word list — enough to keep a 100-word cloud interesting.
@@ -204,7 +354,7 @@ def top_words(channel: str | None = None, top_n: int = 120,
         args.append(channel)
     # Cap at a large but finite number so a huge archive doesn't OOM us.
     # ORDER BY id makes capped samples stable across runs.
-    sql += " ORDER BY id LIMIT 500000"
+    sql += f" ORDER BY id LIMIT {TOP_WORDS_SAMPLE_LIMIT}"
     import re as _re
     word_re = _re.compile(rf"[a-zA-Z][a-zA-Z']{{{min_len_i - 1},}}")
     counts: dict[str, int] = {}
@@ -300,14 +450,19 @@ def backfill_upload_ts(limit: int = 0) -> dict[str, int]:
             swallow("roll back graph upload-time backfill", rollback_exc)
         _log.warning("backfill_upload_ts failed after %d filled/%d skipped: %s",
                      filled, skipped, exc)
+    if filled:
+        invalidate_top_words_cache()
     return {"filled": filled, "skipped": skipped}
 
 
 def _week_backfill_pending(conn) -> int:
     try:
+        canonical_ctes = _index().canonical_videos_cte_sql()
         with _index()._reader_lock:
             row = conn.execute(
-                "SELECT COUNT(*) FROM videos WHERE upload_ts IS NULL"
+                f"WITH {canonical_ctes} "
+                "SELECT COUNT(*) FROM canonical_videos "
+                "WHERE logical_upload_ts IS NULL AND is_available_copy=1"
             ).fetchone()
         return int(row[0] or 0) if row else 0
     except sqlite3.Error:
@@ -322,8 +477,8 @@ def graph_word_frequency(word: str, channel: str | None = None,
 
     bucket ∈ {"year", "month", "week"}. Returns {labels, values}.
 
-    - "year" → group by segments.year
-    - "month" → group by "YYYY-MM" from segments.year + segments.month
+    - "year" → canonical video upload year, then segments.year fallback
+    - "month" → canonical upload month, then segment year/month fallback
     - "week" → group by ISO-week key "YYYY-Www" from videos.upload_ts
                 (segments only store year+month, so weekly granularity
                 requires joining videos + using the file mtime which
@@ -335,6 +490,7 @@ def graph_word_frequency(word: str, channel: str | None = None,
     if conn is None or not word.strip():
         return {"labels": [], "values": []}
     word = word.strip()
+    canonical_ctes = _index().canonical_videos_cte_sql()
     # Normalize the same way Search does so hyphenated / punctuated terms
     # (e.g. "well-known") plot real data instead of silently rendering an
     # empty chart. Lazy import to avoid any import cycle at module load.
@@ -354,12 +510,14 @@ def graph_word_frequency(word: str, channel: str | None = None,
         # computed in Python after fetch so week 52-53 → week 1
         # transitions don't split spanning weeks across two labels.
         sql = (
-            "SELECT v.upload_ts, COUNT(*) "
+            f"WITH {canonical_ctes} "
+            "SELECT v.logical_upload_ts, COUNT(*) "
             " FROM segments_fts fts "
             " JOIN segments s ON s.id = fts.rowid "
-            " LEFT JOIN videos v ON s.video_id <> '' AND v.video_id = s.video_id "
+            " LEFT JOIN canonical_videos v "
+            "   ON s.video_id <> '' AND v.video_id = s.video_id "
             " WHERE fts.text MATCH ? "
-            " AND v.upload_ts IS NOT NULL"
+            " AND v.logical_upload_ts IS NOT NULL"
         )
         args: list[Any] = [word]
         if channel:
@@ -372,57 +530,21 @@ def graph_word_frequency(word: str, channel: str | None = None,
         # (e.g. "2015-W12 ~80k"). ISO-week grouping is still done in Python
         # below so year-boundary weeks (e.g. 2024-12-30 → 2025-W01) don't
         # split across two labels.
-        sql += " GROUP BY v.upload_ts"
+        sql += " GROUP BY v.logical_upload_ts"
     else:
         # FTS5 MATCH to find segments containing the word.
         args = [word]
-        if bucket == "month":
-            # Derive the month from videos.upload_ts (the file mtime, which
-            # yt-dlp set to the exact YouTube upload date via --mtime) rather
-            # than segments.year/month (which come from the FOLDER PATH via
-            # _parse_year_month_from_path). Channels stored in year-only
-            # folders ("Years" org, no month subfolder) have month=NULL in the
-            # path, so the old path-only bucketing lumped a whole year into one
-            # spike and forced a NULL-month "year" bucket. Prefer the real
-            # upload month; LEFT JOIN keeps segments whose video_id has no
-            # matching videos row (legacy / drop-in archives), which fall back
-            # to the path-parsed year/month. CAST(year AS TEXT) keeps every key
-            # TEXT so ORDER BY bucket sorts chronologically (a bare INTEGER year
-            # sorts before all "YYYY-MM" text keys) and stays NULL-safe so a
-            # truly date-less segment drops out instead of becoming "0000".
-            # Bucket by the TRUE upload month from videos.upload_ts (yt-dlp
-            # --mtime; the pipeline preserves it and the YouTube re-fetch
-            # repaired any corrupted dates, so it is authoritative). Fall back
-            # to the path-parsed year/month ONLY for orphan segments with no
-            # linked video. Deliberately NO folder-year sanity check: an
-            # aggregated transcript file can live under a folder whose year
-            # differs from the videos it covers (e.g. a re-transcription pass
-            # dropped many old videos' transcripts into one recent-year file),
-            # so the segment's path year is LESS reliable than the linked
-            # video's real upload date.
-            # In MONTH mode every bucket MUST be 'YYYY-MM'. Prefer the true
-            # upload month; else the path-parsed year+month. If NEITHER yields
-            # a month (orphan segment whose source video was removed, and no
-            # month subfolder in the path), emit NULL so the segment is
-            # DROPPED — never a bare-year bucket, which would put a monthless
-            # 'YYYY' tick on a month axis.
-            bucket_expr = (
-                "COALESCE("
-                "strftime('%Y-%m', v.upload_ts, 'unixepoch', 'localtime'), "
-                "CASE WHEN s.year IS NOT NULL AND s.month IS NOT NULL "
-                "THEN CAST(s.year AS TEXT) || '-' || printf('%02d', s.month) "
-                "ELSE NULL END)")
-            sql = (f"SELECT {bucket_expr} AS bucket, COUNT(*) "
-                   f" FROM segments_fts fts "
-                   f" JOIN segments s ON s.id = fts.rowid "
-                   f" LEFT JOIN videos v "
-                   f"   ON s.video_id <> '' AND v.video_id = s.video_id "
-                   f" WHERE fts.text MATCH ?")
-        else:
-            sql = ("SELECT s.year AS bucket, COUNT(*) "
-                   " FROM segments_fts fts "
-                   " JOIN segments s ON s.id = fts.rowid "
-                   " WHERE fts.text MATCH ?")
+        # Prefer the canonical video's upload date.  Only orphan segments
+        # fall back to path-derived year/month; duplicate physical copies can
+        # therefore neither multiply counts nor contribute competing dates.
+        bucket_expr = _calendar_bucket_expr(bucket)
+        sql = (f"WITH {canonical_ctes} "
+               f"SELECT {bucket_expr} AS bucket, COUNT(*) "
+               f" FROM segments_fts fts "
+               f" JOIN segments s ON s.id = fts.rowid "
+               f" LEFT JOIN canonical_videos v "
+               f"   ON s.video_id <> '' AND v.video_id = s.video_id "
+               f" WHERE fts.text MATCH ?")
         if channel:
             sql += " AND s.channel=?"
             args.append(channel)

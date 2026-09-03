@@ -12,11 +12,15 @@ import os
 import re
 import threading
 import time
+import uuid
 
 from backend import subs as subs_backend
 from backend import sync as sync_backend
 from backend import youtube_session, youtube_traffic
 from backend.log import swallow
+from backend.process_runner import PROCESS_REGISTRY, process_owner_scope
+from backend.services.job_supervisor import WorkAdmissionClosed
+from backend.services.managed_work import start_managed_task
 from backend.ytarchiver_config import ARCHIVE_FILE, load_config
 
 from ._shared import _api_err, _log
@@ -35,9 +39,35 @@ class SyncMixin:
         with self._sync_start_lock:
             if self.sync_is_running():
                 return False
-            self._sync_thread = threading.Thread(target=target, daemon=True)
-            self._sync_thread.start()
+            return self._start_sync_thread_unlocked(target)
+
+    def _start_sync_thread_unlocked(self, target):
+        """Register a sync-lane worker before its OS thread can begin."""
+        sync_job_id = f"sync-{uuid.uuid4().hex}"
+        cancel = getattr(self, "_sync_cancel", None)
+        if not isinstance(cancel, threading.Event):
+            cancel = threading.Event()
+
+        def _owned_target():
+            with process_owner_scope("sync", sync_job_id):
+                target()
+
+        try:
+            self._sync_thread = start_managed_task(
+                self,
+                owner="sync",
+                label="Sync and redownload lane",
+                task_id=sync_job_id,
+                cancel=cancel,
+                target=_owned_target,
+                name="sync-worker",
+                thread_factory=threading.Thread,
+            )
+            self._sync_start_error = ""
             return True
+        except WorkAdmissionClosed as exc:
+            self._sync_start_error = str(exc)
+            return False
 
 
     def _maybe_autostart_sync(self):
@@ -77,13 +107,50 @@ class SyncMixin:
                 first = self._redwnl_pending.pop(0)
             ch = first.get("ch") or {}
             new_res = first.get("new_res") or "best"
-            self.chan_redownload(
-                ch,
-                new_res,
-                scope=first.get("scope"),
-                only_video=first.get("only_video"),
-            )
+            kwargs = {
+                "scope": first.get("scope"),
+                "only_video": first.get("only_video"),
+            }
+            restored_id = str(
+                (first.get("rd_task") or {}).get("task_id") or "").strip()
+            if restored_id:
+                kwargs["task_id"] = restored_id
+            result = self.chan_redownload(ch, new_res, **kwargs)
+            if not isinstance(result, dict) or not result.get("ok"):
+                # The durable QueueState row was deliberately retained. Keep
+                # its execution companion too; otherwise the row remains
+                # visible but cannot run again until a process restart.
+                with self._redwnl_lock:
+                    current_id = str(
+                        (self._queues.current_sync or {}).get("task_id")
+                        or "").strip()
+                    pending_ids = {
+                        str(((item or {}).get("rd_task") or {}).get("task_id")
+                            or "").strip()
+                        for item in self._redwnl_pending
+                    }
+                    if (restored_id != current_id
+                            and restored_id not in pending_ids):
+                        self._redwnl_pending.insert(0, first)
+                _log.warning(
+                    "post-sync redownload remained queued: %s",
+                    (result or {}).get("error")
+                    if isinstance(result, dict) else "invalid response")
         except Exception as e:
+            try:
+                with self._redwnl_lock:
+                    pending_ids = {
+                        str(((item or {}).get("rd_task") or {}).get("task_id")
+                            or "").strip()
+                        for item in self._redwnl_pending
+                    }
+                    restored_id = str(
+                        ((first or {}).get("rd_task") or {}).get("task_id")
+                        or "").strip()
+                    if restored_id and restored_id not in pending_ids:
+                        self._redwnl_pending.insert(0, first)
+            except Exception:
+                pass
             _log.warning(
                 "post-sync redownload drain failed for queued task: %s", e)
 
@@ -104,6 +171,11 @@ class SyncMixin:
         the worker \u2014 so "Queued metadata for 103 channels" turned
         into "Sync pass starting (206 channels)."
         """
+        admission = getattr(self, "_work_admission_error", None)
+        if callable(admission):
+            blocked = admission("a sync")
+            if blocked is not None:
+                return blocked
         # Hold a lock around the is-running check + thread spawn. Old
         # code did check-then-spawn outside a lock, so two near-
         # simultaneous calls (autorun timer + user-clicked Start)
@@ -195,6 +267,9 @@ class SyncMixin:
         self._sync_cancel.clear()
         self._sync_skip.clear()
         self._sync_pause.clear()
+        if not hasattr(self, "_sync_clear_requested"):
+            self._sync_clear_requested = threading.Event()
+        self._sync_clear_requested.clear()
         # Mirror the pause-clear onto the QueueState flag too. `queue_pause`
         # sets both the threading.Event AND `QueueState.sync_paused`, but
         # only the Event was cleared here — so a new pass saw `sync_paused`
@@ -241,6 +316,7 @@ class SyncMixin:
                         add_downloads_from_config=bool(
                             add_downloads_from_config),
                         autosync=bool(scheduled),
+                        clear_event=self._sync_clear_requested,
                     )
             except Exception as e:
                 self._log_stream.emit_error(f"Sync crashed: {e}")
@@ -332,22 +408,38 @@ class SyncMixin:
                 # so _sync_thread.is_alive() reads False when the
                 # chain worker is spawned.
                 try:
-                    threading.Timer(
-                        0.6,
-                        self._drain_pending_redownload_after_sync,
-                    ).start()
-                except Exception as e: _log.debug("swallowed: %s", e)
-                # Scheduled second push AFTER this thread's finally
-                # actually returns. Without this, _on_queue_changed
-                # runs while we're still inside _run, so
-                # `self._sync_thread.is_alive()` reads True and the
-                # Sync Tasks icon keeps blinking after the queue
-                # finishes. this was reported The Timer fires
-                # 500ms later when the thread has definitely exited.
-                try: threading.Timer(0.5, self._on_queue_changed).start()
-                except Exception as e: _log.debug("swallowed: %s", e)
-        self._sync_thread = threading.Thread(target=_run, daemon=True)
-        self._sync_thread.start()
+                    followup_cancel = threading.Event()
+
+                    def _post_sync_followup():
+                        # Wait until this sync worker's finally has retired it
+                        # from the shared lane, then drain redownload work and
+                        # publish a truthful idle/running UI state.
+                        if followup_cancel.wait(0.6):
+                            return
+                        self._drain_pending_redownload_after_sync()
+                        if not followup_cancel.is_set():
+                            self._on_queue_changed()
+
+                    start_managed_task(
+                        self,
+                        owner="sync-followup",
+                        label="Post-sync queue follow-up",
+                        target=_post_sync_followup,
+                        cancel=followup_cancel,
+                        name="post-sync-followup",
+                        thread_factory=threading.Thread,
+                    )
+                except Exception as e:
+                    # Admission closing is safe: the durable queue row remains
+                    # and shutdown/restore owns the next transition.
+                    _log.debug("post-sync follow-up not started: %s", e)
+        if not self._start_sync_thread_unlocked(_run):
+            return {
+                "ok": False,
+                "started": False,
+                "error": getattr(
+                    self, "_sync_start_error", "Sync could not be started"),
+            }
         self._on_queue_changed()
         return {"ok": True, "started": True}
 
@@ -402,17 +494,40 @@ class SyncMixin:
         goes empty; cancel alone just aborts the in-flight pass while
         leaving queued items in place. UI exposes this as `Clear Queue`.
         """
-        removed = 0
+        pending_snapshot = []
         try:
+            pending_snapshot = self._queues.sync_snapshot()
+            _was_running = bool(self._queues.current_sync)
             removed = self._queues.sync_clear()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        _was_running = bool(self._queues.current_sync)
+            if removed < 0:
+                return {"ok": False, "removed": 0,
+                        "running": _was_running,
+                        "error": "Sync queue could not be saved"}
+            if not self._queues.clear_resuming_slots(
+                    "sync", clear_current=True):
+                self._queues.restore_pending_snapshot(
+                    "sync", pending_snapshot)
+                return {"ok": False, "removed": 0,
+                        "running": _was_running,
+                        "error": "Running sync task could not be saved as cancelled"}
+        except Exception as exc:
+            _log.warning("sync queue clear transaction failed: %s", exc)
+            try:
+                self._queues.restore_pending_snapshot(
+                    "sync", pending_snapshot)
+            except Exception:
+                pass
+            return {"ok": False, "removed": 0,
+                    "running": bool(getattr(
+                        self._queues, "current_sync", None)),
+                    "error": "Sync queue could not be saved"}
+
+        # Both QueueState files are committed before any live cancellation is
+        # signalled.  A failed response therefore cannot stop recoverable work.
+        if not hasattr(self, "_sync_clear_requested"):
+            self._sync_clear_requested = threading.Event()
+        self._sync_clear_requested.set()
         self._sync_cancel.set()
-        try:
-            self._queues.clear_resuming_slots("sync", clear_current=True)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
         # Clear Queue must also drain + stop the redownload chain.
         # sync_clear() above already emptied its UI rows; leaving
         # _redwnl_pending populated would let the worker resurrect and
@@ -442,75 +557,27 @@ class SyncMixin:
         cancel feels broken — the queue clears visually but you stare
         at the running task forever.
 
-        This API also walks `psutil.Process(os.getpid()).children(recursive=True)`
-        and kills every yt-dlp / ffmpeg / ffprobe child. The worker
-        thread sees its subprocess died, returns from the call with
-        whatever partial output it got, checks `_sync_cancel` (set
-        below), and bails out of the task loop immediately.
+        Sync worker threads attach owner metadata to every yt-dlp process.
+        Force Stop targets only those registered ``owner="sync"`` trees.
+        Manual downloads, Processing/GPU work, metadata, and the updater are
+        separate owners and cannot be selected by this operation.
 
         Returns {ok, removed, killed} so the UI can toast a useful
         message ("Stopped — 12 queued cleared, 3 subprocesses killed.").
         """
-        removed = 0
-        try:
-            removed = self._queues.sync_clear()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        try:
-            self._queues.clear_resuming_slots("sync", clear_current=True)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        # Drain the redownload pending list too (same as sync_cancel
-        # does — without this a queued redownload chain would silently
-        # resume on the next loop iteration). Same lock protection as
-        # sync_cancel.
-        try:
-            with self._redwnl_lock:
-                self._redwnl_pending.clear()
-                # Force-stop kills the in-flight redownload too — set
-                # under _redwnl_lock so the chain worker's per-item
-                # clear can't interleave.
-                self._redwnl_cancel.set()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        self._sync_cancel.set()
+        clear_result = self.sync_clear_queue()
+        if not clear_result.get("ok"):
+            return {"ok": False, "removed": 0, "killed": 0,
+                    "error": clear_result.get("error")
+                    or "Sync queue could not be saved"}
+        removed = int(clear_result.get("removed") or 0)
         killed = 0
         try:
-            import psutil
-            _names_to_kill = ("yt-dlp", "yt-dlp.exe",
-                              "ffmpeg", "ffmpeg.exe",
-                              "ffprobe", "ffprobe.exe")
-            _us = psutil.Process(os.getpid())
-            # recursive=True walks the whole descendant tree, so
-            # grandchildren spawned by yt-dlp itself also get cleaned up.
-            for _child in _us.children(recursive=True):
-                try:
-                    _nm = (_child.name() or "").lower()
-                except Exception:
-                    _nm = ""
-                if _nm not in _names_to_kill:
-                    continue
-                try:
-                    _child.kill()
-                    killed += 1
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-            # Wait briefly so the worker thread can observe the dead
-            # subprocess and unwind before we report success.
-            try:
-                _gone, _alive = psutil.wait_procs(
-                    [c for c in _us.children(recursive=True)
-                     if (c.name() or "").lower() in _names_to_kill],
-                    timeout=1.5)
-                # Anything still alive after kill+wait is unusual but
-                # not fatal — log it and let the worker take care of it
-                # at its next subprocess.run boundary.
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
+            killed = PROCESS_REGISTRY.terminate_owner("sync", timeout=2.0)
         except Exception as e:
             try:
                 self._log_stream.emit_error(
-                    f"force-stop: psutil walk failed: {e}")
+                    f"force-stop: owned process cleanup failed: {e}")
             except Exception as e:
                 _log.debug("swallowed: %s", e)
         try:
@@ -531,43 +598,15 @@ class SyncMixin:
         the pending journal rewritten so nothing resurrects on the next
         launch.
         """
-        removed = 0
         try:
-            removed = self._queues.gpu_clear()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        try:
-            self._transcribe.cancel_all()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        # Belt-and-suspenders: also do the same defensive cleanup as
-        # gpu_skip_current so a wedged worker can't leave a phantom
-        # "running" row in the popover or a journal entry that comes
-        # back on restart. See gpu_skip_current docstring for rationale.
-        try:
-            self._transcribe.skip_current()  # kills subprocess if any
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        try:
-            self._queues.set_current_gpu(None)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        try:
-            self._queues.clear_resuming_slots("gpu", clear_current=True)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        try:
-            self._transcribe.drop_running_from_journal()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        try:
-            self._transcribe.clear_pending_journal()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        try:
-            removed += self._queues.gpu_clear()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+            removed = len(self._queues.gpu_snapshot())
+            if not self._transcribe.cancel_all():
+                return {"ok": False, "removed": 0,
+                        "error": "Processing queue could not be saved"}
+        except Exception as exc:
+            _log.warning("Processing queue clear failed: %s", exc)
+            return {"ok": False, "removed": 0,
+                    "error": "Processing queue could not be saved"}
         self._on_queue_changed()
         return {"ok": True, "removed": removed}
 
@@ -579,6 +618,11 @@ class SyncMixin:
         channels already queued or currently running are skipped.
         Returns {ok, queued, skipped, total_queued}.
         """
+        admission = getattr(self, "_work_admission_error", None)
+        if callable(admission):
+            blocked = admission("a sync queue change")
+            if blocked is not None:
+                return blocked
         try:
             cfg = self._config or load_config()
             channels = cfg.get("channels", []) or []
@@ -606,10 +650,14 @@ class SyncMixin:
         ch = subs_backend.get_channel(identity or {})
         if not ch:
             return {"ok": False, "error": "Channel not found"}
+        task_id = f"sync-prefetch-{uuid.uuid4().hex}"
+        cancel = threading.Event()
         def _run():
             try:
+                if cancel.is_set():
+                    return
                 r = sync_backend.prefetch_channel_total(ch.get("url", ""))
-                if r.get("ok"):
+                if r.get("ok") and not cancel.is_set():
                     self._log_stream.emit([
                         ["[Prefetch] ", "sync_bracket"],
                         [f"{ch.get('name', '?')}: ", "simpleline_blue"],
@@ -621,7 +669,19 @@ class SyncMixin:
                     self._log_stream.flush()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-        threading.Thread(target=_run, daemon=True).start()
+        try:
+            start_managed_task(
+                self,
+                owner="channel-prefetch",
+                label="Prefetch channel totals",
+                task_id=task_id,
+                cancel=cancel,
+                target=_run,
+                name="channel-total-prefetch",
+                thread_factory=threading.Thread,
+            )
+        except WorkAdmissionClosed as exc:
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "started": True}
 
 
@@ -702,7 +762,7 @@ class SyncMixin:
             return False
 
 
-    def sync_skip_current(self):
+    def sync_skip_current(self, task_id=""):
         """Skip the currently-running sync item and advance to the next.
 
         Sets _sync_skip only. sync_all passes _sync_skip as `kill_current`
@@ -711,61 +771,64 @@ class SyncMixin:
         rapid Skip+Cancel sequence can't swallow the Cancel.
         """
         try:
+            wanted = str(task_id or "").strip()
+            current_id = str(
+                (self._queues.current_sync or {}).get("task_id") or "").strip()
+            if not wanted or wanted != current_id:
+                return {"ok": False,
+                        "error": "Queue changed; task is no longer running"}
+            if not self._queues.replace_current_task_durable(
+                    "sync", None, expected_task_id=wanted):
+                return {"ok": False,
+                        "error": "Current sync task could not be saved as cancelled"}
+            # The durable queue/current transition is the commit point.  Do
+            # not signal yt-dlp before it succeeds or a failed API response
+            # could still cancel recoverable work.
             self._sync_skip.set()
-            self._log_stream.emit([
-                ["[Sync] ", "sync_bracket"],
-                ["Skip current channel \u2014 moving on\n", "simpleline"],
-            ])
-            self._log_stream.flush()
+            try:
+                self._log_stream.emit([
+                    ["[Sync] ", "sync_bracket"],
+                    ["Skip current channel \u2014 moving on\n", "simpleline"],
+                ])
+                self._log_stream.flush()
+            except Exception as exc:
+                _log.debug("sync skip log failed: %s", exc)
             return {"ok": True}
         except Exception as e:
             return _api_err("INTERNAL_ERROR", str(e))
 
 
-    def gpu_skip_current(self):
-        """Skip the currently-running GPU (transcribe / compress / metadata)
-        job and advance to the next one.
-
-        Belt-and-suspenders: in addition to signaling cancel + killing
-        the subprocess (the worker's normal cleanup path), we also
-        immediately clear `queues.current_gpu` and forcibly omit the
-        running job from the pending journal. If the worker is healthy
-        and reaches its own `finally` block, those overwrites are
-        redundant. If the worker is hung \u2014 which is precisely when the
-        user is clicking Cancel \u2014 the popover updates immediately AND
-        the task doesn't resurrect from the journal on next launch.
-        """
+    def gpu_skip_current(self, task_id=""):
+        """Durably cancel the exact running Processing task."""
         try:
-            # 1. Normal cancel \u2014 fire the cancel event + kill subprocess.
-            self._transcribe.skip_current()
-            # 2. Force-clear the running-slot in the popover so the user
-            #    sees immediate feedback instead of waiting on whatever
-            #    the worker is doing. Idempotent with the worker's own
-            #    set_current_gpu(None) in its finally block.
+            wanted = str(task_id or "").strip()
+            current_id = str(
+                (self._queues.current_gpu or {}).get("task_id") or "").strip()
+            if not wanted or wanted != current_id:
+                return {"ok": False,
+                        "error": "Queue changed; task is no longer running"}
+
+            committed = self._transcribe.cancel_current_durable(
+                wanted,
+                lambda: self._queues.replace_current_task_durable(
+                    "gpu", None, expected_task_id=wanted),
+            )
+            if not committed:
+                return {"ok": False,
+                        "error": "Current Processing task could not be saved as cancelled"}
             try:
-                self._queues.set_current_gpu(None)
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-            # 3. Pre-emptively rewrite the pending journal without the
-            #    running job. If the worker recovers and reaches its
-            #    own _persist_pending(), this gets re-overwritten with
-            #    the same content. If the worker hangs forever, this
-            #    ensures the task doesn't come back on restart.
-            try:
-                self._transcribe.drop_running_from_journal()
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-            self._log_stream.emit([
-                ["[GPU] ", "trans_bracket"],
-                ["Skip current GPU job \u2014 moving on\n", "simpleline"],
-            ])
-            self._log_stream.flush()
+                self._log_stream.emit([
+                    ["[GPU] ", "trans_bracket"],
+                    ["Skip current GPU job \u2014 moving on\n", "simpleline"],
+                ])
+                self._log_stream.flush()
+            except Exception as exc:
+                _log.debug("GPU skip log failed: %s", exc)
             return {"ok": True}
         except Exception as e:
             return _api_err("INTERNAL_ERROR", str(e))
 
-
-    def sync_defer_current(self):
+    def sync_defer_current(self, task_id=""):
         """Send the currently-running sync task to the END of the queue,
         then cancel the running pass so the next queued item picks up.
         Different from sync_skip_current \u2014 `skip` drops the task; `defer`
@@ -780,43 +843,69 @@ class SyncMixin:
         """
         try:
             cur = self._queues.current_sync
+            wanted = str(task_id or "").strip()
+            if not wanted or wanted != str(
+                    (cur or {}).get("task_id") or "").strip():
+                return {"ok": False, "error": "Queue changed; task is no longer running"}
             if cur:
                 deferred = dict(cur)
                 deferred.pop("_pass_start_ts", None)
-                # Drop any pre-existing queued entry with the same URL
-                # FIRST so the dedupe inside sync_enqueue can't skip
-                # our append. Without this, defer could become a no-op
-                # (existing queue entry stays at its old position) and
-                # "send to END of queue" became "may or may not append"
-                # (audit: sync_mixin H18).
-                try:
-                    self._queues.sync_remove(deferred.get("url") or "")
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-                self._queues.sync_enqueue(deferred)
+                if not self._queues.sync_defer_task(deferred):
+                    return {"ok": False,
+                            "error": "Deferred task could not be saved"}
                 self._log_stream.emit([
                     ["[Sync] ", "sync_bracket"],
                     [(f"Deferred {deferred.get('name') or deferred.get('url') or 'current job'}"
                       " \u2014 sent to end of queue\n"), "simpleline"],
                 ])
             # Now skip the in-flight run so the next queued item starts.
-            return self.sync_skip_current()
+            result = self.sync_skip_current(task_id)
+            if isinstance(result, dict) and not result.get("ok") and cur:
+                try:
+                    self._queues.sync_remove_task(
+                        str(deferred.get("task_id") or ""), durable=True)
+                except Exception as e:
+                    _log.warning("sync defer rollback failed: %s", e)
+            return result
         except Exception as e:
             return _api_err("INTERNAL_ERROR", str(e))
 
 
-    def gpu_defer_current(self):
+    def gpu_defer_current(self, task_id=""):
         """Send the currently-running GPU task to the END of the GPU
         queue, then cancel the running job. See sync_defer_current
         rationale.
         """
         try:
             cur = self._queues.current_gpu
+            wanted = str(task_id or "").strip()
+            if not wanted or wanted != str(
+                    (cur or {}).get("task_id") or "").strip():
+                return {"ok": False, "error": "Queue changed; task is no longer running"}
             if cur:
+                manager = getattr(self, "_transcribe", None)
+                defer_exact = getattr(manager, "defer_current", None)
+                if wanted and callable(defer_exact):
+                    if not defer_exact(wanted):
+                        return {"ok": False,
+                                "error": "Queue changed; task is no longer running"}
+                    self._log_stream.emit([
+                        ["[GPU] ", "trans_bracket"],
+                        [(f"Deferred {cur.get('title') or cur.get('path') or 'current job'}"
+                          " — sent to end of queue\n"), "simpleline"],
+                    ])
+                    self._log_stream.flush()
+                    return {"ok": True}
+
+                # Internal compatibility for a pre-ID current slot/test double.
+                # Current frontend calls always take the exact path above.
                 deferred = dict(cur)
                 try:
-                    key = ((deferred.get("id") or deferred.get("path")
-                            or deferred.get("task_id") or "").strip())
+                    key = str(deferred.get("task_id") or "").strip()
+                    if not key and not wanted:
+                        # In-process migration compatibility for a legacy
+                        # current slot. New UI requests always carry task_id.
+                        key = str(deferred.get("path") or "").strip()
                     if key:
                         self._queues.gpu_remove(key)
                     elif deferred.get("bulk_id"):
@@ -829,7 +918,7 @@ class SyncMixin:
                     [(f"Deferred {deferred.get('title') or deferred.get('path') or 'current job'}"
                       " \u2014 sent to end of queue\n"), "simpleline"],
                 ])
-            return self.gpu_skip_current()
+            return self.gpu_skip_current(task_id)
         except Exception as e:
             return _api_err("INTERNAL_ERROR", str(e))
 
@@ -859,16 +948,17 @@ class SyncMixin:
         try: self._on_queue_changed()
         except Exception as e: _log.debug("swallowed: %s", e)
 
+        # Report a deliberately paused/restored queue even when its worker is
+        # still alive in the pause wait. The UI needs this truth to explain
+        # that the newly queued work will not start until Resume is pressed.
+        if bool(self._queues.sync_paused):
+            return {"ok": True, "queued": added, "started": False,
+                    "paused": True, "name": ch_name}
+
         # A live worker will pick the task up between queue iterations.
         if already_running or self.sync_is_running():
             return {"ok": True, "queued": added, "started": False,
                     "name": ch_name}
-
-        # Respect a deliberately paused/restored queue. The task is now
-        # durable and remains visible until the user resumes it.
-        if bool(self._queues.sync_paused):
-            return {"ok": True, "queued": added, "started": False,
-                    "paused": True, "name": ch_name}
 
         started = self.sync_start_all(add_downloads_from_config=False)
         if not started or not started.get("ok"):

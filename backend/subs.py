@@ -26,17 +26,40 @@ Schema matches YTArchiver.py's CHANNEL_DEFAULTS (line 173):
 
 from __future__ import annotations
 
+import copy
+import datetime as dt
 import os
 import re
+import uuid
 from typing import Any
 from urllib.parse import urlparse
 
 from .log import get_logger
+from .services.channel_leases import (
+    LeaseOwner,
+    channel_aliases,
+    channel_leases,
+    global_archive_aliases,
+)
+from .services.channel_transactions import (
+    ChannelTransactionConflict,
+    ChannelTransactionJournalError,
+    apply_channel_config_patch,
+    build_channel_config_patch,
+    channel_transaction_aliases,
+    checkpoint_channel_transaction,
+    clear_channel_transaction,
+    load_channel_transaction,
+    make_remove_transaction,
+    make_rename_transaction,
+    mark_channel_recovery_required,
+    write_channel_transaction,
+)
 from .ytarchiver_config import (
     CHANNEL_DEFAULTS_ALL,
     config_transaction,
     load_config,
-    save_config,
+    save_config,  # noqa: F401 - retained for test/extension monkeypatch compatibility
 )
 
 _log = get_logger(__name__)
@@ -162,10 +185,11 @@ def validate_channel_url(url: str) -> tuple[bool, str]:
 
 def _find_channel(channels: list[dict[str, Any]], match: dict[str, str]) -> int | None:
     """Find the index of a channel matching by url, name, or folder."""
-    match_url = normalize_channel_url(match.get("url", "")) if match.get("url") else ""
+    match_url = (normalize_channel_url(match.get("url", "")).rstrip("/")
+                 if match.get("url") else "")
     match_name = (match.get("name") or match.get("folder") or "").strip().lower()
     for i, ch in enumerate(channels):
-        ch_url = normalize_channel_url(ch.get("url", ""))
+        ch_url = normalize_channel_url(ch.get("url", "")).rstrip("/")
         if match_url and ch_url == match_url:
             return i
         ch_name = (ch.get("name") or ch.get("folder") or "").strip().lower()
@@ -199,8 +223,14 @@ def _payload_to_channel(payload: dict[str, Any]) -> dict[str, Any]:
     seconds. Converting here keeps the drop-in replacement lossless.
     """
     def _mins_to_secs(v):
-        try: return max(0, int(v)) * 60
-        except Exception: return 0
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return 0
+        if isinstance(v, bool):
+            raise SubsError("Minimum and maximum length must be whole numbers.")
+        text = str(v).strip()
+        if not re.fullmatch(r"-?\d+", text):
+            raise SubsError("Minimum and maximum length must be whole numbers.")
+        return int(text) * 60
     ch = {
         "name": (payload.get("folder") or payload.get("name") or "").strip(),
         "folder": (payload.get("folder") or payload.get("name") or "").strip(),
@@ -243,6 +273,35 @@ def _payload_to_channel(payload: dict[str, Any]) -> dict[str, Any]:
         ch["compress_level"] = ""
         ch["compress_output_res"] = ""
     return _apply_defaults(ch)
+
+
+def _validate_channel_constraints(channel: dict[str, Any]) -> None:
+    """Reject settings that would make a sync silently do the wrong work."""
+    try:
+        minimum = int(channel.get("min_duration") or 0)
+        maximum = int(channel.get("max_duration") or 0)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise SubsError("Minimum and maximum length must be whole numbers.") \
+            from exc
+    if minimum < 0 or maximum < 0:
+        raise SubsError("Minimum and maximum length cannot be negative.")
+    if minimum and maximum and minimum > maximum:
+        raise SubsError(
+            "Minimum length cannot be greater than maximum length."
+        )
+
+    mode = str(channel.get("mode") or "new").strip().lower()
+    if mode not in {"fromdate", "date"}:
+        return
+    from_date = str(
+        channel.get("from_date") or channel.get("date_after") or ""
+    ).strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", from_date):
+        raise SubsError("From date must include a valid year, month, and day.")
+    try:
+        dt.date.fromisoformat(from_date)
+    except ValueError as exc:
+        raise SubsError("From date is not a valid calendar date.") from exc
 
 
 # ── Public API ─────────────────────────────────────────────────────────
@@ -379,8 +438,16 @@ def add_channel(payload: dict[str, Any]) -> dict[str, Any]:
         payload = dict(payload)
         if "resolution" not in payload or payload["resolution"] in (None, ""):
             payload["resolution"] = cfg_defaults.get("default_resolution", "720")
-        if "min_duration" not in payload or payload["min_duration"] in (None, "", 0):
-            default_secs = int(cfg_defaults.get("min_duration", 180) or 180)
+        min_value = payload.get("min_duration")
+        min_unspecified = (
+            "min_duration" not in payload
+            or min_value is None
+            or (isinstance(min_value, str) and not min_value.strip())
+        )
+        if min_unspecified:
+            raw_default = cfg_defaults.get("min_duration", 180)
+            default_secs = int(
+                180 if raw_default in (None, "") else raw_default)
             payload["min_duration"] = max(0, default_secs // 60) # minutes
         if "auto_metadata" not in payload:
             payload["auto_metadata"] = True
@@ -410,6 +477,7 @@ def add_channel(payload: dict[str, Any]) -> dict[str, Any]:
         raise SubsError(
             "Channel folder name could not be determined from the URL. "
             "Provide a folder name explicitly.")
+    _validate_channel_constraints(new_ch)
     # T123: run the dup-check + append + save as one atomic transaction so
     # a concurrent worker save (e.g. a sync's last_sync write) can't load a
     # stale snapshot mid-add and clobber the new channel (or vice versa).
@@ -422,6 +490,13 @@ def add_channel(payload: dict[str, Any]) -> dict[str, Any]:
             if _find_channel(channels, {"name": new_ch["name"]}) is not None:
                 raise SubsError(
                     "A channel with that folder name already exists.")
+            from .sync import channel_folder_name
+            wanted_folder = channel_folder_name(new_ch).casefold()
+            if wanted_folder and any(
+                    channel_folder_name(channel).casefold() == wanted_folder
+                    for channel in channels if isinstance(channel, dict)):
+                raise SubsError(
+                    "Another channel already uses that archive folder.")
             channels.append(new_ch)
             # Sort alphabetically by name (matches YTArchiver's ordering)
             channels.sort(key=lambda c: (c.get("name") or "").lower())
@@ -436,7 +511,230 @@ def add_channel(payload: dict[str, Any]) -> dict[str, Any]:
     return new_ch
 
 
-def update_channel(identity: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+class _SnapshotRestoreAbort(RuntimeError):
+    """Exit a config transaction without saving an unchanged document."""
+
+    def __init__(self, result: dict[str, Any]) -> None:
+        super().__init__(str(result.get("error") or "unchanged"))
+        self.result = result
+
+
+def restore_channel_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Re-add one exact channel record saved in a v2 Trash manifest.
+
+    This intentionally does *not* call :func:`add_channel`: that public Add
+    path converts duration units, fills current UI defaults, and may perform a
+    network name lookup.  A Trash restore must reproduce the record that was
+    removed, including fields introduced by newer versions of the app.
+    """
+    if not isinstance(snapshot, dict):
+        return {"ok": False, "added": False,
+                "error": "Trash entry has no valid channel snapshot."}
+    candidate = copy.deepcopy(snapshot)
+    name = str(candidate.get("name") or candidate.get("folder") or "").strip()
+    url = normalize_channel_url(str(candidate.get("url") or ""))
+    if not name or not url:
+        return {"ok": False, "added": False,
+                "error": "Saved channel details are incomplete."}
+    candidate["url"] = url
+    if not str(candidate.get("name") or "").strip():
+        candidate["name"] = name
+    if not str(candidate.get("folder") or "").strip():
+        candidate["folder"] = name
+
+    from .sync import channel_folder_name
+
+    wanted_folder = channel_folder_name(candidate).casefold()
+    stable_keys = ("channel_id", "id", "stable_key")
+    try:
+        with config_transaction() as cfg:
+            channels = cfg.setdefault("channels", [])
+            for current in channels:
+                if not isinstance(current, dict):
+                    continue
+                if current == candidate:
+                    raise _SnapshotRestoreAbort({
+                        "ok": True,
+                        "added": False,
+                        "already_present": True,
+                        "channel": copy.deepcopy(current),
+                    })
+                current_url = normalize_channel_url(
+                    str(current.get("url") or ""))
+                if current_url and current_url == url:
+                    raise _SnapshotRestoreAbort({
+                        "ok": False, "added": False,
+                        "error": "A channel with that URL already exists.",
+                    })
+                current_name = str(
+                    current.get("name") or current.get("folder") or ""
+                ).strip().casefold()
+                if current_name and current_name == name.casefold():
+                    raise _SnapshotRestoreAbort({
+                        "ok": False, "added": False,
+                        "error": "A channel with that name already exists.",
+                    })
+                if wanted_folder and channel_folder_name(current).casefold() == wanted_folder:
+                    raise _SnapshotRestoreAbort({
+                        "ok": False, "added": False,
+                        "error": "Another channel already uses that archive folder.",
+                    })
+                for key in stable_keys:
+                    wanted = str(candidate.get(key) or "").strip().casefold()
+                    existing = str(current.get(key) or "").strip().casefold()
+                    if wanted and existing and wanted == existing:
+                        raise _SnapshotRestoreAbort({
+                            "ok": False, "added": False,
+                            "error": "That saved channel is already configured.",
+                        })
+            channels.append(candidate)
+            channels.sort(key=lambda channel: str(
+                channel.get("name") or "").casefold())
+    except _SnapshotRestoreAbort as exc:
+        return exc.result
+    except (OSError, TypeError, ValueError) as exc:
+        return {"ok": False, "added": False, "error": str(exc)}
+    return {"ok": True, "added": True, "already_present": False,
+            "channel": copy.deepcopy(candidate)}
+
+
+def rollback_restored_channel_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Remove only the unchanged record inserted by a failed Trash restore."""
+    if not isinstance(snapshot, dict):
+        return {"ok": False, "removed": False,
+                "error": "Saved channel details are invalid."}
+    wanted_url = normalize_channel_url(str(snapshot.get("url") or ""))
+    try:
+        with config_transaction() as cfg:
+            channels = cfg.setdefault("channels", [])
+            matches = [
+                (index, channel)
+                for index, channel in enumerate(channels)
+                if isinstance(channel, dict)
+                and normalize_channel_url(str(channel.get("url") or "")) == wanted_url
+            ]
+            if len(matches) != 1:
+                raise _SnapshotRestoreAbort({
+                    "ok": False, "removed": False,
+                    "error": "Could not uniquely identify the restored channel.",
+                })
+            index, current = matches[0]
+            # Config loading may add newly introduced defaults.  Every value
+            # that was actually saved in the manifest must still match before
+            # rollback is allowed to remove the record.
+            if any(current.get(key) != value for key, value in snapshot.items()):
+                raise _SnapshotRestoreAbort({
+                    "ok": False, "removed": False,
+                    "error": "The restored channel changed; rollback was refused.",
+                })
+            channels.pop(index)
+    except _SnapshotRestoreAbort as exc:
+        return exc.result
+    except (OSError, TypeError, ValueError) as exc:
+        return {"ok": False, "removed": False, "error": str(exc)}
+    return {"ok": True, "removed": True}
+
+
+class _FolderTransactionAbort(RuntimeError):
+    """Stop a config transaction and return a prepared user-facing result."""
+
+    def __init__(self, result: dict[str, Any]) -> None:
+        message = result.get("error") or result.get("delete_error") or ""
+        super().__init__(str(message))
+        self.result = result
+
+
+def _same_path(first: str, second: str) -> bool:
+    return os.path.normcase(os.path.abspath(first)) == os.path.normcase(
+        os.path.abspath(second)
+    )
+
+
+def _same_filesystem(source: str, destination: str) -> bool:
+    try:
+        if os.name == "nt":
+            source_drive = os.path.splitdrive(os.path.abspath(source))[0]
+            destination_drive = os.path.splitdrive(os.path.abspath(destination))[0]
+            return source_drive.casefold() == destination_drive.casefold()
+        return os.stat(source).st_dev == os.stat(os.path.dirname(destination)).st_dev
+    except OSError:
+        return False
+
+
+def _mutation_lease(
+    channel: dict[str, Any],
+    *,
+    updated_channel: dict[str, Any] | None = None,
+    paths: tuple[str, ...] = (),
+    needs_journal: bool = False,
+    label: str,
+):
+    alias_sets = []
+    current_aliases = channel_aliases(channel, paths=paths)
+    if current_aliases:
+        alias_sets.append(current_aliases)
+    if updated_channel is not None:
+        updated_aliases = channel_aliases(updated_channel)
+        if updated_aliases:
+            alias_sets.append(updated_aliases)
+    if needs_journal:
+        alias_sets.append(channel_transaction_aliases())
+    if not alias_sets:
+        alias_sets.append(global_archive_aliases())
+    owner = LeaseOwner(
+        owner="subscriptions",
+        job_id=uuid.uuid4().hex,
+        label=label,
+        kind="channel-config",
+    )
+    return channel_leases.try_acquire_many(alias_sets, owner)
+
+
+def _require_empty_channel_journal() -> None:
+    try:
+        pending = load_channel_transaction(strict=True)
+    except ChannelTransactionJournalError as exc:
+        raise SubsError(str(exc)) from exc
+    if pending is not None:
+        raise SubsError(
+            "An earlier channel-folder change still needs recovery. "
+            "Restart YTArchiver before changing another channel folder."
+        )
+
+
+def _rollback_folder_rename(
+    record: dict[str, Any],
+    old_path: str,
+    new_path: str,
+    cause: object,
+) -> tuple[bool, str]:
+    try:
+        old_exists = os.path.exists(old_path)
+        new_exists = os.path.exists(new_path)
+        if new_exists and not old_exists:
+            os.rename(new_path, old_path)
+        elif not (old_exists and not new_exists):
+            raise OSError(
+                "Cannot determine which folder is authoritative during rollback."
+            )
+    except OSError as exc:
+        detail = f"{cause}; folder rollback failed: {exc}"
+        mark_channel_recovery_required(record, phase="rename_rollback", error=detail)
+        return False, detail
+    if not clear_channel_transaction():
+        detail = "Folder rollback completed, but its recovery journal remains."
+        mark_channel_recovery_required(
+            record,
+            phase="journal_clear_after_rollback",
+            error=detail,
+        )
+        return False, detail
+    return True, ""
+
+
+def update_channel(
+        identity: dict[str, str], payload: dict[str, Any], *,
+        pending_path_reconciler=None) -> dict[str, Any]:
     """Update an existing channel matched by identity (url or name/folder).
 
     If the folder name changed, rename the on-disk folder too so the user's
@@ -447,7 +745,7 @@ def update_channel(identity: dict[str, str], payload: dict[str, Any]) -> dict[st
     idx = _find_channel(channels, identity)
     if idx is None:
         raise SubsError(f"Channel not found: {identity}")
-    existing = channels[idx]
+    existing = dict(channels[idx])
     # Partial-update safety: if the caller passed a sparse payload (e.g.
     # only {"name": "X"} to rename), we must not let `_payload_to_channel`
     # rebuild the whole dict from DEFAULTS — that would silently wipe the
@@ -472,20 +770,22 @@ def update_channel(identity: dict[str, str], payload: dict[str, Any]) -> dict[st
         merged = dict(existing)
         # Handle known UI-shape fields — these need conversion
         for k, v in payload.items():
-            if k == "min_duration" and isinstance(v, (int, str)):
+            if k == "min_duration":
                 # Accept either seconds or minutes; heuristic: if less than
                 # 1000, assume minutes and convert.
-                try:
-                    n = int(v)
-                    merged[k] = n * 60 if n < 1000 else n
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-            elif k == "max_duration" and isinstance(v, (int, str)):
-                try:
-                    n = int(v)
-                    merged[k] = n * 60 if n < 1000 else n
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                if isinstance(v, bool) or not re.fullmatch(
+                        r"-?\d+", str(v).strip()):
+                    raise SubsError(
+                        "Minimum length must be a whole number.")
+                n = int(v)
+                merged[k] = n * 60 if n < 1000 else n
+            elif k == "max_duration":
+                if isinstance(v, bool) or not re.fullmatch(
+                        r"-?\d+", str(v).strip()):
+                    raise SubsError(
+                        "Maximum length must be a whole number.")
+                n = int(v)
+                merged[k] = n * 60 if n < 1000 else n
             elif k == "folder_org":
                 merged["split_years"] = (v in ("years", "months"))
                 merged["split_months"] = (v == "months")
@@ -515,180 +815,513 @@ def update_channel(identity: dict[str, str], payload: dict[str, Any]) -> dict[st
         # etc. Without this merge, editing a channel's resolution would
         # silently wipe its init_batch_after cooldown.
         _preserve = (
+            # Blank duration fields are omitted by the editor. Preserve the
+            # saved limits instead of letting the full payload mapper turn an
+            # omitted value into zero.
+            "min_duration", "max_duration",
             "last_sync", "n_vids", "size_gb", "size_bytes",
             "initialized", "init_complete", "init_batch_after",
             "batch_resume_index",
             "transcription_complete", "transcription_pending",
             "metadata_pending",
             "folder_override",
+            # Legacy builds stored this value. The current Processing queue
+            # is per-file, but an ordinary edit must not erase the field.
+            "compress_batch_size",
         )
         for key in _preserve:
             if key in existing and key not in payload:
                 updated[key] = existing[key]
 
-    # Detect folder rename → move the on-disk folder
-    import os as _os
-
-    from . import sync as _sync
-    old_name = (existing.get("name") or existing.get("folder") or "").strip()
-    new_name = (updated.get("name") or updated.get("folder") or "").strip()
-    old_folder = _sync.channel_folder_name(existing)
-    new_folder = _sync.channel_folder_name(updated)
-    if old_name and new_name and old_name != new_name:
-        # preflight — refuse if the new name collides with
-        # ANY other existing channel. Without this, two channels could
-        # end up with the same normalized name, which then has
-        # _find_channel lookups return whichever was seen first.
-        _new_lower = new_name.lower()
-        for _j, _other in enumerate(channels):
-            if _j == idx:
-                continue
-            _o_name = (_other.get("name") or _other.get("folder") or "").strip().lower()
-            if _o_name == _new_lower:
-                raise SubsError(
-                    f"A channel named {new_name!r} already exists. "
-                    f"Choose a different name.")
-    if old_folder and new_folder and old_folder != new_folder:
-        base = (cfg.get("output_dir") or "").strip()
-        if base:
-            old_path = _os.path.join(base, old_folder)
-            new_path = _os.path.join(base, new_folder)
-            if _os.path.isdir(old_path) and not _os.path.exists(new_path):
-                # Reject cross-volume renames up front. os.rename is
-                # documented atomic only when source + dest live on the
-                # same volume. On UNC/junction'd setups the destination
-                # path may resolve to a different physical volume even
-                # though both paths share `base` — partial moves are
-                # possible if the OS falls through to copy+delete. We
-                # never want a half-moved channel folder.
-                try:
-                    _os_name = _os.name
-                    if _os_name == "nt":
-                        _old_drv, _ = _os.path.splitdrive(_os.path.abspath(old_path))
-                        _new_drv, _ = _os.path.splitdrive(_os.path.abspath(new_path))
-                        _same_vol = _old_drv.lower() == _new_drv.lower()
-                    else:
-                        # POSIX: stat().st_dev tells us the actual device.
-                        _same_vol = (_os.stat(old_path).st_dev ==
-                                     _os.stat(_os.path.dirname(new_path)).st_dev)
-                except OSError:
-                    _same_vol = False
-                if not _same_vol:
-                    raise SubsError(
-                        f"Cannot rename folder from {old_name!r} to "
-                        f"{new_name!r}: source and destination are on "
-                        f"different volumes. Move the channel folder "
-                        f"manually, then rename in the app.")
-                try:
-                    _os.rename(old_path, new_path)
-                    updated["_folder_renamed"] = {"from": old_path, "to": new_path}
-                except OSError as e:
-                    # if the folder rename fails, REJECT the
-                    # whole update. Old behavior silently reverted name
-                    # to old_name but still saved OTHER mutations (res,
-                    # compress settings, etc.) — creating a partial-
-                    # apply state that the user didn't intend.
-                    # Now we raise; caller turns it into a UI error and
-                    # the user sees the full update didn't land.
-                    raise SubsError(
-                        f"Could not rename folder from {old_name!r} to "
-                        f"{new_name!r}: {e}. No settings saved.")
-
-    # Sanity: refuse to save a channel with a blanked-out name. Matches the
-    # add_channel guard — prevents sync from routing to _unnamed/ on the
-    # next run if the user accidentally cleared the name field in the UI.
-    if not (updated.get("name") or "").strip():
+    if not str(updated.get("name") or "").strip():
         raise SubsError(
-            "Channel name cannot be blank \u2014 syncs would route to the "
-            "shared `_unnamed/` graveyard folder. Provide a name.")
-    channels[idx] = updated
-    channels.sort(key=lambda c: (c.get("name") or "").lower())
-    if not save_config(cfg):
-        # Save failed — restore the original channel record in-memory so
-        # a later unrelated save_config call can't accidentally persist
-        # the unsaved mutation. Re-locate by identity since the sort
-        # above may have shuffled the index.
-        _r_idx = _find_channel(channels, identity)
-        if _r_idx is not None:
-            channels[_r_idx] = existing
-            channels.sort(key=lambda c: (c.get("name") or "").lower())
-        return {**updated, "_write_blocked": True}
-    return updated
+            "Channel name cannot be blank — syncs would route to the shared "
+            "`_unnamed/` graveyard folder. Provide a name."
+        )
+    _validate_channel_constraints(updated)
+
+    from . import sync as sync_backend
+
+    old_name = str(existing.get("name") or existing.get("folder") or "").strip()
+    new_name = str(updated.get("name") or updated.get("folder") or "").strip()
+    old_folder = sync_backend.channel_folder_name(existing)
+    new_folder = sync_backend.channel_folder_name(updated)
+    folder_changed = bool(old_folder and new_folder and old_folder != new_folder)
+    base = str(cfg.get("output_dir") or "").strip()
+    old_path = os.path.join(base, old_folder) if folder_changed and base else ""
+    new_path = os.path.join(base, new_folder) if folder_changed and base else ""
+    physical_change = bool(old_path and new_path and not _same_path(old_path, new_path))
+
+    lease_result = _mutation_lease(
+        existing,
+        updated_channel=updated,
+        paths=tuple(path for path in (old_path, new_path) if path),
+        needs_journal=physical_change,
+        label=f"Edit channel {old_name or new_name}",
+    )
+    if not lease_result.ok or lease_result.lease is None:
+        raise SubsError(lease_result.explanation)
+
+    patch = build_channel_config_patch(existing, updated)
+    journal: dict[str, Any] | None = None
+    journal_written = False
+    renamed: dict[str, str] | None = None
+    queue_remapped = False
+    queue_reconcile_result: dict[str, Any] = {"ok": True, "changed": 0}
+    committed = dict(updated)
+    with lease_result.lease:
+        try:
+            with config_transaction() as live_cfg:
+                live_channels = live_cfg.setdefault("channels", [])
+                live_idx = _find_channel(live_channels, identity)
+                if live_idx is None:
+                    raise SubsError(
+                        "Channel changed while the edit was open. Reload and retry."
+                    )
+                live_channel = dict(live_channels[live_idx])
+                try:
+                    live_channel = apply_channel_config_patch(live_channel, patch)
+                except ChannelTransactionConflict as exc:
+                    raise SubsError(str(exc)) from exc
+
+                wanted_name = str(
+                    live_channel.get("name") or live_channel.get("folder") or ""
+                ).strip().casefold()
+                wanted_folder = sync_backend.channel_folder_name(
+                    live_channel).casefold()
+                for position, other in enumerate(live_channels):
+                    if position == live_idx:
+                        continue
+                    if not isinstance(other, dict):
+                        continue
+                    other_name = str(
+                        other.get("name") or other.get("folder") or ""
+                    ).strip().casefold()
+                    if wanted_name and other_name == wanted_name:
+                        raise SubsError(
+                            f"A channel named {live_channel.get('name')!r} "
+                            "already exists."
+                        )
+                    if (wanted_folder
+                            and sync_backend.channel_folder_name(
+                                other).casefold() == wanted_folder):
+                        raise SubsError(
+                            "Another channel already uses that archive folder."
+                        )
+
+                live_base = str(live_cfg.get("output_dir") or "").strip()
+                if physical_change and not _same_path(live_base, base):
+                    raise SubsError(
+                        "The archive location changed while this edit was open. "
+                        "Reload and retry."
+                    )
+                if physical_change:
+                    old_exists = os.path.isdir(old_path)
+                    new_exists = os.path.exists(new_path)
+                    if old_exists and new_exists:
+                        raise SubsError(
+                            f"Cannot rename {old_name!r}: destination folder "
+                            f"{new_path!r} already exists."
+                        )
+                    if not old_exists and new_exists:
+                        raise SubsError(
+                            "The old channel folder is missing and the destination "
+                            "already exists. Nothing was changed."
+                        )
+                    if old_exists:
+                        if not _same_filesystem(old_path, new_path):
+                            raise SubsError(
+                                f"Cannot rename folder from {old_name!r} to "
+                                f"{new_name!r}: source and destination are on "
+                                "different volumes."
+                            )
+                        _require_empty_channel_journal()
+                        journal = make_rename_transaction(
+                            identity=dict(identity),
+                            old_channel=existing,
+                            new_channel=updated,
+                            old_path=old_path,
+                            new_path=new_path,
+                        )
+                        if not write_channel_transaction(journal):
+                            raise SubsError(
+                                "Could not save folder-rename recovery state. "
+                                "Nothing was changed."
+                            )
+                        journal_written = True
+                        if callable(pending_path_reconciler):
+                            queue_reconcile_result = pending_path_reconciler(
+                                old_path, new_path, old_name, new_name)
+                            if not queue_reconcile_result.get("ok"):
+                                raise SubsError(
+                                    queue_reconcile_result.get("error")
+                                    or "Queued Processing tasks could not be updated."
+                                )
+                            queue_remapped = bool(
+                                queue_reconcile_result.get("changed"))
+                        try:
+                            os.rename(old_path, new_path)
+                            renamed = {"from": old_path, "to": new_path}
+                        except OSError as exc:
+                            if os.path.isdir(new_path) and not os.path.exists(old_path):
+                                renamed = {"from": old_path, "to": new_path}
+                            raise SubsError(
+                                f"Could not rename folder from {old_name!r} to "
+                                f"{new_name!r}: {exc}. No settings saved."
+                            ) from exc
+                        if not checkpoint_channel_transaction(journal, "folder_moved"):
+                            raise SubsError(
+                                "Folder moved, but its durable recovery checkpoint "
+                                "could not be saved."
+                            )
+
+                live_channels[live_idx] = live_channel
+                live_channels.sort(
+                    key=lambda channel: str(channel.get("name") or "").lower()
+                )
+                committed = dict(live_channel)
+        except (OSError, SubsError) as exc:
+            recovery_error = ""
+            rollback_processing_queue = True
+            if renamed is not None and journal is not None:
+                rolled_back, recovery_error = _rollback_folder_rename(
+                    journal,
+                    renamed["from"],
+                    renamed["to"],
+                    exc,
+                )
+                if rolled_back:
+                    renamed = None
+                else:
+                    # The folder is still at (or ambiguously near) the new
+                    # path and the durable recovery journal owns the decision.
+                    # Keep queued paths aligned with that new-side recovery
+                    # state instead of blindly pointing them back at a missing
+                    # old folder.
+                    rollback_processing_queue = False
+            elif journal_written and journal is not None:
+                if not clear_channel_transaction():
+                    recovery_error = (
+                        "No folder change was committed, but its recovery journal "
+                        "could not be cleared."
+                    )
+                    mark_channel_recovery_required(
+                        journal,
+                        phase="journal_clear_after_failure",
+                        error=recovery_error,
+                    )
+            if (queue_remapped and rollback_processing_queue
+                    and callable(pending_path_reconciler)):
+                queue_rollback = pending_path_reconciler(
+                    new_path, old_path, new_name, old_name)
+                if not queue_rollback.get("ok"):
+                    queue_error = str(
+                        queue_rollback.get("error")
+                        or "Processing queue rollback failed."
+                    )
+                    recovery_error = "; ".join(
+                        part for part in (recovery_error, queue_error) if part)
+            if recovery_error:
+                return {
+                    **updated,
+                    "_write_blocked": True,
+                    "_recovery_required": True,
+                    "_rollback_error": recovery_error,
+                }
+            if isinstance(exc, SubsError):
+                raise
+            return {**updated, "_write_blocked": True, "_error": str(exc)}
+
+        if renamed is not None and journal is not None:
+            committed["_folder_renamed"] = renamed
+            committed["_processing_queue_result"] = queue_reconcile_result
+            if not clear_channel_transaction():
+                detail = (
+                    "Channel and folder were updated, but the recovery journal "
+                    "could not be cleared."
+                )
+                mark_channel_recovery_required(
+                    journal,
+                    phase="journal_clear_after_commit",
+                    error=detail,
+                )
+                committed["_recovery_required"] = True
+                committed["_recovery_error"] = detail
+    return committed
 
 
-def remove_channel(identity: dict[str, str],
-                   delete_files: bool = False) -> dict[str, Any]:
-    """Remove a channel from the subs list.
+def remove_channel(
+    identity: dict[str, str],
+    delete_files: bool = False,
+) -> dict[str, Any]:
+    """Remove one subscription, quarantining its folder as one transaction.
 
-    If `delete_files=True`, also move the channel's on-disk folder (videos,
-    transcripts, metadata, thumbnails, .ChannelArt — the whole folder) to the
-    app trash. Returns {ok, deleted_folder, delete_error?}. The quarantine is
-    best-effort; if it fails the subscription is still removed so the user
-    isn't stuck with a broken record.
+    When folder quarantine fails, the subscription remains in config so the
+    user can retry. A config-save failure restores the quarantined folder.
     """
     cfg = load_config()
     channels = cfg.setdefault("channels", [])
     idx = _find_channel(channels, identity)
     if idx is None:
         raise SubsError(f"Channel not found: {identity}")
-    ch = dict(channels[idx])
+    channel = dict(channels[idx])
 
-    # Move files FIRST, then update the config. Old
-    # order (pop + save_config before delete) meant a crash mid-operation
-    # left the config updated but the folder orphaned — the user
-    # couldn't retry delete-files via the UI because the channel was
-    # already gone from the subs list. Now the folder move runs
-    # first; the subs-list removal only happens after the delete
-    # resolves (or was never requested).
+    from .sync import channel_folder_name
+
+    base = str(cfg.get("output_dir") or "").strip()
+    folder_name = channel_folder_name(channel)
+    folder_path = os.path.join(base, folder_name) if base and folder_name else ""
+    lease_result = _mutation_lease(
+        channel,
+        paths=(folder_path,) if folder_path else (),
+        needs_journal=bool(delete_files and folder_path),
+        label=f"Remove channel {channel.get('name') or folder_name}",
+    )
+    if not lease_result.ok or lease_result.lease is None:
+        return {
+            "ok": False,
+            "busy": lease_result.status in {"busy", "timeout"},
+            "deleted_folder": False,
+            "error": lease_result.explanation,
+        }
+
     result: dict[str, Any] = {"ok": False, "deleted_folder": False}
-    if delete_files:
-        base = (cfg.get("output_dir") or "").strip()
-        if base:
-            try:
-                from .sync import channel_folder_name as _cfn
-                folder_name = _cfn(ch)
-                folder_path = os.path.join(base, folder_name)
-                # Path-containment guard — refuse to move anything
-                # that doesn't live INSIDE output_dir. A malformed
-                # channel name with .. traversal characters could
-                # otherwise yield a path outside the archive root.
-                from backend.services.file_ops import safe_rmtree_channel_folder
-                delete_result = safe_rmtree_channel_folder(
-                    folder_path,
-                    require_config_writable=True,
-                    reason="subs_remove_channel",
+    journal: dict[str, Any] | None = None
+    journal_written = False
+    quarantined_path = ""
+    saved = False
+    with lease_result.lease:
+        try:
+            with config_transaction() as live_cfg:
+                live_channels = live_cfg.setdefault("channels", [])
+                live_idx = _find_channel(live_channels, identity)
+                if live_idx is None:
+                    raise SubsError(f"Channel not found: {identity}")
+                live_channel = dict(live_channels[live_idx])
+
+                if delete_files and folder_path:
+                    live_base = str(live_cfg.get("output_dir") or "").strip()
+                    live_folder = channel_folder_name(live_channel)
+                    live_path = (
+                        os.path.join(live_base, live_folder)
+                        if live_base and live_folder
+                        else ""
+                    )
+                    if not live_path or not _same_path(live_path, folder_path):
+                        raise SubsError(
+                            "The channel folder changed while removal was open. "
+                            "Reload and retry."
+                        )
+                    if os.path.isdir(folder_path):
+                        from backend.services.file_ops import (
+                            restore_trash_entry,
+                            safe_rmtree_channel_folder,
+                        )
+
+                        _require_empty_channel_journal()
+                        journal = make_remove_transaction(
+                            identity=dict(identity),
+                            old_channel=live_channel,
+                            old_path=folder_path,
+                            archive_root=live_base,
+                        )
+                        if not write_channel_transaction(journal):
+                            raise _FolderTransactionAbort(
+                                {
+                                    **result,
+                                    "delete_error": (
+                                        "Could not save folder-removal recovery "
+                                        "state. Nothing was changed."
+                                    ),
+                                }
+                            )
+                        journal_written = True
+                        deleted = safe_rmtree_channel_folder(
+                            folder_path,
+                            require_config_writable=True,
+                            reason="subs_remove_channel",
+                            reserved_trash_path=str(
+                                journal["trashed_folder_path"]),
+                            transaction_id=str(journal["tx_id"]),
+                            channel_snapshot=live_channel,
+                        )
+                        result.update(
+                            {
+                                key: value
+                                for key, value in deleted.items()
+                                if key not in {"ok", "reason", "error"}
+                            }
+                        )
+                        if not deleted.get("ok"):
+                            detail = str(
+                                deleted.get("error") or "Folder quarantine failed."
+                            )
+                            rollback_error = str(deleted.get("rollback_error") or "")
+                            if rollback_error:
+                                mark_channel_recovery_required(
+                                    journal,
+                                    phase="quarantine_rollback",
+                                    error=f"{detail}; {rollback_error}",
+                                )
+                                result.update(
+                                    {
+                                        "_recovery_required": True,
+                                        "_rollback_error": rollback_error,
+                                    }
+                                )
+                            elif not clear_channel_transaction():
+                                mark_channel_recovery_required(
+                                    journal,
+                                    phase="journal_clear_after_failure",
+                                    error=detail,
+                                )
+                                result["_recovery_required"] = True
+                            result["delete_error"] = detail
+                            raise _FolderTransactionAbort(result)
+
+                        quarantined_path = str(
+                            deleted.get("trashed_folder_path") or ""
+                        )
+                        if deleted.get("deleted_folder") and not quarantined_path:
+                            detail = "Folder moved, but its trash location is unknown."
+                            mark_channel_recovery_required(
+                                journal,
+                                phase="folder_moved",
+                                error=detail,
+                            )
+                            result.update(
+                                {
+                                    "delete_error": detail,
+                                    "_recovery_required": True,
+                                }
+                            )
+                            raise _FolderTransactionAbort(result)
+                        if quarantined_path and not checkpoint_channel_transaction(
+                            journal,
+                            "folder_moved",
+                        ):
+                            restored = restore_trash_entry(
+                                quarantined_path,
+                                expected_transaction_id=str(journal["tx_id"]),
+                            )
+                            if restored.get("ok"):
+                                result["deleted_folder"] = False
+                                if not clear_channel_transaction():
+                                    mark_channel_recovery_required(
+                                        journal,
+                                        phase="journal_clear_after_rollback",
+                                        error="Removal checkpoint was rolled back.",
+                                    )
+                                    result["_recovery_required"] = True
+                                result["delete_error"] = (
+                                    "Folder-removal checkpoint failed; the folder "
+                                    "was restored."
+                                )
+                            else:
+                                rollback_error = str(
+                                    restored.get("error") or "Trash restore failed."
+                                )
+                                mark_channel_recovery_required(
+                                    journal,
+                                    phase="remove_rollback",
+                                    error=rollback_error,
+                                )
+                                result.update(
+                                    {
+                                        "delete_error": (
+                                            "Folder-removal checkpoint and rollback "
+                                            "both failed."
+                                        ),
+                                        "_recovery_required": True,
+                                        "_rollback_error": rollback_error,
+                                    }
+                                )
+                            raise _FolderTransactionAbort(result)
+
+                live_channels.pop(live_idx)
+            saved = True
+        except _FolderTransactionAbort as exc:
+            return exc.result
+        except (OSError, SubsError) as exc:
+            result["error"] = str(exc) or "Config save failed"
+            if quarantined_path and journal is not None:
+                from backend.services.file_ops import restore_trash_entry
+
+                restored = restore_trash_entry(
+                    quarantined_path,
+                    expected_transaction_id=str(journal["tx_id"]),
                 )
-                result.update({
-                    k: v for k, v in delete_result.items()
-                    if k not in {"ok", "reason"}
-                })
-                if not delete_result.get("ok"):
-                    raise ValueError(delete_result.get("error")
-                                     or "folder quarantine failed")
-            except Exception as e:
-                # Delete failed — surface the error but STILL drop the
-                # subs-list entry. The alternative (keeping it in the
-                # list) leaves the user stuck with a broken record
-                # that their UI can't recover from. Partial success is
-                # strictly better than no-progress.
-                result["delete_error"] = str(e)
-    # Now drop the subs-list entry and persist config.
-    channels.pop(idx)
-    saved = save_config(cfg)
-    if saved:
-        ch_url = (ch.get("url") or "").strip()
-        if ch_url:
+                if restored.get("ok"):
+                    result["deleted_folder"] = False
+                    if not clear_channel_transaction():
+                        detail = (
+                            "Folder was restored, but its recovery journal remains."
+                        )
+                        mark_channel_recovery_required(
+                            journal,
+                            phase="journal_clear_after_rollback",
+                            error=detail,
+                        )
+                        result.update(
+                            {
+                                "_recovery_required": True,
+                                "_rollback_error": detail,
+                            }
+                        )
+                else:
+                    rollback_error = str(
+                        restored.get("error") or "Trash restore failed."
+                    )
+                    mark_channel_recovery_required(
+                        journal,
+                        phase="remove_rollback",
+                        error=f"{exc}; {rollback_error}",
+                    )
+                    result.update(
+                        {
+                            "_recovery_required": True,
+                            "_rollback_error": rollback_error,
+                        }
+                    )
+            elif journal_written and journal is not None:
+                if not clear_channel_transaction():
+                    mark_channel_recovery_required(
+                        journal,
+                        phase="journal_clear_after_failure",
+                        error=exc,
+                    )
+                    result["_recovery_required"] = True
+            return result
+
+        if saved and journal_written and journal is not None:
+            if not clear_channel_transaction():
+                detail = (
+                    "Subscription and folder removal completed, but the recovery "
+                    "journal could not be cleared."
+                )
+                mark_channel_recovery_required(
+                    journal,
+                    phase="journal_clear_after_commit",
+                    error=detail,
+                )
+                result["_recovery_required"] = True
+                result["recovery_error"] = detail
+
+        channel_url = str(channel.get("url") or "").strip()
+        if channel_url:
             try:
                 from . import archive_scan
-                archive_scan.invalidate_channel(ch_url)
-            except Exception:
-                pass
+
+                archive_scan.invalidate_channel(channel_url)
+            except Exception as exc:
+                _log.debug("archive scan cache invalidation failed: %s", exc)
             try:
                 from . import channel_cache
-                channel_cache.clear(ch_url)
-            except Exception:
-                pass
-    result["ok"] = bool(saved)
+
+                channel_cache.clear(channel_url)
+            except Exception as exc:
+                _log.debug("channel id cache invalidation failed: %s", exc)
+        result["ok"] = True
     return result
 
 

@@ -25,7 +25,14 @@
   async function _reconcileMissingFolders() {
     if (!nativeBridgeUp()) return;
     let res;
-    try { res = await bridgeCall("check_channel_folders"); } catch { return; }
+    try { res = await bridgeCall("check_channel_folders"); } catch (error) {
+      console.warn("missing-folder check failed:", error);
+      return;
+    }
+    if (!res?.ok) {
+      console.warn("missing-folder check failed:", res?.error || res);
+      return;
+    }
     const missing = (res && res.missing) || [];
     if (!missing.length) return;
     for (const ch of missing) {
@@ -63,8 +70,22 @@
           window._showToast?.(pick.error || "Invalid folder.", "error");
         }
       } else if (choice === "remove") {
-        await bridgeCall("subs_remove_channel", { name: ch.name, url: ch.url });
-        window._showToast?.(`Removed "${ch.name}" from subs.`, "warn");
+        try {
+          const removed = await bridgeCall(
+            "subs_remove_channel", { name: ch.name, url: ch.url }, false);
+          if (removed?.ok || removed?.subscription_removed) {
+            window._showToast?.(
+              `Removed "${ch.name}" from subscriptions.`, "warn");
+            await window.refreshSubsTable?.();
+          } else {
+            window._showToast?.(
+              removed?.error || `Could not remove "${ch.name}".`, "error");
+          }
+        } catch (error) {
+          window._showToast?.(
+            `Could not remove "${ch.name}": ${error?.message || error}`,
+            "error");
+        }
       }
       // skip / cancel — leave as-is
     }

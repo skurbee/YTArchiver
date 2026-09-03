@@ -66,40 +66,52 @@
       }
     };
 
-    // A cold Windows sign-in occasionally leaves graphTab.js unloaded even
-    // though its classic <script> tag appears before app.js.  Do not leave the
-    // Graph controls dead for the whole session: retry that one self-contained
-    // module with a unique URL, then initialize it as soon as it publishes its
-    // back-compat global.  The retry is asynchronous so the rest of boot stays
-    // usable; a warning is shown only if recovery itself fails.
-    let _graphRetryPending = false;
-    if (typeof window.initGraphView !== "function") {
-      _graphRetryPending = true;
+    // WebView2 can occasionally skip one local classic-script request during
+    // a cold start even though the tags are in the correct order. Retry the
+    // small, self-contained modules where this has been observed with a
+    // cache-busted URL. The rest of boot stays usable, and a startup warning
+    // appears only if the retry itself fails.
+    const _pendingBootRetries = new Set();
+    const _retryBootModule = (fnName, moduleUrl, featureName, initFn) => {
+      if (typeof window[fnName] === "function") return;
+      _pendingBootRetries.add(fnName);
       const retry = document.createElement("script");
-      const retryUrl = new URL("graphTab.js?v=1", document.baseURI);
+      const retryUrl = new URL(moduleUrl, document.baseURI);
       retryUrl.searchParams.set("boot-retry", String(Date.now()));
       retry.src = retryUrl.href;
-      retry.dataset.bootRetry = "graphTab";
+      retry.dataset.bootRetry = fnName;
       retry.onload = () => {
-        _graphRetryPending = false;
-        if (typeof window.initGraphView === "function") {
-          _safe("initGraphView", () => window.initGraphView());
+        _pendingBootRetries.delete(fnName);
+        if (typeof window[fnName] === "function") {
+          _safe(fnName, initFn);
         } else {
           window._reportBootIssue?.(
-            "initGraphView",
-            "graphTab.js loaded on retry but did not publish initGraphView.",
+            fnName,
+            `${moduleUrl.split("?")[0]} loaded again but did not finish setting up ${featureName}.`,
           );
         }
       };
       retry.onerror = () => {
-        _graphRetryPending = false;
+        _pendingBootRetries.delete(fnName);
         window._reportBootIssue?.(
-          "initGraphView",
-          "graphTab.js failed to load, including the automatic startup retry; related UI controls may not work.",
+          fnName,
+          `${moduleUrl.split("?")[0]} failed to load again; ${featureName} is unavailable for this session.`,
         );
       };
       document.head.appendChild(retry);
-    }
+    };
+    _retryBootModule(
+      "initGraphView",
+      "graphTab.js?v=1",
+      "Graph",
+      () => window.initGraphView(),
+    );
+    _retryBootModule(
+      "initPunctRestoreDialog",
+      "punctRestoreDialog.js?v=2",
+      "punctuation repair",
+      () => window.initPunctRestoreDialog(),
+    );
 
     const _expectedBootFns = [
       "initTabs",
@@ -111,6 +123,7 @@
       "initBrowseSubmodes",
       "initBrowseSubmodeContent",
       "initBrowseContextMenus",
+      "initTrashView",
       "initSearchView",
       "initGraphView",
       "initBookmarksExport",
@@ -122,6 +135,8 @@
       "initQueuePendingButton",
       "initSettingsTab",
       "initSettingsSubTabs",
+      "initNavigationHistory",
+      "initHealthOverview",
       "initSettingsArchiveRoots",
       "initIndexControls",
       "initMetadataTab",
@@ -155,7 +170,7 @@
     ];
     for (const fnName of _expectedBootFns) {
       if (typeof window[fnName] !== "function") {
-        if (fnName === "initGraphView" && _graphRetryPending) continue;
+        if (_pendingBootRetries.has(fnName)) continue;
         window._reportBootIssue?.(
           fnName,
           `${fnName} is not loaded; related UI controls may not work.`,
@@ -175,6 +190,7 @@
     _safe("initBrowseSubmodes",       () => window.initBrowseSubmodes?.());
     _safe("initBrowseSubmodeContent", () => window.initBrowseSubmodeContent?.());
     _safe("initBrowseContextMenus",   () => window.initBrowseContextMenus?.());
+    _safe("initTrashView",            () => window.initTrashView?.());
     _safe("initSearchView",           () => window.initSearchView?.());
     _safe("initGraphView",            () => window.initGraphView?.());
     _safe("initBookmarksExport",      () => window.initBookmarksExport?.());
@@ -190,9 +206,11 @@
     // Settings tab + sub-tabs
     _safe("initSettingsTab",         () => window.initSettingsTab?.());
     _safe("initSettingsSubTabs",     () => window.initSettingsSubTabs?.());
+    _safe("initHealthOverview",      () => window.initHealthOverview?.());
     _safe("initSettingsArchiveRoots", () => window.initSettingsArchiveRoots?.());
     _safe("initIndexControls",       () => window.initIndexControls?.());
     _safe("initMetadataTab",         () => window.initMetadataTab?.());
+    _safe("initNavigationHistory",   () => window.initNavigationHistory?.());
     _safe("initScanArchive",         () => window.initScanArchive?.());
     _safe("initAutorun",             () => window.initAutorun?.());
     _safe("initAutorunHistoryDialog", () => window.initAutorunHistoryDialog?.());
@@ -207,8 +225,10 @@
     _safe("initPunctRestoreDialog", () => window.initPunctRestoreDialog?.());
     _safe("initProvenanceDialog",  () => window.initProvenanceDialog?.());
     _safe("initQueueModals",       () => window.initQueueModals?.());
-    // Global status bar wraps renderQueues / setQueueState / _setIndicator,
-    // so it must init AFTER queue + log modules have assigned those globals.
+    // QueueBlink owns the canonical queue-state handler.  Initialize it before
+    // the status bar adds its read-only wrapper; the reverse order let
+    // QueueBlink overwrite the wrapper and the bar missed every later push.
+    _safe("initQueueBlink",        () => window.initQueueBlink?.());
     _safe("initStatusBar",         () => window.initStatusBar?.());
     _safe("initCommandPalette",    () => window.initCommandPalette?.());
     _safe("initWatchActions",      () => window.initWatchActions?.());
@@ -218,7 +238,6 @@
     _safe("initUrlField",       () => window.initUrlField?.());
     _safe("initDragDropUrl",    () => window.initDragDropUrl?.());
     _safe("initClearLog",       () => window.initClearLog?.());
-    _safe("initQueueBlink",     () => window.initQueueBlink?.());
     _safe("initQueueAutoCheckboxes", () => window.initQueueAutoCheckboxes?.());
     _safe("initDeferredLivestreams", () => window.initDeferredLivestreams?.());
 

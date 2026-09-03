@@ -170,6 +170,20 @@ class DiskErrorMonitor:
         self._retry_wake.set()
         threading.Thread(target=self._retry_tick, daemon=True).start()
 
+    def stop(self, timeout: float = 1.0) -> bool:
+        """Permanently stop the retry owner and bound its final join."""
+        with self._lock:
+            self._active = False
+        self._retry_wake.set()
+        thread = self._retry_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.0, float(timeout)))
+        return thread is None or not thread.is_alive()
+
+    def is_alive(self) -> bool:
+        thread = self._retry_thread
+        return bool(thread is not None and thread.is_alive())
+
     # ── Private ─────────────────────────────────────────────────────────
 
     def _enter_error_state(self) -> None:

@@ -15,6 +15,7 @@
     .replace(/[&<>"']/g, (ch) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
     }[ch])));
+  const displayText = window.YT?.util?.displayText || ((s) => String(s ?? ""));
   function bridgeCall(method, ...args) {
     const fn = window.YT?.bridge?.bridgeCall;
     if (fn) return fn(method, ...args);
@@ -100,7 +101,7 @@
       }
     } catch (_e) {
       window._showToast?.(
-        `Couldn't switch to ${pick}: ${_e?.message || _e || "bridge error"}.`,
+        `Couldn't switch to ${pick}: ${_e?.message || _e || "app connection error"}.`,
         "error");
       return null;
     }
@@ -108,9 +109,23 @@
   }
   window._askWhisperModel = _askWhisperModel;
 
-  async function _askTranscribeChannel(channelName, combined) {
+  async function _askTranscribeChannel(channelIdentity, combined) {
     if (!nativeBridgeUp()) {
-      window._showToast?.("Native mode required.", "warn");
+      window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
+      return;
+    }
+    const channelName = typeof channelIdentity === "object" && channelIdentity
+      ? String(channelIdentity.name || channelIdentity.folder || "").trim()
+      : String(channelIdentity || "").trim();
+    const channelArg = typeof channelIdentity === "object" && channelIdentity
+      ? {
+          name: channelIdentity.name || "",
+          folder: channelIdentity.folder || "",
+          url: channelIdentity.url || "",
+        }
+      : channelName;
+    if (!channelName) {
+      window._showToast?.("Could not identify the channel.", "error");
       return;
     }
     // Manual channel transcribe → ask which whisper model (60s countdown
@@ -120,7 +135,7 @@
       const model = await _askWhisperModel(`"${channelName}"`);
       if (model === null) return; // user cancelled
     }
-    const res = await bridgeCall("chan_transcribe_all", channelName, combined);
+    const res = await bridgeCall("chan_transcribe_all", channelArg, combined);
     if (res?.ok === false) {
       window._showToast?.(res.error || "Transcribe failed to start.", "error");
       return;
@@ -144,7 +159,7 @@
       });
       if (pick === null) return; // user cancelled
       // Recurse with the resolved choice.
-      return _askTranscribeChannel(channelName, pick === "combined");
+      return _askTranscribeChannel(channelArg, pick === "combined");
     }
     if (res?.ok && res.queued != null) {
       window._showToast?.(
@@ -161,6 +176,13 @@
   // user had navigated away and the next video had been picked. Track
   // a monotonic token per open call and bail when it changes.
   let _watchOpenToken = 0;
+  let _watchOpenIntentToken = 0;
+  // Some entry paths must resolve a media file before they can invoke the
+  // canonical opener. Reserving an intent immediately makes "last click
+  // wins" apply across that pre-open await as well as transcript loading.
+  window._reserveWatchOpenIntent = () => ++_watchOpenIntentToken;
+  window._isWatchOpenIntentCurrent = (token) =>
+    token === _watchOpenIntentToken;
   // _browseState publication moved to web/browseState.js — that module
   // loads early enough to be the canonical owner. We just expose the
   // _watchOpenToken getter for logs.js _loadVideoSource (which checks
@@ -169,8 +191,14 @@
     get() { return _watchOpenToken; },
     configurable: true,
   });
-  window._openVideoInWatch = async function (video) {
+  window._openVideoInWatch = async function (video, options = {}) {
     if (!video) return;
+    const reservedIntent = Number(options.intentToken);
+    if (Number.isFinite(reservedIntent)) {
+      if (reservedIntent !== _watchOpenIntentToken) return;
+    } else {
+      ++_watchOpenIntentToken;
+    }
     const myToken = ++_watchOpenToken;
     // Ensure we're on the Browse tab and in Watch view.
     document.querySelector('.tab[data-tab="browse"]')?.click();
@@ -188,6 +216,21 @@
     }
     _browseState.currentVideo = video;
     showView("watch");
+
+    // Find belongs to one rendered transcript, not to the Watch pane as a
+    // whole. Clear the previous video's query/count as soon as a new open
+    // starts and dispatch input so watchActions also resets its private match
+    // list. A deliberate Search-result query is applied again after the new
+    // transcript renders below.
+    const watchFind = document.getElementById("watch-find");
+    const watchFindCount = document.getElementById("watch-find-count");
+    if (watchFind) {
+      watchFind.value = "";
+      try {
+        watchFind.dispatchEvent(new Event("input", { bubbles: true }));
+      } catch {}
+    }
+    if (watchFindCount) watchFindCount.textContent = "";
 
     // Loading-state paint now happens inside showView("watch") above,
     // so every entry path (video-grid click, search-result click,
@@ -311,24 +354,50 @@
     }).catch(() => {});
   };
 
+  function _paintChannelVideoCatalogStatus(status) {
+    if (status.phase === "done") return;
+    const grid = document.getElementById("video-grid");
+    const target = grid?.querySelector(
+      ".browse-loading, #channel-video-page-sentinel");
+    if (target) target.textContent = status.text;
+  }
+
+  function _paintChannelVideoError(message) {
+    const grid = document.getElementById("video-grid");
+    if (!grid) return;
+    grid.innerHTML = "";
+    const error = document.createElement("div");
+    error.className = "browse-empty";
+    error.textContent = message || "Couldn’t load this channel’s videos.";
+    grid.appendChild(error);
+  }
+
   // ── Channel action header (Batch 8) ────────────────────────────────
   // The channel currently shown in #view-videos, remembered so the header
   // buttons (Sync now / Settings / Open folder) know which channel to act on.
   let _cphChannel = null;
+  let _cphSyncState = "";
   function _updateChannelHeader(channel) {
     _cphChannel = channel || null;
     const header = document.getElementById("channel-page-header");
     const info = document.getElementById("cph-info");
     if (!header) return;
-    if (!channel) { header.hidden = true; return; }
+    if (!channel) {
+      _cphSyncState = "";
+      header.hidden = true;
+      return;
+    }
     const name = channel.folder || channel.name || "";
     const parts = [];
-    const vids = channel.n_vids || channel.video_count;
-    if (vids) parts.push(`${Number(vids).toLocaleString()} videos`);
+    const vids = channel.n_vids ?? channel.video_count;
+    if (vids !== undefined && vids !== null && Number.isFinite(Number(vids))) {
+      parts.push(`${Number(vids).toLocaleString()} videos`);
+    }
     if (channel.size) parts.push(String(channel.size));
     // Live sync state for this channel.
     let state = "";
     try { state = window._queueHasSyncForChannel?.(name) || ""; } catch (e) { /* ignore */ }
+    _cphSyncState = state;
     let badge = "";
     if (state === "running") badge = '<span class="cph-badge cph-badge-run">Syncing now</span>';
     else if (state === "queued") badge = '<span class="cph-badge">Queued to sync</span>';
@@ -342,6 +411,41 @@
     const syncBtn = document.getElementById("cph-sync-now");
     if (syncBtn) syncBtn.disabled = !!state;
     header.hidden = false;
+  }
+
+  function _channelNameKey(channel) {
+    return String(channel?.folder || channel?.name || "")
+      .trim().toLowerCase();
+  }
+
+  function _reconcileCompleteChannelCount(channel) {
+    // A filtered page is only the number of matches. A page with hasMore is
+    // only the first slice of a large channel. Neither may replace the true
+    // archive count. Once an unfiltered page is complete, however, the card
+    // list itself is authoritative and can safely repair an old cache value.
+    if (!_channelPage.active || _channelPage.query || _channelPage.hasMore) {
+      return false;
+    }
+    const name = channel?.folder || channel?.name || "";
+    const key = _channelNameKey(channel);
+    if (!key) return false;
+    const count = Array.isArray(_browseState.videos)
+      ? _browseState.videos.length : 0;
+    const changes = { n_vids: count, video_count: count };
+    Object.assign(channel, changes);
+    if (_cphChannel && _channelNameKey(_cphChannel) === key) {
+      Object.assign(_cphChannel, changes);
+    }
+    for (const row of (Array.isArray(_browseState.channels)
+      ? _browseState.channels : [])) {
+      if (_channelNameKey(row) === key) Object.assign(row, changes);
+    }
+    window._refreshChannelCardSummary?.(name, changes);
+    if (_browseState.view === "videos"
+        && _channelNameKey(_browseState.currentChannel) === key) {
+      _updateChannelHeader(_browseState.currentChannel || channel);
+    }
+    return true;
   }
 
   async function loadVideosFor(channel) {
@@ -372,7 +476,7 @@
       grid.innerHTML = '<div class="browse-loading">Loading\u2026</div>';
     }
     const titleEl = document.getElementById("browse-main-title");
-    if (titleEl) titleEl.textContent = name;
+    if (titleEl) titleEl.textContent = displayText(name);
 
     // Populate + show the channel action header (Batch 8 — channel page can
     // now sync / configure / open-folder, not just watch).
@@ -390,11 +494,24 @@
       }
       _channelPage.active = false;
       try {
-        const rows = await bridgeCall("browse_list_videos", name, sort, 50000);
+        const outcome = await window.YT.bridge.catalogRead(
+          "channel-videos",
+          () => bridgeCall("browse_list_videos", name, sort, 50000),
+          {
+            label: "channel videos",
+            onStatus: _paintChannelVideoCatalogStatus,
+          });
+        if (outcome.stale) return;
+        const rows = outcome.value;
         if (myLoadSeq !== loadVideosFor._seq) return; // stale, user clicked another channel
         if (Array.isArray(rows)) {
           _browseState.videos = rows.map(r => _mapVideoRow(r, name));
           sortCurrentVideos(sort);
+          return;
+        }
+        if (rows?.error) {
+          _paintChannelVideoError(rows.error);
+          window._showToast?.(rows.error, "error");
           return;
         }
       } catch (e) { console.warn("browse_list_videos failed:", e); }
@@ -402,7 +519,8 @@
 
     // Fallback for preview mode — synthesize placeholder videos
     _browseState.videos = [];
-    window._showToast?.("Archive bridge unavailable. Videos will load once the app is ready.", "warn");
+    window._showToast?.(
+      "YTArchiver is still starting. Videos will load when it is ready.", "warn");
     sortCurrentVideos(sort);
   }
 
@@ -427,15 +545,36 @@
     _renderChannelPageSentinel();
     let stale = false;
     try {
-      const res = await bridgeCall(
-        "browse_list_videos_page",
-        name, sort, CHANNEL_VIDEO_PAGE_SIZE, offset, query);
+      const outcome = await window.YT.bridge.catalogRead(
+        "channel-videos",
+        () => bridgeCall(
+          "browse_list_videos_page",
+          name, sort, CHANNEL_VIDEO_PAGE_SIZE, offset, query),
+        {
+          label: "channel videos",
+          onStatus: _paintChannelVideoCatalogStatus,
+        });
+      if (outcome.stale) {
+        stale = true;
+        return true;
+      }
+      const res = outcome.value;
       if (seq && seq !== loadVideosFor._seq) {
         stale = true;
         return true;
       }
-      const rows = (res && res.rows) || [];
-      if (!Array.isArray(rows)) return false;
+      if (res?.error) {
+        _channelPage.active = false;
+        _paintChannelVideoError(res.error);
+        window._showToast?.(res.error, "error");
+        return true;
+      }
+      if (!res || !Array.isArray(res.rows)) {
+        _channelPage.active = false;
+        _paintChannelVideoError("Couldn’t load this channel’s videos.");
+        return true;
+      }
+      const rows = res.rows;
 
       const mapped = rows.map(r => _mapVideoRow(r, name));
       if (reset) {
@@ -459,6 +598,7 @@
         ? nextOffset : offset + mapped.length;
       _channelPage.hasMore = !!res?.has_more;
       _channelPage.loading = false;
+      _reconcileCompleteChannelCount(channel);
       sortCurrentVideos(sort);
       return true;
     } catch (e) {
@@ -574,14 +714,26 @@
       // Thumbnail sidecar (file:// URL from .Thumbnails/ or next-to-video).
       thumbnail: r.thumbnail || "",
       thumbnail_url: r.thumbnail_url || "",
+      removed_from_yt: !!r.removed_from_yt,
+      tracked: true,
     };
   }
 
   function _videoRowSig(v) {
     return [
       v.video_id || v.filepath || "",
+      v.title || "",
+      v.channel || "",
+      v.filepath || "",
       v.thumbnail_url || "",
+      v.duration || "",
+      v.uploaded || "",
+      Number(v.upload_ts || 0),
+      Number(v.view_count || 0),
+      Number(v.like_count || 0),
+      Number(v.size_bytes || 0),
       v.tx_status || "",
+      v.removed_from_yt ? "1" : "0",
     ].join("~");
   }
 
@@ -644,11 +796,12 @@
       </span>
       <button class="btn btn-primary btn-thin">Download metadata</button>
     `;
-    banner.querySelector("b").textContent = ch.folder || ch.name || "this channel";
+    banner.querySelector("b").textContent = displayText(
+      ch.folder || ch.name || "this channel");
     banner.querySelector("button").addEventListener("click", async (e) => {
       e.stopPropagation();
       if (!nativeBridgeUp()) {
-        window._showToast?.("Native mode required.", "warn");
+        window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
         return;
       }
       const name = ch.folder || ch.name || "";
@@ -703,26 +856,60 @@
       if (!name || !nativeBridgeUp()) return;
       try {
         const r = await bridgeCall("sync_one_channel", { name });
-        if (r?.ok && r?.queued) {
-          window._showToast?.(`Added "${r.name || name}" to sync queue.`, "ok");
-        } else if (r?.error) {
-          window._showToast?.(r.error, "error");
-        }
+        window.YT?.bridge?.reportSyncOneResult?.(r, name);
       } catch (e) {
-        window._showToast?.("Sync failed: " + e, "error");
+        window.YT?.bridge?.reportSyncOneResult?.({
+          ok: false,
+          error: "Sync failed: " + (e?.message || e),
+        }, name);
       }
       _updateChannelHeader(ch);
     });
+    // Queue rows are rendered asynchronously after Sync now returns. Keep the
+    // open channel header tied to that authoritative payload, and do one final
+    // catalog read when this channel leaves the queue. The download-landed
+    // push normally refreshes sooner; this completion read is the safety net
+    // for an early/missed push and guarantees the final committed row appears.
+    if (!initBrowseSubmodeContent._queuePayloadWired) {
+      initBrowseSubmodeContent._queuePayloadWired = true;
+      window.YT?.eventState?.subscribe("queue-payload", () => {
+        const ch = _cphChannel;
+        const name = ch && (ch.folder || ch.name || "");
+        if (!name) return;
+        const previous = _cphSyncState;
+        let current = "";
+        try {
+          current = window._queueHasSyncForChannel?.(name) || "";
+        } catch (_e) { /* leave idle */ }
+        // The header lives inside #view-videos, so repainting it while Watch
+        // or another Browse view is active cannot leak it onto that screen.
+        // It does ensure Back never reveals a stale badge or disabled button.
+        _updateChannelHeader(ch);
+        if (previous && !current) {
+          window._refreshChannelVideosIfLoaded?.(name);
+        }
+      });
+    }
     document.getElementById("cph-settings")?.addEventListener("click", () => {
       const ch = _cphChannel;
       const name = ch && (ch.folder || ch.name || "");
       if (!name) return;
       window._editChannelFromBrowse?.(name);
     });
-    document.getElementById("cph-folder")?.addEventListener("click", () => {
+    document.getElementById("cph-folder")?.addEventListener("click", async () => {
       const ch = _cphChannel;
       const name = ch && (ch.folder || ch.name || "");
-      if (name && nativeBridgeUp()) bridgeCall("chan_open_folder", name);
+      if (!name || !nativeBridgeUp()) return;
+      try {
+        const result = await bridgeCall("chan_open_folder", name);
+        if (!result?.ok) {
+          window._showToast?.(
+            result?.error || "Could not open channel folder.", "error");
+        }
+      } catch (error) {
+        window._showToast?.(
+          `Could not open channel folder: ${error?.message || error}`, "error");
+      }
     });
     // ⋮ More — reuse the FULL channel-card context menu (reorg, redownload,
     // re-transcribe, remove, open-on-YouTube, …) by dispatching a
@@ -732,18 +919,15 @@
       e.stopPropagation();
       const ch = _cphChannel;
       if (!ch) return;
-      let card = null;
-      const idx = Array.isArray(_browseState.channels)
-        ? _browseState.channels.indexOf(ch) : -1;
-      if (idx >= 0) {
-        card = document.querySelector(
-          `#channel-grid .channel-card[data-channel-index="${idx}"]`);
-      }
-      if (!card) {
-        const name = (ch.folder || ch.name || "").trim();
-        card = [...document.querySelectorAll("#channel-grid .channel-card")].find(
-          (c) => (c.querySelector(".channel-card-name")?.textContent || "").trim() === name);
-      }
+      const folder = String(ch.folder || "").trim().toLowerCase();
+      const name = String(ch.name || ch.folder || "").trim().toLowerCase();
+      const card = [...document.querySelectorAll(
+        "#channel-grid .channel-card")].find(
+        (candidate) => folder
+          ? String(candidate.dataset.channelFolder || "").trim().toLowerCase()
+            === folder
+          : String(candidate.dataset.channelName || "").trim().toLowerCase()
+            === name);
       if (!card) return;
       const r = e.currentTarget.getBoundingClientRect();
       const menuWidth = 180; // .ctx-menu min-width; keeps dropdown right-aligned to ⋮.
@@ -762,6 +946,7 @@
             item.remove();
           }
         });
+        window._markBrowseContextTrigger?.(e.currentTarget);
       }
     });
   }
@@ -826,70 +1011,63 @@
     container.appendChild(frag);
   }
 
+  let _searchHitOpenSeq = 0;
   async function _openSearchHitInWatch(hit) {
     if (!nativeBridgeUp()) {
-      window._showToast?.("Native mode required for playback.", "warn");
+      window._showToast?.("Playback isn't ready yet. Try again in a moment.", "warn");
       return;
     }
+    // Snapshot the row before awaiting. Callers reuse/mutate their result
+    // state, and the last double-click should win even if an earlier file
+    // resolution finishes later.
+    const snapshot = {
+      jsonl_path: hit?.jsonl_path || "",
+      video_id: hit?.video_id || "",
+      title: hit?.title || "",
+      channel: hit?.channel || "",
+      start_time: Number(hit?.start_time) || 0,
+      search_query: hit?._search_query || "",
+    };
+    const openSeq = ++_searchHitOpenSeq;
+    const intentToken = window._reserveWatchOpenIntent?.();
+    const originSubmode = _browseState.submode;
+    const browseTab = document.querySelector('.tab[data-tab="browse"]');
+    const originWasActive = !!browseTab?.classList.contains("active");
+    const originIsCurrent = () =>
+      (!originWasActive || !!browseTab?.classList.contains("active"))
+      && (!originSubmode || _browseState.submode === originSubmode);
     try {
       const res = await bridgeCall("browse_resolve_segment",
-        hit.jsonl_path || "", hit.video_id || "", hit.title || "");
-      if (!res?.ok) {
+        snapshot.jsonl_path, snapshot.video_id, snapshot.title);
+      if (openSeq !== _searchHitOpenSeq) return;
+      if (Number.isFinite(intentToken)
+          && !window._isWatchOpenIntentCurrent?.(intentToken)) return;
+      if (!originIsCurrent()) return;
+      if (!res?.ok || !res.filepath) {
         window._showToast?.(res?.error || "Video file not found.", "error");
         return;
       }
-      const video = {
-        title: res.title || hit.title || "",
-        channel: res.channel || hit.channel || "",
+      if (typeof window._openVideoInWatch !== "function") {
+        window._showToast?.("Watch view is not ready yet.", "warn");
+        return;
+      }
+      // Route every result type through the canonical Watch opener. It owns
+      // transcript loading, navigation cancellation, source loading and the
+      // seek-after-metadata behavior; duplicating that work here caused
+      // stale result A to repaint over a newer result B.
+      await window._openVideoInWatch({
+        title: res.title || snapshot.title,
+        channel: res.channel || snapshot.channel,
         filepath: res.filepath,
-        video_id: res.video_id || hit.video_id || "",
-        start_at: Number(hit.start_time) || 0,
-      };
-      _browseState.currentVideo = video;
-      showView("watch");
-      // Load real transcript, fall back to synthesized
-      let transcript = null;
-      let sourceInfo = null;
-      try {
-        // Pass video_id + title ONLY (no jsonl_path) — see browseSearch.js:
-        // forwarding the hit's jsonl_path made the backend re-normpath a
-        // slash-mixed stored path and the jsonl_path=? match missed, blanking
-        // the Watch transcript. Let the backend resolve its canonical path.
-        const res = await bridgeCall("browse_get_transcript", {
-          video_id: video.video_id || undefined,
-          title: video.title,
-          channel: video.channel || "",
-          filepath: video.filepath || "",
-        });
-        if (Array.isArray(res)) transcript = res;
-        else if (res && res.segments) {
-          transcript = res.segments;
-          sourceInfo = res.source || null;
-        }
-        if (res && !Array.isArray(res) && res.tx_status) {
-          video.tx_status = res.tx_status;
-        }
-      } catch { /* ignore */ }
-      if (!transcript || transcript.length === 0) {
-        // empty array → renderer shows the no-speech / no-transcript message
-        transcript = [];
-      } else {
-        transcript = transcript.map(seg => ({
-          ts: _formatTs(seg.s), text: seg.t, words: seg.w, s: seg.s, e: seg.e,
-        }));
-      }
-      window.renderWatchView(video, transcript, sourceInfo);
-      // Seek + flash-highlight the segment once the <video> element is ready.
-      const vEl = document.getElementById("watch-video");
-      if (vEl && video.start_at > 0) {
-        const seek = () => {
-          try { vEl.currentTime = video.start_at; vEl.play?.().catch(() => {}); }
-          catch { /* ignore */ }
-        };
-        if (vEl.readyState >= 1) seek();
-        else vEl.addEventListener("loadedmetadata", seek, { once: true });
-      }
+        video_id: res.video_id || snapshot.video_id,
+        _seek_to: snapshot.start_time,
+        _search_query: snapshot.search_query,
+      }, { intentToken });
     } catch (e) {
+      if (openSeq !== _searchHitOpenSeq) return;
+      if (Number.isFinite(intentToken)
+          && !window._isWatchOpenIntentCurrent?.(intentToken)) return;
+      if (!originIsCurrent()) return;
       console.warn("open search hit failed:", e);
       window._showToast?.("Could not open video.", "error");
     }
@@ -934,27 +1112,9 @@
     // Sidebar stats as well
     setText("stat-channels", (c.channels ?? "").toLocaleString?.() ?? "");
     setText("stat-videos", (c.videos ?? "").toLocaleString?.() ?? "");
-    // Segment count isn't in the summary cards (it's an expensive full-DB
-    // aggregate), so fetch it once via the same call Settings → Index uses
-    // and fill the sidebar "segments" badge when it resolves — otherwise it
-    // sits at "—" the whole session. (This lives here, not in the
-    // indexControls compat shim, because browseContent.js loads last and
-    // overwrites window._applyIndexSummary.)
-    if (!window.__segStatFetched) {
-      window.__segStatFetched = true;
-      if (nativeBridgeUp()) {
-        bridgeCall("get_index_db_stats").then((db) => {
-          if (db && db.segments != null) {
-            setText("stat-segments", Number(db.segments).toLocaleString());
-            setText("search-stat-segments", Number(db.segments).toLocaleString());
-          } else {
-            window.__segStatFetched = false;
-          }
-        }).catch(() => { window.__segStatFetched = false; });
-      } else {
-        window.__segStatFetched = false;
-      }
-    }
+    // The segment total requires an archive-wide database aggregate. Keep it
+    // lazy at startup; Health → Library runs that explicit detail request
+    // and applies the result to these sidebar badges when it completes.
 
     // Per-channel table
     if (Array.isArray(idx.per_channel)) {
@@ -1032,15 +1192,38 @@
       setTimeout(poll, 150);
     }
 
-    // Change handler: bridgeCall re-resolves the api each call (handles
-    // the same api-timing gotcha noted above). Gated on nativeBridgeUp so
-    // a toggle in browser-preview mode stays a silent no-op.
-    syncCB?.addEventListener("change", () => {
-      if (nativeBridgeUp()) bridgeCall("queue_auto_set", "sync", syncCB.checked);
-    });
-    gpuCB?.addEventListener("change", () => {
-      if (nativeBridgeUp()) bridgeCall("queue_auto_set", "gpu", gpuCB.checked);
-    });
+    // Save one optimistic toggle, but roll the checkbox back if persistence
+    // fails. Otherwise the UI claims Auto is enabled while the saved config
+    // still says it is off (and the queue remains parked after restart).
+    const persistAuto = async (kind, checkbox) => {
+      const requested = !!checkbox.checked;
+      _restored = true; // a late startup read must not overwrite this choice
+      checkbox.disabled = true;
+      checkbox.setAttribute("aria-busy", "true");
+      try {
+        if (!nativeBridgeUp()) {
+          checkbox.checked = !requested;
+          window._showToast?.("This setting isn't ready yet. Try again in a moment.", "warn");
+          return;
+        }
+        const result = await bridgeCall("queue_auto_set", kind, requested);
+        if (!result?.ok) {
+          checkbox.checked = !requested;
+          window._showToast?.(
+            result?.error || "Could not save the Auto setting.", "error");
+        }
+      } catch (error) {
+        checkbox.checked = !requested;
+        window._showToast?.(
+          `Could not save the Auto setting: ${error?.message || error}`,
+          "error");
+      } finally {
+        checkbox.disabled = false;
+        checkbox.removeAttribute("aria-busy");
+      }
+    };
+    syncCB?.addEventListener("change", () => persistAuto("sync", syncCB));
+    gpuCB?.addEventListener("change", () => persistAuto("gpu", gpuCB));
   }
 
   window.initBrowseSubmodeContent = initBrowseSubmodeContent;
@@ -1048,6 +1231,96 @@
   window._askWhisperModel = _askWhisperModel;
   window._askTranscribeChannel = _askTranscribeChannel;
   window.loadVideosFor = loadVideosFor;
+  function _summaryVideoCount(row) {
+    const raw = row?.video_count ?? row?.n_vids;
+    if (typeof raw === "number") {
+      return Number.isFinite(raw) && raw >= 0 ? raw : null;
+    }
+    const cleaned = String(raw ?? "").replace(/[\s,]/g, "");
+    if (!/^\d+$/.test(cleaned)) return null;
+    const parsed = Number(cleaned);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+  }
+
+  // A per-channel completion push already fetches every lightweight Subs row.
+  // Merge that paid-for count/size result into every Browse card, not only the
+  // currently-open channel. The old current-channel-only merge discarded a
+  // newly-added channel's fresh count while the user was on the Channels
+  // landing screen, leaving its card at "0 videos" until they opened it.
+  window._refreshBrowseChannelSummaries = function (rows) {
+    if (!Array.isArray(rows)) return false;
+    const stateRows = Array.isArray(_browseState.channels)
+      ? _browseState.channels : [];
+    const previous = new Map(stateRows.map((row) => [
+      _channelNameKey(row), _summaryVideoCount(row),
+    ]));
+    const freshKeys = new Set();
+    let countsChanged = previous.size !== rows.length;
+    let totalVideos = 0;
+
+    for (const row of rows) {
+      const name = row?.folder || row?.name || "";
+      const key = _channelNameKey(row);
+      if (!key) continue;
+      freshKeys.add(key);
+      const count = _summaryVideoCount(row);
+      if (count !== null) totalVideos += count;
+      if (!previous.has(key) || previous.get(key) !== count) {
+        countsChanged = true;
+      }
+
+      // Subs rows use display-formatted counts (for example "1,234" or
+      // "—"). Cards and sort code require a real number, so normalize known
+      // counts and preserve an existing rich-catalog count when the cache row
+      // is unavailable.
+      const summary = { ...row };
+      if (count === null) {
+        delete summary.n_vids;
+        delete summary.video_count;
+      } else {
+        summary.n_vids = count;
+        summary.video_count = count;
+      }
+      window._refreshChannelCardSummary?.(name, summary);
+    }
+    for (const key of previous.keys()) {
+      if (key && !freshKeys.has(key)) countsChanged = true;
+    }
+
+    // These sidebar badges describe the configured channel library. They were
+    // previously refreshed only at startup, so Add/Remove and completed syncs
+    // could leave them stale for the rest of the session.
+    const channelStat = document.getElementById("stat-channels");
+    const videoStat = document.getElementById("stat-videos");
+    if (channelStat) channelStat.textContent = rows.length.toLocaleString();
+    if (videoStat) videoStat.textContent = totalVideos.toLocaleString();
+
+    const current = _browseState.currentChannel || _cphChannel;
+    const currentKey = _channelNameKey(current);
+    if (current && currentKey) {
+      const fresh = rows.find((row) => _channelNameKey(row) === currentKey);
+      if (fresh) {
+        const count = _summaryVideoCount(fresh);
+        const summary = { ...fresh };
+        if (count === null) {
+          delete summary.n_vids;
+          delete summary.video_count;
+        } else {
+          summary.n_vids = count;
+          summary.video_count = count;
+        }
+        Object.assign(current, summary);
+        if (_cphChannel && _cphChannel !== current) {
+          Object.assign(_cphChannel, summary);
+        }
+        if (_browseState.view === "videos") _updateChannelHeader(current);
+      }
+    }
+    return countsChanged;
+  };
+  // Backward-compatible name for callers/tests outside this module.
+  window._refreshCurrentChannelSummary =
+    window._refreshBrowseChannelSummaries;
   window._filterChannelVideosPaged = function () {
     if (_browseState.view !== "videos" || !nativeBridgeUp()) return false;
     if (_channelGroupingEnabled()) return false;
@@ -1062,7 +1335,12 @@
   // ONLY if the set actually changed (no flash on a no-op). Runs whether or
   // not the grid is the active view, so a download that arrives while the
   // user is on another tab is already in place when they return to Browse.
+  // Hidden refreshes deliberately use the hidden-grid path below. Calling
+  // loadVideosFor() while Channels / Videos / Search / etc. is visible would
+  // also repaint the shared title and channel-action chrome for a page the
+  // user has already left.
   let _chanRefreshBusy = false;
+  let _chanRefreshPendingName = null;
   window._refreshChannelVideosIfLoaded = async function (channelName) {
     const cur = _browseState.currentChannel;
     if (!cur || !nativeBridgeUp()) return;
@@ -1077,28 +1355,66 @@
       // doesn't trigger a full channel re-fetch.
       return;
     }
-    if (_chanRefreshBusy) return;
+    if (_chanRefreshBusy) {
+      // A sync can land several videos while the first catalog refresh is
+      // still reading. Remember the newest notification instead of dropping
+      // it; the first query's SQLite snapshot may predate that later commit.
+      _chanRefreshPendingName = channelName || "";
+      return;
+    }
     _chanRefreshBusy = true;
     try {
       const sort = document.getElementById("browse-sort")?.value || "newest";
+      const loadSeq = loadVideosFor._seq || 0;
+      const channelViewIsVisible = () => {
+        const active = _browseState.currentChannel;
+        const activeName = active ? (active.folder || active.name || "") : "";
+        return _browseState.view === "videos" && activeName === shown;
+      };
       if (_channelPage.active && !_channelGroupingEnabled()) {
-        await loadVideosFor(cur);
+        if (channelViewIsVisible()) {
+          await loadVideosFor(cur);
+        } else {
+          // Refresh paged data without the title/header/month-control writes
+          // performed by loadVideosFor(). The page loader only touches the
+          // hidden channel grid and keeps its offset/has-more state coherent.
+          await _loadChannelPage(cur, true, loadSeq);
+        }
         return;
       }
-      const rows = await bridgeCall("browse_list_videos", shown, sort, 50000);
-      // Discard if the user switched channels (or left the videos view)
-      // during the fetch — don't clobber the newer view.
+      const outcome = await window.YT.bridge.catalogRead(
+        "channel-videos",
+        () => bridgeCall("browse_list_videos", shown, sort, 50000),
+        { label: "channel videos" });
+      if (outcome.stale) return;
+      const rows = outcome.value;
+      // Discard if the user opened/reloaded a channel while this background
+      // read was pending. That newer load is authoritative. Merely leaving
+      // the channel page is safe: the refreshed grid is hidden and ready if
+      // the user returns.
+      if ((loadVideosFor._seq || 0) !== loadSeq) return;
       const curNow = _browseState.currentChannel;
       const shownNow = curNow ? (curNow.folder || curNow.name || "") : "";
       if (shownNow !== shown || !Array.isArray(rows)) return;
-      const newSig = rows.map(r => _videoRowSig(r)).join("|");
+      const mappedRows = rows.map(r => _mapVideoRow(r, shown));
+      const newSig = mappedRows.map(r => _videoRowSig(r)).join("|");
       const oldSig = (_browseState.videos || [])
         .map(v => _videoRowSig(v)).join("|");
       if (newSig === oldSig) return;   // nothing new — leave the grid as-is
-      _browseState.videos = rows.map(r => _mapVideoRow(r, shown));
+      _browseState.videos = mappedRows;
       sortCurrentVideos(sort);
     } catch (_e) { /* non-fatal — leave the current grid as-is */ }
-    finally { _chanRefreshBusy = false; }
+    finally {
+      _chanRefreshBusy = false;
+      const pendingName = _chanRefreshPendingName;
+      _chanRefreshPendingName = null;
+      if (pendingName !== null) {
+        setTimeout(() => {
+          window._refreshChannelVideosIfLoaded(
+            pendingName || undefined);
+        }, 0);
+      }
+    }
   };
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", _wireChannelPagingScroll,

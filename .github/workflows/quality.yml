@@ -1,0 +1,48 @@
+name: Windows quality gate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pinned Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Install pinned Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Run isolated Windows gate
+        shell: powershell
+        run: >-
+          powershell -NoProfile -ExecutionPolicy Bypass
+          -File scripts/check.ps1 -Bootstrap -RequireCleanTree
+
+      - name: Upload verified executable
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: YTArchiver-windows-x64
+          path: dist/YTArchiver.exe
+          if-no-files-found: error
+          retention-days: 14

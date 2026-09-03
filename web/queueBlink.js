@@ -100,9 +100,9 @@
     // queue paints to fire 2x, 3x, ... on subsequent inits.
     if (window._queueBlinkInited) return;
     window._queueBlinkInited = true;
-    // Backend drives blink state via:
-    // window.setQueueState({ sync: {running, paused, pausedActive}, gpu: {...} })
-    window.setQueueState = (state) => {
+    const events = window.YT?.eventState;
+    const applyQueueState = (state) => {
+      state = state || {};
       _touchBlinkState();
       // Capture the moment paused goes from false → true so we can
       // hold the "pending" blink for a minimum visible window even
@@ -128,21 +128,27 @@
       ensureBlinkRunning();
       ensurePendingBlinkRunning();
       paintBlinkState();
+      _syncPauseButtonState();
     };
+    if (events) {
+      events.subscribe("queue-state", applyQueueState);
+    } else {
+      // Standalone diagnostics may load this module without eventState.js.
+      const previousSetQueueState = window.setQueueState;
+      window.setQueueState = (state) => {
+        if (typeof previousSetQueueState === "function") {
+          try { previousSetQueueState(state); } catch (_e) { /* mirror only */ }
+        }
+        applyQueueState(state);
+      };
+    }
     // Paint initial idle state (buttons default to gray)
     paintBlinkState();
     // NOTE: auto-start for preview-only mode was removed — it was firing in
     // native mode too because pywebview.api isn't ready at boot time.
     // Pause button: disabled when nothing running
     _syncPauseButtonState();
-    // Re-check whenever state is pushed
-    const origSet = window.setQueueState;
-    window.setQueueState = (state) => {
-      origSet(state);
-      _syncPauseButtonState();
-    };
-    // Wrap renderQueues so queue counts AND paused flags are mirrored
-    // into _blinkState every payload. Critical for cold launch: the
+    // Mirror queue counts AND paused flags from every payload. Critical for cold launch: the
     // backend only pushes setQueueState via _on_queue_changed (i.e.
     // when state CHANGES after the window is ready) — it never emits
     // a baseline after set_window. So the frontend's first view of
@@ -151,11 +157,9 @@
     // flags here, _blinkState.paused stays false at boot, the global
     // Pause button's "paused + items queued" branch never fires, and
     // the button sits disabled with 99+ items waiting.
-    const origRenderQueues = window.renderQueues;
-    if (typeof origRenderQueues === "function") {
-      window.renderQueues = (queues) => {
+    const applyQueuePayload = (queues) => {
+        queues = queues || {};
         _touchBlinkState();
-        origRenderQueues(queues);
         const _syncCount = queues?.sync_count;
         const _gpuCount = queues?.gpu_count;
         _blinkState.sync.count = Number.isFinite(_syncCount)
@@ -188,7 +192,17 @@
         _syncPauseButtonState();
         ensurePendingBlinkRunning();
         paintBlinkState();
-      };
+    };
+    if (events) {
+      events.subscribe("queue-payload", applyQueuePayload);
+    } else {
+      const origRenderQueues = window.renderQueues;
+      if (typeof origRenderQueues === "function") {
+        window.renderQueues = (queues) => {
+          origRenderQueues(queues);
+          applyQueuePayload(queues);
+        };
+      }
     }
   }
 
@@ -405,6 +419,7 @@
             ? "Resume all queues"
             : "Pause all queues (current jobs finish first)");
       pauseBtn.setAttribute("data-tooltip", _pauseTip);
+      pauseBtn.setAttribute("aria-label", _pauseTip);
       pauseBtn.removeAttribute("title");
       const svg = pauseBtn.querySelector("svg");
       if (svg) {

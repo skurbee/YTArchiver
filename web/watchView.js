@@ -31,6 +31,8 @@
 (function () {
   "use strict";
 
+  const displayText = window.YT?.util?.displayText || ((s) => String(s ?? ""));
+
   function bridgeCall(method, ...args) {
     const fn = window.YT?.bridge?.bridgeCall;
     if (fn) return fn(method, ...args);
@@ -41,14 +43,27 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
+  function _watchVideoIdentity(video) {
+    if (!video) return "";
+    if (video.video_id) return `id:${video.video_id}`;
+    if (video.filepath) {
+      return `file:${String(video.filepath).replace(/\\/g, "/").toLowerCase()}`;
+    }
+    return `fallback:${video.channel || ""}\u0000${video.title || ""}`;
+  }
+
   /** Retranscribe completion hook — called by Python via evaluate_js
    * when a `transcribe_retranscribe` job finishes. If the completed
    * video is the one currently on screen, refetch the transcript and
    * re-render the Watch view (this flips the source banner from
    * "auto-captions — approximate" to "Whisper transcription"). Mirrors
-   * ArchivePlayer `_ytStartProgressPoll`'s post-finish refresh at
-   * static/app.js:1209-1221. */
+   * the companion viewer's post-finish progress refresh. */
   window._onRetranscribeComplete = async function (payload) {
+    let refreshToken = null;
+    let refreshKey = "";
+    const existingTranscriptKept = payload?.existing_transcript_kept === true;
+    const keptTranscriptMessage =
+      "Whisper found no speech — the existing transcript was kept.";
     try {
       const { video_id, filepath } = payload || {};
       // Clear the in-flight entry for THIS video so other watch-view
@@ -61,6 +76,17 @@
       if (!wv || wv.hidden) return;
       const cur = window._watchCurrentVideo || null;
       if (!cur) return;
+      refreshToken = (typeof window._watchOpenToken === "number")
+        ? window._watchOpenToken : null;
+      refreshKey = _watchVideoIdentity(cur);
+      const stillShowingRefreshTarget = () => {
+        const active = window._watchCurrentVideo || null;
+        const tokenMatches = refreshToken === null
+          || window._watchOpenToken === refreshToken;
+        return tokenMatches
+          && _watchVideoIdentity(active) === refreshKey
+          && (!window._browseState || window._browseState.view === "watch");
+      };
       // Normalize filepaths — Python sends os.path.normpath() output which
       // uses backslashes on Windows, the video obj's `filepath` field may
       // carry whatever separator the source set. reported the Watch
@@ -79,12 +105,33 @@
         channel: cur.channel || "",
         filepath: cur.filepath || "",
       });
+      // The user may have opened B while A's refreshed transcript was
+      // loading. Never repaint A over B or announce A's completion as if it
+      // applied to the video now on screen.
+      if (!stillShowingRefreshTarget()) return;
       let segments = [];
       let sourceInfo = null;
       if (Array.isArray(res)) segments = res;
       else if (res && res.segments) {
         segments = res.segments;
         sourceInfo = res.source || null;
+      }
+      // A re-transcription can legitimately find no speech even though the
+      // video already has a usable transcript (for example, saved captions).
+      // The backend deliberately preserves that transcript. Refresh it when
+      // available, but never replace it with an empty state or claim that
+      // Whisper updated it.
+      if (existingTranscriptKept) {
+        if (segments.length) {
+          const transcript = segments.map(seg => ({
+            ts: (window._formatTs ? window._formatTs(seg.s) : ""),
+            text: seg.t, words: seg.w, s: seg.s, e: seg.e,
+          }));
+          window.renderWatchView(cur, transcript, sourceInfo,
+                                 { skipVideoReload: true });
+        }
+        window._showToast?.(keptTranscriptMessage, "ok");
+        return;
       }
       // when the retranscribe completes but the segment
       // fetch comes back empty (JSONL write failed, FTS ingest failed,
@@ -122,6 +169,19 @@
                              { skipVideoReload: true });
       window._showToast?.("Re-transcription complete — transcript updated.", "ok");
     } catch (e) {
+      if (refreshToken !== null
+          && (window._watchOpenToken !== refreshToken
+              || _watchVideoIdentity(window._watchCurrentVideo) !== refreshKey
+              || (window._browseState && window._browseState.view !== "watch"))) {
+        return;
+      }
+      if (existingTranscriptKept) {
+        // The durable transcript was preserved even if this one UI refresh
+        // failed. Keep the current transcript on screen and report the actual
+        // Whisper outcome instead of implying new text was saved.
+        window._showToast?.(keptTranscriptMessage, "ok");
+        return;
+      }
       console.warn("_onRetranscribeComplete failed:", e);
       window._showToast?.(
         "Re-transcription finished but the view couldn't refresh; reopen the video.",
@@ -188,7 +248,20 @@
     const canStart = ctrl.dataset.canStart === "1";
     const inflight = window._inflightRetranscribes;
     const busy = !!(vid && inflight && inflight.has && inflight.has(vid));
-    const pct = busy ? Math.max(0, Math.min(99, parseInt(inflight.get(vid), 10) || 0)) : 0;
+    const rawState = busy ? inflight.get(vid) : 0;
+    const state = busy && window._normalizeRetranscribeWatchState
+      ? window._normalizeRetranscribeWatchState(rawState)
+      : {
+          pct: Math.max(0, Math.min(99, parseInt(rawState, 10) || 0)),
+          phase: (parseInt(rawState, 10) || 0) > 0
+            ? "transcribing" : "queued",
+        };
+    const pct = state.pct;
+    const finalizing = state.phase === "finalizing";
+    const paused = state.phase === "paused";
+    const resuming = state.phase === "resuming";
+    const needsAttention = state.phase === "needs_attention";
+    const queued = state.phase === "queued";
     const link = ctrl.querySelector(".watch-retranscribe-link");
     const progress = ctrl.querySelector(".watch-retranscribe-progress");
     const fill = ctrl.querySelector(".watch-retranscribe-fill");
@@ -199,18 +272,47 @@
     if (banner) banner.classList.toggle("is-progress-pinned", busy);
     ctrl.hidden = (!busy && !canStart);
     if (link) link.hidden = busy || !canStart;
-    if (progress) progress.hidden = !busy;
+    if (progress) {
+      progress.hidden = !busy;
+      progress.classList.toggle("is-needs-attention", needsAttention);
+      progress.classList.toggle("is-paused", paused);
+    }
     if (!busy) return;
 
     if (text) {
-      text.textContent = pct > 0 ? `Whisper ${pct}%` : "Queued";
-      text.title = pct > 0
-        ? `Re-transcribing with Whisper, ${pct}%`
-        : "Re-transcribe queued";
+      if (finalizing) {
+        const display = window._retranscribeWatchFinalizingDisplay
+          ? window._retranscribeWatchFinalizingDisplay(state)
+          : { text: "Finishing transcript…", title: "Finishing transcript" };
+        text.textContent = display.text;
+        text.title = display.title;
+      } else if (needsAttention) {
+        text.textContent = "Needs attention — retry in Processing";
+        text.title = "Open Processing to retry this re-transcription.";
+      } else if (paused) {
+        text.textContent = "Paused — resume in Processing";
+        text.title = "Open Processing when you are ready to resume.";
+      } else if (resuming) {
+        text.textContent = "Resuming transcription…";
+        text.title = "Re-transcription is resuming.";
+      } else if (queued) {
+        text.textContent = "Queued";
+        text.title = "Re-transcription is waiting in the Processing queue.";
+      } else {
+        text.textContent = pct > 0 ? `Whisper ${pct}%` : "Queued";
+        text.title = pct > 0
+          ? `Re-transcribing with Whisper, ${pct}%`
+          : "Re-transcribe queued";
+      }
     }
     if (fill) {
-      fill.style.width = pct > 0 ? `${pct}%` : "36%";
-      fill.classList.toggle("is-indeterminate", pct <= 0);
+      const stopped = paused || needsAttention;
+      const indeterminate = !stopped
+        && (finalizing || resuming || queued || pct <= 0);
+      fill.style.width = indeterminate
+        ? "36%" : pct > 0 ? `${pct}%` : "0%";
+      fill.classList.toggle("is-indeterminate", indeterminate);
+      fill.classList.toggle("is-needs-attention", needsAttention);
     }
   }
 
@@ -256,7 +358,10 @@
       ts.dataset.s = String(startSec);
       ts.textContent = _fmtParaTs(startSec);
       ts.title = "Jump to " + _fmtParaTs(startSec);
-      ts.tabIndex = -1;
+      ts.tabIndex = 0;
+      ts.setAttribute("aria-haspopup", "menu");
+      ts.setAttribute("aria-expanded", "false");
+      ts.setAttribute("aria-keyshortcuts", "Shift+F10");
       const text = document.createElement("span");
       text.className = "para-text";
       para.appendChild(ts);
@@ -416,7 +521,7 @@
    * `video.filepath` is used to request a file:// URL from the backend.
    *
    * Render mode: single continuous flowing body (no per-segment divs,
-   * no [timestamp] inline prefixes) — matches ArchivePlayer. A source
+   * no [timestamp] inline prefixes) — matches the companion viewer. A source
    * banner above the body tells the user whether the transcript came
    * from Whisper or YouTube auto-captions, and for auto-captions offers
    * an inline "Re-transcribe with Whisper" link for better accuracy.
@@ -439,9 +544,9 @@
     // when the retranscribe for the currently-playing video finishes.
     const skipVideoReload = !!(opts && opts.skipVideoReload);
 
-    title.textContent = video.title || "Video Title";
+    title.textContent = displayText(video.title || "Video Title");
     const parts = [];
-    if (video.channel) parts.push(video.channel);
+    if (video.channel) parts.push(displayText(video.channel));
     if (video.uploaded) parts.push(video.uploaded);
     if (video.duration) parts.push(video.duration);
     if (video.views) parts.push(video.views + " views");
@@ -452,6 +557,14 @@
     // completed job matches what's on screen.
     window._watchCurrentVideo = video;
     window._watchRenderedToken = window._watchOpenToken;
+    const bookmarkButton = document.getElementById("btn-bookmark-now");
+    if (bookmarkButton) {
+      const canBookmark = !!video.video_id;
+      bookmarkButton.disabled = !canBookmark;
+      bookmarkButton.title = canBookmark
+        ? "Bookmark current segment (B)"
+        : "Bookmark unavailable: this file has no YouTube ID";
+    }
 
     // Repaint the Re-transcribe button to reflect whether THIS video
     // has an in-flight retranscribe. Without this, navigating from
@@ -489,10 +602,10 @@
   };
 
   /** Build the source-banner div for the Watch view transcript panel.
-   * Returns a DOM element or null. Mirrors ArchivePlayer's
-   * `_ytSourceBannerHTML` (static/app.js:1106) EXACTLY — same text,
+   * Returns a DOM element or null. Mirrors the companion viewer's source
+   * banner — same text,
    * same four cases, same link wording. The "unknown, no raw" case
-   * returns null so no banner appears at all (ArchivePlayer returns
+   * returns null so no banner appears at all (the companion returns
    * the empty string for that case). */
   function _buildSourceBanner(sourceInfo, video, transcript) {
     const src = (sourceInfo && sourceInfo.source) || "unknown";
@@ -591,7 +704,7 @@
       // file got at ingest. The legacy tag system distinguished
       // "punct restoration pass ran" vs "didn't run" — but modern YT
       // auto-cap arrives already punctuated and skips the restoration
-      // pass, so a yt_captions_raw video like Vox May 2026 can have
+      // pass, so a raw-caption fixture from a later refresh can have
       // fully punctuated text while a yt_captions_punct legacy video
       // has lowercase per-segment content. Basing the badge on visible
       // content reflects what the user sees instead of pipeline state.
@@ -602,7 +715,7 @@
       banner.appendChild(buildRetranscribeControl(true));
       return banner;
     }
-    // Unknown. Per ArchivePlayer app.js:1140 — don't flag with a warning
+    // Unknown source — do not flag it with a warning
     // since we genuinely don't know. Show a neutral tag if we have a raw
     // string, otherwise NOTHING at all.
     if (raw) {
@@ -621,6 +734,7 @@
   // Exposed via window.loadWatchMetadataDrawer so the Refresh-metadata
   // button (wired in app.js) can re-render the drawer in place after a
   // per-video re-fetch, instead of forcing a Back-and-reopen.
+  let _watchMetadataSeq = 0;
   window.loadWatchMetadataDrawer = (video) => _loadWatchMetadataDrawer(video);
   async function _loadWatchMetadataDrawer(video) {
     const drawer = document.getElementById("watch-meta-drawer");
@@ -629,6 +743,17 @@
     const descEl = document.getElementById("watch-meta-description");
     const commentsEl = document.getElementById("watch-meta-comments");
     const countEl = document.getElementById("watch-meta-comments-count");
+    const requestSeq = ++_watchMetadataSeq;
+    const requestToken = (typeof window._watchOpenToken === "number")
+      ? window._watchOpenToken : null;
+    const requestKey = _watchVideoIdentity(video);
+    const requestIsCurrent = () => {
+      const tokenMatches = requestToken === null
+        || window._watchOpenToken === requestToken;
+      return requestSeq === _watchMetadataSeq
+        && tokenMatches
+        && _watchVideoIdentity(window._watchCurrentVideo) === requestKey;
+    };
     // Reset state immediately so a slow fetch doesn't bleed previous video's data
     if (statsEl) statsEl.textContent = "";
     if (descEl) descEl.textContent = "Loading…";
@@ -636,7 +761,7 @@
     if (countEl) countEl.textContent = "";
 
     if (!nativeBridgeUp()) {
-      if (descEl) descEl.textContent = "(Metadata unavailable in browser-preview mode)";
+      if (descEl) descEl.textContent = "Video details aren't available because YTArchiver isn't ready yet.";
       return;
     }
     let res;
@@ -648,9 +773,14 @@
         channel: video.channel || "",
       });
     } catch (e) {
+      if (!requestIsCurrent()) return;
       if (descEl) descEl.textContent = "(Failed to load metadata.)";
       return;
     }
+    // Metadata A can finish after the user opens B, or after a manual
+    // refresh for the same video starts. Only the newest matching request
+    // may touch the shared drawer.
+    if (!requestIsCurrent()) return;
     if (!res?.ok || !res.meta) {
       if (descEl) descEl.textContent =
         "No metadata on disk for this video yet. Run 'Download metadata' on the channel to fetch it.";
@@ -1115,18 +1245,15 @@
         }
         if (idx >= 0 && segEls[idx]) {
           segEls[idx].classList.add("active");
-          // Auto-scroll transcript if toggle is on. CRITICAL: use
-          // container-local scrollTop rather than `scrollIntoView` —
+          // Keep the transcript following playback. Use container-local
+          // scrollTop rather than `scrollIntoView` —
           // scrollIntoView walks up the parent chain and also scrolls
           // the outer `.browse-view` container, which pushes the video
-          // off-screen as the karaoke follows along. "scrolls
-          // the whole page down so you can't see the video ... we need
-          // to scroll the transcription up to where the video is".
+          // off-screen as the karaoke follows along.
           // Compute the element's offset relative to the scrollable
           // transcript pane and set scrollTop directly so no ancestor
           // containers move.
-          const follow = document.getElementById("watch-autofollow");
-          if (follow?.checked && trWrap) {
+          if (trWrap) {
             window._scrollTranscriptTo(trWrap, segEls[idx]);
           }
         }

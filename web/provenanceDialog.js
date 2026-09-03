@@ -73,7 +73,8 @@
 
       runBtn.addEventListener("click", async () => {
         if (!nativeBridgeUp()) {
-          window._showToast?.("Embed file tags API not available.", "warn");
+          window._showToast?.(
+            "YTArchiver is still starting. Try again in a moment.", "warn");
           return;
         }
         const payload = {
@@ -83,7 +84,7 @@
           dry_run: !!dryEl?.checked,
         };
         if (!payload.do_txt && !payload.do_mp4) {
-          window._showToast?.("Enable at least one phase.", "warn");
+          window._showToast?.("Choose at least one item to update.", "warn");
           return;
         }
         // Confirm an all-channels live MP4 run — it rewrites every
@@ -92,13 +93,11 @@
         // knowingly. Header-only runs are quick and skip the prompt.
         if (!payload.channel && !payload.dry_run && payload.do_mp4) {
           const _ok = await window.askDanger(
-            "Embed file tags — ALL channels",
-            "This rewrites every known-ID video file once to embed its "
-            + "tags (stream copy — no re-encode, dates preserved). On a "
-            + "large archive this is hours of background disk work.\n\n"
-            + "It runs as a Sync Task you can pause, cancel, and resume "
-            + "any time — already-tagged files are skipped on re-runs."
-            + "\n\nProceed?",
+            "Embed file details for all channels?",
+            "This will update every video with a known YouTube ID and may "
+            + "take hours on a large archive. Video quality and file dates "
+            + "will not change. You can pause, cancel, or resume it from "
+            + "Sync Tasks.",
             "Run on all channels");
           if (!_ok) return;
         }
@@ -106,19 +105,19 @@
           const res = await bridgeCall("provenance_embed", payload);
           if (res?.ok && res.queued) {
             const msg = res.started
-              ? "Embed file tags queued — running now. Watch the main log."
-              : "Embed file tags queued — will run when the sync queue resumes.";
+              ? "File details queued — running now. Watch the main log."
+              : "File details queued — will run when the sync queue resumes.";
             window._showToast?.(msg, "ok");
             _close();
           } else if (res?.ok && !res.queued) {
             window._showToast?.(
-              res?.reason || "An embed-tags task with this scope is already queued.",
+              res?.reason || "This file-details task is already queued.",
               "warn");
           } else {
-            window._showToast?.(res?.error || "Embed file tags failed to start.", "warn");
+            window._showToast?.(res?.error || "File details failed to start.", "warn");
           }
         } catch (e) {
-          window._showToast?.(`Embed file tags error: ${e}`, "warn");
+          window._showToast?.(`File details could not be updated: ${e}`, "warn");
         }
       });
   }

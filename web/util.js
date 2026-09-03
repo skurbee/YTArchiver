@@ -32,12 +32,93 @@
     return escapeHtml(s);
   }
 
+  /** Repair one narrowly-identifiable legacy display artifact without
+   * changing the stored value used for lookups/actions.
+   *
+   * U+FFFD means the original character has already been lost, so a broad
+   * replacement would invent data.  The one safe presentation case is an
+   * English possessive between a letter/number and a trailing "s":
+   * `Creator\uFFFDs` can be shown as `Creator’s`.  Isolated or repeated
+   * replacement characters stay visible so ambiguous corruption is never
+   * silently disguised.
+   */
+  function displayText(s) {
+    return String(s ?? "")
+      .replace(/([\p{L}\p{N}])\uFFFD(?=s\b)/gu, "$1’");
+  }
+
   /** Format a seconds count as "M:SS". null/undefined → "0:00". */
   function _formatTs(sec) {
     if (sec == null) return "0:00";
     const m = Math.floor(sec / 60);
     const s = Math.floor(sec % 60);
     return `${m}:${String(s).padStart(2, "0")}`;
+  }
+
+  /** Human-readable byte count for library/storage UI. Invalid or missing
+   * values display as an em dash instead of pretending the item is empty. */
+  function formatBytes(value) {
+    const bytes = Number(value);
+    if (!Number.isFinite(bytes) || bytes < 0) return "\u2014";
+    if (bytes < 1024) return `${Math.round(bytes)} B`;
+    const units = ["KB", "MB", "GB", "TB", "PB"];
+    let amount = bytes;
+    let unit = -1;
+    do {
+      amount /= 1024;
+      unit += 1;
+    } while (amount >= 1024 && unit < units.length - 1);
+    const digits = amount >= 100 ? 0 : (amount >= 10 ? 1 : 2);
+    return `${amount.toFixed(digits).replace(/\.0+$|(?<=\.[0-9])0$/, "")} ${units[unit]}`;
+  }
+
+  /** Convert an ISO string or epoch-seconds/milliseconds value into a Date. */
+  function parseDateValue(value) {
+    if (value instanceof Date) {
+      return Number.isFinite(value.getTime()) ? value : null;
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      const ms = Math.abs(value) < 1e11 ? value * 1000 : value;
+      const date = new Date(ms);
+      return Number.isFinite(date.getTime()) ? date : null;
+    }
+    if (typeof value !== "string" || !value.trim()) return null;
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && /^\d+(?:\.\d+)?$/.test(value.trim())) {
+      return parseDateValue(numeric);
+    }
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? date : null;
+  }
+
+  /** Short relative age such as "4 minutes ago" or "in 2 days". */
+  function formatRelativeTime(value, nowMs = Date.now()) {
+    const date = parseDateValue(value);
+    if (!date) return "Date unknown";
+    const deltaSeconds = Math.round((Number(nowMs) - date.getTime()) / 1000);
+    const future = deltaSeconds < 0;
+    const seconds = Math.abs(deltaSeconds);
+    let amount;
+    let unit;
+    if (seconds < 45) return future ? "in a moment" : "just now";
+    if (seconds < 3600) {
+      amount = Math.max(1, Math.round(seconds / 60));
+      unit = "minute";
+    } else if (seconds < 86400) {
+      amount = Math.max(1, Math.round(seconds / 3600));
+      unit = "hour";
+    } else if (seconds < 86400 * 45) {
+      amount = Math.max(1, Math.round(seconds / 86400));
+      unit = "day";
+    } else if (seconds < 86400 * 545) {
+      amount = Math.max(1, Math.round(seconds / (86400 * 30)));
+      unit = "month";
+    } else {
+      amount = Math.max(1, Math.round(seconds / (86400 * 365)));
+      unit = "year";
+    }
+    const phrase = `${amount} ${unit}${amount === 1 ? "" : "s"}`;
+    return future ? `in ${phrase}` : `${phrase} ago`;
   }
 
   /** Run `fn` once per (target, key) pair. Uses a dataset flag so the
@@ -82,7 +163,11 @@
   YT.util = {
     escapeHtml,
     escapeAttr,
+    displayText,
     _formatTs,
+    formatBytes,
+    parseDateValue,
+    formatRelativeTime,
     onceIdempotent,
     normalizeSubsChannels,
     loadSubsChannels,
@@ -90,5 +175,6 @@
 
   // Compatibility aliases for modules that still consume global helpers.
   window._escapeHtml = escapeHtml;
+  window._displayText = displayText;
   window._formatTs = _formatTs;
 })();

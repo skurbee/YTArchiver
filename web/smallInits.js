@@ -80,14 +80,36 @@
   // restart. 400ms debounce so dragging doesn't hammer the bridge.
   function persistSplitterOnResize() {
     const top = document.querySelector(".activity-log-frame");
+    const splitter = document.getElementById("paned-splitter");
     if (!top) return;
     let saveTimer = null;
-    const obs = new ResizeObserver(() => {
+    let hydrated = false;
+    let userAdjusted = false;
+    let lastVisibleHeight = 0;
+    const scheduleSave = () => {
+      if (!hydrated || !nativeBridgeUp()) return;
+      // A hidden tab reports a zero-sized frame.  Ignore that ResizeObserver
+      // notification so tab navigation cannot overwrite the user's saved
+      // splitter position with 0px.
+      const visibleHeight = top.getBoundingClientRect().height;
+      if (!(visibleHeight > 0) || top.getClientRects().length === 0) return;
+      lastVisibleHeight = visibleHeight;
       clearTimeout(saveTimer);
       saveTimer = setTimeout(() => {
-        const h = top.getBoundingClientRect().height;
-        if (nativeBridgeUp()) bridgeCall("window_state_save", { splitter_top_px: Math.round(h) });
+        const current = top.getBoundingClientRect().height;
+        const h = current > 0 ? current : lastVisibleHeight;
+        if (!(h > 0)) return;
+        bridgeCall("window_state_save", {
+          splitter_top_px: Math.round(h),
+        })?.catch?.(() => {});
       }, 400);
+    };
+    splitter?.addEventListener("ytarchiver:splitter-adjusted", () => {
+      userAdjusted = true;
+      scheduleSave();
+    });
+    const obs = new ResizeObserver(() => {
+      if (userAdjusted) scheduleSave();
     });
     obs.observe(top);
     // Tear down on unload so the observer + pending timer don't
@@ -96,14 +118,40 @@
       try { obs.disconnect(); } catch {}
       try { clearTimeout(saveTimer); } catch {}
     });
-    // Apply saved height on load. Guard the .then chain in case the
-    // backend returns undefined (audit: smallInits.js H143).
-    const _p = nativeBridgeUp() ? bridgeCall("window_state_load") : undefined;
-    if (_p && typeof _p.then === "function") {
-      _p.then((st) => {
-        if (st?.splitter_top_px && top) top.style.flex = `0 0 ${st.splitter_top_px}px`;
-      }).catch(() => {});
-    }
+    // Apply the saved height after the native bridge is ready. On a normal
+    // launch DOMContentLoaded runs first, so a one-shot call used to miss the
+    // saved value and leave the default split in place.
+    const loadSaved = async () => {
+      if (hydrated || !nativeBridgeUp()) return false;
+      try {
+        const st = await bridgeCall("window_state_load");
+        if (!userAdjusted && Number(st?.splitter_top_px) > 0) {
+          splitter?.dispatchEvent(new CustomEvent(
+            "ytarchiver:splitter-restore",
+            { detail: { height: Number(st.splitter_top_px) } },
+          ));
+        }
+        hydrated = true;
+        if (userAdjusted) scheduleSave();
+        return true;
+      } catch (_e) {
+        return false;
+      }
+    };
+    loadSaved().then((ok) => {
+      if (ok) return;
+      window.addEventListener("pywebviewready", () => { loadSaved(); },
+                              { once: true });
+      let tries = 0;
+      const poll = () => {
+        if (hydrated || tries >= 20) return;
+        tries++;
+        loadSaved().then((loaded) => {
+          if (!loaded) setTimeout(poll, 150);
+        });
+      };
+      setTimeout(poll, 150);
+    });
   }
 
   // Subs tab live filter — 100ms debounce, Esc + clear-button both

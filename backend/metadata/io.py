@@ -28,6 +28,13 @@ from pathlib import Path
 from typing import Any
 
 from ..log import get_logger
+from ..services.sidecar_store import (
+    SidecarError,
+    SidecarValidationError,
+    atomic_write_jsonl,
+    fsync_directory,
+    read_jsonl,
+)
 from ..utils import (
     MONTH_FOLDERS as _MONTH_NAMES,
 )
@@ -176,49 +183,42 @@ def _read_metadata_jsonl(jsonl_path: str, *, strict: bool = False
     (was a print()) — captured by PyInstaller --noconsole builds.
     """
     existing: dict[str, dict[str, Any]] = {}
-    if not os.path.isfile(jsonl_path):
-        return existing
-    _bad_lines = 0
-    _total_lines = 0
     try:
-        # utf-8-sig so a UTF-8 BOM at the top of an externally-edited
-        # jsonl doesn't strip the first entry's first byte (audit:
-        # metadata/io.py:96).
-        with open(jsonl_path, "r", encoding="utf-8-sig") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                _total_lines += 1
-                try:
-                    entry = json.loads(line)
-                    vid = entry.get("video_id", "")
-                    if vid:
-                        # Duplicate-vid resolution: prefer the entry
-                        # with the more-recent `fetched_at`. Without
-                        # this, a crash mid-rewrite that left two
-                        # entries for the same video_id silently
-                        # picked LAST line wins regardless of which
-                        # was newer (audit: metadata/io.py:83-120).
-                        _prev = existing.get(vid)
-                        if _prev is None:
-                            existing[vid] = entry
-                        else:
-                            if _metadata_entry_is_newer(entry, _prev):
-                                existing[vid] = entry
-                except json.JSONDecodeError:
-                    _bad_lines += 1
-                    continue
-    except Exception as e:
+        snapshot = read_jsonl(
+            jsonl_path,
+            invalid="raise" if strict else "skip",
+        )
+    except SidecarValidationError as e:
+        if strict:
+            # Keep the long-standing parser contract for callers/tests that
+            # distinguish malformed JSON syntax from other schema failures.
+            if isinstance(e.__cause__, json.JSONDecodeError):
+                raise e.__cause__
+            raise
+        _log.warning("Could not read metadata sidecar %s: %s", jsonl_path, e)
+        return existing
+    except SidecarError as e:
         if strict:
             raise
-        _log.debug("swallowed: %s", e)
+        _log.warning("Could not read metadata sidecar %s: %s", jsonl_path, e)
+        return existing
+
+    for entry in snapshot.records:
+        vid = entry.get("video_id", "")
+        if vid:
+            # Duplicate-vid resolution: prefer the entry with the more-recent
+            # fetched_at rather than blindly trusting line order.
+            previous = existing.get(vid)
+            if previous is None or _metadata_entry_is_newer(entry, previous):
+                existing[vid] = entry
+
+    _bad_lines = len(snapshot.invalid_lines)
     if _bad_lines > 0:
         try:
             _log.warning(
-                "%s: %d/%d JSONL lines were corrupt and skipped. "
+                "%s: %d JSONL lines were corrupt and skipped. "
                 "Metadata for those videos will appear missing.",
-                jsonl_path, _bad_lines, _total_lines)
+                jsonl_path, _bad_lines)
         except Exception as e:
             _log.debug("swallowed: %s", e)
     return existing
@@ -275,22 +275,8 @@ def _lock_for(path: str) -> threading.RLock:
 
 
 def _fsync_parent_dir(path: str) -> None:
-    if os.name == "nt":
-        return
-    parent = os.path.dirname(path) or "."
-    flags = getattr(os, "O_RDONLY", 0) | getattr(os, "O_DIRECTORY", 0)
-    fd = None
-    try:
-        fd = os.open(parent, flags)
-        os.fsync(fd)
-    except OSError as e:
-        _log.debug("parent directory fsync failed for %s: %s", path, e)
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+    """Backward-compatible facade over the shared durability helper."""
+    fsync_directory(os.path.dirname(path) or ".")
 
 
 def _write_metadata_jsonl(jsonl_path: str,
@@ -298,8 +284,8 @@ def _write_metadata_jsonl(jsonl_path: str,
     """Write all entries to the aggregated JSONL, hiding on Windows.
     Matches YTArchiver.py:26583.
 
-    Atomic via .tmp + fsync + os.replace so a crash mid-write doesn't
-    truncate the entire channel's metadata file. Serialized per
+    Atomic via same-directory staging + fsync + os.replace so a crash
+    mid-write doesn't truncate the entire channel's metadata file. Serialized per
     jsonl_path so two concurrent writers can't race on os.replace
     and lose one writer's entries.
     """
@@ -307,22 +293,14 @@ def _write_metadata_jsonl(jsonl_path: str,
     with _lock_for(jsonl_path):
         if os.name == "nt" and os.path.isfile(jsonl_path):
             _unhide_file_win(jsonl_path)
-        tmp_path = jsonl_path + ".tmp"
-        # Clean up tmp on any failure so a partial write doesn't sit
-        # next to the real file forever (audit: metadata/io H92).
         try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                for _vid, data in entries_dict.items():
-                    f.write(json.dumps(data, ensure_ascii=False) + "\n")
-                try:
-                    f.flush()
-                    os.fsync(f.fileno())
-                except OSError:
-                    pass
-            os.replace(tmp_path, jsonl_path)
-            _fsync_parent_dir(jsonl_path)
-        except Exception:
-            try: os.remove(tmp_path)
-            except OSError: pass
-            raise
-        _hide_file_win(jsonl_path)
+            atomic_write_jsonl(
+                jsonl_path,
+                entries_dict.values(),
+                before_replace=_hide_file_win,
+                after_replace=_hide_file_win,
+            )
+        finally:
+            # If staging/validation/replace failed, restore the hidden bit on
+            # the still-authoritative old file.
+            _hide_file_win(jsonl_path)

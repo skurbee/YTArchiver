@@ -162,6 +162,9 @@ def refresh_channel_comments(channel: dict[str, Any],
 
     total = len(targets)
     if total == 0:
+        if cancel_event is not None and cancel_event.is_set():
+            return {"ok": False, "cancelled": True, "partial": False,
+                    "fetched": 0, "errors": 0, "skipped": 0, "took": 0}
         stream.emit([[" \u2014 No videos match the comment-refresh "
                       "scope.\n", "dim"]])
         # A completed scoped check is fresh information even when the scope
@@ -248,11 +251,15 @@ def refresh_channel_comments(channel: dict[str, Any],
     _clear_active()
 
     # Stamp separate last-comments-refresh timestamp on the channel.
-    stamp_channel_refresh(channel, "last_comments_refresh_ts")
+    cancelled = bool(cancel_event is not None and cancel_event.is_set())
+    if not cancelled:
+        stamp_channel_refresh(channel, "last_comments_refresh_ts")
 
     took = time.time() - t0
     # Per-channel summary is rendered by the sync loop's `_sync_row_emit`
     # done-row in rich single-line form. No inline emit here.
-    return {"ok": True, "fetched": fetched, "errors": errors,
+    return {"ok": not cancelled, "cancelled": cancelled,
+            "partial": cancelled and fetched > 0,
+            "fetched": fetched, "errors": errors,
             "unchanged": unchanged, "skipped": 0, "took": took}
 

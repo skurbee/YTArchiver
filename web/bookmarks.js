@@ -26,6 +26,18 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
+  function _isTrackedChannel(channel) {
+    const key = String(channel || "").trim().toLowerCase();
+    if (!key) return false;
+    const complete = Array.isArray(_browseState.channels)
+      ? _browseState.channels : [];
+    const pending = Array.isArray(_browseState.pendingChannels)
+      ? _browseState.pendingChannels : [];
+    return complete.concat(pending).some((item) =>
+      [item?.name, item?.folder].some((value) =>
+        String(value || "").trim().toLowerCase() === key));
+  }
+
   function _fmtBytes(bytes) {
     const n = Number(bytes || 0);
     if (!Number.isFinite(n) || n <= 0) return "";
@@ -55,19 +67,50 @@
     return `linear-gradient(135deg, hsl(${hue}, 55%, 28%) 0%, hsl(${hue2}, 60%, 18%) 100%)`;
   }
 
+  const _BOOKMARK_EMPTY_HTML =
+    '<div class="browse-empty">No bookmarks yet. Open a video in Watch and click Bookmark, or right-click a transcript segment.</div>';
+
+  function _beginBookmarksLoad(list) {
+    list.setAttribute("aria-busy", "true");
+    list.innerHTML = '<div class="browse-empty">Loading bookmarks&hellip;</div>';
+    const exportBtn = document.getElementById("btn-bookmarks-export");
+    if (exportBtn) exportBtn.disabled = true;
+  }
+
+  function _finishBookmarksLoad(list, succeeded) {
+    list.setAttribute("aria-busy", "false");
+    const exportBtn = document.getElementById("btn-bookmarks-export");
+    if (exportBtn) exportBtn.disabled = !succeeded;
+  }
+
+  function _rowsFromBookmarkResult(res) {
+    if (!Array.isArray(res) && res?.ok === false) {
+      throw new Error(res.error || "Bookmarks could not be loaded.");
+    }
+    return Array.isArray(res) ? res : (res?.rows || []);
+  }
+
+  function _showBookmarksLoadError(list, error) {
+    _finishBookmarksLoad(list, false);
+    list.innerHTML = '<div class="browse-empty">Couldn\'t load bookmarks. Try again.</div>';
+    console.warn("bookmarks:", error);
+  }
+
   // ─── Browse > Bookmarks sub-mode ─────────────────────────────────────
   async function refreshBookmarks() {
     const list = document.getElementById("bookmarks-list");
     if (!list) return;
     if (!nativeBridgeUp()) return;
+    _beginBookmarksLoad(list);
     try {
       // bookmark_list() now returns {ok: bool, rows: [...]} to match
       // the other bookmark_* methods' shape. Back-compat: if an older
       // build returns the raw array, fall back gracefully.
       const res = await bridgeCall("bookmark_list");
-      const rows = Array.isArray(res) ? res : (res?.rows || []);
+      const rows = _rowsFromBookmarkResult(res);
+      _finishBookmarksLoad(list, true);
       if (!rows || rows.length === 0) {
-        list.innerHTML = '<div class="browse-empty">No bookmarks yet. Right-click a transcript segment in Watch view to add one.</div>';
+        list.innerHTML = _BOOKMARK_EMPTY_HTML;
         return;
       }
       const frag = document.createDocumentFragment();
@@ -143,7 +186,7 @@
           // Resolve the actual video file via the title+channel index.
           // Tries (video_id → title → fuzzy) and opens Watch view.
           if (!nativeBridgeUp()) {
-            window._showToast?.("Native mode required.", "warn");
+            window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
             return;
           }
           try {
@@ -154,6 +197,8 @@
                 title: title,
                 channel: b.channel || "",
                 video_id: vid || r.video_id || "",
+                tracked: r.tracked !== undefined
+                  ? !!r.tracked : _isTrackedChannel(b.channel),
                 _seek_to: start, // Watch view uses this for initial seek
               };
               if (typeof window._openVideoInWatch === "function") {
@@ -191,17 +236,19 @@
       }
       list.innerHTML = "";
       list.appendChild(frag);
-    } catch (e) { console.warn("bookmarks:", e); }
+    } catch (e) { _showBookmarksLoadError(list, e); }
   }
 
   async function refreshBookmarksGrid() {
     const list = document.getElementById("bookmarks-list");
     if (!list || !nativeBridgeUp()) return;
+    _beginBookmarksLoad(list);
     try {
       const res = await bridgeCall("bookmark_list");
-      const rows = Array.isArray(res) ? res : (res?.rows || []);
+      const rows = _rowsFromBookmarkResult(res);
+      _finishBookmarksLoad(list, true);
       if (!rows || rows.length === 0) {
-        list.innerHTML = '<div class="browse-empty">No bookmarks yet. Right-click a transcript segment in Watch view to add one.</div>';
+        list.innerHTML = _BOOKMARK_EMPTY_HTML;
         return;
       }
       const frag = document.createDocumentFragment();
@@ -309,7 +356,7 @@
         noteBtn.addEventListener("click", async (e) => {
           e.stopPropagation();
           if (!nativeBridgeUp()) {
-            window._showToast?.("Native mode required.", "warn");
+            window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
             return;
           }
           const entered = await (askTextInput
@@ -377,6 +424,7 @@
             duration: b.duration || "",
             thumbnail_url: b.thumbnail_url || "",
             _seek_to: start,
+            tracked: _isTrackedChannel(channel),
           };
           try {
             if (openObj.filepath && typeof window._openVideoInWatch === "function") {
@@ -391,6 +439,8 @@
                 channel,
                 video_id: openObj.video_id || r.video_id || "",
                 _seek_to: start,
+                tracked: r.tracked !== undefined
+                  ? !!r.tracked : _isTrackedChannel(channel),
               });
               return;
             }
@@ -413,32 +463,229 @@
       list.innerHTML = "";
       list.appendChild(frag);
     } catch (e) {
-      console.warn("bookmarks:", e);
+      _showBookmarksLoadError(list, e);
     }
   }
 
-  // Called from seedLogs once channel data arrives.
-  // `channels` comes from get_subs_channels (no avatar/banner URLs). To get
-  // the real channel-art paths for the grid we hit browse_list_channels
-  // which enriches with .ChannelArt/* URLs. Fall back to the plain list if
-  // the richer call isn't available.
+  let _channelPrimeGeneration = 0;
+
+  function _finishChannelCatalogPaint() {
+    const grid = document.getElementById("channel-grid");
+    if (!grid) return;
+    _browseState.channelsRefreshState = "idle";
+    document.getElementById("channel-catalog-status")?.remove();
+    grid.classList.remove("is-refreshing");
+    grid.setAttribute("aria-busy", "false");
+  }
+
+  function _paintChannelCatalogStatus(status) {
+    const grid = document.getElementById("channel-grid");
+    if (!grid) return;
+    const hasCompleteRows = _browseState.channelsReady === true;
+
+    // On first load there is nothing honest to show yet. Keep one compact
+    // loader in place and avoid exposing catalog-lane implementation details
+    // such as which hidden screen currently owns the reader.
+    if (!hasCompleteRows) {
+      if (status.phase === "done") return;
+      const message = status.phase === "slow"
+        ? "Still loading channels…"
+        : "Loading channels…";
+      window.renderChannelGridLoading?.(message, {
+        announce: status.announce !== false,
+      });
+      return;
+    }
+
+    let note = document.getElementById("channel-catalog-status");
+    if (status.phase === "done") {
+      note?.remove();
+      grid.classList.remove("is-refreshing");
+      grid.setAttribute("aria-busy", "false");
+      return;
+    }
+    if (!note) {
+      note = document.createElement("div");
+      note.id = "channel-catalog-status";
+      note.className = "catalog-read-status";
+      note.setAttribute("role", "status");
+      note.setAttribute("aria-live", "polite");
+      grid.prepend(note);
+    }
+    note.setAttribute("role", "status");
+    grid.classList.add("is-refreshing");
+    grid.setAttribute("aria-busy", "true");
+    note.setAttribute("aria-live", status.announce === false ? "off" : "polite");
+    const message = "Showing channels · updating details…";
+    if (note.textContent !== message) note.textContent = message;
+  }
+
+  function _paintChannelCatalogError(basic, error, { log = true } = {}) {
+    const grid = document.getElementById("channel-grid");
+    if (!grid) return;
+    _browseState.channelsRefreshState = "error";
+    _browseState.channelsError = true;
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "btn btn-ghost btn-thin";
+    retry.textContent = "Retry";
+    retry.addEventListener("click", () => window._primeBrowse(basic));
+
+    if (_browseState.channelsReady === true) {
+      let note = document.getElementById("channel-catalog-status");
+      if (!note) {
+        note = document.createElement("div");
+        note.id = "channel-catalog-status";
+        note.className = "catalog-read-status";
+        grid.prepend(note);
+      }
+      note.setAttribute("role", "alert");
+      note.setAttribute("aria-live", "polite");
+      const text = document.createElement("span");
+      text.textContent = "Couldn’t update channel details. ";
+      note.replaceChildren(text, retry);
+    } else {
+      _browseState.channels = [];
+      _browseState.channelsReady = false;
+      const failure = document.createElement("div");
+      failure.className = "grid-loading channel-grid-load-error";
+      failure.setAttribute("role", "alert");
+      const text = document.createElement("span");
+      text.className = "grid-loading-label";
+      text.textContent = "Couldn’t load channels.";
+      failure.append(text, retry);
+      grid.replaceChildren(failure);
+    }
+    grid.classList.remove("is-refreshing");
+    grid.setAttribute("aria-busy", "false");
+    if (log) console.warn("[channels] detail load failed", error);
+  }
+
+  // renderChannelGrid intentionally replaces all of its children. Restore
+  // the refresh/error row afterward so sorting or filtering cached cards
+  // cannot make an active read (or its Retry action) silently disappear.
+  window._restoreChannelCatalogOverlay = function () {
+    if (_browseState.channelsReady !== true) return;
+    if (_browseState.channelsRefreshState === "refreshing") {
+      _paintChannelCatalogStatus({
+        phase: "loading",
+        announce: false,
+      });
+    } else if (_browseState.channelsRefreshState === "error") {
+      _paintChannelCatalogError(
+        Array.isArray(_browseState.pendingChannels)
+          ? _browseState.pendingChannels : [],
+        null,
+        { log: false },
+      );
+    }
+  };
+
+  // Called after the cheap subscription list arrives. That first result is
+  // useful for internal identity lookups, but it is not complete enough for
+  // the channel cards (no art and potentially no catalog totals). Hold it
+  // behind a loader until browse_list_channels returns. Once a complete grid
+  // has rendered, keep those cached cards visible during later refreshes.
   window._primeBrowse = async function (channels) {
+    // Some legacy callers used a no-argument call merely as a repaint nudge.
+    // It is not proof that the user's library is empty and must never wipe a
+    // completed grid or supersede the real refresh already in flight.
+    if (!Array.isArray(channels)) return;
+    const generation = ++_channelPrimeGeneration;
     const basic = (channels || []).slice().sort((a, b) =>
       (a.folder || "").localeCompare(b.folder || "", undefined, { sensitivity: "base" })
     );
-    let enriched = basic;
-    if (nativeBridgeUp()) {
-      try {
-        const rich = await bridgeCall("browse_list_channels");
-        if (Array.isArray(rich) && rich.length) enriched = rich;
-      } catch { /* fall through to basic */ }
-    }
-    _browseState.channels = enriched;
-    window.renderChannelGrid(enriched, (c) => {
+    const openChannel = (c) => {
       _browseState.currentChannel = c;
       loadVideosFor(c);
       showView("videos");
-    });
+    };
+    _browseState.pendingChannels = basic;
+    _browseState.channelsError = false;
+
+    // An actually empty subscription list is a complete answer; do not make
+    // a new user wait on a second query before showing the onboarding card.
+    if (!basic.length) {
+      _browseState.channels = [];
+      _browseState.channelsReady = true;
+      _browseState.pendingChannels = [];
+      window.renderChannelGrid([], openChannel);
+      _finishChannelCatalogPaint();
+      _refreshBrowseWeekSummary();
+      return;
+    }
+
+    if (!nativeBridgeUp()) {
+      // Browser-only/offline fallback. Production always uses the native
+      // bridge, where partial rows stay hidden until rich details arrive.
+      _browseState.channels = basic;
+      _browseState.channelsReady = true;
+      _browseState.pendingChannels = [];
+      window.renderChannelGrid(basic, openChannel);
+      _finishChannelCatalogPaint();
+      _refreshBrowseWeekSummary();
+      return;
+    }
+
+    const hasCompleteRows = _browseState.channelsReady === true
+      && Array.isArray(_browseState.channels)
+      && _browseState.channels.length > 0;
+    _browseState.channelsRefreshState = hasCompleteRows
+      ? "refreshing" : "initial";
+    if (!hasCompleteRows) {
+      _browseState.channels = [];
+      _browseState.channelsReady = false;
+      window.renderChannelGridLoading?.();
+    }
+    const summaryRevisionAtStart = Number(
+      _browseState.channelSummaryRevision || 0);
+
+    try {
+      const outcome = await window.YT.bridge.catalogRead(
+        "channels",
+        () => bridgeCall("browse_list_channels"),
+        {
+          label: "channel details",
+          onStatus: (status) => {
+            if (generation === _channelPrimeGeneration) {
+              _paintChannelCatalogStatus(status);
+            }
+          },
+        });
+      if (generation !== _channelPrimeGeneration || outcome.stale) return;
+      const rich = outcome.value;
+      if (!Array.isArray(rich)) {
+        throw new Error("Channel details returned an invalid response.");
+      }
+      if (!rich.length) {
+        throw new Error("Channel details were empty for a non-empty library.");
+      }
+      const summaryOverrides = _browseState.channelSummaryOverrides instanceof Map
+        ? _browseState.channelSummaryOverrides : new Map();
+      const hydrated = rich.map((row) => {
+        const key = String(row?.folder || row?.name || "")
+          .trim().toLowerCase();
+        const override = summaryOverrides.get(key);
+        return override?.revision > summaryRevisionAtStart
+          ? { ...row, ...override.changes }
+          : row;
+      });
+      _browseState.channelSummaryOverrides = new Map();
+      _browseState.channels = hydrated;
+      _browseState.channelsReady = true;
+      _browseState.channelsError = false;
+      _browseState.pendingChannels = [];
+      _browseState.channelsRefreshState = "idle";
+      if (typeof window._renderChannelsForCurrentControls === "function") {
+        window._renderChannelsForCurrentControls();
+      } else {
+        window.renderChannelGrid(hydrated, openChannel);
+      }
+      _finishChannelCatalogPaint();
+    } catch (error) {
+      if (generation !== _channelPrimeGeneration) return;
+      _paintChannelCatalogError(basic, error);
+    }
     // Populate "New this week" summary bar (async, best-effort).
     _refreshBrowseWeekSummary();
   };
@@ -470,7 +717,7 @@
 
   async function _askRedownload(channelName, resolution) {
     if (!nativeBridgeUp()) {
-      window._showToast?.("Native mode required.", "warn");
+      window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
       return;
     }
     const label = resolution === "best" ? "Best available" : `${resolution}p`;

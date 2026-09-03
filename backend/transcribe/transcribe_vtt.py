@@ -27,12 +27,20 @@ import re
 import shutil
 import subprocess
 import time
+from enum import StrEnum
+from pathlib import Path
 
 from .. import youtube_traffic
 from ..log import get_logger
 from ..log_stream import LogStreamer
 from ..process_runner import run_ytdlp
+from ..services.sidecar_store import (
+    SidecarError,
+    begin_reconciliation,
+    reconciliation_marker_path,
+)
 from ..subprocess_util import make_startupinfo as _make_startupinfo
+from ..ytarchiver_config import APP_DATA_DIR
 from .paths import (
     _generate_distributed_words,
     _hide_per_video_transcript_txt_if_needed,
@@ -43,6 +51,24 @@ from .transcribe_files import (
 )
 
 _log = get_logger(__name__)
+
+
+class _CaptionOutcome(StrEnum):
+    """Detailed auto-caption result while preserving legacy truthiness.
+
+    ``_try_auto_captions`` historically returned a bool. Keeping SUCCESS
+    truthy and every other member falsey lets existing callers continue to use
+    ``if _try_auto_captions(...)`` while the queue worker can distinguish a
+    harmless miss from a persistence failure that must be recovered.
+    """
+
+    SUCCESS = "success"
+    UNAVAILABLE = "unavailable"
+    FAILED = "failed"
+    PARTIAL = "partial"
+
+    def __bool__(self) -> bool:
+        return self is _CaptionOutcome.SUCCESS
 
 # Hide the yt-dlp subprocess console window on Windows. Matches the
 # `_startupinfo` constant in transcribe/legacy.py — when this file was
@@ -272,7 +298,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
                         from_download: bool = False,
                         allow_fetch: bool = True,
                         prepunctuated_only: bool = False,
-                        update_pending: bool = True) -> bool:
+                        update_pending: bool = True) -> _CaptionOutcome:
     """If yt-dlp wrote a .en.vtt (or similar) next to the video, parse it
     into the aggregated channel Transcript.txt + hidden JSONL sidecar,
     then ingest into FTS — skip Whisper entirely.
@@ -301,9 +327,11 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     ``update_pending=False`` is used by the synchronous download path because
     no Processing job (and therefore no pending-count increment) was created.
 
-    Output matches YTArchiver.py:15449-15478 exactly. Returns True on
-    success; False if no usable auto-sub file exists or the caller requested
-    pre-punctuated captions and the text needs model processing."""
+    Output matches YTArchiver.py:15449-15478 exactly. The detailed return
+    value remains bool-compatible: SUCCESS is truthy; UNAVAILABLE, FAILED,
+    and PARTIAL are falsey. PARTIAL means at least one durable output may
+    already have changed and callers must use replacement semantics on retry.
+    """
     base = os.path.splitext(video_path)[0]
     candidates = [
         f"{base}.en.vtt", f"{base}.en-US.vtt", f"{base}.en-GB.vtt",
@@ -323,7 +351,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
             candidates.append(vtt)
 
     if not vtt:
-        return False
+        return _CaptionOutcome.UNAVAILABLE
 
     t0 = time.time()
     try:
@@ -356,7 +384,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
                     time.sleep(0.1)
             if not _removed:
                 _log.debug("temp .vtt cleanup failed (will retry next pass): %s", _p)
-        return False
+        return _CaptionOutcome.FAILED
     if not segs:
         # Clean ONLY the .vtt files we just fetched into the temp
         # location. Sweeping `candidates` would delete pre-existing
@@ -370,12 +398,12 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
                     break
                 except OSError:
                     time.sleep(0.1)
-        return False
+        return _CaptionOutcome.UNAVAILABLE
 
     # Resolve aggregated transcript paths for this channel (matches OLD layout).
     paths = _resolve_transcript_paths(video_path, title, channel)
     if paths is None:
-        return False
+        return _CaptionOutcome.FAILED
     txt_path, jsonl_path, _year, _month, upload_date = paths
     try:
         os.makedirs(os.path.dirname(txt_path), exist_ok=True)
@@ -396,7 +424,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     # YT auto-captions arrive as a run-on stream of lowercase words;
     # running them through the punct model restores casing + commas
     # + periods so the .txt reads like a real transcript. Source tag
-    # flips to `YT+PUNCTUATION` so ArchivePlayer / Watch banner can
+    # flips to `YT+PUNCTUATION` so companion / Watch banners can
     # detect the upgraded quality. Silently falls back to raw captions
     # if the punct model isn't available or the call fails.
     # Skip the pass entirely when the source VTT already arrived with
@@ -441,7 +469,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
             if os.path.isfile(_p):
                 try: os.remove(_p)
                 except OSError: pass
-        return False
+        return _CaptionOutcome.UNAVAILABLE
     if punct_mgr is not None and full_text and not _already_punct:
         try:
             # `job_tag` (e.g. `whisper_job_7`) makes this line
@@ -474,22 +502,66 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
         except Exception as _pe:
             stream.emit_dim(f" (punctuation skipped: {_pe})")
 
+    marker_path = reconciliation_marker_path(
+        Path(APP_DATA_DIR) / "reconciliation",
+        operation="auto-caption",
+        key=f"{os.path.normcase(os.path.abspath(video_path))}|{vid_id}",
+    )
+    txt_store = f"txt:{os.path.normcase(os.path.abspath(txt_path))}"
+    jsonl_store = f"jsonl:{os.path.normcase(os.path.abspath(jsonl_path))}"
+    index_store = f"index:{os.path.normcase(os.path.abspath(video_path))}"
+    try:
+        marker = begin_reconciliation(
+            marker_path,
+            operation="auto-caption TXT/JSONL/index commit",
+            stores=(txt_store, jsonl_store, index_store),
+            details={"video_id": vid_id, "video_path": video_path},
+        )
+    except SidecarError as exc:
+        try:
+            stream.emit_error(
+                f"Could not create transcript recovery marker: {exc}")
+        except Exception as emit_exc:
+            _log.debug("caption marker error emit failed: %s", emit_exc)
+        return _CaptionOutcome.FAILED
+
+    def _record_partial(error: object) -> None:
+        try:
+            marker.record_failure(error)
+        except SidecarError as marker_exc:
+            _log.error("Could not update transcript recovery marker %s: %s",
+                       marker.path, marker_exc)
+
     if not _write_transcript_entry(txt_path, title, upload_date, duration,
                                    src_tag, full_text, video_id=vid_id):
+        _record_partial(f"TXT write failed: {txt_path}")
         try:
             stream.emit_error(f"Could not write transcript to {txt_path}")
         except Exception as e:
             _log.debug("swallowed: %s", e)
-        return False
+        return _CaptionOutcome.FAILED
+    try:
+        marker.mark_committed(txt_store)
+    except SidecarError as exc:
+        _record_partial(exc)
+        return _CaptionOutcome.PARTIAL
     _hide_per_video_transcript_txt_if_needed(video_path, txt_path)
     if not _write_jsonl_entry(jsonl_path, vid_id, title, segs):
+        _record_partial(f"JSONL write failed: {jsonl_path}")
         try:
             stream.emit_error(
                 f"Could not write transcript JSONL to {jsonl_path} "
                 f"— not marking {os.path.basename(video_path)} transcribed")
         except Exception as e:
             _log.debug("swallowed: %s", e)
-        return False
+        # TXT is already durable. This is not the ordinary "captions were
+        # unavailable" miss: retain the job and retry through replacement.
+        return _CaptionOutcome.PARTIAL
+    try:
+        marker.mark_committed(jsonl_store)
+    except SidecarError as exc:
+        _record_partial(exc)
+        return _CaptionOutcome.PARTIAL
 
     # Clean up only .vtt sidecars fetched by this function. Pre-existing
     # user-supplied caption sidecars must survive a successful parse.
@@ -498,13 +570,34 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
             try: os.remove(_p)
             except OSError: pass
 
-    # FTS ingest — use the new aggregated .jsonl path
+    # FTS ingest — use the new aggregated .jsonl path. A committed sidecar
+    # with a failed index update is a recoverable partial result, never green
+    # success. ``ingest_jsonl`` owns the transaction that inserts segments and
+    # marks matching video rows; a second independent mark here could report
+    # false after that transaction committed and strand a completed job.
     try:
         from .. import index as _idx
-        _idx.ingest_jsonl(video_path, jsonl_path, title, channel)
-        _idx.mark_video_transcribed(video_path)
+        if not _idx.ingest_jsonl(video_path, jsonl_path, title, channel):
+            raise RuntimeError("index ingest returned no transcript segments")
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        _record_partial(e)
+        _log.warning("auto-caption index finalization failed for %s: %s",
+                     os.path.basename(video_path), e)
+        try:
+            stream.emit_error(
+                f"Auto-captions were written but indexing failed for "
+                f"{os.path.basename(video_path)}: {e}. Task kept for retry.")
+        except Exception as emit_exc:
+            _log.debug("caption index failure emit failed: %s", emit_exc)
+        return _CaptionOutcome.PARTIAL
+    try:
+        marker.mark_committed(index_store)
+        marker.finish()
+    except SidecarError as exc:
+        _record_partial(exc)
+        _log.error("Auto-caption stores committed but marker update failed: %s",
+                   exc)
+        return _CaptionOutcome.PARTIAL
     # Decrement transcription_pending / set transcription_complete on 0 only
     # when this ingest belongs to a queued Processing job. The synchronous
     # sync path never increments the counter in the first place.
@@ -564,7 +657,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
         txt_tags=_txt_tag,
         detail_tags=_detail_tag,
     ))
-    return True
+    return _CaptionOutcome.SUCCESS
 
 
 def _ts_to_sec(ts: str) -> float:

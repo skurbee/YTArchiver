@@ -113,7 +113,10 @@
       }
     };
     const observer = new MutationObserver(sync);
-    observer.observe(modal, { attributes: true, attributeFilter: ["hidden"] });
+    observer.observe(modal, {
+      attributes: true,
+      attributeFilter: ["hidden", "style", "class", "aria-hidden"],
+    });
     sync();
     return () => {
       observer.disconnect();
@@ -140,6 +143,7 @@
       outsideClickValue: null,
       onMount: null,          // (root, resolve) => void
       onCleanup: null,        // () => void
+      initialFocus: null,     // selector inside the backdrop
     }, opts || {});
 
     return new Promise((resolve) => {
@@ -155,7 +159,9 @@
       }
 
       document.body.appendChild(backdrop);
-      const releaseFocusTrap = activateFocusTrap(backdrop);
+      const releaseFocusTrap = activateFocusTrap(backdrop, {
+        initialFocus: cfg.initialFocus,
+      });
 
       let _resolved = false;
       function resolveOuter(val) {
@@ -192,6 +198,12 @@
     });
   }
 
+  function questionEnterDecision(danger, focusedAction) {
+    if (focusedAction === "cancel") return "cancel";
+    if (focusedAction === "confirm") return "confirm";
+    return danger ? "ignore" : "confirm";
+  }
+
   // ── askQuestion: title + body text + OK [+ Cancel] ───────────────
   function askQuestion(opts) {
     const cfg = Object.assign({
@@ -217,9 +229,45 @@
       `,
       escapeValue: false,
       outsideClickValue: false,
+      initialFocus: cfg.danger
+        ? (cfg.noCancel ? ".askq-dialog" : '[data-act="cancel"]')
+        : '[data-act="confirm"]',
       onKey: (e, resolveOuter) => {
-        if (e.key === "Enter") { resolveOuter(true); return true; }
-        return false;
+        if (e.key !== "Enter") return false;
+
+        // Respect the button the user actually selected.  In particular,
+        // danger dialogs focus Cancel by default; the old unconditional
+        // `true` here ran before the focused button's native click and turned
+        // that visibly-safe default into approval.
+        const focused = document.activeElement;
+        const focusedAction = focused?.closest?.("[data-act]")?.dataset?.act;
+        const decision = questionEnterDecision(cfg.danger, focusedAction);
+        if (decision === "cancel") {
+          e.preventDefault();
+          e.stopImmediatePropagation?.();
+          resolveOuter(false);
+          return true;
+        }
+        if (decision === "confirm") {
+          e.preventDefault();
+          e.stopImmediatePropagation?.();
+          resolveOuter(true);
+          return true;
+        }
+
+        // A destructive action is never the implicit Enter default.  A
+        // danger dialog without a Cancel button starts on the dialog itself;
+        // the user must deliberately Tab/click to the affirmative button.
+        if (cfg.danger) {
+          e.preventDefault();
+          e.stopImmediatePropagation?.();
+          return true;
+        }
+
+        e.preventDefault();
+        e.stopImmediatePropagation?.();
+        resolveOuter(true);
+        return true;
       },
       onMount: (root, resolveOuter) => {
         root.querySelector(".askq-header").textContent = cfg.title;
@@ -233,24 +281,6 @@
           "click", () => resolveOuter(true));
         if (cancelBtn) cancelBtn.addEventListener(
           "click", () => resolveOuter(false));
-        // Focus the safe button by default (Cancel for danger, Confirm
-        // otherwise). Audit U-10: accidental Enter on a danger dialog
-        // shouldn't auto-confirm.
-        // BUT: if danger+noCancel (no cancel button rendered), the
-        // fallback to focusing the confirm button defeats the safety
-        // entirely — an Enter press auto-confirms the destructive
-        // action. In that case focus the dialog root instead, so
-        // Enter doesn't immediately commit (audit: modals.js H230).
-        let focusTarget;
-        if (cfg.danger && !cancelBtn) {
-          focusTarget = root;
-          try { root.setAttribute("tabindex", "-1"); } catch {}
-        } else if (cfg.danger && cancelBtn) {
-          focusTarget = cancelBtn;
-        } else {
-          focusTarget = root.querySelector('[data-act="confirm"]');
-        }
-        setTimeout(() => focusTarget?.focus(), 30);
       },
     });
   }
@@ -322,13 +352,29 @@
       escapeValue: null,
       outsideClickValue: null,
       onKey: (e, resolveOuter) => {
-        if (e.key === "Enter" && primary) {
-          e.preventDefault();
-          clearCountdown();
+        if (e.key !== "Enter") return false;
+
+        // Enter follows the control the user actually focused.  This matters
+        // when keyboard navigation moves from the primary choice to another
+        // choice or to Cancel: the visible focus must win over the default.
+        const focused = document.activeElement;
+        const focusedChoice = focused?.closest?.("[data-value]");
+        const focusedCancel = focused?.closest?.('[data-act="cancel"]');
+        if (!focusedChoice && !focusedCancel && !primary) return false;
+
+        e.preventDefault();
+        e.stopImmediatePropagation?.();
+        clearCountdown();
+        if (focusedChoice) {
+          resolveOuter(focusedChoice.dataset.value);
+        } else if (focusedCancel) {
+          resolveOuter(null);
+        } else {
+          // Preserve the documented Enter shortcut when focus is on the
+          // dialog itself or another non-action element.
           resolveOuter(primary.value);
-          return true;
         }
-        return false;
+        return true;
       },
       onCleanup: clearCountdown,
       onMount: (root, resolveOuter) => {
@@ -440,8 +486,17 @@
 
   function isVisible(el) {
     if (!el || !el.isConnected) return false;
-    const st = window.getComputedStyle ? window.getComputedStyle(el) : null;
-    return st ? st.display !== "none" : el.style.display !== "none";
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+      if (node.hidden || node.getAttribute?.("aria-hidden") === "true") {
+        return false;
+      }
+      const st = window.getComputedStyle ? window.getComputedStyle(node) : null;
+      if (st && (st.display === "none" || st.visibility === "hidden")) {
+        return false;
+      }
+      if (!st && node.style?.display === "none") return false;
+    }
+    return true;
   }
 
   function topVisibleEscapeEntry() {
@@ -454,11 +509,11 @@
 
   function onSharedEscapeClose(e) {
     if (e.key !== "Escape") return;
-    const askOpen = Array.from(document.querySelectorAll(".askq-backdrop"))
-      .some(isVisible);
-    if (askOpen) return;
     const entry = topVisibleEscapeEntry();
     if (!entry) return;
+    const askOpen = Array.from(document.querySelectorAll(".askq-backdrop"))
+      .some((backdrop) => backdrop !== entry.backdrop && isVisible(backdrop));
+    if (askOpen) return;
     e.preventDefault();
     entry.close();
   }
@@ -487,13 +542,30 @@
     activateFocusTrap,
     bindStaticModal,
     registerEscapeClose,
+    isVisible,
+    _questionEnterDecision: questionEnterDecision,
   };
 
   document.addEventListener("DOMContentLoaded", () => {
-    bindStaticModal(document.getElementById("welcome-modal"), {
+    // Reusable dialogs live in the page from startup. Give them the same
+    // focus containment and focus restoration as generated confirmations.
+    const staticDialogs = [
+      ["about-backdrop", "#about-close"],
+      ["compress-dry-backdrop", "#compress-dry-res"],
+      ["drift-backdrop", "#drift-channel"],
+      ["repair-yt-backdrop", "#repair-yt-channel"],
+      ["punct-restore-backdrop", "#punct-restore-channel"],
+      ["provenance-backdrop", "#provenance-channel"],
+      ["diag-backdrop", "#diag-refresh"],
+      ["manual-tx-backdrop", "#manual-tx-browse"],
+      ["autorun-history-backdrop", "#autorun-history-filter"],
+      ["channel-editor-backdrop", "#channel-editor-close"],
+    ];
+    staticDialogs.forEach(([id, initialFocus]) => {
+      bindStaticModal(document.getElementById(id), { initialFocus });
+    });
+    bindStaticModal(document.getElementById("redwnl-sample-modal"), {
       dialogSelector: ".yt-modal",
-      initialFocus: "#welcome-browse",
-      restoreFocus: false,
     });
   });
 

@@ -97,7 +97,7 @@
       if (t === "views_refresh_progress") return t;
       // Comments refresh sticky [N/total] progress line — replaces
       // in-place per video so the user sees progress on long
-      // channels (e.g. David Pakman = 2086 videos). Cleared via
+      // channels. Cleared via
       // clear_line when the channel finishes or pauses.
       if (t === "comments_refresh_active") return t;
     }
@@ -219,6 +219,9 @@
         }, 45000);
       }
     }
+    window.YT?.eventState?.publish("indicator", {
+      slot: String(slot || ""), text: text || "",
+    });
   };
   function tagClasses(tag) {
     if (!tag) return "";
@@ -830,11 +833,11 @@
             continue;
           }
           const line = buildLine(segs);
-          // Surface whisper_pct percentage onto the watch-view
-          // Re-transcribe button — but only for the video this line
+          // Surface Whisper progress onto the watch-view Re-transcribe
+          // control — but only for the video this line
           // belongs to. The `tx_done_<vid>` marker tag rides every
-          // transcribe progress emit (transcribe/legacy.py
-          // _emit_progress), so we read the video_id out of it and let
+          // transcribe progress/finalizing emit, so we read the video_id
+          // out of it and let
           // the update function decide whether THAT video is on screen.
           // Without the video_id gate, Video A's progress used to paint
           // Video B's button when the user navigated away mid-transcribe.
@@ -843,6 +846,7 @@
                 && window._inflightRetranscribes.size > 0) {
               let _lineVid = "";
               let _pctStr = "";
+              let _phase = "";
               for (const _sg of segs) {
                 if (!Array.isArray(_sg) || _sg.length < 2) continue;
                 const _tag = _sg[1];
@@ -859,8 +863,14 @@
                   const _m = String(_sg[0] || "").match(/(\d+)\s*%/);
                   if (_m) _pctStr = _m[1];
                 }
+                if (!_phase && tags.includes("whisper_finalizing")) {
+                  _phase = "finalizing";
+                }
               }
-              if (_lineVid && _pctStr
+              if (_lineVid && _phase === "finalizing"
+                  && window._retranscribeWatchMarkFinalizing) {
+                window._retranscribeWatchMarkFinalizing(_lineVid);
+              } else if (_lineVid && _pctStr
                   && window._retranscribeWatchUpdateProgress) {
                 window._retranscribeWatchUpdateProgress(_pctStr, _lineVid);
               }

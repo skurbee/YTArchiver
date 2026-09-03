@@ -100,7 +100,7 @@ YTArchiver/
 │   ├── utils.py            # Misc helpers (legacy grab-bag)
 │   ├── log.py              # Logging bridge to LogStreamer
 │   ├── log_stream.py       # Batched log emit to JS
-│   ├── cmd_server.py       # HTTP cmd server (ArchivePlayer integration)
+│   ├── cmd_server.py       # Loopback HTTP API for companion viewers
 │   ├── local_fileserver.py # Local fileserver for video playback
 │   ├── tray.py             # System tray
 │   ├── autorun.py          # Scheduled sync runner

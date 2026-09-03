@@ -23,6 +23,7 @@ import os
 import secrets
 import socket
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -47,6 +48,7 @@ _lock = threading.Lock()
 _allowed_roots: list[str] = []
 _allowed_files: set[str] = set()
 _request_token: str = ""
+_file_revisions: dict[str, int] = {}
 
 
 def _normalize_root(p: str) -> str:
@@ -88,6 +90,17 @@ def allow_file(path: str) -> None:
     p = _normalize_file(path or "")
     if p:
         _allowed_files.add(p)
+
+
+def mark_file_changed(path: str) -> None:
+    """Give future URLs for ``path`` a new cache identity.
+
+    Thumbnail refreshes can atomically replace a file without changing its
+    name. WebView2 otherwise reuses the old bitmap for up to a day.
+    """
+    p = _normalize_file(path or "")
+    if p:
+        _file_revisions[p] = time.time_ns()
 
 
 def _is_under_allowed_root(path: str) -> bool:
@@ -382,4 +395,8 @@ def url_for(path: str) -> str:
     norm = os.path.abspath(path).replace("\\", "/")
     encoded = urllib.parse.quote(norm, safe="")
     token = urllib.parse.quote(_request_token, safe="")
-    return f"http://127.0.0.1:{_server_port}/file/{encoded}?t={token}"
+    revision = _file_revisions.get(_normalize_file(path))
+    suffix = f"&v={revision}" if revision else ""
+    return (
+        f"http://127.0.0.1:{_server_port}/file/{encoded}?t={token}{suffix}"
+    )

@@ -25,7 +25,7 @@
   function initScanArchive() {
     document.getElementById("btn-scan-archive")?.addEventListener("click", async () => {
       if (!nativeBridgeUp()) {
-        window._showToast?.("Native mode required.", "warn");
+        window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
         return;
       }
       // Confirm first \u2014 this is a heavy, DB-mutating pass (it prunes index
@@ -34,10 +34,9 @@
       const ok = await (askConfirm
         ? askConfirm(
             "Rescan archive?",
-            "Walks every channel folder for files added or removed outside " +
-            "the app and prunes index entries for videos no longer on disk. " +
-            "Safe, but it rewrites index state \u2014 continue?",
-            "Rescan")
+            "This rescans your archive and updates YTArchiver's library to " +
+            "match the files on disk. It may take a while. Continue?",
+            { confirm: "Rescan" })
         : Promise.resolve(true));
       if (!ok) return;
       try {

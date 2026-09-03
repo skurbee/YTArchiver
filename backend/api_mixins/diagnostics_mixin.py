@@ -12,6 +12,7 @@ import os
 import threading
 
 from backend.archive_capacity import archive_capacity_status
+from backend.services.managed_work import start_managed_task
 from backend.version import APP_VERSION
 from backend.ytarchiver_config import CONFIG_FILE, load_config
 
@@ -82,10 +83,19 @@ class DiagnosticsMixin:
         try:
             mgr = getattr(self, "_transcribe", None)
             py311 = getattr(mgr, "_python311", None) if mgr else None
-            rows.append({"name": "Python 3.11 (whisper)", "ok": bool(py311),
-                         "detail": py311 or "Install Python 3.11 + faster-whisper"})
+            rows.append({
+                "name": "AI transcription tools",
+                # Transcription is optional. Keep it visible without making
+                # the startup summary claim downloads are broken.
+                "ok": True,
+                "status": "ok" if py311 else "warning",
+                "detail": py311 or (
+                    "Run setup again from Settings > App behavior"),
+            })
         except Exception:
-            rows.append({"name": "Python 3.11 (whisper)", "ok": False, "detail": "unknown"})
+            rows.append({"name": "AI transcription tools", "ok": True,
+                         "status": "warning",
+                         "detail": "Status unavailable"})
         # Log a one-line summary for the startup log
         missing = [r for r in rows if not r["ok"]]
         if missing:
@@ -117,9 +127,12 @@ class DiagnosticsMixin:
                 # Best-effort toast (pywebview window may not be live yet
                 # at first launch — fire after a short delay).
                 try:
-                    import threading as _th
+                    _toast_cancel = threading.Event()
+
                     def _delayed_toast():
                         try:
+                            if _toast_cancel.wait(3.0):
+                                return
                             if self._window is None:
                                 return
                             msg = (f"Missing: {names}. "
@@ -132,7 +145,15 @@ class DiagnosticsMixin:
                                 msg, "error", ttl_ms=12000)
                         except Exception:
                             pass
-                    _th.Timer(3.0, _delayed_toast).start()
+                    start_managed_task(
+                        self,
+                        owner="ui-notice",
+                        label="Missing dependency notice",
+                        target=_delayed_toast,
+                        cancel=_toast_cancel,
+                        name="missing-dependency-notice",
+                        thread_factory=threading.Thread,
+                    )
                 except Exception:
                     pass
         return {"ok": True, "rows": rows, "missing": len(missing)}
@@ -148,7 +169,8 @@ class DiagnosticsMixin:
         cfg = self._diagnostics_config()
         base = (cfg.get("output_dir") or "").strip()
         if not base:
-            return {"ok": False, "error": "output_dir not set", "missing": []}
+            return {"ok": False,
+                    "error": "No archive folder is configured.", "missing": []}
         from backend.sync import channel_folder_name as _cfn
         missing = []
         for ch in cfg.get("channels", []):
@@ -188,8 +210,12 @@ class DiagnosticsMixin:
             except Exception:
                 return (0,)
 
+        cancel_event = threading.Event()
+
         def _run():
             try:
+                if cancel_event.is_set():
+                    return
                 import json as _json
                 import urllib.request as _ur
                 req = _ur.Request(
@@ -202,6 +228,8 @@ class DiagnosticsMixin:
                     # diagnostics_mixin.py:155-191). 1MB is plenty
                     # for a GitHub release-metadata JSON.
                     data = _json.loads(resp.read(1_000_000))
+                if cancel_event.is_set():
+                    return
                 latest = (data.get("tag_name") or "").strip()
                 rel_url = data.get("html_url") or \
                     "https://github.com/skurbee/YTArchiver/releases/latest"
@@ -228,8 +256,19 @@ class DiagnosticsMixin:
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
 
-        threading.Thread(target=_run, daemon=True).start()
-        return {"ok": True, "started": True}
+        try:
+            start_managed_task(
+                self,
+                owner="update-check",
+                label="Application update check",
+                target=_run,
+                cancel=cancel_event,
+                name="application-update-check",
+                thread_factory=threading.Thread,
+            )
+            return {"ok": True, "started": True}
+        except Exception as exc:
+            return {"ok": False, "started": False, "error": str(exc)}
 
 
     def diagnostics_run(self):
@@ -260,33 +299,51 @@ class DiagnosticsMixin:
         except Exception as e:
             _row("yt-dlp", False, str(e))
 
-        # 2. Python 3.11 (for whisper + punct workers)
+        # 2. ffmpeg + ffprobe.  These are core media tools, not implied by
+        # the yt-dlp check above, so report them independently.
+        try:
+            from backend.deps_installer import probe as probe_dependencies
+
+            media_tools = probe_dependencies()
+            for key, label in (("ffmpeg", "ffmpeg"),
+                               ("ffprobe", "ffprobe")):
+                tool = media_tools.get(key) or {}
+                _row(
+                    label,
+                    bool(tool.get("ok")),
+                    "Ready" if tool.get("ok") else "Not installed",
+                )
+        except Exception as e:
+            _row("ffmpeg", False, str(e))
+            _row("ffprobe", False, str(e))
+
+        # 3. Python 3.11 (for whisper + punct workers)
         try:
             mgr = getattr(self, "_transcribe", None)
             py311 = getattr(mgr, "_python311", None) if mgr else None
             if py311 and os.path.isfile(py311):
-                _row("Python 3.11 (whisper)", True, py311)
+                _row("AI transcription tools", True, "Ready")
             else:
-                _row("Python 3.11 (whisper)", False,
-                     "Not found — whisper + punctuation won't run")
+                _row("AI transcription tools", True,
+                     "Not installed; video downloads still work", "warning")
         except Exception as e:
-            _row("Python 3.11 (whisper)", False, str(e))
+            _row("AI transcription tools", True,
+                 f"Could not check; video downloads still work ({e})", "warning")
 
-        # 3. FTS transcription DB
+        # 4. FTS transcription DB
         try:
             from backend.ytarchiver_config import TRANSCRIPTION_DB
             if TRANSCRIPTION_DB.exists():
                 sz = TRANSCRIPTION_DB.stat().st_size
                 gb = sz / (1024 ** 3)
-                _row("Transcript DB", True,
-                     f"{TRANSCRIPTION_DB} ({gb:.2f} GB)")
+                _row("Transcript search", True, f"Ready ({gb:.2f} GB)")
             else:
-                _row("Transcript DB", True,
-                     f"{TRANSCRIPTION_DB} (will be created on first use)")
+                _row("Transcript search", True,
+                     "Will be created when first needed")
         except Exception as e:
-            _row("Transcript DB", False, str(e))
+            _row("Transcript search", False, str(e))
 
-        # 4. GPU (nvidia-smi probe). Bound the JS-bridge freeze window:
+        # 5. GPU (nvidia-smi probe). Bound the JS-bridge freeze window:
         # 5s was long enough for a driver-glitch hang to make the
         # Diagnostics dialog feel frozen (audit: diagnostics_mixin.py:
         # 243-255). nvidia-smi returns in <100ms on a healthy install,
@@ -304,13 +361,19 @@ class DiagnosticsMixin:
             if r.returncode == 0 and r.stdout.strip():
                 _row("GPU", True, r.stdout.strip().splitlines()[0])
             else:
-                _row("GPU", False, "nvidia-smi not available (CPU whisper only)")
+                _row("GPU", True,
+                     "GPU acceleration is unavailable; transcription will use the CPU",
+                     "warning")
         except subprocess.TimeoutExpired:
-            _row("GPU", False, "nvidia-smi probe timed out (>2s)")
+            _row("GPU", True,
+                 "The GPU check took too long; transcription will use the CPU",
+                 "warning")
         except Exception as e:
-            _row("GPU", False, f"nvidia-smi not runnable: {e}")
+            _row("GPU", True,
+                 f"GPU acceleration is unavailable; transcription will use the CPU ({e})",
+                 "warning")
 
-        # 5. Archive root + free space
+        # 6. Archive root + free space
         try:
             base = (cfg.get("output_dir") or "").strip()
             status = archive_capacity_status(base, cfg)
@@ -319,25 +382,26 @@ class DiagnosticsMixin:
         except Exception as e:
             _row("Archive root", False, str(e))
 
-        # 6. Config file
+        # 7. Config file
         try:
             if CONFIG_FILE.exists():
-                _row("Config file", True, str(CONFIG_FILE))
+                _row("Settings file", True, "Ready")
             else:
-                _row("Config file", False, "Not found")
+                _row("Settings file", False, "Not found")
         except Exception as e:
-            _row("Config file", False, str(e))
+            _row("Settings file", False, str(e))
 
-        # 7. Write-gate state
+        # 8. Write-gate state
         try:
             from backend.ytarchiver_config import config_is_writable
             writable = config_is_writable()
-            _row("Write-gate", writable,
-                 "Enabled" if writable else "OFF")
+            _row("Settings access", writable,
+                 "Ready" if writable else "Read-only")
         except Exception as e:
-            _row("Write-gate", False, str(e))
+            _row("Settings access", False, str(e))
 
-        # 8. Cookies source
+        # 9. Cookies source.  Signing in is optional; public videos continue
+        # to work, so absence belongs in warnings rather than problems.
         try:
             from backend.sync import _find_cookie_source
             src = _find_cookie_source() or []
@@ -349,13 +413,69 @@ class DiagnosticsMixin:
                 # only useful for forensic debugging which a support
                 # request can ask for separately.
                 if src[0] == "--cookies-from-browser":
-                    _row("Cookies source", True, "browser cookies (profile masked)")
+                    _row("YouTube sign-in", True, "Browser cookies found")
                 else:
-                    _row("Cookies source", True, "cookies.txt file (path masked)")
+                    _row("YouTube sign-in", True, "Cookie file found")
             else:
-                _row("Cookies source", False,
-                     "No browser profile or cookies.txt found (public-only mode)")
+                _row("YouTube sign-in", True,
+                     "Not found; only public videos are available", "warning")
         except Exception as e:
-            _row("Cookies source", False, str(e))
+            _row("YouTube sign-in", True,
+                 f"Could not check; public videos are still available ({e})",
+                 "warning")
 
         return {"ok": True, "rows": rows}
+
+
+    def integrity_scan_preview(self):
+        """Run Patch 5's archive reconciliation audit without changing data.
+
+        Every path is resolved here from the application's active config and
+        passed explicitly to the scanner.  The scanner has no repair entry
+        point and opens SQLite through an immutable read-only connection.
+        """
+        cfg = self._diagnostics_config()
+        archive_path = str(cfg.get("output_dir") or "").strip()
+        if not archive_path:
+            return {
+                "ok": False,
+                "preview_only": True,
+                "repairs_applied": False,
+                "repair_available": False,
+                "error": "Choose an archive folder before running the integrity preview.",
+            }
+        try:
+            from backend.activity_history import ACTIVITY_HISTORY_FILE
+            from backend.integrity_scan import scan_integrity
+            from backend.ytarchiver_config import (
+                APP_DATA_DIR,
+                ARCHIVE_FILE,
+                QUEUE_FILE,
+                TRANSCRIPTION_DB,
+            )
+
+            result = scan_integrity(
+                archive_path=archive_path,
+                config_path=CONFIG_FILE,
+                db_path=TRANSCRIPTION_DB,
+                queue_path=QUEUE_FILE,
+                download_archive_path=ARCHIVE_FILE,
+                transcription_recovery_path=(
+                    APP_DATA_DIR / "ytarchiver_pending_transcribe.json"
+                ),
+                activity_history_path=ACTIVITY_HISTORY_FILE,
+            )
+            result["backup_notice"] = (
+                "This was a read-only preview. Export and verify a full backup "
+                "before applying any proposed repair outside YTArchiver."
+            )
+            return result
+        except Exception as exc:
+            _log.exception("integrity preview failed")
+            return {
+                "ok": False,
+                "preview_only": True,
+                "repairs_applied": False,
+                "repair_available": False,
+                "error": f"Integrity preview could not finish: {exc}",
+            }

@@ -9,12 +9,13 @@ fallback state.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import threading
 import time
 
 from backend import window_state as winstate
-from backend.ytarchiver_config import load_config, save_config
+from backend.ytarchiver_config import load_config, save_config, update_config
 
 from ._shared import _log, normalize_dialog_paths
 
@@ -37,6 +38,15 @@ class WindowMixin:
         if services is not None:
             return services.save_config(cfg)
         return save_config(cfg)
+
+    def _window_update_config(self, mutator):
+        """Commit one native-window preference against current state."""
+        services = self._window_services()
+        mutate = (getattr(services, "mutate_config", None)
+                  if services is not None else None)
+        if callable(mutate):
+            return mutate(mutator)
+        return update_config(mutator)
 
     def _window_log_stream(self):
         services = self._window_services()
@@ -128,16 +138,16 @@ class WindowMixin:
         except Exception: pass
         if remember:
             try:
-                cfg = self._window_config()
-                cfg["close_behavior"] = choice
-                if self._window_save_config(cfg):
-                    self._reload_config()
-                else:
-                    try:
-                        self._window_log_stream().emit_dim(
-                            " (close behavior preference not saved)")
-                    except Exception:
-                        pass
+                self._window_update_config(
+                    lambda cfg: cfg.__setitem__("close_behavior", choice))
+                self._reload_config()
+            except OSError as e:
+                try:
+                    self._window_log_stream().emit_dim(
+                        " (close behavior preference not saved)")
+                except Exception:
+                    pass
+                _log.warning("close behavior preference save failed: %s", e)
             except Exception as e:
                 try:
                     self._window_log_stream().emit_dim(
@@ -187,14 +197,11 @@ class WindowMixin:
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
             else:
-                # Wiring missing (unusual init order) — at least give
-                # the queue save a real chance.
+                # Wiring missing (unusual init order) — save on this same
+                # exit-coordinator thread. Spawning a detached writer here
+                # would let os._exit race an unfinished queue replacement.
                 try:
-                    save_t = threading.Thread(
-                        target=lambda: self._window_queues().save_now(),
-                        daemon=True)
-                    save_t.start()
-                    save_t.join(timeout=2.0)
+                    self._window_queues().save_now()
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
             # After cleanup, close the webview and let main.py's
@@ -333,81 +340,69 @@ class WindowMixin:
 
 
     def app_restart(self):
-        """Re-launch the exe/script, then destroy the current window.
+        """Quiesce the old process, then re-launch the exe/script.
 
         Used after backup-restore so the freshly-loaded config takes effect.
         """
         try:
-            import subprocess
-            # Cleanup happens ONCE in `_die` (post-launch) — the
-            # previous pre-launch + post-launch double-call meant
-            # `_queues.save_now()` ran twice. On a slow disk the
-            # second save could land AFTER the new instance had
-            # already written its own queue file, clobbering it
-            # (audit: window_mixin H8). Also: pre-launch cleanup
-            # would race the new instance's port-bind (~2.5s kill
-            # vs new instance startup), so dropping it here also
-            # eliminates the brief two-instance window.
-            # Release the single-instance mutex BEFORE launching the
-            # child. The old instance held it through its multi-second
-            # teardown, so the child's import-time CreateMutexW saw
-            # ERROR_ALREADY_EXISTS and exited — "restart" silently
-            # became "quit" (deterministically under `python main.py`,
-            # a coin flip for the frozen exe). Accessed via
-            # sys.modules["__main__"]: `import main` here would
-            # RE-EXECUTE main.py's module level — including the mutex
-            # check — inside this very process. (If the Popen below
-            # fails, we keep running without the mutex; acceptable —
-            # the user just retries the restart.)
-            try:
-                import ctypes as _ct
-                _main_mod = sys.modules.get("__main__")
-                _mx = getattr(_main_mod, "_INSTANCE_MUTEX", None)
-                if _mx:
-                    _ct.windll.kernel32.CloseHandle(_mx)
-                    try:
-                        _main_mod._INSTANCE_MUTEX = None
-                    except Exception:
-                        pass
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-            if getattr(sys, "frozen", False):
-                # Running as PyInstaller exe — relaunch the .exe itself.
-                subprocess.Popen([sys.executable],
-                                 close_fds=True,
-                                 creationflags=0x00000008) # DETACHED_PROCESS
-            else:
-                subprocess.Popen([sys.executable, *sys.argv],
-                                 close_fds=True,
-                                 creationflags=0x00000008)
-            # Small delay so the new process initializes before we tear down.
-            # call _shutdown_cleanup() BEFORE os._exit so
-            # queue state gets saved, window geometry persisted, and
-            # child subprocesses (yt-dlp / whisper / ffmpeg) killed
-            # rather than carried over into the restarted process
-            # where they'd race with the new instance's fresh jobs.
-            def _die():
-                time.sleep(0.6)
+            def _restart_coordinator():
+                # Let the bridge response return before touching the webview.
+                time.sleep(0.10)
                 try:
-                    # Run the full close sequence (queue persist,
-                    # subprocess kills, port release) before exiting.
-                    # `_shutdown_cleanup` is defined inside main() and
-                    # bound to this Api instance via `_register_shutdown`
-                    # at startup. If that wiring is somehow missing
-                    # (unusual init order), we still os._exit so the
-                    # restart doesn't hang.
+                    # The replacement must not exist until every old writer is
+                    # quiesced.  If cleanup cannot prove that, fail closed and
+                    # leave the frozen old process visible for a manual exit.
+                    _cb = getattr(self, "_shutdown_cleanup_fn", None)
+                    if not callable(_cb):
+                        raise RuntimeError("Shutdown coordinator is unavailable")
+                    cleanup = _cb()
+                    if not isinstance(cleanup, dict) or not cleanup.get("ok"):
+                        reason = ((cleanup or {}).get("error")
+                                  if isinstance(cleanup, dict) else "")
+                        raise RuntimeError(
+                            reason or "Background work did not stop safely")
+
+                    # Release the single-instance mutex only after old writers
+                    # and local servers are stopped, then launch exactly one
+                    # detached replacement.
                     try:
-                        _cb = getattr(self, "_shutdown_cleanup_fn", None)
-                        if callable(_cb):
-                            _cb()
-                    except Exception as _ce:
-                        print(f"[app_restart] shutdown_cleanup: {_ce}")
+                        import ctypes as _ct
+                        _main_mod = sys.modules.get("__main__")
+                        _mx = getattr(_main_mod, "_INSTANCE_MUTEX", None)
+                        if _mx:
+                            _ct.windll.kernel32.CloseHandle(_mx)
+                            _main_mod._INSTANCE_MUTEX = None
+                    except Exception as exc:
+                        _log.debug("restart mutex release failed: %s", exc)
+
+                    argv = ([sys.executable] if getattr(sys, "frozen", False)
+                            else [sys.executable, *sys.argv])
+                    subprocess.Popen(
+                        argv,
+                        close_fds=True,
+                        creationflags=0x00000008,  # DETACHED_PROCESS
+                    )
                     if self._window:
                         self._window.destroy()
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-                os._exit(0)
-            threading.Thread(target=_die, daemon=True).start()
+                    os._exit(0)
+                except Exception as exc:
+                    _log.error("safe restart stopped: %s", exc)
+                    try:
+                        services = getattr(self, "services", None)
+                        if services is not None:
+                            services.event_bus.show_toast(
+                                f"Restart stopped safely: {exc}",
+                                "error", ttl_ms=15000)
+                    except Exception:
+                        pass
+
+            # This control-plane thread invokes the supervisor and therefore
+            # must not register itself as work that the same supervisor joins.
+            threading.Thread(
+                target=_restart_coordinator,
+                daemon=True,
+                name="safe-restart-coordinator",
+            ).start()
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}

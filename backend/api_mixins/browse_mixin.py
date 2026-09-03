@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from typing import Any
 
@@ -23,6 +24,13 @@ from backend import archive_scan
 from backend import index as index_backend
 from backend.log import swallow
 from backend.services import file_ops
+from backend.services.job_supervisor import WorkAdmissionClosed
+from backend.services.managed_work import (
+    admitted_operation,
+    lease_busy_result,
+    start_managed_task,
+    try_global_archive_lease,
+)
 from backend.ytarchiver_config import load_config
 
 from ._shared import _log
@@ -213,6 +221,76 @@ def _guard_browse_launch_path(filepath: str, *, require_file: bool) -> dict:
     return guard
 
 
+def _catalog_video_identity(filepath: str) -> dict[str, str] | None:
+    """Return the catalog-owned identity for one exact video path."""
+    try:
+        rconn = index_backend._reader_open()
+        if rconn is None:
+            return None
+        with index_backend._reader_lock:
+            row = rconn.execute(
+                "SELECT video_id, title, channel FROM videos "
+                "WHERE filepath=? COLLATE NOCASE LIMIT 1",
+                (os.path.normpath(filepath or ""),),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "video_id": str(row[0] or "").strip(),
+            "title": str(row[1] or "").strip(),
+            "channel": str(row[2] or "").strip(),
+        }
+    except Exception:
+        return None
+
+
+def _catalog_stats_for_channel_keys(conn, channel_keys: set[str]
+                                    ) -> dict[str, dict[str, int]]:
+    """Return exact per-channel catalog totals for selected channel keys.
+
+    The disk cache remains the normal Browse-grid source. This query is only
+    used for configured channels whose cache record is absent, so a temporary
+    cache hole does not make a populated channel look empty. Logical videos
+    are deduplicated by YouTube ID (or normalized path when no ID exists),
+    matching the per-channel Browse query's identity rules.
+    """
+    wanted = {
+        str(key or "").strip().lower()
+        for key in channel_keys
+        if str(key or "").strip()
+    }
+    if conn is None or not wanted:
+        return {}
+
+    placeholders = ",".join("?" for _ in wanted)
+    rows = conn.execute(
+        "SELECT lower(trim(v.channel)) AS channel_key, "
+        "COUNT(DISTINCT CASE "
+        " WHEN trim(COALESCE(v.video_id, '')) <> '' "
+        " THEN 'id:' || trim(v.video_id) "
+        " ELSE 'path:' || lower(replace(trim(v.filepath), '/', char(92))) "
+        " END) AS logical_videos, "
+        "COUNT(*) AS physical_copies, "
+        "COALESCE(SUM(v.size_bytes), 0) AS size_bytes "
+        "FROM videos AS v "
+        f"WHERE lower(trim(v.channel)) IN ({placeholders}) "
+        "AND COALESCE(v.availability, 'available')='available' "
+        "AND trim(COALESCE(v.filepath, '')) <> '' "
+        "GROUP BY lower(trim(v.channel))",
+        tuple(sorted(wanted)),
+    )
+    stats: dict[str, dict[str, int]] = {}
+    for key, logical_videos, physical_copies, size_bytes in rows:
+        normalized = str(key or "").strip().lower()
+        if normalized in wanted:
+            stats[normalized] = {
+                "n_vids": int(logical_videos or 0),
+                "physical_copies": int(physical_copies or 0),
+                "size_bytes": int(size_bytes or 0),
+            }
+    return stats
+
+
 class BrowseMixin:
     def _browse_services(self):
         return getattr(self, "services", None)
@@ -231,6 +309,19 @@ class BrowseMixin:
         if services is not None:
             return services.fresh_config()
         return load_config()
+
+    def _browse_channel_is_tracked(self, channel_name):
+        key = str(channel_name or "").strip().casefold()
+        if not key:
+            return False
+        cfg = self._browse_fresh_config() or {}
+        return any(
+            key in {
+                str(channel.get("name") or "").strip().casefold(),
+                str(channel.get("folder") or "").strip().casefold(),
+            }
+            for channel in cfg.get("channels", [])
+        )
 
     def _browse_log_stream(self):
         services = self._browse_services()
@@ -267,6 +358,15 @@ class BrowseMixin:
         except Exception:
             stream = None
 
+        task_id = f"manual-thumbs-{uuid.uuid4().hex}"
+        cancel = threading.Event()
+        lease = None
+
+        def _retire() -> None:
+            with _MANUAL_THUMB_BACKFILL_LOCK:
+                for item in todo:
+                    _MANUAL_THUMB_BACKFILL_INFLIGHT.discard(item["key"])
+
         def _run():
             try:
                 from backend import index as _idx
@@ -294,6 +394,8 @@ class BrowseMixin:
                 # generation block later cards whose sidecars already exist.
                 missing = []
                 for item in todo:
+                    if cancel.is_set():
+                        return
                     fp = item["filepath"]
                     if not os.path.isfile(fp):
                         continue
@@ -309,20 +411,59 @@ class BrowseMixin:
                 # Pass 2 handles true misses. Generation can be slow, but all
                 # ready sidecars above are already visible by this point.
                 for item in missing:
+                    if cancel.is_set():
+                        return
                     fp = item["filepath"]
                     thumb_dir = _ensure_thumbnails_dir(os.path.dirname(fp))
                     tp = _generate_local_thumbnail(
                         fp, thumb_dir, item["title"], item["video_id"],
-                        stream=stream)
+                        stream=stream,
+                        commit_allowed=lambda: not cancel.is_set(),
+                        cancel_event=cancel)
                     if tp:
                         _push_ready(item, tp, "local")
             finally:
-                with _MANUAL_THUMB_BACKFILL_LOCK:
-                    for item in todo:
-                        _MANUAL_THUMB_BACKFILL_INFLIGHT.discard(item["key"])
+                try:
+                    if lease is not None:
+                        lease.release()
+                finally:
+                    _retire()
 
-        threading.Thread(target=_run, name="manual-local-thumbs",
-                         daemon=True).start()
+        try:
+            with admitted_operation(
+                self,
+                owner="thumbnail-maintenance",
+                label="Generate manual video thumbnails",
+                task_id=task_id,
+                cancel=cancel,
+            ):
+                admission = try_global_archive_lease(
+                    owner="thumbnail-maintenance",
+                    label="Generate manual video thumbnails",
+                    task_id=task_id,
+                    cancel=cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    _retire()
+                    return
+                lease = admission.lease
+                try:
+                    start_managed_task(
+                        self,
+                        owner="thumbnail-maintenance",
+                        label="Generate manual video thumbnails",
+                        task_id=task_id,
+                        cancel=cancel,
+                        target=_run,
+                        name="manual-local-thumbs",
+                        thread_factory=threading.Thread,
+                    )
+                except Exception:
+                    lease.release()
+                    _retire()
+                    raise
+        except WorkAdmissionClosed:
+            _retire()
 
     def _queue_manual_duration_backfill(
             self, candidates: list[dict[str, Any]]) -> None:
@@ -351,11 +492,19 @@ class BrowseMixin:
         if not todo:
             return
 
+        task_id = f"manual-durations-{uuid.uuid4().hex}"
+        cancel = threading.Event()
+        lease = None
+
+        def _retire() -> None:
+            with _MANUAL_DURATION_BACKFILL_LOCK:
+                for item in todo:
+                    _MANUAL_DURATION_BACKFILL_INFLIGHT.discard(item["key"])
+
         def _run():
             try:
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-
                 from backend import index as _idx
+                from backend.executor_utils import WorkResult, run_bounded
 
                 # ffprobe mostly reads container headers. A small bounded pool
                 # repairs legacy/manual rows far faster than the old serial
@@ -365,67 +514,115 @@ class BrowseMixin:
                     dur = _probe_manual_duration_seconds(fp)
                     return item, dur
 
-                workers = min(4, len(todo))
-                with ThreadPoolExecutor(
-                        max_workers=workers,
-                        thread_name_prefix="manual-duration-probe") as pool:
-                    futures = [pool.submit(_probe, item) for item in todo]
-                    completed = as_completed(futures)
-                    for future in completed:
+                def _cancelled() -> bool:
+                    supervisor = getattr(self, "_job_supervisor", None)
+                    return bool(
+                        cancel.is_set()
+                        or (
+                            supervisor is not None
+                            and not supervisor.accepting_work()
+                        )
+                    )
+
+                def _record(result: WorkResult) -> None:
+                    if result.error is not None or result.value is None:
+                        if result.error is not None:
+                            _log.debug(
+                                "manual duration worker failed: %s",
+                                result.error,
+                            )
+                        return
+                    item, dur = result.value
+                    fp = item["filepath"]
+                    label = _fmt_manual_duration(dur)
+                    if not label or _cancelled():
+                        return
+                    persisted = False
+                    try:
+                        persisted = _idx.set_video_duration(fp, dur)
+                    except Exception as e:
+                        _log.debug(
+                            "manual duration persist failed for %r: %s",
+                            fp, e)
+                    # Root-folder discovery is the safety net for loose manual
+                    # videos absent from the catalog.  Durable work stays on
+                    # this caller thread, after the shutdown admission check.
+                    if item.get("register_if_missing") and not persisted:
                         try:
-                            item, dur = future.result()
-                        except Exception as e:
-                            _log.debug("manual duration worker failed: %s", e)
-                            continue
-                        fp = item["filepath"]
-                        label = _fmt_manual_duration(dur)
-                        if not label:
-                            continue
-                        persisted = False
-                        try:
-                            persisted = _idx.set_video_duration(fp, dur)
+                            _idx.register_video(
+                                fp,
+                                item.get("channel") or "Single Videos",
+                                item.get("title") or os.path.splitext(
+                                    os.path.basename(fp))[0],
+                                tx_status="pending",
+                                video_id=item.get("video_id") or None,
+                                duration_secs=dur,
+                            )
                         except Exception as e:
                             _log.debug(
-                                "manual duration persist failed for %r: %s",
+                                "manual fallback registration failed for %r: %s",
                                 fp, e)
-                        # Root-folder discovery is the safety net for loose
-                        # manual videos absent from the catalog. Merely probing
-                        # those files left nowhere to retain duration_s, so
-                        # every launch forgot it and showed blanks again.
-                        if item.get("register_if_missing") and not persisted:
-                            try:
-                                _idx.register_video(
-                                    fp,
-                                    item.get("channel") or "Single Videos",
-                                    item.get("title") or os.path.splitext(
-                                        os.path.basename(fp))[0],
-                                    tx_status="pending",
-                                    video_id=item.get("video_id") or None,
-                                    duration_secs=dur,
-                                )
-                            except Exception as e:
-                                _log.debug(
-                                    "manual fallback registration failed for "
-                                    "%r: %s", fp, e)
-                        # Publish each result as soon as it is known instead of
-                        # waiting for the slowest ffprobe in the whole page.
-                        try:
-                            import json as _json
-                            payload = _json.dumps([
-                                {"filepath": fp, "duration": label}
-                            ])
-                            win.evaluate_js(
-                                "window._manualDurationsReady && "
-                                f"window._manualDurationsReady({payload});")
-                        except Exception as e:
-                            _log.debug("manual duration push failed: %s", e)
-            finally:
-                with _MANUAL_DURATION_BACKFILL_LOCK:
-                    for item in todo:
-                        _MANUAL_DURATION_BACKFILL_INFLIGHT.discard(item["key"])
+                    try:
+                        import json as _json
+                        payload = _json.dumps([
+                            {"filepath": fp, "duration": label}
+                        ])
+                        win.evaluate_js(
+                            "window._manualDurationsReady && "
+                            f"window._manualDurationsReady({payload});")
+                    except Exception as e:
+                        _log.debug("manual duration push failed: %s", e)
 
-        threading.Thread(target=_run, name="manual-local-durations",
-                         daemon=True).start()
+                run_bounded(
+                    todo,
+                    _probe,
+                    _record,
+                    max_workers=min(4, len(todo)),
+                    thread_name_prefix="manual-duration-probe",
+                    is_cancelled=_cancelled,
+                )
+            finally:
+                try:
+                    if lease is not None:
+                        lease.release()
+                finally:
+                    _retire()
+
+        try:
+            with admitted_operation(
+                self,
+                owner="index-maintenance",
+                label="Backfill manual video durations",
+                task_id=task_id,
+                cancel=cancel,
+            ):
+                admission = try_global_archive_lease(
+                    owner="index-maintenance",
+                    label="Backfill manual video durations",
+                    task_id=task_id,
+                    cancel=cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    _retire()
+                    return
+                lease = admission.lease
+                try:
+                    start_managed_task(
+                        self,
+                        owner="index-maintenance",
+                        label="Backfill manual video durations",
+                        task_id=task_id,
+                        cancel=cancel,
+                        target=_run,
+                        name="manual-local-durations",
+                        thread_factory=threading.Thread,
+                    )
+                except Exception:
+                    lease.release()
+                    _retire()
+                    raise
+        except WorkAdmissionClosed:
+            _retire()
 
 
     # ─── Browse tab (reads from transcription_index.db) ────────────────
@@ -451,6 +648,13 @@ class BrowseMixin:
         channels = cfg.get("channels", [])
         cache = archive_scan.load_disk_cache()
         base = (cfg.get("output_dir") or "").strip()
+        missing_cache_keys = {
+            str(ch.get("name") or ch.get("folder") or "").strip().lower()
+            for ch in channels
+            if str(ch.get("url") or "").strip()
+            and str(ch.get("url") or "").strip() not in cache
+            and str(ch.get("name") or ch.get("folder") or "").strip()
+        }
         from backend.channel_art import (
             avatar_path_for,
             banner_path_for,
@@ -464,6 +668,7 @@ class BrowseMixin:
         # old file, which made 15-year-old channels sort as freshly downloaded.
         last_added: dict[str, float] = {}
         latest_filepaths: dict[str, str] = {}
+        catalog_fallback_stats: dict[str, dict[str, int]] = {}
         try:
             from backend import index as _idx
             _conn = _idx._reader_open()
@@ -480,16 +685,38 @@ class BrowseMixin:
                             last_added[_key] = float(_mx or 0)
                             if _fp:
                                 latest_filepaths[_key] = _fp
+                    if missing_cache_keys:
+                        try:
+                            catalog_fallback_stats = (
+                                _catalog_stats_for_channel_keys(
+                                    _conn, missing_cache_keys))
+                        except Exception as e:
+                            _log.debug(
+                                "catalog cache-miss fallback query failed: %s",
+                                e)
         except Exception as e:
             _log.debug("last_added query failed: %s", e)
         out = []
         subscriber_cache_updates: dict[str, int | None] = {}
         for ch in channels:
-            st = archive_scan.stats_for_channel(ch, cache)
             name = ch.get("name") or ch.get("folder", "")
             name_key = (name or "").strip().lower()
             ch_url = (ch.get("url") or "").strip()
             cache_rec = cache.get(ch_url) if ch_url else None
+            st = archive_scan.stats_for_channel(ch, cache)
+            # Do not second-guess a real cache record, even when its count is
+            # legitimately zero. The catalog is a display-only safety net for
+            # an absent URL entry; the normal background cache healer remains
+            # responsible for making the disk cache durable again.
+            if ch_url and ch_url not in cache:
+                fallback = catalog_fallback_stats.get(name_key)
+                if fallback:
+                    st = {
+                        **fallback,
+                        "size_gb": fallback["size_bytes"] / (1024 ** 3),
+                        "cached": False,
+                        "stale_secs": None,
+                    }
             subscriber_count = None
             if (isinstance(cache_rec, dict)
                     and "subscriber_count_checked_at" in cache_rec):
@@ -608,8 +835,14 @@ class BrowseMixin:
         """List videos in a channel from the index DB."""
         # Foreground Browse query — make the startup sweep yield
         # the Z: pool while this user-initiated channel grid loads.
-        with index_backend.foreground_browse():
-            return index_backend.list_videos_for_channel(channel, sort=sort, limit=limit)
+        try:
+            if index_backend._reader_open() is None:
+                return {"ok": False, "error": "Search index is unavailable."}
+            with index_backend.foreground_browse():
+                return index_backend.list_videos_for_channel(
+                    channel, sort=sort, limit=limit)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def browse_list_videos_page(self, channel, sort="newest", limit=120,
                                 offset=0, query=""):
@@ -681,7 +914,7 @@ class BrowseMixin:
     def _classify_transcript_source(self, title, jsonl_path, video_id):
         """Read the aggregated Transcript.txt that covers `title` and pull
         the source tag out of its `===(title), ..., (SOURCE)===` header line.
-        Mirrors ArchivePlayer's `_yt_parse_source_tags_in_dir` + classifier.
+        Mirrors the compatible companion viewer's source-tag classifier.
         Cheap — only reads until we find the matching header block."""
         if not title and not jsonl_path and not video_id:
             return {"source": "unknown", "raw": ""}
@@ -828,7 +1061,7 @@ class BrowseMixin:
             if raw_tag:
                 break
 
-        # Classify — mirrors ArchivePlayer _yt_classify_source exactly.
+        # Classify — mirrors the companion viewer's classifier exactly.
         up = raw_tag.upper()
         if "WHISPER" in up:
             kind = "whisper"
@@ -894,7 +1127,8 @@ class BrowseMixin:
                 if m:
                     video_id = m.group(1)
             if not video_id:
-                return {"ok": False, "error": "No video_id"}
+                return {"ok": False,
+                        "error": "This video does not have a YouTube ID."}
             cached = _metadata_drawer_cache_get(video_id, channel)
             if cached:
                 return cached
@@ -963,43 +1197,144 @@ class BrowseMixin:
 
 
     def browse_refresh_video_metadata(self, payload):
-        """Refresh views/likes/description/comments for a single video.
+        task_id = f"metadata-one-{uuid.uuid4().hex}"
+        try:
+            with admitted_operation(
+                self,
+                owner="metadata-maintenance",
+                label="Refresh video metadata",
+                task_id=task_id,
+            ) as cancel:
+                admission = try_global_archive_lease(
+                    owner="metadata-maintenance",
+                    label="Refresh video metadata",
+                    task_id=task_id,
+                    cancel=cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    return lease_busy_result(admission)
+                try:
+                    return self._browse_refresh_video_metadata_owned(
+                        payload, cancel_event=cancel)
+                finally:
+                    admission.lease.release()
+        except WorkAdmissionClosed as exc:
+            return {"ok": False, "started": False, "error": str(exc)}
+
+    def _browse_refresh_video_metadata_owned(
+            self, payload, *, cancel_event=None):
+        """Refresh selected saved information for a single tracked video.
 
         Drives the Watch view's "Refresh metadata" button — synchronous
         per-video fetch via yt-dlp, write straight back to the channel's
         aggregated Metadata.jsonl, and return the new entry so the
         drawer can re-render without a Back-and-reopen round-trip.
 
-        payload: {filepath, video_id?, title?, channel?}
+        payload: {filepath, video_id?, title?, channel?, mode?}
+        mode: stats | comments | all (default)
         Returns: {ok, meta?, error?}
         """
         try:
-            filepath = (payload or {}).get("filepath") or ""
-            video_id = (payload or {}).get("video_id") or ""
-            title    = (payload or {}).get("title") or ""
-            channel  = (payload or {}).get("channel") or ""
-            if not video_id and filepath:
-                import re as _re
-                m = _re.search(r"\[([A-Za-z0-9_-]{11})\]",
-                               os.path.basename(filepath))
-                if m:
-                    video_id = m.group(1)
-            if not video_id:
-                return {"ok": False, "error": "No video_id"}
+            raw = payload if isinstance(payload, dict) else {}
+            mode = str(raw.get("mode") or "all").strip().lower()
+            if mode not in {"stats", "comments", "all"}:
+                return {"ok": False, "error": "Invalid metadata refresh option."}
+            filepath = str(raw.get("filepath") or "").strip()
+            video_id = str(raw.get("video_id") or "").strip()
+            title = str(raw.get("title") or "").strip()
+            channel = str(raw.get("channel") or "").strip()
+            filepath = os.path.normpath(filepath)
             if not filepath or not os.path.isfile(filepath):
                 return {"ok": False, "error": "Video file not found"}
+
+            # Trust the exact catalog row over browser-provided fields. A
+            # stale card can outlive a background catalog refresh, and a
+            # mismatched non-empty ID must not write another video's metadata
+            # beside this file.
+            catalog = _catalog_video_identity(filepath) or {}
+            catalog_id = catalog.get("video_id") or ""
+            if video_id and catalog_id and video_id != catalog_id:
+                return {
+                    "ok": False,
+                    "error": "Video details changed. Reopen the menu and try again.",
+                }
+            video_id = catalog_id or video_id
+            title = catalog.get("title") or title
+            channel = catalog.get("channel") or channel
+
             cfg = self._browse_config()
             ch_dict = None
+            channel_key = channel.casefold()
             for ch in cfg.get("channels", []):
-                if (ch.get("name") or "") == channel:
+                identities = {
+                    str(ch.get("name") or "").strip().casefold(),
+                    str(ch.get("folder") or "").strip().casefold(),
+                }
+                if channel_key and channel_key in identities:
                     ch_dict = ch
                     break
             if ch_dict is None:
-                return {"ok": False, "error": f"Channel '{channel}' not in config"}
+                return {"ok": False,
+                        "error": f"Channel '{channel}' is not in your library."}
+
+            # Legacy archives often have title-only filenames and blank IDs.
+            # Recover from local evidence first; if none exists, do one exact,
+            # unambiguous title match against this channel's YouTube listing.
+            if not video_id:
+                try:
+                    video_id = index_backend._resolve_id_from_sidecars(filepath)
+                except Exception:
+                    video_id = ""
+            if not video_id:
+                try:
+                    from backend.text_utils import extract_video_id
+                    video_id = extract_video_id(
+                        filepath, info_json_fallback=True)
+                except Exception:
+                    video_id = ""
+            if not video_id and not (
+                    cancel_event is not None and cancel_event.is_set()):
+                try:
+                    from backend.metadata.core import _resolve_ids_by_title
+                    from backend.sync import find_yt_dlp
+                    yt = find_yt_dlp()
+                    resolved = _resolve_ids_by_title(
+                        yt or "", str(ch_dict.get("url") or "").strip(),
+                        [filepath], self._browse_log_stream(), cancel_event)
+                    wanted = os.path.normcase(os.path.normpath(filepath))
+                    for resolved_path, resolved_id in resolved.items():
+                        if (os.path.normcase(os.path.normpath(resolved_path))
+                                == wanted):
+                            video_id = str(resolved_id or "").strip()
+                            break
+                    if video_id:
+                        index_backend.set_manual_video_id(
+                            filepath, video_id,
+                            f"https://www.youtube.com/watch?v={video_id}",
+                            channel=(ch_dict.get("name")
+                                     or ch_dict.get("folder") or channel))
+                except Exception as e:
+                    _log.debug("single video ID recovery failed: %s", e)
+            if cancel_event is not None and cancel_event.is_set():
+                return {"ok": False, "cancelled": True,
+                        "error": "Refresh cancelled."}
+            if not video_id:
+                return {
+                    "ok": False,
+                    "error": "Could not match this file to a YouTube video.",
+                }
+
+            canonical_channel = str(
+                ch_dict.get("name") or ch_dict.get("folder") or channel)
             from backend.metadata import fetch_single_video_metadata
             res = fetch_single_video_metadata(
                 ch_dict, video_id, filepath, title,
-                self._browse_log_stream(), emit_inline_log=False, refresh=True)
+                self._browse_log_stream(), emit_inline_log=False, refresh=True,
+                cancel_event=cancel_event, refresh_scope=mode,
+                # Browse owns thumbnail refresh separately so it can replace a
+                # populated image, fall back to a local frame, and report a
+                # partial failure without rerunning the metadata request.
+                refresh_thumbnail=False)
             if not res.get("ok"):
                 return {"ok": False,
                         "error": res.get("error") or "fetch failed",
@@ -1008,21 +1343,298 @@ class BrowseMixin:
             # canonical on-disk shape (matches browse_get_video_metadata).
             ret = self.browse_get_video_metadata({
                 "filepath": filepath, "video_id": video_id,
-                "title": title, "channel": channel,
+                "title": title, "channel": canonical_channel,
             })
-            # Re-render the Recent grid so the freshly downloaded
-            # thumbnail shows up without a relaunch. The .jpg sidecar
-            # gets written inside fetch_single_video_metadata above,
-            # but the Recent grid was rendered BEFORE that write and
-            # has a stale thumbnail_url="" on the card.
-            try: self._push_recent_refresh()
-            except Exception as e: swallow("recent-refresh push", e)
-            return ret if ret.get("ok") else {"ok": True, "meta": res.get("entry")}
+            result = (ret if ret.get("ok")
+                      else {"ok": True, "meta": res.get("entry")})
+            result["video_id"] = video_id
+            result["refresh_mode"] = mode
+
+            thumbnail_result = None
+            if mode == "all":
+                thumbnail_result = self._browse_repair_video_thumbnail_owned({
+                    "filepath": filepath,
+                    "video_id": video_id,
+                    "title": title,
+                    "channel": canonical_channel,
+                    "force": True,
+                }, cancel_event=cancel_event)
+                if thumbnail_result.get("ok"):
+                    if thumbnail_result.get("thumbnail_url"):
+                        result["thumbnail_url"] = thumbnail_result["thumbnail_url"]
+                    result["thumbnail_refreshed"] = True
+                else:
+                    # The metadata write already committed. Report the one
+                    # incomplete part without pretending the whole operation
+                    # failed or hiding that the other values were refreshed.
+                    result["thumbnail_refreshed"] = False
+                    result["warning"] = (
+                        "Video information was refreshed, but the thumbnail "
+                        "could not be refreshed."
+                    )
+                    result["thumbnail_error"] = thumbnail_result.get("error") or ""
+
+            # A successful thumbnail refresh already pushes the Browse/Recent
+            # invalidation. Stats/comments, or a partial all-refresh, still
+            # need one refresh so the new values appear without a relaunch.
+            if not (thumbnail_result and thumbnail_result.get("ok")):
+                try:
+                    self._push_recent_refresh(canonical_channel)
+                except Exception as e:
+                    swallow("recent-refresh push", e)
+            return result
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
 
-    def _manual_refresh_metadata_one(self, payload, *, push_refresh: bool):
+    def browse_repair_video_thumbnail(self, payload):
+        """Repair one Browse card's thumbnail, including legacy no-ID files."""
+        task_id = f"thumbnail-one-{uuid.uuid4().hex}"
+        cancel = threading.Event()
+        try:
+            with admitted_operation(
+                self,
+                owner="thumbnail-maintenance",
+                label="Repair video thumbnail",
+                task_id=task_id,
+                cancel=cancel,
+            ):
+                admission = try_global_archive_lease(
+                    owner="thumbnail-maintenance",
+                    label="Repair video thumbnail",
+                    task_id=task_id,
+                    cancel=cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    return lease_busy_result(admission)
+                try:
+                    return self._browse_repair_video_thumbnail_owned(
+                        payload, cancel_event=cancel)
+                finally:
+                    admission.lease.release()
+        except WorkAdmissionClosed as exc:
+            return {"ok": False, "started": False, "error": str(exc)}
+
+    def _browse_repair_video_thumbnail_owned(
+            self, payload, *, cancel_event=None):
+        """Use a YouTube thumbnail when possible, otherwise a local frame."""
+        try:
+            raw = payload if isinstance(payload, dict) else {}
+            filepath = str(raw.get("filepath") or "").strip()
+            video_id = str(raw.get("video_id") or "").strip()
+            title = str(raw.get("title") or "").strip()
+            channel = str(raw.get("channel") or "").strip()
+            force = raw.get("force") is True
+            guard = _guard_browse_launch_path(filepath, require_file=True)
+            if not guard.get("ok"):
+                return guard
+            filepath = guard["path"]
+
+            catalog = _catalog_video_identity(filepath) or {}
+            catalog_id = catalog.get("video_id") or ""
+            if video_id and catalog_id and video_id != catalog_id:
+                return {
+                    "ok": False,
+                    "error": "Video details changed. Reopen the menu and try again.",
+                }
+            video_id = catalog_id or video_id
+            title = (catalog.get("title") or title
+                     or os.path.splitext(os.path.basename(filepath))[0])
+            channel = catalog.get("channel") or channel
+
+            if not video_id:
+                try:
+                    video_id = index_backend._resolve_id_from_sidecars(filepath)
+                except Exception:
+                    video_id = ""
+            if not video_id:
+                try:
+                    from backend.text_utils import extract_video_id
+                    video_id = extract_video_id(
+                        filepath, info_json_fallback=True)
+                except Exception:
+                    video_id = ""
+
+            if video_id and not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+                return {"ok": False, "error": "Invalid YouTube video ID."}
+            if video_id and not catalog_id:
+                try:
+                    index_backend.set_manual_video_id(
+                        filepath,
+                        video_id,
+                        f"https://www.youtube.com/watch?v={video_id}",
+                        channel=channel or None,
+                    )
+                except Exception as e:
+                    _log.debug("thumbnail repair ID persistence failed: %s", e)
+
+            from backend.thumbnails import (
+                _download_thumbnail,
+                _ensure_thumbnails_dir,
+                _generate_local_thumbnail,
+                _image_magic_ok,
+                _safe_thumb_stem,
+                invalidate_thumb_cache_entry,
+            )
+
+            def _reconcile_thumbnail_state(thumbnail_path):
+                """Make every catalog/cache consumer observe one valid sidecar."""
+                try:
+                    conn = index_backend._open()
+                    if conn is not None:
+                        with index_backend._db_lock:
+                            conn.execute(
+                                "UPDATE videos SET has_thumbnail=1 "
+                                "WHERE filepath=? COLLATE NOCASE",
+                                (filepath,),
+                            )
+                            conn.commit()
+                except Exception as e:
+                    _log.debug("thumbnail catalog update failed: %s", e)
+                try:
+                    invalidate_thumb_cache_entry(channel)
+                except Exception as e:
+                    _log.debug("thumbnail status invalidation failed: %s", e)
+                index_backend.invalidate_channel_videos(channel or None)
+                try:
+                    self._push_recent_refresh(channel or None)
+                except Exception as e:
+                    swallow("thumbnail repair refresh", e)
+
+            existing = index_backend.find_thumbnail_channelwide(
+                filepath, video_id)
+            existing_valid = bool(existing and _image_magic_ok(existing))
+            if existing_valid and not force:
+                _reconcile_thumbnail_state(existing)
+                return {
+                    "ok": True,
+                    "repaired": False,
+                    "already_present": True,
+                    "source": "existing",
+                    "thumbnail_url": index_backend._file_url(existing),
+                    "video_id": video_id,
+                }
+            if existing and not _image_magic_ok(existing):
+                # Keep a damaged sidecar until a valid replacement commits.
+                # Removed/delisted videos may have no retrievable remote image
+                # and local frame extraction can also fail.
+                _log.debug("thumbnail repair found damaged sidecar: %s", existing)
+
+            if cancel_event is not None and cancel_event.is_set():
+                return {"ok": False, "cancelled": True,
+                        "error": "Thumbnail repair cancelled."}
+
+            thumb_dir = _ensure_thumbnails_dir(os.path.dirname(filepath))
+            thumbnail_path = None
+            source = ""
+            if video_id:
+                thumbnail_url = ""
+                try:
+                    metadata = self.browse_get_video_metadata({
+                        "filepath": filepath,
+                        "video_id": video_id,
+                        "title": title,
+                        "channel": channel,
+                    })
+                    if metadata.get("ok"):
+                        thumbnail_url = str(
+                            (metadata.get("meta") or {}).get(
+                                "thumbnail_url") or "").strip()
+                except Exception as e:
+                    _log.debug("thumbnail metadata lookup failed: %s", e)
+                if not thumbnail_url:
+                    thumbnail_url = (
+                        f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg")
+                download_state = {}
+                downloaded = _download_thumbnail(
+                    thumbnail_url, thumb_dir, title, video_id,
+                    stream=self._browse_log_stream(),
+                    commit_allowed=(
+                        (lambda: not cancel_event.is_set())
+                        if cancel_event is not None else None),
+                    force=force,
+                    result_out=download_state,
+                )
+                # Resolve the exact output independently of the helper's
+                # cleanup result. A replacement can have committed even when
+                # retiring an older blocker failed, and the original corrupt
+                # sidecar must never shadow this known-good path selection.
+                downloaded_stem = (
+                    f"{_safe_thumb_stem(title)} [{video_id}]")
+                if downloaded or download_state.get("committed_path"):
+                    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+                        candidate = os.path.join(
+                            thumb_dir, downloaded_stem + ext)
+                        if _image_magic_ok(candidate):
+                            thumbnail_path = os.path.normpath(candidate)
+                            source = "youtube"
+                            break
+
+            should_keep_existing = bool(force and video_id and existing_valid)
+            if (not thumbnail_path and not should_keep_existing and not (
+                    cancel_event is not None and cancel_event.is_set())):
+                thumbnail_path = _generate_local_thumbnail(
+                    filepath, thumb_dir, title, video_id,
+                    stream=self._browse_log_stream(),
+                    commit_allowed=(
+                        (lambda: not cancel_event.is_set())
+                        if cancel_event is not None else None),
+                    cancel_event=cancel_event, force=force)
+                if thumbnail_path:
+                    source = "local"
+
+            if cancel_event is not None and cancel_event.is_set():
+                return {"ok": False, "cancelled": True,
+                        "error": "Thumbnail repair cancelled."}
+            if not thumbnail_path or not _image_magic_ok(thumbnail_path):
+                return {
+                    "ok": False,
+                    "error": (
+                        "Could not refresh the thumbnail. The existing "
+                        "thumbnail was kept."
+                        if should_keep_existing
+                        else "Could not create a thumbnail for this video."
+                    ),
+                    "video_id": video_id,
+                }
+
+            if (existing
+                    and os.path.normcase(os.path.normpath(existing))
+                    != os.path.normcase(os.path.normpath(thumbnail_path))
+                    and (force or not _image_magic_ok(existing))):
+                try:
+                    os.remove(existing)
+                except FileNotFoundError:
+                    # `_download_thumbnail` may already have retired a
+                    # differently-titled blocker after committing its target.
+                    pass
+                except OSError as e:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "A new thumbnail was created, but the previous "
+                            "thumbnail could not be replaced cleanly. Check file "
+                            f"permissions and try again: {e}"
+                        ),
+                        "video_id": video_id,
+                    }
+
+            _reconcile_thumbnail_state(thumbnail_path)
+            return {
+                "ok": True,
+                "repaired": True,
+                "already_present": False,
+                "refreshed": force,
+                "source": source,
+                "thumbnail_url": index_backend._file_url(thumbnail_path),
+                "video_id": video_id,
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
+    def _manual_refresh_metadata_one(
+            self, payload, *, push_refresh: bool, cancel_event=None):
         """Refresh metadata for a single MANUAL download (not part of any
         subscription). Fetches views/likes/description/comments by video_id and
         writes the entry to a `.…Metadata.jsonl` NEXT TO the video file, where
@@ -1058,7 +1670,8 @@ class BrowseMixin:
             from backend.metadata import fetch_single_video_metadata
             res = fetch_single_video_metadata(
                 syn, video_id, filepath, title, self._browse_log_stream(),
-                emit_inline_log=False, refresh=True, dest_folder=dest)
+                emit_inline_log=False, refresh=True, dest_folder=dest,
+                cancel_event=cancel_event)
             if not res.get("ok"):
                 return {"ok": False,
                         "error": res.get("error") or "fetch failed",
@@ -1079,7 +1692,29 @@ class BrowseMixin:
             return {"ok": False, "error": str(e)}
 
     def manual_refresh_metadata(self, payload):
-        return self._manual_refresh_metadata_one(payload, push_refresh=True)
+        task_id = f"manual-metadata-{uuid.uuid4().hex}"
+        try:
+            with admitted_operation(
+                self,
+                owner="metadata-maintenance",
+                label="Refresh manual metadata",
+                task_id=task_id,
+            ) as cancel:
+                admission = try_global_archive_lease(
+                    owner="metadata-maintenance",
+                    label="Refresh manual metadata",
+                    task_id=task_id,
+                    cancel=cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    return lease_busy_result(admission)
+                try:
+                    return self._manual_refresh_metadata_one(
+                        payload, push_refresh=True, cancel_event=cancel)
+                finally:
+                    admission.lease.release()
+        except WorkAdmissionClosed as exc:
+            return {"ok": False, "started": False, "error": str(exc)}
 
     def _manual_bulk_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -1196,6 +1831,10 @@ class BrowseMixin:
         if existing is not None and existing.is_alive():
             return {"ok": False, "error": "Manual metadata refresh is already running"}
 
+        cancel = threading.Event()
+        task_id = f"manual-metadata-all-{uuid.uuid4().hex}"
+        self._manual_refresh_all_cancel = cancel
+
         def _run():
             summary = {
                 "ok": True,
@@ -1215,6 +1854,10 @@ class BrowseMixin:
                     "phase": "scanned",
                 })
                 for i, r in enumerate(rows, 1):
+                    if cancel.is_set():
+                        summary["ok"] = False
+                        summary["cancelled"] = True
+                        break
                     fp = r.get("filepath") or ""
                     title = r.get("title") or os.path.basename(fp)
                     self._manual_emit_js("_manualRefreshAllProgress", {
@@ -1239,7 +1882,7 @@ class BrowseMixin:
                         "channel": r.get("channel") or "",
                     }
                     res = self._manual_refresh_metadata_one(
-                        payload, push_refresh=False)
+                        payload, push_refresh=False, cancel_event=cancel)
                     if res.get("ok"):
                         summary["refreshed"] += 1
                         phase = "done"
@@ -1268,12 +1911,43 @@ class BrowseMixin:
             except Exception as e:
                 summary = {"ok": False, "error": str(e)}
             finally:
+                lease.release()
                 self._manual_emit_js("_manualRefreshAllDone", summary)
 
-        t = threading.Thread(target=_run, name="manual-metadata-all",
-                             daemon=True)
-        self._manual_refresh_all_thread = t
-        t.start()
+        try:
+            with admitted_operation(
+                self,
+                owner="metadata-maintenance",
+                label="Refresh all manual metadata",
+                task_id=task_id,
+                cancel=cancel,
+            ):
+                admission = try_global_archive_lease(
+                    owner="metadata-maintenance",
+                    label="Refresh all manual metadata",
+                    task_id=task_id,
+                    cancel=cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    return lease_busy_result(admission)
+                lease = admission.lease
+                try:
+                    t = start_managed_task(
+                        self,
+                        owner="metadata-maintenance",
+                        label="Refresh all manual metadata",
+                        task_id=task_id,
+                        cancel=cancel,
+                        target=_run,
+                        name="manual-metadata-all",
+                        thread_factory=threading.Thread,
+                    )
+                except Exception:
+                    lease.release()
+                    raise
+                self._manual_refresh_all_thread = t
+        except WorkAdmissionClosed as exc:
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "started": True}
 
     def manual_transcribe_all(self, model=""):
@@ -1282,10 +1956,16 @@ class BrowseMixin:
             return {"ok": False, "error": "Manual transcription queueing is already running"}
 
         apply_model = getattr(self, "_apply_runtime_whisper_model", None)
+        requested_model = (model or "").strip()
         if callable(apply_model):
             model_result = apply_model(model or "")
             if not model_result.get("ok"):
                 return model_result
+            requested_model = model_result.get("model", requested_model)
+
+        cancel = threading.Event()
+        task_id = f"manual-transcribe-all-{uuid.uuid4().hex}"
+        self._manual_transcribe_all_cancel = cancel
 
         def _run():
             summary = {
@@ -1319,6 +1999,10 @@ class BrowseMixin:
                     "phase": "scanned",
                 })
                 for i, r in enumerate(candidates, 1):
+                    if cancel.is_set():
+                        summary["ok"] = False
+                        summary["cancelled"] = True
+                        break
                     fp = r.get("filepath") or ""
                     title = r.get("title") or os.path.basename(fp)
                     self._manual_emit_js("_manualTranscribeAllProgress", {
@@ -1345,6 +2029,7 @@ class BrowseMixin:
                             bulk_id=bulk_id,
                             bulk_total=total,
                             bulk_index=i,
+                            requested_model=requested_model,
                         )
                     except Exception:
                         ok = False
@@ -1372,10 +2057,20 @@ class BrowseMixin:
             finally:
                 self._manual_emit_js("_manualTranscribeAllQueued", summary)
 
-        t = threading.Thread(target=_run, name="manual-transcribe-all",
-                             daemon=True)
-        self._manual_transcribe_all_thread = t
-        t.start()
+        try:
+            t = start_managed_task(
+                self,
+                owner="queue-maintenance",
+                label="Queue all manual transcriptions",
+                task_id=task_id,
+                cancel=cancel,
+                target=_run,
+                name="manual-transcribe-all",
+                thread_factory=threading.Thread,
+            )
+            self._manual_transcribe_all_thread = t
+        except WorkAdmissionClosed as exc:
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "started": True}
 
 
@@ -1410,6 +2105,7 @@ class BrowseMixin:
                 try: stream.emit_error(f"Recover IDs failed: {_e}")
                 except Exception as _ee: swallow("recover-ids err emit", _ee)
             finally:
+                lease.release()
                 # Refresh the Manual grid so freshly-resolved rows pick up
                 # their new id (and thus the "Refresh metadata" action).
                 try: self._push_recent_refresh()
@@ -1424,9 +2120,41 @@ class BrowseMixin:
                             f"window._manualBackfillDone({_summary});")
                 except Exception as _we: swallow("recover-ids done reset", _we)
 
-        t = _thr.Thread(target=_run, name="manual-id-backfill", daemon=True)
-        self._manual_backfill_thread = t
-        t.start()
+        task_id = f"manual-id-backfill-{uuid.uuid4().hex}"
+        try:
+            with admitted_operation(
+                self,
+                owner="metadata-maintenance",
+                label="Recover manual video IDs",
+                task_id=task_id,
+                cancel=cancel,
+            ):
+                admission = try_global_archive_lease(
+                    owner="metadata-maintenance",
+                    label="Recover manual video IDs",
+                    task_id=task_id,
+                    cancel=cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    return lease_busy_result(admission)
+                lease = admission.lease
+                try:
+                    t = start_managed_task(
+                        self,
+                        owner="metadata-maintenance",
+                        label="Recover manual video IDs",
+                        task_id=task_id,
+                        cancel=cancel,
+                        target=_run,
+                        name="manual-id-backfill",
+                        thread_factory=_thr.Thread,
+                    )
+                except Exception:
+                    lease.release()
+                    raise
+                self._manual_backfill_thread = t
+        except WorkAdmissionClosed as exc:
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "started": True, "dry_run": bool(dry_run)}
 
     def manual_backfill_ids_cancel(self):
@@ -1486,14 +2214,102 @@ class BrowseMixin:
         except Exception as e:
             swallow("review remove", e)
 
+    def _manual_review_has_filepath(self, filepath):
+        """True only for an exact path in the current review queue."""
+        try:
+            from backend.metadata.manual_backfill import REVIEW_FILE
+            if not REVIEW_FILE.exists():
+                return False
+            wanted = _real_norm(filepath)
+            if not wanted:
+                return False
+            import json as _json
+            for line in REVIEW_FILE.read_text(
+                    encoding="utf-8", errors="replace").splitlines():
+                try:
+                    item = _json.loads(line)
+                except Exception:
+                    continue
+                if _real_norm(item.get("filepath") or "") == wanted:
+                    return True
+        except Exception as e:
+            _log.debug("manual review authorization failed: %s", e)
+        return False
+
+    def _manual_registration_path_is_trusted(self, filepath):
+        """Authorize fallback registration without trusting a JS path."""
+        if file_ops.assert_within_managed_roots(filepath).get("ok"):
+            return True
+        wanted = _real_norm(filepath)
+        if not wanted:
+            return False
+        cfg = self._browse_config() or {}
+        return any(
+            _real_norm(item.get("filepath") or "") == wanted
+            for item in (cfg.get("recent_downloads") or [])
+            if isinstance(item, dict)
+        )
+
     def manual_backfill_apply_pick(self, filepath, video_id, channel="", title=""):
+        """Apply a review choice under one admitted, archive-owned job."""
+        if not filepath or not video_id:
+            return {"ok": False,
+                    "error": "YTArchiver could not identify that video."}
+        if not os.path.isfile(filepath):
+            return {"ok": False, "error": "file not found"}
+        if not self._manual_review_has_filepath(filepath):
+            return {
+                "ok": False,
+                "error": (
+                    "That file is not in the current pending review. Refresh "
+                    "the review list and try again."
+                ),
+            }
+        task_id = f"manual-review-metadata-{uuid.uuid4().hex}"
+        cancel = threading.Event()
+        try:
+            with admitted_operation(
+                self,
+                owner="metadata-maintenance",
+                label="Apply manual video match",
+                task_id=task_id,
+                cancel=cancel,
+            ):
+                admission = try_global_archive_lease(
+                    owner="metadata-maintenance",
+                    label="Apply manual video match",
+                    task_id=task_id,
+                    cancel=cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    return lease_busy_result(admission)
+                lease = admission.lease
+                try:
+                    result = self._manual_backfill_apply_pick_owned(
+                        filepath,
+                        video_id,
+                        channel,
+                        title,
+                        task_id=task_id,
+                        cancel=cancel,
+                    )
+                finally:
+                    lease.release()
+                return result
+        except WorkAdmissionClosed as exc:
+            return {"ok": False, "started": False, "error": str(exc)}
+
+    def _manual_backfill_apply_pick_owned(
+            self, filepath, video_id, channel="", title="", *, task_id,
+            cancel):
         """User picked a candidate for an ambiguous manual download: register
         it with that id, queue its metadata refresh, and drop it from the
         review list. The slow network metadata fetch runs in the background so
         the picker can advance immediately."""
         try:
             if not filepath or not video_id:
-                return {"ok": False, "error": "missing filepath or video_id"}
+                return {"ok": False,
+                        "error": "YTArchiver could not identify that video."}
             if not os.path.isfile(filepath):
                 return {"ok": False, "error": "file not found"}
             from backend import index as _idx
@@ -1501,23 +2317,52 @@ class BrowseMixin:
             wrote = _idx.set_manual_video_id(
                 filepath, video_id, url, channel=channel or "")
             if not wrote:
-                _idx.register_video(
+                if not self._manual_registration_path_is_trusted(filepath):
+                    return {
+                        "ok": False,
+                        "error": (
+                            "That video is outside the configured library and "
+                            "is not a recorded manual download."
+                        ),
+                    }
+                wrote = _idx.register_video(
                     filepath, channel or "Single Videos",
                     title or os.path.splitext(os.path.basename(filepath))[0],
                     video_id=video_id)
+                if not wrote:
+                    return {"ok": False,
+                            "error": "Could not update the video catalog."}
             self._manual_review_remove(filepath)
             try: self._push_recent_refresh()
             except Exception as e: swallow("review-pick refresh", e)
 
             def _fetch_after_pick():
+                worker_lease = None
                 try:
+                    if cancel.is_set():
+                        return
+                    worker_admission = try_global_archive_lease(
+                        owner="metadata-maintenance",
+                        label="Refresh matched manual video metadata",
+                        task_id=task_id,
+                        cancel=cancel,
+                    )
+                    if (not worker_admission.ok
+                            or worker_admission.lease is None):
+                        return
+                    worker_lease = worker_admission.lease
                     from backend.metadata import fetch_single_video_metadata
                     fetch_single_video_metadata(
                         {"name": channel or "Single Videos",
                          "split_years": False, "split_months": False},
                         video_id, filepath, title or "", self._browse_log_stream(),
                         emit_inline_log=False, refresh=True,
-                        dest_folder=os.path.dirname(filepath))
+                        dest_folder=os.path.dirname(filepath),
+                        cancel_event=cancel,
+                        process_owner="metadata-maintenance",
+                        process_task_id=task_id)
+                    if cancel.is_set():
+                        return
                     try:
                         from backend import utils as _u
                         _u.hide_stray_sidecars(
@@ -1528,17 +2373,30 @@ class BrowseMixin:
                 except Exception as e:
                     swallow("review-pick metadata fetch", e)
                 finally:
-                    try: self._push_recent_refresh()
-                    except Exception as e: swallow("review-pick metadata push", e)
+                    try:
+                        if not cancel.is_set():
+                            self._push_recent_refresh()
+                    except Exception as e:
+                        swallow("review-pick metadata push", e)
+                    finally:
+                        if worker_lease is not None:
+                            worker_lease.release()
 
             try:
-                threading.Thread(
+                start_managed_task(
+                    self,
+                    owner="metadata-maintenance",
+                    label="Refresh matched manual video metadata",
+                    task_id=task_id,
+                    cancel=cancel,
                     target=_fetch_after_pick,
                     name="manual-review-metadata",
-                    daemon=True,
-                ).start()
+                    thread_factory=threading.Thread,
+                )
             except Exception as e:
                 swallow("review-pick metadata thread", e)
+                return {"ok": False, "error": str(e),
+                        "metadata_started": False}
             return {"ok": True, "metadata_started": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -1553,7 +2411,8 @@ class BrowseMixin:
 
 
     def browse_search(self, query, channel=None, limit=200, sort="relevance",
-                      year_from=None, year_to=None):
+                      year_from=None, year_to=None,
+                      date_from_ts=None, date_to_ts=None):
         """FTS5 search across transcript segments.
 
         `channel` accepts either a single channel-folder string, a list
@@ -1571,11 +2430,14 @@ class BrowseMixin:
         """
         return index_backend.search_fts(query, channel=channel,
                                          limit=limit, sort=sort,
-                                         year_from=year_from, year_to=year_to)
+                                         year_from=year_from, year_to=year_to,
+                                         date_from_ts=date_from_ts,
+                                         date_to_ts=date_to_ts)
 
 
     def browse_search_titles(self, query, channel=None, limit=200, sort="newest",
-                             year_from=None, year_to=None):
+                             year_from=None, year_to=None,
+                             date_from_ts=None, date_to_ts=None):
         """Global video search by title across every channel (or a
         subset). `channel` follows the same accept-string-or-list rule
         as `browse_search` so the new search UI can apply its channel
@@ -1590,7 +2452,8 @@ class BrowseMixin:
         """
         return index_backend.search_video_titles(
             query, channel=channel, limit=limit, sort=sort,
-            year_from=year_from, year_to=year_to)
+            year_from=year_from, year_to=year_to,
+            date_from_ts=date_from_ts, date_to_ts=date_to_ts)
 
 
     def browse_graph(self, word, channel=None, bucket="month", normalize=False):
@@ -1659,7 +2522,19 @@ class BrowseMixin:
         """
         try:
             res = index_backend.top_words(channel=channel, top_n=int(top_n or 120))
-            return {"ok": True, "words": res}
+            from backend.index_graph import (
+                TOP_WORDS_SAMPLE_LABEL,
+                TOP_WORDS_SAMPLE_LIMIT,
+            )
+            return {
+                "ok": True,
+                "words": res,
+                "sampling": {
+                    "limited": True,
+                    "limit": TOP_WORDS_SAMPLE_LIMIT,
+                    "label": TOP_WORDS_SAMPLE_LABEL,
+                },
+            }
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -1677,7 +2552,8 @@ class BrowseMixin:
             return {"ok": False, "error": str(e)}
 
 
-    def browse_resolve_segment(self, jsonl_path, video_id=None, title=None):
+    def browse_resolve_segment(self, jsonl_path, video_id=None, title=None,
+                               channel_hint=None):
         """Given a transcript segment's .jsonl_path (from FTS search results),
         resolve the actual video file sitting next to it so the Watch view
         can be opened with a proper filepath.
@@ -1687,6 +2563,26 @@ class BrowseMixin:
         """
         try:
             out = {"ok": False}
+            # Prefer the catalog identity when one exists. A transcript may
+            # live under an optional year folder, so the immediate parent of
+            # the media file is not always the channel. Looking up the same
+            # video id also lets us decide whether a former/manual channel is
+            # still a current subscription without changing the long-lived
+            # frontend bridge call shape.
+            catalog_row = None
+            if video_id:
+                try:
+                    from backend.index import _reader_lock, _reader_open
+                    rconn = _reader_open()
+                    if rconn is not None:
+                        with _reader_lock:
+                            catalog_row = rconn.execute(
+                                "SELECT filepath, title, channel FROM videos "
+                                "WHERE video_id=? LIMIT 1",
+                                (video_id,),
+                            ).fetchone()
+                except Exception:
+                    catalog_row = None
             jp = os.path.normpath(jsonl_path or "")
             if jp and os.path.isfile(jp):
                 base = os.path.splitext(jp)[0]
@@ -1702,10 +2598,15 @@ class BrowseMixin:
                         # (audit: browse_mixin H2). Standard layout
                         # is <output_dir>/<channel>/<file>, so the
                         # parent folder name is the channel.
-                        _ch_guess = ""
+                        _ch_guess = str(
+                            channel_hint
+                            or (catalog_row[2] if catalog_row else "")
+                            or ""
+                        ).strip()
                         try:
-                            _ch_guess = os.path.basename(
-                                os.path.dirname(cand)) or ""
+                            if not _ch_guess:
+                                _ch_guess = os.path.basename(
+                                    os.path.dirname(cand)) or ""
                         except Exception:
                             pass
                         return {
@@ -1714,30 +2615,28 @@ class BrowseMixin:
                             "title": title or os.path.basename(base),
                             "channel": _ch_guess,
                             "video_id": video_id or "",
+                            "tracked": self._browse_channel_is_tracked(
+                                _ch_guess),
                         }
             # Fallback — search the videos table by video_id.
             # Use the reader connection so this lookup doesn't queue
             # behind sweep / ingest_jsonl writers holding `_db_lock`.
             if video_id:
-                from backend.index import _reader_lock, _reader_open
-                rconn = _reader_open()
-                if rconn is not None:
-                    with _reader_lock:
-                        row = rconn.execute(
-                            "SELECT filepath, title, channel FROM videos WHERE video_id=? LIMIT 1",
-                            (video_id,),
-                        ).fetchone()
-                    if row and row[0] and os.path.isfile(row[0]):
-                        guard = file_ops.assert_within_managed_roots(row[0])
-                        if not guard.get("ok"):
-                            return guard
-                        return {
-                            "ok": True,
-                            "filepath": row[0],
-                            "title": row[1] or title or "",
-                            "channel": row[2] or "",
-                            "video_id": video_id,
-                        }
+                if catalog_row and catalog_row[0] and os.path.isfile(
+                        catalog_row[0]):
+                    guard = file_ops.assert_within_managed_roots(
+                        catalog_row[0])
+                    if not guard.get("ok"):
+                        return guard
+                    return {
+                        "ok": True,
+                        "filepath": catalog_row[0],
+                        "title": catalog_row[1] or title or "",
+                        "channel": catalog_row[2] or "",
+                        "video_id": video_id,
+                        "tracked": self._browse_channel_is_tracked(
+                            catalog_row[2] or ""),
+                    }
             out["error"] = "Video file not found"
             return out
         except Exception as e:
@@ -1883,6 +2782,7 @@ class BrowseMixin:
         seen: set[str] = set()
         duplicate_index_paths: set[str] = set()
         folder_fallback_paths: set[str] = set()
+        index_error = ""
 
         # 1. Index-registered single downloads (any location on disk).
         #    include_thumbs=False is CRITICAL: the per-row channel-wide
@@ -1899,7 +2799,8 @@ class BrowseMixin:
                 }
             except Exception:
                 duplicate_index_paths = set()
-            for r in _idx.list_manual_videos(include_thumbs=False):
+            for r in _idx.list_manual_videos(
+                    include_thumbs=False, report_errors=True):
                 fp = r.get("filepath") or ""
                 if not fp:
                     continue
@@ -1912,6 +2813,7 @@ class BrowseMixin:
                 rows.append(r)
         except Exception as e:
             _log.debug("list_manual_videos index query failed: %s", e)
+            index_error = str(e) or "Search index is unavailable."
 
         # 2. Folder-walk video_out_dir for any not-yet-indexed files.
         #    Root-only by design; subfolders under this parent include channel
@@ -2018,11 +2920,19 @@ class BrowseMixin:
             if tx in ("failed", "error"):
                 badges.append({"label": "Transcript failed", "kind": "bad"})
             elif tx == "no_speech":
-                badges.append({"label": "No transcript", "kind": "neutral"})
+                badges.append({"label": "No speech", "kind": "neutral"})
             elif tx not in ("transcribed", "done"):
                 badges.append({"label": "No transcript", "kind": "bad"})
             if badges:
                 r["manual_badges"] = badges
 
-        return {"rows": page, "has_more": has_more, "folder": folder,
-                "total": len(rows)}
+        result = {"rows": page, "has_more": has_more, "folder": folder,
+                  "total": len(rows)}
+        if index_error:
+            if rows:
+                result["warning"] = (
+                    "Some manual downloads may be missing because the "
+                    f"Search index could not be read: {index_error}")
+            else:
+                result["error"] = index_error
+        return result

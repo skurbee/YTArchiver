@@ -33,18 +33,29 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
+  function visibleModalOpen() {
+    const isVisible = window.YT?.modals?.isVisible;
+    return Array.from(document.querySelectorAll(".askq-backdrop"))
+      .some((el) => {
+        if (typeof isVisible === "function") return isVisible(el);
+        if (el.hidden || el.getAttribute?.("aria-hidden") === "true") return false;
+        const st = window.getComputedStyle?.(el);
+        return !st || (st.display !== "none" && st.visibility !== "hidden");
+      });
+  }
+
   function initKeyboardShortcuts() {
     document.addEventListener("keydown", (e) => {
-      const tag = e.target.tagName;
+      const tag = e.target?.tagName;
       const editing = tag === "INPUT" || tag === "TEXTAREA" ||
-                      e.target.isContentEditable;
+                      !!e.target?.isContentEditable;
       const key = (e.key && e.key.length === 1)
         ? e.key.toLowerCase() : e.key;
 
       // When ANY modal is open (askq backdrop), every shortcut except
       // Esc/Enter is blocked. Modals own input focus — Ctrl+S firing
       // Sync while a "Delete files?" confirm is up was a real footgun.
-      const _modalOpen = !!document.querySelector(".askq-backdrop");
+      const _modalOpen = visibleModalOpen();
       if (_modalOpen && e.key !== "Escape" && e.key !== "Enter") {
         return;
       }

@@ -30,6 +30,7 @@
     .replace(/[&<>"']/g, (ch) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
     }[ch])));
+  const displayText = window.YT?.util?.displayText || ((s) => String(s ?? ""));
   function bridgeCall(method, ...args) {
     const fn = window.YT?.bridge?.bridgeCall;
     if (fn) return fn(method, ...args);
@@ -52,7 +53,30 @@
     query: "",
     title: "",
     seq: 0,
+    loading: false,
   };
+  let _searchOpenSeq = 0;
+
+  function _setSearchViewerLoading(loading) {
+    _searchViewerState.loading = !!loading;
+    const bEarly = document.getElementById("search-viewer-earlier");
+    const bLater = document.getElementById("search-viewer-later");
+    if (bEarly) bEarly.disabled = !!loading;
+    if (bLater) bLater.disabled = !!loading;
+  }
+
+  function _resetSearchViewerPane() {
+    const body = document.getElementById("search-viewer-body");
+    const title = document.getElementById("search-viewer-title");
+    const meta = document.getElementById("search-viewer-meta");
+    const bEarly = document.getElementById("search-viewer-earlier");
+    const bLater = document.getElementById("search-viewer-later");
+    if (body) body.innerHTML = "";
+    if (title) title.textContent = "Select a result to read";
+    if (meta) meta.textContent = "";
+    if (bEarly) bEarly.hidden = true;
+    if (bLater) bLater.hidden = true;
+  }
 
   async function _loadSearchViewer(resultRow, query) {
     const body = document.getElementById("search-viewer-body");
@@ -61,8 +85,48 @@
     const bEarly = document.getElementById("search-viewer-earlier");
     const bLater = document.getElementById("search-viewer-later");
     if (!body || !titleEl) return;
+    // A title-table hit identifies a video, not a transcript segment. Asking
+    // browse_search_context for an absent segment_id produces the technically
+    // accurate but misleading "Segment not found" message. Keep the useful
+    // double-click action on the result row and explain the single-click state
+    // without making a backend call that cannot succeed.
+    const hasSegmentId = resultRow?.segment_id !== undefined
+      && resultRow?.segment_id !== null
+      && String(resultRow.segment_id).trim() !== "";
+    if (resultRow?._match_kind === "title" || !hasSegmentId) {
+      _searchViewerState.seq++;
+      _searchViewerState.segmentId = null;
+      _searchViewerState.before = 30;
+      _searchViewerState.after = 30;
+      _searchViewerState.query = query || "";
+      _searchViewerState.title = resultRow?.title || "";
+      _searchViewerState._videoId = resultRow?.video_id || "";
+      _searchViewerState._jsonlPath = resultRow?.jsonl_path || "";
+      _searchViewerState._channel = resultRow?.channel || "";
+      _setSearchViewerLoading(false);
+      titleEl.textContent = displayText(resultRow?.title || "(untitled)");
+      if (metaEl) {
+        metaEl.textContent = resultRow?.channel
+          ? `${displayText(resultRow.channel)} \u00b7 Title match`
+          : "Title match";
+      }
+      if (bEarly) bEarly.hidden = true;
+      if (bLater) bLater.hidden = true;
+      body.innerHTML = "";
+      const message = document.createElement("div");
+      message.className = "browse-empty";
+      message.textContent = "No transcript available for this title match. "
+        + "Double-click to open the video.";
+      body.appendChild(message);
+      return;
+    }
     if (!nativeBridgeUp()) {
-      body.innerHTML = '<div class="browse-empty">Viewer pane requires native mode.</div>';
+      _searchViewerState.seq++;
+      _searchViewerState.segmentId = null;
+      _setSearchViewerLoading(false);
+      if (bEarly) bEarly.hidden = true;
+      if (bLater) bLater.hidden = true;
+      body.innerHTML = '<div class="browse-empty">The transcript viewer isn\'t ready yet. Try again in a moment.</div>';
       return;
     }
     _searchViewerState.segmentId = resultRow.segment_id;
@@ -74,9 +138,10 @@
     _searchViewerState._jsonlPath = resultRow.jsonl_path || "";
     _searchViewerState._channel = resultRow.channel || "";
 
-    titleEl.textContent = resultRow.title || "(untitled)";
-    metaEl.textContent = `${resultRow.channel || ""} \u00b7 ${_formatTs(resultRow.start_time)}`;
+    titleEl.textContent = displayText(resultRow.title || "(untitled)");
+    metaEl.textContent = `${displayText(resultRow.channel)} \u00b7 ${_formatTs(resultRow.start_time)}`;
     const mySeq = ++_searchViewerState.seq;
+    _setSearchViewerLoading(true);
     if (bEarly) bEarly.hidden = true;
     if (bLater) bLater.hidden = true;
     body.innerHTML = '<div class="browse-empty search-loading">Loading context\u2026</div>';
@@ -91,10 +156,12 @@
       });
     } catch (e) {
       if (mySeq !== _searchViewerState.seq) return;
+      _setSearchViewerLoading(false);
       body.innerHTML = `<div class="browse-empty">Error: ${escapeHtml(String(e))}</div>`;
       return;
     }
     if (mySeq !== _searchViewerState.seq) return;
+    _setSearchViewerLoading(false);
     if (!ctx?.ok) {
       body.innerHTML = `<div class="browse-empty">${escapeHtml(ctx?.error || "No context available.")}</div>`;
       return;
@@ -191,28 +258,59 @@
     }
   }
 
-  function _openSearchResultInWatch(state, seg) {
+  async function _openResolvedSearchHit(hit, seekTo, query) {
     if (!nativeBridgeUp()) return;
-    bridgeCall("browse_resolve_segment", state._jsonlPath || "",
-                               state._videoId || "",
-                               state.title || "").then((res) => {
+    // Copy every field before awaiting. The viewer state object is reused
+    // for each selection, so retaining it here let a late A response mix
+    // A's resolved file with B's title/video id.
+    const snapshot = {
+      jsonlPath: hit?.jsonl_path || hit?._jsonlPath || "",
+      videoId: hit?.video_id || hit?._videoId || "",
+      title: hit?.title || "",
+      channel: hit?.channel || hit?._channel || "",
+      seekTo: Number(seekTo) || 0,
+      query: String(query || ""),
+    };
+    const openSeq = ++_searchOpenSeq;
+    const intentToken = window._reserveWatchOpenIntent?.();
+    const originSubmode = window._browseState?.submode;
+    const browseTab = document.querySelector('.tab[data-tab="browse"]');
+    const originWasActive = !!browseTab?.classList.contains("active");
+    const originIsCurrent = () =>
+      (!originWasActive || !!browseTab?.classList.contains("active"))
+      && (!originSubmode || window._browseState?.submode === originSubmode);
+    try {
+      const res = await bridgeCall("browse_resolve_segment",
+        snapshot.jsonlPath, snapshot.videoId, snapshot.title);
+      if (openSeq !== _searchOpenSeq) return;
+      if (Number.isFinite(intentToken)
+          && !window._isWatchOpenIntentCurrent?.(intentToken)) return;
+      if (!originIsCurrent()) return;
       if (!res?.ok || !res.filepath) {
-        window._showToast?.("Couldn't resolve source video.", "warn");
+        window._showToast?.(
+          res?.error || "Couldn't resolve source video.", "warn");
         return;
       }
-      // feature F5: pass the active search query through so the Watch
-      // view can auto-pre-fill the transcript Find box, letting the
-      // user jump between hits of THIS video's transcript with
-      // Enter / Shift+Enter.
-      window._openVideoInWatch({
+      if (typeof window._openVideoInWatch !== "function") {
+        window._showToast?.("Watch view is not ready yet.", "warn");
+        return;
+      }
+      // Use the one canonical Watch opener. It owns transcript loading,
+      // the Watch navigation token, source loading and seek handling.
+      await window._openVideoInWatch({
         filepath: res.filepath,
-        title: state.title,
-        channel: state._channel || res.channel || "",
-        video_id: state._videoId || res.video_id || "",
-        _seek_to: Number(seg.s) || 0,
-        _search_query: state.query || _searchViewerState.query || "",
-      });
-    }).catch((err) => {
+        title: res.title || snapshot.title,
+        channel: res.channel || snapshot.channel,
+        video_id: res.video_id || snapshot.videoId,
+        tracked: res.tracked !== false,
+        _seek_to: snapshot.seekTo,
+        _search_query: snapshot.query,
+      }, { intentToken });
+    } catch (err) {
+      if (openSeq !== _searchOpenSeq) return;
+      if (Number.isFinite(intentToken)
+          && !window._isWatchOpenIntentCurrent?.(intentToken)) return;
+      if (!originIsCurrent()) return;
       // surface resolve failures so the user sees WHY a
       // segment click did nothing. Old .catch(() => {}) silently
       // ate every error (missing file, backend exception, network)
@@ -221,7 +319,51 @@
       window._showToast?.(
         `Could not open segment: ${err?.message || err || "unknown error"}`,
         "error");
-    });
+    }
+  }
+
+  function _openSearchResultInWatch(state, seg) {
+    _openResolvedSearchHit(state, seg?.s, state?.query);
+  }
+
+  async function _expandSearchViewer(beforeDelta, afterDelta, direction) {
+    if (!_searchViewerState.segmentId || _searchViewerState.loading) return;
+    const request = {
+      segmentId: _searchViewerState.segmentId,
+      before: _searchViewerState.before + beforeDelta,
+      after: _searchViewerState.after + afterDelta,
+      query: _searchViewerState.query,
+    };
+    const mySeq = ++_searchViewerState.seq;
+    _setSearchViewerLoading(true);
+    let ctx;
+    try {
+      ctx = await bridgeCall("browse_search_context", {
+        segment_id: request.segmentId,
+        before: request.before,
+        after: request.after,
+        query: request.query,
+      });
+    } catch (e) {
+      if (mySeq !== _searchViewerState.seq) return;
+      _setSearchViewerLoading(false);
+      window._showToast?.(`Couldn't load ${direction} context: ${e}`, "error");
+      return;
+    }
+    if (mySeq !== _searchViewerState.seq) return;
+    _setSearchViewerLoading(false);
+    if (!ctx?.ok) {
+      window._showToast?.(
+        ctx?.error || `Couldn't load ${direction} context.`, "error");
+      return;
+    }
+    _searchViewerState.before = request.before;
+    _searchViewerState.after = request.after;
+    _renderSearchViewer(ctx, request.segmentId);
+    const bEarly = document.getElementById("search-viewer-earlier");
+    const bLater = document.getElementById("search-viewer-later");
+    if (bEarly) bEarly.hidden = !ctx.before_more;
+    if (bLater) bLater.hidden = !ctx.after_more;
   }
 
   function _initSearchViewerLoadMore() {
@@ -237,42 +379,10 @@
     // isn't injected yet, so a captured reference would be a stale
     // undefined when the buttons are actually clicked later.
     document.getElementById("search-viewer-earlier")?.addEventListener("click", async () => {
-      if (!_searchViewerState.segmentId) return;
-      _searchViewerState.before += 30;
-      try {
-        const ctx = await bridgeCall("browse_search_context", {
-          segment_id: _searchViewerState.segmentId,
-          before: _searchViewerState.before,
-          after: _searchViewerState.after,
-          query: _searchViewerState.query,
-        });
-        if (ctx?.ok) {
-          _renderSearchViewer(ctx, _searchViewerState.segmentId);
-          document.getElementById("search-viewer-earlier").hidden = !ctx.before_more;
-          document.getElementById("search-viewer-later").hidden = !ctx.after_more;
-        }
-      } catch (e) {
-        window._showToast?.("Couldn't load earlier context: " + e, "error");
-      }
+      await _expandSearchViewer(30, 0, "earlier");
     });
     document.getElementById("search-viewer-later")?.addEventListener("click", async () => {
-      if (!_searchViewerState.segmentId) return;
-      _searchViewerState.after += 30;
-      try {
-        const ctx = await bridgeCall("browse_search_context", {
-          segment_id: _searchViewerState.segmentId,
-          before: _searchViewerState.before,
-          after: _searchViewerState.after,
-          query: _searchViewerState.query,
-        });
-        if (ctx?.ok) {
-          _renderSearchViewer(ctx, _searchViewerState.segmentId);
-          document.getElementById("search-viewer-earlier").hidden = !ctx.before_more;
-          document.getElementById("search-viewer-later").hidden = !ctx.after_more;
-        }
-      } catch (e) {
-        window._showToast?.("Couldn't load later context: " + e, "error");
-      }
+      await _expandSearchViewer(0, 30, "later");
     });
   }
 
@@ -311,12 +421,17 @@
     const handler = async (e) => {
       e.preventDefault();
       if (!nativeBridgeUp()) {
-        window._showToast?.("Native mode required.", "warn");
+        window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
         return;
       }
-      window._showToast?.("Rescanning archive for new transcripts\u2026", "ok");
       try {
-        await bridgeCall("archive_rescan");
+        const result = await bridgeCall("archive_rescan");
+        if (!result?.ok || result?.started === false) {
+          window._showToast?.(
+            result?.error || "Rescan did not start.", "error");
+          return;
+        }
+        window._showToast?.("Archive rescan started.", "ok");
         // Poll until the rescan clears the unindexed count or times out.
         let tries = 0;
         const tick = async () => {
@@ -358,6 +473,14 @@
     let _searchSeq = 0;
     const doSearch = async () => {
       const myId = ++_searchSeq;
+      // A new result set invalidates context and file-resolution work from
+      // the previous one. Otherwise an old double-click can finish later
+      // and unexpectedly open a video that is no longer on screen.
+      _searchOpenSeq++;
+      _searchViewerState.seq++;
+      _searchViewerState.segmentId = null;
+      _setSearchViewerLoading(false);
+      _resetSearchViewerPane();
       const q = (input?.value || "").trim();
       if (!q) {
         results.innerHTML = '<div class="browse-empty">Type a query and press Search or Enter.</div>';
@@ -368,7 +491,8 @@
                           '<div class="browse-empty">Searching\u2026</div>';
       counter.textContent = "\u2026";
       if (!nativeBridgeUp()) {
-        results.innerHTML = '<div class="browse-empty">Search requires native mode.</div>';
+        results.innerHTML = '<div class="browse-empty">Search isn\'t ready yet. Try again in a moment.</div>';
+        counter.textContent = "Search unavailable";
         return;
       }
       // Read what + where from the new search UI.
@@ -422,38 +546,90 @@
         if (_fEl) _fEl.value = String(yearFrom);
         if (_tEl) _tEl.value = String(yearTo);
       }
+      let exactRange = window._searchExactDateRange || null;
+      if (exactRange && String(exactRange.query || "") !== q) {
+        exactRange = null;
+        window._searchExactDateRange = null;
+      }
+      const dateFromTs = Number.isFinite(Number(exactRange?.fromTs))
+        ? Number(exactRange.fromTs) : null;
+      const dateToTs = Number.isFinite(Number(exactRange?.toTs))
+        ? Number(exactRange.toTs) : null;
       try {
-        const promises = [];
-        // Transcripts leg — FTS5 against segments.
-        if (wantTranscripts) {
-          promises.push(
-            Promise.resolve(bridgeCall("browse_search", q, selectedChannels, 200, sortKey, yearFrom, yearTo))
-              .then(rs => (rs || []).map(r => ({ ...r, _match_kind: "transcript" })))
-              .catch(() => [])
-          );
-        } else {
-          promises.push(Promise.resolve([]));
-        }
-        // Titles leg — videos table LIKE search, re-shaped to look
-        // like a transcript hit so the renderer below stays unified.
-        if (wantTitles) {
-          promises.push(
-            Promise.resolve(bridgeCall("browse_search_titles", q, selectedChannels, 200, sortKeyTitles, yearFrom, yearTo))
-              .then(rs => (rs || []).map(r => ({
+        const runLeg = async (enabled, label, call, mapRow) => {
+          if (!enabled) return { rows: [], error: null, skipped: true, label };
+          try {
+            const response = await call();
+            if (!Array.isArray(response)) {
+              throw new Error(response?.error || "Invalid response from search service");
+            }
+            return {
+              rows: response.map(mapRow), error: null, skipped: false, label,
+            };
+          } catch (error) {
+            return { rows: [], error, skipped: false, label };
+          }
+        };
+        // Keep failures separate from legitimate empty result sets. With
+        // both boxes checked, one failed leg used to become [] and the UI
+        // quietly presented the other leg as a complete search.
+        const outcome = await window.YT.bridge.catalogRead(
+          "search",
+          async (context) => {
+            // The backend serializes these catalog reads on one connection.
+            // Run the selected legs one at a time so a combined search does
+            // not create two Python calls that merely wait on each other.
+            const txResult = await runLeg(
+              wantTranscripts,
+              "Transcript search",
+              () => bridgeCall("browse_search", q, selectedChannels, 200,
+                               sortKey, yearFrom, yearTo,
+                               dateFromTs, dateToTs),
+              r => ({ ...r, _match_kind: "transcript" }));
+            if (!context.isCurrent()) return null;
+            const tiResult = await runLeg(
+              wantTitles,
+              "Title search",
+              () => bridgeCall("browse_search_titles", q, selectedChannels, 200,
+                               sortKeyTitles, yearFrom, yearTo,
+                               dateFromTs, dateToTs),
+              r => ({
                 ...r,
                 text: r.title || "",
-                snippet: escapeHtml(r.title || ""),
+                // The renderer below uses text nodes. Pre-escaping here made
+                // an ordinary title such as "A & B" display as "A &amp; B".
+                snippet: r.title || "",
                 start_time: 0,
                 jsonl_path: "",
                 _match_kind: "title",
-              })))
-              .catch(() => [])
-          );
-        } else {
-          promises.push(Promise.resolve([]));
-        }
-        const [txRows, tiRows] = await Promise.all(promises);
-        if (myId !== _searchSeq) return; // user kicked off a newer search; drop stale results
+              }));
+            return { txResult, tiResult };
+          },
+          {
+            label: "search results",
+            onStatus: (status) => {
+              if (status.phase === "done" || myId !== _searchSeq) return;
+              const loading = results.querySelector(".browse-empty");
+              if (loading) loading.textContent = status.phase === "loading"
+                ? "Searching…"
+                : status.text;
+              if (status.phase === "slow") {
+                counter.textContent = `Waiting ${Math.floor(status.elapsedMs / 1000)}s`;
+              }
+            },
+          });
+        if (outcome.stale || myId !== _searchSeq || !outcome.value) return;
+        const { txResult, tiResult } = outcome.value;
+        const txRows = txResult.rows;
+        const tiRows = tiResult.rows;
+        const legFailures = [txResult, tiResult]
+          .filter(result => !result.skipped && result.error);
+        const failureSummary = legFailures.map((result) => {
+          const detail = result.error?.message || String(result.error || "unknown error");
+          return `${result.label} failed: ${detail}`;
+        }).join("; ");
+        const requestedLegCount = [txResult, tiResult]
+          .filter(result => !result.skipped).length;
         // Each leg is server-capped at 200 rows. If a leg came back full,
         // there are almost certainly more matches than we're showing — flag
         // it so the count reads "N+ … (capped)" instead of implying N is the
@@ -488,9 +664,6 @@
             return _cmpStr(a.video_id, b.video_id);
           });
         }
-        // Surface a backend-shaped error row if either leg returned one.
-        const errRow = rows.find(r => r && r.error);
-        if (errRow) rows = [errRow];
         // When BOTH legs ran, the per-row renderer below prepends a
         // tiny [title]/[transcript] badge to the snippet so the user
         // can tell the source at a glance. Single-leg searches stay
@@ -503,27 +676,34 @@
         // noise. Build the badge as a real DOM element down in the
         // render loop instead, keying off r._match_kind.
         const bothLegs = wantTranscripts && wantTitles;
-        if (!Array.isArray(rows) || rows.length === 0 || (rows[0] && rows[0].error)) {
-          const errMsg = (rows && rows[0] && rows[0].error) ? `Search error: ${rows[0].error}` : "No matches.";
+        if (!Array.isArray(rows) || rows.length === 0) {
+          let errMsg = "No matches.";
+          if (legFailures.length === requestedLegCount) {
+            errMsg = `Search failed. ${failureSummary}. Please try again.`;
+          } else if (legFailures.length) {
+            errMsg = `No matches in the available results. ${failureSummary}.`;
+          }
           results.innerHTML = `<div class="browse-empty">${escapeHtml(errMsg)}</div>`;
-          counter.textContent = "0 matches";
+          counter.textContent = legFailures.length ? "Search incomplete" : "0 matches";
           // Clear the right-hand reader pane — otherwise the previously
           // selected result's transcript lingers next to a "No matches".
-          const _vBody = document.getElementById("search-viewer-body");
-          const _vTitle = document.getElementById("search-viewer-title");
-          const _vMeta = document.getElementById("search-viewer-meta");
-          if (_vBody) _vBody.innerHTML = "";
-          if (_vTitle) _vTitle.textContent = "Select a result to read";
-          if (_vMeta) _vMeta.textContent = "";
-          const _vEarlier = document.getElementById("search-viewer-earlier");
-          if (_vEarlier) _vEarlier.hidden = true;
+          _resetSearchViewerPane();
           return;
         }
         const _matchWord = rows.length === 1 ? "match" : "matches";
-        counter.textContent = capped
+        counter.textContent = (capped
           ? `${rows.length.toLocaleString()}+ ${_matchWord} (capped)`
-          : `${rows.length.toLocaleString()} ${_matchWord}`;
+          : `${rows.length.toLocaleString()} ${_matchWord}`)
+          + (exactRange?.label ? ` · ${exactRange.label}` : "")
+          + (legFailures.length ? " · partial" : "");
         const frag = document.createDocumentFragment();
+        if (legFailures.length) {
+          const warning = document.createElement("div");
+          warning.className = "browse-hint";
+          warning.textContent = `Some results may be missing. ${failureSummary}. `
+            + "Try the search again.";
+          frag.appendChild(warning);
+        }
         for (const r of rows) {
           const row = document.createElement("div");
           row.className = "search-result";
@@ -534,9 +714,10 @@
             </div>
             <div class="search-result-snippet"></div>
           `;
-          row.querySelector(".search-result-title").textContent = r.title || "(untitled)";
+          row.querySelector(".search-result-title").textContent =
+            displayText(r.title || "(untitled)");
           row.querySelector(".search-result-meta").textContent =
-            `${r.channel || ""} \u00b7 ${_formatTs(r.start_time)}`;
+            `${displayText(r.channel)} \u00b7 ${_formatTs(r.start_time)}`;
           // Patch B (XSS hardening): build snippet via DOM nodes
           // instead of innerHTML. FTS5 wraps matched terms in <mark>
           // tags, but the surrounding text comes from YouTube
@@ -556,7 +737,7 @@
             _snipEl.appendChild(_badge);
             _snipEl.appendChild(document.createTextNode(" "));
           }
-          const _rawSnip = r.snippet || r.text || "";
+          const _rawSnip = displayText(r.snippet || r.text || "");
           const _snipParts = _rawSnip.split(/<mark>([\s\S]*?)<\/mark>/);
           for (let _si = 0; _si < _snipParts.length; _si++) {
             if (_si % 2 === 0) {
@@ -568,84 +749,8 @@
             }
           }
           row.title = "Double-click to open in Watch view at this timestamp";
-          const openHit = async () => {
-            // Resolve the real video file (sibling of the jsonl_path) and
-            // build a Watch view that can actually play. Falls back to the
-            // transcript-only view when the video file is missing.
-            let video = {
-              title: r.title, channel: r.channel, video_id: r.video_id,
-              start_at: Number(r.start_time) || 0,
-            };
-            try {
-              const res = await bridgeCall("browse_resolve_segment",
-                r.jsonl_path || "", r.video_id || "", r.title || "");
-              if (res?.ok && res.filepath) {
-                video.filepath = res.filepath;
-                if (res.channel) video.channel = res.channel;
-              }
-            } catch { /* leave video.filepath undefined */ }
-            // Record the origin so Watch ▸ Back returns to the search
-            // results (this list-row path bypasses _openVideoInWatch, so
-            // it must set watchReturnTo itself — otherwise Back fell
-            // through to the channel grid).
-            _browseState.watchReturnTo = _browseState.submode || "search";
-            _browseState.currentVideo = video;
-            showView("watch");
-            try {
-              // NOTE: pass video_id + title ONLY (no jsonl_path). Forwarding
-              // the search hit's jsonl_path made get_segments re-normpath a
-              // stored path that mixes slashes, so the literal jsonl_path=?
-              // match missed and Watch showed "No transcript available".
-              // Letting the backend resolve its own canonical jsonl_path
-              // (as the channel-grid/bookmark paths do) fixes it.
-              const res = await bridgeCall("browse_get_transcript", {
-                video_id: r.video_id,
-                title: video.title || "",
-                channel: video.channel || r.channel || "",
-                filepath: video.filepath || "",
-              });
-              const segs = Array.isArray(res)
-                ? res
-                : (res?.segments || []);
-              const sourceInfo = (res && !Array.isArray(res)) ? (res.source || null) : null;
-              // Carry tx_status so the empty-transcript branch can show
-              // "No speech detected" for a genuinely-silent video.
-              if (res && !Array.isArray(res) && res.tx_status) {
-                video.tx_status = res.tx_status;
-              }
-              const rendered = segs.map(seg => ({
-                ts: _formatTs(seg.s), text: seg.t, words: seg.w, s: seg.s, e: seg.e,
-              }));
-              window.renderWatchView(video, rendered, sourceInfo);
-              // Seek the <video> to the hit's start_time
-              const vEl = document.getElementById("watch-video");
-              if (vEl && video.start_at > 0) {
-                const seek = () => {
-                  try { vEl.currentTime = video.start_at; vEl.play?.().catch(() => {}); }
-                  catch { /* ignore */ }
-                };
-                if (vEl.readyState >= 1) seek();
-                else vEl.addEventListener("loadedmetadata", seek, { once: true });
-              }
-              // Scroll transcript to the clicked segment. Uses the
-              // container-local scroll helper so we don't also scroll
-              // the outer .browse-view (which would push the video
-              // out of frame).
-              setTimeout(() => {
-                const tr = document.getElementById("watch-transcript");
-                if (!tr) return;
-                const segs = tr.querySelectorAll(".seg");
-                for (const s of segs) {
-                  const ts = s.querySelector(".timestamp")?.textContent || "";
-                  if (ts && ts.includes(_formatTs(r.start_time))) {
-                    window._scrollTranscriptTo?.(tr, s);
-                    s.classList.add("search-hit");
-                    break;
-                  }
-                }
-              }, 80);
-            } catch (e) { console.warn(e); }
-          };
+          const openHit = () => _openResolvedSearchHit(
+            r, r.start_time, q);
           // Single-click → load context in the right-side viewer pane
           // (stay on the Search view). Double-click → open in Watch view.
           row.addEventListener("click", () => {
@@ -660,7 +765,9 @@
         results.innerHTML = "";
         results.appendChild(frag);
       } catch (e) {
+        if (myId !== _searchSeq) return;
         results.innerHTML = `<div class="browse-empty">Search failed: ${escapeHtml(String(e))}</div>`;
+        counter.textContent = "Search failed";
       }
     };
     btn?.addEventListener("click", doSearch);
@@ -678,6 +785,9 @@
       if (e.isComposing) return;
       doSearch();
     });
+    input?.addEventListener("input", () => {
+      window._searchExactDateRange = null;
+    });
     // Re-run on sort change so the user doesn't have to re-click Search
     // every time they pick a different ordering. Only re-runs when the
     // query box has something in it — avoids a spurious search on first
@@ -692,6 +802,7 @@
     // search on each partial value. Only re-runs when the query box has text.
     ["search-year-from", "search-year-to"].forEach((id) => {
       document.getElementById(id)?.addEventListener("change", () => {
+        window._searchExactDateRange = null;
         if ((input?.value || "").trim()) doSearch();
       });
     });
@@ -792,6 +903,7 @@
     // survives panel re-renders. Empty Set = "All channels".
     const selected = new Set();
     wrap._searchSelected = selected;
+    let populateSeq = 0;
 
     const isAllMode = () => selected.size === 0;
 
@@ -801,7 +913,7 @@
         const only = Array.from(selected)[0];
         // Use the display name if we have one cached
         const row = (window._subsAllRows || []).find(r => r.folder === only);
-        label.textContent = row?.name || row?.folder || only;
+        label.textContent = displayText(row?.name || row?.folder || only);
         return;
       }
       label.textContent = `${selected.size} channels`;
@@ -811,24 +923,64 @@
       allCb.checked = isAllMode();
     };
 
+    const paintMessage = (text, isError = false) => {
+      list.innerHTML = "";
+      const message = document.createElement("div");
+      message.className = "search-channel-message";
+      if (isError) message.classList.add("is-error");
+      message.textContent = text;
+      list.appendChild(message);
+    };
+
     const populate = async () => {
+      const mySeq = ++populateSeq;
       // Snapshot the channel list. Sort alphabetically by display
       // name so the user can scan it quickly.
-      let rows = window._subsAllRows || [];
+      let rows = (window._subsAllRows || []).length
+        ? window._subsAllRows
+        : (window._browseState?.channels || []);
       if (!rows.length) {
+        paintMessage("Loading channels…");
+        if (!nativeBridgeUp()) {
+          paintMessage("The channel list isn't ready yet. Try again in a moment.", true);
+          return;
+        }
         try {
-          if (nativeBridgeUp()) {
-            const res = await bridgeCall("browse_list_channels");
-            if (Array.isArray(res)) rows = res;
+          const outcome = await window.YT.bridge.catalogRead(
+            "search-channels",
+            () => bridgeCall("browse_list_channels"),
+            {
+              label: "search channels",
+              onStatus: (status) => {
+                if (mySeq !== populateSeq || status.phase === "done") return;
+                paintMessage(status.phase === "loading"
+                  ? "Loading channels…"
+                  : status.text);
+              },
+            });
+          if (outcome.stale || mySeq !== populateSeq) return;
+          if (!Array.isArray(outcome.value)) {
+            throw new Error(outcome.value?.error || "Invalid channel-list response");
           }
-        } catch { /* leave empty */ }
+          rows = outcome.value;
+        } catch (error) {
+          if (mySeq !== populateSeq) return;
+          console.warn("search channel list:", error);
+          paintMessage("Couldn’t load channels. Close this list and try again.", true);
+          return;
+        }
       }
+      if (mySeq !== populateSeq) return;
       rows = rows
         .map(r => ({ folder: r.folder || r.name || "", name: r.name || r.folder || "" }))
         .filter(r => r.folder)
         .sort((a, b) => (a.name || a.folder).toLowerCase()
                           .localeCompare((b.name || b.folder).toLowerCase()));
       list.innerHTML = "";
+      if (!rows.length) {
+        paintMessage("No channels found.");
+        return;
+      }
       const frag = document.createDocumentFragment();
       for (const r of rows) {
         const opt = document.createElement("label");
@@ -838,7 +990,7 @@
         cb.value = r.folder;
         cb.checked = selected.has(r.folder);
         const sp = document.createElement("span");
-        sp.textContent = r.name || r.folder;
+        sp.textContent = displayText(r.name || r.folder);
         opt.appendChild(cb);
         opt.appendChild(sp);
         frag.appendChild(opt);
@@ -857,14 +1009,16 @@
       list.appendChild(frag);
     };
 
-    const open = async () => {
-      await populate();
+    const open = () => {
       panel.hidden = false;
       trigger.classList.add("is-open");
+      trigger.setAttribute("aria-expanded", "true");
+      populate();
     };
     const close = () => {
       panel.hidden = true;
       trigger.classList.remove("is-open");
+      trigger.setAttribute("aria-expanded", "false");
     };
     const toggle = (e) => {
       e.stopPropagation();
@@ -872,6 +1026,13 @@
     };
 
     trigger.addEventListener("click", toggle);
+    wrap.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape" || panel.hidden) return;
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+      trigger.focus();
+    });
 
     // Master "All channels" — checking it clears all individual
     // selections (and the empty-set state means "all"). Unchecking

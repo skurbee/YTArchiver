@@ -292,6 +292,18 @@
 .edit-field-full {
   flex: 1 1 100%;
 }
+.edit-validation-row {
+  min-height: 16px;
+  color: var(--c-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.35;
+}
+.edit-validation-row.is-error {
+  color: var(--c-log-red, #e66);
+}
+.edit-validation-row[hidden] {
+  display: none;
+}
 .edit-gl {
   color: var(--c-accent);
   font-size: var(--fs-sm);
@@ -349,6 +361,7 @@
   width: 100%;
 }
 .edit-res { width: 84px; flex: 0 0 84px; }
+#edit-folder-org { width: 132px; flex-basis: 132px; }
 .edit-num {
   width: 56px;
   flex: 0 0 56px;
@@ -368,7 +381,7 @@
 .edit-date-group > #edit-date-year { width: 56px; }
 .edit-date-group .edit-date-mm { width: 36px; }
 
-/* Compress expansion: Res / Quality / Batch dropdowns shown when checked */
+/* Compression resolution / quality controls shown when enabled */
 .edit-compress-group {
   display: inline-flex;
   align-items: center;
@@ -379,10 +392,6 @@
 }
 .edit-compress-group[hidden] { display: none; }
 .edit-compress-group .edit-dim { font-size: var(--fs-sm); }
-.edit-batch {
-  width: 54px;
-  flex: 0 0 54px;
-}
 /* Removed: dead rule. `.edit-grid { display: contents }` makes it
    a no-op layout container, so `.edit-grid .icon-btn-slim` never
    matches — global `.icon-btn-slim` styling lives in
@@ -602,6 +611,24 @@
   white-space: nowrap;
 }
 .ctx-menu-item:hover { background: var(--c-btn); }
+.ctx-menu-item.has-count {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+.ctx-menu-count {
+  min-width: 1.5em;
+  color: var(--c-text);
+  font-size: var(--fs-2xs);
+  font-variant-numeric: tabular-nums;
+  font-weight: 750;
+  text-align: right;
+}
+.ctx-menu-count.dim {
+  color: var(--c-dim);
+  font-weight: 500;
+}
 .ctx-menu-item.primary {
   font-weight: 720;
   color: var(--c-text);
@@ -665,12 +692,19 @@
   border-radius: 3px;
   padding: 4px 0;
   min-width: 160px;
+  max-height: calc(100vh - 8px);
+  overflow-y: auto;
   display: none;
   /* Was rendering BEHIND the menu items below it: later positioned rows
      paint over an earlier row's flyout. Lift the flyout (and its hovered
      parent row) so it always sits on top; the shadow reads it as a layer. */
   z-index: 10;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+}
+.ctx-submenu.has-nested-submenu {
+  /* A scrolling parent clips the next flyout. Menus marked with nested
+     choices are intentionally short and rely on per-flyout positioning. */
+  overflow: visible;
 }
 .ctx-submenu-wrap.submenu-left::after {
   content: "\25C2";
@@ -679,8 +713,13 @@
   left: auto;
   right: 100%;
 }
-.ctx-submenu-wrap:hover { z-index: 10; }
-.ctx-submenu-wrap:hover > .ctx-submenu { display: block; }
+.ctx-submenu-wrap:hover,
+.ctx-submenu-wrap.submenu-open { z-index: 10; }
+.ctx-submenu-wrap:hover > .ctx-submenu,
+.ctx-submenu-wrap.submenu-open > .ctx-submenu { display: block; }
+.ctx-submenu-wrap.submenu-keyboard-closed > .ctx-submenu {
+  display: none;
+}
 
 /* ═══ Queue popovers (Sync Tasks, GPU Tasks) ═══
    Anchored to the icon button, like a dropdown. Not a centered modal. */

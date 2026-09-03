@@ -19,7 +19,9 @@
  *   window._inflightRetranscribes
  *   window._syncWatchRetranscribeButton
  *   window._retranscribeWatchUpdateProgress
+ *   window._retranscribeWatchMarkFinalizing
  *   window._retranscribeWatchClear
+ *   window._onRetranscribeState
  *
  * Exposed as window.initWatchActions; app.js boot calls it once.
  *
@@ -48,6 +50,28 @@
   function _nativeBridgeUp() {
     return !!window.YT?.bridge?.isUp?.();
   }
+
+  function _isActuallyVisible(el) {
+    if (!el || !el.isConnected) return false;
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+      if (node.hidden || node.getAttribute?.("aria-hidden") === "true") return false;
+      const st = window.getComputedStyle?.(node);
+      if (st && (st.display === "none" || st.visibility === "hidden")) return false;
+    }
+    return true;
+  }
+
+  // Watch's own `hidden` flag is only a sub-view state.  The Browse panel is
+  // switched with the `active` class, so Watch can be logically open while a
+  // different top-level tab is covering it.  Publish one canonical check for
+  // keyboard controls and the playback/karaoke modules to share.
+  function _isWatchViewVisible() {
+    const panel = document.getElementById("panel-browse");
+    const view = document.getElementById("view-watch");
+    return !!(panel?.classList?.contains("active")
+      && view && !view.hidden && _isActuallyVisible(view));
+  }
+  window._isWatchViewVisible = _isWatchViewVisible;
 
   function initWatchActions() {
     // Re-init guard — multiple inits would stack duplicate window
@@ -127,15 +151,19 @@
 
     // Video-scoped keyboard shortcuts (only active when the watch view is visible)
     document.addEventListener("keydown", (e) => {
-      const watchView = document.getElementById("view-watch");
-      const watchVisible = !!(watchView && !watchView.hidden);
-      if (!watchVisible || !vEl) return;
-      // Include TEXTAREA so typing in a bookmark-note textarea doesn't
-      // trigger Space/Arrow/B/M video shortcuts.
-      const _tag = e.target.tagName;
-      const editing = _tag === "INPUT" || _tag === "TEXTAREA"
-                      || e.target.isContentEditable;
-      if (editing) return;
+      if (!_isWatchViewVisible() || !vEl || e.defaultPrevented) return;
+      // Buttons, selects, links, sliders, and modal controls own their keys.
+      // In particular, Space on a focused button must click that button, not
+      // start hidden media playback behind it.
+      const interactive = e.target?.closest?.([
+        "input", "textarea", "select", "button", "a[href]",
+        "[contenteditable='true']", "[role='button']", "[role='textbox']",
+        "[role='menuitem']", "[role='option']",
+      ].join(","));
+      if (interactive || e.ctrlKey || e.metaKey || e.altKey) return;
+      const modalOpen = Array.from(document.querySelectorAll(".askq-backdrop"))
+        .some((el) => window.YT?.modals?.isVisible?.(el));
+      if (modalOpen) return;
       if (e.key === " " || e.code === "Space") {
         e.preventDefault();
         if (vEl.paused) vEl.play().catch(()=>{}); else vEl.pause();
@@ -166,17 +194,32 @@
       }
     });
 
-    document.getElementById("btn-open-external")?.addEventListener("click", () => {
+    document.getElementById("btn-open-external")?.addEventListener("click", async () => {
       const v = _watchActionVideo();
       if (!v?.filepath) { window._showToast?.("No file loaded.", "warn"); return; }
-      _bridgeCall("browse_open_video", v.filepath);
+      try {
+        const result = await _bridgeCall("browse_open_video", v.filepath);
+        if (!result?.ok) {
+          window._showToast?.(
+            result?.error || "Could not open the video externally.", "error");
+        }
+      } catch (error) {
+        window._showToast?.(
+          `Could not open the video externally: ${error?.message || error}`,
+          "error");
+      }
     });
 
     // Redownload current video — resolution picker, then video_redownload.
     document.getElementById("btn-watch-redownload")?.addEventListener("click", async () => {
       let v = _watchActionVideo();
-      if (!v?.video_id && !v?.filepath) {
-        window._showToast?.("No video loaded.", "warn");
+      if (!v?.video_id) {
+        window._showToast?.("This video does not have a YouTube ID.", "warn");
+        return;
+      }
+      if (v.tracked === false) {
+        window._showToast?.(
+          "Redownload is available for current subscriptions.", "warn");
         return;
       }
       const actionToken = window._watchOpenToken;
@@ -211,20 +254,41 @@
         window._showToast?.(`Invalid resolution: ${pick}`, "error");
         return;
       }
-      _bridgeCall("video_redownload", v.video_id || "", v.title || "", pick);
-      window._showToast?.(`Redownload queued at ${pick}.`, "ok");
+      const button = document.getElementById("btn-watch-redownload");
+      if (button) {
+        button.disabled = true;
+        button.setAttribute("aria-busy", "true");
+      }
+      try {
+        const result = await _bridgeCall(
+          "video_redownload", v.video_id || "", v.title || "", pick);
+        if (result?.ok) {
+          window._showToast?.(`Redownload queued at ${pick}.`, "ok");
+        } else {
+          window._showToast?.(
+            result?.error || "Could not queue redownload.", "error");
+        }
+      } catch (error) {
+        window._showToast?.(
+          `Could not queue redownload: ${error?.message || error}`, "error");
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.removeAttribute("aria-busy");
+        }
+      }
     });
 
     // Per-video metadata refresh: synchronous yt-dlp fetch for THIS video.
     document.getElementById("btn-watch-refresh-meta")?.addEventListener("click", async () => {
       const v = _watchActionVideo();
-      if (!v?.filepath && !v?.video_id) {
-        window._showToast?.("No video loaded.", "warn");
+      if (!v?.video_id) {
+        window._showToast?.("This video does not have a YouTube ID.", "warn");
         return;
       }
       const btn = document.getElementById("btn-watch-refresh-meta");
       if (!_nativeBridgeUp()) {
-        window._showToast?.("Refresh unavailable in browser-preview mode.", "warn");
+        window._showToast?.("Refresh isn't ready yet. Try again in a moment.", "warn");
         return;
       }
       // Use the stable label from dataset.label (or "Refresh metadata"
@@ -237,14 +301,21 @@
       const _origText = (btn && btn.dataset.label) || "Refresh metadata";
       if (btn) { btn.disabled = true; btn.textContent = "Refreshing…"; }
       try {
-        const res = await _bridgeCall("browse_refresh_video_metadata", {
+        const method = v.tracked === false
+          ? "manual_refresh_metadata" : "browse_refresh_video_metadata";
+        const payload = {
           filepath: v.filepath || "",
           video_id: v.video_id || "",
           title: v.title || "",
           channel: v.channel || "",
-        });
+        };
+        if (v.tracked !== false) payload.mode = "all";
+        const res = await _bridgeCall(method, payload);
         if (res?.ok) {
-          window._showToast?.("Metadata refreshed.", "ok");
+          window._showToast?.(
+            res.warning || "Metadata refreshed.",
+            res.warning ? "warn" : "ok",
+          );
           window.loadWatchMetadataDrawer?.(v);
         } else {
           const msg = res?.error || "Refresh failed.";
@@ -410,11 +481,17 @@
       if (!showMenu) return;
       const rect = e.currentTarget.getBoundingClientRect();
       const click = (id) => () => document.getElementById(id)?.click();
-      showMenu(rect.left, rect.bottom + 4, [
-        { label: "Redownload…", action: click("btn-watch-redownload") },
-        { label: "Re-transcribe…", action: click("btn-watch-retranscribe") },
-        { label: "Refresh metadata", action: click("btn-watch-refresh-meta") },
-      ]);
+      const video = _watchActionVideo();
+      const items = [];
+      if (video?.video_id && video.tracked !== false) {
+        items.push({ label: "Redownload…", action: click("btn-watch-redownload") });
+      }
+      items.push({ label: "Re-transcribe…", action: click("btn-watch-retranscribe") });
+      if (video?.video_id) {
+        items.push({ label: "Refresh metadata", action: click("btn-watch-refresh-meta") });
+      }
+      showMenu(rect.left, rect.bottom + 4, items);
+      window._markBrowseContextTrigger?.(e.currentTarget);
     });
 
     // Drag-resize splitter between video and transcript panels.
@@ -426,7 +503,13 @@
         Math.min(_TX_WIDTH_MAX, parseInt(px, 10) || 420));
       document.documentElement.style.setProperty(
         "--watch-tx-width", v + "px");
+      const splitter = document.getElementById("watch-splitter");
+      if (splitter) {
+        splitter.setAttribute("aria-valuenow", String(v));
+        splitter.setAttribute("aria-valuetext", `${v} pixels wide`);
+      }
       try { localStorage.setItem(_txWidthKey, String(v)); } catch {}
+      return v;
     }
     function _persistTxWidth(px) {
       if (_nativeBridgeUp()) {
@@ -487,6 +570,22 @@
         window.addEventListener("mousemove", _onMove);
         window.addEventListener("mouseup", _onUp);
       });
+      _splitter.addEventListener("keydown", (e) => {
+        const current = parseInt(getComputedStyle(document.documentElement)
+          .getPropertyValue("--watch-tx-width"), 10) || 420;
+        const step = e.shiftKey ? 60 : 20;
+        let next = null;
+        // The transcript sits to the right of the separator: moving the
+        // separator left makes it wider, and moving it right makes it narrower.
+        if (e.key === "ArrowLeft") next = current + step;
+        else if (e.key === "ArrowRight") next = current - step;
+        else if (e.key === "Home") next = _TX_WIDTH_MIN;
+        else if (e.key === "End") next = _TX_WIDTH_MAX;
+        if (next == null) return;
+        e.preventDefault();
+        const applied = _applyTxWidth(next);
+        _persistTxWidth(applied);
+      });
     }
 
     // Tracks every in-flight watch-view retranscribe by video_id. The
@@ -498,6 +597,144 @@
     // progress; clicking Re-transcribe on B was blocked until A finished.
     window._inflightRetranscribes = window._inflightRetranscribes || new Map();
 
+    const _FINALIZING_STILL_MS = 120000;
+    let _finalizingUiTimer = 0;
+
+    function _clampRetranscribePct(value) {
+      return Math.max(0, Math.min(99, parseInt(value, 10) || 0));
+    }
+
+    // Older in-memory entries were plain numbers. Normalize both shapes so
+    // navigation and a hot frontend refresh remain safe while the richer
+    // finalizing phase rolls out.
+    function _normalizeRetranscribeState(raw, now = Date.now()) {
+      if (raw && typeof raw === "object") {
+        const pct = _clampRetranscribePct(raw.pct);
+        const requestedPhase = String(raw.phase || "").trim().toLowerCase();
+        const knownPhases = new Set([
+          "queued",
+          "transcribing",
+          "finalizing",
+          "paused",
+          "resuming",
+          "needs_attention",
+        ]);
+        const phase = knownPhases.has(requestedPhase)
+          ? requestedPhase
+          : pct > 0 ? "transcribing" : "queued";
+        const startedAt = Number.isFinite(Number(raw.started_at))
+          ? Number(raw.started_at) : now;
+        const phaseStartedAt = Number.isFinite(Number(raw.phase_started_at))
+          ? Number(raw.phase_started_at) : startedAt;
+        return {
+          pct,
+          phase,
+          started_at: startedAt,
+          phase_started_at: phaseStartedAt,
+          filepath: String(raw.filepath || ""),
+          message: String(raw.message || ""),
+        };
+      }
+      const pct = _clampRetranscribePct(raw);
+      return {
+        pct,
+        phase: pct > 0 ? "transcribing" : "queued",
+        started_at: now,
+        phase_started_at: now,
+        filepath: "",
+        message: "",
+      };
+    }
+
+    function _formatRetranscribeElapsed(startedAt, now = Date.now()) {
+      const elapsedSeconds = Math.max(0, Math.floor(
+        (now - Number(startedAt || now)) / 1000));
+      if (elapsedSeconds < 60) return `${elapsedSeconds}s`;
+      const minutes = Math.floor(elapsedSeconds / 60);
+      const seconds = elapsedSeconds % 60;
+      return `${minutes}m ${seconds}s`;
+    }
+
+    function _finalizingDisplay(state, now = Date.now()) {
+      const elapsedMs = Math.max(0, now - Number(state.phase_started_at || now));
+      const elapsed = _formatRetranscribeElapsed(state.phase_started_at, now);
+      const prefix = elapsedMs >= _FINALIZING_STILL_MS
+        ? "Still finishing…" : "Finishing transcript…";
+      return {
+        text: `${prefix} ${elapsed}`,
+        title: "Whisper is finished. YTArchiver is preparing, saving, and "
+          + `indexing the transcript (${elapsed}).`,
+      };
+    }
+
+    window._normalizeRetranscribeWatchState = _normalizeRetranscribeState;
+    window._retranscribeWatchFinalizingDisplay = _finalizingDisplay;
+
+    function _buttonDisplayForRetranscribeState(state) {
+      if (state.phase === "finalizing") {
+        return _finalizingDisplay(state);
+      }
+      if (state.phase === "needs_attention") {
+        return {
+          text: "Needs attention — retry in Processing",
+          title: "This re-transcription needs attention. Open Processing to retry it.",
+        };
+      }
+      if (state.phase === "paused") {
+        return {
+          text: "Re-transcription paused",
+          title: "Re-transcription is paused. Resume it from Processing.",
+        };
+      }
+      if (state.phase === "resuming") {
+        return {
+          text: "Resuming transcription…",
+          title: "Re-transcription is resuming.",
+        };
+      }
+      if (state.phase === "queued") {
+        return {
+          text: "Re-transcription queued",
+          title: "Re-transcription is waiting in the Processing queue.",
+        };
+      }
+      return {
+        text: state.pct > 0
+          ? `Re-transcribing… ${state.pct}%`
+          : "Re-transcribing…",
+        title: state.pct > 0
+          ? `Whisper is re-transcribing this video (${state.pct}%).`
+          : "Whisper is re-transcribing this video.",
+      };
+    }
+
+    function _hasFinalizingRetranscribe() {
+      for (const raw of window._inflightRetranscribes.values()) {
+        if (_normalizeRetranscribeState(raw).phase === "finalizing") return true;
+      }
+      return false;
+    }
+
+    function _stopFinalizingUiTimerIfIdle() {
+      if (_finalizingUiTimer && !_hasFinalizingRetranscribe()) {
+        clearInterval(_finalizingUiTimer);
+        _finalizingUiTimer = 0;
+      }
+    }
+
+    function _ensureFinalizingUiTimer() {
+      if (_finalizingUiTimer || !_hasFinalizingRetranscribe()) return;
+      // The bar itself animates continuously. Repaint once per second so the
+      // elapsed label proves the UI is alive without inventing percent work.
+      _finalizingUiTimer = setInterval(() => {
+        if (!_hasFinalizingRetranscribe()) {
+          _stopFinalizingUiTimerIfIdle();
+          return;
+        }
+        window._syncWatchRetranscribeButton?.();
+      }, 1000);
+    }
+
     // Paint the Re-transcribe button to match the currently-displayed
     // watch video. Called on click, on progress update for the current
     // video, on clear, and (from logs.js) when the watch view renders
@@ -508,14 +745,19 @@
       const vid = cur && cur.video_id ? cur.video_id : "";
       if (btn) {
         if (vid && window._inflightRetranscribes.has(vid)) {
-          const p = window._inflightRetranscribes.get(vid);
+          const state = _normalizeRetranscribeState(
+            window._inflightRetranscribes.get(vid));
+          const display = _buttonDisplayForRetranscribeState(state);
           btn.dataset.busy = "1";
           btn.disabled = true;
-          btn.textContent = `Re-transcribing… ${p}%`;
+          btn.textContent = display.text;
+          btn.title = display.title;
+          if (state.phase === "finalizing") _ensureFinalizingUiTimer();
         } else {
           btn.dataset.busy = "";
           btn.disabled = false;
           btn.textContent = "Re-transcribe…";
+          btn.title = "";
         }
       }
       window._syncWatchRetranscribeBanner?.();
@@ -528,7 +770,7 @@
         return;
       }
       if (!_nativeBridgeUp()) {
-        window._showToast?.("Native mode required.", "warn");
+        window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
         return;
       }
       const vid = v.video_id || "";
@@ -562,7 +804,15 @@
       // branch finds the entry and updates it. Roll back on failure
       // (audit: watchActions.js C27).
       if (vid) {
-        window._inflightRetranscribes.set(vid, 0);
+        const now = Date.now();
+        window._inflightRetranscribes.set(vid, {
+          pct: 0,
+          phase: "queued",
+          started_at: now,
+          phase_started_at: now,
+          filepath: v.filepath,
+          message: "",
+        });
         window._syncWatchRetranscribeButton();
       }
       let res;
@@ -608,22 +858,120 @@
     // Called from logs.js when a whisper_pct line goes by.
     window._retranscribeWatchUpdateProgress = function (pct, video_id) {
       if (!video_id) return;
-      const p = Math.max(0, Math.min(99, parseInt(pct, 10) || 0));
+      const p = _clampRetranscribePct(pct);
       if (window._inflightRetranscribes.has(video_id)) {
-        window._inflightRetranscribes.set(video_id, p);
+        const now = Date.now();
+        const previous = _normalizeRetranscribeState(
+          window._inflightRetranscribes.get(video_id), now);
+        window._inflightRetranscribes.set(video_id, {
+          pct: p,
+          phase: "transcribing",
+          started_at: previous.started_at,
+          phase_started_at: previous.phase === "transcribing"
+            ? previous.phase_started_at : now,
+          filepath: previous.filepath,
+          message: "",
+        });
       }
       const cur = window._watchCurrentVideo;
       if (cur && cur.video_id === video_id) {
         window._syncWatchRetranscribeButton();
       }
     };
+
+    // Called from logs.js when the backend reports that Whisper recognition
+    // has completed and the transcript is being prepared for durable storage.
+    window._retranscribeWatchMarkFinalizing = function (video_id) {
+      if (!video_id || !window._inflightRetranscribes.has(video_id)) return;
+      const now = Date.now();
+      const previous = _normalizeRetranscribeState(
+        window._inflightRetranscribes.get(video_id), now);
+      window._inflightRetranscribes.set(video_id, {
+        pct: previous.pct,
+        phase: "finalizing",
+        started_at: previous.started_at,
+        phase_started_at: previous.phase === "finalizing"
+          ? previous.phase_started_at : now,
+        filepath: previous.filepath,
+        message: "",
+      });
+      _ensureFinalizingUiTimer();
+      const cur = window._watchCurrentVideo;
+      if (cur && cur.video_id === video_id) {
+        window._syncWatchRetranscribeButton();
+      }
+    };
+
     // Called from _onRetranscribeComplete with the finished video_id.
     window._retranscribeWatchClear = function (video_id) {
-      if (video_id) {
-        window._inflightRetranscribes.delete(video_id);
-      } else {
-        window._inflightRetranscribes.clear();
+      // A job without a YouTube ID was never inserted into this ID-keyed map.
+      // Treat its completion as a no-op here; clearing the whole map would
+      // erase truthful progress for every unrelated retranscription.
+      if (!video_id) return;
+      window._inflightRetranscribes.delete(video_id);
+      _stopFinalizingUiTimerIfIdle();
+      window._syncWatchRetranscribeButton();
+    };
+
+    function _sameWatchFile(left, right) {
+      const normalize = (value) => String(value || "")
+        .replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+      const a = normalize(left);
+      const b = normalize(right);
+      return !!(a && b && a === b);
+    }
+
+    // Called by Python for job states that are not percentage updates. Keeping
+    // these separate prevents a paused or failed job from looking like it is
+    // still actively working, and lets cancellation clear only its own video.
+    window._onRetranscribeState = function (payload) {
+      if (!payload || typeof payload !== "object") return;
+      const phase = String(payload.state || payload.phase || "")
+        .trim().toLowerCase();
+      const filepath = String(payload.filepath || "");
+      let videoId = String(payload.video_id || "");
+
+      if (!videoId && filepath) {
+        const current = window._watchCurrentVideo;
+        if (current?.video_id && _sameWatchFile(filepath, current.filepath)) {
+          videoId = String(current.video_id);
+        } else {
+          for (const [candidateId, raw] of window._inflightRetranscribes) {
+            const state = _normalizeRetranscribeState(raw);
+            if (_sameWatchFile(filepath, state.filepath)) {
+              videoId = String(candidateId);
+              break;
+            }
+          }
+        }
       }
+      if (!videoId) return;
+
+      if (phase === "cancelled" || phase === "rejected") {
+        window._retranscribeWatchClear(videoId);
+        return;
+      }
+      if (!["paused", "resuming", "queued", "finalizing",
+            "needs_attention"].includes(phase)) {
+        return;
+      }
+
+      const now = Date.now();
+      const previous = window._inflightRetranscribes.has(videoId)
+        ? _normalizeRetranscribeState(
+            window._inflightRetranscribes.get(videoId), now)
+        : _normalizeRetranscribeState(0, now);
+      window._inflightRetranscribes.set(videoId, {
+        pct: previous.pct,
+        phase,
+        started_at: previous.started_at,
+        phase_started_at: previous.phase === phase
+          ? previous.phase_started_at : now,
+        filepath: filepath || previous.filepath,
+        message: String(payload.message || ""),
+      });
+      _stopFinalizingUiTimerIfIdle();
+      if (phase === "finalizing") _ensureFinalizingUiTimer();
       window._syncWatchRetranscribeButton();
     };
 
@@ -634,8 +982,12 @@
         window._showToast?.("No video loaded.", "warn");
         return;
       }
+      if (!v.video_id) {
+        window._showToast?.("This video does not have a YouTube ID.", "warn");
+        return;
+      }
       if (!_nativeBridgeUp()) {
-        window._showToast?.("Native mode required.", "warn");
+        window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
         return;
       }
       const actionToken = window._watchOpenToken;

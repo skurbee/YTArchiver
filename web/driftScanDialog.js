@@ -43,6 +43,7 @@
       if (!btn || !bd || !body || !chanSel || !scanBtn || !fixBtn) return;
 
       let _lastScan = null;  // { ok, channel, txt_without_jsonl, ... }
+      let _scanGeneration = 0;
 
       const escapeHtml = window._escapeHtml || ((s) =>
         String(s).replace(/[&<>"']/g, c => (
@@ -111,36 +112,40 @@
         }
         const txtOrphans = data.txt_without_jsonl || [];
         const jsonlOrphans = data.jsonl_without_txt || [];
-        const phantoms = data.fts_phantoms || 0;
+        const ftsIssues = data.fts_health_issues ?? data.fts_phantoms ?? 0;
         const totals = data.totals || {};
-        const totalDrift = txtOrphans.length + jsonlOrphans.length + (phantoms > 0 ? 1 : 0);
+        const totalDrift = txtOrphans.length + jsonlOrphans.length + (ftsIssues > 0 ? 1 : 0);
 
         if (summary) {
-          summary.textContent =
-            `${(totals.txt_titles || 0).toLocaleString()} .txt · `
-            + `${(totals.jsonl_titles || 0).toLocaleString()} .jsonl entries scanned`;
+          const channelLabel = data._scan_label
+            ? `${data._scan_label} · ` : "";
+          summary.textContent = channelLabel +
+            `${(totals.txt_titles || 0).toLocaleString()} readable transcripts · `
+            + `${(totals.jsonl_titles || 0).toLocaleString()} transcript detail entries checked`;
         }
 
         let html = "";
         // Summary bar — green if no drift, red/orange if any found.
         html += `<div class="drift-summary-box${totalDrift === 0 ? " is-clean" : ""}">`;
         if (totalDrift === 0) {
-          html += `<strong class="drift-summary-title">No drift found.</strong> `
-            + `All .txt / .jsonl / FTS entries are consistent.`;
+          html += `<strong class="drift-summary-title">No problems found.</strong> `
+            + `Transcript files and search data are consistent.`;
         } else {
-          html += `<strong class="drift-summary-title">Drift detected:</strong> `
-            + `${txtOrphans.length} .txt-only · ${jsonlOrphans.length} .jsonl-only`
-            + (phantoms > 0 ? ` · ${phantoms.toLocaleString()} FTS phantoms (global)` : "");
+          html += `<strong class="drift-summary-title">Problems found:</strong> `
+            + `${txtOrphans.length} missing transcript details · ${jsonlOrphans.length} missing readable transcripts`
+            + (ftsIssues > 0
+              ? ` · ${ftsIssues.toLocaleString()} search index problem(s)`
+              : "");
         }
         html += `</div>`;
 
         // Category A: TXT without JSONL
         html += `<div class="drift-section">`;
         html += `<div class="drift-section-title">`
-          + `A. In .txt but missing from .jsonl (${txtOrphans.length})</div>`;
+          + `A. Transcript details missing (${txtOrphans.length})</div>`;
         html += `<div class="edit-dim drift-section-note">`
-          + `Fix: queue Whisper retranscribe to rebuild both sides. `
-          + `Entries whose video file can't be located in the index are skipped.</div>`;
+          + `Fix: queue a new transcription to rebuild the missing details. `
+          + `Videos whose local file cannot be found are skipped.</div>`;
         if (!txtOrphans.length) {
           html += `<div class="edit-dim drift-empty-row">—</div>`;
         } else {
@@ -161,10 +166,9 @@
         // Category B: JSONL without TXT
         html += `<div class="drift-section">`;
         html += `<div class="drift-section-title">`
-          + `B. In .jsonl but missing from .txt (${jsonlOrphans.length})</div>`;
+          + `B. Readable transcript missing (${jsonlOrphans.length})</div>`;
         html += `<div class="edit-dim drift-section-note">`
-          + `Fix: reconstruct .txt entry from .jsonl segments. Date from `
-          + `.jsonl mtime; source tag = "RECOVERED-FROM-JSONL".</div>`;
+          + `Fix: rebuild the readable transcript from the saved transcript details.</div>`;
         if (!jsonlOrphans.length) {
           html += `<div class="edit-dim drift-empty-row">—</div>`;
         } else {
@@ -180,14 +184,12 @@
         }
         html += `</div>`;
 
-        // Category C: FTS phantoms (global)
+        // Category C: authoritative FTS integrity (global)
         html += `<div class="drift-section-tight">`;
         html += `<div class="drift-section-title">`
-          + `C. FTS5 phantom rows (${phantoms.toLocaleString()})</div>`;
+          + `C. Search index problems (${ftsIssues.toLocaleString()})</div>`;
         html += `<div class="edit-dim drift-section-note">`
-          + `Fix: rebuild FTS5 index (idempotent; clears orphan rowids `
-          + `from re-ingested transcripts — audit bug C-9). Counted globally; `
-          + `fix is global.</div>`;
+          + `Fix: rebuild and verify transcript and video-title search data.</div>`;
         html += `</div>`;
 
         body.innerHTML = html;
@@ -208,14 +210,18 @@
         let identity;
         try { identity = JSON.parse(raw); }
         catch { identity = { name: raw }; }
+        const generation = ++_scanGeneration;
+        const scanLabel = chanSel.options[chanSel.selectedIndex]?.text || "";
         body.innerHTML = `<div class="browse-empty askq-empty-padded">Scanning…</div>`;
         if (summary) summary.textContent = "";
         fixBtn.disabled = true;
         if (scanBtn) scanBtn.disabled = true;
+        chanSel.disabled = true;
+        chanSel._ytddRepaint?.();
         _scanInFlight = true;
         try {
           if (!nativeBridgeUp()) {
-            _renderScan({ ok: false, error: "Native mode required." });
+            _renderScan({ ok: false, error: "YTArchiver isn't ready yet. Try again in a moment." });
             return;
           }
           let res = await bridgeCall("drift_scan_channel", identity);
@@ -224,15 +230,24 @@
             res = await _pollUntilDone(
               res, (t) => bridgeCall("drift_scan_channel_poll", t), 10 * 60 * 1000);
           }
+          if (generation !== _scanGeneration) return;
           // Stash the identity we just scanned with so _fix uses
           // the same one even if the dropdown changes later.
-          if (res && typeof res === "object") res._scan_identity = identity;
+          if (res && typeof res === "object") {
+            res._scan_identity = identity;
+            res._scan_label = scanLabel;
+          }
           _renderScan(res);
         } catch (e) {
+          if (generation !== _scanGeneration) return;
           _renderScan({ ok: false, error: String(e) });
         } finally {
-          _scanInFlight = false;
-          if (scanBtn) scanBtn.disabled = false;
+          if (generation === _scanGeneration) {
+            _scanInFlight = false;
+            if (scanBtn) scanBtn.disabled = false;
+            chanSel.disabled = false;
+            chanSel._ytddRepaint?.();
+          }
         }
       };
 
@@ -250,24 +265,29 @@
           })();
         const txtCount = (_lastScan.txt_without_jsonl || []).length;
         const jsonlCount = (_lastScan.jsonl_without_txt || []).length;
-        const phantoms = _lastScan.fts_phantoms || 0;
+        const ftsIssues = _lastScan.fts_health_issues
+          ?? _lastScan.fts_phantoms
+          ?? 0;
         // Confirm before queueing potentially many Whisper jobs.
         if (txtCount > 0 && window.askDanger) {
           const ok = await window.askDanger(
-            "Fix transcript drift?",
-            `This will queue ${txtCount} Whisper retranscribe job(s), `
-              + `rebuild ${jsonlCount} .txt entries from .jsonl, and `
-              + (phantoms > 0 ? `rebuild the FTS index. ` : ``)
+            "Fix transcript differences?",
+            `This will queue ${txtCount} new transcription job(s) and `
+              + `rebuild ${jsonlCount} readable transcript(s)`
+              + (ftsIssues > 0 ? `, then rebuild the search index. ` : `. `)
               + `Proceed?`,
             "Fix all");
           if (!ok) return;
         }
         fixBtn.disabled = true;
+        scanBtn.disabled = true;
+        chanSel.disabled = true;
+        chanSel._ytddRepaint?.();
         body.innerHTML = `<div class="browse-empty askq-empty-padded">Applying fixes…</div>`;
         try {
           if (!nativeBridgeUp()) {
             body.innerHTML = `<div class="browse-empty askq-empty-padded askq-empty-danger">`
-              + `Native mode required.</div>`;
+              + `YTArchiver isn't ready yet. Try again in a moment.</div>`;
             return;
           }
           let res = await bridgeCall("drift_apply_channel", identity);
@@ -282,10 +302,10 @@
           }
           const a = res.actions || {};
           const parts = [];
-          if (a.txt_reconstructed) parts.push(`${a.txt_reconstructed} .txt rebuilt`);
-          if (a.retranscribe_queued) parts.push(`${a.retranscribe_queued} queued for Whisper`);
+          if (a.txt_reconstructed) parts.push(`${a.txt_reconstructed} readable transcript(s) rebuilt`);
+          if (a.retranscribe_queued) parts.push(`${a.retranscribe_queued} queued for transcription`);
           if (a.retranscribe_skipped) parts.push(`${a.retranscribe_skipped} skipped (video file missing)`);
-          if (a.fts_rebuilt) parts.push("FTS rebuilt");
+          if (a.fts_rebuilt) parts.push("search index rebuilt");
           if (!parts.length) parts.push("no actions taken");
           body.innerHTML = `<div class="drift-done-box">`
             + `<strong class="drift-done-title">Done.</strong> `
@@ -294,14 +314,21 @@
             + `<div class="edit-dim drift-done-note">`
             + `Click Scan again to refresh the report.`
             + `</div>`;
-          window._showToast?.(`Drift fix applied: ${parts.join(" · ")}.`, "ok");
+          window._showToast?.(`Transcript fixes applied: ${parts.join(" · ")}.`, "ok");
         } catch (e) {
           body.innerHTML = `<div class="browse-empty askq-empty-padded askq-empty-danger">`
             + `${escapeHtml(String(e))}</div>`;
+        } finally {
+          scanBtn.disabled = false;
+          chanSel.disabled = false;
+          chanSel._ytddRepaint?.();
         }
       };
 
       const _open = async () => {
+        chanSel.disabled = false;
+        scanBtn.disabled = false;
+        chanSel._ytddRepaint?.();
         bd.hidden = false;
         body.innerHTML = `<div class="browse-empty askq-empty-padded">Loading channels…</div>`;
         if (summary) summary.textContent = "";
@@ -315,7 +342,24 @@
       btn.addEventListener("click", _open);
       scanBtn.addEventListener("click", _scan);
       fixBtn.addEventListener("click", _fix);
-      const _close = () => { bd.hidden = true; };
+      chanSel.addEventListener("change", () => {
+        _scanGeneration += 1;
+        _scanInFlight = false;
+        _lastScan = null;
+        fixBtn.disabled = true;
+        scanBtn.disabled = false;
+        body.innerHTML = `<div class="browse-empty askq-empty-padded">`
+          + `Click Scan to check the selected channel.</div>`;
+        if (summary) summary.textContent = "";
+      });
+      const _close = () => {
+        _scanGeneration += 1;
+        _scanInFlight = false;
+        chanSel.disabled = false;
+        scanBtn.disabled = false;
+        chanSel._ytddRepaint?.();
+        bd.hidden = true;
+      };
       closeBtn?.addEventListener("click", _close);
       bd.addEventListener("click", (e) => {
         if (e.target === bd) _close();

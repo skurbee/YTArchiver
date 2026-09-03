@@ -430,6 +430,18 @@
 .skeleton-line.short { width: 55%; }
 /* Cached content dims very slightly while the fresh query is in flight. */
 .is-refreshing { opacity: 0.85; transition: opacity 0.15s ease; }
+
+/* Honest progress text for catalog-backed grids. It occupies one full grid
+   row so cached/basic cards can remain usable below it while details refresh. */
+.catalog-read-status {
+  grid-column: 1 / -1;
+  min-width: 0;
+  padding: 4px 8px;
+  color: var(--c-dim);
+  font-size: var(--fs-xs);
+  font-style: italic;
+  line-height: 1.35;
+}
 /* "Removed from YT" badge — corner pill on tiles where the uploader
    deleted/privated/unlisted the video since download. Local file is
    still playable; we just can't refresh metadata for it. */
@@ -480,20 +492,6 @@
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
   pointer-events: none;
   z-index: 2;
-}
-/* Whole-card visual treatment for removed videos — desaturated +
-   slight dim so the user can scan the grid and spot them quickly.
-   Hover restores full opacity so the card is still browseable. */
-.video-card.video-card-removed .video-thumb {
-  filter: grayscale(0.55) brightness(0.78);
-}
-.video-card.video-card-removed:hover .video-thumb {
-  filter: grayscale(0) brightness(1);
-}
-.video-card.video-card-removed .video-card-title {
-  /* Was hardcoded #c4a8a8 — use palette token so theme tweaks
-     follow (audit: L172). */
-  color: var(--c-bad-fg);
 }
 .video-card-body {
   padding: 8px 10px;

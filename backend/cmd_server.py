@@ -1,6 +1,5 @@
 """
-HTTP command server on 127.0.0.1:9855 — the API the ArchivePlayer companion +
-ArchiveBrowserWithYTTest viewers talk to.
+HTTP command server on 127.0.0.1:9855 for compatible companion viewers.
 
 Mirrors YTArchiver.py:34400-34960 _start_cmd_server + _CmdHandler. Scope:
 
@@ -12,9 +11,9 @@ Additional endpoints the live app has (repair-orphans, repair-duplicates,
 repair-mismatches) are NOT wired here — they'd need the whole playlist-diff
 machinery, and neither viewer calls them in day-to-day use yet.
 
-Bind defaults to 127.0.0.1 (loopback only). ArchivePlayer's host-discovery
-probes 127.0.0.1 first (archive_player.py:3017) so same-machine integration
-works out of the box. For cross-machine LAN integration — where ArchivePlayer
+Bind defaults to 127.0.0.1 (loopback only). Companion-viewer host discovery
+probes 127.0.0.1 first, so same-machine integration works out of the box. For
+cross-machine LAN integration — where the viewer
 runs on a different PC and relies on the /24 subnet scan path — set env
 `YTARCHIVER_CMD_BIND=0.0.0.0` to re-enable LAN binding.
 
@@ -184,7 +183,7 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
         any browser tab issue cross-origin POSTs to /cmd/retranscribe.
         Restrict to null (file://), and localhost origins — the only
         callers that should reach this server are (a) the pywebview
-        shell from a file:// URL and (b) ArchivePlayer from loopback
+        shell from a file:// URL and (b) a companion client from loopback
         Python (no CORS gate on non-browser clients). If the
         incoming Origin doesn't match, omit the CORS header so the
         browser blocks the response — functionality for the real
@@ -192,7 +191,7 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
         """
         origin = self.headers.get("Origin", "")
         if not origin:
-            # Non-browser (ArchivePlayer / curl) — no CORS needed.
+            # Non-browser companion / curl — no CORS needed.
             return ""
         if origin in ("null",):
             return origin

@@ -31,15 +31,10 @@
      window.pywebview.api             — Python bridge (used directly on
        purpose — see note below)
 
-   Bridge note: this module deliberately calls window.pywebview.api
-   directly rather than going through the YT.api proxy / bridgeCall. Its
-   remove/reorder handlers feature-detect specific backend methods
-   (e.g. `if (api.queues_sync_remove_at) … else if (api.queues_sync_remove)`,
-   `if (api.queues_*_reorder)`) and fall back to legacy URL/path-based APIs
-   on backends that don't expose the newer index-based ones. The YT.api
-   proxy resolves every property name to a function, so it can't express
-   "does this method actually exist?" — routing these calls through it
-   would silently disable the legacy fallbacks. Keep them on the raw bridge.
+   Bridge note: this module calls window.pywebview.api directly so it can
+   require the exact task-ID mutation methods. URL/path/index fallbacks are
+   intentionally forbidden: a stale row must fail instead of changing a
+   different task that happens to share the same visible name or target.
    ═══════════════════════════════════════════════════════════════════════ */
 
 (function () {
@@ -49,10 +44,14 @@
 
   /** Render the queue popovers for Sync Tasks + GPU Tasks. */
   window.renderQueues = function (queues) {
+    _queueIdentityDurable = queues?.identity_ids_durable !== false;
     renderTaskList("sync-tasks-body", queues.sync, "No sync tasks queued.", "sync");
     renderTaskList("gpu-tasks-body", queues.gpu, "No processing tasks queued.", "gpu");
     _updateBadge("badge-sync", _queueCount(queues, "sync"));
     _updateBadge("badge-gpu", _queueCount(queues, "gpu"));
+    window.YT?.eventState?.publish("queue-payload", queues || {
+      sync: [], gpu: [],
+    });
   };
 
   function _queueCount(queues, kind) {
@@ -81,6 +80,7 @@
   // In-memory queue state so drag-to-rearrange can update order.
   const _queueState = { sync: [], gpu: [] };
   let _dragSrcKind = "";
+  let _queueIdentityDurable = true;
   // Exposed so context menus elsewhere (Subs tab) can check whether a
   // channel is currently queued / running and label menu items dynamically.
   // Mirrors OLD's dynamic-label mutation (YTArchiver.py:5596 _chan_ctx_menu).
@@ -115,36 +115,40 @@
     ].some(value => _queueChannelKey(value) === target);
   }
 
-  function _sameText(a, b) {
-    const left = String(a || "").trim();
-    const right = String(b || "").trim();
-    return !!left && !!right && left === right;
+  function _rowTaskIds(task) {
+    const values = Array.isArray(task?.represented_task_ids)
+      ? task.represented_task_ids
+      : (Array.isArray(task?.task_ids) ? task.task_ids : [task?.task_id]);
+    return values.map(value => String(value || "").trim()).filter(Boolean);
   }
 
-  function _queueTaskSameIdentity(task, identity, queueKind) {
-    if (!task || !identity) return false;
-    if (queueKind === "sync") {
-      const taskChannel = _queueChannelKey(
-        task.channel_name || task.channel || task.folder || task.name);
-      const identityChannel = _queueChannelKey(
-        identity.channel_name || identity.channel || identity.folder
-        || identity.name);
-      return _sameText(task.url, identity.url)
-        || (!!taskChannel && taskChannel === identityChannel);
-    }
-    return _sameText(task.path, identity.path)
-      || _sameText(task.bulk_id, identity.bulk_id)
-      || _sameText(task.id, identity.id);
+  function _rowHasTaskId(task, taskId) {
+    const wanted = String(taskId || "").trim();
+    return !!wanted && _rowTaskIds(task).includes(wanted);
   }
 
-  function _backendQueueIndexForPopover(queueKind, popoverIdx) {
-    let queueIdx = 0;
-    for (let j = 0; j < popoverIdx; j++) {
-      if ((_queueState[queueKind][j] || {}).status !== "running") {
-        queueIdx++;
-      }
+  function _findRowIndex(queueKind, taskId) {
+    return (_queueState[queueKind] || [])
+      .findIndex(item => _rowHasTaskId(item, taskId));
+  }
+
+  function _bridgeSucceeded(result) {
+    return !!result && result.ok === true;
+  }
+
+  async function _runExactQueueAction(action, fallbackMessage) {
+    let result;
+    try {
+      result = await action();
+    } catch (error) {
+      window._showToast?.(`${fallbackMessage}: ${error}`, "error");
+      return false;
     }
-    return queueIdx;
+    if (!_bridgeSucceeded(result)) {
+      window._showToast?.(result?.error || fallbackMessage, "error");
+      return false;
+    }
+    return true;
   }
 
   // Convenience: does `channelName` have a sync queued? (running or queued)
@@ -192,9 +196,15 @@
       const statusCls = (_rawStatus === "running" || _rawStatus === "paused")
         ? _rawStatus : "queued";
       row.className = `queue-task-row ${statusCls}`;
-      row.draggable = true;
+      const representedIds = _rowTaskIds(t);
+      const taskId = representedIds[0] || "";
+      const canDrag = _queueIdentityDurable && statusCls === "queued"
+        && t.draggable !== false
+        && representedIds.length === 1;
+      row.draggable = canDrag;
       row.dataset.idx = i;
       row.dataset.queue = queueKind;
+      row.dataset.taskId = taskId;
 
       const stateGlyph =
         statusCls === "running" ? "▶" :
@@ -216,19 +226,10 @@
       // after the running row's translation). For running rows the
       // user should use the right-click context menu's Skip / Cancel
       // actions instead.
-      const closeBtnHtml = statusCls === "running"
+      const closeBtnHtml = statusCls === "running" || representedIds.length === 0
+        || !_queueIdentityDurable
         ? ""
         : '<button class="queue-task-close" title="Remove">&times;</button>';
-      const rowIdentity = {
-        url: t.url || "",
-        path: t.path || "",
-        bulk_id: t.bulk_id || "",
-        id: t.id || "",
-        channel_name: t.channel_name || "",
-        channel: t.channel || "",
-        folder: t.folder || "",
-        name: t.name || t.title || "",
-      };
 
       row.innerHTML = `
         <span class="queue-task-index">${i + 1}.</span>
@@ -238,50 +239,32 @@
       `;
       row.querySelector(".queue-task-name").innerHTML = nameHtml;
 
-      row.querySelector(".queue-task-close")?.addEventListener("click", (e) => {
+      row.querySelector(".queue-task-close")?.addEventListener("click", async (e) => {
         e.stopPropagation();
-        const popoverIdx = _queueState[queueKind].findIndex((item) => (
-          (item?.status || "queued") !== "running"
-          && _queueTaskSameIdentity(item, rowIdentity, queueKind)
-        ));
-        if (popoverIdx < 0) return;
-        const removed = _queueState[queueKind][popoverIdx];
-        const queueIdx = _backendQueueIndexForPopover(queueKind, popoverIdx);
-        _queueState[queueKind].splice(popoverIdx, 1);
-        paintTaskList(body, _queueState[queueKind], emptyText, queueKind);
-        // Original code passed only a URL / path, which deleted EVERY
-        // queue entry sharing that identifier (e.g. one X click on a
-        // metadata-refresh row also dropped the download row for the
-        // same channel because both shared the channel URL).
-        // Fix: prefer the index-based remove API (queues_*_remove_at)
-        // with identity guard. Falls back to the legacy URL-based API
-        // only on backends that don't expose the new method.
-        if (!window.pywebview?.api || !removed) return;
-        const api = window.pywebview.api;
-        if (queueKind === "sync") {
-          if (api.queues_sync_remove_at) {
-            api.queues_sync_remove_at(queueIdx,
-              removed.url || "",
-              removed.channel_name || removed.name || "");
-          } else if (api.queues_sync_remove) {
-            api.queues_sync_remove(removed.url || removed.channel_name
-                                    || removed.name || "");
+        const api = window.pywebview?.api;
+        if (!api || representedIds.length === 0) return;
+        let result;
+        try {
+          if (queueKind === "sync") {
+            result = await api.queues_sync_remove(representedIds[0]);
+          } else if (representedIds.length > 1) {
+            result = await api.queues_gpu_remove_many(representedIds);
+          } else {
+            result = await api.queues_gpu_remove(representedIds[0]);
           }
-        } else if (queueKind === "gpu") {
-          // Coalesced "Transcribe {ch} (N videos)" row → bulk-remove
-          // (drop all siblings). Single rows use index-based API.
-          const isBulk = !!removed.bulk_id && (removed.bulk_count || 0) > 1;
-          if (isBulk && api.queues_gpu_remove_bulk) {
-            api.queues_gpu_remove_bulk(removed.bulk_id);
-          } else if (api.queues_gpu_remove_at) {
-            api.queues_gpu_remove_at(queueIdx,
-              removed.path || "",
-              removed.bulk_id || "");
-          } else if (api.queues_gpu_remove) {
-            api.queues_gpu_remove(removed.path || removed.bulk_id
-                                   || removed.id || removed.name || "");
-          }
+        } catch (error) {
+          window._showToast?.(`Remove failed: ${error}`, "error");
+          return;
         }
+        if (!_bridgeSucceeded(result)) {
+          window._showToast?.(result?.error || "Queue changed; refresh and retry.",
+            "error");
+          return;
+        }
+        const removedIds = new Set(representedIds);
+        _queueState[queueKind] = _queueState[queueKind].filter(
+          item => !_rowTaskIds(item).some(taskId => removedIds.has(taskId)));
+        paintTaskList(body, _queueState[queueKind], emptyText, queueKind);
       });
 
       // Right-click menu on queue rows: skip / move-to-top / cancel-or-remove
@@ -290,23 +273,7 @@
       row.addEventListener("contextmenu", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        // Resolve index FRESH from the live _queueState by matching
-        // the row's identity. row.dataset.idx is stale after a drag
-        // reorder (set at render time, not updated until next paint)
-        // so trusting it could cancel the wrong task (audit:
-        // queueRender H205).
-        let idx = Number(row.dataset.idx);
-        try {
-          const arr = _queueState[queueKind] || [];
-          const _myUrl = t.url || "";
-          const _myPath = t.path || "";
-          const _myName = t.name || t.title || "";
-          const _matched = arr.findIndex(x => x && (
-            (x.url && _myUrl && x.url === _myUrl)
-            || (x.path && _myPath && x.path === _myPath)
-            || (x.name && _myName && x.name === _myName)));
-          if (_matched >= 0) idx = _matched;
-        } catch {}
+        const idx = _findRowIndex(queueKind, taskId);
         const api = window.pywebview?.api;
         const items = [];
         const taskLabel = (t.name || t.title || t.url || "this task").toString().slice(0, 60);
@@ -325,25 +292,45 @@
                 : Promise.resolve(confirm(
                     `Send "${taskLabel}" to the end of the queue and move on?`)));
               if (!ok) return;
-              if (queueKind === "sync") api?.sync_defer_current?.();
-              else api?.gpu_defer_current?.();
+              await _runExactQueueAction(
+                () => queueKind === "sync"
+                  ? api?.sync_defer_current?.(taskId)
+                  : api?.gpu_defer_current?.(taskId),
+                "Task could not be deferred; refresh and retry.",
+              );
             }});
         }
         // "Move to top" — only offered when there's something above the
         // task to overtake. Showing it on idx === 0 (running task or already-
         // first queued task) was confusing because the click silently did
         // nothing.
-        if (idx > 0) {
+        if (canDrag && Number(t.pending_index) > 0) {
           items.push(
             { label: "Move to top",
-              action: () => {
-                const [taken] = _queueState[queueKind].splice(idx, 1);
-                _queueState[queueKind].unshift(taken);
+              action: async () => {
+                let result;
+                try {
+                  result = queueKind === "sync"
+                    ? await api?.queues_sync_reorder?.(taskId, 0)
+                    : await api?.queues_gpu_reorder?.(taskId, 0);
+                } catch (error) {
+                  window._showToast?.(`Reorder failed: ${error}`, "error");
+                  return;
+                }
+                if (!_bridgeSucceeded(result)) {
+                  window._showToast?.(result?.error || "Queue changed; refresh and retry.",
+                    "error");
+                  return;
+                }
+                const liveIndex = _findRowIndex(queueKind, taskId);
+                if (liveIndex < 0) return;
+                const [taken] = _queueState[queueKind].splice(liveIndex, 1);
+                const firstPending = _queueState[queueKind].findIndex(
+                  item => (item?.status || "queued") !== "running");
+                _queueState[queueKind].splice(
+                  firstPending < 0 ? _queueState[queueKind].length : firstPending,
+                  0, taken);
                 paintTaskList(body, _queueState[queueKind], emptyText, queueKind);
-                if (queueKind === "sync" && api?.queues_sync_reorder)
-                  api.queues_sync_reorder(taken?.url || taken?.name || "", 0);
-                else if (queueKind === "gpu" && api?.queues_gpu_reorder)
-                  api.queues_gpu_reorder(taken?.id || taken?.path || taken?.name || "", 0);
               }},
           );
         }
@@ -368,8 +355,12 @@
                 : Promise.resolve(confirm(msg)));
               if (!ok) return;
               if (statusCls === "running") {
-                if (queueKind === "sync") api?.sync_skip_current?.();
-                else api?.gpu_skip_current?.();
+                await _runExactQueueAction(
+                  () => queueKind === "sync"
+                    ? api?.sync_skip_current?.(taskId)
+                    : api?.gpu_skip_current?.(taskId),
+                  "Task could not be cancelled; refresh and retry.",
+                );
               } else {
                 row.querySelector(".queue-task-close")?.click();
               }
@@ -387,21 +378,17 @@
       // U-2: notify backend of the reorder. Without this the next push
       //      from main.py snaps the rows back to old order.
       row.addEventListener("dragstart", (e) => {
+        if (!canDrag || !taskId) {
+          e.preventDefault();
+          return;
+        }
         row.classList.add("drag-src");
         _dragSrcKind = queueKind;
         e.dataTransfer.effectAllowed = "move";
         e.dataTransfer.setData("text/plain",
           JSON.stringify({
             queueKind: queueKind,
-            idx: i,
-            // Identity fields: the drop handler re-resolves the live
-            // index from these. A backend push between dragstart and
-            // drop re-renders the list and renumbers everything — the
-            // captured idx alone then splices the WRONG entry (same
-            // class as context-menu fix H205).
-            url: t.url || "",
-            path: t.path || "",
-            name: t.name || t.title || "",
+            task_id: taskId,
           }));
       });
       row.addEventListener("dragend", () => {
@@ -425,33 +412,13 @@
       row.addEventListener("dragleave", () => {
         row.classList.remove("drag-target-above", "drag-target-below");
       });
-      row.addEventListener("drop", (e) => {
+      row.addEventListener("drop", async (e) => {
         e.preventDefault();
-        // Parse the source identity. Refuse cross-queue drops — the
-        // dragged item belongs to a different queue's _queueState
-        // and a different backend reorder API. Splicing across queues
-        // would corrupt state (U-1).
         let parsed;
         try { parsed = JSON.parse(e.dataTransfer.getData("text/plain")); }
         catch { parsed = null; }
-        // Back-compat: legacy payload was a bare index string. If parse
-        // fails, treat as same-queue drop (matches old behavior).
-        const srcKind = (parsed && parsed.queueKind) || queueKind;
-        let srcIdx = parsed && Number.isFinite(parsed.idx)
-          ? parsed.idx
-          : Number(e.dataTransfer.getData("text/plain"));
-        // Re-resolve the source index by IDENTITY — the numeric idx
-        // goes stale if a backend push re-rendered between dragstart
-        // and drop (mirrors the context menu's H205 fix).
-        if (parsed && (parsed.url || parsed.path || parsed.name)) {
-          const _arr = _queueState[srcKind] || [];
-          const _m = _arr.findIndex(x => x && (
-            (x.url && parsed.url && x.url === parsed.url)
-            || (x.path && parsed.path && x.path === parsed.path)
-            || ((x.name || x.title) && parsed.name
-                && (x.name || x.title) === parsed.name)));
-          if (_m >= 0) srcIdx = _m;
-        }
+        const srcKind = parsed?.queueKind || "";
+        const sourceTaskId = String(parsed?.task_id || "").trim();
         if (srcKind !== queueKind) {
           row.classList.remove("drag-target-above", "drag-target-below");
           // Cross-queue drop: no-op. Show a brief toast so the user
@@ -460,34 +427,51 @@
             "Can't drag tasks between Sync and Processing queues.", "warn");
           return;
         }
-        const dstIdx = Number(row.dataset.idx);
-        if (Number.isNaN(srcIdx) || srcIdx === dstIdx) return;
+        const srcIdx = _findRowIndex(queueKind, sourceTaskId);
+        const dstIdx = _findRowIndex(queueKind, taskId);
+        if (!sourceTaskId || srcIdx < 0 || dstIdx < 0 || srcIdx === dstIdx) return;
         const rect = row.getBoundingClientRect();
         const below = e.clientY >= rect.top + rect.height / 2;
         const list = _queueState[queueKind];
-        const [moved] = list.splice(srcIdx, 1);
-        let insertAt = dstIdx;
-        if (srcIdx < dstIdx) insertAt -= 1;
-        if (below) insertAt += 1;
-        list.splice(insertAt, 0, moved);
-        paintTaskList(body, list, emptyText, queueKind);
-        // U-2: notify the backend so the reorder actually persists.
-        // Mirrors the right-click "Move to top" handler, which already
-        // calls queues_*_reorder. Without this, the next backend push
-        // snaps the rows back to the old order — the drag looked like
-        // it took effect for one frame, then visually undid itself.
+        const source = list[srcIdx];
+        const sourcePending = Number(source?.pending_index);
+        let insertAt = statusCls === "running"
+          ? 0
+          : (below ? Number(t.pending_end) + 1 : Number(t.pending_start));
+        if (!Number.isFinite(insertAt) || !Number.isFinite(sourcePending)) return;
+        if (sourcePending < insertAt) insertAt -= 1;
+        const pendingCount = list.reduce(
+          (count, item) => count + ((item?.status || "queued") === "running"
+            ? 0 : _rowTaskIds(item).length), 0);
+        insertAt = Math.max(0, Math.min(insertAt, pendingCount - 1));
         const api = window.pywebview?.api;
-        if (api && moved) {
-          if (queueKind === "sync" && api.queues_sync_reorder) {
-            api.queues_sync_reorder(
-              moved.url || moved.channel_name || moved.name || "",
-              insertAt);
-          } else if (queueKind === "gpu" && api.queues_gpu_reorder) {
-            api.queues_gpu_reorder(
-              moved.path || moved.bulk_id || moved.id || moved.name || "",
-              insertAt);
-          }
+        let result;
+        try {
+          result = queueKind === "sync"
+            ? await api?.queues_sync_reorder?.(sourceTaskId, insertAt)
+            : await api?.queues_gpu_reorder?.(sourceTaskId, insertAt);
+        } catch (error) {
+          window._showToast?.(`Reorder failed: ${error}`, "error");
+          return;
         }
+        if (!_bridgeSucceeded(result)) {
+          window._showToast?.(result?.error || "Queue changed; refresh and retry.",
+            "error");
+          return;
+        }
+
+        // Apply the visual reorder only after the backend accepted the exact
+        // ID. A concurrent backend push may already have done this, so resolve
+        // both source and destination again from the latest mirror.
+        const liveSource = _findRowIndex(queueKind, sourceTaskId);
+        const liveTarget = _findRowIndex(queueKind, taskId);
+        if (liveSource < 0 || liveTarget < 0 || liveSource === liveTarget) return;
+        const [moved] = list.splice(liveSource, 1);
+        let displayInsert = liveTarget;
+        if (liveSource < liveTarget) displayInsert -= 1;
+        if (below) displayInsert += 1;
+        list.splice(displayInsert, 0, moved);
+        paintTaskList(body, list, emptyText, queueKind);
       });
 
       body.appendChild(row);

@@ -45,6 +45,7 @@
   let _graphChart = null;
   let _graphLastData = null; // last-rendered { labels, values | series, bucket, word, channel }
   let _graphType = "line"; // current chart type
+  let _graphRequestSeq = 0;
 
   function initGraphView() {
     // Re-init guard so a second invocation doesn't double-wire
@@ -57,8 +58,16 @@
     const typeBtns = document.querySelectorAll(".chart-type-btn");
     typeBtns.forEach(b => {
       b.addEventListener("click", () => {
-        typeBtns.forEach(x => x.classList.remove("active"));
+        // Invalidate a query started for the old chart type before changing
+        // modes. A late line response must not be interpreted as word-cloud
+        // data (or vice versa).
+        _graphRequestSeq++;
+        typeBtns.forEach(x => {
+          x.classList.remove("active");
+          x.setAttribute("aria-pressed", "false");
+        });
         b.classList.add("active");
+        b.setAttribute("aria-pressed", "true");
         _graphType = b.dataset.type || "line";
         // Re-render on type switch. Word Cloud is independent of the Line/Bar
         // query (it needs no word) and previously showed "No words." until the
@@ -68,6 +77,8 @@
         // word in the box.
         if (_graphType === "wordcloud") {
           if (_graphLastData && Array.isArray(_graphLastData.cloud)) {
+            const emptyEl = document.getElementById("graph-empty");
+            if (emptyEl) emptyEl.textContent = "";
             drawGraphFromData(_graphLastData);
           } else {
             drawGraph();
@@ -81,6 +92,8 @@
         } else if (_graphLastData && !_graphLastData.cloud) {
           // No word typed but a cached series exists — redraw it so the
           // Line<->Bar toggle still works without forcing a re-type.
+          const emptyEl = document.getElementById("graph-empty");
+          if (emptyEl) emptyEl.textContent = "";
           drawGraphFromData(_graphLastData);
         } else {
           // Cold start / empty box: drawGraph() toasts "Enter a word to plot."
@@ -114,6 +127,8 @@
     });
     // CSV export
     document.getElementById("btn-graph-export-csv")?.addEventListener("click", _exportGraphCsv);
+    document.getElementById("btn-graph-drill")?.addEventListener(
+      "click", _drillSelectedGraphPoint);
   }
 
   function _graphDestroy() {
@@ -121,6 +136,78 @@
       try { _graphChart.destroy(); } catch {}
       _graphChart = null;
     }
+  }
+
+  function _clearGraphResult() {
+    _graphLastData = null;
+    _graphDestroy();
+    _hideWordCloud();
+    _clearGraphDrillControls();
+  }
+
+  function _clearGraphDrillControls() {
+    const controls = document.getElementById("graph-drill-controls");
+    const select = document.getElementById("graph-drill-select");
+    if (controls) controls.hidden = true;
+    if (select) {
+      select.innerHTML = "";
+      select._graphDrillChoices = [];
+    }
+  }
+
+  function _populateGraphDrillControls(data) {
+    const controls = document.getElementById("graph-drill-controls");
+    const select = document.getElementById("graph-drill-select");
+    if (!controls || !select) return;
+    const labels = Array.isArray(data?.labels) ? data.labels : [];
+    const choices = [];
+    if (Array.isArray(data?.series) && data.series.length) {
+      data.series.forEach((series, datasetIndex) => {
+        labels.forEach((label, index) => {
+          choices.push({
+            word: series?.word || data.word || "",
+            label,
+            bucket: data.bucket || "month",
+            channel: data.channel || null,
+            value: Array.isArray(series?.values) ? series.values[index] : "",
+            datasetIndex,
+            index,
+          });
+        });
+      });
+    } else {
+      labels.forEach((label, index) => {
+        choices.push({
+          word: data?.word || "",
+          label,
+          bucket: data?.bucket || "month",
+          channel: data?.channel || null,
+          value: Array.isArray(data?.values) ? data.values[index] : "",
+          datasetIndex: 0,
+          index,
+        });
+      });
+    }
+    select.innerHTML = "";
+    choices.forEach((choice, index) => {
+      const option = document.createElement("option");
+      option.value = String(index);
+      const word = choice.word ? `“${choice.word}” — ` : "";
+      option.textContent = `${word}${choice.label}: ${choice.value ?? ""}`;
+      select.appendChild(option);
+    });
+    select._graphDrillChoices = choices;
+    controls.hidden = choices.length === 0;
+  }
+
+  function _drillSelectedGraphPoint() {
+    const select = document.getElementById("graph-drill-select");
+    const index = Number(select?.value);
+    const choice = Number.isInteger(index)
+      ? select?._graphDrillChoices?.[index] : null;
+    if (!choice) return;
+    _drillIntoSearch(
+      choice.word, choice.label, choice.bucket, choice.channel);
   }
 
   // In Word-cloud mode the Word field is ignored (the cloud is a global
@@ -152,6 +239,10 @@
     const canvas = document.getElementById("graph-canvas");
     if (!canvas || !wordEl) return;
 
+    const requestId = ++_graphRequestSeq;
+    const requestType = _graphType;
+    const requestIsCurrent = () =>
+      requestId === _graphRequestSeq && requestType === _graphType;
     const word = (wordEl.value || "").trim();
     const bucket = bucketEl?.value || "month";
     const channel = (chanEl && chanEl.value !== "All") ? chanEl.value : null;
@@ -159,51 +250,110 @@
 
     // Word Cloud doesn't require a word — it's "what are the most-spoken
     // words overall?". Line/Bar both need a word.
-    if (_graphType !== "wordcloud" && !word) {
+    if (requestType !== "wordcloud" && !word) {
+      _clearGraphResult();
+      if (emptyEl) emptyEl.textContent = "Enter a word to plot.";
       window._showToast?.("Enter a word to plot.", "warn");
       return;
     }
 
     if (!nativeBridgeUp()) {
-      if (emptyEl) emptyEl.textContent = "Graph requires native mode.";
+      _clearGraphResult();
+      if (emptyEl) emptyEl.textContent = "The graph isn't ready yet. Try again in a moment.";
       return;
     }
 
+    _clearGraphResult();
     if (emptyEl) emptyEl.textContent = "Querying\u2026";
 
     // Word Cloud path
-    if (_graphType === "wordcloud") {
+    if (requestType === "wordcloud") {
       // Method-existence check — kept on direct api because the YT.api
       // proxy resolves every name to a function and so can't express
       // "is this endpoint actually wired on the backend?". Preserves the
       // distinct "not wired yet" message instead of a generic toast.
       if (!window.pywebview?.api?.browse_word_cloud) {
+        _clearGraphResult();
         if (emptyEl) emptyEl.textContent = "Word cloud backend not wired yet.";
         return;
       }
       let cloud;
-      try { cloud = await bridgeCall("browse_word_cloud", channel, 120); }
-      catch (e) { if (emptyEl) emptyEl.textContent = "Error: " + e; return; }
+      try {
+        const outcome = await window.YT.bridge.catalogRead(
+          "graph",
+          () => bridgeCall("browse_word_cloud", channel, 120),
+          {
+            label: "graph data",
+            onStatus: (status) => {
+              if (status.phase !== "done" && requestIsCurrent() && emptyEl) {
+                emptyEl.textContent = status.text;
+              }
+            },
+          });
+        if (outcome.stale) return;
+        cloud = outcome.value;
+      }
+      catch (e) {
+        if (requestIsCurrent()) {
+          _clearGraphResult();
+          if (emptyEl) emptyEl.textContent = "Error: " + e;
+        }
+        return;
+      }
+      if (!requestIsCurrent()) return;
       if (!cloud?.ok || !Array.isArray(cloud.words) || !cloud.words.length) {
+        _clearGraphResult();
         if (emptyEl) emptyEl.textContent = cloud?.error || "No words found.";
         return;
       }
       if (emptyEl) emptyEl.textContent = "";
-      _renderWordCloud(cloud.words);
-      _graphLastData = { cloud: cloud.words, channel };
+      const samplingLabel = cloud.sampling?.label || "";
+      _renderWordCloud(cloud.words, samplingLabel);
+      _graphLastData = {
+        cloud: cloud.words,
+        channel,
+        graphType: requestType,
+        samplingLabel,
+      };
       return;
     }
 
     // Line / Bar path
     // Method-existence check kept on direct api (see word-cloud note above).
     if (!window.pywebview?.api?.browse_graph) {
-      if (emptyEl) emptyEl.textContent = "Graph requires native mode.";
+      _clearGraphResult();
+      if (emptyEl) emptyEl.textContent = "The graph isn't ready yet. Try again in a moment.";
       return;
     }
     let data;
-    try { data = await bridgeCall("browse_graph", word, channel, bucket, normalize); }
-    catch (e) { if (emptyEl) emptyEl.textContent = "Error: " + e; return; }
-    if (data?.error) { if (emptyEl) emptyEl.textContent = data.error; return; }
+    try {
+      const outcome = await window.YT.bridge.catalogRead(
+        "graph",
+        () => bridgeCall("browse_graph", word, channel, bucket, normalize),
+        {
+          label: "graph data",
+          onStatus: (status) => {
+            if (status.phase !== "done" && requestIsCurrent() && emptyEl) {
+              emptyEl.textContent = status.text;
+            }
+          },
+        });
+      if (outcome.stale) return;
+      data = outcome.value;
+    }
+    catch (e) {
+      if (requestIsCurrent()) {
+        _clearGraphResult();
+        if (emptyEl) emptyEl.textContent = "Error: " + e;
+      }
+      return;
+    }
+    if (!requestIsCurrent()) return;
+    if (data?.error) {
+      _clearGraphResult();
+      if (emptyEl) emptyEl.textContent = data.error;
+      return;
+    }
     // backend reports `backfill_pending` when week-bucket
     // plots are requested before upload_ts backfill finishes. Surface
     // this so the user knows sparse week data is incomplete, not empty.
@@ -214,28 +364,38 @@
     }
     if (!data?.labels?.length) {
       if (emptyEl) emptyEl.textContent = `No occurrences found.`;
-      _graphDestroy();
+      _clearGraphResult();
       return;
     }
     if (emptyEl) emptyEl.textContent = "";
 
     _graphLastData = Object.assign({}, data,
-      { word, channel, bucket, normalize });
-    drawGraphFromData(_graphLastData);
+      { word, channel, bucket, normalize, graphType: requestType });
+    drawGraphFromData(_graphLastData, requestType);
   }
 
-  function drawGraphFromData(data) {
+  function drawGraphFromData(data, graphType = _graphType) {
     if (!data) return;
     const canvas = document.getElementById("graph-canvas");
     if (!canvas) return;
-    if (typeof Chart === "undefined") return;
 
     // Word cloud uses its own renderer, not Chart.js
-    if (_graphType === "wordcloud") {
-      _renderWordCloud(data.cloud || []);
+    if (graphType === "wordcloud") {
+      _clearGraphDrillControls();
+      _renderWordCloud(data.cloud || [], data.samplingLabel || "");
       return;
     }
+    _populateGraphDrillControls(data);
     _hideWordCloud();
+
+    const chartWords = Array.isArray(data.series) && data.series.length
+      ? data.series.map(series => series.word).filter(Boolean).join(", ")
+      : (data.word || "word frequency");
+    canvas.setAttribute(
+      "aria-label",
+      `${graphType === "bar" ? "Bar" : "Line"} chart for ${chartWords}. `
+        + "Use the Chart point controls below to inspect a bucket in Search.");
+    if (typeof Chart === "undefined") return;
 
     _graphDestroy();
     const palette = ["#6cb4ee", "#e87aac", "#3dd68c", "#c7e64f",
@@ -247,12 +407,14 @@
         label: `"${s.word}"`,
         data: s.values,
         borderColor: palette[i % palette.length],
-        backgroundColor: _graphType === "bar"
+        backgroundColor: graphType === "bar"
           ? palette[i % palette.length] + "aa"
           : palette[i % palette.length] + "28",
         tension: 0.25,
-        fill: _graphType === "line",
+        fill: graphType === "line",
         pointRadius: 3,
+        pointHoverRadius: 5,
+        pointHitRadius: 14,
         pointBackgroundColor: palette[i % palette.length],
       }));
     } else {
@@ -261,18 +423,20 @@
                (data.normalize ? " (per 1k)" : ""),
         data: data.values,
         borderColor: "#6cb4ee",
-        backgroundColor: _graphType === "bar"
+        backgroundColor: graphType === "bar"
           ? "rgba(108, 180, 238, 0.75)"
           : "rgba(108, 180, 238, 0.15)",
         tension: 0.25,
-        fill: _graphType === "line",
+        fill: graphType === "line",
         pointRadius: 3,
+        pointHoverRadius: 5,
+        pointHitRadius: 14,
         pointBackgroundColor: "#6cb4ee",
       }];
     }
 
     _graphChart = new Chart(canvas.getContext("2d"), {
-      type: _graphType,
+      type: graphType,
       data: { labels: data.labels, datasets: datasets },
       options: {
         responsive: true,
@@ -283,8 +447,21 @@
         // window is squished narrow.
         resizeDelay: 50,
         animation: { duration: 300 },
+        // A one-bucket series used to pin its only point to the chart edge,
+        // where the canvas clipped most of its click target. Center that
+        // special case, keep a little breathing room, and let Chart.js choose
+        // the nearest point when the click is just outside the visible dot.
+        layout: { padding: { left: 10, right: 10 } },
+        interaction: { mode: "nearest", intersect: false },
         scales: {
-          x: { ticks: { color: "#a0aabb" }, grid: { color: "#2a2c30" } },
+          x: {
+            // Preserve Chart.js's normal bar spacing while centering the
+            // otherwise edge-clipped one-point line-series case.
+            offset: graphType === "bar"
+              || (Array.isArray(data.labels) && data.labels.length === 1),
+            ticks: { color: "#a0aabb" },
+            grid: { color: "#2a2c30" },
+          },
           y: { ticks: { color: "#a0aabb" }, grid: { color: "#2a2c30" }, beginAtZero: true,
                title: {
                  display: !!data.normalize,
@@ -303,7 +480,11 @@
           if (!els || !els.length) return;
           const idx = els[0].index;
           const label = data.labels[idx];
-          const word = data.word || (data.series?.[els[0].datasetIndex]?.word) || "";
+          // A multi-word plot stores the original comma-separated input in
+          // data.word. Drill with the clicked dataset's word first; otherwise
+          // every line opened Search for the whole comma-separated string.
+          const word = data.series?.[els[0].datasetIndex]?.word
+            || data.word || "";
           _drillIntoSearch(word, label, data.bucket || "month", data.channel);
         },
       },
@@ -360,12 +541,47 @@
     const yf = document.getElementById("search-year-from");
     const yt = document.getElementById("search-year-to");
     const scope = document.getElementById("search-scope");
+    const inTranscripts = document.getElementById("search-in-transcripts");
+    const inTitles = document.getElementById("search-in-titles");
     if (q) q.value = word;
-    // Parse bucket label — "2024" (year), "2024-03" (month), or a week key
+    // Graph points are calculated exclusively from transcript segments, so
+    // their drill-down must search the same source regardless of whatever
+    // content mode the user last chose in Search. Use transcript-only here:
+    // retaining title matches would mix unrelated video-title hits into the
+    // evidence behind the plotted point. Dispatch change so the visible
+    // filter state and the hidden compatibility scope stay in sync.
+    if (inTranscripts) inTranscripts.checked = true;
+    if (inTitles) inTitles.checked = false;
+    inTranscripts?.dispatchEvent(new Event("change", { bubbles: true }));
+    inTitles?.dispatchEvent(new Event("change", { bubbles: true }));
+    if (scope) scope.value = "all";
+    // Preserve the exact clicked month or ISO week for the Search request.
+    // The visible year fields stay populated as a useful summary.
     const m1 = /^(\d{4})$/.exec(bucketLabel || "");
     const m2 = /^(\d{4})-(\d{2})$/.exec(bucketLabel || "");
+    const mw = /^(\d{4})-W(\d{2})$/.exec(bucketLabel || "");
+    let range = null;
     if (m1) { if (yf) yf.value = m1[1]; if (yt) yt.value = m1[1]; }
-    else if (m2) { if (yf) yf.value = m2[1]; if (yt) yt.value = m2[1]; }
+    else if (m2) {
+      if (yf) yf.value = m2[1];
+      if (yt) yt.value = m2[1];
+      const start = new Date(Number(m2[1]), Number(m2[2]) - 1, 1);
+      const end = new Date(Number(m2[1]), Number(m2[2]), 1);
+      range = { fromTs: start.getTime() / 1000, toTs: end.getTime() / 1000 };
+    } else if (mw) {
+      if (yf) yf.value = mw[1];
+      if (yt) yt.value = mw[1];
+      const jan4 = new Date(Number(mw[1]), 0, 4);
+      const mondayOffset = (jan4.getDay() + 6) % 7;
+      const start = new Date(Number(mw[1]), 0,
+        4 - mondayOffset + (Number(mw[2]) - 1) * 7);
+      const end = new Date(start);
+      end.setDate(end.getDate() + 7);
+      range = { fromTs: start.getTime() / 1000, toTs: end.getTime() / 1000 };
+    }
+    window._searchExactDateRange = range
+      ? { ...range, label: String(bucketLabel), query: String(word) }
+      : null;
     if (scope && channel) {
       // Set the hidden compat select so the legacy path picks up the
       // single-channel scope.
@@ -400,8 +616,9 @@
   // Word cloud renderer — no Chart.js; just positions span elements sized
   // proportional to their frequency. Matches YTArchiver.py's matplotlib
   // word-cloud conceptually but DOM-based so we don't pull another lib.
-  function _renderWordCloud(words) {
+  function _renderWordCloud(words, samplingLabel = "") {
     _graphDestroy();
+    _clearGraphDrillControls();
     const canvas = document.getElementById("graph-canvas");
     const wrap = canvas?.parentElement;
     if (!wrap) return;
@@ -416,6 +633,12 @@
     }
     cloud.style.display = "";
     cloud.innerHTML = "";
+    if (samplingLabel) {
+      const samplingHint = document.createElement("div");
+      samplingHint.className = "browse-hint graph-wordcloud-hint";
+      samplingHint.textContent = samplingLabel;
+      cloud.appendChild(samplingHint);
+    }
     const cleanWords = Array.isArray(words)
       ? words.map(w => ({
           word: String(w?.word || "").trim(),
@@ -454,12 +677,20 @@
       span.style.fontSize = size + "px";
       span.style.color = palette[i % palette.length];
       span.title = `${w.word} \u2014 ${(w.count).toLocaleString()} occurrence${w.count === 1 ? "" : "s"}`;
-      // Click = seed the Word field with this word and re-plot as line.
-      span.addEventListener("click", () => {
+      span.setAttribute("role", "button");
+      span.tabIndex = 0;
+      // Activate = seed the Word field with this word and re-plot as line.
+      const activate = () => {
         const wordEl = document.getElementById("graph-word");
         if (wordEl) wordEl.value = w.word;
         // Switch back to line chart
         document.querySelector('.chart-type-btn[data-type="line"]')?.click();
+      };
+      span.addEventListener("click", activate);
+      span.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        activate();
       });
       cloud.appendChild(span);
     }
@@ -481,6 +712,11 @@
     }
     let rows = [];
     if (_graphLastData.cloud) {
+      const samplingLabel = String(_graphLastData.samplingLabel ||
+        "Limited sample: word frequencies use at most the oldest 500,000 " +
+        "transcript segments, not the complete archive.");
+      rows.push(["SAMPLE SCOPE", samplingLabel]);
+      rows.push([]);
       rows.push(["word", "count"]);
       const cloudRows = Array.isArray(_graphLastData.cloud)
         ? _graphLastData.cloud : [];
@@ -518,9 +754,16 @@
     const fname = _graphLastData.cloud ? "wordcloud.csv" :
       `graph_${(_graphLastData.word || "data").replace(/[^\w-]+/g, "_")}.csv`;
     if (nativeBridgeUp()) {
-      const res = await bridgeCall("save_text_to_file", fname, csv);
-      if (res?.ok) window._showToast?.("CSV saved.", "ok");
-      else window._showToast?.(res?.error || "Save failed.", "error");
+      try {
+        const res = await bridgeCall("save_text_to_file", fname, csv);
+        if (res?.ok) window._showToast?.("CSV saved.", "ok");
+        else if (!res?.cancelled) {
+          window._showToast?.(res?.error || "Save failed.", "error");
+        }
+      } catch (error) {
+        window._showToast?.(
+          `Save failed: ${error?.message || error}`, "error");
+      }
     } else {
       // Browser preview fallback
       const blob = new Blob([csv], { type: "text/csv" });
@@ -536,12 +779,38 @@
     const sel = document.getElementById("graph-channel");
     if (!sel) return;
     if (!nativeBridgeUp()) return;
-    try {
-      const chans = await bridgeCall("browse_list_channels");
-      if (!chans) return;
+    const paint = (chans) => {
+      if (!Array.isArray(chans)) return;
+      const previous = sel.value;
       sel.innerHTML = '<option value="All">All</option>' +
         chans.map(c => `<option value="${escapeHtml(c.name || c.folder)}">${escapeHtml(c.name || c.folder)}</option>`).join("");
-    } catch (e) { /* ignore */ }
+      if ([...sel.options].some(option => option.value === previous)) {
+        sel.value = previous;
+      }
+    };
+    // The Channels screen already owns a useful subscription snapshot. Use
+    // it immediately instead of making the graph dropdown wait for artwork
+    // and aggregate counts it never displays.
+    const cached = window._browseState?.channels || [];
+    if (cached.length) {
+      paint(cached);
+      return;
+    }
+    sel.innerHTML = '<option value="All">Loading channels…</option>';
+    try {
+      const outcome = await window.YT.bridge.catalogRead(
+        "graph-channels",
+        () => bridgeCall("browse_list_channels"),
+        {
+          label: "graph channels",
+          onStatus: (status) => {
+            if (status.phase !== "done" && sel.options.length) {
+              sel.options[0].textContent = status.text;
+            }
+          },
+        });
+      if (!outcome.stale && Array.isArray(outcome.value)) paint(outcome.value);
+    } catch (e) { paint([]); }
   }
 
   YT.graph = {

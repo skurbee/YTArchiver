@@ -52,7 +52,8 @@ window state restore, and signal handling for clean shutdown.
 **Key things to find inside:**
 - `class Api` — the JS bridge. Hundreds of methods, organized into
   sections by comment headers (Subs, Browse, Watch, Settings, etc).
-- `APP_VERSION` constant near the top — gets bumped on every release.
+- `backend/version.py` — the single source of truth for `APP_VERSION` and
+  `APP_VERSION_DATE`.
 - Bottom of file: `if __name__ == "__main__":` block — initializes
   everything in order, creates the pywebview window, starts the
   main loop.
@@ -60,8 +61,23 @@ window state restore, and signal handling for clean shutdown.
 ### `YTArchiver.spec`
 PyInstaller "recipe". Tells PyInstaller how to bundle `main.py` plus
 every backend module, the `web/` folder, the icon, and the whisper
-worker script into a single `dist/YTArchiver.exe`. Build with
-`py -3.13 -m PyInstaller YTArchiver.spec`.
+worker script into a single `dist/YTArchiver.exe`. The normal build path is
+the verified gate in `scripts/check.ps1`, not a bare PyInstaller command.
+
+### Toolchain, dependency, and release files
+
+- `.python-version` and `.nvmrc` pin the Python and Node versions used by the
+  local gate and Windows CI.
+- `requirements/*.lock` contains exact, hash-verified locks for the app,
+  build/test tools, and CPU/CUDA worker environments.
+- `package.json` and `package-lock.json` pin the Playwright browser-test
+  harness.
+- `THIRD_PARTY_NOTICES.md` and `licenses/` carry the notices and license text
+  packaged with the executable.
+- `.github/workflows/quality.yml` runs the same Windows quality gate used
+  locally and publishes only an executable that passes build verification.
+
+See [`BUILD.md`](BUILD.md) for the complete command and gate stages.
 
 ### `icon.ico`
 The window icon and tray icon, used by both `pywebview` and `pystray`.
@@ -159,6 +175,17 @@ have a real file). Used by the maintenance pass in Settings.
 **Key functions:** `scan_channel`, `apply_channel`,
 `rebuild_fts_index`.
 
+### `integrity_scan.py`  ·  read-only cross-store preview
+
+Inspects explicit archive, config, database, and queue paths without changing
+them. SQLite is opened immutable/read-only. The report compares FTS and
+transcripts, legacy and normalized catalog links, saved-media IDs, queue and
+transcription recovery records, folder overrides, activity history, and
+migration state. It reports proposed repairs but deliberately has no repair
+entry point.
+
+**Key functions:** `scan_integrity`, `run_integrity_scan`.
+
 ### `index.py`  ·  the SQLite database (entry module)
 THE central data store. Every downloaded video gets a row here with
 its title, channel, upload date, duration, file path, transcription
@@ -184,11 +211,33 @@ re-exports for back-compat.
 (parallel reader for non-mutating queries), `_open_independent`
 (fresh per-thread connection for long-running writes like sweep).
 
+### `catalog_repository.py`  ·  logical videos and physical media
+
+Owns the additive normalized projection beside the legacy `videos` table.
+`logical_videos` represents content identity and `media_files` represents each
+known path/copy. Identity comes from a YouTube ID, then a normalized path,
+then an explicit legacy row ID; title text is never used as identity.
+
+The staged migration creates and verifies a separate legacy-catalog backup,
+projects old rows, compares deterministic digests, and enables normalized
+reads only after equivalence passes. Compatibility triggers mark identities
+dirty when an older executable writes `videos`; `CatalogConnection` reconciles
+those identities in the same transaction as the next Patch 5 commit.
+
+**Key classes/functions:** `CatalogConnection`, `CatalogStatus`,
+`create_verified_legacy_catalog_backup`, `verify_legacy_catalog_backup`,
+`reconcile_catalog`, `reconcile_dirty_catalog`, `catalog_status`,
+`normalized_reads_enabled`.
+
 ### `index_search.py`  ·  FTS5 + title search
 Owns the Browse > Search backend.
 
-**Key functions:** `search_video_titles` (LIKE-based titles),
-`search_fts` (FTS5 MATCH over transcript segments), `_sanitize_fts_query`.
+When normalized reads are enabled, both title and transcript results resolve
+through logical video identity and its canonical available media path. This
+prevents duplicate physical copies from multiplying search results.
+
+**Key functions:** `search_video_titles` (LIKE-based titles), `search_fts`
+(FTS5 MATCH over transcript segments), `_sanitize_fts_query`.
 
 ### `index_graph.py`  ·  word-frequency graphing
 Powers Browse > Graph.
@@ -271,17 +320,33 @@ Package layout (all symbols re-exported via `metadata/__init__.py`):
 `count_thumbnail_status_bulk`, `count_video_id_status_bulk`,
 `sweep_missing_thumbnails`, `realign_misplaced_thumbnails`.
 
-### `services/`  ·  shared service container  ·  package
-The gradual replacement for implicit cross-mixin `self._*` access in
-`main.Api`. New code should prefer `self.services.<dependency>` for shared
-config, queue, log, transcribe, event-bus, and file-operation dependencies.
+### `services/`  ·  explicit state and lifecycle boundaries  ·  package
+
+The gradual replacement for implicit cross-mixin `self._*` ownership in
+`main.Api`. New code should depend on a named repository or domain service and
+receive shared instances through `self.services`; `AppServices` stays a thin
+dependency holder.
 
 Package layout:
-- `app_services.py` — `AppServices`, the dependency container
-- `event_bus.py` — `BridgeEventBus`, safe Python-to-JS event dispatch
-- `file_ops.py` — managed-root checked file deletion helpers
+- `app_services.py` — `AppServices`, the long-lived dependency container
+- `config_repository.py` — config load/replace/serialized mutation contract
+- `queue_repository.py` — atomic queue/resuming commits and corruption
+  preservation (used by `QueueState`)
+- `sidecar_store.py` — locked, validated, staged sidecar reads/writes and
+  durable multi-store reconciliation markers
+- `event_bus.py` — `BridgeEventBus`, safely serialized Python-to-JS dispatch
+- `file_ops.py` — managed-root containment and recoverable destructive actions
+- `job_supervisor.py` — register-before-start background ownership,
+  admission, checkpoint, bounded join, and exact force-stop
+- `managed_work.py` — small adapters for supervised API/startup work
+- `channel_leases.py` — atomic channel-alias and archive-wide leases
+- `channel_transactions.py` — crash-recoverable folder/config transaction
+  journal
+- `restore_coordinator.py` — validated, staged, rollback-capable state restore
 
-**Key classes/functions:** `AppServices`, `BridgeEventBus`,
+**Key classes/functions:** `AppServices`, `ConfigRepository`,
+`QueueRepository`, `BridgeEventBus`, `JobSupervisor`,
+`begin_reconciliation`, `channel_leases`, `start_managed_task`,
 `safe_remove_file`, `safe_rmtree_channel_folder`.
 
 ### `net.py`  ·  am I online?
@@ -322,9 +387,14 @@ queue (yt-dlp downloads) and the GPU queue (Whisper transcriptions +
 ffmpeg compressions). The Sync Tasks / GPU Tasks popups in the
 header render these.
 
-**Key classes/functions:** `class QueueState` (the state machine —
-load, save, enqueue, pop, remove, reorder, clear, current-running
-tracking, pause flags, UI payload formatting).
+`QueueState` owns the in-memory state machine. File parsing and commits are
+delegated to `services/queue_repository.py`, which preserves malformed input
+as a sidelined backup and never replaces the last known-good file with an
+invalid object.
+
+**Key classes/functions:** `class QueueState` (enqueue, pop, remove, reorder,
+clear, current-running tracking, pause flags, UI payload formatting),
+`QueueRepository` (main/resuming load and atomic commit).
 
 ### `redownload.py`  ·  fetch existing video at higher res
 Right-click a video and pick "Redownload at 1080p" — this module
@@ -370,6 +440,8 @@ metadata + transcribe jobs as each video completes.
 Package layout (all symbols re-exported via `sync/__init__.py`):
 - `core.py` — `sync_channel`, the per-channel orchestration giant
 - `sync_all.py` — `sync_all`, the multi-channel batch coordinator
+- `download_commit.py` — validates durable final media and performs the one
+  catalog-registration commit for completed downloads
 - `sync_helpers.py` — small file/format helpers (`_hide_sidecar_win`,
   `_sweep_orphan_vtts`, `_scan_recent_video`, `_resolve_final_mp4`,
   `_fmt_duration`, `_fmt_size`)
@@ -390,6 +462,8 @@ Package layout (all symbols re-exported via `sync/__init__.py`):
   yt-dlp, parses every output line, manages the per-video Downloading-
   line lifecycle, handles cookie / livestream / archive-skip / Merger
   / DLTRACK events.
+- `commit_download` — rejects missing/empty/partial media and returns one
+  explicit `DownloadCommitResult` for durable media plus registration.
 - `sync_all` — top-level batch sync across all subscribed channels.
 - `build_format_string` — turns a resolution preference (e.g. "1080")
   into the right yt-dlp format selector.
@@ -423,6 +497,8 @@ Owns the transcription pipeline. Two paths:
 
 Package layout (all symbols re-exported via `transcribe/__init__.py`):
 - `core.py` — `TranscribeManager` + worker loop
+- `job_execution.py` — explicit worker outcomes and cancel/defer/shutdown
+  policy after file-changing work stops
 - `helpers.py` — pure helpers (path/title resolution, `find_python311`,
   `_extract_video_id`, `_bump_transcription_pending`,
   `_resolve_transcript_paths`, `_ffprobe_duration`, chunk constants)
@@ -436,6 +512,8 @@ Package layout (all symbols re-exported via `transcribe/__init__.py`):
 **Key classes/functions:**
 - `class TranscribeManager` — the worker thread that consumes the
   GPU queue.
+- `TranscriptionJobExecutor`, `WorkerOutcome`, `execution_decision` — the
+  result contract that decides terminal removal versus retry/pause.
 - `class PunctuationManager` — manages the `punct_worker.py`
   subprocess.
 - `find_python311` — discovers the Whisper environment.
@@ -584,6 +662,9 @@ later modules read earlier modules' globals.
   `onceIdempotent`; namespaced as `YT.util.*`.
 - `bridge.js` — `window.pywebview.api` shim + `bridgeCall(method,
   ...)` helper that tolerates calls before the bridge is ready.
+- `eventState.js` — stable named-topic `publish` / `subscribe` / `snapshot`
+  owner for shared bridge-pushed state. `window.setQueueState` publishes the
+  `queue-state` topic instead of being repeatedly wrapped by consumers.
 - `browseState.js` — declares `window._browseState` early so
   extracted modules close over the same object.
 
@@ -591,6 +672,8 @@ later modules read earlier modules' globals.
 - `chrome.js` — header strip, tab buttons, view switcher.
 - `shortcuts.js` — global keyboard shortcuts.
 - `queueBlink.js` — pause/resume button + queue badge state machine.
+  Subscribes to `queue-state` and `queue-payload` independently of the status
+  bar.
 - `dropdown.js` — custom select widget used in toolbars.
 - `contextMenu.js` — generic right-click menu used everywhere.
 - `logContextMenu.js` — log-line right-click (copy / open URL / etc).
@@ -643,6 +726,47 @@ Browse > Graph view. Third-party, do not edit.
 
 ---
 
+## Tests and release tooling
+
+### `tests/`
+
+Python regression modules cover the backend by patch/domain. Patch 5 adds
+focused coverage for the normalized catalog, integrity preview, queue/config
+repositories, download/transcription boundaries, and durable sidecar store.
+The Windows gate runs each Python test module in a fresh interpreter with
+disposable app-data directories so process-lifetime state cannot leak between
+unrelated modules.
+
+Frontend tests have two layers:
+
+- `tests/test_frontend*.js` — fast Node regression tests for isolated modules.
+- `tests/frontend/browser/` — Playwright tests that load the real generated
+  `web/index.html` with a deterministic `window.pywebview.api` stub. They cover
+  modal safety, startup bridge timing, exact queue identity, stale async Watch
+  responses, hidden-player shortcuts, backend error handling, and isolated
+  event-state subscribers.
+
+`tests/release/test_release_guardrails.py` verifies the guardrails themselves:
+dependency locks, generated HTML, bridge scanning, privacy scanning, version
+ownership, CI stages, x64 PE parsing, and packaged notices.
+
+### `scripts/`
+
+- `check.ps1` — authoritative Windows gate and clean verified build
+- `lock_dependencies.ps1` — validates or intentionally refreshes lock files
+- `import_check.py` — compiles and imports every backend module
+- `check_generated_html.py` — fails when generated `index.html` is stale
+- `check_bridge_contract.py` — reports frontend bridge calls with no Python API
+- `repository_scan.py` — blocks known secret and publication-privacy patterns
+- `verify_build.py` — verifies x64 PE structure, version resources, and required
+  files inside the PyInstaller executable
+
+The CI workflow in `.github/workflows/quality.yml` invokes
+`scripts/check.ps1 -Bootstrap -RequireCleanTree`, so local and hosted release
+checks use the same implementation.
+
+---
+
 ## How a sync actually works (end-to-end)
 
 Helpful to trace:
@@ -659,16 +783,18 @@ Helpful to trace:
    `[download] Destination:` → emit "Downloading <title>" log row;
    `[download] 50%` → update that row in place;
    `[Merger] Merging formats into "X.mp4"` → capture final path;
-   `DLTRACK:::...` (a custom `--print` template we inject) → confirm
-   the video is fully merged. Replace the Downloading row with a
-   "✓ <title>" done row. Submit an inline metadata task + transcribe
-   task for this video.
+   `DLTRACK:::...` (a custom `--print` template we inject) → identify
+   the final output. `download_commit.commit_download` verifies that the file
+   is durable and performs one catalog registration before the UI reports a
+   successful completion.
 7. Inline metadata task fires immediately via a single-worker
    ThreadPoolExecutor (so we don't hammer YouTube). It refreshes
-   views / likes / comments and writes the metadata sidecar.
+   views / likes / comments and writes the metadata sidecar through the
+   shared durable sidecar store.
 8. Transcribe task enqueues onto the GPU queue. The
    `TranscribeManager` worker picks it up, tries auto-captions first,
-   falls back to Whisper on the 3.11 subprocess.
+   falls back to Whisper on the 3.11 subprocess, and returns an explicit
+   worker outcome for completion/retry policy.
 9. After every video, `sync_channel` writes a `[Dwnld]` row to the
    activity log (consolidated across the channel's videos so far).
 10. When the channel finishes, the consolidated row is finalized,
@@ -699,12 +825,13 @@ and the mini-logs.
    so the karaoke viewer stays usable.
 6. The raw text gets shipped to the `punct_worker.py` subprocess for
    punctuation + capitalization restoration.
-7. The worker writes a per-video `.jsonl` sidecar (word-level
-   timestamps) and appends an entry to the channel's merged
-   `Transcript.txt`. It also registers / updates the video row in
-   the SQLite index, which immediately makes the transcript
-   searchable in the UI.
-8. Throughout, progress updates flow back to the UI via the log
+7. The worker writes a per-video `.jsonl` sidecar (word-level timestamps) and
+   updates the channel's merged `Transcript.txt` through validated atomic
+   sidecar commits. Multi-store operations retain a reconciliation marker
+   until every store is committed.
+8. It registers / updates the video and ingests transcript segments in the
+   SQLite index, which immediately makes the transcript searchable in the UI.
+9. Throughout, progress updates flow back to the UI via the log
    stream so the user sees percent-complete inline in the main log.
 
 ---
@@ -722,11 +849,14 @@ to learn codebase, read in this order:
    builds the yt-dlp command, loops over stdout, handles each line
    type. (Submodules under `sync/` are mostly extracted helpers — read
    them only when their concern matters.)
-5. **`backend/index.py`** — the database underneath everything user-
-   visible. Know the `register_video` / `list_videos_for_channel` /
-   `search_fts` shape.
-6. **`web/index.html`** + **`web/app.js`** header — the page
+5. **`backend/index.py`** + **`backend/catalog_repository.py`** — the database
+   underneath user-visible Browse/Search and the logical-video/physical-media
+   projection.
+6. **`backend/services/`** — persistence, lifecycle, lease, and restore
+   ownership boundaries.
+7. **`web/index.html`** + **`web/eventState.js`** + **`web/app.js`** — the page
    structure + section map are at the top of each file.
-7. **`backend/transcribe/core.py`** + **`backend/whisper_worker.py`**
+8. **`backend/transcribe/core.py`** + **`backend/whisper_worker.py`**
    — the transcription pipeline, only if you need to touch it.
+9. **`scripts/check.ps1`** — the executable definition of done for a change.
 

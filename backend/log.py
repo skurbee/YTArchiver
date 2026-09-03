@@ -9,9 +9,9 @@ Lets us replace silent `except Exception: pass` blocks with
 Level → tag mapping (uses existing LogStreamer tag scheme):
     DEBUG    → "dim"  (already in VERBOSE_ONLY_TAGS → hidden in Simple mode)
     INFO     → None   (default style, visible in both modes)
-    WARNING  → None   (no dedicated yellow tag)
-    ERROR    → "red"
-    CRITICAL → "red"
+    WARNING  → ["internal_warning", "summary"] (Verbose-only, amber)
+    ERROR    → ["internal_error", "red"] (Verbose-only, red)
+    CRITICAL → ["internal_error", "red"] (Verbose-only, red)
 
 Usage from any module:
     from backend.log import get_logger
@@ -30,13 +30,20 @@ Wire-up (once, in main.py):
 from __future__ import annotations
 
 import logging
+import time
 
 _LEVEL_TO_TAG = {
     logging.DEBUG:    "dim",
     logging.INFO:     None,
-    logging.WARNING:  None,
-    logging.ERROR:    "red",
-    logging.CRITICAL: "red",
+    # Internal warning records can also contain archive paths or low-level
+    # backend wording. Keep them amber and searchable in Verbose mode only.
+    logging.WARNING:  ["internal_warning", "summary"],
+    # Raw logger failures commonly contain backend names, SQLite details, and
+    # full archive paths. They remain red and searchable in Verbose mode, but
+    # use a verbose-only primary tag so Simple mode shows the operation's
+    # plain-English status/error line instead of internal console output.
+    logging.ERROR:    ["internal_error", "red"],
+    logging.CRITICAL: ["internal_error", "red"],
 }
 
 
@@ -47,14 +54,36 @@ _bridge_attached = False
 class LogStreamerHandler(logging.Handler):
     """Forwards LogRecords to a LogStreamer as one tagged line per record."""
 
+    _SIMPLE_NOTICE_COOLDOWN_SECONDS = 300.0
+    _SIMPLE_NOTICE = (
+        "A background library update hit a problem. YTArchiver will keep "
+        "working; switch to Verbose for technical details."
+    )
+
     def __init__(self, stream, level: int = logging.DEBUG):
         super().__init__(level=level)
         self._stream = stream
+        self._simple_notice_at: dict[tuple[str, str], float] = {}
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             text = self.format(record)
             tag = _LEVEL_TO_TAG.get(record.levelno, None)
+            if (record.levelno >= logging.ERROR
+                    and bool(getattr(self._stream, "simple_mode", False))):
+                # One plain notice per logger + unformatted record template.
+                # Repeated per-file failures (for example a catalog sweep)
+                # therefore produce one useful line instead of hundreds, and
+                # neither interpolated paths nor SQL details enter Simple mode.
+                key = (str(record.name or ""), str(record.msg or ""))
+                now = time.monotonic()
+                previous = self._simple_notice_at.get(key)
+                if (previous is None or
+                        now - previous >= self._SIMPLE_NOTICE_COOLDOWN_SECONDS):
+                    if len(self._simple_notice_at) >= 256:
+                        self._simple_notice_at.clear()
+                    self._simple_notice_at[key] = now
+                    self._stream.emit_error(self._SIMPLE_NOTICE)
             self._stream.emit_text(text, tag)
         except Exception:
             # Never let the logger crash the caller; can't log this

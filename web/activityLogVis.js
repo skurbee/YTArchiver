@@ -38,7 +38,7 @@
     if (!el || !frame) return;
     const hasItems = el.childElementCount > 0;
     // Rising edge: empty → populated. Reset inline flex so the CSS
-    // rule (`.activity-log-frame { flex: 0 0 56px }` → ~3 rows)
+    // rule (`.activity-log-frame { flex: 0 0 90px }` → a few rows)
     // takes effect instead of whatever height the splitter drag
     // last applied.
     if (hasItems && !_lastActivityHasItems) {

@@ -43,6 +43,15 @@ _SUBSCRIBER_CACHE_FIELDS = (
     "subscriber_fetch_last_attempt_ts",
     "subscriber_fetch_last_error",
 )
+_COUNT_SEMANTICS_VERSION = 2
+
+
+def _cache_int(value: Any, default: int = 0) -> int:
+    """Coerce legacy cache scalars without letting one bad record abort boot."""
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def subscriber_count_from_media(filepath: str) -> int | None:
@@ -191,51 +200,148 @@ def save_disk_cache(cache: dict[str, dict[str, Any]]) -> bool:
         return False
 
 
+def _indexed_channel_stats(channel_name: str) -> dict[str, Any] | None:
+    """Return current logical/copy/byte stats for one indexed channel."""
+    name = str(channel_name or "").strip()
+    if not name:
+        return None
+    try:
+        from . import index as _idx
+        conn = _idx._reader_open()
+        if conn is None:
+            return None
+        with _idx._reader_lock:
+            cte = _idx.channel_videos_cte_sql()
+            row = conn.execute(
+                f"WITH {cte} "
+                "SELECT "
+                " (SELECT COUNT(*) FROM channel_videos), "
+                " (SELECT COALESCE(SUM(size_bytes), 0) "
+                "  FROM _ranked_channel_copies), "
+                " (SELECT COUNT(*) FROM _ranked_channel_copies), "
+                " (SELECT MAX(downloaded_ts) "
+                "  FROM _ranked_channel_copies)",
+                (name,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "n_vids": int(row[0] or 0),
+            "size_bytes": int(row[1] or 0),
+            "physical_copies": int(row[2] or 0),
+            "latest_downloaded_ts": float(row[3] or 0),
+        }
+    except Exception as exc:
+        _log.debug("indexed channel stats failed for %r: %s", name, exc)
+        return None
+
+
+def migrate_legacy_cache_counts(channels: list | None = None) -> int:
+    """Upgrade cached counts created with library-wide duplicate filtering.
+
+    Older records can undercount a channel when that channel's valid media is
+    marked as a duplicate of a primary copy stored elsewhere. Recalculate
+    only unversioned records from the indexed physical rows, then stamp the
+    semantics version so ordinary Browse reads pay this cost once.
+    """
+    if channels is None:
+        try:
+            channels = list((load_config() or {}).get("channels", []) or [])
+        except Exception:
+            channels = []
+    by_url = {
+        str(ch.get("url") or "").strip(): ch
+        for ch in (channels or [])
+        if isinstance(ch, dict) and str(ch.get("url") or "").strip()
+    }
+    with _CACHE_LOCK:
+        snapshot = load_disk_cache()
+    candidates = []
+    for url, ch in by_url.items():
+        rec = snapshot.get(url)
+        if not isinstance(rec, dict):
+            continue
+        version = _cache_int(rec.get("count_semantics_version"), 0)
+        if version >= _COUNT_SEMANTICS_VERSION:
+            continue
+        candidates.append((url, ch, {
+            "n_vids": _cache_int(rec.get("num_vids"), 0),
+            "physical_copies": _cache_int(
+                rec.get("physical_copies"),
+                _cache_int(rec.get("num_vids"), 0)),
+            "size_bytes": _cache_int(rec.get("size_bytes"), 0),
+        }))
+
+    updates: dict[str, dict[str, Any]] = {}
+    for url, ch, legacy in candidates:
+        name = ch.get("name") or ch.get("folder") or ""
+        stats = _indexed_channel_stats(str(name))
+        if stats is None:
+            continue
+        # A smaller indexed result cannot prove that an old cache is wrong:
+        # startup may still be rebuilding that channel. Leave it unversioned
+        # so the startup healer uses its filesystem fallback instead of
+        # permanently stamping a partial catalog count.
+        if (stats["n_vids"] == 0
+                or stats["n_vids"] < legacy["n_vids"]
+                or stats["physical_copies"] < legacy["physical_copies"]
+                or stats["size_bytes"] < legacy["size_bytes"]):
+            continue
+        updates[url] = stats
+
+    if not updates:
+        return 0
+    migrated = 0
+    with _CACHE_LOCK:
+        live = load_disk_cache()
+        for url, stats in updates.items():
+            rec = live.get(url)
+            if not isinstance(rec, dict):
+                continue
+            version = _cache_int(rec.get("count_semantics_version"), 0)
+            if version >= _COUNT_SEMANTICS_VERSION:
+                continue
+            rec["num_vids"] = stats["n_vids"]
+            rec["physical_copies"] = stats["physical_copies"]
+            rec["size_bytes"] = stats["size_bytes"]
+            rec["count_semantics_version"] = _COUNT_SEMANTICS_VERSION
+            migrated += 1
+        if migrated and not save_disk_cache(live):
+            return 0
+    return migrated
+
+
 def update_disk_cache_for_channel(channel: dict[str, Any],
                                   force_filesystem: bool = False
                                   ) -> dict[str, Any]:
     """Re-walk the channel folder, update its cache entry, save, and return
     the new stats. Mirrors YTArchiver.py:3136 _update_disk_cache_for_channel.
     """
-    from .ytarchiver_config import load_config
     cfg = load_config()
     base = (cfg.get("output_dir") or "").strip()
     if not base:
-        return {"n_vids": 0, "size_bytes": 0, "size_gb": 0.0}
+        return {"n_vids": 0, "physical_copies": 0,
+                "size_bytes": 0, "size_gb": 0.0}
     # Fast path: aggregate count + size straight from the index DB (indexed
     # query, ~1s) instead of an os.walk + per-file stat of the whole channel
-    # folder. On a 28k-video channel on pooled storage that walk took ~2
+    # folder. On a very large channel on pooled storage that walk took minutes
     # MINUTES, and the sync calls this after every download — the dominant
     # part of the post-download "hang" on large channels. The index stores
     # size_bytes per video and is kept current by register_video / sweep /
     # prune, so its totals match the walk. Fall back to the walk when the DB
     # has no rows for this channel yet (brand-new / unindexed) or is down.
-    n_vids = total_bytes = None
+    n_vids = total_bytes = physical_copies = None
     latest_downloaded_ts = 0.0
     try:
         if force_filesystem:
             raise LookupError("filesystem refresh requested")
-        from . import index as _idx
-        _conn = _idx._reader_open()
-        if _conn is not None:
-            _nm = (channel.get("name") or channel.get("folder") or "").strip()
-            if _nm:
-                with _idx._reader_lock:
-                    _row = _conn.execute(
-                        "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0), "
-                        "MAX(downloaded_ts) "
-                        "FROM videos WHERE channel=? COLLATE NOCASE "
-                        # Exclude duplicate rows so this DB fast-path agrees
-                        # with the filesystem walk (which subtracts dups) AND
-                        # with Browse (which filters is_duplicate_of IS NULL).
-                        # Without this the Subs count flipped between runs
-                        # depending on which path ran (audit r2).
-                        "AND is_duplicate_of IS NULL AND "
-                        "COALESCE(availability, 'available')='available'",
-                        (_nm,)).fetchone()
-                if _row and _row[0]:
-                    n_vids, total_bytes = int(_row[0]), int(_row[1])
-                    latest_downloaded_ts = float(_row[2] or 0)
+        _nm = (channel.get("name") or channel.get("folder") or "").strip()
+        _stats = _indexed_channel_stats(_nm)
+        if _stats and _stats["n_vids"]:
+            n_vids = _stats["n_vids"]
+            total_bytes = _stats["size_bytes"]
+            physical_copies = _stats["physical_copies"]
+            latest_downloaded_ts = _stats["latest_downloaded_ts"]
     except LookupError:
         n_vids = total_bytes = None
     except Exception as e:
@@ -247,7 +353,8 @@ def update_disk_cache_for_channel(channel: dict[str, Any],
         n_vids = total_bytes = None
     if n_vids is None:
         from pathlib import Path as _P
-        n_vids, total_bytes = scan_channel_folder(_P(base), channel)
+        n_vids, total_bytes, physical_copies = scan_channel_folder(
+            _P(base), channel, include_physical=True)
     url = channel.get("url", "").strip()
     subscriber_count = None
     subscriber_checked = False
@@ -270,8 +377,10 @@ def update_disk_cache_for_channel(channel: dict[str, Any],
             _prev = cache.get(url)
             _rec = {
                 "num_vids": int(n_vids),
+                "physical_copies": int(physical_copies or n_vids),
                 "size_bytes": int(total_bytes),
                 "last_updated": time.time(),
+                "count_semantics_version": _COUNT_SEMANTICS_VERSION,
             }
             # Preserve the sweep fingerprint across stat refreshes —
             # replacing the whole record dropped it and forced a full
@@ -290,6 +399,7 @@ def update_disk_cache_for_channel(channel: dict[str, Any],
             cache[url] = _rec
             save_disk_cache(cache)
     return {"n_vids": n_vids,
+            "physical_copies": int(physical_copies or n_vids),
             "size_bytes": total_bytes,
             "size_gb": total_bytes / (1024 ** 3)}
 
@@ -370,20 +480,23 @@ def record_subscriber_fetch_failure(url: str, error: str = "",
 
 def stats_for_channel(channel: dict[str, Any], cache: dict[str, Any] | None = None
                       ) -> dict[str, Any]:
-    """Return stats for one channel: {n_vids, size_gb, size_bytes, cached, stale_secs}."""
+    """Return logical-video, physical-copy, and byte stats for one channel."""
     if cache is None:
         cache = load_disk_cache()
     url = channel.get("url", "").strip()
     rec = cache.get(url)
     if not rec:
-        return {"n_vids": 0, "size_bytes": 0, "size_gb": 0.0,
+        return {"n_vids": 0, "physical_copies": 0,
+                "size_bytes": 0, "size_gb": 0.0,
                 "cached": False, "stale_secs": None}
     n_vids = int(rec.get("num_vids", 0))
+    physical_copies = int(rec.get("physical_copies", n_vids))
     size_bytes = int(rec.get("size_bytes", 0))
     last = float(rec.get("last_updated", 0) or 0)
     stale = (time.time() - last) if last > 0 else None
     return {
         "n_vids": n_vids,
+        "physical_copies": physical_copies,
         "size_bytes": size_bytes,
         "size_gb": size_bytes / (1024 ** 3),
         "cached": True,
@@ -394,10 +507,12 @@ def stats_for_channel(channel: dict[str, Any], cache: dict[str, Any] | None = No
 def enrich_channels_with_stats(channels: list, cache: dict[str, Any] | None = None) -> list:
     """Attach n_vids / size_gb to each channel dict in-place. Returns the list."""
     if cache is None:
+        migrate_legacy_cache_counts(channels)
         cache = load_disk_cache()
     for ch in channels:
         st = stats_for_channel(ch, cache)
         ch["n_vids"] = st["n_vids"]
+        ch["physical_copies"] = st["physical_copies"]
         ch["size_bytes"] = st["size_bytes"]
         ch["size_gb"] = st["size_gb"]
     return channels
@@ -469,13 +584,20 @@ def heal_malformed_cache_entries() -> int:
 
     Returns the number of entries dropped.
     """
+    # Upgrade valid legacy records first. Any record that remains unversioned
+    # could not be proven against the index and must take the existing safe
+    # filesystem-walk path below.
+    migrate_legacy_cache_counts()
     with _CACHE_LOCK:
         cache = load_disk_cache()
-        dropped = [
-            url for url, rec in list(cache.items())
-            if not isinstance(rec, dict)
-               or "num_vids" not in rec or "size_bytes" not in rec
-        ]
+        dropped = []
+        for url, rec in list(cache.items()):
+            if (not isinstance(rec, dict)
+                    or "num_vids" not in rec
+                    or "size_bytes" not in rec
+                    or _cache_int(rec.get("count_semantics_version"), 0)
+                       < _COUNT_SEMANTICS_VERSION):
+                dropped.append(url)
         if not dropped:
             return 0
         for url in dropped:
@@ -489,6 +611,7 @@ def archive_totals(cache: dict[str, Any] | None = None) -> dict[str, Any]:
     if cache is None:
         cache = load_disk_cache()
     total_vids = 0
+    total_copies = 0
     total_bytes = 0
     n_channels = 0
     for url, rec in cache.items():
@@ -496,10 +619,13 @@ def archive_totals(cache: dict[str, Any] | None = None) -> dict[str, Any]:
             continue
         n_channels += 1
         total_vids += int(rec.get("num_vids", 0))
+        total_copies += int(rec.get("physical_copies",
+                                    rec.get("num_vids", 0)))
         total_bytes += int(rec.get("size_bytes", 0))
     return {
         "channels": n_channels,
         "videos": total_vids,
+        "physical_copies": total_copies,
         "size_bytes": total_bytes,
         "size_gb": total_bytes / (1024 ** 3),
     }
@@ -520,7 +646,8 @@ def _channel_folder_name(ch: dict[str, Any]) -> str:
 
 
 def scan_channel_folder(base_dir: Path, channel: dict[str, Any],
-                        stop_if=None) -> tuple[int, int] | None:
+                        stop_if=None, *, include_physical: bool = False
+                        ) -> tuple[int, int] | tuple[int, int, int] | None:
     """Walk a channel's folder, return (num_vids, total_bytes).
 
     Mirrors YTArchiver.py:3012 _scan_channel_disk_info for the two counts we need.
@@ -535,12 +662,13 @@ def scan_channel_folder(base_dir: Path, channel: dict[str, Any],
         return None
     folder_name = _channel_folder_name(channel)
     if not folder_name:
-        return (0, 0)
+        return (0, 0, 0) if include_physical else (0, 0)
     ch_folder = base_dir / folder_name
     if not ch_folder.is_dir():
-        return (0, 0)
+        return (0, 0, 0) if include_physical else (0, 0)
     n_vids = 0
     total = 0
+    media_paths: list[str] = []
     zero_byte = 0
     for dp, _dns, fns in os.walk(ch_folder):
         if _should_stop():
@@ -572,6 +700,7 @@ def scan_channel_folder(base_dir: Path, channel: dict[str, Any],
                 continue
             total += size
             n_vids += 1
+            media_paths.append(fp)
     # Bug [24]: surface 0-byte files instead of silently dropping them.
     # Previously this was completely invisible — a channel with 100
     # zero-byte placeholders showed clean stats while the orphans
@@ -583,12 +712,10 @@ def scan_channel_folder(base_dir: Path, channel: dict[str, Any],
                   f"downloads — safe to delete or re-sync)")
         except Exception as e:
             _log.debug("swallowed: %s", e)
-    # subtract any rows the FTS DB has flagged as
-    # duplicates for this channel. list_videos_for_channel filters
-    # `is_duplicate_of IS NULL`, so after a prune the Browse grid
-    # shows (n_vids - duplicates) while this function returned
-    # the raw on-disk count — leaving the Subs "videos" column
-    # and Browse grid disagreeing silently. Now both views agree.
+    physical_copies = n_vids
+    # Map each scanned physical filepath to the central logical key. Unknown
+    # (not-yet-indexed) files remain one logical item per physical path until
+    # the normal sweep registers their video ID.
     try:
         from . import index as _idx
         _conn = _idx._reader_open()
@@ -596,30 +723,33 @@ def scan_channel_folder(base_dir: Path, channel: dict[str, Any],
             ch_name = (channel.get("name") or channel.get("folder")
                        or "").strip()
             if ch_name:
-                # Reader path — duplicate-count is a pure SELECT and
-                # shouldn't queue behind sweep / ingest writes. Only
-                # count duplicates whose file STILL EXISTS on disk;
-                # the previous query included rows whose file had
-                # already been deleted, double-subtracting from the
-                # walk count and producing under-counts.
                 with _idx._reader_lock:
-                    _dup_rows = _conn.execute(
-                        "SELECT filepath FROM videos "
-                        "WHERE channel=? COLLATE NOCASE "
-                        "AND is_duplicate_of IS NOT NULL",
+                    _cte = _idx.channel_videos_cte_sql()
+                    _rows = _conn.execute(
+                        f"WITH {_cte} "
+                        "SELECT filepath, logical_video_key "
+                        "FROM _ranked_channel_copies",
                         (ch_name,)).fetchall()
-                _n_dup = 0
-                for _r in _dup_rows or ():
-                    _fp = (_r[0] or "")
-                    if _fp and os.path.isfile(_fp):
-                        _n_dup += 1
-                if _n_dup:
-                    n_vids = max(0, n_vids - _n_dup)
+                _by_path = {
+                    os.path.normcase(os.path.normpath(_fp)): _key
+                    for _fp, _key in _rows if _fp and _key
+                }
+                _logical_keys = {
+                    _by_path.get(
+                        os.path.normcase(os.path.normpath(_fp)),
+                        ("unindexed-path", os.path.normcase(
+                            os.path.normpath(_fp))),
+                    )
+                    for _fp in media_paths
+                }
+                n_vids = len(_logical_keys)
     except Exception as e:
         _log.warning(
             "archive duplicate-count DB query failed for %r: %s",
             channel.get("name") or channel.get("folder") or channel.get("url"),
             e)
+    if include_physical:
+        return (n_vids, total, physical_copies)
     return (n_vids, total)
 
 
@@ -650,16 +780,19 @@ def scan_all_channels(progress_cb=None,
                 progress_cb(ch.get("name", ""), i, total)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-        scanned = scan_channel_folder(base_dir, ch, stop_if=stop_if)
+        scanned = scan_channel_folder(
+            base_dir, ch, stop_if=stop_if, include_physical=True)
         if scanned is None:
             return None
-        n_vids, size_bytes = scanned
+        n_vids, size_bytes, physical_copies = scanned
         url = ch.get("url", "").strip()
         if url:
             rec = {
                 "num_vids": n_vids,
+                "physical_copies": physical_copies,
                 "size_bytes": size_bytes,
                 "last_updated": now,
+                "count_semantics_version": _COUNT_SEMANTICS_VERSION,
             }
             old = previous.get(url)
             if isinstance(old, dict):
@@ -695,6 +828,7 @@ def index_summary() -> dict[str, Any]:
         per_channel.append({
             "folder": ch.get("name") or ch.get("folder", ""),
             "n_vids": st["n_vids"],
+            "physical_copies": st["physical_copies"],
             "size_gb": st["size_gb"],
             "size": _fmt_size(st["size_bytes"]),
             "auto_transcribe": bool(ch.get("auto_transcribe")),
@@ -704,6 +838,7 @@ def index_summary() -> dict[str, Any]:
         "cards": {
             "channels": len(channels),
             "videos": tot["videos"],
+            "physical_copies": tot["physical_copies"],
             "size_gb": tot["size_gb"],
             "size_label": _fmt_size(tot["size_bytes"]),
             "transcribed_channels": transcribed_channels,
@@ -723,7 +858,7 @@ def _fmt_size(b: int) -> str:
 def index_db_stats() -> dict[str, Any]:
     """Slow index-DB-side stats: segments count, hours of indexed video,
     and the FTS DB file size. Split out from index_summary() because
-    on a large archive (9M+ segments, 16GB DB) the COUNT(*) +
+    on a large archive the COUNT(*) +
     JOIN aggregate run for many seconds — long enough to hang the
     boot sequence if it ran inline. Settings panel calls this async.
 
@@ -739,6 +874,12 @@ def index_db_stats() -> dict[str, Any]:
     try:
         from . import index as _idx
         from .ytarchiver_config import TRANSCRIPTION_DB as _DB
+        # A private stats connection is read-only and cannot create missing
+        # tables. Initialize the canonical schema first so a brand-new install
+        # returns real zero counts instead of briefly failing with "no such
+        # table" and caching a misleading empty/error state in the UI.
+        if not _idx._schema_inited and _idx._open() is None:
+            raise RuntimeError("index schema initialization failed")
         if _DB.exists():
             try:
                 index_db_bytes = _DB.stat().st_size
@@ -766,7 +907,10 @@ def index_db_stats() -> dict[str, Any]:
             _row = _own.execute("SELECT COUNT(*) FROM segments").fetchone()
             if _row:
                 segments_count = int(_row[0] or 0)
-            # Hours of video — sum the videos.duration_s column, which is
+            # Hours of video — sum one eligible canonical row per logical
+            # video. This uses the exact same eligibility set as total count,
+            # so duplicate or missing physical rows cannot inflate duration.
+            # duration_s is
             # populated by register_video for new downloads and backfilled
             # from each video's longest segment end_time for older imports
             # (index.backfill_video_durations_if_needed, run once at boot).
@@ -775,41 +919,23 @@ def index_db_stats() -> dict[str, Any]:
             # video_id` fallback over the multi-million-row segments table
             # ran for minutes on a large archive and hung this panel — the
             # backfill makes it unnecessary while yielding the same total.
+            _cte = _idx.canonical_videos_cte_sql()
             _row = _own.execute(
-                "SELECT COALESCE(SUM(duration_s), 0) FROM videos "
-                "WHERE duration_s IS NOT NULL").fetchone()
-            if _row:
-                hours += float(_row[0] or 0) / 3600.0
-            # Archive-wide transcription COVERAGE: videos that have an actual
-            # transcript (tx_status='transcribed') over the total video count.
-            # 'no_speech' (Whisper ran, found nothing), 'no_captions', and
-            # 'pending' are NOT counted as transcribed — they have no
-            # transcript — so this reflects real coverage, not the
-            # auto-transcribe channel setting (the old transcribed_pct_channels).
-            _row = _own.execute(
-                "SELECT COUNT(*) FROM videos "
-                "WHERE is_duplicate_of IS NULL "
-                "AND COALESCE(availability, 'available')='available'"
+                f"WITH {_cte} "
+                "SELECT COUNT(*), COALESCE(SUM(logical_duration_s), 0), "
+                "COALESCE(SUM(CASE WHEN tx_status='transcribed' "
+                "THEN 1 ELSE 0 END), 0) "
+                "FROM canonical_videos WHERE is_available_copy=1"
             ).fetchone()
             if _row:
                 total_videos = int(_row[0] or 0)
-            _row = _own.execute(
-                "SELECT COUNT(*) FROM videos WHERE tx_status='transcribed' "
-                "AND is_duplicate_of IS NULL "
-                "AND COALESCE(availability, 'available')='available'"
-            ).fetchone()
-            if _row:
-                transcribed_videos = int(_row[0] or 0)
+                hours = float(_row[1] or 0) / 3600.0
+                transcribed_videos = int(_row[2] or 0)
         finally:
             if _own is not None:
                 try: _own.close()
                 except Exception as _ce:
                     _log.debug("swallowed: %s", _ce)
-        # Touch _idx so the import stays meaningful for the schema-init
-        # side-effect (DB file + tables exist before the COUNT runs).
-        if not _idx._schema_inited:
-            try: _idx._open()
-            except Exception as e: _log.debug("swallowed: %s", e)
     except Exception as e:
         _log.debug("swallowed: %s", e)
     return {

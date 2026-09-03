@@ -81,76 +81,35 @@ def _segments_for_video(conn: sqlite3.Connection, video_id: str) -> list:
 
 def _update_db_text(conn: sqlite3.Connection, video_id: str,
                     segments: list) -> int:
-    """Targeted UPDATE on segments.text — column-only.
-
-    Also re-syncs the FTS5 external-content index for the affected
-    rows. Without this, the FTS tokens stay indexed against the OLD
-    pre-punctuation text — searches for the newly-added punctuated
-    forms miss, and searches for the lowercase raw form still match
-    (returning rows whose visible text no longer contains those raw
-    forms). The audit called this out at index.py:564 — the phantom
-    accumulated specifically because callers like this one were
-    updating segments.text without re-syncing FTS.
-    """
+    """Targeted UPDATE on segments.text; v4 DB triggers own FTS sync."""
     updated = 0
-    affected_ids = []
-    for seg in segments:
-        s_val = float(seg.get("start") or 0)
-        e_val = float(seg.get("end") or 0)
-        # Capture rowids we'll touch so we can re-sync FTS afterward.
-        # Match repair_captions' tolerance window instead of exact
-        # float equality so tiny parse/rewrite drift cannot desync DB
-        # text from the JSONL sidecar.
-        try:
-            row = conn.execute(
-                "SELECT id, text FROM segments "
+    try:
+        for seg in segments:
+            s_val = float(seg.get("start") or 0)
+            e_val = float(seg.get("end") or 0)
+            # Match repair_captions' tolerance window instead of exact
+            # float equality so tiny parse/rewrite drift cannot desync DB
+            # text from the JSONL sidecar.
+            cur = conn.execute(
+                "UPDATE segments SET text=? "
                 "WHERE video_id=? "
                 "AND ABS(start_time - ?) < 0.01 "
                 "AND ABS(end_time - ?) < 0.01",
-                (video_id, s_val, e_val)).fetchone()
-        except sqlite3.Error:
-            row = None
-        cur = conn.execute(
-            "UPDATE segments SET text=? "
-            "WHERE video_id=? "
-            "AND ABS(start_time - ?) < 0.01 "
-            "AND ABS(end_time - ?) < 0.01",
-            (seg["text"], video_id, s_val, e_val))
-        if cur.rowcount and row:
-            # (rowid, old_text) — used to clear stale FTS tokens.
-            affected_ids.append((row[0], row[1]))
-        elif not cur.rowcount:
-            _log.warning(
-                "punct_restore: no DB row matched %s %.3f-%.3f",
-                video_id, s_val, e_val)
-        updated += cur.rowcount
-    # FTS re-sync: issue 'delete' with the OLD text to clear stale
-    # tokens, then re-insert with the NEW text. Done in batches to
-    # keep the transaction small.
-    if affected_ids:
+                (seg["text"], video_id, s_val, e_val))
+            if not cur.rowcount:
+                _log.warning(
+                    "punct_restore: no DB row matched %s %.3f-%.3f",
+                    video_id, s_val, e_val)
+            updated += cur.rowcount
+        conn.commit()
+    except sqlite3.Error as exc:
         try:
-            conn.executemany(
-                "INSERT INTO segments_fts(segments_fts, rowid, text) "
-                "VALUES('delete', ?, ?)",
-                affected_ids)
-            new_id_text = []
-            for rid, _old in affected_ids:
-                row2 = conn.execute(
-                    "SELECT text FROM segments WHERE id=?", (rid,)).fetchone()
-                if row2:
-                    new_id_text.append((rid, row2[0]))
-            if new_id_text:
-                conn.executemany(
-                    "INSERT INTO segments_fts(rowid, text) VALUES(?, ?)",
-                    new_id_text)
-        except sqlite3.Error as e:
-            try:
-                conn.rollback()
-            except sqlite3.Error:
-                pass
-            raise RuntimeError(
-                f"FTS re-sync failed after punctuation update: {e}") from e
-    conn.commit()
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise RuntimeError(
+            f"segment/FTS update failed during punctuation restore: {exc}"
+        ) from exc
     return updated
 
 
@@ -209,6 +168,21 @@ def _enumerate_yt_videos(jsonl_path: Path) -> list:
     except OSError:
         return []
     return [(vid, t, jsonl_path, tag) for vid, (t, tag) in seen.items()]
+
+
+def _find_single_video(root: Path, video_id: str) -> tuple | None:
+    """Find one YT-caption work item by streaming every aggregate JSONL.
+
+    `_enumerate_yt_videos` reads each sidecar line-by-line.  Keeping the
+    single-video lookup on that same path avoids the old 4 MiB prefix cap,
+    which made videos later in a large channel aggregate appear missing.
+    """
+    for jsonl_path in root.rglob(".*Transcript.jsonl"):
+        for found_id, title, path, source_tag in _enumerate_yt_videos(
+                jsonl_path):
+            if found_id == video_id:
+                return path, found_id, title, source_tag
+    return None
 
 
 def restore_punctuation_archive(*, output_dir: str, log_stream,
@@ -272,20 +246,9 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
     work: list = []  # [(jsonl_path, video_id, title, src_tag), ...]
     used_checkpoint = False
     if video_id:
-        # Single-video: find its jsonl by scanning. Cheap enough.
-        for j in root.rglob(".*Transcript.jsonl"):
-            try:
-                with open(j, "rb") as f:
-                    payload = f.read(4 * 1024 * 1024)  # first 4MB scan
-            except OSError:
-                continue
-            if (b'"' + video_id.encode() + b'"') in payload:
-                # Pull the title from that line
-                for vid, t, jp, tag in _enumerate_yt_videos(j):
-                    if vid == video_id:
-                        work.append((jp, vid, t, tag))
-                        break
-                break
+        found = _find_single_video(root, video_id)
+        if found is not None:
+            work.append(found)
         if not work:
             log_stream.emit_error(
                 f" — video_id {video_id} not found.\n")

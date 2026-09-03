@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid
 
+from backend.services.job_supervisor import WorkAdmissionClosed
+from backend.services.managed_work import start_managed_task
 from backend.ytarchiver_config import load_config
 
 from ._shared import _api_err, _log
@@ -40,25 +43,40 @@ class TranscribeMixin:
         return load_config()
 
     def _transcribe_save_config(self, cfg):
+        """Compatibility-only full save for older injected services.
+
+        New code should use ``_transcribe_update_config`` so an unrelated
+        config change made after this mixin's read cannot be overwritten.
+        """
         services = self._transcribe_services()
         if services is not None:
             return services.save_config(cfg)
         from backend.ytarchiver_config import save_config as _save_config
         return _save_config(cfg)
 
+    def _transcribe_update_config(self, mutator):
+        services = self._transcribe_services()
+        if services is not None and hasattr(services, "mutate_config"):
+            return services.mutate_config(mutator)
+        from backend.ytarchiver_config import update_config
+        return update_config(mutator)
+
     # ─── Transcribe ─────────────────────────────────────────────────────
 
     _WHISPER_MODELS = {"tiny", "small", "medium", "large-v3"}
 
     def _apply_runtime_whisper_model(self, model):
+        """Validate and snapshot a model for jobs about to be queued.
+
+        Kept under its historical name for bridge compatibility. It no longer
+        swaps mutable runtime state; each job carries the returned model.
+        """
         model = (model or "").strip()
         if not model:
-            return {"ok": True}
+            model = self._transcribe_manager().current_model()
         if model not in self._WHISPER_MODELS:
             return {"ok": False, "error": "Unsupported model"}
-        if not self._transcribe_manager().swap_model(model):
-            return {"ok": False, "error": "Model swap failed"}
-        return {"ok": True}
+        return {"ok": True, "model": model}
 
     def transcribe_enqueue(self, path, title="", model=""):
         """Queue a video for transcription."""
@@ -91,7 +109,8 @@ class TranscribeMixin:
             return model_result
         try:
             ok = self._transcribe_manager().enqueue(
-                path, title, channel=_channel)
+                path, title, channel=_channel,
+                requested_model=model_result.get("model", ""))
         except Exception as _e:
             # surface the error instead of the silent
             # {ok: False} that the old code returned. Caller can
@@ -127,12 +146,17 @@ class TranscribeMixin:
         model_result = self._apply_runtime_whisper_model(model)
         if not model_result.get("ok"):
             return model_result
+        requested_model = model_result.get("model", "")
+        task_id = f"transcribe-folder-{uuid.uuid4().hex}"
+        cancel = threading.Event()
 
         def _run():
             log_stream = self._transcribe_log_stream()
             transcribe_mgr = self._transcribe_manager()
             try:
                 import webview as _wv
+                if cancel.is_set():
+                    return
                 paths = self._window.create_file_dialog(_wv.FOLDER_DIALOG)
             except Exception as e:
                 log_stream.emit_error(
@@ -218,7 +242,11 @@ class TranscribeMixin:
             candidates: list[tuple[str, str]] = []
             too_many = False
             for dp, dns, fns in os.walk(folder):
+                if cancel.is_set():
+                    return
                 for fn in fns:
+                    if cancel.is_set():
+                        return
                     if not fn.lower().endswith((".mp4", ".mkv", ".webm", ".m4a", ".mov")):
                         continue
                     video = os.path.join(dp, fn)
@@ -239,11 +267,15 @@ class TranscribeMixin:
                 return
 
             for video, title in candidates:
+                if cancel.is_set():
+                    return
                 _ch = _channel_for(video)
                 if _already_done(video, title, _ch):
                     skipped += 1
                     continue
-                transcribe_mgr.enqueue(video, title, channel=_ch)
+                transcribe_mgr.enqueue(
+                    video, title, channel=_ch,
+                    requested_model=requested_model)
                 queued += 1
             try:
                 self._on_queue_changed()
@@ -255,14 +287,25 @@ class TranscribeMixin:
                 [f"{queued} queued, {skipped} already done\n", "simpleline"],
             ])
             log_stream.flush()
-        threading.Thread(target=_run, daemon=True,
-                         name="transcribe-folder-dialog").start()
+        try:
+            start_managed_task(
+                self,
+                owner="queue-maintenance",
+                label="Queue a folder for transcription",
+                task_id=task_id,
+                cancel=cancel,
+                target=_run,
+                name="transcribe-folder-dialog",
+                thread_factory=threading.Thread,
+            )
+        except WorkAdmissionClosed as exc:
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "started": True}
 
 
     def transcribe_retranscribe(self, path, title="", video_id="",
                                  _on_complete_extra=None, *,
-                                 _log_queued=True):
+                                 _log_queued=True, model=""):
         """Queue a re-transcription of a video with the current Whisper model.
         Mirrors YTArchiver.py:16369 `_run_retranscribe_job`.
 
@@ -359,21 +402,67 @@ class TranscribeMixin:
         # Completion hook: push a JS event when the job finishes so the
         # Watch view can refetch the transcript + re-render its source
         # banner (replacing the "approximate" warning with the new
-        # Whisper banner). Mirrors ArchivePlayer's `_ytStartProgressPoll`
+        # Whisper banner). Mirrors the companion viewer's progress poll
         # transition-detection pattern but reactive instead of polled.
         _self = self
         _vid = vid_id
         _path = os.path.normpath(path)
-        def _on_done(_result):
+
+        def _push_runtime_state(value):
+            """Publish a non-success processing state to the Watch view."""
             try:
-                if _self._window is not None:
-                    import json as _json
-                    payload = _json.dumps({"video_id": _vid, "filepath": _path})
-                    _self._window.evaluate_js(
-                        f"if (window._onRetranscribeComplete) "
-                        f"window._onRetranscribeComplete({payload});")
+                if _self._window is None:
+                    return
+                import json as _json
+                state_payload = dict(value) if isinstance(value, dict) else {
+                    "state": str(value or ""),
+                }
+                if not state_payload.get("video_id"):
+                    state_payload["video_id"] = _vid
+                if not state_payload.get("filepath"):
+                    state_payload["filepath"] = _path
+                payload = _json.dumps(state_payload)
+                _self._window.evaluate_js(
+                    f"if (window._onRetranscribeState) "
+                    f"window._onRetranscribeState({payload});")
             except Exception as e:
                 _log.debug("swallowed: %s", e)
+
+        def _on_state(value):
+            _push_runtime_state(value)
+
+        def _on_done(_result):
+            failed = (isinstance(_result, dict)
+                      and _result.get("ok") is False)
+            if failed:
+                _push_runtime_state({
+                    "state": str(_result.get("state") or "rejected"),
+                    "video_id": _vid,
+                    "filepath": _path,
+                    "message": str(
+                        _result.get("message")
+                        or _result.get("error")
+                        or "Re-transcription was not queued"),
+                })
+            else:
+                try:
+                    if _self._window is not None:
+                        import json as _json
+                        complete_payload = {
+                            "video_id": _vid,
+                            "filepath": _path,
+                        }
+                        if (isinstance(_result, dict)
+                                and _result.get(
+                                    "_existing_transcript_kept")):
+                            complete_payload[
+                                "existing_transcript_kept"] = True
+                        payload = _json.dumps(complete_payload)
+                        _self._window.evaluate_js(
+                            f"if (window._onRetranscribeComplete) "
+                            f"window._onRetranscribeComplete({payload});")
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
             # Extra hook for callers (e.g. _handle_retranscribe model
             # restore — audit: main.py H20). Always fires whether or
             # not the JS push above succeeded.
@@ -389,14 +478,18 @@ class TranscribeMixin:
             retranscribe=True,
             video_id=vid_id,
             on_complete=_on_done,
+            on_state=_on_state,
+            requested_model=(model or "").strip(),
         )
-        # If enqueue rejected the job (queue full, manager down), fire
-        # the completion hook synchronously so the JS Watch view's
-        # pending state clears instead of spinning forever (audit:
-        # transcribe_mixin H19).
+        # If enqueue rejected the job, clear the optimistic Watch state via a
+        # rejection event.  Do not run the success-only refresh hook.
         if not ok:
             try:
-                _on_done({"ok": False, "error": "enqueue rejected"})
+                _on_done({
+                    "ok": False,
+                    "state": "rejected",
+                    "error": "enqueue rejected",
+                })
             except Exception as e:
                 _log.debug("swallowed: %s", e)
         # Visible log line so the user can see the click was honored,
@@ -421,7 +514,9 @@ class TranscribeMixin:
 
 
     def transcribe_cancel_all(self):
-        self._transcribe_manager().cancel_all()
+        if not self._transcribe_manager().cancel_all():
+            return {"ok": False,
+                    "error": "Processing queue could not be saved"}
         return {"ok": True}
 
 
@@ -475,21 +570,19 @@ class TranscribeMixin:
             except Exception:
                 _lock = None
             try:
-                saved = False
                 if _lock is not None:
                     with _lock:
-                        cfg = self._transcribe_config()
-                        cfg["whisper_model"] = new_model
-                        saved = bool(self._transcribe_save_config(cfg))
+                        self._transcribe_update_config(
+                            lambda cfg: cfg.__setitem__(
+                                "whisper_model", new_model))
                 else:
-                    cfg = self._transcribe_config()
-                    cfg["whisper_model"] = new_model
-                    saved = bool(self._transcribe_save_config(cfg))
-                if saved:
-                    self._reload_config()
-                    persisted = True
+                    self._transcribe_update_config(
+                        lambda cfg: cfg.__setitem__(
+                            "whisper_model", new_model))
+                self._reload_config()
+                persisted = True
             except Exception as e:
-                _log.debug("swallowed: %s", e)
+                _log.warning("whisper default save failed: %s", e)
         return {"ok": ok, "model": new_model, "persisted": persisted}
 
 

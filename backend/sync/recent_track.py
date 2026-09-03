@@ -273,7 +273,12 @@ def _record_recent_download(filepath: str, channel: str, title: str,
                     cfg_s = load_config()
                     output_dir = (cfg_s.get("output_dir") or "").strip()
                     if output_dir:
-                        _idx.sweep_new_videos(output_dir, cfg_s.get("channels", []))
+                        _idx.sweep_new_videos(
+                            output_dir,
+                            cfg_s.get("channels", []),
+                            extra_roots=list(
+                                cfg_s.get("tp_archive_roots") or []),
+                        )
                 except Exception as e:
                     swallow("bg index sweep", e)
             _thr.Thread(target=_bg_sweep, daemon=True).start()

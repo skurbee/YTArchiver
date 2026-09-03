@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 
-from backend.ytarchiver_config import load_config, save_config
+from backend.ytarchiver_config import load_config, save_config, update_config
 
 from ._shared import _log
 
@@ -49,6 +49,15 @@ class QueueMixin:
         if services is not None:
             return services.save_config(cfg)
         return save_config(cfg)
+
+    def _queue_update_config(self, mutator):
+        """Commit one queue preference without saving a stale snapshot."""
+        services = self._queue_services()
+        mutate = (getattr(services, "mutate_config", None)
+                  if services is not None else None)
+        if callable(mutate):
+            return mutate(mutator)
+        return update_config(mutator)
 
     def _queue_gpu_count(self):
         queues = self._queue_state()
@@ -104,13 +113,8 @@ class QueueMixin:
             return {"ok": False, "error": "kind must be sync or gpu"}
         key = "autorun_gpu" if kind == "gpu" else "autorun_sync"
         try:
-            services = self._queue_services()
-            cfg = (services.fresh_config()
-                   if services is not None else load_config())
-            cfg[key] = bool(enabled)
-            if not self._queue_save_config(cfg):
-                return {"ok": False,
-                        "error": "Config write failed (write-gate off?)"}
+            self._queue_update_config(
+                lambda live: live.__setitem__(key, bool(enabled)))
             if getattr(self, "_config", None) is not None:
                 self._config[key] = bool(enabled)
             if kind == "gpu" and enabled:
@@ -165,43 +169,29 @@ class QueueMixin:
 
     # ─── Queue mutations (right-click menu) ────────────────────────────
 
-    def queues_sync_remove(self, identifier):
-        """Remove ONE pending sync item by URL or channel name.
-        First-match semantics — when the queue has duplicates (same
-        channel queued for download AND metadata refresh), only the
-        first one drops. The popover X-click should prefer
-        `queues_sync_remove_at` (index-based with identity guard);
-        this method is a fallback for callers without an index."""
-        ident = str(identifier or "").strip()
+    def queues_sync_remove(self, task_id):
+        """Remove one pending sync item by opaque task ID only."""
+        ident = str(task_id or "").strip()
+        if not ident:
+            return {"ok": False, "error": "task_id required"}
         queues = self._queue_state()
-        ok = queues.sync_remove(ident)
-        if not ok and ident:
-            # Name / folder fallback — first match only. Routed
-            # through QueueState's public sync_remove_by_name() so the
-            # _lock/_notify/save_debounced invariants are honored
-            # inside the class instead of bypassing encapsulation
-            # (audit: queue_mixin H5).
-            ok = queues.sync_remove_by_name(ident)
+        queued = next(
+            (item for item in queues.sync_snapshot()
+             if str(item.get("task_id") or "").strip() == ident),
+            None,
+        )
+        if queued and (queued.get("kind") or "").lower() == "redownload":
+            ok = self._remove_pending_redownload_exact(ident, queues)
+        else:
+            ok = queues.sync_remove_task(ident, durable=True)
         self._on_queue_changed()
         return {"ok": ok}
 
 
     def queues_sync_remove_at(self, idx, expected_url="", expected_name=""):
-        """Remove the sync queue item at exactly `idx` (the row index
-        the user actually clicked X on in the popover). The optional
-        identity hints prevent deleting the wrong item if the queue
-        shifted between paint and click."""
-        try:
-            i = int(idx)
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "bad index"}
-        ok = self._queue_state().sync_remove_at(
-            i,
-            expected_url=str(expected_url or "").strip(),
-            expected_name=str(expected_name or "").strip(),
-        )
-        self._on_queue_changed()
-        return {"ok": ok}
+        """Reject stale index/URL mutations from pre-ID frontends."""
+        return {"ok": False,
+                "error": "Queue changed; refresh and retry with task_id"}
 
 
     def _drop_pending_jobs(self, predicate):
@@ -209,74 +199,143 @@ class QueueMixin:
         list so the user-removed item doesn't get popped + re-displayed
         as the active task when the worker's turn comes for it."""
         try:
-            self._queue_transcribe().remove_pending_jobs(predicate)
+            return self._queue_transcribe().remove_pending_jobs(predicate)
         except Exception as e:
             _log.debug("swallowed: %s", e)
+            return 0
+
+    def _remove_pending_redownload_exact(self, task_id, queues):
+        """Commit one redownload removal in both runtime and durable queues."""
+        lock = getattr(self, "_redwnl_lock", None)
+        pending = getattr(self, "_redwnl_pending", None)
+        if lock is None or not isinstance(pending, list):
+            return queues.sync_remove_task(task_id, durable=True)
+        with lock:
+            index = next(
+                (i for i, item in enumerate(pending)
+                 if str(((item or {}).get("rd_task") or {}).get("task_id")
+                        or "").strip() == task_id),
+                -1,
+            )
+            if not queues.sync_remove_task(task_id, durable=True):
+                return False
+            if index >= 0:
+                pending.pop(index)
+            return True
+
+    def _reorder_pending_redownload_exact(
+            self, task_id, new_index, queues) -> bool:
+        """Keep the redownload chain's relative order equal to QueueState."""
+        lock = getattr(self, "_redwnl_lock", None)
+        pending = getattr(self, "_redwnl_pending", None)
+        if lock is None or not isinstance(pending, list):
+            return queues.sync_reorder(task_id, new_index, durable=True)
+        with lock:
+            queue_order = queues.sync_snapshot()
+            source_index = next(
+                (i for i, item in enumerate(queue_order)
+                 if str(item.get("task_id") or "").strip() == task_id),
+                -1,
+            )
+            if (source_index < 0 or new_index < 0
+                    or new_index >= len(queue_order)):
+                return False
+            moved = queue_order.pop(source_index)
+            queue_order.insert(new_index, moved)
+            if not queues.sync_reorder(task_id, new_index, durable=True):
+                return False
+            by_id = {
+                str(((item or {}).get("rd_task") or {}).get("task_id")
+                    or "").strip(): item
+                for item in pending
+                if str(((item or {}).get("rd_task") or {}).get("task_id")
+                       or "").strip()
+            }
+            ordered_ids = [
+                str(item.get("task_id") or "").strip()
+                for item in queue_order
+                if (item.get("kind") or "").lower() == "redownload"
+                and str(item.get("task_id") or "").strip() in by_id
+            ]
+            reordered = [by_id[ident] for ident in ordered_ids]
+            reordered.extend(
+                item for item in pending if item not in reordered)
+            pending[:] = reordered
+            return True
 
 
-    def queues_gpu_remove(self, identifier):
-        """Remove ONE pending GPU job by path (preferred) or bulk_id.
-        First-match semantics. The popover X-click should prefer
-        `queues_gpu_remove_at` (index-based with identity guard)."""
-        ident = str(identifier or "").strip()
+    def queues_gpu_remove(self, task_id):
+        """Remove one pending Processing job by opaque task ID only."""
+        ident = str(task_id or "").strip()
         if not ident:
-            return {"ok": False}
+            return {"ok": False, "error": "task_id required"}
         queues = self._queue_state()
-        ok = queues.gpu_remove(ident)
-        if ok:
-            # Single removal — match by path (or id when path absent).
-            self._drop_pending_jobs(
-                lambda j, p=ident: (j.get("path") or "") == p
-                or (j.get("id") or "") == p)
-        else:
-            # Fallback: treat as bulk_id.
-            dropped = queues.gpu_remove_bulk(ident)
-            ok = dropped > 0
-            if ok:
-                self._drop_pending_jobs(
-                    lambda j, b=ident: str(j.get("bulk_id") or "") == b)
+        entries = queues.gpu_items_for_ids({ident})
+        manager = self._queue_transcribe()
+        coordinate = getattr(
+            manager, "remove_pending_task_ids_coordinated", None)
+        if not callable(coordinate):
+            return {"ok": False,
+                    "error": "Processing queue coordinator unavailable"}
+        ok = coordinate(
+            {ident},
+            lambda: queues.gpu_remove(ident, durable=True),
+            lambda: queues.gpu_restore_items(entries, durable=True),
+        )
         self._on_queue_changed()
-        return {"ok": ok}
+        return ({"ok": True} if ok else
+                {"ok": False, "error": "Task removal could not be saved"})
 
 
     def queues_gpu_remove_at(self, idx, expected_path="", expected_bulk_id=""):
-        """Remove the GPU queue item at exactly `idx` (the row index
-        the user actually clicked X on). For coalesced "Transcribe X
-        (N videos)" rows the popover should call queues_gpu_remove_bulk
-        instead — this drops a single slot."""
-        try:
-            i = int(idx)
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "bad index"}
-        ep = str(expected_path or "").strip()
-        eb = str(expected_bulk_id or "").strip()
-        ok = self._queue_state().gpu_remove_at(
-            i, expected_path=ep, expected_bulk_id=eb)
-        if ok:
-            if ep:
-                self._drop_pending_jobs(
-                    lambda j, p=ep: (j.get("path") or "") == p)
-            elif eb:
-                self._drop_pending_jobs(
-                    lambda j, b=eb: str(j.get("bulk_id") or "") == b)
-        self._on_queue_changed()
-        return {"ok": ok}
+        """Reject stale index/path mutations from pre-ID frontends."""
+        return {"ok": False,
+                "error": "Queue changed; refresh and retry with task_id"}
 
 
     def queues_gpu_remove_bulk(self, bulk_id):
-        """Drop every GPU job with a matching `bulk_id` (coalesced row
-        removal). Called from the queue-popover context menu when the
-        user removes a "Transcribe {ch} (N videos)" row."""
-        bid = str(bulk_id or "")
-        dropped = self._queue_state().gpu_remove_bulk(bid)
-        if dropped > 0:
-            self._drop_pending_jobs(
-                lambda j, b=bid: str(j.get("bulk_id") or "") == b)
+        """Reject ambiguous bulk-label removal; grouped rows send exact IDs."""
+        return {"ok": False,
+                "error": "Grouped removal requires exact task_ids"}
+
+
+    def queues_gpu_remove_many(self, task_ids):
+        """Remove the exact Processing tasks represented by a grouped row."""
+        if not isinstance(task_ids, list):
+            return {"ok": False, "error": "task_ids must be a list"}
+        wanted = [str(task_id or "").strip() for task_id in task_ids]
+        wanted = [task_id for task_id in wanted if task_id]
+        if not wanted or len(set(wanted)) != len(wanted):
+            return {"ok": False, "error": "unique task_ids required"}
+        queues = self._queue_state()
+        wanted_set = set(wanted)
+        entries = queues.gpu_items_for_ids(wanted_set)
+        manager = self._queue_transcribe()
+        coordinate = getattr(
+            manager, "remove_pending_task_ids_coordinated", None)
+        if not callable(coordinate):
+            return {"ok": False,
+                    "error": "Processing queue coordinator unavailable"}
+        removed: list[str] = []
+
+        def _remove_exact() -> bool:
+            nonlocal removed
+            removed = queues.gpu_remove_tasks(
+                wanted, durable=True, require_all=True)
+            return set(removed) == wanted_set
+
+        ok = coordinate(
+            wanted_set, _remove_exact,
+            lambda: queues.gpu_restore_items(entries, durable=True),
+        )
         self._on_queue_changed()
-        return {"ok": dropped > 0, "dropped": dropped}
+        return {"ok": ok, "dropped": len(removed) if ok else 0,
+                "task_ids": removed if ok else [],
+                **({} if ok else
+                   {"error": "Grouped task removal could not be saved"})}
 
 
-    def queues_sync_reorder(self, identifier, new_index):
+    def queues_sync_reorder(self, task_id, new_index):
         # Reject None/missing new_index explicitly — `int(None or 0)`
         # silently defaulted to index 0, sending unrelated drops to
         # the top of the queue (audit: queue_mixin L11).
@@ -286,27 +345,57 @@ class QueueMixin:
             _idx = int(new_index)
         except (TypeError, ValueError):
             return {"ok": False, "error": f"Invalid new_index: {new_index!r}"}
-        ok = self._queue_state().sync_reorder(str(identifier or ""), _idx)
+        ident = str(task_id or "").strip()
+        if not ident:
+            return {"ok": False, "error": "task_id required"}
+        queues = self._queue_state()
+        queued = next(
+            (item for item in queues.sync_snapshot()
+             if str(item.get("task_id") or "").strip() == ident),
+            None,
+        )
+        if queued and (queued.get("kind") or "").lower() == "redownload":
+            ok = self._reorder_pending_redownload_exact(
+                ident, _idx, queues)
+        else:
+            ok = queues.sync_reorder(ident, _idx, durable=True)
         self._on_queue_changed()
         return {"ok": ok}
 
 
-    def queues_gpu_reorder(self, identifier, new_index):
+    def queues_gpu_reorder(self, task_id, new_index):
         if new_index is None:
             return {"ok": False, "error": "new_index required"}
         try:
             _idx = int(new_index)
         except (TypeError, ValueError):
             return {"ok": False, "error": f"Invalid new_index: {new_index!r}"}
-        ident = str(identifier or "")
-        ok = self._queue_state().gpu_reorder(ident, _idx)
-        if ok:
-            try:
-                self._queue_transcribe().reorder_pending_job(ident, _idx)
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
+        ident = str(task_id or "").strip()
+        if not ident:
+            return {"ok": False, "error": "task_id required"}
+        queues = self._queue_state()
+        snapshot = queues.gpu_snapshot()
+        old_index = next(
+            (i for i, item in enumerate(snapshot)
+             if str(item.get("task_id") or "").strip() == ident),
+            -1,
+        )
+        if old_index < 0:
+            return {"ok": False, "error": "Queue changed; task not found"}
+        manager = self._queue_transcribe()
+        coordinate = getattr(
+            manager, "reorder_pending_task_coordinated", None)
+        if not callable(coordinate):
+            return {"ok": False,
+                    "error": "Processing queue coordinator unavailable"}
+        ok = coordinate(
+            ident, _idx,
+            lambda: queues.gpu_reorder(ident, _idx, durable=True),
+            lambda: queues.gpu_reorder(ident, old_index, durable=True),
+        )
         self._on_queue_changed()
-        return {"ok": ok}
+        return ({"ok": True} if ok else
+                {"ok": False, "error": "Task order could not be saved"})
 
 
     # ─── Global pause / resume / skip (both queues) ────────────────────
@@ -432,7 +521,22 @@ class QueueMixin:
             # pause Event; the worker would immediately re-park on the Auto
             # gate. request_drain() arms a one-shot drain that empties the
             # backlog regardless, then re-parks.
-            self._queue_transcribe().request_drain()
+            if not self._queue_transcribe().request_drain():
+                # Restore the painted pause state. request_drain fails before
+                # starting work when QueueState/journal reconciliation cannot
+                # commit, so reporting success here would leave a green toast
+                # over a queue that never moved.
+                queues.set_gpu_paused(True)
+                self._queue_transcribe().pause()
+                if which == "both":
+                    self._sync_pause.set()
+                    queues.set_sync_paused(True)
+                self._on_queue_changed()
+                return {
+                    "ok": False,
+                    "paused": True,
+                    "error": "Processing recovery state could not be saved",
+                }
             try:
                 self._queue_log_stream().emit_text(
                     " - Processing queue resumed - draining "
@@ -463,11 +567,17 @@ class QueueMixin:
         one.)"""
         queues = self._queue_state()
         gpu_count = self._queue_gpu_count()
-        queues.set_gpu_paused(False)
         try:
-            self._queue_transcribe().request_drain()
+            started = self._queue_transcribe().request_drain()
         except Exception as e:
             return {"ok": False, "error": str(e)}
+        if not started:
+            queues.set_gpu_paused(True)
+            self._queue_transcribe().pause()
+            self._on_queue_changed()
+            return {"ok": False,
+                    "error": "Processing recovery state could not be saved"}
+        queues.set_gpu_paused(False)
         try:
             self._on_queue_changed()
         except Exception as e:

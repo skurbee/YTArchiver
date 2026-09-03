@@ -2,8 +2,8 @@
  * web/logContextMenu.js — right-click menus for every log surface.
  *
  * Attaches a contextmenu handler to each of:
- *   #main-log, #activity-log, #subs-mini-log, #recent-mini-log,
- *   #browse-mini-log, #settings-mini-log
+ *   #main-log, #activity-log, and the mini logs on Subs, Browse, Settings,
+ *   and Health.
  *
  * The menu offers Copy selection / Copy this line / Copy all (Log) /
  * Save to file / Clear.
@@ -48,9 +48,9 @@
       { el: document.getElementById("main-log"), label: "Main log" },
       { el: document.getElementById("activity-log"), label: "Activity log" },
       { el: document.getElementById("subs-mini-log"), label: "Mini log" },
-      { el: document.getElementById("recent-mini-log"), label: "Mini log" },
       { el: document.getElementById("browse-mini-log"), label: "Mini log" },
       { el: document.getElementById("settings-mini-log"), label: "Mini log" },
+      { el: document.getElementById("health-mini-log"), label: "Mini log" },
     ];
     for (const { el, label } of handlers) {
       if (!el) continue;

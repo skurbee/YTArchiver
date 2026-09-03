@@ -7,11 +7,8 @@
  * activity log, the italic indicator line, the two queue-popover buttons,
  * and the tray icon.
  *
- * It does NOT own any state: it wraps the globals the backend already
- * pushes to (`renderQueues`, `setQueueState`, `_setIndicator`) and the log
- * DOM, so it stays a pure read-only mirror. Wrapping happens in
- * initStatusBar() (called from app.js boot, after the queue/log modules
- * have assigned those globals).
+ * It does NOT own backend state. It subscribes to the shared event-state
+ * service and mirrors queue/indicator updates alongside the log DOM.
  *
  * Exposed as window.initStatusBar.
  */
@@ -161,8 +158,13 @@
     // Session error count.
     const errEl = document.getElementById("gsb-errors");
     const errCount = document.getElementById("gsb-errors-count");
+    const errLabel = document.getElementById("gsb-errors-label");
     if (errEl) errEl.hidden = _errorCount <= 0;
     if (errCount) errCount.textContent = String(_errorCount);
+    if (errLabel) errLabel.textContent = _errorCount === 1 ? "error" : "errors";
+    if (errEl) {
+      errEl.title = `${_errorCount} error${_errorCount === 1 ? "" : "s"} this session — click for details`;
+    }
 
     // Live rolling YouTube operation counters. Unlimited intentionally
     // hides the whole segment because it has no configured ceiling.
@@ -399,18 +401,11 @@
     );
     reportWindowFocus(document.hasFocus());
 
-    // Wrap the three globals the backend pushes to. Each wrapper calls the
-    // previous implementation first (preserving any other wrappers, e.g.
-    // queueBlink's setQueueState), then refreshes the bar.
-    const origRender = window.renderQueues;
-    window.renderQueues = function (q) {
-      if (origRender) { try { origRender(q); } catch (e) { /* ignore */ } }
+    const applyQueuePayload = (q) => {
       _queues = q || { sync: [], gpu: [] };
       _render();
     };
-    const origState = window.setQueueState;
-    window.setQueueState = function (s) {
-      if (origState) { try { origState(s); } catch (e) { /* ignore */ } }
+    const applyQueueState = (s) => {
       _state = s || { sync: {}, gpu: {} };
       _render();
       // The backend pushes queue state immediately when a rolling YouTube
@@ -418,12 +413,33 @@
       // that same edge instead of leaving it behind until the poll timer.
       _requestTrafficRefresh(0);
     };
-    const origInd = window._setIndicator;
-    window._setIndicator = function (slot, text) {
-      if (origInd) { try { origInd(slot, text); } catch (e) { /* ignore */ } }
+    const applyIndicator = ({ slot, text } = {}) => {
       if (slot === "sweep") _indicator[slot] = text || "";
       _render();
     };
+    const events = window.YT?.eventState;
+    if (events) {
+      events.subscribe("queue-payload", applyQueuePayload);
+      events.subscribe("queue-state", applyQueueState);
+      events.subscribe("indicator", applyIndicator);
+    } else {
+      // Standalone diagnostics may load this module without eventState.js.
+      const origRender = window.renderQueues;
+      window.renderQueues = function (q) {
+        if (origRender) { try { origRender(q); } catch (e) { /* ignore */ } }
+        applyQueuePayload(q);
+      };
+      const origState = window.setQueueState;
+      window.setQueueState = function (s) {
+        if (origState) { try { origState(s); } catch (e) { /* ignore */ } }
+        applyQueueState(s);
+      };
+      const origInd = window._setIndicator;
+      window._setIndicator = function (slot, text) {
+        if (origInd) { try { origInd(slot, text); } catch (e) { /* ignore */ } }
+        applyIndicator({ slot, text });
+      };
+    }
 
     // Sync / Processing segments open their existing queue popovers,
     // anchored to the SEGMENT (so it works on any tab — the toolbar button

@@ -10,10 +10,15 @@ venv/
 # Build output
 build/
 dist/
+build.prepatch*/
+dist.prepatch*/
 
 # Tooling caches
 .pytest_cache/
 .ruff_cache/
+node_modules/
+playwright-report/
+test-results/
 
 # Logs
 *.log

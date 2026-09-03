@@ -31,7 +31,32 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
+  async function openVideoExternally(filepath) {
+    if (!filepath) {
+      window._showToast?.("No video file was found.", "warn");
+      return { ok: false };
+    }
+    if (!nativeBridgeUp()) {
+      window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
+      return { ok: false };
+    }
+    try {
+      const result = await bridgeCall("browse_open_video", filepath);
+      if (!result?.ok) {
+        window._showToast?.(
+          result?.error || "Could not open the video.", "error");
+      }
+      return result;
+    } catch (error) {
+      window._showToast?.(
+        `Could not open the video: ${error?.message || error}`, "error");
+      return { ok: false, error: String(error) };
+    }
+  }
+  window._openVideoExternally = openVideoExternally;
+
   const escapeHtml = window._escapeHtml || ((s) => String(s ?? ""));
+  const displayText = window._displayText || ((s) => String(s ?? ""));
 
   /** Legacy tree renderer — no-op since Browse switched to the channel
       grid layout. Kept so existing call sites don't error. */
@@ -60,13 +85,42 @@
     return compactCountFormatter.format(count);
   }
 
-  function _buildChannelCard(c, index) {
-    const name = c.folder || c.name || "";
-    const rawVids = c.n_vids ?? c.video_count;
+  function _paintChannelCardMeta(card, channel) {
+    const metaEl = card.querySelector(".channel-card-meta");
+    if (!metaEl) return;
+    metaEl.replaceChildren();
+    const rawVids = channel.n_vids ?? channel.video_count;
     const vids = Number.isFinite(Number(rawVids))
       ? Number(rawVids).toLocaleString()
       : "\u2014";
-    const size = c.size || "";
+    const addMetaLine = (parts) => {
+      const line = document.createElement("div");
+      line.className = "channel-card-meta-line";
+      for (const part of parts) {
+        const item = document.createElement("span");
+        item.textContent = part;
+        line.appendChild(item);
+      }
+      metaEl.appendChild(line);
+    };
+    if (channel.subscriber_count !== null
+        && channel.subscriber_count !== undefined) {
+      const count = Number(channel.subscriber_count);
+      const formatted = compactCount(count);
+      if (formatted) {
+        const label = count === 1 ? "subscriber" : "subscribers";
+        addMetaLine([`${formatted} ${label}`]);
+      }
+    }
+    const archiveParts = [
+      `${vids}${vids !== "\u2014" ? " videos" : ""}`,
+    ];
+    if (channel.size) archiveParts.push(channel.size);
+    addMetaLine(archiveParts);
+  }
+
+  function _buildChannelCard(c, index) {
+    const name = c.folder || c.name || "";
     const first = (name[0] || "?").toUpperCase();
 
     const bannerUrl = c.banner_url || "";
@@ -78,9 +132,15 @@
     card.className = "channel-card";
     card.dataset.channelIndex = String(index);
     card.dataset.channelName = name;
+    card.dataset.channelFolder = c.folder || "";
+    card.dataset.channelUrl = c.url || "";
     card.setAttribute("role", "button");
     card.tabIndex = 0;
-    card.setAttribute("aria-label", `Open channel ${name || "Untitled"}`);
+    card.setAttribute("aria-haspopup", "menu");
+    card.setAttribute("aria-expanded", "false");
+    card.setAttribute("aria-keyshortcuts", "Shift+F10");
+    card.setAttribute(
+      "aria-label", `Open channel ${displayText(name || "Untitled")}`);
     if (!bannerSrc) {
       // Pure-gradient fallback gets the tinted bg directly.
       card.style.background = gradientFor(name);
@@ -132,7 +192,7 @@
       card.appendChild(avEl);
     }
     const nameEl = card.querySelector(".channel-card-name");
-    nameEl.textContent = name;
+    nameEl.textContent = displayText(name);
     if (c._pending_redownload) {
       const dot = document.createElement("span");
       dot.className = "channel-redownload-dot";
@@ -142,30 +202,7 @@
       dot.title = `Unfinished redownload at ${savedLabel}`;
       nameEl.appendChild(dot);
     }
-    const metaEl = card.querySelector(".channel-card-meta");
-    const addMetaLine = (parts) => {
-      const line = document.createElement("div");
-      line.className = "channel-card-meta-line";
-      for (const part of parts) {
-        const item = document.createElement("span");
-        item.textContent = part;
-        line.appendChild(item);
-      }
-      metaEl.appendChild(line);
-    };
-    if (c.subscriber_count !== null && c.subscriber_count !== undefined) {
-      const count = Number(c.subscriber_count);
-      const formatted = compactCount(count);
-      if (formatted) {
-        const label = count === 1 ? "subscriber" : "subscribers";
-        addMetaLine([`${formatted} ${label}`]);
-      }
-    }
-    const archiveParts = [
-      `${vids}${vids !== "\u2014" ? " videos" : ""}`,
-    ];
-    if (size) archiveParts.push(size);
-    addMetaLine(archiveParts);
+    _paintChannelCardMeta(card, c);
 
     // Swap to gradient if the banner image fails to load.
     const bgEl = card.querySelector(".channel-card-bg");
@@ -184,6 +221,39 @@
     return card;
   }
 
+  /** Keep the first Channels hydration behind one stable loading surface. */
+  window.renderChannelGridLoading = function (
+    message = "Loading channels…", { announce = true } = {},
+  ) {
+    const grid = document.getElementById("channel-grid");
+    if (!grid) return;
+    _unobserveGridSentinel(grid);
+    grid._channelItems = [];
+    grid._onChannelClick = null;
+    grid.classList.remove("is-refreshing");
+    grid.setAttribute("aria-busy", "true");
+
+    let loading = grid.querySelector(":scope > .grid-loading");
+    if (!loading || grid.children.length !== 1) {
+      grid.replaceChildren();
+      loading = document.createElement("div");
+      loading.className = "grid-loading";
+      loading.setAttribute("role", "status");
+      loading.setAttribute("aria-live", "polite");
+      const spinner = document.createElement("div");
+      spinner.className = "grid-spinner";
+      spinner.setAttribute("aria-hidden", "true");
+      const label = document.createElement("span");
+      label.className = "grid-loading-label";
+      loading.append(spinner, label);
+      grid.appendChild(loading);
+    }
+    loading.setAttribute("role", "status");
+    loading.setAttribute("aria-live", announce ? "polite" : "off");
+    const label = loading.querySelector(".grid-loading-label");
+    if (label && label.textContent !== message) label.textContent = message;
+  };
+
   /** Render the Channels grid (Browse tab landing view).
    *
    * YouTube-style: banner fills the card, circular PFP overlaps
@@ -196,6 +266,7 @@
     if (!grid) return;
     _unobserveGridSentinel(grid);
     grid.innerHTML = "";
+    grid.setAttribute("aria-busy", "false");
     channels = Array.isArray(channels) ? channels : [];
     grid._channelItems = channels;
     grid._onChannelClick = onChannelClick;
@@ -224,6 +295,7 @@
         noMatches.className = "browse-empty";
         noMatches.textContent = "No channels match this filter.";
         grid.appendChild(noMatches);
+        window._restoreChannelCatalogOverlay?.();
         return;
       }
       const welcome = document.createElement("div");
@@ -242,6 +314,7 @@
       add.addEventListener("click", () => window._openAddChannelEditor?.(""));
       welcome.append(eyebrow, title, copy, add);
       grid.appendChild(welcome);
+      window._restoreChannelCatalogOverlay?.();
       return;
     }
 
@@ -277,6 +350,73 @@
     // browser cache and decoded. Runs on idle time so it never blocks
     // main-thread scrolling.
     _prefetchChannelArt(channels);
+    window._restoreChannelCatalogOverlay?.();
+  };
+
+  /** Merge fresh stats into the already-rendered Channels grid.
+   *
+   * Channel detail loads can prove an old cached count wrong. Updating both
+   * the backing row and its card means returning to Channels never shows the
+   * stale count again; lazy cards that have not rendered yet also inherit the
+   * corrected row when they are built.
+   */
+  window._refreshChannelCardSummary = function (channelName, changes) {
+    const key = String(channelName || "").trim().toLowerCase();
+    if (!key || !changes || typeof changes !== "object") return false;
+
+    const matches = (row) => String(
+      row?.folder || row?.name || "").trim().toLowerCase() === key;
+    let changed = false;
+    const stateRows = Array.isArray(window._browseState?.channels)
+      ? window._browseState.channels : [];
+    for (const row of stateRows) {
+      if (!matches(row)) continue;
+      Object.assign(row, changes);
+      changed = true;
+    }
+    const pendingRows = Array.isArray(window._browseState?.pendingChannels)
+      ? window._browseState.pendingChannels : [];
+    for (const row of pendingRows) {
+      if (!matches(row)) continue;
+      Object.assign(row, changes);
+      changed = true;
+    }
+    if (window._browseState) {
+      if (!(window._browseState.channelSummaryOverrides instanceof Map)) {
+        window._browseState.channelSummaryOverrides = new Map();
+      }
+      const revision = Number(window._browseState.channelSummaryRevision || 0)
+        + 1;
+      window._browseState.channelSummaryRevision = revision;
+      const previous = window._browseState.channelSummaryOverrides.get(key);
+      window._browseState.channelSummaryOverrides.set(
+        key, {
+          revision,
+          changes: { ...(previous?.changes || {}), ...changes },
+        });
+    }
+
+    const grid = document.getElementById("channel-grid");
+    const gridRows = Array.isArray(grid?._channelItems)
+      ? grid._channelItems : [];
+    for (const row of gridRows) {
+      if (!matches(row)) continue;
+      Object.assign(row, changes);
+      changed = true;
+    }
+    if (!grid) return changed;
+
+    for (const card of Array.from(grid.querySelectorAll(".channel-card"))) {
+      if (String(card.dataset.channelName || "").trim().toLowerCase() !== key) {
+        continue;
+      }
+      const index = Number(card.dataset.channelIndex);
+      const row = Number.isFinite(index) ? gridRows[index] : null;
+      if (!row) continue;
+      _paintChannelCardMeta(card, row);
+      changed = true;
+    }
+    return changed;
   };
 
   let _prefetchQueue = [];
@@ -357,12 +497,15 @@
     card.className = "video-card";
     card.setAttribute("role", "button");
     card.tabIndex = 0;
-    const labelBits = [v.title || "Untitled video"];
-    if (v.channel) labelBits.push(v.channel);
+    card.setAttribute("aria-haspopup", "menu");
+    card.setAttribute("aria-expanded", "false");
+    card.setAttribute("aria-keyshortcuts", "Shift+F10");
+    const labelBits = [displayText(v.title || "Untitled video")];
+    if (v.channel) labelBits.push(displayText(v.channel));
     if (v.uploaded) labelBits.push(v.uploaded);
     card.setAttribute("aria-label", labelBits.join(", "));
-    // Flag visually + via data attr so CSS can fade the card, add a
-    // strikethrough on the title, and overlay a corner badge.
+    // Keep the normal clickable card treatment. The corner badge is the
+    // only visual warning that the YouTube copy is no longer available.
     if (v.removed_from_yt) {
       card.classList.add("video-card-removed");
       card.dataset.removedFromYt = "1";
@@ -426,7 +569,7 @@
       }, { once: true });
     }
     card.querySelector(".video-duration-badge").textContent = v.duration || "";
-    card.querySelector(".video-card-title").textContent = v.title || "";
+    card.querySelector(".video-card-title").textContent = displayText(v.title);
     // Channel line — opt-in via v.show_channel so contexts like the
     // Recent grid (many channels mixed together) get it, while the
     // Browse video grid (already scoped to one channel) doesn't show
@@ -434,7 +577,7 @@
     const chEl = card.querySelector(".video-card-channel");
     if (chEl) {
       if (v.show_channel && v.channel) {
-        chEl.textContent = v.channel;
+        chEl.textContent = displayText(v.channel);
         chEl.style.display = "";
       } else {
         chEl.style.display = "none";
@@ -476,9 +619,7 @@
       e.preventDefault();
       e.stopPropagation();
       if (_clickTimer) { clearTimeout(_clickTimer); _clickTimer = null; }
-      if (v.filepath && nativeBridgeUp()) {
-        bridgeCall("browse_open_video", v.filepath);
-      }
+      if (v.filepath) openVideoExternally(v.filepath);
     });
     return card;
   }

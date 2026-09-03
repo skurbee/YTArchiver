@@ -63,7 +63,10 @@ def _extract_video_id(video_path: str, hint: str = "") -> str:
     return ""
 
 
-def _scan_existing_transcript_titles(folder_path: str, ch_name: str) -> dict:
+def _scan_existing_transcript_titles(
+        folder_path: str,
+        ch_name: str,
+        excluded_roots: list[str] | tuple[str, ...] | None = None) -> dict:
     """Return `{norm_title: (raw_title, video_id_or_empty)}` for every
     entry in ANY Transcript.txt under `folder_path`.
 
@@ -89,7 +92,17 @@ def _scan_existing_transcript_titles(folder_path: str, ch_name: str) -> dict:
     id_pattern = re.compile(r"\[([A-Za-z0-9_-]{11})\]\s*$")
     if not folder_path or not os.path.isdir(folder_path):
         return existing
-    for dirpath, _dirs, files in os.walk(folder_path):
+    excluded = {
+        os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
+        for path in (excluded_roots or [])
+        if str(path or "").strip()
+    }
+    for dirpath, dirs, files in os.walk(folder_path):
+        dirs[:] = [
+            name for name in dirs
+            if os.path.normcase(os.path.abspath(os.path.normpath(
+                os.path.join(dirpath, name)))) not in excluded
+        ]
         for f in files:
             if not f.endswith("Transcript.txt"):
                 continue

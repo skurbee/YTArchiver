@@ -77,6 +77,31 @@ def _scan_metadata_and_thumbnail_ids(folder: Path, name: str, stream=None
     return have_meta, jsonl_count, have_thumb, thumb_file_count
 
 
+def _metadata_targets(on_disk_ids, have_meta: set[str],
+                      have_thumb: set[str], failed_fetch: set[str],
+                      *, refresh: bool) -> list[str]:
+    """Build one ordered, deduplicated metadata target list.
+
+    This helper is deliberately reused after legacy title/ID backfill.  The
+    former second implementation forgot the permanent-failure exclusion and
+    dedupe, causing private/deleted videos to resume network retries whenever
+    one unrelated no-ID file existed.
+    """
+    seen: set[str] = set()
+    targets: list[str] = []
+    for raw_vid in on_disk_ids:
+        vid = str(raw_vid or "").strip()
+        if not vid or vid in seen:
+            continue
+        seen.add(vid)
+        if refresh:
+            targets.append(vid)
+        elif ((vid not in have_meta or vid not in have_thumb)
+              and vid not in failed_fetch):
+            targets.append(vid)
+    return targets
+
+
 def fetch_channel_metadata(channel: dict[str, Any],
                            stream: LogStreamer,
                            cancel_event: threading.Event | None = None,
@@ -274,33 +299,6 @@ def fetch_channel_metadata(channel: dict[str, Any],
         _scan_metadata_and_thumbnail_ids(folder, name, stream))
     have_meta = set(have_meta)
     jsonl_count = int(jsonl_count)
-    _expected_prefix = f".{name} "          # ".{ch_name} ..."
-    _expected_exact  = f".{name} Metadata.jsonl"
-    for dp, _dns, fns in ():
-        for fn in fns:
-            if not fn.endswith("Metadata.jsonl"):
-                continue
-            # Accept either the bare ".{name} Metadata.jsonl" form
-            # (no year/month split) or any ".{name} <year/month tag>
-            # Metadata.jsonl" form. Reject ".{otherChannel} ..." files
-            # even though they share the suffix.
-            if fn != _expected_exact and not fn.startswith(_expected_prefix):
-                continue
-            jsonl_count += 1
-            # Per-file error isolation so one corrupt jsonl doesn't
-            # tank the whole channel's metadata pass (audit:
-            # refresh_fetch H79). Surface the failure to the stream
-            # so the user can investigate / regenerate.
-            try:
-                have_meta.update(
-                    _read_metadata_jsonl(os.path.join(dp, fn)).keys())
-            except Exception as _re:
-                try:
-                    stream.emit_dim(
-                        f" (jsonl read failed: {fn} — {_re})")
-                except Exception:
-                    pass
-
     # 3. Enumerate existing THUMBNAILS. a case: 2 videos had
     # metadata JSONL entries but no thumbnail file on disk — the
     # earlier logic only checked metadata so those 2 showed as
@@ -310,21 +308,6 @@ def fetch_channel_metadata(channel: dict[str, Any],
     # bracketed video_id from each filename.
     have_thumb = set(have_thumb)
     thumb_file_count = int(thumb_file_count)
-    _thumb_id_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
-    for dp, _dns, fns in ():
-        # Only look in .Thumbnails/ folders — avoids picking up a
-        # bracketed id from an unrelated file elsewhere in the tree.
-        if os.path.basename(dp).lower() != ".thumbnails":
-            continue
-        for fn in fns:
-            low = fn.lower()
-            if not low.endswith((".jpg", ".jpeg", ".png", ".webp")):
-                continue
-            thumb_file_count += 1
-            m = _thumb_id_re.search(fn)
-            if m:
-                have_thumb.add(m.group(1))
-
     # 4. Compute targets: missing metadata OR missing thumbnail.
     # Dedupe via dict (preserves insertion order) so a video whose
     # id accidentally appears multiple times in `on_disk_ids`
@@ -334,18 +317,9 @@ def fetch_channel_metadata(channel: dict[str, Any],
     # Skip videos whose metadata fetch previously failed (deleted /
     # private / region-locked) — `_failed_fetch` set comes from
     # the DB and gets cleared on refresh=True.
-    seen: set = set()
-    deduped_ids: list = []
-    for _vid in on_disk_ids:
-        if _vid not in seen:
-            seen.add(_vid)
-            deduped_ids.append(_vid)
-    if refresh:
-        targets = list(deduped_ids)
-    else:
-        targets = [vid for vid in deduped_ids
-                   if (vid not in have_meta or vid not in have_thumb)
-                   and vid not in _failed_fetch]
+    targets = _metadata_targets(
+        on_disk_ids, have_meta, have_thumb, _failed_fetch,
+        refresh=refresh)
 
     # Breakdown so the user can see exactly what the scan found
     # (metadata coverage vs thumbnail coverage are now reported
@@ -360,12 +334,9 @@ def fetch_channel_metadata(channel: dict[str, Any],
     _perm_failed = sum(1 for vid in on_disk_ids if vid in _failed_fetch)
     # FIX (2026-05-14): the ratio used to read `len(have_meta)/len(on_disk_ids)`
     # which was misleading because `have_meta` includes orphan files for
-    # videos no longer on disk. Example seen with ColdFusion:
-    #   `metadata: 513/512 (0 missing)` \u2014 513 metadata files but only
-    #    512 unique video IDs on disk; 1 orphan metadata file.
-    #   `thumbnails: 497/512 (20 missing)` \u2014 497 thumbs but only 492
-    #    match current videos (5 orphan); display claimed 20 missing
-    #    but 512-497=15 didn't math.
+    # videos no longer on disk. A raw asset total can therefore exceed the
+    # number of current videos even while some current videos are missing that
+    # asset, which makes subtraction-based coverage misleading.
     # Now X = covered (videos WITH the asset), Y = total on-disk videos,
     # so X/Y is a real coverage ratio and X + missing = Y always holds.
     # Orphan files get their own callout when present.
@@ -621,11 +592,9 @@ def fetch_channel_metadata(channel: dict[str, Any],
     # list and the newly-resolved files never got their metadata
     # fetched on this pass (user had to click Recheck twice).
     if n_without_id:
-        if refresh:
-            targets = list(on_disk_ids)
-        else:
-            targets = [vid for vid in on_disk_ids
-                       if vid not in have_meta or vid not in have_thumb]
+        targets = _metadata_targets(
+            on_disk_ids, have_meta, have_thumb, _failed_fetch,
+            refresh=refresh)
 
     if not targets:
         stream.emit([[" \u2713 ", "simpleline_green"],

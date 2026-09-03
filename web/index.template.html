@@ -10,29 +10,27 @@
 
   Page structure (top to bottom in the source below):
     1. <header-strip>     App title + version label
-    2. <tab-row>          Top-level tabs: Subs, Browse, Settings
-                          (Recent used to live here too, now under Browse)
+    2. <tab-row>          Top-level tabs: Download, Subs, Browse, Health,
+                          and Settings
     3. <main>             Tab panels, only one visible at a time:
        - #panel-subs         Channel subscriptions table + Sync controls
        - #panel-browse       Library navigation: Channels grid, Search,
                              Graph, Bookmarks, Recent. Has its own
                              left sidebar that swaps the right pane.
-       - #panel-settings     Per-channel + global settings, sync log
+       - #panel-health       Library status, repair tools, and backups
+       - #panel-settings     App preferences
     4. Floating overlays (not in the tab flow):
-       - #welcome-modal      First-launch archive-root picker (modal)
-       - #ask-modal          Generic confirm/prompt modal used by
-                             askConfirm() / askChoice() helpers in app.js
-       - #context-menu       Right-click menu, repurposed per context
-       - .drawer-livestreams Deferred-livestreams drawer slides up
-                             from bottom-right
+       - #onboarding-overlay First-launch setup wizard
+       - .askq-backdrop      Confirmations and long-running tool dialogs
+       - #ctx-menu-root      Right-click menu mount point
        - .mini-log           Tiny "tail of activity" panel docked at the
                              bottom of every tab so the user always
                              sees recent log activity
-       - #sync-tasks-popup / #gpu-tasks-popup   Queue popups anchored
+       - #popover-sync-tasks / #popover-gpu-tasks Queue popups anchored
                              to their respective header badges
     5. <script src="vendor/chart.umd.min.js">  Chart.js for the
                              Browse > Graph charts
-    6. <script src="logs.js"> + <script src="app.js">  The two JS
+    6. Feature scripts loaded in dependency order near the end of the page
                              files that wire everything together — see
                              web/app.js header for its section map.
 
@@ -53,10 +51,10 @@
   <link rel="stylesheet" href="styles-settings.css?v=2" />
   <link rel="stylesheet" href="styles-download-controls.css?v=1" />
   <link rel="stylesheet" href="styles-logs.css?v=1" />
-  <link rel="stylesheet" href="styles-tabs-data.css?v=1" />
+  <link rel="stylesheet" href="styles-tabs-data.css?v=3" />
   <link rel="stylesheet" href="styles-browse.css?v=2" />
-  <link rel="stylesheet" href="styles-browse-grids.css?v=1" />
-  <link rel="stylesheet" href="styles-watch.css?v=1" />
+  <link rel="stylesheet" href="styles-browse-grids.css?v=2" />
+  <link rel="stylesheet" href="styles-watch.css?v=3" />
   <link rel="stylesheet" href="styles-dialogs.css?v=1" />
   <link rel="stylesheet" href="styles-onboarding.css?v=1" />
 </head>
@@ -100,11 +98,15 @@
        indicator line, two popover buttons, and the tray. Sync/Processing
        segments open their queue popovers; Log jumps to the full log. -->
   <div class="global-status-bar" id="global-status-bar">
-    <button type="button" class="gsb-seg" id="gsb-sync" title="Sync queue — click for details">
+    <button type="button" class="gsb-seg" id="gsb-sync" title="Sync queue — click for details"
+            aria-haspopup="dialog" aria-controls="popover-sync-tasks"
+            aria-expanded="false">
       <span class="gsb-dot gsb-dot-sync"></span><span class="gsb-text" id="gsb-sync-text">Sync idle</span>
     </button>
     <span class="gsb-sep"></span>
-    <button type="button" class="gsb-seg" id="gsb-gpu" title="Processing queue — click for details">
+    <button type="button" class="gsb-seg" id="gsb-gpu" title="Processing queue — click for details"
+            aria-haspopup="dialog" aria-controls="popover-gpu-tasks"
+            aria-expanded="false">
       <span class="gsb-dot gsb-dot-gpu"></span><span class="gsb-text" id="gsb-gpu-text">Processing idle</span>
     </button>
     <span class="gsb-seg gsb-index" id="gsb-index" hidden>
@@ -119,7 +121,8 @@
     <button type="button" class="gsb-seg gsb-errors" id="gsb-errors" hidden
             aria-haspopup="dialog" aria-controls="popover-session-errors"
             title="Errors this session — click for details">
-      <span id="gsb-errors-count">0</span> errors
+      <span id="gsb-errors-count">0</span>
+      <span id="gsb-errors-label">errors</span>
     </button>
     <span class="gsb-traffic" id="gsb-traffic" hidden
           title="YouTube request limits. If either limit is reached, YTArchiver waits and continues automatically.">
@@ -143,23 +146,24 @@
   <script src="vendor/chart.umd.min.js"></script>
   <!-- UI helper modules load before logs.js + app.js so their exports are ready. -->
   <script src="util.js?v=1"></script>
-  <script src="bridge.js?v=1"></script>
+  <script src="bridge.js?v=3"></script>
+  <script src="eventState.js?v=1"></script>
   <script src="browseState.js?v=1"></script>
   <script src="toasts.js?v=1"></script>
   <script src="modals.js?v=1"></script>
-  <script src="contextMenu.js?v=1"></script>
+  <script src="contextMenu.js?v=3"></script>
   <script src="dropdown.js?v=1"></script>
   <script src="chrome.js?v=1"></script>
   <script src="logContextMenu.js?v=1"></script>
   <script src="shortcuts.js?v=1"></script>
   <script src="graphTab.js?v=1"></script>
   <script src="queueBlink.js?v=1"></script>
-  <script src="watchActions.js?v=1"></script>
+  <script src="watchActions.js?v=4"></script>
   <script src="editChannel.js?v=1"></script>
   <script src="browseSearch.js?v=1"></script>
-  <script src="browseContextMenus.js?v=1"></script>
+  <script src="browseContextMenus.js?v=5"></script>
   <script src="columnSort.js?v=1"></script>
-  <script src="downloadUrl.js?v=1"></script>
+  <script src="downloadUrl.js?v=2"></script>
   <script src="downloadDragDrop.js?v=1"></script>
   <script src="clearButton.js?v=1"></script>
   <script src="autoSync.js?v=1"></script>
@@ -168,18 +172,20 @@
   <script src="syncSubbed.js?v=1"></script>
   <script src="indexControls.js?v=3"></script>
   <script src="settingsInfra.js?v=1"></script>
+  <script src="healthOverview.js?v=1"></script>
   <script src="metadataTab.js?v=2"></script>
   <script src="settingsTab.js?v=2"></script>
   <script src="driftScanDialog.js?v=1"></script>
   <script src="compressDryRunDialog.js?v=1"></script>
   <script src="repairCaptionsDialog.js?v=1"></script>
-  <script src="punctRestoreDialog.js?v=1"></script>
+  <script src="punctRestoreDialog.js?v=2"></script>
   <script src="provenanceDialog.js?v=1"></script>
   <script src="aboutDialog.js?v=1"></script>
-  <script src="diagnosticsDialog.js?v=1"></script>
+  <script src="diagnosticsDialog.js?v=2"></script>
   <script src="manualTranscribe.js?v=1"></script>
   <script src="queuePopovers.js?v=1"></script>
   <script src="browseView.js?v=1"></script>
+  <script src="navigationHistory.js?v=1"></script>
   <script src="browseContent.js?v=1"></script>
   <script src="autorunHistory.js?v=1"></script>
   <script src="logMode.js?v=1"></script>
@@ -191,14 +197,15 @@
   <script src="missingFolders.js?v=1"></script>
   <script src="redownloadSampleModal.js?v=1"></script>
   <script src="appDialogs.js?v=1"></script>
-  <script src="logs.js?v=34"></script>
+  <script src="logs.js?v=35"></script>
   <script src="queueRender.js?v=1"></script>
   <script src="tables.js?v=1"></script>
   <script src="browseGrids.js?v=1"></script>
   <script src="videosView.js?v=1"></script>
   <script src="manualView.js?v=1"></script>
+  <script src="trashView.js?v=1"></script>
   <script src="manualReview.js?v=1"></script>
-  <script src="watchView.js?v=1"></script>
+  <script src="watchView.js?v=3"></script>
   <script src="uxPolish.js?v=1"></script>
   <script src="removeChannel.js?v=1"></script>
   <script src="queuePending.js?v=1"></script>
@@ -206,6 +213,6 @@
   <script src="smallInits.js?v=2"></script>
   <script src="statusBar.js?v=3"></script>
   <script src="commandPalette.js?v=1"></script>
-  <script src="app.js?v=79"></script>
+  <script src="app.js?v=80"></script>
 </body>
 </html>

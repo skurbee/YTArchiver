@@ -1,5 +1,5 @@
 /**
- * web/onboarding.js — first-run setup wizard controller.
+ * web/onboarding.js — setup wizard controller.
  *
  * Restores the onboarding lost in the tkinter -> pywebview migration:
  *   Step 1  Welcome
@@ -10,7 +10,7 @@
  *
  * Exposes:
  *   window._startOnboarding({force})  — show the wizard. seedLogs.js calls
- *       this on first run; Settings > Tools calls it with {force:true}.
+ *       this on first run; Settings can call it with {force:true}.
  *   window._onboardingProgress(d)     — install progress sink, called from
  *       the Python side (OnboardingMixin._push_onboarding).
  */
@@ -39,6 +39,7 @@
   let _traffic = null;        // live traffic status + projection
   let _trafficMode = "conservative";
   let _force = false;         // true when re-opened from Settings (dismissable)
+  let _releaseFocusTrap = null;
   const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
   let _coreWatchdog = null;
   let _whisperWatchdog = null;
@@ -46,10 +47,33 @@
   const STEP_NEXT_LABEL = {
     1: "Get started", 2: "Continue", 3: "Continue", 4: "Continue", 5: "Finish"
   };
+  const STEP_TITLE_ID = {
+    1: "onb-intro-title",
+    2: "onb-folder-title",
+    3: "onb-traffic-title",
+    4: "onb-deps-title",
+    5: "onb-done-title",
+  };
+
+  function renderIntroCopy() {
+    const title = $("onb-intro-title");
+    const text = $("onb-intro-text");
+    if (_force) {
+      if (title) title.textContent = "Review YTArchiver setup";
+      if (text) {
+        text.textContent = "Review or change your current setup. Your existing choices stay in place unless you change them.";
+      }
+    } else {
+      if (title) title.textContent = "Welcome to YTArchiver";
+      if (text) text.textContent = "We'll choose your archive folder, traffic limits, and download tools.";
+    }
+  }
 
   function renderTraffic(traffic) {
-    if (traffic) _traffic = traffic;
-    _trafficMode = _traffic?.mode || _trafficMode || "conservative";
+    if (traffic) {
+      _traffic = traffic;
+      _trafficMode = traffic.mode || _trafficMode || "conservative";
+    }
     document.querySelectorAll("#onb-traffic-grid .onb-traffic-card").forEach((card) => {
       const selected = card.dataset.trafficMode === _trafficMode;
       card.classList.toggle("selected", selected);
@@ -57,13 +81,20 @@
     });
     const custom = $("onb-traffic-custom");
     if (custom) custom.hidden = _trafficMode !== "custom";
-    window._setBudgetAutosyncAvailable?.(_trafficMode !== "unlimited");
+    // A no-argument render is only a provisional card selection while the
+    // save is pending.  Do not change Auto-sync until the backend returns the
+    // newly committed traffic state.
+    if (traffic) {
+      window._setBudgetAutosyncAvailable?.(_trafficMode !== "unlimited");
+    }
     const p = _traffic?.projection;
     const summary = $("onb-traffic-summary");
     if (summary) {
       let text = p?.recommendation || "Conservative is the safest starting point.";
       if (_trafficMode === "unlimited") {
-        text = "Unlimited removes the rolling ceilings. Launch spacing and the emergency rate-limit stop remain active, but budget-based auto-sync is unavailable.";
+        text = "Unlimited removes the hourly and daily limits. YTArchiver will "
+          + "still space out YouTube requests and pause if YouTube starts "
+          + "rejecting them. Auto-sync cannot use “When budget allows” in this mode.";
       } else if (p?.sweep?.channels) {
         text += ` One complete sweep is estimated at about ${p.sweep.units} operations.`;
       }
@@ -86,20 +117,43 @@
   }
 
   async function saveTraffic(mode) {
-    _trafficMode = mode || _trafficMode;
+    const previousTraffic = _traffic;
+    const previousMode = _trafficMode;
+    _trafficMode = mode || previousMode;
     renderTraffic();
-    if (!nativeBridgeUp()) return;
+    if (!nativeBridgeUp()) {
+      _traffic = previousTraffic;
+      _trafficMode = previousMode;
+      renderTraffic(previousTraffic);
+      window._showToast?.(
+        "YTArchiver is still starting. Try again in a moment.", "warn");
+      return false;
+    }
     try {
       const result = await bridgeCall(
         "onboarding_set_traffic", _trafficMode, customTrafficValues());
       if (result?.ok && result.youtube_traffic) {
         renderTraffic(result.youtube_traffic);
-      } else if (result?.error) {
-        window._showToast?.(result.error, "error");
+        if (result.budget_autosync_disabled) {
+          window.dispatchEvent(new Event("autorun-state-changed"));
+        }
+        return true;
+      } else {
+        _traffic = previousTraffic;
+        _trafficMode = previousMode;
+        renderTraffic(previousTraffic);
+        window._showToast?.(
+          result?.error || "Could not save the traffic setting.", "error");
+        return false;
       }
     } catch (e) {
+      _traffic = previousTraffic;
+      _trafficMode = previousMode;
+      renderTraffic(previousTraffic);
       window._showToast?.("Could not save traffic safety setting: " + e, "error");
+      return false;
     }
+    return false;
   }
 
   // ── dep-row rendering ─────────────────────────────────────────────────
@@ -131,13 +185,11 @@
     // Update the Install button label/state.
     const btn = $("onb-install-core");
     const allOk = d.ytdlp?.ok && d.ffmpeg?.ok && d.ffprobe?.ok;
-    if (allOk && _coreBusy) {
-      _coreBusy = false;
-      _clearInstallWatchdog("core");
-    }
-    if (btn && !_coreBusy) {
-      btn.textContent = allOk ? "Reinstall" : "Install";
-      btn.disabled = false;
+    if (btn) {
+      btn.textContent = _coreBusy
+        ? "Installing…"
+        : (allOk ? "Reinstall" : "Install");
+      btn.disabled = _coreBusy;
     }
   }
 
@@ -162,13 +214,11 @@
     const el = $("onb-whisper-rows");
     if (el) el.innerHTML = rows.join("");
     const btn = $("onb-install-whisper");
-    if (wOk && _whisperBusy) {
-      _whisperBusy = false;
-      _clearInstallWatchdog("whisper");
-    }
-    if (btn && !_whisperBusy) {
-      btn.textContent = wOk ? "Reinstall" : "Install";
-      btn.disabled = false;
+    if (btn) {
+      btn.textContent = _whisperBusy
+        ? "Installing…"
+        : (wOk ? "Reinstall" : "Install");
+      btn.disabled = _whisperBusy;
     }
   }
 
@@ -215,7 +265,11 @@
     renderWhisperRows(_deps);       // show the spinner immediately
     try {
       const r = await bridgeCall("onboarding_probe", true);
-      if (r && r.ok && r.deps) _deps = Object.assign({}, _deps || {}, r.deps);
+      if (r && r.ok && r.deps) {
+        _deps = Object.assign({}, _deps || {}, r.deps);
+      } else {
+        throw new Error(r?.error || "The transcription check did not finish.");
+      }
     } catch (e) {
       console.error("[onboarding] auto-verify whisper", e);
       window._showToast?.(`Could not verify transcription setup: ${e}`, "warn");
@@ -248,20 +302,24 @@
     }
     const warn = $("onb-done-warn");
     if (warn) {
+      warn.classList.remove("onb-msg-error");
       const coreMissing = !(d.ytdlp?.ok && d.ffmpeg?.ok && d.ffprobe?.ok);
       warn.innerHTML = coreMissing
         ? "⚠ The download tools aren't installed yet — sync/downloads "
-          + "won't work until you install them (re-run setup from Settings > Tools)."
+          + "won't work until you install them (re-run setup from Settings)."
         : "";
     }
   }
 
   // ── step navigation ───────────────────────────────────────────────────
-  function gotoStep(n) {
+  function gotoStep(n, { focusHeading = true } = {}) {
     _step = n;
     document.querySelectorAll("#onboarding-overlay .onb-step").forEach((s) => {
       s.hidden = (parseInt(s.dataset.step, 10) !== n);
     });
+    const titleId = STEP_TITLE_ID[n];
+    const dialog = document.querySelector("#onboarding-overlay .onb-card");
+    if (dialog && titleId) dialog.setAttribute("aria-labelledby", titleId);
     document.querySelectorAll("#onboarding-overlay .onb-dot").forEach((d) => {
       const dn = parseInt(d.dataset.step, 10);
       d.classList.toggle("done", dn < n);
@@ -271,7 +329,9 @@
     if (back) back.hidden = (n === 1);
     const next = $("onb-next");
     if (next) {
-      next.textContent = STEP_NEXT_LABEL[n] || "Continue";
+      next.textContent = (n === 1 && _force)
+        ? "Review setup"
+        : (STEP_NEXT_LABEL[n] || "Continue");
       // Gate: step 2 needs a folder before moving on.
       next.disabled = (n === 2 && !_folder);
     }
@@ -279,6 +339,10 @@
     // Auto-verify the whisper stack when the deps step opens so its row
     // resolves to a real ✓/✗ without the user clicking Re-check.
     if (n === 4) autoVerifyWhisper();
+    // Moving focus to the newly revealed heading makes the step change
+    // explicit to keyboard and screen-reader users.  Initial opening is
+    // handled by the focus trap so it can still restore the launch control.
+    if (focusHeading && titleId) $(titleId)?.focus();
   }
 
   // ── progress sink (called from Python) ────────────────────────────────
@@ -338,15 +402,64 @@
   function _startInstallWatchdog(kind) {
     _clearInstallWatchdog(kind);
     const isWhisper = kind === "whisper";
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
+      const msg = $(isWhisper ? "onb-whisper-msg" : "onb-core-msg");
+      // A transcription install can legitimately run longer than ten minutes.
+      // Ask the backend whether the managed worker still exists before
+      // offering Retry; a second click must never start a competing installer.
+      try {
+        const state = nativeBridgeUp()
+          ? await bridgeCall("onboarding_state") : null;
+        if (!state || state.installing?.[kind]) {
+          if (msg) {
+            msg.textContent = "Still installing…";
+            msg.classList.remove("onb-msg-error");
+          }
+          _startInstallWatchdog(kind);
+          return;
+        }
+        let deps = state.deps || {};
+        if (isWhisper && !deps.whisper?.checked) {
+          const verified = await bridgeCall("onboarding_probe", true);
+          if (verified?.ok && verified.deps) deps = verified.deps;
+        }
+        const finished = isWhisper
+          ? !!deps.whisper?.ok
+          : !!(deps.ytdlp?.ok && deps.ffmpeg?.ok && deps.ffprobe?.ok);
+        if (finished) {
+          if (isWhisper) _whisperBusy = false;
+          else _coreBusy = false;
+          renderDeps(deps);
+          const btn = $(isWhisper ? "onb-install-whisper" : "onb-install-core");
+          const fill = $(isWhisper ? "onb-whisper-fill" : "onb-core-fill");
+          if (btn) { btn.disabled = false; btn.textContent = "Reinstall"; }
+          if (fill) {
+            fill.classList.remove("onb-fill-indef");
+            fill.style.width = "100%";
+          }
+          if (msg) {
+            msg.textContent = "Done.";
+            msg.classList.remove("onb-msg-error");
+          }
+          if (isWhisper) _whisperWatchdog = null;
+          else _coreWatchdog = null;
+          return;
+        }
+      } catch (_error) {
+        if (msg) {
+          msg.textContent = "Still waiting for the installer…";
+          msg.classList.remove("onb-msg-error");
+        }
+        _startInstallWatchdog(kind);
+        return;
+      }
       if (isWhisper) _whisperBusy = false;
       else _coreBusy = false;
       const btn = $(isWhisper ? "onb-install-whisper" : "onb-install-core");
-      const msg = $(isWhisper ? "onb-whisper-msg" : "onb-core-msg");
       const fill = $(isWhisper ? "onb-whisper-fill" : "onb-core-fill");
       if (btn) { btn.disabled = false; btn.textContent = "Retry"; }
       if (msg) {
-        msg.textContent = "Install timed out - click to retry.";
+        msg.textContent = "The installer stopped before it finished. Click Retry.";
         msg.classList.add("onb-msg-error");
       }
       if (fill) fill.classList.remove("onb-fill-indef");
@@ -364,11 +477,23 @@
     const btn = $("onb-install-core");
     if (btn) { btn.disabled = true; btn.textContent = "Installing…"; }
     const wrap = $("onb-core-progress"); if (wrap) wrap.hidden = false;
-    try { await bridgeCall("onboarding_install_core"); }
+    try {
+      const result = await bridgeCall("onboarding_install_core");
+      if (!result?.ok || (!result?.started && !result?.running)) {
+        throw new Error(result?.error || "The installer did not start.");
+      }
+      if (result.running) {
+        window._showToast?.("Download tools are already being installed.", "warn");
+      }
+    }
     catch (e) {
       _clearInstallWatchdog("core");
-      _onboardingProgress({ phase: "core", status: "error", msg: String(e) });
+      _onboardingProgress({
+        phase: "core", status: "done", ok: false,
+        error: e?.message || String(e), msg: e?.message || String(e),
+      });
       _coreBusy = false;
+      if (btn) { btn.disabled = false; btn.textContent = "Retry"; }
     }
   }
 
@@ -379,22 +504,43 @@
     const btn = $("onb-install-whisper");
     if (btn) { btn.disabled = true; btn.textContent = "Installing…"; }
     const wrap = $("onb-whisper-progress"); if (wrap) wrap.hidden = false;
-    try { await bridgeCall("onboarding_install_whisper"); }
+    try {
+      const result = await bridgeCall("onboarding_install_whisper");
+      if (!result?.ok || (!result?.started && !result?.running)) {
+        throw new Error(result?.error || "The installer did not start.");
+      }
+      if (result.running) {
+        window._showToast?.("Transcription tools are already being installed.", "warn");
+      }
+    }
     catch (e) {
       _clearInstallWatchdog("whisper");
-      _onboardingProgress({ phase: "whisper", status: "error", msg: String(e) });
+      _onboardingProgress({
+        phase: "whisper", status: "done", ok: false,
+        error: e?.message || String(e), msg: e?.message || String(e),
+      });
       _whisperBusy = false;
+      if (btn) { btn.disabled = false; btn.textContent = "Retry"; }
     }
   }
 
   async function recheck() {
-    if (!nativeBridgeUp()) return;
+    if (!nativeBridgeUp()) {
+      window._showToast?.(
+        "YTArchiver is still starting. Try again in a moment.", "warn");
+      return;
+    }
+    const button = $("onb-recheck");
+    if (button) button.disabled = true;
     try {
       const r = await bridgeCall("onboarding_probe", true);
       if (r && r.ok && r.deps) renderDeps(r.deps);
+      else throw new Error(r?.error || "The setup check did not finish.");
     } catch (e) {
       console.error("[onboarding] recheck", e);
-      window._showToast?.(`Setup re-check failed: ${e}`, "warn");
+      window._showToast?.(`Setup re-check failed: ${e}`, "error");
+    } finally {
+      if (button) button.disabled = false;
     }
   }
 
@@ -404,7 +550,7 @@
     if (browse) browse.disabled = true;
     const hint = $("onb-folder-hint");
     try {
-      const picked = await bridgeCall("pick_folder", "Choose archive root");
+      const picked = await bridgeCall("pick_folder", "Choose archive folder");
       if (picked && picked.ok && picked.path) {
         // Save immediately so the rest of the app + a mid-wizard quit
         // still leaves a valid output_dir.
@@ -430,14 +576,42 @@
   }
 
   async function finish() {
-    try { if (nativeBridgeUp()) await bridgeCall("onboarding_finish"); }
-    catch (e) {
+    const next = $("onb-next");
+    if (next?.disabled) return false;
+    if (next) next.disabled = true;
+    let result;
+    try {
+      if (!nativeBridgeUp()) {
+        result = {
+          ok: false,
+          error: "YTArchiver is still starting. Try again in a moment.",
+        };
+      } else {
+        result = await bridgeCall("onboarding_finish");
+      }
+    } catch (e) {
       console.error("[onboarding] finish", e);
-      window._showToast?.(`Could not save setup completion: ${e}`, "warn");
+      result = { ok: false, error: e?.message || String(e) };
+    }
+    if (!result?.ok) {
+      const msg = result?.error || "Setup completion could not be saved.";
+      const warn = $("onb-done-warn");
+      if (warn) {
+        warn.textContent = `Setup is still open because it could not be saved: ${msg}`;
+        warn.classList.add("onb-msg-error");
+      }
+      window._showToast?.(`Could not save setup completion: ${msg}`, "error");
+      if (next) next.disabled = false;
+      return false;
     }
     const ov = $("onboarding-overlay");
     if (ov) ov.hidden = true;
     document.removeEventListener("keydown", _escBlock, true);
+    if (_releaseFocusTrap) {
+      _releaseFocusTrap();
+      _releaseFocusTrap = null;
+    }
+    return true;
   }
 
   // Hide the wizard WITHOUT finalizing setup. Used by the close (X) button
@@ -449,6 +623,10 @@
     const ov = $("onboarding-overlay");
     if (ov) ov.hidden = true;
     document.removeEventListener("keydown", _escBlock, true);
+    if (_releaseFocusTrap) {
+      _releaseFocusTrap();
+      _releaseFocusTrap = null;
+    }
   }
 
   function _escBlock(e) {
@@ -493,18 +671,33 @@
     const ov = $("onboarding-overlay");
     if (!ov) { console.warn("[onboarding] overlay element missing"); return; }
     wireOnce();
-    _step = 1; _folder = ""; _coreBusy = false; _whisperBusy = false; _whisperChecking = false;
-    // Re-opened from Settings > Tools ("Run setup again") → dismissable
+    _step = 1; _folder = ""; _whisperChecking = false;
+    // Re-opened from Settings ("Run setup again") → dismissable
     // (show the X, allow Esc). Genuine first-run (no force) stays gated.
     _force = !!(opts && opts.force);
     const closeBtn = $("onb-close");
     if (closeBtn) closeBtn.hidden = !_force;
+    renderIntroCopy();
     // Seed state from the backend (best-effort; the wizard still works if
     // this fails — the user can Browse + Re-check manually).
     try {
       if (nativeBridgeUp()) {
         const st = await bridgeCall("onboarding_state");
         if (st) {
+          _coreBusy = !!st.installing?.core;
+          _whisperBusy = !!st.installing?.whisper;
+          const coreButton = $("onb-install-core");
+          const whisperButton = $("onb-install-whisper");
+          if (coreButton && _coreBusy) {
+            coreButton.disabled = true;
+            coreButton.textContent = "Installing…";
+            _startInstallWatchdog("core");
+          }
+          if (whisperButton && _whisperBusy) {
+            whisperButton.disabled = true;
+            whisperButton.textContent = "Installing…";
+            _startInstallWatchdog("whisper");
+          }
           _folder = (st.output_dir || "");
           const pe = $("onb-folder-path"); if (pe) pe.value = _folder;
           renderDeps(st.deps || {});
@@ -530,11 +723,16 @@
     }
     ov.hidden = false;
     document.addEventListener("keydown", _escBlock, true);
-    gotoStep(1);
+    gotoStep(1, { focusHeading: false });
+    if (_releaseFocusTrap) _releaseFocusTrap();
+    _releaseFocusTrap = window.YT?.modals?.activateFocusTrap?.(ov, {
+      dialogSelector: ".onb-card",
+      initialFocus: "#onb-intro-title",
+    }) || null;
     console.info("[onboarding] wizard shown", opts || {});
   }
 
-  // Wire the Settings > Tools "Run setup again" button independently of the
+  // Wire the Settings "Run setup again" button independently of the
   // auto-show path, so it works even when onboarding never auto-triggered.
   function wireSettingsButton() {
     const b = $("btn-run-setup");

@@ -9,8 +9,22 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 
 from backend import subs as subs_backend
+from backend.services.channel_leases import (
+    LeaseOwner,
+    channel_aliases,
+    channel_leases,
+    global_archive_aliases,
+)
+from backend.services.job_supervisor import WorkAdmissionClosed
+from backend.services.managed_work import (
+    admitted_operation,
+    lease_busy_result,
+    start_managed_task,
+    try_global_archive_lease,
+)
 from backend.ytarchiver_config import load_config
 
 from ._shared import _log
@@ -117,14 +131,20 @@ class ThumbnailMixin:
         name = (ch.get("name") or ch.get("folder")
                 or identity.get("name") or identity.get("folder")
                 or "channel")
+        task_id = f"thumbnail-refetch-{uuid.uuid4().hex}"
+        cancel = threading.Event()
+        lease = None
         def _run():
             log_stream = self._thumbnail_log_stream()
             try:
+                if cancel.is_set():
+                    return
                 from backend import metadata as _md
                 log_stream.emit_text(
                     f" - Thumbnail refetch starting for {name}...",
                     "simpleline")
-                res = _md.sweep_missing_thumbnails(ch, stream=log_stream)
+                res = _md.sweep_missing_thumbnails(
+                    ch, stream=log_stream, cancel_event=cancel)
                 log_stream.emit_text(
                     f" - Thumbnail refetch for {name}: "
                     f"{res.get('fetched', 0)} fetched, "
@@ -134,7 +154,48 @@ class ThumbnailMixin:
             except Exception as _e:
                 log_stream.emit_error(
                     f"Thumbnail refetch failed for {name}: {_e}")
-        threading.Thread(target=_run, daemon=True).start()
+            finally:
+                if lease is not None:
+                    lease.release()
+        try:
+            with admitted_operation(
+                self,
+                owner="thumbnail-maintenance",
+                label=f"Refetch thumbnails for {name}",
+                task_id=task_id,
+                cancel=cancel,
+            ):
+                aliases = channel_aliases(ch) or global_archive_aliases()
+                admission = channel_leases.try_acquire(
+                    aliases,
+                    LeaseOwner(
+                        owner="thumbnail-maintenance",
+                        job_id=task_id,
+                        task_id=task_id,
+                        label=f"Refetch thumbnails for {name}",
+                        kind="maintenance",
+                    ),
+                    cancel_event=cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    return lease_busy_result(admission)
+                lease = admission.lease
+                try:
+                    start_managed_task(
+                        self,
+                        owner="thumbnail-maintenance",
+                        label=f"Refetch thumbnails for {name}",
+                        task_id=task_id,
+                        cancel=cancel,
+                        target=_run,
+                        name="thumbnail-refetch",
+                        thread_factory=threading.Thread,
+                    )
+                except Exception:
+                    lease.release()
+                    raise
+        except WorkAdmissionClosed as exc:
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "started": True}
 
 
@@ -178,9 +239,50 @@ class ThumbnailMixin:
                     self._realign_jobs[token] = {
                         "done": True, "result": res, "cancel": cancel_ev,
                         "_ts": time.time()}
+                if lease is not None:
+                    lease.release()
 
-            threading.Thread(target=_worker, daemon=True,
-                             name="thumb-realign").start()
+            task_id = f"thumbnail-realign-{token}"
+            lease = None
+            try:
+                with admitted_operation(
+                    self,
+                    owner="thumbnail-maintenance",
+                    label="Realign archive thumbnails",
+                    task_id=task_id,
+                    cancel=cancel_ev,
+                ):
+                    admission = try_global_archive_lease(
+                        owner="thumbnail-maintenance",
+                        label="Realign archive thumbnails",
+                        task_id=task_id,
+                        cancel=cancel_ev,
+                    )
+                    if not admission.ok or admission.lease is None:
+                        with self._realign_jobs_lock:
+                            self._realign_jobs.pop(token, None)
+                        return lease_busy_result(admission)
+                    lease = admission.lease
+                    try:
+                        start_managed_task(
+                            self,
+                            owner="thumbnail-maintenance",
+                            label="Realign archive thumbnails",
+                            task_id=task_id,
+                            cancel=cancel_ev,
+                            target=_worker,
+                            name="thumb-realign",
+                            thread_factory=threading.Thread,
+                        )
+                    except Exception:
+                        lease.release()
+                        with self._realign_jobs_lock:
+                            self._realign_jobs.pop(token, None)
+                        raise
+            except WorkAdmissionClosed as exc:
+                with self._realign_jobs_lock:
+                    self._realign_jobs.pop(token, None)
+                return {"ok": False, "started": False, "error": str(exc)}
             return {"ok": True, "started": True, "token": token}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -233,6 +335,9 @@ class ThumbnailMixin:
                           key=lambda c: (c.get("name") or "").lower())
         if not channels:
             return {"ok": False, "error": "No channels configured"}
+        task_id = f"thumbnail-refetch-all-{uuid.uuid4().hex}"
+        cancel = threading.Event()
+        lease = None
         def _run():
             log_stream = self._thumbnail_log_stream()
             try:
@@ -244,13 +349,15 @@ class ThumbnailMixin:
                     "simpleline_pink")
                 log_stream.flush()
                 for i, ch in enumerate(channels, 1):
+                    if cancel.is_set():
+                        return
                     nm = ch.get("name") or ch.get("folder") or "?"
                     try:
                         log_stream.emit_text(
                             f"  - [{i}/{len(channels)}] {nm}…",
                             "simpleline")
                         res = _md.sweep_missing_thumbnails(
-                            ch, stream=log_stream)
+                            ch, stream=log_stream, cancel_event=cancel)
                         total_fetched += int(res.get("fetched", 0) or 0)
                         total_missing += int(res.get("missing", 0) or 0)
                         total_checked += int(res.get("checked", 0) or 0)
@@ -275,7 +382,41 @@ class ThumbnailMixin:
             except Exception as _e:
                 log_stream.emit_error(
                     f"Bulk thumbnail refetch failed: {_e}")
-        threading.Thread(target=_run, daemon=True,
-                         name="thumb-refetch-all").start()
+            finally:
+                if lease is not None:
+                    lease.release()
+        try:
+            with admitted_operation(
+                self,
+                owner="thumbnail-maintenance",
+                label="Refetch all archive thumbnails",
+                task_id=task_id,
+                cancel=cancel,
+            ):
+                admission = try_global_archive_lease(
+                    owner="thumbnail-maintenance",
+                    label="Refetch all archive thumbnails",
+                    task_id=task_id,
+                    cancel=cancel,
+                )
+                if not admission.ok or admission.lease is None:
+                    return lease_busy_result(admission)
+                lease = admission.lease
+                try:
+                    start_managed_task(
+                        self,
+                        owner="thumbnail-maintenance",
+                        label="Refetch all archive thumbnails",
+                        task_id=task_id,
+                        cancel=cancel,
+                        target=_run,
+                        name="thumb-refetch-all",
+                        thread_factory=threading.Thread,
+                    )
+                except Exception:
+                    lease.release()
+                    raise
+        except WorkAdmissionClosed as exc:
+            return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "started": True,
                 "channels": len(channels)}

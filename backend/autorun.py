@@ -11,7 +11,6 @@ AUTORUN_OPTIONS ports YTArchiver.py:22210 verbatim.
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from collections.abc import Callable
@@ -19,9 +18,13 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from . import youtube_traffic
+from .activity_history import (
+    ACTIVITY_HISTORY_FILE,
+    ACTIVITY_HISTORY_MAX,
+    ActivityHistoryStore,
+)
 from .log import get_logger
 from .ytarchiver_config import (
-    APP_DATA_DIR,
     autorun_history_entries_for_ui,
     config_is_writable,
     config_transaction,
@@ -38,8 +41,8 @@ AUTORUN_OPTIONS = {
 }
 AUTORUN_LABELS = list(AUTORUN_OPTIONS.keys())
 
-AUTORUN_HISTORY_MAX = 10000  # UI activity log can display the full history.
-AUTORUN_HISTORY_FILE = APP_DATA_DIR / "autorun_history.jsonl"
+AUTORUN_HISTORY_MAX = ACTIVITY_HISTORY_MAX
+AUTORUN_HISTORY_FILE = ACTIVITY_HISTORY_FILE
 RATE_LIMIT_MIN_RETRY_SECONDS = 6 * 3600
 BUDGET_STARTUP_GRACE_SECONDS = 3 * 60
 BUDGET_BUSY_RETRY_SECONDS = 60
@@ -89,6 +92,10 @@ class AutorunScheduler:
         self._clock_anchor_24 = self._validated_clock_anchor(
             _initial_config.get("autorun_clock_time_24"), 1440)
         self._lock = threading.RLock()
+        # A preference change touches both live timer state and the config
+        # file. Serialize that two-part transaction so two quick UI changes
+        # cannot persist or roll back over one another.
+        self._settings_change_lock = threading.RLock()
         self._timer: threading.Timer | None = None
         self._next_fire_ts: float | None = None
         # True between _fire() kicking sync and notify_sync_done() firing.
@@ -110,6 +117,9 @@ class AutorunScheduler:
         self._budget_waiting_for_startup = False
         self._timer_waiting_for_startup = False
         self._startup_grace_until: float | None = None
+        # Permanent lifecycle gate. A timer callback already in flight when
+        # shutdown begins must not re-arm a successor timer afterward.
+        self._closed = False
 
     # ── interval management ─────────────────────────────────────────
 
@@ -130,11 +140,54 @@ class AutorunScheduler:
             return self._clock_anchor_24
         return 0
 
+    def _runtime_snapshot_locked(self) -> dict[str, Any]:
+        """Capture user-visible scheduler state before a settings change."""
+        return {
+            "interval_mins": self._interval_mins,
+            "clock_mode": self._clock_mode,
+            "clock_anchor_12": self._clock_anchor_12,
+            "clock_anchor_24": self._clock_anchor_24,
+            "next_fire_ts": self._next_fire_ts,
+            "waiting_for_sync_done": self._waiting_for_sync_done,
+            "budget_waiting_for_startup": self._budget_waiting_for_startup,
+            "timer_waiting_for_startup": self._timer_waiting_for_startup,
+            "startup_grace_until": self._startup_grace_until,
+            "budget_impossible": self._budget_impossible,
+            "budget_message": self._budget_message,
+        }
+
+    def _restore_runtime_snapshot_locked(self, state: dict[str, Any]) -> None:
+        """Undo an unsaved change, including its replacement timer."""
+        self._cancel_timer_locked()
+        self._interval_mins = int(state["interval_mins"])
+        self._clock_mode = bool(state["clock_mode"])
+        self._clock_anchor_12 = int(state["clock_anchor_12"])
+        self._clock_anchor_24 = int(state["clock_anchor_24"])
+        self._waiting_for_sync_done = bool(state["waiting_for_sync_done"])
+        self._budget_waiting_for_startup = bool(
+            state["budget_waiting_for_startup"])
+        self._timer_waiting_for_startup = bool(
+            state["timer_waiting_for_startup"])
+        saved_next = state.get("next_fire_ts")
+        if saved_next is not None and not self._waiting_for_sync_done:
+            self._schedule_next_locked(
+                target_ts=float(saved_next), persist_deadline=False)
+        else:
+            self._next_fire_ts = saved_next
+        # Scheduling computes budget fields; restore the exact prior UI state.
+        self._startup_grace_until = state.get("startup_grace_until")
+        self._budget_impossible = bool(state["budget_impossible"])
+        self._budget_message = str(state["budget_message"] or "")
+
     def set_interval_label(self, label: str) -> dict[str, Any]:
         mins = AUTORUN_OPTIONS.get(label, 0)
         return self.set_interval_mins(mins)
 
     def set_interval_mins(self, mins: int) -> dict[str, Any]:
+        with self._settings_change_lock:
+            return self._set_interval_mins_serialized(mins)
+
+    def _set_interval_mins_serialized(self, mins: int) -> dict[str, Any]:
         requested = int(mins or 0)
         adjusted_reason = ""
         if requested == -1:
@@ -145,6 +198,7 @@ class AutorunScheduler:
                     '"When budget allows" requires a finite YouTube traffic '
                     "budget, so auto-sync was turned Off.")
         with self._lock:
+            previous = self._runtime_snapshot_locked()
             self._interval_mins = requested
             self._cancel_timer_locked()
             self._waiting_for_sync_done = False
@@ -159,7 +213,7 @@ class AutorunScheduler:
                         "Waiting for startup checks and archive indexing "
                         "to finish.")
                 else:
-                    self._schedule_next_locked()
+                    self._schedule_next_locked(persist_deadline=False)
         # Persist to config (gated).
         # check save_config return so a write-gate failure
         # surfaces to the caller instead of silently keeping the old
@@ -182,6 +236,20 @@ class AutorunScheduler:
                 persisted = False
         else:
             persisted = False
+        if not persisted:
+            with self._lock:
+                self._restore_runtime_snapshot_locked(previous)
+            failure = {
+                "ok": False,
+                "mins": self._interval_mins,
+                "persisted": False,
+                "error": (
+                    adjusted_reason + " " if adjusted_reason else ""
+                ) + "Auto-sync could not be saved. Nothing changed.",
+            }
+            if adjusted_reason:
+                failure["adjusted"] = True
+            return failure
         result = {
             "ok": not adjusted_reason,
             "mins": self._interval_mins,
@@ -194,6 +262,11 @@ class AutorunScheduler:
 
     def restore_interval_mins(self, mins: int) -> dict[str, Any]:
         """Restore a saved interval without resetting its timer deadline."""
+        with self._settings_change_lock:
+            return self._restore_interval_mins_serialized(mins)
+
+    def _restore_interval_mins_serialized(self, mins: int) -> dict[str, Any]:
+        """Serialized implementation for restore_interval_mins."""
         requested = int(mins or 0)
         if requested <= 0 or self._clock_mode:
             return self.set_interval_mins(requested)
@@ -239,14 +312,19 @@ class AutorunScheduler:
     def set_mode(self, mode: str) -> dict[str, Any]:
         """Switch between 'timer' (countdown) and 'clock' (wall-clock
         aligned) firing, persist it, and reschedule the pending fire."""
+        with self._settings_change_lock:
+            return self._set_mode_serialized(mode)
+
+    def _set_mode_serialized(self, mode: str) -> dict[str, Any]:
         clock = (str(mode).lower() == "clock")
         with self._lock:
+            previous = self._runtime_snapshot_locked()
             self._clock_mode = clock
             self._timer_waiting_for_startup = False
             if self._interval_mins > 0:
                 self._cancel_timer_locked()
                 self._waiting_for_sync_done = False
-                self._schedule_next_locked()
+                self._schedule_next_locked(persist_deadline=False)
         persisted = True
         if config_is_writable():
             try:
@@ -264,16 +342,30 @@ class AutorunScheduler:
                 persisted = False
         else:
             persisted = False
+        if not persisted:
+            with self._lock:
+                self._restore_runtime_snapshot_locked(previous)
+            return {
+                "ok": False,
+                "mode": "clock" if self._clock_mode else "timer",
+                "persisted": False,
+                "error": "Auto-sync timing could not be saved. Nothing changed.",
+            }
         return {"ok": True, "mode": "clock" if clock else "timer",
-                "persisted": persisted}
+                "persisted": True}
 
     def set_clock_anchor(self, minutes: int) -> dict[str, Any]:
         """Set the wall-clock anchor for a 12h or 24h schedule."""
+        with self._settings_change_lock:
+            return self._set_clock_anchor_serialized(minutes)
+
+    def _set_clock_anchor_serialized(self, minutes: int) -> dict[str, Any]:
         try:
             anchor = int(minutes)
         except (TypeError, ValueError):
             return {"ok": False, "error": "Clock time must be minutes."}
         with self._lock:
+            previous = self._runtime_snapshot_locked()
             interval = self._interval_mins
             if interval not in AUTORUN_CLOCK_INTERVALS:
                 return {
@@ -295,7 +387,7 @@ class AutorunScheduler:
             if self._clock_mode:
                 self._cancel_timer_locked()
                 self._waiting_for_sync_done = False
-                self._schedule_next_locked()
+                self._schedule_next_locked(persist_deadline=False)
             next_fire_ts = self._next_fire_ts
         persisted = True
         if config_is_writable():
@@ -307,6 +399,17 @@ class AutorunScheduler:
                 persisted = False
         else:
             persisted = False
+        if not persisted:
+            with self._lock:
+                self._restore_runtime_snapshot_locked(previous)
+            return {
+                "ok": False,
+                "minutes": self._clock_anchor_for_interval(
+                    self._interval_mins),
+                "next_fire_ts": self._next_fire_ts,
+                "persisted": False,
+                "error": "Auto-sync time could not be saved. Nothing changed.",
+            }
         return {
             "ok": True,
             "minutes": anchor,
@@ -433,6 +536,9 @@ class AutorunScheduler:
         With `sec=None` and clock mode on, the next fire snaps to the next
         wall-clock boundary instead of `now + interval`. Explicit `sec`
         (the 60s busy-retry) always counts from now regardless of mode."""
+        if self._closed:
+            self._next_fire_ts = None
+            return
         if target_ts is not None:
             self._budget_impossible = False
             self._budget_message = ""
@@ -596,6 +702,8 @@ class AutorunScheduler:
         # convert it into the same post-startup grace used for an overdue
         # deadline restored from disk.
         with self._lock:
+            if self._closed:
+                return
             if self._interval_mins > 0 and not self._startup_ready:
                 self._cancel_timer_locked()
                 self._waiting_for_sync_done = False
@@ -718,6 +826,8 @@ class AutorunScheduler:
         resets from now rather than finishing its mid-sync countdown.
         """
         with self._lock:
+            if self._closed:
+                return
             if self._interval_mins == 0:
                 self._waiting_for_sync_done = False
                 return
@@ -746,6 +856,8 @@ class AutorunScheduler:
         normal clock alignment resumes through ``notify_sync_done``.
         """
         with self._lock:
+            if self._closed:
+                return 0
             if self._interval_mins == 0:
                 self._waiting_for_sync_done = False
                 return 0
@@ -762,19 +874,40 @@ class AutorunScheduler:
 
     def cancel(self):
         with self._lock:
+            self._closed = True
             self._cancel_timer_locked()
             self._waiting_for_sync_done = False
             self._budget_waiting_for_startup = False
             self._timer_waiting_for_startup = False
 
+    def is_alive(self) -> bool:
+        with self._lock:
+            timer = self._timer
+            return bool(timer is not None and timer.is_alive())
+
+    def join(self, timeout: float = 1.0) -> bool:
+        with self._lock:
+            timer = self._timer
+        if timer is not None and timer.is_alive():
+            timer.join(timeout=max(0.0, float(timeout)))
+        return timer is None or not timer.is_alive()
+
 
 # ── Activity-log history append ────────────────────────────────────────
 
-_HISTORY_LOCK = threading.Lock()
+_HISTORY_LOCK = threading.RLock()
+
+
+def _history_store(path=None) -> ActivityHistoryStore:
+    # Construct on demand so tests and portable hosts can redirect the legacy
+    # public ``AUTORUN_HISTORY_FILE`` constant without mutating a singleton.
+    return ActivityHistoryStore(
+        path or AUTORUN_HISTORY_FILE, max_entries=AUTORUN_HISTORY_MAX)
 
 
 def _decode_history_line(line: str) -> str | None:
     try:
+        import json
         data = json.loads(line)
     except Exception:
         return None
@@ -786,33 +919,17 @@ def _decode_history_line(line: str) -> str | None:
 
 
 def _append_history_line(path, entry: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    if not _history_store(path).append(entry):
+        raise OSError("activity history save failed")
 
 
 def _read_history_file(path=None,
                        limit: int = AUTORUN_HISTORY_MAX) -> list[str]:
-    try:
-        path = path or AUTORUN_HISTORY_FILE
-        if not path.is_file():
-            return []
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except Exception:
-        return []
-    entries: list[str] = []
-    for line in lines[-max(1, int(limit)):]:
-        entry = _decode_history_line(line)
-        if entry:
-            entries.append(entry)
-    return entries
+    entries = _history_store(path).entries()
+    return entries[-max(1, int(limit)):]
 
 
 def _seed_history_file_from_config_locked(path=None) -> None:
-    path = path or AUTORUN_HISTORY_FILE
-    if path.exists():
-        return
     try:
         old = load_config().get("autorun_history") or []
     except Exception:
@@ -820,21 +937,27 @@ def _seed_history_file_from_config_locked(path=None) -> None:
     entries = [e for e in old[-AUTORUN_HISTORY_MAX:] if isinstance(e, str)]
     if not entries:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for entry in entries:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    if not _history_store(path).migrate_legacy(entries):
+        raise OSError("legacy activity history migration failed")
 
 
 def history_entries_for_ui(cfg: dict[str, Any] | None = None):
-    entries = _read_history_file()
+    with _HISTORY_LOCK:
+        try:
+            legacy = (cfg if isinstance(cfg, dict) else load_config()).get(
+                "autorun_history") or []
+            if not _history_store().migrate_legacy(legacy):
+                _log.warning("legacy activity history migration did not commit")
+        except Exception as exc:
+            _log.warning("legacy activity history migration failed: %s", exc)
+        entries = _read_history_file()
     if entries:
         return autorun_history_entries_for_ui({"autorun_history": entries})
-    return autorun_history_entries_for_ui(cfg or {})
+    return []
 
 
 def append_history_entry(entry: str, kind: str = "Auto") -> bool:
-    """Append an autorun-history entry to config['autorun_history'].
+    """Append one entry to the stable-ID JSONL activity repository.
 
     IMPORTANT: matches YTArchiver.py:22565 exactly — newest entry at the
     END of the list, trim via `hist[-MAX:]` to keep the last N. Earlier
@@ -860,25 +983,37 @@ def append_history_entry(entry: str, kind: str = "Auto") -> bool:
 
 
 def clear_history() -> dict[str, Any]:
-    """Empty config['autorun_history'] and persist. Returns the count
+    """Empty the activity repository and retire the legacy config list.
     of entries that were removed. `_clear_autorun_history` semantics — the user's "Clear" button on
     the activity-log strip clears BOTH the visible log and the saved
     history, so a relaunch doesn't resurrect the entries.
     """
     if not config_is_writable():
-        return {"ok": False, "error": "write-gate off", "removed": 0}
-    try:
-        removed = len(_read_history_file())
+        return {
+            "ok": False,
+            "error": ("Settings are temporarily read-only. Restart "
+                      "YTArchiver and try again."),
+            "removed": 0,
+        }
+    with _HISTORY_LOCK:
         try:
-            AUTORUN_HISTORY_FILE.unlink(missing_ok=True)
+            def _retire_legacy() -> int:
+                with config_transaction() as cfg:
+                    legacy_removed = len(cfg.get("autorun_history") or [])
+                    cfg["autorun_history"] = []
+                return legacy_removed
+
+            removed = _history_store().clear(
+                retire_legacy=_retire_legacy)
+            if removed < 0:
+                return {
+                    "ok": False,
+                    "error": "history clear failed",
+                    "removed": 0,
+                }
+            return {"ok": True, "removed": removed}
         except Exception as e:
-            return {"ok": False, "error": str(e), "removed": removed}
-        with config_transaction() as cfg:
-            removed += len(cfg.get("autorun_history") or [])
-            cfg["autorun_history"] = []
-        return {"ok": True, "removed": removed}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "removed": 0}
+            return {"ok": False, "error": str(e), "removed": 0}
 
 
 def format_history_entry(kind: str, channel: str,

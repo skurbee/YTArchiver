@@ -11,12 +11,21 @@ from __future__ import annotations
 import os
 import re
 import threading
+import uuid
 from datetime import datetime
 
 from backend import sync as sync_backend
 from backend import youtube_traffic
 from backend.log import swallow
-from backend.process_runner import popen_ytdlp
+from backend.process_runner import (
+    popen_ytdlp,
+    supervise_streaming_process,
+)
+from backend.services.managed_work import start_managed_task
+from backend.sync.download_commit import (
+    commit_download,
+    finalize_collision_safe_bundle,
+)
 from backend.ytarchiver_config import load_config
 
 from ._shared import _log
@@ -94,6 +103,46 @@ def _clean_ytdlp_path(path: str) -> str:
     if len(path) >= 2 and path[0] == path[-1] and path[0] in ("'", '"'):
         path = path[1:-1]
     return path.strip()
+
+
+def _truncate_utf8_filename(value: str, max_bytes: int) -> str:
+    """Trim a literal filename portion without splitting a UTF-8 sequence."""
+    raw = str(value or "").encode("utf-8")[:max(0, int(max_bytes))]
+    return raw.decode("utf-8", "ignore").rstrip(" .")
+
+
+def build_manual_output_template_name(
+    *,
+    use_yt_title: bool,
+    custom_name: str,
+    add_date: bool,
+    download_date: str,
+    include_video_id: bool = True,
+) -> str:
+    """Return a collision-safe one-off download filename template.
+
+    When ``include_video_id`` is true, the ID is temporary for ordinary
+    downloads: post-download commit removes it when the traditional title-only
+    name is free. A real title collision keeps the suffix so two different
+    videos can never share media or sidecars. The byte budgets also avoid
+    yt-dlp's unsafe absolute-path ``--trim-filenames`` behavior.
+    """
+    title_budget = 159 if add_date else 170
+    if use_yt_title:
+        stem = f"%(title).{title_budget}B"
+    else:
+        safe = re.sub(
+            r'[<>:"/\\|?*\x00-\x1f]', "_", str(custom_name or "")
+        ).strip().rstrip(".")
+        safe = _truncate_utf8_filename(safe, title_budget)
+        # Custom text is literal output-template content. Escape percent so a
+        # name such as ``100% Complete`` cannot become template syntax.
+        stem = safe.replace("%", "%%")
+    if add_date:
+        stem += f" ({download_date})"
+    if include_video_id:
+        stem += " [%(id)s]"
+    return f"{stem}.%(ext)s"
 
 
 def _choose_existing_ytdlp_candidate(
@@ -212,9 +261,12 @@ def resolve_final_path(base: str, video_id: str, title: str,
     final_path = _choose_existing_ytdlp_candidate(candidate_paths, base)
     try:
         vid_candidates = []
-        if video_id:
+        if not final_path and video_id:
             for g in _glob.glob(os.path.join(base, "*")):
-                if video_id in os.path.basename(g):
+                if (video_id in os.path.basename(g)
+                        and os.path.isfile(g)
+                        and os.path.splitext(g)[1].lower()
+                        in _BINDABLE_MEDIA_EXTS):
                     vid_candidates.append(g)
         if vid_candidates:
             vid_candidates.sort(
@@ -234,6 +286,10 @@ def resolve_final_path(base: str, video_id: str, title: str,
                 title, strip_windows_illegal=True, strip_trailing_punct=False)
             title_candidates = []
             for g in _glob.glob(os.path.join(base, "*")):
+                if (not os.path.isfile(g)
+                        or os.path.splitext(g)[1].lower()
+                        not in _BINDABLE_MEDIA_EXTS):
+                    continue
                 stem = os.path.splitext(os.path.basename(g))[0]
                 # Match if the stem EQUALS the full title (possibly with a
                 # trailing " (MM.DD.YY)" date suffix stripped) once both
@@ -263,7 +319,7 @@ def resolve_final_path(base: str, video_id: str, title: str,
             sp = _bind_file_via_sidecar_id(base, video_id)
             if sp:
                 final_path = sp
-                _log.info(
+                _log.debug(
                     "single-video bind via sidecar-id: vid=%s -> %s",
                     video_id, sp)
         except Exception as sie:
@@ -282,7 +338,7 @@ def resolve_final_path(base: str, video_id: str, title: str,
                     and _recent_scan_bind_is_corroborated(
                         rp, video_id, title)):
                 final_path = rp
-                _log.info(
+                _log.debug(
                     "single-video bind via recent-scan: vid=%s -> %s",
                     video_id, rp)
             elif rp:
@@ -328,12 +384,48 @@ def classify_download_outcome(returncode, has_dltrack, killed,
 
 class ArchiveMixin:
 
+    def _ensure_archive_single_tracking(self) -> None:
+        if (hasattr(self, "_archive_single_lock")
+                and hasattr(self, "_archive_single_inflight")
+                and hasattr(self, "_archive_single_cancel_events")
+                and hasattr(self, "_archive_single_threads")):
+            return
+        with _archive_init_lock:
+            if not hasattr(self, "_archive_single_lock"):
+                self._archive_single_lock = threading.Lock()
+            if not hasattr(self, "_archive_single_inflight"):
+                self._archive_single_inflight = set()
+            if not hasattr(self, "_archive_single_cancel_events"):
+                self._archive_single_cancel_events = {}
+            if not hasattr(self, "_archive_single_threads"):
+                self._archive_single_threads = {}
+
     def archive_single_is_running(self) -> bool:
         try:
+            self._ensure_archive_single_tracking()
             with self._archive_single_lock:
                 return bool(self._archive_single_inflight)
         except Exception:
             return False
+
+    def archive_single_cancel(self, task_id="") -> dict:
+        """Request cancellation for one manual download, or all of them.
+
+        The worker's streaming supervisor observes these events even while
+        yt-dlp is completely silent. Process termination remains scoped to the
+        exact registered manual-download job.
+        """
+        self._ensure_archive_single_tracking()
+        wanted = str(task_id or "").strip()
+        with self._archive_single_lock:
+            if wanted:
+                event = self._archive_single_cancel_events.get(wanted)
+                events = [event] if event is not None else []
+            else:
+                events = list(self._archive_single_cancel_events.values())
+        for event in events:
+            event.set()
+        return {"ok": True, "cancelled": len(events)}
 
     # ─── Already-archived pre-check (Download-tab warning) ──────────────
 
@@ -373,18 +465,27 @@ class ArchiveMixin:
     def archive_single_video(self, url, options=None):
         """Download a single YouTube URL immediately (no channel walk).
 
-        Output layout mirrors YTArchiver.py:17313 build_video_cmd exactly so
-        single-video downloads are indistinguishable from OLD's:
+        Normal output layout mirrors YTArchiver.py:17313 build_video_cmd:
           - Target dir: `cfg['video_out_dir']` (NOT `output_dir`/channels),
-            no `%(uploader)s` subfolder, no `[id]` suffix.
+            no `%(uploader)s` subfolder.
           - Filename: `{title}.mp4` or `{title} (MM.DD.YY).mp4` when add_date.
           - Custom name sanitizer: `[<>:"/\\|?*\x00-\x1f]` → `_`.
           - `--mtime` when date_file is True so mtime = YT upload date.
+
+        YouTube downloads stage with ``[video-id]`` attached. The suffix is
+        removed after a verified commit when the classic destination is free;
+        only a real same-title collision keeps it. Other yt-dlp-supported sites
+        retain their established generic-ID path.
 
         Concurrency guard: a per-URL lock prevents the user from
         spawning parallel yt-dlp processes for the same URL by
         double-clicking. Different URLs are still allowed in parallel.
         """
+        admission = getattr(self, "_work_admission_error", None)
+        if callable(admission):
+            blocked = admission("a manual download")
+            if blocked is not None:
+                return blocked
         import re as _re
         url = (url or "").strip()
         if not url:
@@ -414,6 +515,7 @@ class ArchiveMixin:
             except Exception:
                 return u
         url = _canonicalize_yt_url(url)
+        _is_youtube_url = youtube_traffic.is_youtube_url(url)
         # Security: require an http(s) scheme before the URL reaches yt-dlp as
         # a positional arg. A pasted value beginning with '-' (e.g.
         # "--exec=calc.exe") has no scheme and would otherwise be parsed by
@@ -432,25 +534,36 @@ class ArchiveMixin:
         # over the same filename. Lazy init wrapped in a module-level
         # lock so two near-simultaneous first-time calls can't each
         # build a separate set+Lock and both think they "hold" the URL.
-        if not hasattr(self, "_archive_single_inflight"):
-            with _archive_init_lock:
-                if not hasattr(self, "_archive_single_inflight"):
-                    self._archive_single_lock = threading.Lock()
-                    self._archive_single_inflight = set()
+        self._ensure_archive_single_tracking()
+        task_id = f"manual-download-{uuid.uuid4().hex}"
+        cancel_event = threading.Event()
+        channel_lease = [None]
         with self._archive_single_lock:
             if url in self._archive_single_inflight:
                 return {"ok": False,
                         "error": "Already downloading this URL"}
             self._archive_single_inflight.add(url)
+            self._archive_single_cancel_events[task_id] = cancel_event
+
+        def _release_download_tracking() -> None:
+            try:
+                with self._archive_single_lock:
+                    self._archive_single_inflight.discard(url)
+                    self._archive_single_cancel_events.pop(task_id, None)
+                    self._archive_single_threads.pop(task_id, None)
+                lease = channel_lease[0]
+                if lease is not None:
+                    lease.release()
+                    channel_lease[0] = None
+            except Exception as exc:
+                swallow("manual download tracking cleanup", exc)
+
         if not sync_backend.find_yt_dlp():
             # audit DT-1: DON'T record URL in history on a failed
             # launch. History write is moved to the success path
             # in _run() below. A URL that fails validation shouldn't
             # pollute the autocomplete dropdown.
-            try:
-                self._archive_single_inflight.discard(url)
-            except Exception as e:
-                swallow("inflight discard on yt-dlp missing", e)
+            _release_download_tracking()
             return {"ok": False, "error": "yt-dlp not found"}
         cfg = load_config()
         opts = options if isinstance(options, dict) else {}
@@ -460,21 +573,15 @@ class ArchiveMixin:
         base = (opts.get("save_to") or cfg.get("video_out_dir")
                 or cfg.get("output_dir") or "").strip()
         if not base:
-            try:
-                self._archive_single_inflight.discard(url)
-            except Exception as e:
-                swallow("inflight discard on no output-dir", e)
-            return {"ok": False, "error": "No output_dir configured"}
+            _release_download_tracking()
+            return {"ok": False, "error": "No archive folder is configured."}
         # audit DT-3: verify target folder is writable before
         # launching yt-dlp. Creates the dir if it doesn't exist;
         # bails with a clear error if the dir cannot be written.
         try:
             _probe_output_folder_writable(base)
         except OSError as _fe:
-            try:
-                self._archive_single_inflight.discard(url)
-            except Exception as e:
-                swallow("inflight discard on folder not writable", e)
+            _release_download_tracking()
             return {"ok": False,
                     "error": f"Output folder not writable: {base} ({_fe})"}
         # audit DT-11 / DT-5: validate custom name if "use YT title"
@@ -487,13 +594,37 @@ class ArchiveMixin:
             _safe_cname = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_",
                                   _cname).strip().rstrip(".")
             if not _safe_cname:
-                try:
-                    self._archive_single_inflight.discard(url)
-                except Exception as e:
-                    swallow("inflight discard on bad custom name", e)
+                _release_download_tracking()
                 return {"ok": False,
                         "error": "Custom name is empty or all special chars. "
                                  "Enable 'Use YT title' or enter a real name."}
+        try:
+            from backend.services.channel_leases import (
+                LeaseOwner,
+                channel_aliases,
+                channel_leases,
+            )
+            lease_result = channel_leases.try_acquire(
+                channel_aliases(paths=[base]),
+                LeaseOwner(
+                    "manual-download", task_id,
+                    label="Manual video download", task_id=task_id,
+                    kind="download"),
+                cancel_event=cancel_event,
+            )
+            if not lease_result.ok or lease_result.lease is None:
+                _release_download_tracking()
+                return {
+                    "ok": False,
+                    "started": False,
+                    "busy": lease_result.status == "busy",
+                    "error": lease_result.explanation,
+                }
+            channel_lease[0] = lease_result.lease
+        except Exception as exc:
+            _release_download_tracking()
+            return {"ok": False, "started": False,
+                    "error": f"Could not reserve the output folder: {exc}"}
         import subprocess as _sp
         yt = sync_backend.find_yt_dlp()
         res = str(opts.get("resolution") or "1080").strip()
@@ -504,14 +635,15 @@ class ArchiveMixin:
         use_yt_title = opts.get("use_yt_title", True)
         add_date = bool(opts.get("add_date", False))
         custom_name = (opts.get("custom_name") or "").strip()
-        if not use_yt_title and custom_name:
-            safe = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", custom_name).strip().rstrip(".")
-            if add_date:
-                fname = f"{safe} ({dl_date}).%(ext)s"
-            else:
-                fname = f"{safe}.%(ext)s"
-        else:
-            fname = f"%(title)s ({dl_date}).%(ext)s" if add_date else "%(title)s.%(ext)s"
+        fname = build_manual_output_template_name(
+            use_yt_title=bool(use_yt_title),
+            custom_name=custom_name,
+            add_date=add_date,
+            download_date=dl_date,
+            # Non-YouTube extractor IDs have different shapes and are not
+            # part of YTArchiver's strict 11-character identity model.
+            include_video_id=_is_youtube_url,
+        )
         out_tpl = os.path.join(base, fname)
 
         # Option: date_file — apply YT upload date as file mtime (default: True)
@@ -537,7 +669,7 @@ class ArchiveMixin:
             _state = {"fname": url, "last_pct": -1,
                       "have_title": False, "final_size": 0,
                       "registered": False, "recorded": False,
-                      "final_path": ""}
+                      "final_path": "", "safety_error": ""}
             _killed = False
 
             def _emit_dwnld(suffix=""):
@@ -561,7 +693,7 @@ class ArchiveMixin:
                    "--retries", "3", "--socket-timeout", "15"]
             if date_file:
                 cmd.append("--mtime")
-            cmd += ["--trim-filenames", "200", "--format", fmt]
+            cmd += ["--format", fmt]
             if res != "audio":
                 cmd += ["--merge-output-format", "mp4", "--ppa", "Merger:-c copy"]
             # Optional metadata + thumbnail for one-off downloads. yt-dlp
@@ -596,19 +728,33 @@ class ArchiveMixin:
                 *sync_backend._find_cookie_source(),
                 url,
             ]
-            if youtube_traffic.is_youtube_url(url):
+            if _is_youtube_url:
                 permission = youtube_traffic.acquire(
-                    "single_video_download", stream=self._log_stream)
+                    "single_video_download", stream=self._log_stream,
+                    cancel_event=cancel_event)
                 if not permission.get("ok"):
-                    self._log_stream.emit_error(
-                        permission.get("error")
-                        or "YouTube traffic governor cancelled")
+                    message = ("Download cancelled" if
+                               permission.get("cancelled") else
+                               permission.get("error")
+                               or "YouTube traffic governor cancelled")
+                    self._log_stream.emit([
+                        ["[Dwnld] ", ["red", _marker_tag]],
+                        [f"{_state['fname']} - failed ({message}).\n",
+                         ["red", _marker_tag]],
+                    ])
+                    self._log_stream.emit_error(message)
+                    self._log_stream.flush()
+                    _release_download_tracking()
                     return
             try:
                 proc = popen_ytdlp(cmd, stdin=_sp.DEVNULL,
                                  stdout=_sp.PIPE, stderr=_sp.STDOUT,
                                  encoding="utf-8", errors="replace",
-                                 bufsize=1, startupinfo=sync_backend._startupinfo)
+                                 bufsize=1,
+                                 startupinfo=sync_backend._startupinfo,
+                                 owner="manual-download",
+                                 task_id=task_id,
+                                 role="download")
             except Exception as e:
                 # Update the in-place [Dwnld] row with a final failed
                 # state so it doesn't sit forever showing just the URL.
@@ -625,11 +771,7 @@ class ArchiveMixin:
                 self._log_stream.emit_error(f"Launch failed: {e}")
                 # Release the in-flight lock on launch failure so a
                 # retry isn't blocked forever.
-                try:
-                    with self._archive_single_lock:
-                        self._archive_single_inflight.discard(url)
-                except Exception as e:
-                    swallow("inflight discard on launch failure", e)
+                _release_download_tracking()
                 return
             # parse the DLTRACK line so single-video downloads
             # land in the videos index, the Recent tab, and the FTS
@@ -649,92 +791,84 @@ class ArchiveMixin:
             _extract_re = _re.compile(
                 r"^\[ExtractAudio\]\s+Destination:\s+(.+)$")
             _pct_re = _re.compile(r"^\[download\]\s+(\d+(?:\.\d+)?)%")
+
+            def _handle_output_line(line):
+                nonlocal _dltrack
+                _line = line.rstrip()
+                # Always feed dim stdout so verbose mode still sees yt-dlp's
+                # raw output. Simple mode filters dim out.
+                self._log_stream.emit_dim(" " + _line)
+                if _line.startswith("DLTRACK:::"):
+                    _dltrack = _line
+                # before_dl line — switch the row to "Title - Channel" as
+                # soon as yt-dlp resolves the video.
+                if _line.startswith("DLPRE:::"):
+                    _pp = _line.split(":::")
+                    _t = _pp[1].strip() if len(_pp) > 1 else ""
+                    _u = _pp[2].strip() if len(_pp) > 2 else ""
+                    if _t and not _state["have_title"]:
+                        _state["fname"] = f"{_t} - {_u}" if _u else _t
+                        _state["have_title"] = True
+                        _emit_dwnld(
+                            f" - {_state['last_pct']}%"
+                            if _state["last_pct"] >= 0 else "")
+                    return
+                for _rx in (_merge_re, _done_re, _extract_re):
+                    _m_path = _rx.match(_line)
+                    if _m_path:
+                        _candidate_paths.append(_m_path.group(1).strip())
+                        break
+                # Capture filename from yt-dlp's Destination line — only as a
+                # fallback when DLPRE never gave us a title.
+                _m_dest = _dest_re.match(_line)
+                if _m_dest:
+                    _dest_path = _m_dest.group(1).strip()
+                    _candidate_paths.append(_dest_path)
+                    if not _state["have_title"]:
+                        _state["fname"] = os.path.basename(_dest_path)
+                        _emit_dwnld()
+                else:
+                    # Parse progress percentage and update inplace line at 5%
+                    # boundaries (mirrors compress.py).
+                    _m_pct = _pct_re.match(_line)
+                    if _m_pct:
+                        _pct = int(float(_m_pct.group(1)))
+                        if _pct != _state["last_pct"] and (
+                                _pct % 5 == 0 or _state["last_pct"] < 0):
+                            _state["last_pct"] = _pct
+                            _emit_dwnld(f" - {_pct}%")
+                # Capture known-failure signatures for the post-run toast.
+                _ll = _line.lower()
+                if "error" in _ll:
+                    _raw_errors.append(_line)
+                    if "members-only" in _ll or "join this channel" in _ll:
+                        _stderr_errors.append("members-only content")
+                    elif "private video" in _ll:
+                        _stderr_errors.append("private video")
+                    elif ("video unavailable" in _ll
+                          or "this video is unavailable" in _ll):
+                        _stderr_errors.append(
+                            "video unavailable (deleted or region-locked)")
+                    elif ("cookies are missing" in _ll
+                          or "sign in to confirm" in _ll):
+                        _stderr_errors.append(
+                            "YouTube wants a sign-in (sign into YouTube in "
+                            "Firefox; its cookies are missing or expired)")
+
             try:
-                for line in proc.stdout:
-                    _line = line.rstrip()
-                    # Always feed dim stdout so verbose mode still sees
-                    # yt-dlp's raw output. Simple mode filters dim out.
-                    self._log_stream.emit_dim(" " + _line)
-                    if _line.startswith("DLTRACK:::"):
-                        _dltrack = _line
-                    # before_dl line — switch the row to "Title - Channel"
-                    # as soon as yt-dlp resolves the video, before the
-                    # download bytes start. Fires once per format (video +
-                    # audio for a merge) but the assignment is idempotent.
-                    if _line.startswith("DLPRE:::"):
-                        _pp = _line.split(":::")
-                        _t = _pp[1].strip() if len(_pp) > 1 else ""
-                        _u = _pp[2].strip() if len(_pp) > 2 else ""
-                        if _t and not _state["have_title"]:
-                            _state["fname"] = f"{_t} - {_u}" if _u else _t
-                            _state["have_title"] = True
-                            _emit_dwnld(
-                                f" - {_state['last_pct']}%"
-                                if _state["last_pct"] >= 0 else "")
-                        continue
-                    for _rx in (_merge_re, _done_re, _extract_re):
-                        _m_path = _rx.match(_line)
-                        if _m_path:
-                            _candidate_paths.append(_m_path.group(1).strip())
-                            break
-                    # Capture filename from yt-dlp's Destination line — only
-                    # as a fallback when DLPRE never gave us a title.
-                    _m_dest = _dest_re.match(_line)
-                    if _m_dest:
-                        _dest_path = _m_dest.group(1).strip()
-                        _candidate_paths.append(_dest_path)
-                        if not _state["have_title"]:
-                            _state["fname"] = os.path.basename(_dest_path)
-                            _emit_dwnld()
-                    else:
-                        # Parse progress percentage and update inplace
-                        # line at 5% boundaries (mirrors compress.py).
-                        _m_pct = _pct_re.match(_line)
-                        if _m_pct:
-                            _pct = int(float(_m_pct.group(1)))
-                            if _pct != _state["last_pct"] and (
-                                    _pct % 5 == 0 or _state["last_pct"] < 0):
-                                _state["last_pct"] = _pct
-                                _emit_dwnld(f" - {_pct}%")
-                    # capture known-failure yt-dlp error
-                    # signatures so the post-run branch can surface a
-                    # toast instead of leaving the user staring at dim
-                    # stdout with no actionable info.
-                    _ll = _line.lower()
-                    if "error" in _ll:
-                        _raw_errors.append(_line)
-                        if "members-only" in _ll or "join this channel" in _ll:
-                            _stderr_errors.append("members-only content")
-                        elif "private video" in _ll:
-                            _stderr_errors.append("private video")
-                        elif "video unavailable" in _ll or "this video is unavailable" in _ll:
-                            _stderr_errors.append("video unavailable (deleted or region-locked)")
-                        elif "cookies are missing" in _ll or "sign in to confirm" in _ll:
-                            _stderr_errors.append("YouTube wants a sign-in (sign into YouTube in Firefox; its cookies are missing or expired)")
-                # Wait with a generous watchdog timeout (15 minutes).
-                # Without this, a wedged yt-dlp (network stall, post-
-                # processor hang, sign-in prompt) keeps the in-flight
-                # URL stuck in _archive_single_inflight forever —
-                # "Already downloading" until app restart.
-                try:
-                    proc.wait(timeout=900)
-                except _sp.TimeoutExpired:
-                    _killed = True
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=5)
-                    except Exception as e:
-                        swallow("watchdog terminate", e)
-                    try:
-                        if proc.poll() is None:
-                            proc.kill()
-                            proc.wait(timeout=2)
-                    except Exception as e:
-                        swallow("watchdog kill", e)
-                    # Also update the in-place [Dwnld] row with the
-                    # failed state so the user sees it resolved
-                    # instead of stuck at "downloading..." forever
-                    # (audit: archive_mixin H17).
+                stream_result = supervise_streaming_process(
+                    proc,
+                    on_stdout_line=_handle_output_line,
+                    cancel_event=cancel_event,
+                    timeout=900,
+                    owner="manual-download",
+                    task_id=task_id,
+                    role="download",
+                )
+                _returncode = stream_result.returncode
+                _killed = bool(
+                    stream_result.timed_out or stream_result.cancelled)
+                if stream_result.timed_out:
                     try:
                         self._log_stream.emit([
                             ["[Dwnld] ", ["red", _marker_tag]],
@@ -745,18 +879,24 @@ class ArchiveMixin:
                         pass
                     self._log_stream.emit_error(
                         "[Dwnld] Watchdog: yt-dlp hung; killed after 15 min.")
+                elif stream_result.cancelled:
+                    self._log_stream.emit([
+                        ["[Dwnld] ", ["red", _marker_tag]],
+                        [f"{_state['fname']} - cancelled.\n",
+                         ["red", _marker_tag]],
+                    ])
                 # audit DT-1: only write to URL history now that the
                 # download actually ran. Previously written on submit,
                 # which polluted history with any URL the user
                 # clicked even if it failed.
-                if proc.returncode == 0:
+                if _returncode == 0 and not _killed:
                     try:
                         self._push_url_history(url)
                     except Exception as e:
                         swallow("url-history write", e)
                 # Post-download bookkeeping — emulate the channel-sync
                 # path's register_video + _record_recent_download hooks.
-                if _dltrack:
+                if _dltrack and not _killed:
                     try:
                         # audit DT-8: guard against yt-dlp output format
                         # changes / missing fields. parse_dltrack returns
@@ -799,7 +939,7 @@ class ArchiveMixin:
                                     final_path)
                                 if _rid:
                                     _vid = _rid
-                                    _log.info(
+                                    _log.debug(
                                         "single-video id recovered from "
                                         "sidecar: %s -> %s", final_path, _rid)
                             except Exception as _rie:
@@ -820,6 +960,26 @@ class ArchiveMixin:
                                     f"re-download to capture it")
                             except Exception as _be:
                                 _log.debug("single-video orphan warn failed: %s", _be)
+                        _bundle_ready = True
+                        _filename_id_is_provenance = True
+                        if (_is_youtube_url and final_path
+                                and os.path.isfile(final_path) and _vid):
+                            _promotion = finalize_collision_safe_bundle(
+                                final_path, _vid)
+                            final_path = _promotion.final_path or final_path
+                            if _promotion.ok:
+                                _filename_id_is_provenance = (
+                                    not _promotion.normalized)
+                            else:
+                                _bundle_ready = False
+                                _state["safety_error"] = _promotion.error
+                                self._log_stream.emit([[
+                                    "[Dwnld] ", ["dlwarn", _marker_tag]], [
+                                    f"{_state['fname']} — saved, but its files "
+                                    "could not be safely matched to this "
+                                    f"video ({_promotion.error}).\n",
+                                    ["dlwarn", _marker_tag, "error_detail"],
+                                ]])
                         if final_path and os.path.isfile(final_path):
                             _state["final_path"] = final_path
                             try:
@@ -827,27 +987,59 @@ class ArchiveMixin:
                             except OSError:
                                 pass
                             _channel_name = _uploader or "Single Videos"
-                            try:
-                                from backend import index as _idx
-                                _state["registered"] = bool(_idx.register_video(
-                                    final_path, _channel_name, _title,
-                                    tx_status="no_captions",
+                            if _bundle_ready and _is_youtube_url:
+                                _download_commit = commit_download(
+                                    final_path,
+                                    _channel_name,
+                                    _title,
                                     video_id=_vid,
-                                    duration_secs=_duration_secs,
-                                    upload_date=_upload_date))
-                            except Exception as _re_err:
-                                self._log_stream.emit_dim(
-                                    f" (index register failed: {_re_err})")
-                            try:
-                                _state["recorded"] = bool(
-                                    sync_backend._record_recent_download(
-                                        final_path, _channel_name, _title, _vid,
-                                        upload_date=_upload_date,
-                                        size_bytes=_state.get("final_size") or None,
-                                        duration_secs=_duration_secs))
-                            except Exception as _re_err:
-                                self._log_stream.emit_dim(
-                                    f" (recent downloads write failed: {_re_err})")
+                                    auto_transcribe=False,
+                                    duration=_duration_secs,
+                                    upload_date=_upload_date,
+                                    filename_id_is_provenance=(
+                                        _filename_id_is_provenance),
+                                )
+                                _state["registered"] = _download_commit.ok
+                                if not _download_commit.ok:
+                                    self._log_stream.emit_dim(
+                                        " (index register failed: "
+                                        f"{_download_commit.error})")
+                            elif _bundle_ready:
+                                # The Download tab intentionally supports
+                                # non-YouTube sites too. Their extractor IDs do
+                                # not use YouTube's 11-character identity
+                                # contract, so retain the established generic
+                                # index path for those URLs.
+                                try:
+                                    from backend import index as _idx
+                                    _state["registered"] = bool(
+                                        _idx.register_video(
+                                            final_path,
+                                            _channel_name,
+                                            _title,
+                                            tx_status="no_captions",
+                                            video_id=_vid,
+                                            duration_secs=_duration_secs,
+                                            upload_date=_upload_date,
+                                        ))
+                                except Exception as _re_err:
+                                    self._log_stream.emit_dim(
+                                        " (index register failed: "
+                                        f"{_re_err})")
+                            if _state["registered"]:
+                                try:
+                                    _state["recorded"] = bool(
+                                        sync_backend._record_recent_download(
+                                            final_path, _channel_name, _title,
+                                            _vid, upload_date=_upload_date,
+                                            size_bytes=(
+                                                _state.get("final_size")
+                                                or None),
+                                            duration_secs=_duration_secs))
+                                except Exception as _re_err:
+                                    self._log_stream.emit_dim(
+                                        " (recent downloads write failed: "
+                                        f"{_re_err})")
                             # Hide the freshly-written metadata/thumbnail
                             # sidecars so the loose-download folder still
                             # shows only the video (+ any Transcript.txt).
@@ -863,7 +1055,7 @@ class ArchiveMixin:
                             # Drop from deferred livestream journal if
                             # this was a previously-deferred premiere
                             # that's now finished (matches bug C-3).
-                            if _vid:
+                            if _vid and _state["registered"]:
                                 try:
                                     from backend import livestreams as _ls
                                     _ls.drop(_vid)
@@ -886,7 +1078,7 @@ class ArchiveMixin:
                 _registered = bool(_state.get("registered"))
                 _recorded = bool(_state.get("recorded"))
                 _outcome, _reason = classify_download_outcome(
-                    proc.returncode, bool(_dltrack), _killed,
+                    _returncode, bool(_dltrack), _killed,
                     _file_exists, _registered, _stderr_errors)
                 if _outcome == "killed":
                     pass
@@ -908,17 +1100,29 @@ class ArchiveMixin:
                     # file is on disk but won't appear in Browse/Watch until
                     # a Rescan picks it up. Make that visible — don't claim
                     # a clean success.
+                    _safety_error = str(_state.get("safety_error") or "")
+                    if _safety_error:
+                        _unindexed_message = (
+                            f"{_state['fname']} — saved but not indexed; its "
+                            "files could not be safely matched to this video. "
+                            "Try the download again.\n")
+                        _toast_message = (
+                            "Saved but not indexed — file identity did not "
+                            "match")
+                    else:
+                        _unindexed_message = (
+                            f"{_state['fname']} — downloaded but not indexed; "
+                            "run Rescan to add it.\n")
+                        _toast_message = (
+                            "Downloaded but not indexed — run Rescan")
                     self._log_stream.emit([
                         ["[Dwnld] ", ["dlwarn", _marker_tag]],
-                        [f"{_state['fname']} — downloaded but not "
-                         "indexed; run Rescan to add it.\n",
-                         ["dlwarn", _marker_tag]],
+                        [_unindexed_message, ["dlwarn", _marker_tag]],
                     ])
                     try:
                         if self._window is not None:
                             self.services.event_bus.show_toast(
-                                "Downloaded but not indexed — run Rescan",
-                                "warn")
+                                _toast_message, "warn")
                     except Exception as e:
                         swallow("downloaded-not-indexed toast", e)
                 else:  # "failed" — _reason already classified above
@@ -960,11 +1164,29 @@ class ArchiveMixin:
             finally:
                 # Always release the URL guard, even on exception, so
                 # the user can retry without restarting the app.
-                try:
-                    with self._archive_single_lock:
-                        self._archive_single_inflight.discard(url)
-                except Exception as e:
-                    swallow("inflight discard in finally", e)
+                _release_download_tracking()
 
-        threading.Thread(target=_run, daemon=True).start()
-        return {"ok": True, "started": True}
+        try:
+            thread = start_managed_task(
+                self,
+                owner="manual-download",
+                label="Manual video download",
+                target=_run,
+                task_id=task_id,
+                cancel=cancel_event,
+                name=f"manual-download-{task_id[-8:]}",
+                # Resolve at call time so narrow tests that replace the
+                # module's Thread factory still exercise the worker inline.
+                thread_factory=threading.Thread,
+            )
+            # start_managed_task registers with the lifecycle supervisor
+            # before starting.  Keep the legacy per-feature snapshot only
+            # while this exact task is still active; an inline/very fast
+            # worker may already have removed its tracking in finally.
+            with self._archive_single_lock:
+                if task_id in self._archive_single_cancel_events:
+                    self._archive_single_threads[task_id] = thread
+        except Exception as exc:
+            _release_download_tracking()
+            return {"ok": False, "started": False, "error": str(exc)}
+        return {"ok": True, "started": True, "task_id": task_id}

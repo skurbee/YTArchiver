@@ -175,22 +175,17 @@ def extract_video_id(
          (Used by index.register_video; the captions probe never has
          time to wait on json IO, hence the conn path for that caller.)
 
-    `reject_alpha_only` rejects matches that are entirely alphabetic
-    (no digit / `_` / `-`). Some archives have filename suffixes like
-    `[a-user-channel]` — 11 letters, valid pattern, but not a real
-    YouTube id. Real ids are random picks so they essentially always
-    include a digit or special char.
+    All-letter eleven-character IDs are valid. When ``reject_alpha_only`` is
+    true, only an uncorroborated filename-bracket candidate is rejected as
+    ambiguous; authoritative hints, exact DB rows, and info sidecars still
+    accept all-letter IDs.
 
     Returns "" if no id can be resolved. Never raises.
     """
     import os
 
     def _ok(cand: str) -> bool:
-        if not cand or not _ID_RE_11.fullmatch(cand):
-            return False
-        if reject_alpha_only and cand.isalpha():
-            return False
-        return True
+        return bool(cand and _ID_RE_11.fullmatch(cand))
 
     def _shape_ok(cand: str) -> bool:
         return bool(cand and _ID_RE_11.fullmatch(cand))
@@ -198,13 +193,7 @@ def extract_video_id(
     if hint:
         h = hint.strip()
         # An explicit hint is AUTHORITATIVE (yt-dlp's DLTRACK %(id)s, or a
-        # caller's known id) — validate by SHAPE only, never by the
-        # `reject_alpha_only` heuristic. That heuristic exists to stop an
-        # 11-letter *filename* bracket (a channel handle like `[SomeName]`)
-        # from being mistaken for an id; it must NEVER reject a real
-        # YouTube id handed to us directly, and real ids CAN be all
-        # letters. Applying it to the hint silently dropped authoritative
-        # ids → NULL video_id (a real contributor to the missing-id bug).
+        # caller's known id) — validate by shape. Real IDs can be all letters.
         if h and _ID_RE_11.fullmatch(h):
             return h
 
@@ -213,11 +202,12 @@ def extract_video_id(
     except Exception:
         name = path or ""
 
+    filename_candidate = ""
     if name:
         stem = os.path.splitext(name)[0]
         m = _ID_IN_FILENAME.search(stem)
         if m and _ok(m.group(1)):
-            return m.group(1)
+            filename_candidate = m.group(1)
 
     if conn is not None and path:
         try:
@@ -264,5 +254,13 @@ def extract_video_id(
                     return raw
         except Exception:
             pass
+
+    # A trailing bracket remains valid evidence, including when every
+    # character is a letter.  It is deliberately the final fallback, though:
+    # old user-created labels can have the same shape, while an exact database
+    # row or yt-dlp info sidecar is authoritative for this physical file.
+    if (filename_candidate
+            and not (reject_alpha_only and filename_candidate.isalpha())):
+        return filename_candidate
 
     return ""

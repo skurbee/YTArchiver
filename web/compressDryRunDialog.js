@@ -128,14 +128,27 @@
       // "nothing happened" when re-opened (audit:
       // compressDryRunDialog H242).
       let _computeInFlight = false;
+      let _computeGeneration = 0;
+      const _setComputing = (active) => {
+        _computeInFlight = active;
+        if (recalcBtn) recalcBtn.disabled = active;
+        if (closeBtn) closeBtn.disabled = active;
+        if (resSel) {
+          resSel.disabled = active;
+          resSel._ytddRepaint?.();
+        }
+        btn.disabled = active;
+      };
       const _open = async () => {
+        if (_computeInFlight) return;
+        const generation = ++_computeGeneration;
         bd.hidden = false;
         body.innerHTML = `<div class="browse-empty askq-empty-padded">Computing…</div>`;
         if (summary) summary.textContent = "";
-        _computeInFlight = true;
+        _setComputing(true);
         try {
           if (!nativeBridgeUp()) {
-            _render({ ok: false, error: "Native mode required." });
+            _render({ ok: false, error: "YTArchiver isn't ready yet. Try again in a moment." });
             return;
           }
           const res = await _withTimeout(
@@ -143,16 +156,21 @@
             5 * 60 * 1000,
             "Timed out computing projections."
           );
+          if (generation !== _computeGeneration) return;
           _render(res);
         } catch (e) {
+          if (generation !== _computeGeneration) return;
           _render({ ok: false, error: String(e) });
         } finally {
-          _computeInFlight = false;
+          if (generation === _computeGeneration) _setComputing(false);
         }
       };
       btn.addEventListener("click", _open);
       recalcBtn?.addEventListener("click", _open);
-      const _close = () => { bd.hidden = true; };
+      const _close = () => {
+        if (_computeInFlight) return;
+        bd.hidden = true;
+      };
       closeBtn?.addEventListener("click", _close);
       bd.addEventListener("click", (e) => {
         if (e.target === bd && !_computeInFlight) _close();

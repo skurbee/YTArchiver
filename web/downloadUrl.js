@@ -20,6 +20,26 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
+  // One result contract shared by typed and dropped single-video URLs.
+  // A resolved bridge promise is not necessarily success: backend validation
+  // failures deliberately resolve as {ok:false, error:"..."}.
+  async function queueSingleVideo(url, options) {
+    if (!nativeBridgeUp()) {
+      return { ok: false, error: "YTArchiver isn't ready yet. Try again in a moment." };
+    }
+    try {
+      const result = await bridgeCall("archive_single_video", url, options || {});
+      if (result?.ok) return result;
+      return {
+        ok: false,
+        error: result?.error || "The download could not be queued.",
+      };
+    } catch (e) {
+      return { ok: false, error: e?.message || String(e) };
+    }
+  }
+  window._queueSingleVideo = queueSingleVideo;
+
   // ─── URL field + Download button ────────────────────────────────────
   //
   // Behavior matches YTArchiver.py:19706-19708 + _validate_download_btn:
@@ -30,10 +50,70 @@
   //
   // The old "Paste & archive" button is gone — pasting a URL just shows the
   // Download button, which is more discoverable and matches the original.
-  // Anchor on the youtube domain proper (with optional subdomain or
-  // music.) so "notyoutube.com" can't match. Add `/clip/` for shorts-
-  // clip URLs (audit: downloadUrl.js H240).
-  const _YT_RE = /(?:^|[./@])(?:music\.|m\.|www\.)?youtube\.com\/(?:watch\?v=|shorts\/|embed\/|live\/|clip\/)|(?:^|[./@])youtu\.be\/[\w-]{6,}/i;
+  // Parse the URL before inspecting its path. A regex over the full string
+  // can mistake a foreign URL path or username (for example,
+  // evil.example/youtube.com/... or youtube.com@evil.example) for the host.
+  // YouTube uses several first-party subdomains, so accept youtube.com and
+  // its subdomains, plus the youtu.be short-link host.
+  function parseYouTubeUrl(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+    let candidate = raw;
+    if (candidate.startsWith("//")) candidate = `https:${candidate}`;
+    else if (!/^[a-z][a-z\d+.-]*:/i.test(candidate)) {
+      candidate = `https://${candidate}`;
+    }
+    let parsed;
+    try { parsed = new URL(candidate); } catch { return null; }
+    if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+    // User-info is unnecessary for YouTube links and makes deceptive URLs
+    // unnecessarily hard to read, even when the final hostname is YouTube.
+    if (parsed.username || parsed.password) return null;
+    if (parsed.port
+        && !((parsed.protocol === "https:" && parsed.port === "443")
+             || (parsed.protocol === "http:" && parsed.port === "80"))) {
+      return null;
+    }
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+    if (host !== "youtu.be"
+        && host !== "youtube.com"
+        && !host.endsWith(".youtube.com")) {
+      return null;
+    }
+    return parsed;
+  }
+
+  function urlLooksLikeVideo(value) {
+    const parsed = parseYouTubeUrl(value);
+    if (!parsed) return false;
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+    const path = parsed.pathname;
+    if (host === "youtu.be") {
+      return /^\/[A-Za-z0-9_-]{6,}\/?$/.test(path);
+    }
+    if (/^\/watch\/?$/i.test(path)) {
+      return /^[A-Za-z0-9_-]{6,}$/.test(parsed.searchParams.get("v") || "");
+    }
+    return /^\/(?:shorts|embed|live|clip)\/[A-Za-z0-9_-]{6,}(?:\/|$)/i
+      .test(path);
+  }
+
+  function urlLooksLikeChannel(value) {
+    const parsed = parseYouTubeUrl(value);
+    if (!parsed) return false;
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+    if (host === "youtu.be") return false;
+    if (/^\/(?:@[^/]+|c\/[^/]+|channel\/[^/]+|user\/[^/]+)(?:\/|$)/i
+        .test(parsed.pathname)) {
+      return true;
+    }
+    return /^\/playlist\/?$/i.test(parsed.pathname)
+      && !!parsed.searchParams.get("list");
+  }
+
+  window._parseYouTubeUrl = parseYouTubeUrl;
+  window._urlLooksLikeYouTube = (value) => !!parseYouTubeUrl(value);
+  window._urlLooksLikeVideo = urlLooksLikeVideo;
 
   function initUrlField() {
     const input = document.getElementById("url-input");
@@ -43,29 +123,14 @@
     const voPanel = document.getElementById("video-opts-panel");
     const nudgePanel = document.getElementById("channel-nudge-panel");
     if (!input || !btn) return;
-    // populate the url-history datalist so the <input
-    // list=".."> dropdown shows recent URLs. Backend persists the list
-    // via api.url_history(); frontend just populates the <option>s.
-    (async () => {
+    // Hydrate bridge-backed defaults both now and when pywebview becomes
+    // ready. The Download tab is initialized before bridge injection on a
+    // normal launch, so a one-shot early return left the defaults blank.
+    let _hydrateInFlight = false;
+    const hydrateBridgePreferences = async () => {
+      if (_hydrateInFlight || !nativeBridgeUp()) return;
+      _hydrateInFlight = true;
       try {
-        if (!nativeBridgeUp()) return;
-        const hist = await bridgeCall("url_history");
-        const dl = document.getElementById("url-history-list");
-        if (!dl || !Array.isArray(hist)) return;
-        dl.innerHTML = "";
-        for (const u of hist) {
-          const o = document.createElement("option");
-          o.value = String(u);
-          dl.appendChild(o);
-        }
-      } catch { /* non-fatal */ }
-    })();
-
-    // Pre-populate the Save-to placeholder with the actual default
-    // folder so users don't have to remember what they set it to.
-    (async () => {
-      try {
-        if (!nativeBridgeUp()) return;
         const s = await bridgeCall("settings_load");
         const def = (s?.video_out_dir || s?.output_dir || "").trim();
         const saveInput = document.getElementById("vo-save-to");
@@ -82,17 +147,16 @@
         if (_selRes && !_savedRes && _defRes &&
             [..._selRes.options].some(o => o.value === _defRes)) {
           _selRes.value = _defRes;
+          _selRes._ytddRepaint?.();
         }
       } catch { /* non-fatal */ }
-    })();
-
-    const urlLooksLikeVideo = (s) => _YT_RE.test((s || "").trim());
-    window._urlLooksLikeVideo = urlLooksLikeVideo;
-    const urlLooksLikeChannel = (s) => {
-      const t = (s || "").trim();
-      if (!t) return false;
-      return /youtube\.com\/@|youtube\.com\/c\/|youtube\.com\/channel\/|youtube\.com\/user\/|youtube\.com\/playlist/i.test(t);
+      finally { _hydrateInFlight = false; }
     };
+    hydrateBridgePreferences();
+    window.YT?.bridge?.ready?.then(hydrateBridgePreferences).catch(() => {});
+    window.addEventListener(
+      "pywebviewready", hydrateBridgePreferences, { once: true });
+
     // Show persistent error below URL field when input doesn't look like a
     // recognized YouTube URL. Matches YTArchiver.py:17060 url_error_var.
     const setErr = (msg) => {
@@ -207,6 +271,7 @@
     // downloadDragDrop.js C35).
     window._readVideoOptions = readVideoOptions;
 
+    let submitInFlight = false;
     const submit = async () => {
       const url = (input.value || "").trim();
       if (!urlLooksLikeVideo(url)) {
@@ -214,32 +279,50 @@
         return;
       }
       if (!nativeBridgeUp()) {
-        window._showToast?.("Native mode required.", "warn");
+        window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
         return;
       }
-      // Already-archived warning. Checked against the live index by video id
-      // (not a separate list), so it reflects what's actually archived now.
-      // Any failure falls through and allows the download. User can override.
+      if (submitInFlight) return;
+      submitInFlight = true;
+      btn.disabled = true;
       try {
-        if (askConfirm) {
-          const chk = await bridgeCall("single_video_archived", url);
-          if (chk?.ok && chk.archived) {
-            const what = chk.title ? `"${chk.title}"` : "This video";
-            const where = chk.channel ? ` in "${chk.channel}"` : "";
-            const go = await askConfirm(
-              "Already archived",
-              `${what} is already archived${where}.\n\n` +
-              `Download it again anyway?`,
-              { confirm: "Download anyway" });
-            if (!go) return;
+        // Already-archived warning. Checked against the live index by video id
+        // (not a separate list), so it reflects what's actually archived now.
+        // Any failure falls through and allows the download. User can override.
+        try {
+          if (askConfirm) {
+            const chk = await bridgeCall("single_video_archived", url);
+            if (chk?.ok && chk.archived) {
+              const what = chk.title ? `"${chk.title}"` : "This video";
+              const where = chk.channel ? ` in "${chk.channel}"` : "";
+              const go = await askConfirm(
+                "Already archived",
+                `${what} is already archived${where}.\n\n` +
+                `Download it again anyway?`,
+                { confirm: "Download anyway" });
+              if (!go) return;
+            }
           }
+        } catch { /* non-fatal — allow the download */ }
+
+        const result = await queueSingleVideo(url, readVideoOptions());
+        if (!result.ok) {
+          const msg = result.error || "The download could not be queued.";
+          // Keep the URL available for correction/retry.  Do not overwrite an
+          // even newer URL the user typed while this bridge call was pending.
+          if ((input.value || "").trim() === url) setErr(msg);
+          window._showToast?.(msg, "error");
+          return;
         }
-      } catch { /* non-fatal — allow the download */ }
-      const opts = readVideoOptions();
-      await bridgeCall("archive_single_video", url, opts);
-      window._showToast?.("Queued: " + url.slice(0, 60), "ok");
-      input.value = "";
-      updateBtnVisibility();
+        window._showToast?.("Queued: " + url.slice(0, 60), "ok");
+        if ((input.value || "").trim() === url) {
+          input.value = "";
+          updateBtnVisibility();
+        }
+      } finally {
+        submitInFlight = false;
+        btn.disabled = false;
+      }
     };
 
     input.addEventListener("input", updateBtnVisibility);
@@ -272,35 +355,24 @@
     // Save-to folder Browse button → pywebview native folder picker
     document.getElementById("vo-save-to-browse")?.addEventListener("click", async () => {
       if (!nativeBridgeUp()) {
-        window._showToast?.("Native mode required.", "warn");
+        window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
         return;
       }
       const saveInput = document.getElementById("vo-save-to");
       const current = saveInput?.value || "";
-      const res = await bridgeCall("pick_folder", "Save video to…", current);
-      if (res?.ok && res.path) {
-        // if the user picks a path outside the archive tree,
-        // the downloaded file won't show up in Browse / Search / FTS
-        // because the scanner only walks output_dir. Warn before
-        // committing so users aren't surprised later.
-        try {
-          const s = await bridgeCall("settings_load");
-          const archiveRoot = (s?.output_dir || "").replace(/[\\/]+$/, "");
-          const picked = String(res.path || "").replace(/[\\/]+$/, "");
-          if (archiveRoot && picked &&
-              !picked.toLowerCase().startsWith(archiveRoot.toLowerCase())) {
-            const ok = await askConfirm(
-              "Save outside archive root?",
-              `The path you picked is outside your archive root.\n\n` +
-              `Root: ${archiveRoot}\n` +
-              `Picked: ${picked}\n\n` +
-              `Videos saved here won't appear in Browse / Search / FTS ` +
-              `(the scanner only walks the archive root). Proceed anyway?`,
-              { confirm: "Save outside" });
-            if (!ok) return;
-          }
-        } catch {}
-        if (saveInput) saveInput.value = res.path;
+      try {
+        const res = await bridgeCall("pick_folder", "Save video to…", current);
+        if (res?.ok && res.path) {
+          // Custom locations are registered in the catalog when the download
+          // completes, so they remain available in Browse and Search.
+          if (saveInput) saveInput.value = res.path;
+        } else if (!res?.cancelled) {
+          window._showToast?.(
+            res?.error || "Could not choose a destination folder.", "error");
+        }
+      } catch (error) {
+        window._showToast?.(
+          `Could not choose a destination folder: ${error}`, "error");
       }
     });
 

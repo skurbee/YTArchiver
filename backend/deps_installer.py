@@ -31,17 +31,23 @@ re-runnable and never raise to the caller (they return {"ok": bool, ...}).
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
+import threading
 import time
 import urllib.request
+import uuid
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlparse
 
 from .log import get_logger
+from .process_runner import supervise_streaming_process
 from .ytarchiver_config import APP_DATA_DIR
 
 _log = get_logger(__name__)
@@ -54,8 +60,12 @@ _FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.
 # Pinned Python 3.11 (last 3.11 with a Windows installer at time of writing).
 _PY311_VERSION = "3.11.9"
 _PY311_URL = f"https://www.python.org/ftp/python/{_PY311_VERSION}/python-{_PY311_VERSION}-amd64.exe"
-# torch CUDA wheel index (cu121 covers modern NVIDIA drivers); CPU uses PyPI.
-_TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu121"
+# All dependency mutations share one process-wide lock.  The lock is
+# re-entrant because the whisper installer calls the Python installer while
+# holding it.  This prevents two onboarding clicks from racing downloads,
+# swaps, or pip against the same managed locations.
+_INSTALL_LOCK = threading.RLock()
+_BIN_SWAP_JOURNAL_NAME = ".bin-swap.json"
 
 
 # ── integrity helpers ────────────────────────────────────────────────────
@@ -73,23 +83,172 @@ def _verify_sha256(path: Path, expected_hex: str) -> None:
     return {"ok": False, "integrity_error": True} rather than executing a
     potentially tampered artifact.
     """
+    expected = str(expected_hex or "").strip().lower()
+    if (len(expected) != 64
+            or any(ch not in "0123456789abcdef" for ch in expected)):
+        raise RuntimeError(f"missing or malformed SHA-256 for {path.name}")
     h = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     actual = h.hexdigest().lower()
-    if actual != expected_hex.lower():
+    if actual != expected:
         try:
             path.unlink()
         except OSError:
             pass
         raise RuntimeError(
             f"integrity check failed for {path.name}: "
-            f"expected {expected_hex[:16]}…, got {actual[:16]}…"
+            f"expected {expected[:16]}…, got {actual[:16]}…"
         )
 
 
 # ── small helpers ─────────────────────────────────────────────────────────
+def _bin_swap_journal_path() -> Path:
+    return APP_DATA_DIR / _BIN_SWAP_JOURNAL_NAME
+
+
+def _write_bin_swap_journal(payload: dict) -> None:
+    """Durably publish dependency-swap recovery state."""
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    target = _bin_swap_journal_path()
+    tmp = target.with_name(f"{target.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _swap_child(name: object, prefix: str) -> Path | None:
+    """Resolve one journal child without permitting path traversal."""
+    if not isinstance(name, str) or not name.startswith(prefix):
+        return None
+    if os.path.basename(name) != name:
+        return None
+    return APP_DATA_DIR / name
+
+
+def _directory_has_files(path: Path) -> bool:
+    try:
+        return path.is_dir() and any(child.is_file() for child in path.iterdir())
+    except OSError:
+        return False
+
+
+def _safe_mtime(path: Path) -> float:
+    """Return an orphan backup's mtime without letting one bad entry abort recovery."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return -1.0
+
+
+def _recover_interrupted_bin_swap() -> None:
+    """Restore a usable managed tool directory after an interrupted swap.
+
+    The live directory is renamed before the staged directory can take its
+    place, so a power loss between those two atomic renames otherwise leaves
+    the next launch with no tools.  The journal identifies the exact backup
+    and verified stage.  A conservative orphan-backup fallback also repairs
+    state left by older builds that predated the journal.
+    """
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    live = APP_DATA_DIR / "bin"
+    journal_path = _bin_swap_journal_path()
+    journal = None
+    if journal_path.is_file():
+        try:
+            with open(journal_path, encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                journal = loaded
+        except (OSError, ValueError) as exc:
+            _log.error("dependency swap journal is unreadable: %s", exc)
+
+    if journal is not None:
+        stage = _swap_child(journal.get("stage"), ".bin-stage-")
+        backup = _swap_child(journal.get("backup"), ".bin-backup-")
+        had_existing = bool(journal.get("had_existing"))
+        phase = journal.get("phase")
+        try:
+            if phase == "committed" and _directory_has_files(live):
+                # Only the durable committed phase proves that a non-empty
+                # live directory is the verified staged toolset.
+                if stage is not None and stage.exists():
+                    shutil.rmtree(stage)
+                if backup is not None and backup.exists():
+                    shutil.rmtree(backup)
+                journal_path.unlink(missing_ok=True)
+                return
+
+            if had_existing and backup is not None and backup.is_dir():
+                # In prepared/backup_moved (and unknown) phases, live may be a
+                # partial commit or rollback. The exact journal backup remains
+                # authoritative even when that partial directory has files.
+                if live.exists():
+                    shutil.rmtree(live)
+                os.replace(backup, live)
+                if stage is not None and stage.exists():
+                    shutil.rmtree(stage)
+                journal_path.unlink(missing_ok=True)
+                return
+
+            if _directory_has_files(live):
+                # No recoverable prior toolset exists. Keep the only usable
+                # live directory, but never take this branch while an intact
+                # journal backup is available.
+                if stage is not None and stage.exists():
+                    shutil.rmtree(stage)
+                journal_path.unlink(missing_ok=True)
+                return
+
+            if live.exists():
+                # Only an empty directory can be present here (for example an
+                # older boot recreated it after the crash).
+                live.rmdir()
+
+            if (not had_existing and stage is not None
+                    and _directory_has_files(stage)):
+                # No live toolset existed before this install. The journal is
+                # written only after validation, so this stage is safe to
+                # promote when the commit rename was interrupted.
+                os.replace(stage, live)
+                journal_path.unlink(missing_ok=True)
+                return
+        except OSError as exc:
+            _log.error("dependency swap recovery failed: %s", exc)
+            return
+
+    # Legacy fallback: old interrupted swaps had no journal. Restore a backup
+    # only when live is absent/empty; never replace a non-empty live toolset.
+    if not _directory_has_files(live):
+        backups = sorted(
+            (p for p in APP_DATA_DIR.glob(".bin-backup-*") if p.is_dir()),
+            key=_safe_mtime,
+            reverse=True,
+        )
+        for backup in backups:
+            if not _directory_has_files(backup):
+                continue
+            try:
+                if live.exists():
+                    live.rmdir()
+                os.replace(backup, live)
+                _log.warning(
+                    "recovered managed tools from interrupted swap backup %s",
+                    backup.name)
+            except OSError as exc:
+                _log.error("legacy dependency backup recovery failed: %s", exc)
+            break
+
+
 def _emit(progress: Progress | None, phase: str, msg: str,
           pct: float | None = None, status: str = "running") -> None:
     """Best-effort progress notification. Never raises."""
@@ -114,12 +273,14 @@ def _no_window():
 def managed_bin_dir() -> Path:
     """%APPDATA%/YTArchiver/bin — where we drop downloaded yt-dlp/ffmpeg.
     Created on demand."""
-    d = APP_DATA_DIR / "bin"
-    try:
-        d.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        _log.debug("could not create bin dir %s: %s", d, e)
-    return d
+    with _INSTALL_LOCK:
+        _recover_interrupted_bin_swap()
+        d = APP_DATA_DIR / "bin"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            _log.debug("could not create bin dir %s: %s", d, e)
+        return d
 
 
 def ensure_bin_on_path() -> str:
@@ -150,26 +311,35 @@ def _download(url: str, dest: Path, progress: Progress | None,
         raise ValueError(f"Unsupported download URL scheme: {url}")
     _emit(progress, phase, f"Downloading {label}…", 0)
     req = urllib.request.Request(url, headers={"User-Agent": "YTArchiver-Setup"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        total = int(resp.headers.get("Content-Length") or 0)
-        got = 0
-        chunk = 1024 * 256
-        with open(tmp, "wb") as f:
-            while True:
-                buf = resp.read(chunk)
-                if not buf:
-                    break
-                f.write(buf)
-                got += len(buf)
-                if total > 0:
-                    _emit(progress, phase,
-                          f"Downloading {label}… "
-                          f"{got // (1024*1024)}/{total // (1024*1024)} MB",
-                          got * 100.0 / total)
-                else:
-                    _emit(progress, phase,
-                          f"Downloading {label}… {got // (1024*1024)} MB")
-    os.replace(tmp, dest)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            got = 0
+            chunk = 1024 * 256
+            with open(tmp, "wb") as f:
+                while True:
+                    buf = resp.read(chunk)
+                    if not buf:
+                        break
+                    f.write(buf)
+                    got += len(buf)
+                    if total > 0:
+                        _emit(progress, phase,
+                              f"Downloading {label}… "
+                              f"{got // (1024*1024)}/"
+                              f"{total // (1024*1024)} MB",
+                              got * 100.0 / total)
+                    else:
+                        _emit(progress, phase,
+                              f"Downloading {label}… "
+                              f"{got // (1024*1024)} MB")
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 # ── probing ───────────────────────────────────────────────────────────────
@@ -286,13 +456,18 @@ def firefox_cookie_status() -> dict:
 
 
 def _whisper_ready(py311: str | None) -> bool:
-    """True if the given Python 3.11 can import faster_whisper + torch."""
+    """True when the Python 3.11 worker can import both worker stacks."""
     if not py311 or not os.path.isfile(py311):
         return False
     try:
         si, cf = _no_window()
         r = subprocess.run(
-            [py311, "-c", "import faster_whisper, torch"],
+            [
+                py311,
+                "-c",
+                "import faster_whisper, torch, transformers; "
+                "from transformers import pipeline",
+            ],
             capture_output=True, text=True, timeout=60,
             startupinfo=si, creationflags=cf)
         return r.returncode == 0
@@ -330,7 +505,7 @@ def probe(check_whisper_import: bool = False) -> dict:
         "python311": {"ok": bool(py311), "path": py311 or ""},
         "whisper": {"ok": whisper_ok,
                     "checked": check_whisper_import,
-                    "detail": "faster-whisper + torch import OK" if whisper_ok
+                    "detail": "Whisper + punctuation imports OK" if whisper_ok
                               else ("Python 3.11 found - packages not verified"
                                     if py311 else "Python 3.11 not found")},
         "gpu": gpu,
@@ -342,164 +517,333 @@ def probe(check_whisper_import: bool = False) -> dict:
 
 
 # ── core installers (yt-dlp + ffmpeg) ──────────────────────────────────────
-def install_ytdlp(progress: Progress | None = None, force: bool = False) -> dict:
-    """Download yt-dlp.exe into the managed bin dir."""
-    ensure_bin_on_path()
-    if not force and _which("yt-dlp"):
-        _emit(progress, "ytdlp", "yt-dlp already present.", 100, "ok")
-        return {"ok": True, "skipped": True, "path": _which("yt-dlp")}
-    dest = managed_bin_dir() / "yt-dlp.exe"
+def _checksum_token(text: str, filename: str | None = None) -> str:
+    """Return a strict SHA-256 token from a checksum sidecar."""
+    wanted = filename.lower() if filename else None
+    for raw_line in str(text or "").splitlines():
+        parts = raw_line.strip().split()
+        if not parts:
+            continue
+        if wanted is not None:
+            if len(parts) < 2:
+                continue
+            published_name = os.path.basename(parts[-1].lstrip("*")).lower()
+            if published_name != wanted:
+                continue
+        token = parts[0].lower()
+        if (len(token) == 64
+                and all(ch in "0123456789abcdef" for ch in token)):
+            return token
+        raise RuntimeError("checksum sidecar contains a malformed SHA-256")
+    target = f" for {filename}" if filename else ""
+    raise RuntimeError(f"checksum sidecar has no SHA-256{target}")
+
+
+def _prepare_bin_stage() -> Path:
+    """Create a same-volume copy of the managed bin directory."""
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    bin_dir = APP_DATA_DIR / "bin"
+    stage = Path(tempfile.mkdtemp(prefix=".bin-stage-", dir=APP_DATA_DIR))
     try:
-        _download(_YTDLP_URL, dest, progress, "ytdlp", "yt-dlp")
-        # Verify against the SHA2-256SUMS file published alongside each release.
-        _emit(progress, "ytdlp", "Verifying yt-dlp integrity…", None)
+        if bin_dir.is_dir():
+            shutil.copytree(bin_dir, stage, dirs_exist_ok=True)
+        for artifact in stage.glob("*.part"):
+            artifact.unlink(missing_ok=True)
+        (stage / "_ffmpeg_dl.zip").unlink(missing_ok=True)
+        return stage
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def _validate_staged_tools(stage: Path, names: set[str]) -> None:
+    missing = []
+    for name in sorted(names):
+        candidate = stage / name
         try:
-            sums_url = _YTDLP_URL.replace("/yt-dlp.exe", "/SHA2-256SUMS")
-            sums_text = _fetch_text(sums_url)
-            expected = None
-            for line in sums_text.splitlines():
-                parts = line.split()
-                if len(parts) == 2 and parts[1].lower() == "yt-dlp.exe":
-                    expected = parts[0]
-                    break
-            if expected:
-                _verify_sha256(dest, expected)  # deletes + raises on mismatch
-            else:
-                _log.warning("SHA2-256SUMS has no yt-dlp.exe entry; skipping hash check")
-        except RuntimeError:
-            raise  # integrity mismatch — propagate to outer handler
-        except Exception as e:
-            _log.warning("yt-dlp hash check unavailable (%s); continuing", e)
-        _emit(progress, "ytdlp", "yt-dlp installed.", 100, "ok")
-        return {"ok": True, "path": str(dest)}
-    except RuntimeError as e:
-        _emit(progress, "ytdlp", f"yt-dlp integrity check failed: {e}", status="error")
-        return {"ok": False, "error": str(e), "integrity_error": True}
-    except Exception as e:
-        _log.warning("yt-dlp install failed: %s", e)
-        _emit(progress, "ytdlp", f"yt-dlp download failed: {e}", status="error")
-        return {"ok": False, "error": str(e)}
+            valid = candidate.is_file() and candidate.stat().st_size > 0
+        except OSError:
+            valid = False
+        if not valid:
+            missing.append(name)
+    if missing:
+        raise RuntimeError(f"staged toolset missing {', '.join(missing)}")
+
+
+def _swap_managed_bin(stage: Path) -> Path:
+    """Replace the managed toolset, rolling back if the swap cannot finish."""
+    bin_dir = APP_DATA_DIR / "bin"
+    backup = APP_DATA_DIR / f".bin-backup-{uuid.uuid4().hex}"
+    had_existing = bin_dir.exists()
+    journal = {
+        "version": 1,
+        "phase": "prepared",
+        "stage": stage.name,
+        "backup": backup.name,
+        "had_existing": had_existing,
+        "created_at": time.time(),
+    }
+    _write_bin_swap_journal(journal)
+    try:
+        if had_existing:
+            os.replace(bin_dir, backup)
+            journal["phase"] = "backup_moved"
+            # This write is part of the swap, not preparation. If it fails,
+            # restore the just-moved live directory immediately rather than
+            # waiting for startup recovery while bin/ is absent.
+            _write_bin_swap_journal(journal)
+        os.replace(stage, bin_dir)
+        journal["phase"] = "committed"
+        _write_bin_swap_journal(journal)
+    except Exception as swap_error:
+        rollback_error = None
+        if had_existing and backup.exists():
+            try:
+                if bin_dir.exists():
+                    shutil.rmtree(bin_dir)
+                os.replace(backup, bin_dir)
+            except Exception as exc:  # pragma: no cover - catastrophic disk fault
+                rollback_error = exc
+        if rollback_error is not None:
+            raise RuntimeError(
+                f"toolset swap failed ({swap_error}); rollback also failed "
+                f"({rollback_error})") from swap_error
+        try:
+            _bin_swap_journal_path().unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    if backup.exists():
+        try:
+            shutil.rmtree(backup)
+        except OSError as exc:
+            _log.warning("could not remove dependency backup %s: %s", backup, exc)
+    try:
+        _bin_swap_journal_path().unlink(missing_ok=True)
+    except OSError as exc:
+        _log.warning("could not remove dependency swap journal: %s", exc)
+    return bin_dir
+
+
+def _stage_ytdlp(stage: Path, progress: Progress | None) -> dict:
+    dest = stage / "yt-dlp.exe"
+    _download(_YTDLP_URL, dest, progress, "ytdlp", "yt-dlp")
+    _emit(progress, "ytdlp", "Verifying yt-dlp integrity…", None)
+    sums_url = _YTDLP_URL.replace("/yt-dlp.exe", "/SHA2-256SUMS")
+    expected = _checksum_token(_fetch_text(sums_url), "yt-dlp.exe")
+    _verify_sha256(dest, expected)
+    _validate_staged_tools(stage, {"yt-dlp.exe"})
+    return {"ok": True, "path": str(dest)}
+
+
+def _stage_ffmpeg(stage: Path, progress: Progress | None) -> dict:
+    zip_path = stage / "_ffmpeg_dl.zip"
+    _download(_FFMPEG_ZIP_URL, zip_path, progress, "ffmpeg", "ffmpeg")
+    _emit(progress, "ffmpeg", "Verifying ffmpeg integrity…", None)
+    expected = _checksum_token(_fetch_text(_FFMPEG_ZIP_URL + ".sha256"))
+    _verify_sha256(zip_path, expected)
+    _emit(progress, "ffmpeg", "Extracting ffmpeg…", None)
+    wanted = {"ffmpeg.exe", "ffprobe.exe"}
+    found: set[str] = set()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.namelist():
+            base = os.path.basename(member)
+            if base in wanted:
+                with zf.open(member) as src, open(stage / base, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                found.add(base)
+    zip_path.unlink(missing_ok=True)
+    if wanted - found:
+        raise RuntimeError(f"zip missing {', '.join(sorted(wanted - found))}")
+    _validate_staged_tools(stage, wanted)
+    return {"ok": True, "path": str(stage / "ffmpeg.exe")}
+
+
+def _integrity_failure(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(token in msg for token in (
+        "checksum", "sha-256", "integrity check", "hash mismatch"))
+
+
+def install_ytdlp(progress: Progress | None = None, force: bool = False) -> dict:
+    """Install yt-dlp through a verified staging directory."""
+    with _INSTALL_LOCK:
+        ensure_bin_on_path()
+        existing = _which("yt-dlp")
+        if not force and existing:
+            _emit(progress, "ytdlp", "yt-dlp already present.", 100, "ok")
+            return {"ok": True, "skipped": True, "path": existing}
+        stage = None
+        try:
+            stage = _prepare_bin_stage()
+            result = _stage_ytdlp(stage, progress)
+            bin_dir = _swap_managed_bin(stage)
+            stage = None
+            path = str(bin_dir / "yt-dlp.exe")
+            _emit(progress, "ytdlp", "yt-dlp installed.", 100, "ok")
+            return {**result, "path": path}
+        except Exception as exc:
+            _log.warning("yt-dlp install failed: %s", exc)
+            integrity = _integrity_failure(exc)
+            label = "integrity check" if integrity else "install"
+            _emit(progress, "ytdlp", f"yt-dlp {label} failed: {exc}",
+                  status="error")
+            return {"ok": False, "error": str(exc),
+                    **({"integrity_error": True} if integrity else {})}
+        finally:
+            if stage is not None:
+                shutil.rmtree(stage, ignore_errors=True)
 
 
 def install_ffmpeg(progress: Progress | None = None, force: bool = False) -> dict:
-    """Download the gyan.dev essentials zip; extract ffmpeg.exe + ffprobe.exe
-    into the managed bin dir."""
-    ensure_bin_on_path()
-    if not force and _which("ffmpeg") and _which("ffprobe"):
-        _emit(progress, "ffmpeg", "ffmpeg already present.", 100, "ok")
-        return {"ok": True, "skipped": True}
-    bin_dir = managed_bin_dir()
-    zip_path = bin_dir / "_ffmpeg_dl.zip"
-    try:
-        _download(_FFMPEG_ZIP_URL, zip_path, progress, "ffmpeg", "ffmpeg")
-        # Verify against gyan.dev's published .sha256 sidecar before extraction.
-        _emit(progress, "ffmpeg", "Verifying ffmpeg integrity…", None)
+    """Install ffmpeg + ffprobe through a verified staging directory."""
+    with _INSTALL_LOCK:
+        ensure_bin_on_path()
+        if not force and _which("ffmpeg") and _which("ffprobe"):
+            _emit(progress, "ffmpeg", "ffmpeg already present.", 100, "ok")
+            return {"ok": True, "skipped": True}
+        stage = None
         try:
-            sha_text = _fetch_text(_FFMPEG_ZIP_URL + ".sha256")
-            token = sha_text.split()[0] if sha_text.strip() else ""
-            if len(token) == 64 and all(c in "0123456789abcdef" for c in token.lower()):
-                _verify_sha256(zip_path, token)  # deletes + raises on mismatch
-            else:
-                _log.warning("ffmpeg .sha256 has unexpected format; skipping hash check")
-        except RuntimeError:
-            raise  # integrity mismatch
-        except Exception as e:
-            _log.warning("ffmpeg hash check unavailable (%s); continuing", e)
-        _emit(progress, "ffmpeg", "Extracting ffmpeg…", None)
-        wanted = {"ffmpeg.exe", "ffprobe.exe"}
-        found: set[str] = set()
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            for zn in zf.namelist():
-                base = os.path.basename(zn)
-                if base in wanted:
-                    with zf.open(zn) as src, open(bin_dir / base, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-                    found.add(base)
-        try:
-            os.remove(zip_path)
-        except OSError:
-            pass
-        if not {"ffmpeg.exe", "ffprobe.exe"} <= found:
-            missing = ", ".join(sorted({"ffmpeg.exe", "ffprobe.exe"} - found))
-            raise RuntimeError(f"zip missing {missing}")
-        _emit(progress, "ffmpeg", "ffmpeg + ffprobe installed.", 100, "ok")
-        return {"ok": True, "path": str(bin_dir / "ffmpeg.exe")}
-    except RuntimeError as e:
-        _log.warning("ffmpeg install failed: %s", e)
-        try:
-            if zip_path.exists():
-                os.remove(zip_path)
-        except OSError:
-            pass
-        is_integrity = "integrity check failed" in str(e)
-        _emit(progress, "ffmpeg",
-              f"ffmpeg {'integrity check' if is_integrity else 'install'} failed: {e}",
-              status="error")
-        return {"ok": False, "error": str(e), **({"integrity_error": True} if is_integrity else {})}
-    except Exception as e:
-        _log.warning("ffmpeg install failed: %s", e)
-        try:
-            if zip_path.exists():
-                os.remove(zip_path)
-        except OSError:
-            pass
-        _emit(progress, "ffmpeg", f"ffmpeg install failed: {e}", status="error")
-        return {"ok": False, "error": str(e)}
+            stage = _prepare_bin_stage()
+            result = _stage_ffmpeg(stage, progress)
+            bin_dir = _swap_managed_bin(stage)
+            stage = None
+            path = str(bin_dir / "ffmpeg.exe")
+            _emit(progress, "ffmpeg", "ffmpeg + ffprobe installed.", 100, "ok")
+            return {**result, "path": path}
+        except Exception as exc:
+            _log.warning("ffmpeg install failed: %s", exc)
+            integrity = _integrity_failure(exc)
+            label = "integrity check" if integrity else "install"
+            _emit(progress, "ffmpeg", f"ffmpeg {label} failed: {exc}",
+                  status="error")
+            return {"ok": False, "error": str(exc),
+                    **({"integrity_error": True} if integrity else {})}
+        finally:
+            if stage is not None:
+                shutil.rmtree(stage, ignore_errors=True)
 
 
 def install_core(progress: Progress | None = None, force: bool = False) -> dict:
-    """Install both core binaries. Returns a combined result + fresh probe."""
-    y = install_ytdlp(progress, force=force)
-    f = install_ffmpeg(progress, force=force)
-    ensure_bin_on_path()
-    state = probe()
-    ok = bool(y.get("ok") and f.get("ok"))
-    _emit(progress, "core",
-          "Core tools ready." if state.get("core_ok") else "Some core tools missing.",
-          100, "ok" if state.get("core_ok") else "error")
-    return {"ok": ok, "ytdlp": y, "ffmpeg": f, "state": state}
+    """Stage, verify, then commit the complete core toolset as one unit."""
+    with _INSTALL_LOCK:
+        ensure_bin_on_path()
+        if (not force and _which("yt-dlp") and _which("ffmpeg")
+                and _which("ffprobe")):
+            state = probe()
+            _emit(progress, "core", "Core tools already present.", 100, "ok")
+            skipped = {"ok": True, "skipped": True}
+            return {"ok": True, "ytdlp": dict(skipped),
+                    "ffmpeg": dict(skipped), "state": state}
+
+        stage = None
+        ytdlp_result: dict = {"ok": False, "error": "not attempted"}
+        ffmpeg_result: dict = {"ok": False, "error": "not attempted"}
+        try:
+            stage = _prepare_bin_stage()
+            ytdlp_result = _stage_ytdlp(stage, progress)
+            ffmpeg_result = _stage_ffmpeg(stage, progress)
+            _validate_staged_tools(
+                stage, {"yt-dlp.exe", "ffmpeg.exe", "ffprobe.exe"})
+            _swap_managed_bin(stage)
+            stage = None
+            _emit(progress, "ytdlp", "yt-dlp installed.", 100, "ok")
+            _emit(progress, "ffmpeg", "ffmpeg + ffprobe installed.", 100, "ok")
+            state = probe()
+            ok = bool(state.get("core_ok"))
+            _emit(progress, "core",
+                  "Core tools ready." if ok else "Some core tools missing.",
+                  100, "ok" if ok else "error")
+            return {"ok": ok, "ytdlp": ytdlp_result,
+                    "ffmpeg": ffmpeg_result, "state": state}
+        except Exception as exc:
+            _log.warning("core toolset install failed: %s", exc)
+            integrity = _integrity_failure(exc)
+            failed = {"ok": False, "error": str(exc),
+                      **({"integrity_error": True} if integrity else {})}
+            if not ytdlp_result.get("ok"):
+                ytdlp_result = dict(failed)
+            else:
+                ffmpeg_result = dict(failed)
+            state = probe()
+            _emit(progress, "core",
+                  f"Core tools unchanged; install failed: {exc}",
+                  status="error")
+            return {"ok": False, "ytdlp": ytdlp_result,
+                    "ffmpeg": ffmpeg_result, "state": state,
+                    "error": str(exc),
+                    **({"integrity_error": True} if integrity else {})}
+        finally:
+            if stage is not None:
+                shutil.rmtree(stage, ignore_errors=True)
 
 
 # ── whisper stack installer ────────────────────────────────────────────────
 def _run_streaming(cmd: list[str], progress: Progress | None, phase: str,
-                   label: str, timeout: int = 2400) -> tuple[int, str]:
+                   label: str, timeout: int = 2400, *,
+                   cancel_event: threading.Event | None = None,
+                   task_id: str | None = None) -> tuple[int, str]:
     """Run a subprocess, streaming stdout lines to progress. Returns
     (returncode, tail_of_output)."""
     si, cf = _no_window()
     _emit(progress, phase, f"{label}…", None)
     tail: list[str] = []
+    job_id = str(task_id or f"dependency-install-{uuid.uuid4().hex}")
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, startupinfo=si, creationflags=cf)
     except Exception as e:
         return 1, str(e)
+
+    def _handle_line(line: str) -> None:
+        line = line.rstrip()
+        if not line:
+            return
+        tail.append(line)
+        del tail[:-40]  # keep enough context for pip failure diagnostics
+        # Surface meaningful pip lines without spamming every byte.
+        low = line.lower()
+        if any(k in low for k in ("downloading", "installing", "collecting",
+                                  "building", "successfully", "error",
+                                  "warning")):
+            status = ("error" if "error" in low else
+                      "warning" if "warning" in low else "running")
+            _emit(progress, phase, f"{label}: {line[:120]}", status=status)
+
     try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip()
-            if not line:
-                continue
-            tail.append(line)
-            del tail[:-40]  # keep enough context for pip failure diagnostics
-            # Surface meaningful pip lines without spamming every byte.
-            low = line.lower()
-            if any(k in low for k in ("downloading", "installing", "collecting",
-                                      "building", "successfully", "error", "warning")):
-                status = ("error" if "error" in low else
-                          "warning" if "warning" in low else "running")
-                _emit(progress, phase, f"{label}: {line[:120]}",
-                      status=status)
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        return 1, "timed out"
+        result = supervise_streaming_process(
+            proc,
+            on_stdout_line=_handle_line,
+            cancel_event=cancel_event,
+            timeout=timeout,
+            owner="dependency-install",
+            task_id=job_id,
+            role=str(phase or "install"),
+        )
     except Exception as e:
         return 1, str(e)
-    return proc.returncode or 0, "\n".join(tail)
+    if result.timed_out:
+        return 1, "timed out"
+    if result.cancelled:
+        return 1, "cancelled"
+    return result.returncode or 0, "\n".join(tail)
+
+
+def _worker_lock_path(*, cuda: bool) -> Path:
+    """Return the checked-in (or PyInstaller-bundled) worker artifact lock."""
+    filename = "worker-cuda.lock" if cuda else "worker-cpu.lock"
+    candidates: list[Path] = []
+    frozen_root = getattr(sys, "_MEIPASS", "")
+    if frozen_root:
+        candidates.append(Path(frozen_root) / "requirements" / filename)
+    candidates.append(Path(__file__).resolve().parents[1] / "requirements" / filename)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"Verified transcription dependency lock is missing: {filename}"
+    )
 
 
 def _fetch_py311_sha256(installer_url: str) -> str | None:
@@ -534,7 +878,7 @@ def _fetch_py311_sha256(installer_url: str) -> str | None:
     return None
 
 
-def install_python311(progress: Progress | None = None) -> dict:
+def _install_python311_unlocked(progress: Progress | None = None) -> dict:
     """Ensure a Python 3.11 interpreter exists. If one is already found,
     reuse it; otherwise download + silently install the official per-user
     build to the location find_python311() checks first.
@@ -552,16 +896,11 @@ def install_python311(progress: Progress | None = None) -> dict:
                   f"Python {_PY311_VERSION}")
         # Verify against the Sigstore bundle published alongside each release.
         _emit(progress, "python", "Verifying Python installer integrity…", None)
-        try:
-            expected = _fetch_py311_sha256(_PY311_URL)
-            if expected:
-                _verify_sha256(installer, expected)  # deletes + raises on mismatch
-            else:
-                _log.warning("python 3.11 sha256 unavailable from sigstore; skipping hash check")
-        except RuntimeError:
-            raise  # integrity mismatch — propagate to outer handler
-        except Exception as e:
-            _log.warning("python 3.11 hash check unavailable (%s); continuing", e)
+        expected = _fetch_py311_sha256(_PY311_URL)
+        if not expected:
+            raise RuntimeError(
+                "Python installer checksum unavailable or malformed")
+        _verify_sha256(installer, expected)  # deletes + raises on mismatch
         _emit(progress, "python",
               "Installing Python 3.11 (per-user, no admin)…", None)
         si, cf = _no_window()
@@ -614,7 +953,13 @@ def install_python311(progress: Progress | None = None) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def install_whisper_stack(progress: Progress | None = None) -> dict:
+def install_python311(progress: Progress | None = None) -> dict:
+    """Serialized public wrapper for the Python runtime installer."""
+    with _INSTALL_LOCK:
+        return _install_python311_unlocked(progress)
+
+
+def _install_whisper_stack_unlocked(progress: Progress | None = None) -> dict:
     """Full transcription-stack setup: Python 3.11 + pip packages.
 
     Installs faster-whisper + transformers, plus torch (CUDA build if an
@@ -630,43 +975,38 @@ def install_whisper_stack(progress: Progress | None = None) -> dict:
           f"GPU: {gpu['name']}" if gpu["ok"]
           else "No NVIDIA GPU detected - installing CPU build.", None)
 
-    # 1) upgrade pip (best-effort)
-    rc_pip, tail_pip = _run_streaming(
-        [python, "-m", "pip", "install", "--upgrade", "pip"],
-        progress, "whisper", "Upgrading pip", timeout=300)
-    if rc_pip != 0:
-        _log.warning("pip upgrade failed during whisper setup: %s", tail_pip)
-        _emit(progress, "whisper",
-              "pip upgrade failed; continuing with existing pip",
-              status="warning")
-
-    # 2) torch (CUDA or CPU) — version-pinned to avoid silent ABI breaks
-    if gpu["ok"]:
-        torch_cmd = [python, "-m", "pip", "install", "torch>=2.1.0,<3.0",
-                     "--index-url", _TORCH_CUDA_INDEX]
-        torch_label = "Installing torch (CUDA)"
-    else:
-        torch_cmd = [python, "-m", "pip", "install", "torch>=2.1.0,<3.0"]
-        torch_label = "Installing torch (CPU)"
-    rc, tail = _run_streaming(torch_cmd, progress, "whisper", torch_label,
-                              timeout=3600)
-    if rc != 0:
-        _emit(progress, "whisper", f"torch install failed: {tail[-160:]}",
-              status="error")
-        return {"ok": False, "stage": "torch", "error": tail[-400:]}
-
-    # 3) faster-whisper + transformers — pinned to avoid silent compatibility breaks
+    # One resolver transaction installs the known-good CPU or CUDA stack.
+    # Every direct and transitive Windows artifact has an exact version and
+    # SHA-256 in the bundled lock.  This replaces the old broad ranges and
+    # unbounded pip upgrade, which could produce a different worker each day.
+    try:
+        lock = _worker_lock_path(cuda=bool(gpu["ok"]))
+    except OSError as exc:
+        _emit(progress, "whisper", str(exc), status="error")
+        return {"ok": False, "stage": "lock", "error": str(exc),
+                "integrity_error": True}
+    label = ("Installing verified CUDA transcription stack"
+             if gpu["ok"] else
+             "Installing verified CPU transcription stack")
     rc, tail = _run_streaming(
-        [python, "-m", "pip", "install",
-         "faster-whisper>=1.0.0,<2.0", "transformers>=4.36.0,<5.0"],
-        progress, "whisper", "Installing faster-whisper + transformers",
-        timeout=1800)
+        [python, "-m", "pip", "install", "--disable-pip-version-check",
+         "--require-hashes", "--only-binary=:all:", "-r", str(lock)],
+        progress, "whisper", label, timeout=5400)
     if rc != 0:
         _emit(progress, "whisper",
-              f"faster-whisper install failed: {tail[-160:]}", status="error")
-        return {"ok": False, "stage": "faster-whisper", "error": tail[-400:]}
+              f"Verified package install failed: {tail[-160:]}",
+              status="error")
+        return {"ok": False, "stage": "packages", "error": tail[-400:]}
 
-    # 4) verify
+    rc, tail = _run_streaming(
+        [python, "-m", "pip", "check"], progress, "whisper",
+        "Checking transcription package compatibility", timeout=300)
+    if rc != 0:
+        _emit(progress, "whisper", f"Package check failed: {tail[-160:]}",
+              status="error")
+        return {"ok": False, "stage": "pip-check", "error": tail[-400:]}
+
+    # Verify the actual worker imports after pip's dependency check.
     _emit(progress, "whisper", "Verifying transcription stack…", None)
     ok = _whisper_ready(python)
     if ok:
@@ -677,6 +1017,12 @@ def install_whisper_stack(progress: Progress | None = None) -> dict:
     return {"ok": False, "stage": "verify",
             "error": "faster_whisper/torch import failed after install",
             "python311": python}
+
+
+def install_whisper_stack(progress: Progress | None = None) -> dict:
+    """Serialize all Python and pip mutations against core installs."""
+    with _INSTALL_LOCK:
+        return _install_whisper_stack_unlocked(progress)
 
 
 __all__ = [

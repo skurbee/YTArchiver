@@ -161,7 +161,7 @@
     if (!btn) return;
     btn.addEventListener("click", async () => {
       if (!nativeBridgeUp()) {
-        window._showToast?.("Native mode required for export.", "warn");
+        window._showToast?.("Export isn't ready yet. Try again in a moment.", "warn");
         return;
       }
       const res = await bridgeCall("bookmark_export_csv");

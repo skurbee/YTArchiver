@@ -57,30 +57,33 @@
   // Close-to-tray confirm. Triggered by main.py's _on_closing handler
   // when settings.close_behavior is "ask". Three-button layout:
   // [Cancel] [Close to tray] [Quit] + a remember-choice checkbox.
-  // Cancel sits on the left (ghost, muted) so it reads as "back out,
-  // don't close yet". Quit is the primary (Enter-focused) action —
-  // that's what the X-button most commonly means.
+  // Cancel sits on the left and receives initial focus.  Closing the whole
+  // app is destructive while work may be running, so Enter must keep the
+  // safe choice unless the user deliberately selects another button.
   window._showCloseDialog = function () {
     if (document.getElementById("close-confirm-modal")) return;
-    // Dismiss any already-open modal before showing the close confirm.
-    // Fire a synthetic Escape keydown FIRST so each modal's
-    // Esc-handler runs and resolves its promise — display:none
-    // alone left the await chains hanging forever (audit:
-    // appDialogs H229).
-    try {
-      document.querySelectorAll(".askq-backdrop").forEach((el) => {
-        if (el.id && el.id !== "close-confirm-modal"
-            && el.style.display !== "none") {
-          try {
-            el.dispatchEvent(new KeyboardEvent("keydown", {
-              key: "Escape", bubbles: true, cancelable: true,
-            }));
-          } catch {}
-          // Belt-and-suspenders: hide if still visible after Esc.
-          if (el.style.display !== "none") el.style.display = "none";
-        }
+    // Do not hide, restyle, or resolve some other dialog just because the
+    // window X was clicked.  Static dialogs live in the DOM while hidden;
+    // the old class-only scan wrote `display:none` onto all of them and their
+    // later openers could not make them visible again.  If a real dialog is
+    // open, leave it intact and cancel this close attempt.  The user can
+    // finish that dialog and click X again.
+    const isVisible = window.YT?.modals?.isVisible;
+    const existing = Array.from(document.querySelectorAll(".askq-backdrop"))
+      .find((el) => {
+        if (el.id === "close-confirm-modal") return false;
+        if (typeof isVisible === "function") return isVisible(el);
+        return !el.hidden && el.style.display !== "none";
       });
-    } catch (_e) { /* non-fatal */ }
+    if (existing) {
+      existing.querySelector?.(".askq-dialog, .yt-modal")?.focus?.();
+      window._showToast?.("Finish or close the open dialog first.", "warn");
+      if (nativeBridgeUp()) {
+        Promise.resolve(bridgeCall("confirm_close", "cancel", false))
+          .catch(() => {});
+      }
+      return;
+    }
     const modal = window.YT?.modals?.open;
     if (!modal) return;
     let remember = null;
@@ -102,6 +105,7 @@
       `,
       escapeValue: "cancel",
       outsideClickValue: "cancel",
+      initialFocus: '[data-act="cancel"]',
       onMount: (root, resolveOuter) => {
         root.id = "close-confirm-modal";
         remember = root.querySelector("#close-remember-choice");
@@ -111,7 +115,6 @@
           "click", () => resolveOuter("tray"));
         root.querySelector('[data-act="quit"]')?.addEventListener(
           "click", () => resolveOuter("quit"));
-        setTimeout(() => root.querySelector('[data-act="quit"]')?.focus(), 30);
       },
     }).then(async (action) => {
       const rem = !!remember?.checked;

@@ -88,17 +88,24 @@ def ignore(video_id: str) -> bool:
     if not video_id:
         return False
     with _lock:
-        ids = _load_ignore()
+        old_ids = _load_ignore()
+        ids = set(old_ids)
         ids.add(video_id)
-        _save_ignore(ids)
-        # Invalidate the cache — next is_ignored() re-reads.
-        _ignore_cache = ids
-        _ignore_cache_loaded = True
-        # Also drop from deferred so it disappears from the drawer.
         items = _load()
         new = [it for it in items if it.get("video_id") != video_id]
-        if len(new) != len(items):
-            _save(new)
+        if not _save_ignore(ids):
+            return False
+        if len(new) != len(items) and not _save(new):
+            # Keep the two journals in agreement. Best effort rollback; the
+            # false result still tells the caller that durable work is
+            # incomplete if the rollback itself is blocked.
+            _save_ignore(old_ids)
+            _ignore_cache = old_ids
+            _ignore_cache_loaded = True
+            return False
+        # Update the in-memory view only after both durable writes succeed.
+        _ignore_cache = ids
+        _ignore_cache_loaded = True
     return True
 
 

@@ -136,6 +136,7 @@
               .forEach(r => r.classList.remove("row-selected"));
           }
         } catch (_e) { /* non-fatal */ }
+        window.YT?.navigationHistory?.record?.();
       });
     });
     syncTabA11y();
@@ -152,6 +153,35 @@
     let dragging = false;
     let startY = 0;
     let startTopH = 0;
+
+    const bounds = (knownContainerH = 0) => {
+      const containerH = knownContainerH
+        || container.getBoundingClientRect().height;
+      // Keep the logical/ARIA minimum aligned with CSS.  Using a smaller
+      // number here made Home announce 32px while the frame's min-height
+      // physically held it at 40px; the next arrow press then appeared to
+      // jump by 24px instead of one 16px step.
+      const cssMin = Number.parseFloat(
+        window.getComputedStyle(top).minHeight) || 0;
+      const min = Math.max(32, cssMin);
+      return { min, max: Math.max(min, containerH - 80 - 6) };
+    };
+    const applyHeight = (requested, knownContainerH = 0) => {
+      const { min, max } = bounds(knownContainerH);
+      const newH = Math.max(min, Math.min(max, requested));
+      top.style.flex = `0 0 ${newH}px`;
+      splitter.setAttribute("aria-valuemin", String(Math.round(min)));
+      splitter.setAttribute("aria-valuemax", String(Math.round(max)));
+      splitter.setAttribute("aria-valuenow", String(Math.round(newH)));
+      return newH;
+    };
+    applyHeight(top.getBoundingClientRect().height);
+    splitter.addEventListener("ytarchiver:splitter-restore", (event) => {
+      const savedHeight = Number(event.detail?.height);
+      if (Number.isFinite(savedHeight) && savedHeight > 0) {
+        applyHeight(savedHeight);
+      }
+    });
 
     splitter.addEventListener("mousedown", (e) => {
       dragging = true;
@@ -179,13 +209,7 @@
         _mmPending = false;
         if (!dragging) return;
         const dy = _mmLastY - startY;
-        const containerH = _splitContainerH
-          || container.getBoundingClientRect().height;
-        const splitterH = 6;
-        const minTop = 32;
-        const maxTop = containerH - 80 - splitterH;
-        const newH = Math.max(minTop, Math.min(maxTop, startTopH + dy));
-        top.style.flex = `0 0 ${newH}px`;
+        applyHeight(startTopH + dy, _splitContainerH);
       });
     });
 
@@ -193,6 +217,7 @@
       if (dragging) {
         dragging = false;
         document.body.style.cursor = "";
+        splitter.dispatchEvent(new CustomEvent("ytarchiver:splitter-adjusted"));
       }
     }
     window.addEventListener("mouseup", _endDrag);
@@ -201,6 +226,18 @@
     // and the splitter would stay in drag mode until the next click.
     window.addEventListener("blur", _endDrag);
     document.addEventListener("mouseleave", _endDrag);
+    splitter.addEventListener("keydown", (e) => {
+      if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(e.key)) return;
+      e.preventDefault();
+      const { min, max } = bounds();
+      const current = top.getBoundingClientRect().height;
+      const step = e.shiftKey ? 48 : 16;
+      const target = e.key === "Home" ? min
+        : e.key === "End" ? max
+        : current + (e.key === "ArrowUp" ? -step : step);
+      applyHeight(target);
+      splitter.dispatchEvent(new CustomEvent("ytarchiver:splitter-adjusted"));
+    });
   }
   window.initSplitter = initSplitter;
 })();

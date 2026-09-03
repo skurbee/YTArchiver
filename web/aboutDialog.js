@@ -34,7 +34,7 @@
     const show = async () => {
       bd.hidden = false;
       if (!nativeBridgeUp()) {
-        body.textContent = "Native mode only.";
+        body.textContent = "YTArchiver isn't ready yet. Try again in a moment.";
         return;
       }
       try {
@@ -55,7 +55,7 @@
               + `<div>Python: ${escapeHtml(info.python_version || "\u2014")}</div>`
               + `<div class="about-meta-row-spaced">Config: `
                 + `<code class="about-code">${escapeHtml(info.config_path)}</code></div>`
-              + `<div>Archive root: `
+              + `<div>Archive folder: `
                 + `<code class="about-code">${escapeHtml(info.output_dir || "\u2014")}</code></div>`
             + `</div>`
           + `</div>`);

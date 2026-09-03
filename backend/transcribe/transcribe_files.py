@@ -16,12 +16,22 @@ Public surface (re-exported through the transcribe package):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import threading as _threading
 
 from ..log import get_logger
+from ..services.sidecar_store import (
+    SidecarError,
+    atomic_write_bytes,
+    atomic_write_text,
+    fsync_directory,
+    read_bytes,
+    read_text,
+    validate_jsonl_bytes,
+)
 from ..utils import unhide_file_win as _unhide_file_win
 from .paths import (
     _format_duration_hms,
@@ -59,13 +69,14 @@ def _norm_title(s: str) -> str:
     return normalize_title(s)
 
 
-def _seg_to_jsonl_line(video_id: str, title: str, seg: dict) -> str:
-    """Serialize ONE transcript segment to a single canonical .jsonl line
-    (trailing newline included). Single source of truth for the on-disk
-    format so the append path (_write_jsonl_entry) and the rewrite path
-    (_replace_jsonl_entry) can't drift byte-for-byte (audit: transcribe_files
-    duplicated serializer). Accepts short-form (s/e/t/w) or long-form
-    (start/end/text/words) segment dicts.
+def _seg_to_jsonl_record(video_id: str, title: str,
+                         seg: dict) -> dict[str, object]:
+    """Return the canonical on-disk record for one transcript segment.
+
+    The same object is serialized to the aggregate JSONL and handed to the
+    guarded per-video index updater. Keeping the normalization here prevents
+    the database from retaining raw Whisper timestamps/words that differ from
+    the durable sidecar representation.
     """
     s = seg.get("start") if "start" in seg else seg.get("s", 0.0)
     e = seg.get("end") if "end" in seg else seg.get("e", 0.0)
@@ -95,20 +106,47 @@ def _seg_to_jsonl_line(video_id: str, title: str, seg: dict) -> str:
     else:
         entry["words"] = _generate_distributed_words(
             entry["text"], entry["start"], entry["end"])
+    return entry
+
+
+def _seg_to_jsonl_line(video_id: str, title: str, seg: dict) -> str:
+    """Serialize ONE transcript segment to a canonical JSONL line.
+
+    Accepts short-form (s/e/t/w) or long-form (start/end/text/words) segment
+    dictionaries. Append and replacement writers both route through this
+    helper so the established sidecar bytes remain stable.
+    """
+    entry = _seg_to_jsonl_record(video_id, title, seg)
     return json.dumps(entry, ensure_ascii=False) + "\n"
+
+
+def _jsonl_generation(path: str, *, exists: bool | None = None) -> dict:
+    """Capture the file identity fields used by an incremental-index receipt."""
+    if exists is False:
+        return {"exists": False, "mtime": 0.0, "mtime_ns": 0, "size": 0}
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        return {"exists": False, "mtime": 0.0, "mtime_ns": 0, "size": 0}
+    return {
+        "exists": True,
+        "mtime": float(info.st_mtime),
+        "mtime_ns": int(info.st_mtime_ns),
+        "size": int(info.st_size),
+    }
+
+
+def _searchable_jsonl_record(record: dict) -> bool:
+    """Match index.ingest_jsonl's rule that blank transcript text is skipped."""
+    value = record.get("text") if "text" in record else record.get("t", "")
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _valid_jsonl_bytes(payload: bytes) -> bool:
     """Return True when *payload* is a complete UTF-8 JSONL document."""
-    if payload and not payload.endswith(b"\n"):
-        return False
     try:
-        for raw_line in payload.splitlines():
-            if not raw_line.strip():
-                continue
-            if not isinstance(json.loads(raw_line.decode("utf-8")), dict):
-                return False
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        validate_jsonl_bytes(payload)
+    except SidecarError:
         return False
     return True
 
@@ -138,18 +176,25 @@ def _recover_stale_jsonl_tmp(jsonl_path: str) -> bool:
         return False
 
     _unhide_file_win(os.path.normpath(tmp))
-    current = b""
-    if os.path.isfile(jsonl_path):
-        _unhide_file_win(os.path.normpath(jsonl_path))
-        with open(jsonl_path, "rb") as f:
-            current = f.read()
-    with open(tmp, "rb") as f:
-        pending = f.read()
+    _unhide_file_win(os.path.normpath(jsonl_path))
+    current_snapshot = read_bytes(jsonl_path)
+    current = current_snapshot.data
+    pending_snapshot = read_bytes(tmp)
+    if not pending_snapshot.exists:
+        return False
+    pending = pending_snapshot.data
+
+    # A stale stage may only replace an existing aggregate after both the old
+    # generation and proposed generation validate completely.  A corrupt old
+    # file is never treated as an empty/prefix document.
+    if current_snapshot.exists:
+        validate_jsonl_bytes(current, require_trailing_newline=False)
 
     if (len(pending) >= len(current)
             and pending.startswith(current)
             and _valid_jsonl_bytes(pending)):
         os.replace(tmp, jsonl_path)
+        fsync_directory(os.path.dirname(jsonl_path) or ".")
         _hide_file_win(jsonl_path)
         _log.warning("Recovered complete stale JSONL temp for %s",
                      os.path.basename(jsonl_path))
@@ -157,6 +202,7 @@ def _recover_stale_jsonl_tmp(jsonl_path: str) -> bool:
 
     recovery = _next_jsonl_recovery_path(tmp)
     os.replace(tmp, recovery)
+    fsync_directory(os.path.dirname(recovery) or ".")
     _hide_file_win(recovery)
     _log.error("Preserved conflicting stale JSONL temp as %s",
                os.path.basename(recovery))
@@ -183,8 +229,6 @@ def _write_jsonl_entry_unlocked(jsonl_path: str, video_id: str, title: str,
     helper accepts EITHER short-form or long-form keys and always writes
     long-form to disk.
     """
-    tmp = jsonl_path + ".tmp"
-    tmp_complete = False
     try:
         _jsonl_dir = os.path.dirname(jsonl_path)
         if _jsonl_dir:
@@ -206,16 +250,33 @@ def _write_jsonl_entry_unlocked(jsonl_path: str, video_id: str, title: str,
         # Now: read existing content (if any), build full new content
         # in memory, write to .tmp, fsync, atomic replace. No torn-write
         # repair needed because every replace lands a complete file.
-        existing = b""
-        if os.path.isfile(jsonl_path):
-            try:
-                with open(jsonl_path, "rb") as _f:
-                    existing = _f.read()
-                # Clear Windows hidden so we can write (re-hidden below).
-                _unhide_file_win(os.path.normpath(jsonl_path))
-            except OSError as e:
-                _log.debug("swallowed: %s", e)
-                existing = b""
+        snapshot = read_bytes(jsonl_path)
+        existing = snapshot.data
+        if snapshot.exists:
+            # Validate every old line before deriving a replacement. This is
+            # intentionally stricter than the read-only viewers: a malformed
+            # aggregate must be repaired, not silently normalized by append.
+            validate_jsonl_bytes(existing, require_trailing_newline=False)
+            _unhide_file_win(os.path.normpath(jsonl_path))
+
+        # Appending is the normal first-write path, but it must also be safe to
+        # repeat after a process dies between the paired TXT/JSONL commits. A
+        # stable video id makes an existing entry authoritative: replace every
+        # segment for that id instead of appending a second copy. This also
+        # covers retries whose punctuation/text changed slightly, where a mere
+        # payload-suffix check would not recognize the prior commit.
+        vid_norm = (video_id or "").strip()
+        if vid_norm:
+            for raw_line in existing.splitlines():
+                try:
+                    obj = json.loads(raw_line)
+                except (TypeError, ValueError):
+                    continue
+                if (isinstance(obj, dict)
+                        and (obj.get("video_id") or "").strip() == vid_norm):
+                    _replace_jsonl_entry_unlocked(
+                        jsonl_path, title, video_id, segments)
+                    return True
 
         # If the existing file's last line is missing a trailing newline
         # (legacy torn write from before this fix), prepend one before
@@ -223,37 +284,25 @@ def _write_jsonl_entry_unlocked(jsonl_path: str, video_id: str, title: str,
         if existing and not existing.endswith(b"\n"):
             existing = existing + b"\n"
 
-        new_bytes = existing + "".join(new_lines).encode("utf-8")
-        with open(tmp, "wb") as f:
-            f.write(new_bytes)
-            try:
-                f.flush()
-                os.fsync(f.fileno())
-            except OSError as e:
-                _log.debug("swallowed: %s", e)
-        tmp_complete = True
-        # Hide tmp BEFORE replace so the file is never briefly visible
-        # in Explorer between the replace and the re-hide (audit:
-        # transcribe_files H58).
-        try: _hide_file_win(tmp)
-        except Exception: pass
-        os.replace(tmp, jsonl_path)
-        # Defensive re-hide after replace in case the hidden attribute
-        # was lost during the rename (rare on same-volume, but happens
-        # cross-volume on Windows).
-        try: _hide_file_win(jsonl_path)
-        except Exception: pass
+        new_payload = "".join(new_lines).encode("utf-8")
+        # If the prior call wrote a complete temp but failed only at
+        # os.replace, stale-temp recovery above has just promoted exactly this
+        # payload. Treat the retry as complete instead of appending it twice.
+        if new_payload and existing.endswith(new_payload):
+            return True
+
+        new_bytes = existing + new_payload
+        atomic_write_bytes(
+            jsonl_path,
+            new_bytes,
+            validator=validate_jsonl_bytes,
+            before_replace=_hide_file_win,
+            after_replace=_hide_file_win,
+            stage_path=jsonl_path + ".tmp",
+            preserve_stage_on_replace_error=True,
+        )
         return True
     except Exception as _jse:
-        # A partial temp cannot be recovered safely. A complete temp is kept
-        # so the next invocation can promote it if atomic replace was the step
-        # that failed.
-        if not tmp_complete:
-            try:
-                _unhide_file_win(os.path.normpath(tmp))
-                os.remove(tmp)
-            except OSError:
-                pass
         # surface to module-level log so .txt/.jsonl desync
         # is diagnosable. Was a print() — routes via
         # logger so PyInstaller --noconsole builds also capture it.
@@ -294,7 +343,7 @@ def _write_transcript_entry_unlocked(txt_path: str, title: str,
     keeps the legacy 4-field shape for unknown-id videos.
 
     Atomic write: read existing content, append the new entry in memory,
-    write to <path>.tmp with fsync, then os.replace onto the final path.
+    write to a same-directory stage with fsync, then os.replace onto the final path.
     The previous open(path, "a") pattern could leave a partially-flushed
     final entry on crash mid-write — the torn header at EOF wouldn't
     parse cleanly on the next read.
@@ -308,30 +357,28 @@ def _write_transcript_entry_unlocked(txt_path: str, title: str,
         entry = (f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}"
                  f"{_header_url_field(video_id)}===\n{text}\n\n\n")
         # Read existing content (file may not exist yet on first transcribe).
-        # `errors="replace"` so a partially corrupt UTF-8 byte sequence
-        # doesn't UnicodeDecodeError and leave the file broken for
-        # subsequent appends — matches _replace_txt_entry's read mode
-        # (audit: transcribe_files H43).
-        try:
-            with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
-                existing = f.read()
-        except FileNotFoundError:
-            existing = ""
+        # Missing is a safe first write. Any other read/decode failure stops
+        # the operation so old transcript bytes cannot be replaced with a
+        # lossy ``errors='replace'`` decode.
+        existing = read_text(txt_path).text
+
+        # A retry after the TXT commit but before JSONL/index completion must
+        # not append another block. Prefer the v2 header's stable video id; for
+        # legacy/no-id output, recognizing an identical trailing block still
+        # makes an exact crash retry idempotent.
+        vid_norm = (video_id or "").strip()
+        if vid_norm and any(
+                (m.group(5) or "").strip() == vid_norm
+                for m in _HEADER_RE.finditer(existing)):
+            return _replace_txt_entry_unlocked(
+                txt_path, title, text, source_tag,
+                video_id=vid_norm,
+                upload_date=upload_date,
+                duration_secs=duration_secs)
+        if entry and existing.endswith(entry):
+            return True
         new_content = existing + entry
-        tmp = txt_path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(new_content)
-                try:
-                    f.flush()
-                    os.fsync(f.fileno())
-                except OSError as e:
-                    _log.debug("swallowed: %s", e)
-            os.replace(tmp, txt_path)
-        except OSError:
-            try: os.remove(tmp)
-            except OSError: pass
-            raise
+        atomic_write_text(txt_path, new_content)
         return True
     except Exception:
         return False
@@ -389,6 +436,8 @@ def _jsonl_text_candidates_from_bytes(data: bytes | None, title: str,
         except Exception as e:
             _log.debug("swallowed: %s", e)
             continue
+        if not isinstance(obj, dict):
+            continue
         seg_vid = (obj.get("video_id") or "").strip()
         seg_title = (obj.get("title") or "").strip()
         title_hit = bool(seg_title) and _norm_title(seg_title) == title_key
@@ -424,12 +473,22 @@ def parse_transcript_header(line: str) -> tuple[str, str, str, str] | None:
 
 
 def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
-                         new_segments: list[dict]) -> set:
-    """Lock-serialized facade for the aggregated JSONL replacement writer."""
+                         new_segments: list[dict], *,
+                         receipt_out: dict | None = None) -> set:
+    """Lock-serialized facade for the aggregated JSONL replacement writer.
+
+    ``receipt_out`` is optional and preserves the established set return API.
+    On success it receives a proof of the exact base/final file generations
+    and canonical replacement records. The search index uses that proof for
+    its guarded fast path; ordinary callers can continue to omit it.
+    """
+    if receipt_out is not None:
+        receipt_out.clear()
     with txt_lock_for(jsonl_path):
         try:
             return _replace_jsonl_entry_unlocked(
-                jsonl_path, title, video_id, new_segments)
+                jsonl_path, title, video_id, new_segments,
+                receipt_out=receipt_out)
         finally:
             # Also covers recovery/unhide failures that occur before the
             # unlocked writer reaches its own try/finally block.
@@ -440,7 +499,8 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
 
 
 def _replace_jsonl_entry_unlocked(jsonl_path: str, title: str, video_id: str,
-                                  new_segments: list[dict]) -> set:
+                                  new_segments: list[dict], *,
+                                  receipt_out: dict | None = None) -> set:
     """Surgically swap this video's entries in the aggregated .jsonl.
 
     `_replace_jsonl_entry` — used by the
@@ -486,89 +546,135 @@ def _replace_jsonl_entry_unlocked(jsonl_path: str, title: str, video_id: str,
                 _log.debug("swallowed: %s", e)
 
     try:
-        old_lines: list[str] = []
-        try:
-            with open(jsonl_path, "r", encoding="utf-8") as f:
-                old_lines = f.readlines()
-        except FileNotFoundError:
-            pass
+        snapshot = read_bytes(jsonl_path)
+        base_generation = _jsonl_generation(
+            jsonl_path, exists=snapshot.exists)
+        if snapshot.exists:
+            # A replacement is destructive by definition. Validate the full
+            # old generation before selecting rows so malformed/non-object
+            # records can never disappear as an accidental side effect.
+            validate_jsonl_bytes(
+                snapshot.data,
+                require_trailing_newline=False,
+            )
+            old_text = snapshot.data.decode("utf-8-sig")
+            old_lines = old_text.splitlines(keepends=True)
+        else:
+            old_lines = []
 
         kept: list[str] = []
         removed_titles: set = set()
+        removed_searchable_count = 0
+        removed_blank_video_id = False
+        base_searchable_count = 0
+        kept_searchable_count = 0
+        requires_full_reingest = False
         vid_norm = (video_id or "").strip()
         tit_key = _norm_title(title)
         for line in old_lines:
             ls = line.strip()
             if not ls:
                 continue
-            try:
-                obj = json.loads(ls)
-                seg_title = (obj.get("title") or "").strip()
-                seg_vid = (obj.get("video_id") or "").strip()
-                # Match by video_id, or by normalized title ONLY when id
-                # disambiguation is impossible (the line carries no id,
-                # or we don't know our own). The old title-OR-id match
-                # purged segments of a DIFFERENT video that legitimately
-                # shared the title ('Q&A', 'LIVE', weekly shows) —
-                # silent transcript loss that drift_scan can't detect
-                # because both sidecars stayed mutually consistent.
-                # (The .txt side still purges by title alone — its
-                # headers carry no ids — but with the .jsonl preserved,
-                # a lost .txt block is recoverable via Drift Scan's
-                # rebuild instead of being gone forever.)
-                _title_hit = bool(seg_title) and _norm_title(seg_title) == tit_key
-                _id_hit = bool(vid_norm) and seg_vid == vid_norm
-                if _id_hit or (_title_hit and (not seg_vid or not vid_norm)):
-                    if seg_title:
-                        removed_titles.add(seg_title)
-                    continue # drop this line
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
+            obj = json.loads(ls)
+            raw_title = obj.get("title")
+            raw_video_id = obj.get("video_id")
+            if raw_title is not None and not isinstance(raw_title, str):
+                requires_full_reingest = True
+            if raw_video_id is not None and not isinstance(raw_video_id, str):
+                requires_full_reingest = True
+            seg_title = (raw_title or "").strip() if isinstance(
+                raw_title, str) or raw_title is None else ""
+            seg_vid = (raw_video_id or "").strip() if isinstance(
+                raw_video_id, str) or raw_video_id is None else ""
+            searchable = _searchable_jsonl_record(obj)
+            raw_text = obj.get("text") if "text" in obj else obj.get("t", "")
+            if not isinstance(raw_text, str):
+                requires_full_reingest = True
+            if searchable:
+                base_searchable_count += 1
+            # Match by video_id, or by normalized title ONLY when id
+            # disambiguation is impossible (the line carries no id,
+            # or we don't know our own). The old title-OR-id match
+            # purged segments of a DIFFERENT video that legitimately
+            # shared the title ('Q&A', 'LIVE', weekly shows) —
+            # silent transcript loss that drift_scan can't detect
+            # because both sidecars stayed mutually consistent.
+            # (The .txt side still purges by title alone — its
+            # headers carry no ids — but with the .jsonl preserved,
+            # a lost .txt block is recoverable via Drift Scan's
+            # rebuild instead of being gone forever.)
+            _title_hit = bool(seg_title) and _norm_title(seg_title) == tit_key
+            _id_hit = bool(vid_norm) and seg_vid == vid_norm
+            if _id_hit or (_title_hit and (not seg_vid or not vid_norm)):
+                if seg_title:
+                    removed_titles.add(seg_title)
+                if searchable:
+                    removed_searchable_count += 1
+                if not seg_vid:
+                    removed_blank_video_id = True
+                continue # drop this line
             kept.append(line if line.endswith("\n") else line + "\n")
+            if searchable:
+                kept_searchable_count += 1
 
         # build the new segments inline and write the
         # filtered-kept lines + new lines in ONE atomic operation. Previously
         # this function wrote kept lines, then called _write_jsonl_entry which
         # re-read the file from disk and rewrote it — two reads + two writes
         # for an operation that only needs one of each.
-        new_lines = [_seg_to_jsonl_line(video_id, title, seg)
-                     for seg in new_segments]
+        canonical_records = [
+            _seg_to_jsonl_record(video_id, title, seg)
+            for seg in new_segments
+        ]
+        new_lines = [
+            json.dumps(record, ensure_ascii=False) + "\n"
+            for record in canonical_records
+        ]
 
         # If kept's last entry is missing a trailing newline, fix before append.
         if kept and not kept[-1].endswith("\n"):
             kept[-1] = kept[-1] + "\n"
 
         final_bytes = ("".join(kept) + "".join(new_lines)).encode("utf-8")
-        tmp = jsonl_path + ".tmp"
-        tmp_complete = False
         try:
-            with open(tmp, "wb") as f:
-                f.write(final_bytes)
-                try:
-                    f.flush()
-                    os.fsync(f.fileno())
-                except OSError as e:
-                    _log.debug("swallowed: %s", e)
-            tmp_complete = True
-            # Hide tmp BEFORE the replace so the jsonl is never
-            # briefly visible in Explorer (audit: transcribe_files H58).
-            try: _hide_file_win(tmp)
-            except Exception: pass
-            os.replace(tmp, jsonl_path)
-        except OSError as _oe:
+            atomic_write_bytes(
+                jsonl_path,
+                final_bytes,
+                validator=validate_jsonl_bytes,
+                before_replace=_hide_file_win,
+                after_replace=_hide_file_win,
+                stage_path=jsonl_path + ".tmp",
+                preserve_stage_on_replace_error=True,
+            )
+        except SidecarError as _oe:
             # previously returned early WITHOUT re-appending the
             # new segments, silently leaving the OLD entry on disk while the
             # caller thought retranscribe succeeded. Now we re-raise so the
             # caller's emit_error in _write_outputs surfaces the failure and
             # the user can see that their retranscribe didn't land.
-            if not tmp_complete:
-                try:
-                    _unhide_file_win(os.path.normpath(tmp))
-                    os.remove(tmp)
-                except OSError:
-                    pass
-            _log.error("_replace_jsonl_entry atomic replace failed: %s", _oe)
+            _log.error("_replace_jsonl_entry atomic write failed: %s", _oe)
             raise
+        final_generation = _jsonl_generation(jsonl_path)
+        if receipt_out is not None:
+            receipt_out.update({
+                "version": 1,
+                "jsonl_path": os.path.normpath(jsonl_path),
+                "video_id": vid_norm,
+                "title": title,
+                "base_generation": base_generation,
+                "final_generation": final_generation,
+                "final_sha256": hashlib.sha256(final_bytes).hexdigest(),
+                "base_searchable_count": base_searchable_count,
+                "final_searchable_count": (
+                    kept_searchable_count
+                    + sum(_searchable_jsonl_record(record)
+                          for record in canonical_records)
+                ),
+                "removed_searchable_count": removed_searchable_count,
+                "removed_blank_video_id": removed_blank_video_id,
+                "requires_full_reingest": requires_full_reingest,
+                "canonical_records": canonical_records,
+            })
     finally:
         # Always restore the hidden attribute, even on failure. If the
         # file was deleted by an earlier step or never existed, this is
@@ -593,7 +699,9 @@ def _replace_txt_entry_unlocked(txt_path: str, title: str, new_text: str,
                        source_tag: str,
                        extra_titles_to_remove=None,
                        old_text_candidates=None,
-                       video_id: str = "") -> bool:
+                       video_id: str = "",
+                       upload_date: str = "",
+                       duration_secs: float = 0) -> bool:
     """Surgically swap this video's `===(…)===\\n<body>\\n\\n\\n` block in
     the aggregated Transcript.txt. `_replace_txt_entry`.
 
@@ -603,7 +711,7 @@ def _replace_txt_entry_unlocked(txt_path: str, title: str, new_text: str,
 
     `source_tag` can be "(WHISPER:small)" or the bare model name; stored
     verbatim as the 4th bracketed field on the header line so the
-    ArchivePlayer / Browse source banner can detect it.
+    The companion viewer / Browse source banner can detect it.
 
     Returns True on success. On failure, raises — the caller in
     transcribe.core._write_outputs catches the exception and runs the
@@ -612,11 +720,7 @@ def _replace_txt_entry_unlocked(txt_path: str, title: str, new_text: str,
     failure so the caller's roll-back branch never fired, leaving the
     user with a new .jsonl + an old .txt (split state).
     """
-    try:
-        with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except FileNotFoundError:
-        content = ""
+    content = read_text(txt_path).text
 
     # Build purge set as NORMALIZED keys (NFC + lowercase +
     # whitespace-collapsed + trailing-punct stripped). Without this
@@ -631,6 +735,8 @@ def _replace_txt_entry_unlocked(txt_path: str, title: str, new_text: str,
     old_body_keys = {
         _body_key(t) for t in (old_text_candidates or ()) if _body_key(t)
     }
+    vid = (video_id or "").strip()
+    id_matches: list[tuple[int, int, re.Match[str]]] = []
     title_matches: list[tuple[int, int, re.Match[str]]] = []
     body_matches: list[tuple[int, int, re.Match[str]]] = []
     for i, m in enumerate(matches):
@@ -638,14 +744,28 @@ def _replace_txt_entry_unlocked(txt_path: str, title: str, new_text: str,
         if entry_key not in purge:
             continue
         end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
-        title_matches.append((m.start(), end, m))
+        candidate = (m.start(), end, m)
+        header_vid = (m.group(5) or "").strip()
+        if vid and header_vid == vid:
+            # v2 headers carry a stable identity. Prefer every block for the
+            # target id (including stale-title duplicates) over title/body
+            # heuristics, which are only needed for legacy v1 headers.
+            id_matches.append(candidate)
+            continue
+        if vid and header_vid:
+            # A v2 header for another video is authoritative evidence that a
+            # same-title block is not ours. Never feed it to legacy fallbacks.
+            continue
+        title_matches.append(candidate)
         if old_body_keys:
             body_start = content.find("\n", m.end(), end)
             body = content[(body_start + 1 if body_start >= 0 else m.end()):end]
             if _body_key(body) in old_body_keys:
-                body_matches.append((m.start(), end, m))
+                body_matches.append(candidate)
 
-    if old_body_keys:
+    if id_matches:
+        removals = id_matches
+    elif old_body_keys:
         removals = body_matches
         if not removals and len(title_matches) == 1:
             # Legacy/edited TXT body may not match JSONL exactly, but a single
@@ -666,9 +786,12 @@ def _replace_txt_entry_unlocked(txt_path: str, title: str, new_text: str,
     # didn't supply one, the video id) from the first removed entry so
     # the new block inherits the provenance.
     new_content = content
-    date_fmt = "(Unknown date)"
-    dur_fmt = "(Unknown length)"
-    vid = (video_id or "").strip()
+    # A recovery replacement can legitimately have no prior TXT block to
+    # inherit from. Preserve the caller's source metadata in that case while
+    # keeping the historical Unknown defaults for existing callers.
+    date_fmt = _format_upload_date(upload_date or "")
+    dur_raw = _format_duration_hms(duration_secs or 0) or ""
+    dur_fmt = f"({dur_raw})" if dur_raw else "(Unknown length)"
     captured = False
     for start, end, m in sorted(removals, key=lambda x: x[0], reverse=True):
         if not captured:
@@ -696,14 +819,5 @@ def _replace_txt_entry_unlocked(txt_path: str, title: str, new_text: str,
         raise ValueError(
             f"_replace_txt_entry refusing non-absolute txt_path: {txt_path}")
     os.makedirs(os.path.dirname(txt_path) or ".", exist_ok=True)
-    tmp = txt_path + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(new_content)
-        os.replace(tmp, txt_path)
-    except OSError:
-        # Clean up partial tmp so the next attempt doesn't see stale data.
-        try: os.remove(tmp)
-        except OSError: pass
-        raise
+    atomic_write_text(txt_path, new_content)
     return True

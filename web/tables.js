@@ -31,6 +31,8 @@
     const tbody = document.getElementById("subs-table-body");
     if (!tbody) return;
     tbody.innerHTML = "";
+    tbody.dataset.renderGeneration = String(
+      (Number(tbody.dataset.renderGeneration) || 0) + 1);
 
     const frag = document.createDocumentFragment();
     for (const r of (rows || [])) {
@@ -87,6 +89,15 @@
       frag.appendChild(tr);
     }
     tbody.appendChild(frag);
+    window._applySubsSort?.();
+
+    // Rendering creates new row elements, so no prior visual selection still
+    // exists. Keep the bulk toolbar in sync with that fact after refreshes and
+    // filters instead of leaving an old selected count on screen.
+    const bar = document.getElementById("subs-bulk-bar");
+    if (bar) bar.hidden = true;
+    const count = document.getElementById("subs-bulk-count");
+    if (count) count.textContent = "0 channels selected";
   }
 
   window._applySubsFilter = function (query) {

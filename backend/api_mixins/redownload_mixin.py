@@ -44,20 +44,29 @@ class RedownloadMixin:
         `sync_start_all` and started a regular Sync Subbed pass —
         the redownload state was never picked up.
 
-        Returns {ok, resumed: N, skipped: M}.
+        Returns counts for restored redownload and ordinary pending tasks.
         """
         resumed = 0
         skipped = 0
         queues = self._redownload_queues()
         try:
             # Snapshot the queue so we can iterate without mutation races.
-            tasks_snapshot = list(queues.sync)
+            tasks_snapshot = queues.sync_snapshot()
+            if not isinstance(tasks_snapshot, list):
+                raise TypeError("sync snapshot is not a list")
         except Exception:
-            tasks_snapshot = []
-        # Remove the redownload items from the live queue FIRST. The
-        # chan_redownload path will re-enqueue them via sync_enqueue +
-        # _redwnl_pending. Skipping this would leave stale rows in the
-        # popover for the lifetime of the chain worker.
+            legacy_tasks = getattr(queues, "sync", [])
+            tasks_snapshot = (list(legacy_tasks)
+                              if isinstance(legacy_tasks, list) else [])
+        regular_pending = sum(
+            1 for task in tasks_snapshot
+            if str(task.get("kind") or "download").lower() != "redownload"
+        )
+        redownload_total = len(tasks_snapshot) - regular_pending
+
+        # Keep every durable row in place while chan_redownload establishes
+        # the exact in-memory chain reservation.  The worker promotes that row
+        # to the crash-resumable current slot immediately before execution.
         for t in tasks_snapshot:
             kind = (t.get("kind") or "").lower()
             if kind != "redownload":
@@ -69,10 +78,6 @@ class RedownloadMixin:
                 skipped += 1
                 continue
             try:
-                queues.sync_remove(url or name)
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-            try:
                 video_id = str(t.get("only_video_id") or "").strip()
                 if video_id:
                     channel_url = str(t.get("channel_url") or "").strip()
@@ -81,26 +86,35 @@ class RedownloadMixin:
                                 else {"name": channel_name})
                     r = self.chan_redownload(
                         identity, res, scope=t.get("scope"),
+                        task_id=t.get("task_id", ""),
                         only_video={
                             "video_id": video_id,
                             "filepath": t.get("only_filepath") or "",
                             "title": t.get("only_title") or name,
-                        })
+                        },
+                        _queue_only=bool(regular_pending))
                 else:
                     identity = {"url": url} if url else {"name": name}
                     r = self.chan_redownload(
-                        identity, res, scope=t.get("scope"))
+                        identity, res, scope=t.get("scope"),
+                        task_id=t.get("task_id", ""),
+                        _queue_only=bool(regular_pending))
                 if isinstance(r, dict) and r.get("ok"):
                     resumed += 1
                 else:
                     skipped += 1
             except Exception:
                 skipped += 1
-        return {"ok": True, "resumed": resumed, "skipped": skipped}
+        result = {"ok": bool(resumed or not redownload_total),
+                  "resumed": resumed, "skipped": skipped,
+                  "regular_pending": regular_pending}
+        if redownload_total and not resumed:
+            result["error"] = "Saved redownload tasks could not be resumed"
+        return result
 
 
     def _run_redownload_one(self, ch, folder, new_res, scope_label,
-                            only_video=None):
+                            only_video=None, rd_task=None):
         """Run ONE redownload to completion. Called from the chain
         worker. Previously inlined as `_run` inside `chan_redownload`;
         extracted so the worker can drain multiple queued items
@@ -110,7 +124,7 @@ class RedownloadMixin:
         queues = self._redownload_queues()
         log_stream = self._redownload_log_stream()
         _scope_text = f" [{scope_label}]" if scope_label else ""
-        _rd_task = dict(ch)
+        _rd_task = dict(rd_task) if isinstance(rd_task, dict) else dict(ch)
         _rd_task["kind"] = "redownload"
         _rd_task["redownload_res"] = new_res
         only_video = only_video if isinstance(only_video, dict) else {}
@@ -128,9 +142,24 @@ class RedownloadMixin:
                 "only_title": video_title,
             })
         try:
-            queues.set_current_sync(_rd_task)
+            _rd_task_id = str(_rd_task.get("task_id") or "").strip()
+            durable_replace = getattr(
+                type(queues), "replace_current_task_durable", None)
+            published = bool(
+                _rd_task_id and callable(durable_replace)
+                and queues.replace_current_task_durable(
+                    "sync", _rd_task, expected_task_id=_rd_task_id)
+            )
+            if not published:
+                # Promotion already created the running slot. A failed CAS
+                # means Clear/Skip won or persistence failed; never resurrect
+                # that exact task with the non-transactional setter.
+                _log.debug(
+                    "redownload current-task decoration was not published "
+                    "for %s", _rd_task_id or "missing task id")
         except Exception as e:
-            _log.warning("redownload: set_current_sync failed; running task won't show in queue display: %s", e)
+            _log.warning(
+                "redownload: current-task decoration failed safely: %s", e)
         try:
             log_stream.emit([
                 ["[Sync] ", "sync_bracket"],
@@ -221,8 +250,25 @@ class RedownloadMixin:
         except Exception as e:
             log_stream.emit_error(f"Redownload crashed: {e}")
         finally:
-            try: queues.set_current_sync(None)
-            except Exception as e: _log.warning("redownload finally: set_current_sync(None) failed; stale task may appear in queue display: %s", e)
+            try:
+                current = queues.current_sync
+                if current is None:
+                    # An exact per-channel cancel durably clears the recovery
+                    # slot before signalling this worker.
+                    cleared = True
+                else:
+                    cleared = queues.replace_current_task_durable(
+                        "sync", None,
+                        expected_task_id=str(
+                            _rd_task.get("task_id") or "").strip(),
+                    )
+                if not cleared:
+                    _log.warning(
+                        "redownload completion could not durably clear its "
+                        "recovery slot; task remains recoverable")
+            except Exception as e:
+                _log.warning(
+                    "redownload finally: durable current clear failed: %s", e)
             log_stream.flush()
             try:
                 from backend import archive_scan as _as

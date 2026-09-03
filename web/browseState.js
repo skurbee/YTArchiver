@@ -24,7 +24,13 @@
   window._browseState = {
     submode: "channels",   // current sidebar mode
     view: "channels",      // within Channels: channels|videos|watch
-    channels: [],          // source data (channel cards)
+    channels: [],          // last fully-hydrated channel-card data
+    channelsReady: false,  // false until browse_list_channels succeeds
+    pendingChannels: [],   // cheap subscription rows held behind the loader
+    channelsError: false,  // keeps Retry visible after a failed first load
+    channelsRefreshState: "idle", // idle|initial|refreshing|error
+    channelSummaryOverrides: new Map(), // fresher counts during hydration
+    channelSummaryRevision: 0,
     currentChannel: null,
     videos: [],
     currentVideo: null,

@@ -462,8 +462,12 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
             # The catalog request and local scope check both completed. An
             # empty recent window is therefore a successful fresh check, not
             # an unattempted refresh.
-            stamp_channel_refresh(channel, "last_views_refresh_ts")
-            return {"ok": True, "fetched": 0, "refreshed": 0,
+            cancelled = bool(
+                cancel_event is not None and cancel_event.is_set())
+            if not cancelled:
+                stamp_channel_refresh(channel, "last_views_refresh_ts")
+            return {"ok": not cancelled, "cancelled": cancelled,
+                    "partial": False, "fetched": 0, "refreshed": 0,
                     "errors": 0, "skipped": 0,
                     "bulk_fetched": len(bulk)}
 
@@ -892,10 +896,10 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 fp_by_id[_v] = (_fp, _t or "")
         # Progress tick: emit a dim "[N/total] processed" line every
         # _PROGRESS_TICK_EVERY videos OR every _PROGRESS_TICK_SECS
-        # so a 600-video channel doesn't look stuck for an hour
+        # so a large channel doesn't look stuck for an hour
         # between the initial "N video(s) have updated counts..."
         # line and the final summary. User flagged this as "refresh
-        # views got stuck" on Bernie Sanders (610 videos).
+        # views got stuck" during long refreshes.
         _PROGRESS_TICK_EVERY = 25
         _PROGRESS_TICK_SECS = 20.0
         _last_tick_ts = time.time()
@@ -996,7 +1000,8 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     # Stamp last-refresh timestamp on the channel config. Separate
     # from per-video fetched_at so the Subs UI can say "refreshed
     # N minutes ago" for the whole channel.
-    if not cookie_auth_required and not rate_limited:
+    cancelled = bool(cancel_event is not None and cancel_event.is_set())
+    if not cookie_auth_required and not rate_limited and not cancelled:
         stamp_channel_refresh(channel, "last_views_refresh_ts")
 
     # Stop the heartbeat thread BEFORE the clear_line + summary so
@@ -1029,7 +1034,10 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         took=took,
     ))
     return {
-        "ok": not (cookie_auth_required or rate_limited),
+        "ok": not (cookie_auth_required or rate_limited or cancelled),
+        "cancelled": cancelled,
+        "partial": cancelled and bool(
+            no_meta_entry or full_fetched or updated_in_place),
         "fetched": no_meta_entry,
         "refreshed": full_fetched + updated_in_place,
         "errors": full_errors,

@@ -9,8 +9,6 @@ when moving them out of main.py.
 from __future__ import annotations
 
 import json
-import os
-from pathlib import Path
 from typing import Any
 
 from backend import subs as subs_backend
@@ -19,8 +17,11 @@ from backend import subs as subs_backend
 # so the scheduled auto-backup and this manual export share ONE
 # implementation. These aliases keep existing call sites and tests
 # working unchanged.
-from backend.auto_backup import (  # noqa: E402
+from backend.auto_backup import (
     BACKUP_MANIFEST_NAME as _BACKUP_MANIFEST_NAME,
+)
+from backend.auto_backup import (
+    BackupCancelled as _BackupCancelled,
 )
 from backend.auto_backup import (
     backup_file_entries as _backup_file_entries,
@@ -28,7 +29,13 @@ from backend.auto_backup import (
 from backend.auto_backup import (
     build_backup_zip as _build_backup_zip,
 )
-from backend.ytarchiver_config import config_is_writable, load_config, save_config
+from backend.services.managed_work import admitted_operation
+from backend.ytarchiver_config import (
+    config_is_writable,
+    config_transaction,
+    load_config,
+    update_config,
+)
 
 from ._shared import _api_err, normalize_dialog_paths
 
@@ -45,6 +52,7 @@ _CHANNEL_IMPORT_MAX = 10000
 _CHANNEL_IMPORT_STRING_LIMITS = {
     "name": 200,
     "folder": 200,
+    "folder_override": 200,
     "url": 500,
     "resolution": 32,
     "mode": 32,
@@ -162,50 +170,104 @@ class BackupMixin:
                         "error": (f"Channel import too large "
                                   f"({len(imported)} > {_CHANNEL_IMPORT_MAX})")}
             if not config_is_writable():
-                return {"ok": False, "error": "Write-gate off"}
-            cfg = load_config()
-            existing_urls = {
-                subs_backend.normalize_channel_url(c.get("url", ""))
-                for c in cfg.get("channels", [])
-            }
+                return {
+                    "ok": False,
+                    "error": ("Settings are temporarily read-only. Restart "
+                              "YTArchiver and try again."),
+                }
             added = 0
             # track WHY each entry was skipped so the UI can
             # tell the user (previously just reported a raw count with
             # no way to debug a partial import).
             skipped_reasons: list[dict[str, str]] = []
-            for ch in imported:
-                if not isinstance(ch, dict):
-                    skipped_reasons.append({
-                        "name": "(unknown)",
-                        "reason": "not a valid channel object",
-                    })
-                    continue
-                if not ch.get("url"):
-                    skipped_reasons.append({
-                        "name": ch.get("name") or "(no name)",
-                        "reason": "missing URL",
-                    })
-                    continue
-                clean_ch, clean_err = _clean_import_channel(ch)
-                if not clean_ch:
-                    skipped_reasons.append({
-                        "name": ch.get("name") or ch.get("url") or "(unknown)",
-                        "reason": clean_err or "invalid channel",
-                    })
-                    continue
-                if clean_ch["url"] in existing_urls:
-                    skipped_reasons.append({
-                        "name": clean_ch.get("name") or clean_ch["url"],
-                        "reason": "already subscribed",
-                    })
-                    continue
-                cfg.setdefault("channels", []).append(clean_ch)
-                existing_urls.add(clean_ch["url"])
-                added += 1
-            cfg["channels"].sort(key=lambda c: (c.get("name") or "").lower())
-            from backend.ytarchiver_config import save_config as _sc
-            if not _sc(cfg):
-                return {"ok": False, "error": "Save failed"}
+            with config_transaction() as cfg:
+                from backend.sync import channel_folder_name
+
+                existing_urls = {
+                    subs_backend.normalize_channel_url(
+                        c.get("url", "")).rstrip("/")
+                    for c in cfg.get("channels", []) if isinstance(c, dict)
+                }
+                existing_folders = {
+                    channel_folder_name(channel).strip().casefold():
+                        str(channel.get("name") or channel.get("folder") or "")
+                    for channel in cfg.get("channels", [])
+                    if isinstance(channel, dict)
+                    and channel_folder_name(channel).strip()
+                }
+                existing_names = {
+                    str(channel.get("name") or channel.get("folder") or "")
+                        .strip().casefold():
+                        str(channel.get("name") or channel.get("folder") or "")
+                    for channel in cfg.get("channels", [])
+                    if isinstance(channel, dict)
+                    and str(channel.get("name") or channel.get("folder") or "")
+                        .strip()
+                }
+                for ch in imported:
+                    if not isinstance(ch, dict):
+                        skipped_reasons.append({
+                            "name": "(unknown)",
+                            "reason": "not a valid channel object",
+                        })
+                        continue
+                    if not ch.get("url"):
+                        skipped_reasons.append({
+                            "name": ch.get("name") or "(no name)",
+                            "reason": "missing URL",
+                        })
+                        continue
+                    clean_ch, clean_err = _clean_import_channel(ch)
+                    if not clean_ch:
+                        skipped_reasons.append({
+                            "name": (
+                                ch.get("name") or ch.get("url") or "(unknown)"
+                            ),
+                            "reason": clean_err or "invalid channel",
+                        })
+                        continue
+                    url_identity = clean_ch["url"].rstrip("/")
+                    if url_identity in existing_urls:
+                        skipped_reasons.append({
+                            "name": clean_ch.get("name") or clean_ch["url"],
+                            "reason": "already subscribed",
+                        })
+                        continue
+                    name_identity = str(
+                        clean_ch.get("name") or clean_ch.get("folder") or ""
+                    ).strip().casefold()
+                    if name_identity and name_identity in existing_names:
+                        skipped_reasons.append({
+                            "name": clean_ch.get("name") or clean_ch["url"],
+                            "reason": "channel name is already used",
+                        })
+                        continue
+                    folder_identity = channel_folder_name(
+                        clean_ch).strip().casefold()
+                    if folder_identity and folder_identity in existing_folders:
+                        owner = existing_folders[folder_identity]
+                        skipped_reasons.append({
+                            "name": clean_ch.get("name") or clean_ch["url"],
+                            "reason": (
+                                "archive folder is already used"
+                                + (f" by {owner}" if owner else "")
+                            ),
+                        })
+                        continue
+                    cfg.setdefault("channels", []).append(clean_ch)
+                    existing_urls.add(url_identity)
+                    if folder_identity:
+                        existing_folders[folder_identity] = str(
+                            clean_ch.get("name") or clean_ch.get("folder") or ""
+                        )
+                    if name_identity:
+                        existing_names[name_identity] = str(
+                            clean_ch.get("name") or clean_ch.get("folder") or ""
+                        )
+                    added += 1
+                cfg["channels"].sort(
+                    key=lambda channel: (channel.get("name") or "").lower()
+                )
             self._reload_config()
             return {"ok": True, "added": added,
                     "skipped": len(skipped_reasons),
@@ -254,16 +316,39 @@ class BackupMixin:
             # snapshot via the sqlite3 backup API, manifest, latest
             # config snapshot) lives in auto_backup.build_backup_zip —
             # shared with the scheduled auto-backup.
-            _stats = _build_backup_zip(out_path)
-            # Record backup timestamp so Settings can show staleness (T295).
-            import time as _bk_time
-            _backup_ts = _bk_time.time()
+            services = getattr(self, "services", None)
+            queue_state = (getattr(services, "queues", None)
+                           if services is not None else None)
+            if queue_state is None:
+                queue_state = getattr(self, "_queues", None)
             try:
-                _c2 = load_config()
-                _c2["last_backup_ts"] = _backup_ts
-                save_config(_c2)
-            except Exception:
-                pass
+                with admitted_operation(
+                    self,
+                    owner="backup-export",
+                    label="Full backup export",
+                ) as cancel_event:
+                    _stats = _build_backup_zip(
+                        out_path,
+                        queue_state=queue_state,
+                        cancel_event=cancel_event,
+                    )
+                    # Keep the timestamp write inside the admitted operation.
+                    # Restore must not swap config after the ZIP commits but
+                    # before this final state mutation retires.
+                    import time as _bk_time
+                    _backup_ts = _bk_time.time()
+                    try:
+                        update_config(
+                            lambda cfg: cfg.__setitem__(
+                                "last_backup_ts", _backup_ts))
+                    except Exception:
+                        pass
+            except _BackupCancelled as exc:
+                return {
+                    "ok": False,
+                    "cancelled": True,
+                    "error": str(exc),
+                }
             _resp = {"ok": True, "path": out_path,
                      "files": _stats["files"],
                      "last_backup_ts": _backup_ts}
@@ -369,29 +454,16 @@ class BackupMixin:
 
 
     def import_full_backup(self, zip_path=None):
-        """Restore a previously-exported backup ZIP into %APPDATA%\\YTArchiver.
+        """Validate, stage, and atomically restore application state.
 
-        Before overwriting any existing files, the current config is snapshotted
-        to backups/config_pre_restore_YYYY-MM-DD_HHMMSS.json so the user can roll
-        back. Gated by config_is_writable() — a read-only probe still
-        lists the ZIP's contents so the frontend can confirm before committing.
-
-        Audit U-11: `zip_path` may be supplied by the caller (after the
-        user confirmed the preview). When None, falls back to opening
-        the file picker directly (legacy one-click flow).
+        Live files are replaced only after the complete ZIP passes limits,
+        checksum, JSON, and SQLite validation. The old in-memory state owners
+        are frozen before commit and the UI must restart afterward.
         """
         try:
-            import datetime as _dt
-            import shutil as _sh
-            import zipfile as _zf
-
             import webview as _wv
 
-            from backend.ytarchiver_config import (
-                APP_DATA_DIR,
-                CONFIG_FILE,
-                config_is_writable,
-            )
+            from backend.services.restore_coordinator import restore_backup
             if self._window is None:
                 return {"ok": False, "error": "No window"}
             zip_path = (zip_path or "").strip()
@@ -405,128 +477,36 @@ class BackupMixin:
                 if not zip_path:
                     return {"ok": False, "cancelled": True}
 
-            # First pass: list contents (read-only; safe even if gated off).
-            try:
-                with _zf.ZipFile(zip_path, "r") as zf:
-                    names = [n for n in zf.namelist() if not n.endswith("/")]
-            except Exception as e:
-                return {"ok": False, "error": f"Not a valid ZIP: {e}"}
-            if not names:
-                return {"ok": False, "error": "Backup is empty"}
-
-            # Whitelist — only restore files we recognise from export.
-            # also allow the FTS index DB so backups that
-            # include it can restore cleanly.
-            allowed_top = _allowed_backup_top_names()
-
             if not config_is_writable():
                 return {
                     "ok": False,
                     "write_blocked": True,
                     "zip_path": zip_path,
-                    "names": names,
-                    "error": "Write-gate off",
+                    "error": ("Settings are temporarily read-only. Restart "
+                              "YTArchiver and try again."),
                 }
-
-            # Snapshot current config BEFORE touching anything.
-            backup_dir = APP_DATA_DIR / "backups"
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            ts = _dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-            snap_path = backup_dir / f"config_pre_restore_{ts}.json"
-            if CONFIG_FILE.exists():
-                try:
-                    _sh.copy2(str(CONFIG_FILE), str(snap_path))
-                except Exception as e:
-                    return {"ok": False, "error": f"Pre-restore snapshot failed: {e}"}
-
-            # Extract whitelisted files.
-            restored = []
-            skipped = []
-            # resolve APP_DATA_DIR once for path-containment
-            # checks. Any target that doesn't resolve under it after
-            # path-join gets rejected. This blocks a crafted ZIP with
-            # "backups/../../../../Windows/File.json"-style names from
-            # writing outside APP_DATA_DIR even though each individual
-            # component looks innocuous.
-            _app_data_resolved = Path(str(APP_DATA_DIR)).resolve()
-            with _zf.ZipFile(zip_path, "r") as zf:
-                for name in names:
-                    # reject entries containing `..` OR a
-                    # drive letter / absolute path. ZipFile preserves
-                    # the raw name, which on Windows can contain
-                    # drive-qualified paths that write anywhere.
-                    _bad_chars = (".." in name.split("/")
-                                  or name.startswith(("/", "\\"))
-                                  or (len(name) > 1 and name[1] == ":"))
-                    if _bad_chars:
-                        skipped.append(f"{name} (rejected — suspicious path)")
-                        continue
-                    # Strip any directory prefix for top-level files; keep
-                    # backups/config_*.json in its folder.
-                    if name.startswith("backups/") and name.endswith(".json"):
-                        target = APP_DATA_DIR / name
-                    else:
-                        base = os.path.basename(name)
-                        if base not in allowed_top:
-                            skipped.append(name)
-                            continue
-                        target = APP_DATA_DIR / base
-                    # final containment check — resolve the target
-                    # and require it to be a TRUE child of
-                    # APP_DATA_DIR, not just a string prefix-match.
-                    # The previous startswith() check would let a
-                    # path like .../YTArchiver2/file pass when
-                    # APP_DATA_DIR resolves to .../YTArchiver,
-                    # allowing extraction outside the directory via
-                    # crafted ZIP names. Path.is_relative_to gives
-                    # the strict parent-child check.
-                    try:
-                        _t_resolved = Path(str(target)).resolve()
-                        try:
-                            _ok_contained = _t_resolved.is_relative_to(_app_data_resolved)
-                        except AttributeError:
-                            # Python <3.9 fallback — compare parents.
-                            _ok_contained = (
-                                _app_data_resolved in _t_resolved.parents
-                                or _t_resolved == _app_data_resolved)
-                        if not _ok_contained:
-                            skipped.append(f"{name} (rejected — escapes APP_DATA_DIR)")
-                            continue
-                    except Exception:
-                        skipped.append(f"{name} (rejected — path resolve failed)")
-                        continue
-                    # Atomic extract — write to .restore.tmp then
-                    # os.replace into target. Previously a crash /
-                    # disk-full / read error mid-write truncated the
-                    # live target file (config.json / queue.json /
-                    # the DB). After this fix the live target stays
-                    # intact until the new content is fully buffered
-                    # to disk.
-                    try:
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        _tmp = str(target) + ".restore.tmp"
-                        try:
-                            with zf.open(name, "r") as src, open(_tmp, "wb") as dst:
-                                dst.write(src.read())
-                            os.replace(_tmp, str(target))
-                        except Exception:
-                            try: os.remove(_tmp)
-                            except OSError: pass
-                            raise
-                        restored.append(target.name)
-                    except Exception as e:
-                        skipped.append(f"{name} ({e})")
-
-            # Force a reload of in-memory config.
-            self._reload_config()
-            return {
-                "ok": True,
-                "files_restored": len(restored),
-                "restored": restored,
-                "skipped": skipped,
-                "pre_restore_snapshot": str(snap_path) if CONFIG_FILE.exists() else None,
-                "zip_path": zip_path,
-                "needs_restart": True,
-            }
+            prepare = getattr(self, "_prepare_restore_commit_fn", None)
+            if not callable(prepare):
+                return {
+                    "ok": False,
+                    "error": (
+                        "Restore safety coordinator is not ready. Restart "
+                        "YTArchiver and try again."
+                    ),
+                }
+            result = restore_backup(zip_path, before_commit=prepare)
+            result["zip_path"] = zip_path
+            if result.get("ok"):
+                # Shutdown must not flush any pre-restore in-memory snapshot.
+                self._restore_state_committed = True
+            elif getattr(self, "_restore_quiesced", False):
+                # Validation has already passed and this process crossed the
+                # one-way freeze boundary. Even when commit/rollback reports a
+                # failure, using the old in-memory owners again would be unsafe.
+                result["needs_restart"] = True
+            return result
         except Exception as e:
-            return _api_err("BACKUP_READ_FAILED", str(e))
+            result = _api_err("BACKUP_READ_FAILED", str(e))
+            if getattr(self, "_restore_quiesced", False):
+                result["needs_restart"] = True
+            return result

@@ -1,0 +1,16 @@
+{
+  "name": "ytarchiver-frontend-tests",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Browser behavior tests for the YTArchiver pywebview frontend",
+  "scripts": {
+    "test:browser": "playwright test",
+    "test:browser:headed": "playwright test --headed"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -147,7 +147,7 @@ def bookmark_add(video_id: str, title: str, channel: str,
 def bookmark_list(limit: int = 500) -> list[dict[str, Any]]:
     conn = _idx._reader_open()
     if conn is None:
-        return []
+        raise RuntimeError("Search index is unavailable.")
     limit = _coerce_limit(limit)
     with _idx._reader_lock:
         cur = conn.execute(

@@ -15,15 +15,14 @@
 
 [project]
 name = "ytarchiver"
-# Source of truth for the runtime version is backend/version.py
-# (APP_VERSION). The field below is kept loosely in sync for tooling
-# discoverability — the deploy workflow does not auto-bump it, so
-# treat the runtime APP_VERSION as authoritative if these ever drift.
-version = "82.9"
+# backend/version.py is the one and only version source. This repository is
+# not built as a wheel, so no packaging backend needs to materialize the
+# dynamic field.
+dynamic = ["version"]
 description = "Subscription-based YouTube channel archiver with local Whisper transcription, FTS5 transcript search, and a pywebview UI."
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.13"
+requires-python = "==3.13.*"
 authors = [{ name = "skurbee" }]
 keywords = ["youtube", "archive", "yt-dlp", "whisper", "transcription", "pywebview"]
 classifiers = [
@@ -39,20 +38,36 @@ classifiers = [
     "Topic :: Utilities",
 ]
 dependencies = [
-    "pywebview>=6.2,<7",
-    "pystray>=0.19,<0.20",
-    "Pillow>=11,<13",
-    "psutil>=7,<8",
+    "pywebview==6.2.1",
+    "pystray==0.19.5",
+    "Pillow==12.2.0",
+    "psutil==7.0.0",
 ]
 
 [project.optional-dependencies]
-dev = ["ruff>=0.15"]
+build = ["pyinstaller==6.19.0"]
+dev = ["coverage==7.16.0", "pytest==9.0.3", "ruff==0.15.13"]
 
 [project.urls]
 Homepage = "https://github.com/skurbee/YTArchiver"
 Repository = "https://github.com/skurbee/YTArchiver"
 Changelog = "https://github.com/skurbee/YTArchiver/blob/main/docs/CHANGELOG.md"
 
-# Note: ruff settings live in `ruff.toml` at the repo root (already
-# configured). If you remove that file, copy the [tool.ruff] block here
-# instead.
+# Full transitive versions and Windows artifact hashes live under
+# requirements/. pyproject lists only the human-facing direct dependencies.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+branch = true
+source = ["backend"]
+# A few frontend-only Python harnesses intentionally execute Node without
+# importing backend code. Per-file isolation makes that expected; the combined
+# report still fails naturally if no coverage data exists at all.
+disable_warnings = ["no-data-collected"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false

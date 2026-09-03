@@ -8,19 +8,21 @@ every backend dependency. Existing mixins can keep using `self._queues`,
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+from backend.services.config_repository import (
+    ConfigLoader,
+    ConfigRepository,
+    ConfigSaver,
+    ConfigUpdater,
+)
 
 if TYPE_CHECKING:
     from backend.log_stream import LogStreamer
     from backend.queues import QueueState
     from backend.services.event_bus import BridgeEventBus
     from backend.transcribe import TranscribeManager
-
-
-ConfigLoader = Callable[[], dict[str, Any]]
-ConfigSaver = Callable[[dict[str, Any]], bool]
 
 
 @dataclass(slots=True)
@@ -37,7 +39,23 @@ class AppServices:
     log_stream: LogStreamer
     transcribe: TranscribeManager
     event_bus: BridgeEventBus
+    update_config: ConfigUpdater | None = None
+    config_repository: ConfigRepository | None = None
+
+    def __post_init__(self) -> None:
+        if self.config_repository is None:
+            self.config_repository = ConfigRepository(
+                self.load_config,
+                self.save_config,
+                self.update_config,
+            )
 
     def fresh_config(self) -> dict[str, Any]:
         """Read the latest config from disk through the injected loader."""
-        return self.load_config() or {}
+        assert self.config_repository is not None
+        return self.config_repository.load()
+
+    def mutate_config(self, mutator):
+        """Apply one serialized read-modify-write config transaction."""
+        assert self.config_repository is not None
+        return self.config_repository.mutate(mutator)

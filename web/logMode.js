@@ -4,23 +4,6 @@
 (function () {
   "use strict";
 
-  const _browseState = window._browseState || {};
-  const showContextMenu = window.showContextMenu || (() => {});
-  const askConfirm = window.askConfirm;
-  const askDanger = window.askDanger;
-  const askQuestion = window.askQuestion;
-  const askChoice = window.askChoice;
-  const askTextInput = window.askTextInput;
-  const escapeHtml = window.YT?.util?.escapeHtml || ((s) => String(s ?? ""));
-  function bridgeCall(method, ...args) {
-    const fn = window.YT?.bridge?.bridgeCall;
-    if (fn) return fn(method, ...args);
-    return undefined;
-  }
-  function nativeBridgeUp() {
-    return !!window.YT?.bridge?.isUp?.();
-  }
-
   // ─── Log mode dropdown (Simple / Verbose) ────────────────────────────
   // Matches YTArchiver's ttk.Combobox with values=["Simple","Verbose"].
   function initLogMode() {
@@ -35,9 +18,10 @@
     sel.addEventListener("change", (e) => {
       const mode = e.target.value;
       document.body.dataset.logMode = mode;
-      if (nativeBridgeUp()) {
-        bridgeCall("set_log_mode", mode);
-      }
+      // Settings owns persistence through settings_save(). Keeping this
+      // listener presentation-only avoids two competing config writes for a
+      // single dropdown change. The backend hot-applies log filtering as part
+      // of that settings_save call.
     });
   }
 

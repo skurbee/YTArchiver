@@ -33,6 +33,17 @@
   const askDanger = window.askDanger;
   const askQuestion = window.askQuestion;
   const askChoice = window.askChoice;
+  const displayText = window.YT?.util?.displayText || ((s) => String(s ?? ""));
+  const BROWSE_SUBMODE_TITLES = Object.freeze({
+    channels: "Channels",
+    recent: "Videos",
+    search: "Search transcripts",
+    graph: "Word frequency",
+    bookmarks: "Bookmarks",
+    manual: "Manual Downloads",
+    trash: "Trash",
+    index: "Archive index",
+  });
   let _browseFilterTimer = null;
   function bridgeCall(method, ...args) {
     const fn = window.YT?.bridge?.bridgeCall;
@@ -68,6 +79,7 @@
         syncSubmodeA11y();
         _browseState.submode = b.dataset.submode;
         browseNavigate();
+        window.YT?.navigationHistory?.record?.();
       });
     });
     const channelsButton = document.querySelector(
@@ -142,40 +154,6 @@
       }
     };
     document.getElementById("browse-back-btn")?.addEventListener("click", window._browseGoBack);
-
-    // Mouse button 4 (back) / 5 (forward) — browser-style navigation
-    // across the Browse tab. the user uses a 5-button mouse and expected
-    // these to work like in a browser. `mouseup` event's `.button`
-    // gives us 3 for back, 4 for forward on Windows; we listen on
-    // `auxclick` which fires for non-primary buttons. `preventDefault`
-    // blocks the browser's native gesture (which would try to navigate
-    // the pywebview URL).
-    //
-    // Forward: re-enters the Watch view with the most recently viewed
-    // video. Stored in `_browseState.lastWatched` when `_browseGoBack`
-    // leaves Watch. If there's nothing to forward to, it's a no-op.
-    window.addEventListener("mouseup", (e) => {
-      if (document.querySelector(".tab.active")?.dataset.tab !== "browse") {
-        return;
-      }
-      if (e.button === 3) {
-        // Back
-        e.preventDefault();
-        if (_browseState.view === "watch") {
-          // Stash the current video so Forward can re-enter.
-          _browseState.lastWatched = _browseState.currentVideo || null;
-        }
-        window._browseGoBack?.();
-      } else if (e.button === 4) {
-        // Forward — re-open the last Watch view we backed out of.
-        e.preventDefault();
-        const v = _browseState.lastWatched;
-        if (v && typeof window._openVideoInWatch === "function") {
-          _browseState.lastWatched = null;
-          window._openVideoInWatch(v);
-        }
-      }
-    });
 
     // Sort dropdown
     document.getElementById("browse-sort")?.addEventListener("change", (e) => {
@@ -253,6 +231,33 @@
     filterCurrentView(document.getElementById("browse-filter")?.value || "");
   };
 
+  function _renderChannelsForCurrentControls(q) {
+    if (_browseState.channelsReady !== true) {
+      if (!_browseState.channelsError) {
+        window.renderChannelGridLoading?.();
+      }
+      return;
+    }
+    q = String(q ?? (
+      _browseState.view === "channels"
+        ? document.getElementById("browse-filter")?.value
+        : ""
+    ) ?? "").toLowerCase().trim();
+    const rows = Array.isArray(_browseState.channels)
+      ? _browseState.channels : [];
+    const filtered = !q
+      ? rows
+      : rows.filter(c => String(c.folder || c.name || "")
+        .toLowerCase().includes(q));
+    window.renderChannelGrid(_sortChannels(filtered), (c) => {
+      _browseState.currentChannel = c;
+      if (typeof window.loadVideosFor === "function") window.loadVideosFor(c);
+      showView("videos");
+    });
+  }
+  window._renderChannelsForCurrentControls =
+    _renderChannelsForCurrentControls;
+
   // Live filter for the channel grid + video grid (Browse tab's
   // top-right search box). Previously lived in indexControls.js where
   // it was unreachable from this IIFE — moved here so the wiring
@@ -260,14 +265,7 @@
   function filterCurrentView(q) {
     q = (q || "").toLowerCase().trim();
     if (_browseState.view === "channels") {
-      const filtered = !q
-        ? _browseState.channels
-        : _browseState.channels.filter(c => (c.folder || "").toLowerCase().includes(q));
-      window.renderChannelGrid(_sortChannels(filtered), (c) => {
-        _browseState.currentChannel = c;
-        if (typeof window.loadVideosFor === "function") window.loadVideosFor(c);
-        showView("videos");
-      });
+      _renderChannelsForCurrentControls(q);
     } else if (_browseState.view === "videos") {
       if (typeof window._filterChannelVideosPaged === "function" &&
           window._filterChannelVideosPaged(q)) {
@@ -313,6 +311,12 @@
     const backBtn = document.getElementById("browse-back-btn");
     const sortWrap = document.getElementById("browse-sort-wrap");
     const title = document.getElementById("browse-main-title");
+    // Reset shared Browse chrome before any destination-specific async loader
+    // starts. A late background result must never leave a new screen carrying
+    // the title of the channel page the user just left.
+    if (title && BROWSE_SUBMODE_TITLES[mode]) {
+      title.textContent = BROWSE_SUBMODE_TITLES[mode];
+    }
     const filter = document.getElementById("browse-filter");
     // Grab the whole filter+icon wrap so we can hide the orphan
     // magnifying-glass icon alongside the input on views that don't
@@ -336,7 +340,6 @@
       // filter input, so hide the top-level find-wrap entirely (wrap,
       // not just input — otherwise the icon orphans).
       document.getElementById("view-recent").hidden = false;
-      title.textContent = "Videos";
       backBtn.hidden = true;
       sortWrap.hidden = true;
       if (findWrap) findWrap.hidden = true;
@@ -348,7 +351,6 @@
       // hide the top-level find-wrap too (same orphan-icon bug as
       // recent if we only hid the input).
       document.getElementById("view-search").hidden = false;
-      title.textContent = "Search transcripts";
       backBtn.hidden = true;
       sortWrap.hidden = true;
       if (findWrap) findWrap.hidden = true;
@@ -357,7 +359,6 @@
       _browseState.view = "search";
     } else if (mode === "graph") {
       document.getElementById("view-graph").hidden = false;
-      title.textContent = "Word frequency";
       backBtn.hidden = true;
       sortWrap.hidden = true;
       if (findWrap) findWrap.hidden = true;
@@ -365,7 +366,6 @@
       window.populateGraphChannels?.();
     } else if (mode === "bookmarks") {
       document.getElementById("view-bookmarks").hidden = false;
-      title.textContent = "Bookmarks";
       backBtn.hidden = true;
       sortWrap.hidden = true;
       if (findWrap) findWrap.hidden = true;
@@ -373,19 +373,24 @@
       window.refreshBookmarks?.();
     } else if (mode === "manual") {
       document.getElementById("view-manual").hidden = false;
-      title.textContent = "Manual Downloads";
       backBtn.hidden = true;
       sortWrap.hidden = true;
       if (findWrap) findWrap.hidden = true;
       _browseState.view = "manual";
       if (typeof window._loadManualView === "function") window._loadManualView();
+    } else if (mode === "trash") {
+      document.getElementById("view-trash").hidden = false;
+      backBtn.hidden = true;
+      sortWrap.hidden = true;
+      if (findWrap) findWrap.hidden = true;
+      _browseState.view = "trash";
+      if (typeof window._loadTrashView === "function") window._loadTrashView();
     } else if (mode === "index") {
       // Browse > Index sub-mode was removed; the Index controls now
-      // live in Settings → Index. Null-check defensively in case
+      // live in Health → Library. Null-check defensively in case
       // anything tries to switch to "index" mode in the future.
       const idx = document.getElementById("view-index");
       if (idx) idx.hidden = false;
-      title.textContent = "Archive index";
       backBtn.hidden = true;
       sortWrap.hidden = true;
     }
@@ -425,7 +430,7 @@
       if (focusItem) {
         const name = focusItem.folder || focusItem.name || "";
         const card = [...el.querySelectorAll(".channel-card")].find(c =>
-          (c.querySelector(".channel-card-name")?.textContent || "") === name);
+          String(c.dataset.channelName || "") === name);
         if (card) {
           card.classList.add("flash-hit");
           setTimeout(() => card.classList.remove("flash-hit"), 1400);
@@ -533,7 +538,8 @@
       }
     } else if (viewName === "videos") {
       document.getElementById("view-videos").hidden = false;
-      title.textContent = _browseState.currentChannel?.folder || "Videos";
+      title.textContent = displayText(
+        _browseState.currentChannel?.folder || "Videos");
       backBtn.hidden = false;
       sortWrap.hidden = false;
       if (chanSortWrap) chanSortWrap.hidden = true;
@@ -542,7 +548,8 @@
       if (findWrap) findWrap.hidden = false;
     } else if (viewName === "watch") {
       document.getElementById("view-watch").hidden = false;
-      title.textContent = _browseState.currentVideo?.title || "Watch";
+      title.textContent = displayText(
+        _browseState.currentVideo?.title || "Watch");
       backBtn.hidden = false;
       sortWrap.hidden = true;
       if (chanSortWrap) chanSortWrap.hidden = true;
@@ -563,6 +570,7 @@
       // fetch was slow).
       _paintWatchLoadingState(_browseState.currentVideo);
     }
+    window.YT?.navigationHistory?.record?.();
   }
 
   // Repaint the Watch pane with a "Loading…" treatment for every slot
@@ -573,10 +581,13 @@
     try {
       const titleEl = document.getElementById("watch-title");
       const metaEl = document.getElementById("watch-meta");
-      if (titleEl) titleEl.textContent = (video && video.title) || "Loading…";
+      if (titleEl) {
+        titleEl.textContent = displayText(
+          (video && video.title) || "Loading…");
+      }
       if (metaEl) {
         const parts = [];
-        if (video?.channel) parts.push(video.channel);
+        if (video?.channel) parts.push(displayText(video.channel));
         if (video?.uploaded) parts.push(video.uploaded);
         if (video?.duration) parts.push(video.duration);
         if (video?.views) parts.push(video.views + " views");

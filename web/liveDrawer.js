@@ -34,11 +34,18 @@
       // initDeferredLivestreams re-checks every 30s so the drawer
       // reappears automatically after snooze expires.
       const state = await bridgeCall("livestreams_drawer_state");
+      if (state && state.ok === false) {
+        console.warn("deferred drawer state:", state.error || state);
+      }
       if (state?.ok && state.visible === false) {
         wrap.hidden = true;
         return;
       }
       const res = await bridgeCall("livestreams_list");
+      if (!res?.ok) {
+        console.warn("deferred list:", res?.error || "load failed");
+        return;
+      }
       const items = res?.items || [];
       if (!items.length) { wrap.hidden = true; return; }
       wrap.hidden = false;
@@ -59,8 +66,10 @@
           ? ` \u2014 ${it.title.slice(0, 60)}` : "";
         row.querySelector("[data-drop]").addEventListener("click", async () => {
           try {
-            await bridgeCall("livestreams_drop", it.video_id);
-            refreshDeferredLivestreams();
+            const result = await bridgeCall("livestreams_drop", it.video_id);
+            if (result?.ok) refreshDeferredLivestreams();
+            else window._showToast?.(
+              result?.error || "Couldn't drop deferred entry.", "error");
           } catch (e) {
             window._showToast?.("Couldn't drop deferred entry: " + e, "error");
           }
@@ -80,7 +89,12 @@
           });
           if (!ok) return;
           try {
-            await bridgeCall("livestreams_ignore", it.video_id);
+            const result = await bridgeCall("livestreams_ignore", it.video_id);
+            if (!result?.ok) {
+              window._showToast?.(
+                result?.error || "Couldn't ignore video.", "error");
+              return;
+            }
             window._showToast?.("Ignored. Won't appear again.", "ok");
             refreshDeferredLivestreams();
           } catch (e) {
@@ -97,11 +111,22 @@
     // snooze the drawer so it stops nagging until that time.
     const retryBtn = document.getElementById("btn-deferred-retry");
     const retryMenu = document.getElementById("deferred-retry-menu");
-    const closeMenu = () => { if (retryMenu) retryMenu.hidden = true; };
+    const closeMenu = () => {
+      if (retryMenu) retryMenu.hidden = true;
+      retryBtn?.setAttribute("aria-expanded", "false");
+    };
     retryBtn?.addEventListener("click", (e) => {
       e.stopPropagation();
       if (!retryMenu) return;
       retryMenu.hidden = !retryMenu.hidden;
+      retryBtn.setAttribute("aria-expanded", retryMenu.hidden ? "false" : "true");
+      if (!retryMenu.hidden) retryMenu.querySelector("button")?.focus();
+    });
+    retryMenu?.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      closeMenu();
+      retryBtn?.focus();
     });
     document.addEventListener("click", (e) => {
       if (!retryMenu || retryMenu.hidden) return;
@@ -112,16 +137,36 @@
         const mode = b.dataset.retry;
         closeMenu();
         if (mode === "now") {
-          if (nativeBridgeUp()) bridgeCall("sync_start_all");
-          window._showToast?.("Retrying deferred livestreams via Sync Subbed.", "ok");
+          if (!nativeBridgeUp()) {
+            window._showToast?.("Sync Subbed isn't ready yet. Try again in a moment.", "warn");
+            return;
+          }
+          const result = await bridgeCall("sync_start_all");
+          window._showToast?.(
+            result?.ok
+              ? "Retrying deferred livestreams via Sync Subbed."
+              : (result?.error || "Sync Subbed did not start."),
+            result?.ok ? "ok" : "error");
         } else if (mode === "24h") {
-          if (nativeBridgeUp()) await bridgeCall("livestreams_snooze", 24 * 60 * 60);
-          window._showToast?.("Deferred livestreams snoozed for 24 hours.", "ok");
-          refreshDeferredLivestreams();
+          const result = nativeBridgeUp()
+            ? await bridgeCall("livestreams_snooze", 24 * 60 * 60)
+            : { ok: false, error: "YTArchiver isn't ready yet. Try again in a moment." };
+          window._showToast?.(
+            result?.ok
+              ? "Deferred livestreams snoozed for 24 hours."
+              : (result?.error || "Could not snooze deferred livestreams."),
+            result?.ok ? "ok" : "error");
+          if (result?.ok) refreshDeferredLivestreams();
         } else if (mode === "1w") {
-          if (nativeBridgeUp()) await bridgeCall("livestreams_snooze", 7 * 24 * 60 * 60);
-          window._showToast?.("Deferred livestreams snoozed for 1 week.", "ok");
-          refreshDeferredLivestreams();
+          const result = nativeBridgeUp()
+            ? await bridgeCall("livestreams_snooze", 7 * 24 * 60 * 60)
+            : { ok: false, error: "YTArchiver isn't ready yet. Try again in a moment." };
+          window._showToast?.(
+            result?.ok
+              ? "Deferred livestreams snoozed for 1 week."
+              : (result?.error || "Could not snooze deferred livestreams."),
+            result?.ok ? "ok" : "error");
+          if (result?.ok) refreshDeferredLivestreams();
         }
       });
     });
@@ -132,6 +177,11 @@
       if (!ok) return;
       if (!nativeBridgeUp()) return;
       const r = await bridgeCall("livestreams_list");
+      if (!r?.ok) {
+        window._showToast?.(
+          r?.error || "Could not load deferred livestreams.", "error");
+        return;
+      }
       let cleared = 0;
       let failed = 0;
       for (const it of (r?.items || [])) {

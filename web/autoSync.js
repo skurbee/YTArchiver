@@ -25,6 +25,7 @@
   function initAutorun() {
     const sel = document.getElementById("auto-sync-select");
     const cd = document.getElementById("autorun-countdown");
+    const modeSel = document.getElementById("settings-autorun-mode");
     const clockWrap = document.getElementById("autorun-clock-time-wrap");
     const clockSel = document.getElementById("auto-sync-clock-time");
     if (!sel) return;
@@ -36,7 +37,9 @@
     // time. dropdown.js only auto-enhances `.settings-view` selects, so
     // this one (in the download controls row) was missed. Enhance it here
     // and repaint after fetchAnchor sets the value below.
-    try { window.enhanceSelect?.(sel); } catch (e) { /* non-fatal */ }
+    try {
+      window.enhanceSelect?.(sel);
+    } catch (e) { /* non-fatal */ }
     let _clockInterval = 0;
     const _clockLabel = (minutes, interval) => {
       const one = (value) => {
@@ -53,8 +56,16 @@
       return one(minutes);
     };
     const _syncClockControl = (st) => {
-      if (!clockWrap || !clockSel) return;
       const interval = Number(st?.mins || 0);
+      // The persistent timer-versus-fixed-time choice lives in Settings.
+      // Keep that control synchronized with the live scheduler while this
+      // row owns only the clock-time picker that some fixed schedules need.
+      if (modeSel) {
+        modeSel.value = st?.mode === "clock" ? "clock" : "timer";
+        modeSel.dataset.savedValue = modeSel.value;
+        modeSel._ytddRepaint?.();
+      }
+      if (!clockWrap || !clockSel) return;
       const available = !!st?.clock_time_available
         && (interval === 720 || interval === 1440);
       clockWrap.hidden = !available;
@@ -217,12 +228,18 @@
     let _selChangeInFlight = false;
     sel.addEventListener("change", async () => {
       if (_selChangeInFlight) return;
-      if (!nativeBridgeUp()) return;
+      if (!nativeBridgeUp()) {
+        await fetchAnchor();
+        paint();
+        return;
+      }
       _selChangeInFlight = true;
+      sel.disabled = true;
+      sel._ytddRepaint?.();
       try {
         const result = await bridgeCall("autorun_set", sel.value);
         if (result?.ok === false) {
-          window._showToast?.(result.error || "Could not change auto-sync.", "warn");
+          window._showToast?.(result.error || "Could not change auto-sync.", "error");
         } else {
           const msg = sel.value === "Off" ? "Auto-sync off."
             : sel.value === "When budget allows"
@@ -232,17 +249,30 @@
         }
         await fetchAnchor();
         paint();
-      } catch (e) { window._showToast?.("Error: " + e, "error"); }
-      finally { _selChangeInFlight = false; }
+      } catch (e) {
+        window._showToast?.("Error: " + e, "error");
+        await fetchAnchor();
+        paint();
+      } finally {
+        _selChangeInFlight = false;
+        sel.disabled = false;
+        sel._ytddRepaint?.();
+      }
     });
     clockSel?.addEventListener("change", async () => {
-      if (!nativeBridgeUp()) return;
+      if (!nativeBridgeUp()) {
+        await fetchAnchor();
+        paint();
+        return;
+      }
+      clockSel.disabled = true;
+      clockSel._ytddRepaint?.();
       try {
         const result = await bridgeCall(
           "autorun_set_clock_time", Number(clockSel.value));
         if (result?.ok === false) {
           window._showToast?.(
-            result.error || "Could not save auto-sync time.", "warn");
+            result.error || "Could not save auto-sync time.", "error");
         } else {
           window._showToast?.(
             `Auto-sync time set to ${clockSel.options[clockSel.selectedIndex]?.text || ""}.`,
@@ -252,6 +282,11 @@
         paint();
       } catch (e) {
         window._showToast?.("Error: " + e, "error");
+        await fetchAnchor();
+        paint();
+      } finally {
+        clockSel.disabled = false;
+        clockSel._ytddRepaint?.();
       }
     });
     // Initial load. initAutorun runs at DOMContentLoaded, which can be
@@ -318,11 +353,11 @@
     option.hidden = !available;
     option.disabled = !available;
     if (!available && sel.value === "When budget allows") {
+      // Traffic + auto-sync are committed together by the backend.  This
+      // helper only reflects that committed state; firing a second save here
+      // let a failed traffic change silently turn auto-sync off anyway.
       sel.value = "Off";
       sel._ytddRepaint?.();
-      if (nativeBridgeUp()) {
-        bridgeCall("autorun_set", "Off").catch(() => {});
-      }
     }
   };
 })();

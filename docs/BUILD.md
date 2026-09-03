@@ -1,70 +1,101 @@
 # Building YTArchiver
 
-## Requirements
+## Supported build path
 
-- **Python 3.13** specifically. The PyInstaller version on PATH is often
-  bundled with 3.11 and produces a broken exe (~28 MB instead of the
-  correct ~32 MB; silently misses `pywebview` modules at runtime).
-  Always invoke PyInstaller via the Python 3.13 interpreter directly.
+YTArchiver is built and verified on Windows x64. The toolchain versions are
+pinned in `.python-version` and `.nvmrc`; do not substitute a different Python
+or Node version for a release build.
 
-## Clean rebuild (always required)
+The authoritative local command is:
 
-Stale `.pyc` files inside `__pycache__` will cause PyInstaller to bundle
-out-of-date bytecode. Clear them first:
-
-```bash
-rm -rf __pycache__ backend/__pycache__ backend/*/__pycache__ build dist
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check.ps1 -Bootstrap
 ```
 
-This catches every sub-package — `backend/sync/`, `backend/transcribe/`,
-`backend/metadata/`, `backend/api_mixins/` — without having to enumerate them.
+`-Bootstrap` creates a disposable virtual environment under the system temp
+directory and installs the exact, SHA-256-verified locks from `requirements/`.
+It does not reuse an unverified global PyInstaller installation. The gate uses
+disposable `APPDATA` and `LOCALAPPDATA` directories for tests and removes its
+temporary environment when it finishes.
 
-Then build:
+Output: `dist/YTArchiver.exe`.
 
-```bash
-py -3.13 -m PyInstaller YTArchiver.spec
+## What the gate verifies
+
+`scripts/check.ps1` runs these stages before it accepts the executable:
+
+1. validate exact/hash-locked Python dependency files;
+2. run Ruff, compile every Python file, and import every backend module;
+3. run each Python test module in a fresh interpreter with
+   warnings-as-errors and collect branch coverage;
+4. check every JavaScript file's syntax and run Node regression tests;
+5. install pinned Playwright dependencies and run browser behavior tests;
+6. prove that `web/index.html` matches its template and partials;
+7. verify every frontend `pywebview.api` call has a Python API method;
+8. scan tracked publication content for configured secret/privacy patterns;
+9. clean `build/` and `dist/`, then build with `YTArchiver.spec`; and
+10. verify the artifact is a Windows x64 PE with the expected version
+    resources and required packaged files.
+
+The gate fingerprints the working tree at the start and end. If a formatter,
+generator, test, or build step changes source, the gate fails instead of
+quietly shipping unreviewed output.
+
+Use `-RequireCleanTree` for CI or a release checkout. `-SkipBuild` is useful
+for a fast local code-only pass. `-SkipBrowserInstall` may be used only when
+the required browser is already installed.
+
+## Generated frontend rule
+
+`web/index.html` is a committed build artifact assembled from
+`web/index.template.html` and `web/partials/*.html`. Edit the source template
+or partial, regenerate, and verify it before running the full gate:
+
+```powershell
+py -3.13 -c "from backend.html_assembler import assemble_index_html; assemble_index_html('web')"
+py -3.13 scripts/check_generated_html.py
 ```
 
-Or with an explicit Python 3.13 path on Windows:
+## Dependency locks
 
-```bash
-"%LOCALAPPDATA%/Programs/Python/Python313/python.exe" -m PyInstaller YTArchiver.spec
+The lock files have separate responsibilities:
+
+- `requirements/runtime.lock` — Python 3.13 desktop runtime
+- `requirements/build.lock` — PyInstaller and packaging tools
+- `requirements/dev.lock` — Ruff, pytest, coverage, and test helpers
+- `requirements/worker-cpu.lock` — Python 3.11 CPU transcription worker
+- `requirements/worker-cuda.lock` — Python 3.11 CUDA transcription worker
+
+Refreshing locks is an intentional maintenance action, not part of a normal
+build:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/lock_dependencies.ps1
 ```
 
-Output: `dist/YTArchiver.exe`. Expected size: **~32 MB**. If you see
-**~28 MB**, you accidentally used Python 3.11 — clean and rebuild.
+Review every version and hash change before accepting it. The normal quality
+gate calls the script with `-ValidateOnly`.
 
-## Spec file
+## PyInstaller specification and notices
 
-`YTArchiver.spec` handles everything — icon, hidden imports, data files.
-Don't build with `pyinstaller --onefile main.py`; use the spec.
+Always build through `YTArchiver.spec`. It declares the pywebview hidden
+imports and packages the frontend, icon, worker scripts, third-party notices,
+and license texts. A bare `pyinstaller --onefile main.py` command does not
+represent the supported artifact.
 
-The icon is bundled both ways:
-- In `datas=[('icon.ico', '.')]` so runtime code can `iconbitmap()` /
-  pystray `Icon(...)`.
-- In the `EXE(...)` `icon=` field for the Windows file icon.
-
-## Distribution
-
-Copy `dist/YTArchiver.exe` wherever. Portable single-file exe; no
-installer needed. Same exe runs on any Windows 10/11 machine with the
-external tools (yt-dlp, ffmpeg) on PATH.
-
-## Testing the build
-
-Always smoke-test the freshly-built exe before considering a release:
-1. Double-click `dist/YTArchiver.exe`.
-2. Confirm window opens, version header shows the expected `vXX.Y`.
-3. Click through each tab — Subs, Browse, Settings, Recent — confirm
-   no white screens or unhandled errors.
-4. If pywebview's console (F12) shows errors, investigate before
-   shipping.
-
-For development, you don't need to build the exe — `python main.py`
-is faster and identical behavior. The exe is only for distribution.
+The build itself is non-interactive and does not launch YTArchiver. After the
+automated gate passes, a maintainer may perform a separate manual acceptance
+run of `dist/YTArchiver.exe` against disposable or explicitly approved state.
 
 ## CI
 
-No CI is set up. Builds are manual. The version bump rule
-(`APP_VERSION` +0.1 per push) is enforced by a pre-push git hook
-locally — see `.git/hooks/pre-push`.
+`.github/workflows/quality.yml` runs the same gate on `windows-latest` for
+pushes, pull requests, and manual dispatches:
+
+```powershell
+scripts/check.ps1 -Bootstrap -RequireCleanTree
+```
+
+CI uploads `dist/YTArchiver.exe` only after the complete gate and artifact
+verification pass. CI does not publish a GitHub release; release publication
+remains a separate, explicitly authorized action.

@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import youtube_traffic
+from ..executor_utils import WorkResult, run_bounded
 from ..log_stream import LogStreamer
 from ..process_runner import popen_ytdlp, run_ytdlp
 from ..sync import _find_cookie_source, _startupinfo, find_yt_dlp
@@ -458,7 +459,7 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
                 "like_count": _num(parts[2]),
                 "comment_count": _num(parts[3]),
                 "title": _title,
-                # New fields (Colbert backfill fix): upload_date and
+                # New fields for same-title backfill: upload_date and
                 # duration for non-title disambiguation in
                 # backfill_video_ids. yt-dlp emits upload_date as
                 # YYYYMMDD (or "NA" if unknown); duration as seconds.
@@ -523,16 +524,15 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
 
     # AUTO-RETRY for @handle URLs that fail bulk-stats. Discovered
     # 2026-05-15: yt-dlp 2026.03.17 + `youtubetab:skip=webpage,authcheck`
-    # can't resolve some channel @handles (ColdFusion specifically:
-    # "Failed to resolve url" error), but the same channel works via
+    # can't resolve some channel @handles ("Failed to resolve url"),
+    # but the same channel works via
     # the canonical /channel/UC.../videos URL form. The skip=webpage
     # arg is REQUIRED for bulk view counts (without it every entry's
     # view_count is "NA"), so we can't just drop the arg. Instead:
     # when the call returns empty AND the URL is the @handle form,
     # spend 1 extra yt-dlp call to resolve the channel_id, then retry
     # the bulk-stats call against /channel/UC.../videos. Saves the
-    # 25+ minute per-video fallback for ColdFusion (and any other
-    # channel where the handle path fails).
+    # slow per-video fallback for any channel where the handle path fails.
     if not out and not _failure_kind and "/@" in (ch_url or ""):
         canonical = _resolve_channel_id_url(yt, ch_url)
         if canonical and canonical != ch_url:
@@ -662,7 +662,6 @@ def _probe_durations_bulk(filepaths: list[str], stream: LogStreamer,
     out: dict[str, float | None] = {}
     if not filepaths:
         return out
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     _t0 = time.time()
     _total = len(filepaths)
     try:
@@ -673,28 +672,44 @@ def _probe_durations_bulk(filepaths: list[str], stream: LogStreamer,
         _log.debug("swallowed: %s", e)
     _last_tick = time.time()
     _done = 0
-    with ThreadPoolExecutor(max_workers=max_workers,
-                            thread_name_prefix="dur-probe") as ex:
-        fut_to_fp = {ex.submit(_probe_file_duration, fp): fp
-                     for fp in filepaths}
-        for fut in as_completed(fut_to_fp):
-            fp = fut_to_fp[fut]
+    def _cancelled() -> bool:
+        return bool(cancel_event is not None and cancel_event.is_set())
+
+    def _probe_one(fp: str) -> float | None:
+        while pause_event is not None and pause_event.is_set():
+            if _cancelled():
+                return None
+            time.sleep(0.05)
+        if _cancelled():
+            return None
+        return _probe_file_duration(fp)
+
+    def _record_probe(result: WorkResult[str, float | None]) -> None:
+        nonlocal _done, _last_tick
+        out[result.item] = None if result.error is not None else result.value
+        _done += 1
+        _now = time.time()
+        if (_now - _last_tick) >= 1.5 and _done < _total:
             try:
-                out[fp] = fut.result()
-            except Exception:
-                out[fp] = None
-            _done += 1
-            if cancel_event is not None and cancel_event.is_set():
-                break
-            _now = time.time()
-            if (_now - _last_tick) >= 1.5 and _done < _total:
-                try:
-                    stream.emit([[f"  — Probing duration "
-                                 f"[{_done:,}/{_total:,}]…\n",
-                                 ["simpleline", "backfill_progress"]]])
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-                _last_tick = _now
+                stream.emit([[f"  — Probing duration "
+                             f"[{_done:,}/{_total:,}]…\n",
+                             ["simpleline", "backfill_progress"]]])
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+            _last_tick = _now
+
+    # Submit at most one item per worker.  On cancel there is no enormous
+    # executor queue left to drain, and already-running ffprobe calls are
+    # allowed to finish behind a strict late-write boundary: only this caller
+    # persists results that arrived before cancellation.
+    run_bounded(
+        filepaths,
+        _probe_one,
+        _record_probe,
+        max_workers=max_workers,
+        thread_name_prefix="dur-probe",
+        is_cancelled=_cancelled,
+    )
     # Persist probed durations to the DB so the next pass doesn't
     # re-probe the same files. One transaction, write only the
     # successful probes (None values stay NULL — re-probing them is
@@ -730,7 +745,13 @@ def _probe_durations_bulk(filepaths: list[str], stream: LogStreamer,
 
 
 def count_missing_durations() -> int:
-    """How many archived videos have no stored duration_s. Read-only."""
+    """How many available archived videos have no stored duration_s.
+
+    Missing and partial catalog rows intentionally remain available to the
+    integrity/repair tools, but there is no media file for ffprobe to read.
+    Counting them here makes the Video lengths tool offer work that can never
+    finish.
+    """
     try:
         from .. import index as _idx
         conn = _idx._reader_open()
@@ -739,7 +760,9 @@ def count_missing_durations() -> int:
         with _idx._reader_lock:
             return int(conn.execute(
                 "SELECT COUNT(*) FROM videos "
-                "WHERE duration_s IS NULL OR duration_s<=0").fetchone()[0])
+                "WHERE (duration_s IS NULL OR duration_s<=0) "
+                "AND COALESCE(availability, 'available')='available'"
+            ).fetchone()[0])
     except Exception as e:
         _log.debug("count_missing_durations failed: %s", e)
         return 0
@@ -749,7 +772,7 @@ def backfill_missing_durations(stream: LogStreamer,
                                cancel_event: threading.Event | None = None,
                                pause_event: threading.Event | None = None,
                                ) -> dict:
-    """Fill videos.duration_s for every archived file that's missing it by
+    """Fill videos.duration_s for every available file that's missing it by
     ffprobing the file locally (no YouTube). The on-disk file is the only
     accurate source — the disk-sweep/import paths register rows without a
     duration. Idempotent: only touches rows still NULL/0, so a cancelled run
@@ -765,17 +788,19 @@ def backfill_missing_durations(stream: LogStreamer,
         rows = conn.execute(
             "SELECT filepath FROM videos "
             "WHERE (duration_s IS NULL OR duration_s<=0) "
+            "AND COALESCE(availability, 'available')='available' "
             "AND filepath IS NOT NULL AND filepath!='' "
             "ORDER BY rowid").fetchall()
     filepaths = [r[0] for r in rows if r and r[0]]
     total = len(filepaths)
     if not total:
         try:
-            stream.emit([["  — Every video already has a length. Nothing to "
-                          "do.\n", "simpleline"]])
+            stream.emit([["  — Every available video already has a length. "
+                          "Nothing to do.\n", "simpleline"]])
         except Exception as e:
             _log.debug("swallowed: %s", e)
-        return {"ok": True, "total": 0, "resolved": 0, "cancelled": False}
+        return {"ok": True, "total": 0, "resolved": 0,
+                "failed": 0, "unchecked": 0, "cancelled": False}
     try:
         stream.emit([[f" Checking video lengths — {total:,} missing. "
                       f"Reading each file with ffprobe…\n", "header"]])
@@ -784,15 +809,37 @@ def backfill_missing_durations(stream: LogStreamer,
     probed = _probe_durations_bulk(filepaths, stream, cancel_event, pause_event)
     resolved = sum(1 for v in probed.values() if v and v > 0)
     cancelled = bool(cancel_event and cancel_event.is_set())
+    attempted = len(probed)
+    # Workers that observe cancellation return without probing. Do not label
+    # those files as unreadable; they are simply unfinished and can resume.
+    failed = 0 if cancelled else max(0, attempted - resolved)
+    unchecked = (max(0, total - resolved) if cancelled
+                 else max(0, total - attempted))
     try:
-        _verb = "Stopped — " if cancelled else "Done — "
-        stream.emit([[f" {_verb}filled {resolved:,} of {total:,} video "
-                      f"length(s)" + (" (re-run to finish the rest)."
-                      if cancelled or resolved < total else ".") + "\n",
-                      "simpleline_green"]])
+        if cancelled:
+            detail = (
+                f" Stopped — filled {resolved:,} of {total:,} video "
+                f"length(s). {unchecked:,} still unchecked"
+            )
+            detail += ". Re-run later to continue.\n"
+            tag = "summary"
+        elif failed:
+            detail = (
+                f" Finished — filled {resolved:,} of {total:,} video "
+                f"length(s). {failed:,} available file(s) could not be read "
+                "by ffprobe and were left unchanged.\n"
+            )
+            tag = "summary"
+        else:
+            detail = (
+                f" Done — filled {resolved:,} of {total:,} video length(s).\n"
+            )
+            tag = "simpleline_green"
+        stream.emit([[detail, tag]])
     except Exception as e:
         _log.debug("swallowed: %s", e)
     return {"ok": True, "total": total, "resolved": resolved,
+            "failed": failed, "unchecked": unchecked,
             "cancelled": cancelled}
 
 
@@ -815,7 +862,6 @@ def _fetch_per_video_upload_dates(yt: str, vids: list[str],
     Returns {vid: "YYYYMMDD" or ""}. Failures are recorded as "" so
     the caller can tell "tried but didn't get a date" from "never tried".
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     out: dict[str, str] = {}
     if not vids:
         return out
@@ -875,47 +921,39 @@ def _fetch_per_video_upload_dates(yt: str, vids: list[str],
                      ["simpleline", "backfill_progress"]]])
     except Exception as e:
         _log.debug("swallowed: %s", e)
-    with ThreadPoolExecutor(max_workers=max_workers,
-                            thread_name_prefix="ud-fetch") as ex:
-        fut_to_vid = {ex.submit(_fetch_one, v): v for v in vids}
-        for fut in as_completed(fut_to_vid):
-            if cancel_event is not None and cancel_event.is_set():
-                # Drop everything still queued NOW — exiting the
-                # with-block runs shutdown(wait=True) with
-                # cancel_futures=False, which would let every queued
-                # 30s yt-dlp fetch run to completion anyway
-                # (multi-minute "hung" cancel + pointless YT traffic).
-                try:
-                    ex.shutdown(wait=False, cancel_futures=True)
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-                break
-            if pause_event is not None and pause_event.is_set():
-                # Worker threads don't honor pause mid-call (they're
-                # blocking on subprocess.run), but the AS_COMPLETED
-                # loop can hold off scheduling new work — practical
-                # effect is a brief delay before pause takes hold.
-                while (pause_event.is_set()
-                       and not (cancel_event is not None
-                                and cancel_event.is_set())):
-                    time.sleep(0.25)
+    def _cancelled() -> bool:
+        return bool(cancel_event is not None and cancel_event.is_set())
+
+    def _record_date(result: WorkResult[str, tuple[str, str]]) -> None:
+        nonlocal _done, _last_tick
+        if result.error is not None or result.value is None:
+            out[result.item] = ""
+            if result.error is not None:
+                _log.debug("upload-date worker failed: %s", result.error)
+        else:
+            vid, date = result.value
+            out[vid] = date
+        _done += 1
+        _now = time.time()
+        if (_now - _last_tick) >= 2.0 and _done < _total:
+            _ok = sum(1 for value in out.values() if value)
             try:
-                vid, date = fut.result()
-                out[vid] = date
+                stream.emit([[f"  — Thorough fetch "
+                             f"[{_done:,}/{_total:,}] · "
+                             f"{_ok:,} dates resolved…\n",
+                             ["simpleline", "backfill_progress"]]])
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-            _done += 1
-            _now = time.time()
-            if (_now - _last_tick) >= 2.0 and _done < _total:
-                _ok = sum(1 for v in out.values() if v)
-                try:
-                    stream.emit([[f"  — Thorough fetch "
-                                 f"[{_done:,}/{_total:,}] · "
-                                 f"{_ok:,} dates resolved…\n",
-                                 ["simpleline", "backfill_progress"]]])
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-                _last_tick = _now
+            _last_tick = _now
+
+    run_bounded(
+        vids,
+        _fetch_one,
+        _record_date,
+        max_workers=max_workers,
+        thread_name_prefix="ud-fetch",
+        is_cancelled=_cancelled,
+    )
     try:
         _ok_n = sum(1 for v in out.values() if v)
         stream.emit([[f"  — Per-video date fetch: {_ok_n:,}/{_total:,}"
@@ -959,8 +997,8 @@ def backfill_video_ids(channel: dict[str, Any],
          flat-playlist
       3. Duration match (NEW): unique YT vid whose duration is
          within ±2s of the local file's ffprobe'd duration. The
-         channel-level "EWU Bodycam" case where renamed titles
-         leave 26% via exact match alone but durations are unique
+         rename-heavy channel case where exact title matching leaves
+         gaps but durations are unique
          to the second is the textbook win for this strategy.
       4. Substring title match (local title subset of YT title, or
          vice-versa) — requires date confirmation, so silent on
@@ -1549,8 +1587,8 @@ def backfill_video_ids(channel: dict[str, Any],
         # CLEAN per-second durations on every YT video; ffprobe gives
         # us clean local durations. When the local duration uniquely
         # matches one YT video within ±2s, accept — no date check
-        # needed. For the EWU Bodycam case (~1 full + few shorts/day,
-        # wildly different durations) this is the textbook win.
+        # needed. Channels with frequently renamed videos and distinct
+        # durations are the textbook win for this strategy.
         _local_dur = _local_durations.get(os.path.normpath(_fp))
         if _local_dur is not None and _local_dur > 0:
             _by_dur = _find_duration_match(_local_dur, _nt)

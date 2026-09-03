@@ -159,6 +159,7 @@ from backend import autorun as autorun_backend
 from backend import index as index_backend
 from backend import net as net_backend
 from backend import sync as sync_backend
+from backend import trash_retention as trash_retention_backend
 from backend import window_state as winstate
 from backend.archive_capacity import archive_capacity_status
 from backend.log import get_logger as _get_logger
@@ -166,6 +167,11 @@ from backend.log import install as _install_log_bridge
 from backend.log_stream import LogStreamer
 from backend.queues import QueueState
 from backend.services import AppServices, BridgeEventBus
+from backend.services.job_supervisor import JobSupervisor, OwnerAdapter
+from backend.services.managed_work import (
+    start_managed_task,
+    try_global_archive_lease,
+)
 from backend.transcribe import TranscribeManager
 from backend.tray import TrayController, activity_spin_color
 from backend.ytarchiver_config import (
@@ -174,6 +180,7 @@ from backend.ytarchiver_config import (
     config_file_exists,
     load_config,
     save_config,
+    update_config,
 )
 
 _boot_trace("backend imports complete")
@@ -203,6 +210,7 @@ from backend.api_mixins import (
     SyncMixin,
     ThumbnailMixin,
     TranscribeMixin,
+    TrashMixin,
     VideoMixin,
     WindowMixin,
 )
@@ -210,7 +218,7 @@ from backend.api_mixins import (
 _boot_trace("api mixins imported")
 
 
-class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, DiagnosticsMixin, IndexMixin, InfoMixin, LivestreamsMixin, MediaOpsMixin, MetadataMixin, OnboardingMixin, QueueMixin, RecentMixin, RedownloadMixin, SettingsMixin, StartupMixin, SubsMixin, SyncMixin, ThumbnailMixin, TranscribeMixin, VideoMixin, WindowMixin):
+class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, DiagnosticsMixin, IndexMixin, InfoMixin, LivestreamsMixin, MediaOpsMixin, MetadataMixin, OnboardingMixin, QueueMixin, RecentMixin, RedownloadMixin, SettingsMixin, StartupMixin, SubsMixin, SyncMixin, ThumbnailMixin, TrashMixin, TranscribeMixin, VideoMixin, WindowMixin):
     """
     Exposed to JS as window.pywebview.api.*
 
@@ -221,6 +229,9 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
     def __init__(self):
         self._window = None
         self._config = None
+        self._job_supervisor = JobSupervisor()
+        self._restore_quiesced = False
+        self._restore_state_committed = False
         self._log_stream = LogStreamer(None)
         _install_log_bridge(self._log_stream)
         self._sync_thread = None
@@ -355,6 +366,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             log_stream=self._log_stream,
             transcribe=self._transcribe,
             event_bus=self._event_bus,
+            update_config=update_config,
         )
 
         from backend.disk_watch import DiskErrorMonitor
@@ -471,8 +483,12 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             # Deferred until log pipeline is up — emit via a micro-delay so
             # the notice lands after any startup banner. Matches OLD's
             # "⏸ Sync queue restored — PAUSED" ui_queue post.
+            _restore_notice_cancel = threading.Event()
+
             def _emit_restore_notice():
                 try:
+                    if _restore_notice_cancel.wait(0.5):
+                        return
                     self._log_stream.emit([
                         ["\u23f8 Queue restored \u2014 ", "pauselog"],
                         ["PAUSED (click Resume to continue)\n", "pauselog"],
@@ -480,7 +496,17 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     self._log_stream.flush()
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
-            threading.Timer(0.5, _emit_restore_notice).start()
+            try:
+                start_managed_task(
+                    self,
+                    owner="ui-notice",
+                    label="Restored queue notice",
+                    target=_emit_restore_notice,
+                    cancel=_restore_notice_cancel,
+                    name="restored-queue-notice",
+                )
+            except Exception as e:
+                _log.debug("restored queue notice not started: %s", e)
         self._queues.add_listener(self._on_queue_changed)
         # Rolling-budget waits are process-wide state, not QueueState
         # mutations. Push them through the same UI state channel so the
@@ -544,9 +570,59 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # Settings > Auto-backup cadence is "off". First check fires
         # ~2 min after boot so it never competes with startup work.
         self._auto_backup = auto_backup_backend.AutoBackupScheduler(
-            stream=self._log_stream)
+            stream=self._log_stream, queue_state=self._queues)
         self._auto_backup.start()
+
+        def _trash_retention_busy_reason():
+            # Permanent cleanup is lowest-priority housekeeping. It can wait
+            # until every user-visible writer is idle rather than competing
+            # with downloads, processing, or catalog maintenance.
+            if self.sync_is_running() or self.archive_single_is_running():
+                return "a download or sync"
+            if self.archive_rescan_is_running():
+                return "an archive rescan"
+            if getattr(self._queues, "current_gpu", None):
+                return "the processing queue"
+            if index_backend.is_db_writer_busy():
+                return "database maintenance"
+            return ""
+
+        def _trash_retention_cleanup(**kwargs):
+            from backend.trash_manager import purge_expired, trash_manager
+
+            lease_result = try_global_archive_lease(
+                owner="scheduler-trash-retention",
+                label="Automatic Trash cleanup",
+                task_id="daily-cleanup",
+                cancel=kwargs.get("cancel_event"),
+            )
+            if not lease_result.ok or lease_result.lease is None:
+                return {
+                    "ok": True,
+                    "deferred": True,
+                    "reason": "archive_busy",
+                    "purged": 0,
+                }
+            with lease_result.lease:
+                result = purge_expired(**kwargs)
+            if isinstance(result, dict) and int(result.get("purged") or 0) > 0:
+                try:
+                    self._trash_event(
+                        "_onTrashChanged", trash_manager.summary())
+                except Exception as exc:
+                    _log.debug("Trash retention UI refresh failed: %s", exc)
+            return result
+
+        self._trash_retention = (
+            trash_retention_backend.TrashRetentionScheduler(
+                cleanup_fn=_trash_retention_cleanup,
+                busy_fn=_trash_retention_busy_reason,
+                startup_required_signals=("checks", "indexing"),
+            )
+        )
+        self._register_background_owners()
         self._reload_config()
+        self._trash_retention.start()
         # Blank-name scan: surface any channel whose folder would resolve to
         # `_unnamed/`. The add/update guards stop new blanks from being
         # saved, but a blank channel imported from an older OLD config or
@@ -561,8 +637,12 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 if not _nm:
                     _blanks.append(_ch.get("url", "<no url>"))
             if _blanks:
+                _blank_warn_cancel = threading.Event()
+
                 def _emit_blank_warn():
                     try:
+                        if _blank_warn_cancel.wait(0.8):
+                            return
                         self._log_stream.emit([
                             ["\u26a0 ", "red"],
                             [f"{len(_blanks)} channel(s) have a blank name. "
@@ -577,9 +657,247 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                         self._log_stream.flush()
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
-                threading.Timer(0.8, _emit_blank_warn).start()
+                start_managed_task(
+                    self,
+                    owner="ui-notice",
+                    label="Blank channel warning",
+                    target=_emit_blank_warn,
+                    cancel=_blank_warn_cancel,
+                    name="blank-channel-warning",
+                )
         except Exception as e:
             _log.debug("swallowed: %s", e)
+
+    @staticmethod
+    def _thread_is_alive(thread_obj) -> bool:
+        try:
+            return bool(thread_obj is not None and thread_obj.is_alive())
+        except Exception:
+            # A failed status probe cannot prove that the owner is stopped.
+            return True
+
+    @classmethod
+    def _join_threads(cls, threads, timeout: float) -> bool:
+        """Join a snapshot of threads within one shared monotonic deadline."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        unique = []
+        seen = set()
+        for thread_obj in threads:
+            if thread_obj is None or id(thread_obj) in seen:
+                continue
+            seen.add(id(thread_obj))
+            unique.append(thread_obj)
+        for thread_obj in unique:
+            if not cls._thread_is_alive(thread_obj):
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                if thread_obj is not threading.current_thread():
+                    thread_obj.join(timeout=remaining)
+            except Exception:
+                pass
+        return not any(cls._thread_is_alive(row) for row in unique)
+
+    def _archive_download_threads(self):
+        """Return tracked manual-download workers (old test doubles are safe)."""
+        lock = getattr(self, "_archive_single_lock", None)
+        threads = getattr(self, "_archive_single_threads", {})
+        try:
+            if lock is not None:
+                with lock:
+                    return list(threads.values()) if isinstance(threads, dict) else []
+        except Exception:
+            pass
+        return list(threads.values()) if isinstance(threads, dict) else []
+
+    @staticmethod
+    def _terminate_process_owners(*owners: str) -> int:
+        """Terminate only explicitly registered process owners."""
+        from backend.process_runner import PROCESS_REGISTRY
+
+        return PROCESS_REGISTRY.terminate_owners(owners, timeout=2.0)
+
+    @staticmethod
+    def _registered_processes_active() -> bool:
+        try:
+            from backend.process_runner import PROCESS_REGISTRY
+            return bool(PROCESS_REGISTRY.snapshot())
+        except Exception:
+            return True
+
+    @staticmethod
+    def _join_registered_processes(timeout: float) -> bool:
+        """Wait for registered children to finish without guessing names."""
+        from backend.process_runner import PROCESS_REGISTRY
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while PROCESS_REGISTRY.snapshot() and time.monotonic() < deadline:
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        return not PROCESS_REGISTRY.snapshot()
+
+    @staticmethod
+    def _force_registered_processes() -> int:
+        """Stop each exact remaining registered root and its descendants."""
+        from backend.process_runner import PROCESS_REGISTRY
+
+        processes = [record.proc for record in PROCESS_REGISTRY.snapshot()]
+        return PROCESS_REGISTRY.terminate_processes(processes, timeout=2.0)
+
+    def _prepare_sync_owner(self) -> bool:
+        self._sync_cancel.set()
+        self._redwnl_cancel.set()
+        return bool(self._queues.save_now())
+
+    def _prepare_reorg_owner(self) -> bool:
+        event = getattr(self, "_reorg_cancel", None)
+        if event is not None:
+            event.set()
+        return True
+
+    def _prepare_ytdlp_monitor_owner(self) -> bool:
+        self.stop_ytdlp_update_monitor(timeout=0)
+        return True
+
+    def _ytdlp_monitor_active(self) -> bool:
+        monitor = getattr(self, "_ytdlp_monitor_thread", None)
+        update = getattr(self, "_ytdlp_update_thread", None)
+        running = bool(getattr(self, "_ytdlp_update_running", False))
+        return (self._thread_is_alive(monitor)
+                or self._thread_is_alive(update) or running)
+
+    def _join_ytdlp_monitor(self, timeout: float) -> bool:
+        return self._join_threads(
+            [getattr(self, "_ytdlp_monitor_thread", None),
+             getattr(self, "_ytdlp_update_thread", None)], timeout)
+
+    def _register_background_owners(self) -> None:
+        """Register every long-lived owner needed by restore and shutdown."""
+        register = self._job_supervisor.register_owner
+
+        register(OwnerAdapter(
+            owner="scheduler-autorun", label="Automatic sync scheduler",
+            active=self._autorun.is_alive,
+            prepare=lambda: (self._autorun.cancel() or True),
+            join=self._autorun.join, force=lambda: 0,
+        ))
+        register(OwnerAdapter(
+            owner="scheduler-backup", label="Automatic backup scheduler",
+            active=self._auto_backup.is_alive,
+            prepare=lambda: (self._auto_backup._stop.set() or True),
+            join=self._auto_backup.stop, force=lambda: 0,
+        ))
+        register(OwnerAdapter(
+            owner="scheduler-trash-retention",
+            label="Automatic Trash cleanup",
+            active=self._trash_retention.is_alive,
+            prepare=self._trash_retention.request_stop,
+            join=self._trash_retention.join,
+            force=lambda: 0,
+            details=self._trash_retention.snapshot,
+        ))
+        register(OwnerAdapter(
+            owner="monitor-disk", label="Disk error monitor",
+            active=self._disk_mon.is_alive,
+            prepare=lambda: (self._disk_mon.stop(0) or True),
+            join=self._disk_mon.stop, force=lambda: 0,
+        ))
+        register(OwnerAdapter(
+            owner="monitor-ytdlp", label="yt-dlp update monitor",
+            active=self._ytdlp_monitor_active,
+            prepare=self._prepare_ytdlp_monitor_owner,
+            join=self._join_ytdlp_monitor,
+            force=lambda: self._terminate_process_owners("ytdlp-updater"),
+        ))
+        register(OwnerAdapter(
+            owner="sync", label="Sync and redownload worker",
+            active=lambda: self._thread_is_alive(self._sync_thread),
+            prepare=self._prepare_sync_owner,
+            join=lambda timeout: self._join_threads([self._sync_thread], timeout),
+            force=lambda: self._terminate_process_owners("sync", "redownload"),
+            details=lambda: {
+                "current_task_id": str(
+                    (getattr(self._queues, "current_sync", None) or {}).get(
+                        "task_id") or "")
+            },
+        ))
+        register(OwnerAdapter(
+            owner="sync-metadata", label="Inline sync metadata workers",
+            active=sync_backend.inline_metadata_workers_active,
+            prepare=sync_backend.inline_metadata_workers_cancel,
+            join=sync_backend.inline_metadata_workers_join,
+            force=lambda: self._terminate_process_owners("sync"),
+            details=sync_backend.inline_metadata_workers_snapshot,
+        ))
+        register(OwnerAdapter(
+            owner="sync-maintenance", label="Deferred post-sync maintenance",
+            active=sync_backend.post_sync_maintenance_active,
+            prepare=sync_backend.post_sync_maintenance_cancel,
+            join=sync_backend.post_sync_maintenance_join,
+            force=sync_backend.post_sync_maintenance_cancel,
+            details=sync_backend.post_sync_maintenance_snapshot,
+        ))
+        register(OwnerAdapter(
+            owner="manual-download", label="Manual downloads",
+            active=self.archive_single_is_running,
+            prepare=lambda: bool(self.archive_single_cancel().get("ok")),
+            join=lambda timeout: self._join_threads(
+                self._archive_download_threads(), timeout),
+            force=lambda: self._terminate_process_owners("manual-download"),
+        ))
+        register(OwnerAdapter(
+            owner="processing", label="GPU processing queue",
+            active=lambda: bool(
+                self._transcribe.shutdown_snapshot().get("worker_alive")),
+            prepare=self._transcribe.begin_shutdown,
+            join=self._transcribe.join_shutdown,
+            force=self._transcribe.force_shutdown,
+            task_id=lambda: str(
+                self._transcribe.shutdown_snapshot().get(
+                    "current_task_id") or ""),
+            details=self._transcribe.shutdown_snapshot,
+        ))
+        register(OwnerAdapter(
+            owner="reorganization", label="Channel reorganization",
+            active=lambda: bool(getattr(self, "_reorg_running", False)),
+            prepare=self._prepare_reorg_owner,
+            join=lambda timeout: self._join_threads(
+                [getattr(self, "_reorg_thread", None)], timeout),
+            force=lambda: 0,
+        ))
+        register(OwnerAdapter(
+            owner="archive-rescan", label="Archive rescan",
+            active=self.archive_rescan_is_running,
+            prepare=lambda: (
+                getattr(self, "_archive_rescan_cancel", None).set()
+                if getattr(self, "_archive_rescan_cancel", None) is not None
+                else True
+            ) is not False,
+            join=lambda timeout: self._join_threads(
+                [getattr(self, "_archive_rescan_thread", None)], timeout),
+            force=lambda: 0,
+        ))
+        # This final catch-all still uses exact registered process roots. It
+        # covers dependency installers and any legacy caller that has not yet
+        # gained a dedicated top-level adapter, without a process-name scan.
+        register(OwnerAdapter(
+            owner="zz-registered-processes", label="Registered child processes",
+            active=self._registered_processes_active,
+            prepare=lambda: True,
+            join=self._join_registered_processes,
+            force=self._force_registered_processes,
+        ))
+
+    def background_owner_snapshot(self):
+        """Expose a serializable owner/process inventory for diagnostics."""
+        return self._job_supervisor.snapshot()
+
+    def _work_admission_error(self, operation: str):
+        """Return a bridge-friendly error when shutdown/restore closed work."""
+        try:
+            self._job_supervisor.require_admission(operation)
+            return None
+        except Exception as exc:
+            return {"ok": False, "started": False, "error": str(exc)}
 
     def set_window(self, w):
         """Attach the pywebview window and route backend log output to it."""
@@ -752,7 +1070,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             print(f"[config] real config not found at {CONFIG_FILE}; using synthetic data")
             self._config = None
 
-    def _run_startup_sequence(self):
+    def _run_startup_sequence(self, cancel_event=None):
         """Three-stage startup log matching YTArchiver's OLD timing:
 
             Stage 1 (< 2s) --- Startup checks complete, ready to download ---
@@ -763,12 +1081,13 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                                 and just report from the cache (instant)
             Stage 3 (background) --- newly-added files swept into the index
 
-        Each stage runs on its own thread and emits its milestone the
-        moment it finishes. The "Loading\u00b7" tick line animates in
-        verbose mode; simple mode sees only the three green milestones
-        as each one lands (the tick is VERBOSE_ONLY).
+        The stages run sequentially under one supervised startup owner and
+        emit each milestone as it finishes. A small joined indicator helper
+        animates the "Loading\u00b7" line in verbose mode; simple mode sees
+        only the three green milestones (the tick is VERBOSE_ONLY).
         """
         import time as _time
+        cancel_event = cancel_event or threading.Event()
         s = self._log_stream
 
         # App-started banner FIRST — must precede the "Startup checks
@@ -848,7 +1167,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             """Cycle dots on each active status slot. When a
             slot's `phase` is empty, its UI indicator is hidden; when
             populated, we emit `{phase}{dots} {detail}`."""
-            while not stage3_done.is_set():
+            while not stage3_done.is_set() and not cancel_event.is_set():
                 dots_state["i"] = (dots_state["i"] + 1) % 3
                 d = ["\u00b7 ", "\u00b7\u00b7 ", "\u00b7\u00b7\u00b7"][dots_state["i"]]
                 log_parts = []
@@ -866,12 +1185,14 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 # Log mirror for the verbose startup "Loading" line.
                 if log_parts:
                     _loading(" \u00b7 ".join(log_parts))
-                _time.sleep(0.4)
+                cancel_event.wait(0.4)
             # NOTE: post-stage-3 indicator state is handled by the
             # caller after stage3_done.set(). The animator deliberately
             # doesn't touch the slot on exit so it can't race-overwrite
             # cleanup.
-        threading.Thread(target=_animate_dots, daemon=True).start()
+        animator = threading.Thread(
+            target=_animate_dots, daemon=True, name="startup-indicator")
+        animator.start()
 
         def _clear_loading():
             """Remove the in-place Loading line from the DOM."""
@@ -949,6 +1270,8 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # ── Stage 2: Disk walk (staleness-gated) ───────────────────────
         def _stage2_disk_walk():
             """Refresh disk-scan cache after Stage 1 makes the UI usable."""
+            if cancel_event.is_set():
+                return
             try:
                 from backend.archive_scan import (
                     archive_totals,
@@ -978,7 +1301,12 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                         dots_state["sweep"]["detail"] = f"{idx+1}/{total} \u2014 {clean}"
                     walked = scan_all_channels(
                         progress_cb=_on_walk,
-                        stop_if=_startup_low_priority_busy)
+                        stop_if=lambda: (
+                            cancel_event.is_set()
+                            or _startup_low_priority_busy()
+                        ))
+                    if cancel_event.is_set():
+                        return
                     if walked is None:
                         dots_state["sweep"]["phase"] = ""
                         dots_state["sweep"]["detail"] = ""
@@ -999,17 +1327,10 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                         # in the log instead of mysteriously rescanning
                         # forever.
                         try:
-                            c2 = load_config()
-                            c2["last_disk_scan_ts"] = _time.time()
-                            ok = save_config(c2)
-                            if ok:
-                                self._config = c2
-                            else:
-                                s.emit_error(
-                                    "Disk scan timestamp save failed \u2014 "
-                                    "next launch will re-run the disk scan. "
-                                    "Is the config writable?")
-                                _flush_now()
+                            _unused, c2 = update_config(
+                                lambda live: live.__setitem__(
+                                    "last_disk_scan_ts", _time.time()))
+                            self._config = c2
                         except Exception as _se:
                             s.emit_error(
                                 f"Disk scan timestamp save raised: {_se}")
@@ -1057,6 +1378,8 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         def _start_subscriber_backfill():
             """Recover missing card counts without delaying app readiness."""
             def _run():
+                if cancel_event.is_set():
+                    return
                 try:
                     from backend.subscriber_counts import (
                         backfill_missing_counts,
@@ -1089,32 +1412,55 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     _log.debug("subscriber-count launch backfill failed: %s",
                                exc)
 
-            threading.Thread(
-                target=_run, daemon=True,
-                name="subscriber-count-backfill").start()
+            _run()
 
         # Stage 3: low-priority background sweep.
         def _stage3_sweep():
             """Run the archive sweep after disk state is known."""
+            if cancel_event.is_set():
+                return
             output_dir = (cfg.get("output_dir") or "").strip()
             sweep_result = {"registered": 0, "ingested": 0}
 
             def _run_sweep():
-                if not output_dir:
+                if not output_dir or cancel_event.is_set():
                     return
-                dots_state["sweep"]["phase"] = "Indexing new files"
-                dots_state["sweep"]["detail"] = ""
+                sweep_progress = {"detail": ""}
                 def _on_sweep(idx, total, name):
                     clean = (name or "")[:32]
+                    sweep_progress["detail"] = f"{idx}/{total} \u2014 {clean}"
                     dots_state["sweep"]["phase"] = "Indexing new files"
-                    dots_state["sweep"]["detail"] = f"{idx}/{total} \u2014 {clean}"
+                    dots_state["sweep"]["detail"] = sweep_progress["detail"]
+
+                def _sweep_busy():
+                    busy = _startup_low_priority_busy()
+                    if busy:
+                        # The old label said "Indexing new files" for up to an
+                        # hour while the sweep was intentionally yielding to a
+                        # sync/GPU/Browse task. Tell the truth about the wait.
+                        dots_state["sweep"]["phase"] = (
+                            "Index scan waiting for active work")
+                        dots_state["sweep"]["detail"] = ""
+                    elif dots_state["sweep"].get("phase") == (
+                            "Index scan waiting for active work"):
+                        dots_state["sweep"]["phase"] = "Indexing new files"
+                        dots_state["sweep"]["detail"] = (
+                            sweep_progress["detail"])
+                    return busy
+
+                if not _sweep_busy():
+                    dots_state["sweep"]["phase"] = "Indexing new files"
+                    dots_state["sweep"]["detail"] = ""
                 try:
                     # Pass the low-priority gate to sweep so it yields
                     # between channels while sync/GPU work is active.
                     r = index_backend.sweep_new_videos(
                         output_dir, cfg.get("channels", []),
                         progress_cb=_on_sweep,
-                        gpu_busy_fn=_startup_low_priority_busy)
+                        gpu_busy_fn=_sweep_busy,
+                        extra_roots=list(cfg.get("tp_archive_roots") or []))
+                    if cancel_event.is_set():
+                        return
                     sweep_result["registered"] = int(r.get("registered") or 0)
                     sweep_result["ingested"] = int(r.get("ingested") or 0)
                     sweep_result["skipped_unchanged"] = int(
@@ -1128,10 +1474,12 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     dots_state["sweep"]["phase"] = ""
                     dots_state["sweep"]["detail"] = ""
 
-            # Run the archive sweep (index new files) on its own thread.
-            t_sweep = threading.Thread(target=_run_sweep, daemon=True)
-            t_sweep.start()
-            t_sweep.join()
+            # This stage already runs on the supervised startup worker. Keep
+            # the sweep inline so shutdown/restore owns the real writer rather
+            # than a nested daemon that could outlive its parent.
+            _run_sweep()
+            if cancel_event.is_set():
+                return
 
             sweep_reg = sweep_result["registered"]
             sweep_ing = sweep_result["ingested"]
@@ -1168,7 +1516,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             stage3_done.set()
             # Wait > the animator's 0.4s sleep cycle so its loop
             # definitely sees stage3_done and exits before cleanup.
-            _time.sleep(0.5)
+            cancel_event.wait(0.5)
             _clear_loading()
             # Clear the live indexing indicator.
             try:
@@ -1181,24 +1529,40 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         def _run_stages():
             """Run slow startup stages in order on the boot worker thread."""
             try:
-                _stage2_disk_walk()
-                _stage3_sweep()
+                if not cancel_event.is_set():
+                    _stage2_disk_walk()
+                if not cancel_event.is_set():
+                    _stage3_sweep()
                 # Start only after the local sweep finishes: it guarantees
                 # normal cache rows exist and avoids racing the sweep's final
                 # disk-cache merge. This remains independent background work,
                 # so traffic spacing never delays app readiness.
-                _start_subscriber_backfill()
+                if not cancel_event.is_set():
+                    _start_subscriber_backfill()
             finally:
+                stage3_done.set()
                 # Budget-based auto-sync is restored from config before the
                 # window exists. Release its boot gate only after local
                 # startup work is finished, then let the scheduler apply its
                 # three-minute remote-sync grace period.
-                try:
-                    self._autorun.notify_startup_ready("indexing")
-                except Exception as e:
-                    _log.debug(
-                        "autorun startup-ready notification failed: %s", e)
-        threading.Thread(target=_run_stages, daemon=True).start()
+                if not cancel_event.is_set():
+                    try:
+                        self._autorun.notify_startup_ready("indexing")
+                    except Exception as e:
+                        _log.debug(
+                            "autorun startup-ready notification failed: %s", e)
+                    try:
+                        self._trash_retention.notify_startup_ready("indexing")
+                    except Exception as e:
+                        _log.debug(
+                            "Trash retention startup-ready notification "
+                            "failed: %s", e)
+        _run_stages()
+        try:
+            if animator is not threading.current_thread():
+                animator.join(timeout=1.0)
+        except (RuntimeError, TypeError):
+            pass
 
 
 def _configured_whisper_model_for_restore(valid_models):
@@ -1227,6 +1591,35 @@ def main():
         _log.debug("ensure_bin_on_path failed (non-fatal): %s", e)
     _boot_trace("bin path ready")
 
+    # Finish or roll back interrupted multi-resource transactions before any
+    # scheduler, queue owner, database connection, or config backup starts.
+    # Continuing with ambiguous folder/config or restore state would let the
+    # new process compound a half-committed generation, so recovery failures
+    # deliberately fail closed and leave the durable journal for diagnosis.
+    from backend.services.channel_transactions import (
+        recover_channel_transaction,
+    )
+    from backend.services.restore_coordinator import (
+        recover_interrupted_restore,
+    )
+    for _recovery_name, _recover in (
+        ("application restore", recover_interrupted_restore),
+        ("channel folder", recover_channel_transaction),
+    ):
+        _recovery = _recover()
+        if not _recovery.get("ok"):
+            raise RuntimeError(
+                f"Interrupted {_recovery_name} requires recovery before "
+                f"YTArchiver can start: {_recovery.get('error') or 'unknown error'}"
+            )
+        if _recovery.get("recovered"):
+            _log.warning(
+                "Recovered interrupted %s transaction: %s",
+                _recovery_name,
+                _recovery.get("action") or "completed",
+            )
+    _boot_trace("transaction recovery checked")
+
     # Start the network-down monitor in the background
     try:
         net_backend.start_monitor()
@@ -1253,7 +1646,11 @@ def main():
     # ends in os._exit(0) (which skips atexit) AND sets shutdown_ran below,
     # so this hook only ever fires when boot blew up before reaching the
     # window — never as a double-teardown on the happy path.
-    _boot_state = {"api": None, "shutdown_ran": False}
+    _boot_state = {
+        "api": None,
+        "shutdown_ran": False,
+        "shutdown_report": None,
+    }
 
     def _boot_emergency_cleanup():
         if _boot_state["shutdown_ran"]:
@@ -1320,8 +1717,8 @@ def main():
     # still flush queues if a later boot step (cmd-server, tray) raises.
     _boot_state["api"] = api
 
-    # HTTP command server on 127.0.0.1:9855 — lets the ArchivePlayer companion
-    # and ArchiveBrowserWithYTTest viewers trigger retranscribe / ping
+    # HTTP command server on 127.0.0.1:9855 lets compatible companion
+    # viewers trigger retranscribe / ping
     # the app. Matches YTArchiver.py:34400 _start_cmd_server.
     try:
         from backend import cmd_server as _cmd
@@ -1338,9 +1735,9 @@ def main():
             except Exception as e:
                 return {"error": str(e)}
         def _handle_retranscribe(body):
-            """Queue a re-transcribe request from the ArchivePlayer
-            companion or ArchiveBrowserWithYTTest. `_cmd_retranscribe`:
-              - accepts {channel, video_id, [model]} (ArchivePlayer's
+            """Queue a re-transcribe request from a companion viewer.
+            `_cmd_retranscribe`:
+              - accepts {channel, video_id, [model]}
                 actual request shape) OR {filepath, title, channel}
                 (legacy/alternative)
               - validates the optional `model` against the supported set
@@ -1350,7 +1747,7 @@ def main():
               - routes through the same retranscribe path the UI uses
                 (retranscribe=True), so the aggregated Transcript.txt /
                 .jsonl entries get SURGICALLY SWAPPED, not duplicated.
-                Without this, every ArchivePlayer re-transcribe would
+                Without this, every companion-viewer re-transcribe would
                 append a second entry to the aggregated files instead
                 of replacing the stale one — bug was flagged earlier.
             """
@@ -1399,52 +1796,20 @@ def main():
                 _log.warning("cmd retranscribe containment check failed: %s", e)
                 return {"ok": False,
                         "error": "Could not verify archive containment for video path."}
-            # Model swap BEFORE enqueue so this job runs under the
-            # requested model. Restore to the configured preference,
-            # not the current mutable runtime model; overlapping
-            # one-off requests can otherwise restore each other's
-            # temporary model.
-            _restore_model = None
-            if model:
-                _restore_model = _configured_whisper_model_for_restore(
-                    _valid_models)
-                try:
-                    api._transcribe.swap_model(model)
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-            def _restore_after(_res):
-                if not _restore_model:
-                    return
-                try:
-                    api._transcribe.swap_model(_restore_model)
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
             # Route through the same path the Watch-view re-transcribe
             # uses so retranscribe=True + video_id are forwarded, and the
-            # completion callback push-updates any open Watch view.
+            # completion callback push-updates any open Watch view. The model
+            # is immutable job data; no global swap/restore race is needed.
             try:
                 res = api.transcribe_retranscribe(
-                    filepath, title, video_id,
-                    _on_complete_extra=_restore_after if _restore_model else None)
+                    filepath, title, video_id, model=model)
                 if res and res.get("ok"):
                     return {"ok": True, "queued": True,
                             "video_id": video_id,
                             "model": model or None}
-                # Enqueue failed — restore immediately since the job
-                # won't run and the completion hook will never fire.
-                if _restore_model:
-                    try:
-                        api._transcribe.swap_model(_restore_model)
-                    except Exception as e:
-                        _log.debug("swallowed: %s", e)
                 return {"ok": False,
                         "error": (res or {}).get("error") or "enqueue failed"}
             except Exception as e:
-                if _restore_model:
-                    try:
-                        api._transcribe.swap_model(_restore_model)
-                    except Exception as e2:
-                        _log.debug("swallowed: %s", e2)
                 return {"ok": False, "error": str(e)}
         _cmd.register_handler("get", "/cmd/ping", _handle_ping)
         _cmd.register_handler("get", "/cmd/gpu-status", _handle_gpu_status)
@@ -1548,26 +1913,84 @@ def main():
     _ws_lock = threading.Lock()
     _ws_pending: dict = {}
     _ws_timer: list = [None]  # holds the current Timer, if any
-    def _ws_flush():
+    _state_writes_enabled = {"value": True}
+
+    def _stop_window_state_writes() -> None:
+        """Cancel stale config timers before a restore swaps live state."""
+        with _ws_lock:
+            _state_writes_enabled["value"] = False
+            _ws_pending.clear()
+            timer = _ws_timer[0]
+            if timer is not None:
+                try: timer.cancel()
+                except Exception: pass
+
+    def _ws_flush(expected_timer=None):
         try:
             with _ws_lock:
+                # A cancelled older timer may already be inside its callback
+                # while a newer debounce generation is scheduled. It must not
+                # consume the newer generation's pending geometry.
+                if (expected_timer is not None
+                        and _ws_timer[0] is not expected_timer):
+                    return
                 snap = _ws_pending.copy()
                 _ws_pending.clear()
                 _ws_timer[0] = None
-            if snap:
+                enabled = _state_writes_enabled["value"]
+            if snap and enabled:
                 winstate.save_window_state(snap)
         except Exception as e:
             _log.debug("swallowed: %s", e)
     def _ws_schedule(updates: dict):
         with _ws_lock:
+            if not _state_writes_enabled["value"]:
+                return
             _ws_pending.update(updates)
             t = _ws_timer[0]
             if t is not None:
                 try: t.cancel()
                 except Exception: pass
-            _ws_timer[0] = threading.Timer(0.25, _ws_flush)
-            _ws_timer[0].daemon = True
-            _ws_timer[0].start()
+            timer = None
+
+            def _flush_this_generation():
+                _ws_flush(timer)
+
+            timer = threading.Timer(0.25, _flush_this_generation)
+            timer.daemon = True
+            _ws_timer[0] = timer
+            timer.start()
+
+    def _ws_owner_active() -> bool:
+        with _ws_lock:
+            timer = _ws_timer[0]
+        return bool(timer is not None and timer.is_alive())
+
+    def _ws_owner_join(timeout: float) -> bool:
+        with _ws_lock:
+            timer = _ws_timer[0]
+        if timer is not None and timer is not threading.current_thread():
+            try:
+                timer.join(timeout=max(0.0, float(timeout)))
+            except (RuntimeError, TypeError):
+                pass
+        return not _ws_owner_active()
+
+    # The debouncer is intentionally a Timer because pywebview can emit
+    # dozens of resize/move events per second.  It is nevertheless a named,
+    # joinable lifecycle owner: restore/shutdown cancels it before the config
+    # swap and the supervisor proves that no delayed writer remains.
+    try:
+        api._job_supervisor.register_owner(OwnerAdapter(
+            owner="window-state",
+            label="Window-state debouncer",
+            active=_ws_owner_active,
+            prepare=_stop_window_state_writes,
+            join=_ws_owner_join,
+            force=_stop_window_state_writes,
+        ))
+    except ValueError:
+        pass
     # Register window-event handlers to save state on resize/move/close.
     def _on_resized(w, h):
         """Persist the latest pywebview window size after resize events."""
@@ -1598,7 +2021,8 @@ def main():
         # confirm dialog — let it through unconditionally.
         if _truly_quit.get("flag"):
             try:
-                winstate.save_window_state({})
+                if not getattr(api, "_restore_quiesced", False):
+                    winstate.save_window_state({})
                 _shutdown_cleanup()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
@@ -1610,7 +2034,8 @@ def main():
         behavior = (cfg.get("close_behavior") or "ask").lower()
         if behavior == "quit":
             try:
-                winstate.save_window_state({})
+                if not getattr(api, "_restore_quiesced", False):
+                    winstate.save_window_state({})
                 _truly_quit["flag"] = True
                 _shutdown_cleanup()
             except Exception as e:
@@ -1666,17 +2091,16 @@ def main():
     tray = None
 
     def _shutdown_cleanup():
-        """Flush disk writes + kill child processes on real shutdown.
-
-        Mirrors YTArchiver.py:34224 on_closing. Runs when the user closes
-        the window (X / Ctrl+Q / tray Quit). Order matters — save before kill.
-        """
+        """Checkpoint owners, stop exact children, then persist final state."""
         # confirm_close performs cleanup before destroy(), and destroy then
         # re-enters _on_closing. Without this guard the complete multi-second
         # teardown ran twice in sequence. Mark it at entry so every real-close
         # route shares one durable cleanup pass.
         if _boot_state["shutdown_ran"]:
-            return
+            return _boot_state.get("shutdown_report") or {
+                "ok": False,
+                "error": "Shutdown cleanup did not publish a result",
+            }
         # Neutralize the T087 boot safety net — the full teardown is running
         # now, so the atexit fallback must not also fire (it would be a no-op
         # under os._exit anyway, but make the intent explicit and defensive).
@@ -1688,122 +2112,45 @@ def main():
             except Exception as e:
                 _log.debug("swallowed: %s", e)
 
-        def _wait_for_worker_stop(thread_obj, label: str,
-                                  timeout: float = 4.0) -> bool:
-            """Give a cancelled worker a bounded chance to journal cleanly."""
-            try:
-                if thread_obj is None or not thread_obj.is_alive():
-                    return True
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-                return True
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                _flush_queues_now()
-                try:
-                    thread_obj.join(timeout=0.2)
-                    if not thread_obj.is_alive():
-                        _flush_queues_now()
-                        return True
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-                    return True
-            try:
-                _log.warning(
-                    "shutdown: %s worker still alive after %.1fs; "
-                    "persisting resuming state before process kill",
-                    label, timeout)
-            except Exception:
-                pass
-            _flush_queues_now()
-            return False
-
+        owners_stopped = False
+        report = None
+        cleanup_error = ""
         try:
-            # Stop the long-lived yt-dlp update scheduler before cancelling
-            # workers or killing child processes. This prevents a due timer
-            # from launching an updater during shutdown teardown.
-            try: api.stop_ytdlp_update_monitor()
-            except Exception as e: _log.debug("swallowed: %s", e)
-            # 0. Signal cancel FIRST so the sync worker has a chance to
-            # tear down cleanly before we start killing subprocesses
-            # underneath it (audit: main.py:1131-1227). Old order
-            # killed yt-dlp procs BEFORE setting the cancel event,
-            # which let the worker observe a dead subprocess return
-            # code and journal a partial-file row to the DB before
-            # checking _sync_cancel.
-            try: api._sync_cancel.set()
-            except Exception as e: _log.debug("swallowed: %s", e)
-            try: api._redwnl_cancel.set()
-            except Exception as e: _log.debug("swallowed: %s", e)
-            # Bounded cooperative wait so an in-flight worker can see
-            # cancel, persist its queue/resuming state, and exit before
-            # PROCESS_REGISTRY starts force-killing child processes.
-            _wait_for_worker_stop(getattr(api, "_sync_thread", None), "sync")
-            # 1. Persist queue state NOW (defeat the debounce timer).
-            _flush_queues_now()
-            # 2. Save window geometry one last time.
-            try: winstate.save_window_state({})
-            except Exception as e: _log.debug("swallowed: %s", e)
+            # One coordinator owns the order: close admission, stop schedulers,
+            # checkpoint/cancel jobs, share one deadline, then force only exact
+            # registered owners that remain. No process-name scan is involved.
+            _stop_window_state_writes()
+            report = api._job_supervisor.quiesce(
+                reason="application shutdown", timeout=10.0)
+            owners_stopped = bool(report.get("ok"))
+            if not owners_stopped:
+                _log.warning(
+                    "shutdown coordinator finished with active owners: %s",
+                    ", ".join(report.get("remaining") or []) or
+                    report.get("error") or "unknown")
+
+            restored = bool(getattr(api, "_restore_state_committed", False))
+            frozen = bool(getattr(api, "_restore_quiesced", False))
+            # The authoritative final save occurs only after every queue owner
+            # has stopped changing state. A successful restore deliberately
+            # skips all stale in-memory writes.
+            if owners_stopped and not restored and not frozen:
+                _flush_queues_now()
+                try: winstate.save_window_state({})
+                except Exception as e: _log.debug("swallowed: %s", e)
+            elif not restored and not frozen:
+                _log.warning(
+                    "final queue/window save skipped because a state owner "
+                    "did not stop before the shutdown deadline")
             try: net_backend.stop_monitor(timeout=1.0)
             except Exception as e: _log.debug("swallowed: %s", e)
-            # 3. Stop the tray thread — otherwise pystray keeps the process
+            # Stop the tray thread — otherwise pystray keeps the process
             # alive after the window destroys. This was the primary ghost
             # cause prior to 2026-04-18.
             try:
                 if tray and getattr(tray, "_started", False):
                     tray.stop()
             except Exception as e: _log.debug("swallowed: %s", e)
-            # 4. Terminate whisper + punctuation subprocesses cleanly.
-            from backend.utils import kill_process
-            try: api._transcribe._stop_subprocess(force=True)
-            except Exception as e: _log.debug("swallowed: %s", e)
-            try:
-                punct = getattr(api._transcribe, "_punct", None)
-                if punct is not None and getattr(punct, "_proc", None):
-                    kill_process(punct._proc)
-            except Exception as e: _log.debug("swallowed: %s", e)
-            # 5. (cancel-then-kill order: cancel already signaled at
-            # step 0; PROCESS_REGISTRY.kill_all below reaps anything
-            # the worker didn't tear down on its own.)
-            # kill registered subprocesses first via
-            # PROCESS_REGISTRY (sync's yt-dlp, compress's ffmpeg, etc.).
-            # The psutil fallback below catches anything that escaped
-            # registration — defense in depth.
-            try:
-                from backend.process_runner import PROCESS_REGISTRY as _PR
-                _n_killed = _PR.kill_all(timeout=2.0)
-                if _n_killed:
-                    _log.info("shutdown: PROCESS_REGISTRY killed %d procs", _n_killed)
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-            # also kill child yt-dlp / ffmpeg subprocesses
-            # that the sync cancel event might not reach in time.
-            # Without this, quitting during a sync leaves orphan
-            # yt-dlp.exe / ffmpeg.exe finishing their current file
-            # after the parent window is already gone → partial .part
-            # files on disk. psutil is already a dependency.
-            try:
-                import psutil as _ps
-                _me = _ps.Process(os.getpid())
-                for _ch in _me.children(recursive=True):
-                    _name = ""
-                    try: _name = (_ch.name() or "").lower()
-                    except Exception as e: _log.debug("swallowed: %s", e)
-                    if any(k in _name for k in
-                           ("yt-dlp", "yt_dlp", "ffmpeg", "ffprobe")):
-                        try: _ch.terminate()
-                        except Exception as e: _log.debug("swallowed: %s", e)
-                # Give them a moment, then force-kill stragglers.
-                try:
-                    _gone, _alive = _ps.wait_procs(_me.children(recursive=True),
-                                                    timeout=1.5)
-                    for _ch in _alive:
-                        try: _ch.kill()
-                        except Exception as e: _log.debug("swallowed: %s", e)
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
             # stop the HTTP servers so port 9855 (cmd)
             # and the local fileserver port are released cleanly. If
             # webview.start() ever returns through a path that doesn't
@@ -1822,22 +2169,85 @@ def main():
                     _stop()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-            # 6. Clear the sync-progress JSON so any companion display
-            # doesn't show stale "running" state after the app closes.
-            # Matches OLD's
-            # YTArchiver.py:34306 _clear_sync_progress() shutdown call.
-            try: sync_backend.clear_sync_progress()
-            except Exception as e: _log.debug("swallowed: %s", e)
-            # 7. Checkpoint + close the SQLite index now that the sync/GPU
-            # workers + subprocesses are stopped. main() ends in os._exit(0),
-            # which bypasses index.py's atexit hook, so call it explicitly here
-            # — otherwise the checkpoint never runs (audit r2). Best-effort.
-            try:
-                from backend import index as _idx
-                _idx._shutdown_index()
-            except Exception as e: _log.debug("swallowed: %s", e)
+            if owners_stopped and not restored and not frozen:
+                # These live files may have been replaced by backup restore.
+                # Never let the old process clear/checkpoint over that state.
+                try: sync_backend.clear_sync_progress()
+                except Exception as e: _log.debug("swallowed: %s", e)
+                try:
+                    from backend import index as _idx
+                    _idx._shutdown_index()
+                except Exception as e: _log.debug("swallowed: %s", e)
         except Exception as e:
+            cleanup_error = str(e)
             _log.debug("swallowed: %s", e)
+        result = {
+            "ok": bool(owners_stopped and not cleanup_error),
+            "owners_stopped": bool(owners_stopped),
+            "remaining": list((report or {}).get("remaining") or []),
+            "error": cleanup_error or str((report or {}).get("error") or ""),
+        }
+        _boot_state["shutdown_report"] = result
+        return result
+
+    def _prepare_restore_commit():
+        """Make every old in-memory state owner incapable of writing again."""
+        if getattr(api, "_restore_quiesced", False):
+            return {
+                "ok": False,
+                "needs_restart": True,
+                "error": "This process is already frozen for restore; restart it.",
+            }
+        # Stop new debounce timers before closing general work admission. A
+        # timer already inside save_config is serialized by the config write
+        # gate; suspend_config_writes below waits for it before restore swaps.
+        _stop_window_state_writes()
+        report = api._job_supervisor.quiesce(
+            reason="backup restore", timeout=12.0)
+        if not report.get("ok"):
+            report["needs_restart"] = True
+            report["error"] = (
+                report.get("error") or
+                "Background work could not be stopped safely. Restart the app."
+            )
+            return report
+        if not api._queues.save_now():
+            return {
+                "ok": False,
+                "needs_restart": True,
+                "error": "The current queue could not be checkpointed safely.",
+            }
+
+        # From this point forward the process is intentionally one-way: it may
+        # finish the restore or quit, but it can never write stale state again.
+        try:
+            from backend.ytarchiver_config import suspend_config_writes
+            suspend_config_writes("backup restore")
+        except Exception as exc:
+            return {"ok": False, "needs_restart": True, "error": str(exc)}
+        try:
+            api._queues.mark_orphan()
+        except Exception as exc:
+            api._restore_quiesced = True
+            return {
+                "ok": False,
+                "needs_restart": True,
+                "error": f"The old queue owner could not be frozen: {exc}",
+            }
+        api._restore_quiesced = True
+        try:
+            from backend import index as _idx
+            _idx._shutdown_index()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "needs_restart": True,
+                "error": f"The search database could not be closed: {exc}",
+            }
+        return {
+            "ok": True,
+            "owners": report.get("after", {}).get("owners", []),
+        }
 
     # Bind the cleanup function to the Api instance so Api.app_restart
     # can invoke the full close sequence (queue persist, subprocess
@@ -1847,6 +2257,7 @@ def main():
     # step. See backend audit #1 (2026-05-13).
     try:
         api._shutdown_cleanup_fn = _shutdown_cleanup
+        api._prepare_restore_commit_fn = _prepare_restore_commit
     except Exception as e:
         _log.debug("swallowed: %s", e)
     _boot_trace("shutdown cleanup wired")
@@ -1980,7 +2391,7 @@ def main():
     # Startup sanity checks — dependency probe, missing folder scan, update
     # ping, leftover temp/partial file sweep. All run in background threads
     # so they never block window.show.
-    def _startup_checks():
+    def _startup_checks_impl(startup_cancel):
         _boot_trace("startup callback begin")
         try: api._log_stream.mark_ready()
         except Exception as e: _log.debug("log stream ready failed: %s", e)
@@ -2000,6 +2411,8 @@ def main():
         _start_dark_titlebar_thread()
         try: api.check_dependencies()
         except Exception as e: _log.debug("swallowed: %s", e)
+        if startup_cancel.is_set():
+            return
         # Start one persistent monitor: it checks immediately when overdue,
         # then keeps honoring the configured elapsed-day interval for apps
         # that remain open for days or weeks.
@@ -2010,8 +2423,12 @@ def main():
         # Browse remains a local-only archive viewer.
         try: api.check_channel_folders()
         except Exception as e: _log.debug("swallowed: %s", e)
+        if startup_cancel.is_set():
+            return
         try: api.check_app_update()
         except Exception as e: _log.debug("swallowed: %s", e)
+        if startup_cancel.is_set():
+            return
         try:
             from backend.temp_cleanup import startup_cleanup_temps
             def _startup_cleanup_busy():
@@ -2028,16 +2445,20 @@ def main():
             startup_cleanup_temps(
                 api._log_stream, busy_fn=_startup_cleanup_busy)
         except Exception as e: _log.debug("swallowed: %s", e)
+        if startup_cancel.is_set():
+            return
         # Legacy upload-timestamp fallback — needed for the Graph tab's Week
         # bucket. Populates only NULL rows from file mtime. New downloads and
         # metadata refreshes use yt-dlp's authoritative upload_date instead;
         # `--mtime` is an HTTP Last-Modified value and can predate publication.
         # Runs once per launch; idempotent (only fills NULL rows).
-        # Background thread so a large archive doesn't slow boot.
+        # The pywebview startup callback already runs off the UI thread.
         try:
             from backend.index import backfill_upload_ts as _backfill
             _backfill()
         except Exception as e: _log.debug("swallowed: %s", e)
+        if startup_cancel.is_set():
+            return
         # Seed the catalog's real completed-download timestamp from the legacy
         # recent_downloads history. `added_ts` is only first discovery time;
         # keeping the concepts separate prevents rescans of old archives from
@@ -2051,24 +2472,30 @@ def main():
                 _log.info("download timestamp backfill: %s", _dl_result)
         except Exception as e:
             _log.debug("download timestamp backfill failed: %s", e)
+        if startup_cancel.is_set():
+            return
         # View/like backfill for the global Videos view — materializes
         # view_count/like_count from the per-channel Metadata.jsonl sidecars
         # into the index DB so the whole archive can be sorted by views/
-        # likes off an indexed column. Idempotent no-op once populated; own
-        # daemon thread so the one-time ~minute pass never blocks boot.
+        # likes off an indexed column. Idempotent no-op once populated; it
+        # stays under the startup-check owner so restore can wait for it.
         try:
             from backend.index import backfill_video_stats_if_needed as _bvs
-            threading.Thread(target=_bvs, daemon=True).start()
+            _bvs()
         except Exception as e: _log.debug("swallowed: %s", e)
+        if startup_cancel.is_set():
+            return
         # Duration backfill for the Index panel's "Hours of video" stat —
         # fills videos.duration_s from each video's longest segment for
         # older imports that lack it. Makes that panel's hours read an
         # instant SUM instead of a multi-minute per-segment GROUP BY that
-        # used to hang it. One-time, idempotent; own daemon thread.
+        # used to hang it. One-time and idempotent.
         try:
             from backend.index import backfill_video_durations_if_needed as _bvd
-            threading.Thread(target=_bvd, daemon=True).start()
+            _bvd()
         except Exception as e: _log.debug("swallowed: %s", e)
+        if startup_cancel.is_set():
+            return
         # One-time video_id recovery for legacy NULL-id imports (channels
         # whose only transcript is an aggregated `.{Name} Transcript.jsonl`,
         # so the sweep's .info.json id-backfill couldn't recover them). Fills
@@ -2093,7 +2520,7 @@ def main():
                                 r.get("filled"), r.get("reconciled"))
                     except Exception as _e:
                         _log.debug("video_id seg-backfill thread: %s", _e)
-                threading.Thread(target=_vid_seg_backfill, daemon=True).start()
+                _vid_seg_backfill()
         except Exception as e: _log.debug("swallowed: %s", e)
         # If launched with --start-minimized (e.g. from Windows boot Registry
         # entry), hide the window immediately so the app is tray-only on boot.
@@ -2102,12 +2529,42 @@ def main():
                 window.hide()
             except Exception as e:
                 _log.debug("start-minimized hide failed: %s", e)
-        try:
-            api._autorun.notify_startup_ready("checks")
-        except Exception as e:
-            _log.debug(
-                "autorun startup-check notification failed: %s", e)
+        if not startup_cancel.is_set():
+            try:
+                api._autorun.notify_startup_ready("checks")
+            except Exception as e:
+                _log.debug(
+                    "autorun startup-check notification failed: %s", e)
+            try:
+                api._trash_retention.notify_startup_ready("checks")
+            except Exception as e:
+                _log.debug(
+                    "Trash retention startup-check notification failed: %s", e)
         _boot_trace("startup callback end")
+
+    def _startup_checks():
+        """Run pywebview's startup callback as one quiesce-visible owner."""
+        import uuid as _uuid
+
+        cancel = threading.Event()
+        task_id = f"startup-checks-{_uuid.uuid4().hex}"
+        api._startup_checks_cancel = cancel
+        try:
+            with api._job_supervisor.operation_scope(
+                owner="startup-checks",
+                label="Startup dependency and catalog checks",
+                task_id=task_id,
+                cancel=cancel,
+            ) as admitted_cancel:
+                _startup_checks_impl(admitted_cancel)
+        except Exception as exc:
+            # Admission normally closes only during Quit/Restart/Restore. At
+            # that point the callback must retire silently instead of starting
+            # a late index/config writer against the next state generation.
+            _log.debug("startup checks not run: %s", exc)
+        finally:
+            if getattr(api, "_startup_checks_cancel", None) is cancel:
+                api._startup_checks_cancel = None
     # Defer startup checks until pywebview has actually rendered the
     # window. Previously this thread started BEFORE webview.start(), so
     # api.check_dependencies / check_channel_folders / check_app_update

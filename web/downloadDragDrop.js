@@ -52,27 +52,31 @@
                   e.dataTransfer.getData("text/plain");
       if (!url) return;
       const trimmed = url.trim();
-      // Reject file:// drags entirely (audit: downloadDragDrop.js
-      // H239). Also tighten the regex to anchor on a real youtube /
-      // youtu.be domain instead of the bare substring "youtube" —
-      // "notyoutube.com" used to pass.
+      // Reject file:// drags entirely (audit: downloadDragDrop.js H239).
+      // Use the parsed hostname validator shared with the typed field so a
+      // foreign URL cannot smuggle "youtube.com" into its path or user-info.
       if (/^file:/i.test(trimmed)) {
         window._showToast?.("Drop a YouTube URL, not a file.", "warn");
         return;
       }
-      if (!/(^|[./@])(youtube\.com|youtu\.be|music\.youtube\.com)(\/|$)/i.test(trimmed)) {
+      const parsed = typeof window._parseYouTubeUrl === "function"
+        ? window._parseYouTubeUrl(trimmed) : null;
+      if (!parsed) {
         window._showToast?.("Drop a YouTube URL to archive.", "warn");
         return;
       }
       const looksLikeVideo = typeof window._urlLooksLikeVideo === "function"
         ? window._urlLooksLikeVideo(trimmed)
-        : /(?:^|[./@])(?:music\.|m\.|www\.)?youtube\.com\/(?:watch\?v=|shorts\/|embed\/|live\/|clip\/)|(?:^|[./@])youtu\.be\/[\w-]{6,}/i.test(trimmed);
+        : false;
       if (!looksLikeVideo) {
         window._showToast?.("Drop a single YouTube video URL here. Add channels from Browse.", "warn");
         return;
       }
       const input = document.querySelector("#panel-download .ctl-input");
-      if (input) input.value = trimmed;
+      if (input) {
+        input.value = trimmed;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      }
       if (nativeBridgeUp()) {
         // Already-archived warning — same gate as the URL-submit flow, so a
         // dropped URL for a video already in the archive prompts before
@@ -100,8 +104,34 @@
         // is scoped to that file's IIFE and not visible here.
         const opts = (typeof window._readVideoOptions === "function")
             ? window._readVideoOptions() : {};
-        await bridgeCall("archive_single_video", trimmed, opts);
+        const queue = typeof window._queueSingleVideo === "function"
+          ? window._queueSingleVideo
+          : async (url, options) => {
+              try {
+                const result = await bridgeCall("archive_single_video", url, options);
+                return result?.ok ? result : {
+                  ok: false,
+                  error: result?.error || "The download could not be queued.",
+                };
+              } catch (err) {
+                return { ok: false, error: err?.message || String(err) };
+              }
+            };
+        const result = await queue(trimmed, opts);
+        if (!result?.ok) {
+          window._showToast?.(
+            result?.error || "The download could not be queued.", "error");
+          return; // URL stays in the field for correction/retry.
+        }
         window._showToast?.("Queued: " + trimmed.slice(0, 60), "ok");
+        // Match the typed-URL flow: a successfully queued URL is consumed,
+        // and dispatching input also hides the options panel/button.
+        if (input && input.value.trim() === trimmed) {
+          input.value = "";
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+      } else {
+        window._showToast?.("YTArchiver isn't ready yet. The URL is still here so you can try again.", "warn");
       }
     });
   }

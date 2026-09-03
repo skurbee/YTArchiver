@@ -351,64 +351,36 @@ def emit_consolidated_auto_row(stream: LogStreamer,
     return row_id
 
 
-# Row-ID-aware history persistence. `emit_consolidated_auto_row` can
-# be called twice for the SAME row_id — first when sync_channel
-# finishes (transcribe count may still be 0), then retroactively when
-# the transcribe worker drains. Without tracking which config index
-# each row_id owns, the retroactive call appends a SECOND line to
-# `autorun_history`, producing duplicate [Dwnld] rows on next load
-# (and sometimes immediately if renderActivityLog re-runs). This
-# dict maps row_id -> index in config["autorun_history"] so the
-# retroactive path overwrites the correct slot.
+# Compatibility index for diagnostics and older extensions. The durable
+# identity now lives in each JSONL record itself; this map is rebuilt after an
+# upsert and is never used to decide which row gets replaced.
 _HIST_INDEX_BY_ROW_ID: dict[str, int] = {}
 _HIST_INDEX_LOCK = threading.Lock()
 
 
 def _persist_row_history(row_id: str, line: str) -> None:
-    """Append `line` to config['autorun_history'], or replace the
-    previously-persisted entry if this row_id has already been
-    written. Deduplicates retroactive updates of the same row.
-    """
+    """Upsert one activity line in the stable-ID JSONL repository."""
     try:
         from .. import autorun as _ar
-        from .. import ytarchiver_config as _cfg
     except Exception:
         return
-    if not _cfg.config_is_writable():
-        return
     try:
-        cfg = _cfg.load_config()
-        hist = cfg.setdefault("autorun_history", [])
         with _HIST_INDEX_LOCK:
-            existing_idx = _HIST_INDEX_BY_ROW_ID.get(row_id) if row_id else None
-            if (existing_idx is not None
-                    and 0 <= existing_idx < len(hist)):
-                # Retroactive update — replace the previous line.
-                hist[existing_idx] = line
+            store = _ar._history_store()
+            if row_id:
+                saved = store.upsert(row_id, line)
             else:
-                hist.append(line)
-                new_idx = len(hist) - 1
-                # Trim + shift previously tracked indices if we exceeded cap.
-                if len(hist) > _ar.AUTORUN_HISTORY_MAX:
-                    trim_n = len(hist) - _ar.AUTORUN_HISTORY_MAX
-                    hist = hist[-_ar.AUTORUN_HISTORY_MAX:]
-                    cfg["autorun_history"] = hist
-                    for _k, _v in list(_HIST_INDEX_BY_ROW_ID.items()):
-                        if _k == row_id:
-                            continue
-                        if _v < trim_n:
-                            _HIST_INDEX_BY_ROW_ID.pop(_k, None)
-                        else:
-                            _HIST_INDEX_BY_ROW_ID[_k] = _v - trim_n
-                    new_idx -= trim_n
-                if row_id:
-                    _HIST_INDEX_BY_ROW_ID[row_id] = new_idx
-            for _k, _v in list(_HIST_INDEX_BY_ROW_ID.items()):
-                if not isinstance(_v, int) or _v < 0 or _v >= len(hist):
-                    _HIST_INDEX_BY_ROW_ID.pop(_k, None)
-        _cfg.save_config(cfg)
+                saved = bool(store.append(line))
+            if not saved:
+                raise OSError("activity history upsert failed")
+            _HIST_INDEX_BY_ROW_ID.clear()
+            _HIST_INDEX_BY_ROW_ID.update({
+                str(record.get("id") or ""): index
+                for index, record in enumerate(store.records())
+                if str(record.get("id") or "")
+            })
     except Exception as e:
-        swallow("log-history config save", e)
+        swallow("log-history JSONL save", e)
 
 
 # Registry: channel_name -> (row_id, downloaded, metadata, errors,

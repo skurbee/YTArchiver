@@ -475,6 +475,7 @@ body {
 
 /* Clickable Total: X TB label in Subs header */
 .status-text.clickable-total {
+  flex: 0 0 auto;
   cursor: pointer;
   user-select: none;
   border-bottom: 1px dotted transparent;
@@ -554,6 +555,7 @@ body {
   flex: 1 1 auto;
   display: flex;
   flex-direction: column;
+  min-width: 0;
   overflow-y: auto;
 }
 .settings-single-page .settings-actions {
@@ -569,6 +571,7 @@ body {
   flex: 1 1 auto;
   display: flex;
   flex-direction: column;
+  min-width: 0;
 }
 .settings-view[hidden] {
   display: none !important;

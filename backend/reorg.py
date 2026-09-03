@@ -25,6 +25,14 @@ from typing import Any
 
 from .log import get_logger
 from .log_stream import LogStreamer
+from .services.channel_leases import (
+    LeaseOwner,
+    canonical_path,
+    channel_aliases,
+    channel_leases,
+)
+from .services.sidecar_store import SidecarError, read_json_object, read_jsonl
+from .ytarchiver_config import load_config
 
 _log = get_logger(__name__)
 
@@ -46,6 +54,51 @@ from .utils import MONTH_FOLDERS as _MONTH_FOLDERS
 from .utils import sampled_files_equal
 
 _REORG_SKIP_DIRS = ("_TEMP_COMPRESS", "_BACKLOG_TEMP", "_REDOWNLOAD_TEMP")
+
+
+def _resolve_lease_target(channel_folder: str) -> tuple[str, frozenset[str]]:
+    """Resolve the current configured identity/path immediately before work."""
+    supplied = os.path.realpath(channel_folder)
+    aliases = set(channel_aliases(paths=[supplied]))
+    try:
+        cfg = load_config() or {}
+        base = str(cfg.get("output_dir") or "").strip()
+        if not base:
+            return supplied, frozenset(aliases)
+        from .sync.ytdlp_proc import channel_folder_name
+
+        supplied_key = canonical_path(supplied)
+        for channel in cfg.get("channels") or []:
+            if not isinstance(channel, dict):
+                continue
+            current = os.path.join(base, channel_folder_name(channel))
+            if canonical_path(current) != supplied_key:
+                continue
+            aliases.update(channel_aliases(channel, paths=[supplied, current]))
+            return os.path.realpath(current), frozenset(aliases)
+    except Exception as exc:
+        _log.debug("reorg lease identity resolution failed: %s", exc)
+    return supplied, frozenset(aliases)
+
+
+def _lease_failure(action: str, result, stream: LogStreamer) -> dict[str, Any]:
+    if result.status == "cancelled":
+        return {"ok": False, "cancelled": True, "reason": "cancelled"}
+    message = (
+        f"{action} could not start because this channel is busy. "
+        f"{result.explanation} Try again after the active task finishes."
+    )
+    try:
+        stream.emit_error(message)
+    except Exception:
+        pass
+    return {
+        "ok": False,
+        "busy": True,
+        "reason": "channel_busy",
+        "error": message,
+        "blockers": [item.as_dict() for item in result.blockers],
+    }
 
 
 def _gather_video_files(root: Path) -> list[Path]:
@@ -361,6 +414,15 @@ def _relocate_flat_aggregate_files(root: Path, ch_name: str,
                     f"to {target.name}.")
                 moved += 1
                 continue
+            if src.name.lower().endswith(".jsonl"):
+                try:
+                    # Reorganization must not relocate a partial/non-object
+                    # aggregate and thereby make it look like a clean commit.
+                    read_jsonl(src, invalid="raise")
+                except SidecarError as exc:
+                    stream.emit_error(
+                        f"Move refused for invalid aggregate {src.name}: {exc}")
+                    continue
             try:
                 shutil.move(str(src), str(target))
                 if target.name.startswith("."):
@@ -389,22 +451,21 @@ def _date_from_info_json(video: Path) -> datetime | None:
         video.parent / (video.stem + ".info.json"),
     ]
     for p in candidates:
-        if p.is_file():
-            try:
-                import json as _json
-                with p.open("r", encoding="utf-8") as f:
-                    data = _json.load(f)
-                raw = data.get("upload_date") or data.get("release_date") or ""
-                if raw and len(raw) == 8 and raw.isdigit():
-                    return datetime(int(raw[:4]), int(raw[4:6]), int(raw[6:8]))
-            except (OSError, ValueError):
-                pass
+        try:
+            exists, data = read_json_object(p)
+            if not exists:
+                continue
+            raw = data.get("upload_date") or data.get("release_date") or ""
+            if raw and len(raw) == 8 and raw.isdigit():
+                return datetime(int(raw[:4]), int(raw[4:6]), int(raw[6:8]))
+        except (SidecarError, ValueError) as exc:
+            _log.warning("Could not read info sidecar %s: %s", p, exc)
     return None
 
 
-def fix_file_dates(channel_folder: str, stream: LogStreamer,
-                   cancel_event: threading.Event | None = None
-                   ) -> dict[str, Any]:
+def _fix_file_dates_impl(channel_folder: str, stream: LogStreamer,
+                         cancel_event: threading.Event | None = None
+                         ) -> dict[str, Any]:
     """Walk the channel folder and update each video file's mtime to match
     its YouTube upload date (from the .info.json sidecar).
 
@@ -497,12 +558,29 @@ def fix_file_dates(channel_folder: str, stream: LogStreamer,
             "missing": missing, "cancelled": _was_cancelled}
 
 
-def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
-                  stream: LogStreamer,
-                  cancel_event: threading.Event | None = None,
-                  use_mtime: bool = True,
-                  recheck_dates: bool = False,
-                  dry_run: bool = False) -> dict[str, Any]:
+def fix_file_dates(channel_folder: str, stream: LogStreamer,
+                   cancel_event: threading.Event | None = None
+                   ) -> dict[str, Any]:
+    """Fix dates while excluding sync, redownload, and reorganization work."""
+    target, aliases = _resolve_lease_target(channel_folder)
+    owner = LeaseOwner(
+        "reorg", f"dates-{threading.get_ident()}-{time.monotonic_ns()}",
+        label=f"Fix file dates for {Path(target).name}", kind="fix_dates")
+    admission = channel_leases.try_acquire(
+        aliases, owner, cancel_event=cancel_event)
+    if not admission.ok:
+        return _lease_failure("Fix file dates", admission, stream)
+    assert admission.lease is not None
+    with admission.lease:
+        return _fix_file_dates_impl(target, stream, cancel_event)
+
+
+def _reorg_channel_impl(channel_folder: str, split_years: bool, split_months: bool,
+                        stream: LogStreamer,
+                        cancel_event: threading.Event | None = None,
+                        use_mtime: bool = True,
+                        recheck_dates: bool = False,
+                        dry_run: bool = False) -> dict[str, Any]:
     """
     Move all videos in `channel_folder` into the requested layout.
 
@@ -737,3 +815,32 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
     return {"ok": True, "moved": moved, "skipped": skipped, "errors": errors,
             "redated": redated, "aggregate_moved": aggregate_moved,
             "took": took}
+
+
+def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
+                  stream: LogStreamer,
+                  cancel_event: threading.Event | None = None,
+                  use_mtime: bool = True,
+                  recheck_dates: bool = False,
+                  dry_run: bool = False) -> dict[str, Any]:
+    """Reorganize one channel while holding all current identity/path aliases."""
+    target, aliases = _resolve_lease_target(channel_folder)
+    owner = LeaseOwner(
+        "reorg", f"reorg-{threading.get_ident()}-{time.monotonic_ns()}",
+        label=f"Reorganize {Path(target).name}", kind="reorganize")
+    admission = channel_leases.try_acquire(
+        aliases, owner, cancel_event=cancel_event)
+    if not admission.ok:
+        return _lease_failure("Reorganization", admission, stream)
+    assert admission.lease is not None
+    with admission.lease:
+        return _reorg_channel_impl(
+            target,
+            split_years,
+            split_months,
+            stream,
+            cancel_event=cancel_event,
+            use_mtime=use_mtime,
+            recheck_dates=recheck_dates,
+            dry_run=dry_run,
+        )

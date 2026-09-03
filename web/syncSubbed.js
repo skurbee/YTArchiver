@@ -40,7 +40,14 @@
   }
 
   async function checkedQueueCall(call, okMessage, okKind, failMessage) {
-    const res = await call();
+    let res;
+    try {
+      res = await call();
+    } catch (error) {
+      window._showToast?.(
+        `${failMessage || "Queue action failed."} ${error}`.trim(), "error");
+      return false;
+    }
     if (!res?.ok) {
       window._showToast?.(res?.error || failMessage || "Queue action failed.", "error");
       return false;
@@ -125,7 +132,7 @@
 
     btn.addEventListener("click", _inFlight(async () => {
       if (!nativeBridgeUp()) {
-        window._showToast?.("Sync requires native mode (launch main.py).", "warn");
+        window._showToast?.("Sync isn't ready yet. Try again in a moment.", "warn");
         return;
       }
       try {
@@ -207,8 +214,8 @@
                 `The sync is waiting for a ${reason} rolling-window slot ` +
                 `until ${untilText}. Continuing now will ignore the ` +
                 "configured hourly and 24-hour ceilings for the rest of " +
-                "this sync pass. Emergency YouTube rate-limit protection " +
-                "and launch spacing remain active.",
+                "this sync pass. YTArchiver will still pause if YouTube " +
+                "starts rejecting requests, and launch spacing remains active.",
                 {
                   confirm: "Override and continue",
                   cancel: "Keep waiting",
@@ -242,11 +249,36 @@
           // user's intent is "drain what's queued", not "start a
           // brand new sync of every subscribed channel".
           if (typeof api.sync_start_all === "function") {
-            const res = await api.sync_start_all(false);
-            if (res?.ok) {
-              window._showToast?.("Resumed \u2014 starting queue.", "ok");
-            } else {
-              window._showToast?.(res?.error || "Resume failed.", "error");
+            let redownloadOnly = false;
+            try {
+              const snap = queueStateSnapshot();
+              const hasRedownload = (snap?.sync || []).some(
+                task => (task?.kind || "").toLowerCase() === "redownload");
+              if (hasRedownload &&
+                  typeof api.resume_pending_redownloads === "function") {
+                const rr = await api.resume_pending_redownloads();
+                redownloadOnly = !!(
+                  rr?.ok && rr.resumed > 0 && rr.regular_pending === 0);
+                if (redownloadOnly) {
+                  window._showToast?.(
+                    `Resumed ${rr.resumed} redownload(s).`, "ok");
+                } else if (rr?.regular_pending === 0) {
+                  window._showToast?.(
+                    rr?.error || "Saved redownloads could not be resumed.",
+                    "error");
+                  return;
+                }
+              }
+            } catch (e) {
+              console.error("resume_pending_redownloads:", e);
+            }
+            if (!redownloadOnly) {
+              const res = await api.sync_start_all(false);
+              if (res?.ok) {
+                window._showToast?.("Resumed \u2014 starting queue.", "ok");
+              } else {
+                window._showToast?.(res?.error || "Resume failed.", "error");
+              }
             }
           } else {
             window._showToast?.("Resume failed.", "error");
@@ -287,6 +319,7 @@
           // full sync of every channel" and the redownload state on
           // disk is silently ignored.
           let routedRedownload = false;
+          let redownloadResumeFailed = false;
           try {
             const snap = queueStateSnapshot();
             const hasRedwnl = (snap?.sync || []).some(
@@ -294,15 +327,23 @@
             if (hasRedwnl && api.resume_pending_redownloads) {
               const rr = await api.resume_pending_redownloads();
               if (rr?.ok && rr.resumed > 0) {
-                routedRedownload = true;
+                routedRedownload = rr.regular_pending === 0;
                 window._showToast?.(
-                  `Resumed ${rr.resumed} redownload(s).`, "ok");
+                  routedRedownload
+                    ? `Resumed ${rr.resumed} redownload(s).`
+                    : `Restored ${rr.resumed} redownload(s); starting sync queue.`,
+                  "ok");
+              } else if (rr?.regular_pending === 0) {
+                redownloadResumeFailed = true;
+                window._showToast?.(
+                  rr?.error || "Saved redownloads could not be resumed.",
+                  "error");
               }
             }
           } catch (e) {
             console.error("resume_pending_redownloads:", e);
           }
-          if (!routedRedownload) {
+          if (!routedRedownload && !redownloadResumeFailed) {
             // Pass false so resume only drains the existing queue \u2014
             // does NOT enqueue a fresh Sync Subbed pass for every
             // subscribed channel (which is what `sync_start_all()`
@@ -366,6 +407,11 @@
         : Promise.resolve(confirm("Clear the sync queue?") ? "clear" : null));
       if (choice === "clear") {
         const res = await bridgeCall("sync_clear_queue");
+        if (!res?.ok) {
+          window._showToast?.(
+            res?.error || "Sync queue could not be cleared.", "error");
+          return;
+        }
         const n = res?.removed || 0;
         const wasRunning = !!res?.running;
         // Give clear feedback: if a download was active, tell the user
@@ -380,6 +426,11 @@
           "warn");
       } else if (choice === "stop") {
         const res = await bridgeCall("sync_force_stop");
+        if (!res?.ok) {
+          window._showToast?.(
+            res?.error || "Sync queue could not be stopped.", "error");
+          return;
+        }
         const n = res?.removed || 0;
         const k = res?.killed || 0;
         window._showToast?.(
@@ -441,6 +492,11 @@
         : Promise.resolve(confirm("Clear the processing queue?") ? "clear" : null));
       if (choice === "clear") {
         const res = await bridgeCall("gpu_clear_queue");
+        if (!res?.ok) {
+          window._showToast?.(
+            res?.error || "Processing queue could not be cleared.", "error");
+          return;
+        }
         const n = res?.removed || 0;
         window._showToast?.(
           n > 0 ? `Processing queue cleared (${n} pending).`
@@ -495,8 +551,7 @@
         await window.askConfirm?.(
           "\u26a0\ufe0f YouTube rate limit",
           "YouTube has temporarily rate-limited YTArchiver.\n\n" +
-          "The sync has been \u23f8 paused automatically so it does not " +
-          "keep hammering YouTube.\n\n" +
+          "The sync paused automatically.\n\n" +
           "Wait about one hour, then click \u201cResume\u201d. The interrupted " +
           "task will be retried first.",
           { confirm: "Got it", danger: false }

@@ -31,6 +31,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
+from ..executor_utils import WorkResult, run_bounded
 from ..log import get_logger, swallow
 from ..log_stream import LogStreamer
 from ..process_runner import popen_ytdlp
@@ -100,6 +101,9 @@ def _fetch_video_metadata(yt: str, video_id: str,
                           error_out: list[str] | None = None,
                           stream: LogStreamer | None = None,
                           cancel_event: threading.Event | None = None,
+                          process_owner: str | None = None,
+                          process_task_id: str = "",
+                          include_comments: bool = True,
                           ) -> dict[str, Any] | None:
     """Fetch metadata for a single video via yt-dlp --dump-json.
     Returns the OLD-schema dict, or None on failure.
@@ -117,9 +121,14 @@ def _fetch_video_metadata(yt: str, video_id: str,
         yt,
         "--dump-json", "--no-download", "--no-warnings",
         "--ignore-errors", "--skip-download",
-        "--write-comments",
-        "--extractor-args",
-        "youtube:comment_sort=top;max_comments=50,50,0,0",
+    ]
+    if include_comments:
+        cmd += [
+            "--write-comments",
+            "--extractor-args",
+            "youtube:comment_sort=top;max_comments=50,50,0,0",
+        ]
+    cmd += [
         *_find_cookie_source(),
         f"https://www.youtube.com/watch?v={video_id}",
     ]
@@ -133,6 +142,8 @@ def _fetch_video_metadata(yt: str, video_id: str,
     _rc: int | None = None
     _attempts = (60, 60, 90)
     for _attempt_idx, _attempt_timeout in enumerate(_attempts):
+        if cancel_event is not None and cancel_event.is_set():
+            return None
         from .. import youtube_traffic
         permission = youtube_traffic.acquire(
             "video_metadata", cancel_event=cancel_event, stream=stream)
@@ -140,6 +151,8 @@ def _fetch_video_metadata(yt: str, video_id: str,
             if error_out is not None:
                 error_out.append(
                     permission.get("error") or "traffic governor cancelled")
+            return None
+        if cancel_event is not None and cancel_event.is_set():
             return None
         try:
             # CREATE_NEW_PROCESS_GROUP so taskkill /T /F on cancel/timeout
@@ -159,6 +172,9 @@ def _fetch_video_metadata(yt: str, video_id: str,
                 startupinfo=_startupinfo,
                 env=_utf8_env(),
                 creationflags=_creationflags,
+                owner=process_owner,
+                task_id=process_task_id,
+                role="metadata",
             )
         except OSError as e:
             if error_out is not None:
@@ -173,6 +189,19 @@ def _fetch_video_metadata(yt: str, video_id: str,
         with _inflight_procs_lock:
             _reg.add(proc)
         try:
+            # Close the launch/register race: cancellation may arrive after
+            # the pre-launch check but before this process becomes visible in
+            # the operation registry.
+            if cancel_event is not None and cancel_event.is_set():
+                try:
+                    proc.kill()
+                except Exception as e:
+                    swallow("metadata post-launch cancel kill", e)
+                try:
+                    proc.communicate(timeout=5)
+                except Exception as e:
+                    swallow("metadata post-launch cancel drain", e)
+                return None
             try:
                 stdout, stderr = proc.communicate(timeout=_attempt_timeout)
                 _rc = proc.returncode
@@ -203,7 +232,12 @@ def _fetch_video_metadata(yt: str, video_id: str,
                     # not a permanent failure. audit E-11 sentinel.
                     return {"_timeout": True}
                 # Short backoff before retry
-                time.sleep(2 ** _attempt_idx)  # 1s, 2s
+                backoff = 2 ** _attempt_idx  # 1s, 2s
+                if cancel_event is not None:
+                    if cancel_event.wait(backoff):
+                        return None
+                else:
+                    time.sleep(backoff)
         finally:
             with _inflight_procs_lock:
                 _reg.discard(proc)
@@ -310,6 +344,10 @@ def fetch_single_video_metadata(channel: dict[str, Any],
                                 refresh: bool = False,
                                 dest_folder: str | None = None,
                                 cancel_event: threading.Event | None = None,
+                                process_owner: str | None = None,
+                                process_task_id: str = "",
+                                refresh_scope: str = "all",
+                                refresh_thumbnail: bool = True,
                                 ) -> dict[str, Any]:
     """Fetch metadata for ONE just-downloaded video, inline per-video.
 
@@ -330,6 +368,9 @@ def fetch_single_video_metadata(channel: dict[str, Any],
 
     Returns {ok, fetched|skipped|error}.
     """
+    scope = str(refresh_scope or "all").strip().lower()
+    if scope not in {"all", "stats", "comments"}:
+        return {"ok": False, "error": "invalid metadata refresh scope"}
     if not video_id or not file_path:
         return {"ok": False, "error": "missing id or path"}
 
@@ -371,7 +412,11 @@ def fetch_single_video_metadata(channel: dict[str, Any],
     _fetch_errors: list[str] = []
     entry = _fetch_video_metadata(
         yt, video_id, title_hint, error_out=_fetch_errors,
-        stream=stream, cancel_event=cancel_event)
+        stream=stream, cancel_event=cancel_event,
+        process_owner=process_owner, process_task_id=process_task_id,
+        include_comments=(scope != "stats"))
+    if cancel_event is not None and cancel_event.is_set():
+        return {"ok": False, "cancelled": True}
     if isinstance(entry, dict) and entry.get("_youtube_failure"):
         kind = str(entry["_youtube_failure"])
         return {
@@ -408,13 +453,35 @@ def fetch_single_video_metadata(channel: dict[str, Any],
 
     _jsonl_write_failed = False
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            return {"ok": False, "cancelled": True}
         # Hold the per-path lock across read+merge+write so a concurrent
         # metadata writer's just-landed entry isn't clobbered by our stale
         # read above. The network fetch ran outside the lock; re-read fresh
         # here under it. RLock allows the inner
         # _write_metadata_jsonl re-acquires on this thread safely.
         with _lock_for(jp):
+            if cancel_event is not None and cancel_event.is_set():
+                return {"ok": False, "cancelled": True}
             existing = _read_metadata_jsonl(jp, strict=True)
+            if cancel_event is not None and cancel_event.is_set():
+                return {"ok": False, "cancelled": True}
+            current = existing.get(video_id)
+            if refresh and isinstance(current, dict) and scope != "all":
+                # A scoped refresh must not erase fields the user did not ask
+                # to update. In particular, the fast views/likes request does
+                # not download comments, and a comments refresh must not
+                # silently replace the saved description or thumbnail URL.
+                merged = dict(current)
+                fields = (
+                    ("view_count", "like_count", "comment_count", "fetched_at")
+                    if scope == "stats"
+                    else ("comments", "comment_count", "fetched_at")
+                )
+                for field in fields:
+                    if field in entry:
+                        merged[field] = entry[field]
+                entry = merged
             existing[video_id] = entry
             _write_metadata_jsonl(jp, existing)
     except Exception as e:
@@ -428,26 +495,42 @@ def fetch_single_video_metadata(channel: dict[str, Any],
     # Thumbnail (best-effort). Stream passed through so fetch errors
     # surface as verbose-only dim log lines instead of disappearing.
     thumb_saved = False
-    if entry.get("thumbnail_url"):
+    if cancel_event is not None and cancel_event.is_set():
+        return {"ok": False, "cancelled": True}
+    if scope == "all" and refresh_thumbnail and entry.get("thumbnail_url"):
         thumb_dir = _ensure_thumbnails_dir(subfolder)
         thumb_saved = _download_thumbnail(
             entry["thumbnail_url"], thumb_dir,
             title_hint or entry.get("title", ""), video_id,
-            stream=stream if emit_inline_log else None)
+            stream=stream if emit_inline_log else None,
+            commit_allowed=(
+                (lambda: not cancel_event.is_set())
+                if cancel_event is not None else None
+            ),
+        )
     if thumb_saved:
         _invalidate_browse_thumbnail_cache(name)
 
     # Keep the materialized Browse/Manual stats current for single-video
     # metadata refreshes too. Bulk refreshes already write these columns, but
     # this per-video path is what Manual Downloads uses.
+    if cancel_event is not None and cancel_event.is_set():
+        return {"ok": False, "cancelled": True}
     try:
         from .. import index as _idx_db
-        _idx_db.update_video_stats([(
-            video_id,
-            entry.get("view_count"),
-            entry.get("like_count"),
-            entry.get("upload_date"),
-        )])
+        if scope in {"all", "stats"}:
+            _idx_db.update_video_stats(
+                [(
+                    video_id,
+                    entry.get("view_count"),
+                    entry.get("like_count"),
+                    entry.get("upload_date"),
+                )],
+                commit_allowed=(
+                    (lambda: not cancel_event.is_set())
+                    if cancel_event is not None else None
+                ),
+            )
     except Exception as e:
         swallow("single metadata stats update", e)
 
@@ -486,7 +569,13 @@ def fetch_single_video_metadata(channel: dict[str, Any],
     if _jsonl_write_failed:
         return {"ok": False, "error": f"jsonl write failed: {_jsonl_err}",
                 "entry": entry}
-    return {"ok": True, "fetched": True, "entry": entry}
+    return {
+        "ok": True,
+        "fetched": True,
+        "entry": entry,
+        "refresh_scope": scope,
+        "thumbnail_saved": thumb_saved,
+    }
 
 
 def fetch_metadata_for_videos(channel: dict[str, Any],
@@ -683,7 +772,6 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
 
         _prefetched: dict[str, dict[str, Any] | None] = {}
         if _to_prefetch:
-            import concurrent.futures as _cf
             import random as _random
             _pf_done = 0
             _pf_total = len(_to_prefetch)
@@ -692,87 +780,99 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
             # here, so cancel can't kill DLTRACK per-video fetches running
             # concurrently for a different channel (T187).
             _local_procs: set[subprocess.Popen] = set()
+
+            def _prefetch_cancelled() -> bool:
+                return bool(cancel_event is not None and cancel_event.is_set())
+
+            def _prefetch_one(
+                item: tuple[str, str],
+                _proc_registry=_local_procs,
+            ) -> dict[str, Any] | None:
+                _pf_vid, _pf_title = item
+                if _prefetch_cancelled():
+                    return None
+                # Keep network and pause gates in the worker.  Submission is
+                # then bounded to the three actual workers instead of eagerly
+                # queueing the entire channel before cancellation is checked.
+                try:
+                    from .. import net as _net
+                    _net.block_if_down(
+                        stream=stream,
+                        check_cancel=_prefetch_cancelled,
+                    )
+                except Exception as _nce:
+                    _log.debug("meta net-block check failed: %s", _nce)
+                while pause_event is not None and pause_event.is_set():
+                    if _prefetch_cancelled():
+                        return None
+                    time.sleep(0.05)
+                if _prefetch_cancelled():
+                    return None
+                jitter = _random.uniform(0, 0.2)
+                if cancel_event is not None:
+                    if cancel_event.wait(jitter):
+                        return None
+                else:
+                    time.sleep(jitter)
+                return _fetch_video_metadata(
+                    yt,
+                    _pf_vid,
+                    _pf_title,
+                    proc_registry=_proc_registry,
+                    stream=stream,
+                    cancel_event=cancel_event,
+                )
+
+            def _record_prefetch(
+                    result: WorkResult[
+                        tuple[str, str], dict[str, Any] | None],
+                    _result_store=_prefetched,
+                    _total=_pf_total) -> None:
+                nonlocal _pf_done, _pf_last_tick
+                _pf_vid, _ = result.item
+                _result_store[_pf_vid] = (
+                    None if result.error is not None else result.value)
+                _pf_done += 1
+                _now = time.time()
+                if _now - _pf_last_tick > 1.0 or _pf_done == _total:
+                    _pf_last_tick = _now
+                    try:
+                        stream.emit_dim(
+                            f"  Pre-fetching metadata: "
+                            f"{_pf_done}/{_total}…")
+                    except Exception as _pe:
+                        _log.debug(
+                            "prefetch progress emit failed: %s", _pe)
+
             try:
-                with _cf.ThreadPoolExecutor(
-                        max_workers=3,
-                        thread_name_prefix="yta-meta-prefetch") as _pf_pool:
-                    _pf_futs: dict[Any, str] = {}
-                    for _pf_vid, _pf_title in _to_prefetch:
-                        if cancel_event is not None and cancel_event.is_set():
-                            break
-                        # Pause the burst on a network outage (auto-resumes
-                        # via the net monitor's 2-probe recovery). Without
-                        # this, a bulk refresh during an outage fires 3x
-                        # ~210s timeouts PER video against a dead connection.
-                        # Mirrors sync/redownload's block_if_down checkpoint.
+                _pf_run = run_bounded(
+                    _to_prefetch,
+                    _prefetch_one,
+                    _record_prefetch,
+                    max_workers=3,
+                    thread_name_prefix="yta-meta-prefetch",
+                    is_cancelled=_prefetch_cancelled,
+                )
+                if _pf_run.cancelled:
+                    # Already-running Popen calls are the only work that can
+                    # outlive non-wait executor shutdown.  Kill only this
+                    # operation's processes; unrelated DLTRACK work has a
+                    # different registry.
+                    with _inflight_procs_lock:
+                        _snap = list(_local_procs)
+                    _killed = 0
+                    for _proc in _snap:
                         try:
-                            from .. import net as _net
-                            _net.block_if_down(
-                                stream=stream,
-                                check_cancel=lambda: bool(
-                                    cancel_event and cancel_event.is_set()))
-                        except Exception as _nce:
-                            _log.debug("meta net-block check failed: %s", _nce)
-                        if pause_event is not None and pause_event.is_set():
-                            while (pause_event.is_set()
-                                   and not (cancel_event is not None
-                                            and cancel_event.is_set())):
-                                time.sleep(0.5)
-                            if cancel_event is not None and cancel_event.is_set():
-                                break
-                        # Per-submission jitter to stagger the burst
-                        # against YouTube. 0-200ms is small enough not
-                        # to dominate the wall-clock budget.
-                        time.sleep(_random.uniform(0, 0.2))
-                        _fut = _pf_pool.submit(
-                            _fetch_video_metadata, yt, _pf_vid, _pf_title,
-                            proc_registry=_local_procs, stream=stream,
-                            cancel_event=cancel_event)
-                        _pf_futs[_fut] = _pf_vid
-                    for _fut in _cf.as_completed(_pf_futs):
-                        if cancel_event is not None and cancel_event.is_set():
-                            for _f in _pf_futs:
-                                _f.cancel()
-                            # .cancel() only stops futures that haven't
-                            # started yet; in-flight workers keep running
-                            # until their subprocess timeout (~210s worst
-                            # case). Kill only this operation's in-flight
-                            # procs — _local_procs is scoped here, so we
-                            # can't accidentally kill DLTRACK fetches.
-                            try:
-                                with _inflight_procs_lock:
-                                    _snap = list(_local_procs)
-                                _killed = 0
-                                for _p in _snap:
-                                    try:
-                                        if _p.poll() is None:
-                                            _p.kill()
-                                            _killed += 1
-                                    except Exception as _pe:
-                                        swallow("bulk-cancel proc kill", _pe)
-                                if _killed:
-                                    _log.info(
-                                        "metadata cancel killed %d "
-                                        "in-flight yt-dlp procs", _killed)
-                            except Exception as _ke:
-                                swallow("bulk-cancel kill block", _ke)
-                            break
-                        _vid_done = _pf_futs[_fut]
-                        try:
-                            _prefetched[_vid_done] = _fut.result()
-                        except Exception:
-                            _prefetched[_vid_done] = None
-                        _pf_done += 1
-                        _now = time.time()
-                        if _now - _pf_last_tick > 1.0 or _pf_done == _pf_total:
-                            _pf_last_tick = _now
-                            try:
-                                stream.emit_dim(
-                                    f"  Pre-fetching metadata: "
-                                    f"{_pf_done}/{_pf_total}…")
-                            except Exception as _pe:
-                                _log.debug(
-                                    "prefetch progress emit failed: %s", _pe)
+                            if _proc.poll() is None:
+                                _proc.kill()
+                                _killed += 1
+                        except Exception as _pe:
+                            swallow("bulk-cancel proc kill", _pe)
+                    if _killed:
+                        _log.info(
+                            "metadata cancel killed %d in-flight yt-dlp procs",
+                            _killed,
+                        )
             except Exception as _pf_err:
                 _log.warning(
                     "metadata pre-fetch pool failed (%s); falling back "

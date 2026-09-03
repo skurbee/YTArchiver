@@ -9,8 +9,15 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid
 
-from backend.ytarchiver_config import config_is_writable, load_config, save_config
+from backend.services.managed_work import start_managed_task
+from backend.ytarchiver_config import (
+    config_is_writable,
+    load_config,
+    save_config,
+    update_config,
+)
 
 from ._shared import _log
 
@@ -33,6 +40,15 @@ class VideoMixin:
         if services is not None:
             return services.save_config(cfg)
         return save_config(cfg)
+
+    def _video_update_config(self, mutator):
+        """Commit one catalog-adjacent patch against current config."""
+        services = self._video_services()
+        mutate = (getattr(services, "mutate_config", None)
+                  if services is not None else None)
+        if callable(mutate):
+            return mutate(mutator)
+        return update_config(mutator)
 
     def _video_log_stream(self):
         services = self._video_services()
@@ -59,55 +75,113 @@ class VideoMixin:
         """
         fp = (filepath or "").strip()
         if not fp:
-            return {"ok": False, "error": "Missing filepath"}
+            return {"ok": False, "error": "Select a saved video first."}
+        from backend import index as _idx
+        prepared = _idx.prepare_media_copy_deletion(fp)
+        if not prepared.get("ok"):
+            return {
+                "ok": False,
+                "error": prepared.get("error") or
+                         "Could not preserve the logical transcript.",
+            }
         if not os.path.isfile(fp):
             # The file is already gone, so there is nothing destructive to do
             # on disk. Treat Delete as "remove stale catalog entry" instead of
             # trapping the user with an undeletable ghost card forever.
             try:
-                from backend import index as _idx
-                _conn = _idx._open()
-                if _conn is None:
-                    return {"ok": False, "error": "Index database unavailable"}
-                _channel = ""
-                with _idx._db_lock:
-                    _row = _conn.execute(
-                        "SELECT channel FROM videos WHERE filepath=? "
-                        "COLLATE NOCASE LIMIT 1", (fp,)).fetchone()
-                if _row is None:
+                _prepared_kw = ({"prepared": prepared}
+                                if prepared.get("row_identity") else {})
+                cleanup = _idx.delete_media_copy(fp, **_prepared_kw)
+                if not cleanup.get("ok"):
+                    _idx.finalize_copy_deletion_preparation(prepared)
+                    return {"ok": False,
+                            "error": cleanup.get("error") or
+                                     "Index cleanup failed"}
+                if not cleanup.get("found"):
+                    _idx.finalize_copy_deletion_preparation(prepared)
                     return {"ok": True, "stale_entry_removed": False,
                             "message": "File and catalog entry are already gone."}
-                _channel = _row[0] or ""
-                _idx.delete_segments_for_video(fp)
-                with _idx._db_lock:
-                    _conn.execute(
-                        "DELETE FROM videos WHERE filepath=? COLLATE NOCASE",
-                        (fp,))
-                    _conn.commit()
-                _idx.invalidate_channel_videos(_channel or None)
             except Exception as _e:
+                _idx.finalize_copy_deletion_preparation(prepared)
                 return {"ok": False,
                         "error": f"Could not remove stale catalog entry: {_e}"}
+            _idx.finalize_copy_deletion_preparation(prepared)
             if config_is_writable():
                 try:
-                    cfg = self._video_config()
-                    cfg["recent_downloads"] = [
-                        r for r in cfg.get("recent_downloads", []) or []
-                        if (r.get("filepath") or "").lower() != fp.lower()
-                    ]
-                    self._video_save_config(cfg)
+                    def _drop_stale_recent(cfg):
+                        cfg["recent_downloads"] = [
+                            r for r in cfg.get("recent_downloads", []) or []
+                            if (r.get("filepath") or "").lower() != fp.lower()
+                        ]
+
+                    self._video_update_config(_drop_stale_recent)
                 except Exception as e:
                     _log.debug("stale recent cleanup failed: %s", e)
             return {"ok": True, "stale_entry_removed": True,
                     "message": "Stale Browse entry removed; no file existed on disk."}
+        # Browse can contain legacy/manual catalog rows whose exact file lives
+        # outside every *current* archive root (for example after a custom
+        # Save-to folder changes).  The catalog row authorizes removing that
+        # row, never deleting the external file.  This branch is intentionally
+        # before safe_trash_video_file: quarantine needs a configured owning
+        # root and must continue to reject arbitrary external paths.
+        from backend.services import file_ops as _file_ops
+        managed_guard = _file_ops.assert_within_managed_roots(fp)
+        if not managed_guard.get("ok"):
+            if not isinstance(prepared.get("row_identity"), dict):
+                return managed_guard
+            try:
+                cleanup = _idx.delete_media_copy(fp, prepared=prepared)
+            except Exception as _e:
+                cleanup = {"ok": False, "error": str(_e)}
+            if not cleanup.get("ok"):
+                _idx.rollback_copy_deletion_preparation(prepared)
+                return {
+                    "ok": False,
+                    "error": cleanup.get("error") or
+                             "Could not remove the catalog entry.",
+                }
+            finalized = _idx.finalize_copy_deletion_preparation(prepared)
+            if config_is_writable():
+                try:
+                    def _drop_external_recent(cfg):
+                        cfg["recent_downloads"] = [
+                            r for r in cfg.get("recent_downloads", []) or []
+                            if (r.get("filepath") or "").lower() != fp.lower()
+                        ]
+
+                    self._video_update_config(_drop_external_recent)
+                except Exception as e:
+                    _log.debug("external recent cleanup failed: %s", e)
+            response = {
+                "ok": True,
+                "catalog_entry_removed": True,
+                "external_file_preserved": True,
+                "message": (
+                    "Removed from YTArchiver. The external file was left "
+                    "in place."
+                ),
+            }
+            if not finalized.get("ok"):
+                response["warning"] = (
+                    "The catalog entry was removed and the external file was "
+                    "left in place, but transcript cleanup needs attention."
+                )
+            return response
         # Defense-in-depth: the JS bridge is the trust boundary, so refuse to
         # os.remove a path resolving OUTSIDE the archive roots this app
         # manages — a crafted/compromised filepath must not delete arbitrary
         # files (audit: video_mixin containment).
         from backend.services.file_ops import safe_trash_video_file
         trashed = safe_trash_video_file(
-            fp, require_config_writable=True, reason="video_delete_file")
+            fp, require_config_writable=True, reason="video_delete_file",
+            excluded_sidecar_paths=prepared.get("preserved_sidecar_paths"),
+            catalog_context=prepared.get("row_identity"))
         if not trashed.get("ok"):
+            if trashed.get("rollback_failed"):
+                _idx.finalize_copy_deletion_preparation(prepared)
+            else:
+                _idx.rollback_copy_deletion_preparation(prepared)
             return trashed
         # Refuse the destructive os.remove if config writes are blocked
         # — see recent_mixin H22 for the same precondition.
@@ -115,53 +189,57 @@ class VideoMixin:
         # Drop the index DB row (and its FTS segments) so Browse / Search
         # stop returning the now-deleted video.
         try:
-            from backend import index as _idx
-            _conn = _idx._open()
-            if _conn is not None:
-                # Sidecar .jsonl path was derived via SQL REPLACE() on the
-                # 4-char extension — but SQLite's REPLACE swaps ALL
-                # occurrences of the substring (audit: video_mixin.py:46-55).
-                # A path like "C:\.mp4-archive\foo.mp4" mangled to
-                # "C:\.jsonl-archive\foo.jsonl" and the DELETE missed.
-                # Compute the sidecar path in Python and parameterize it
-                # straight into the IN clause.
-                # FTS-safe, video_id-keyed segment removal — see
-                # index.delete_segments_for_video (the old per-video
-                # jsonl_path DELETE was a no-op in the aggregated
-                # layout and skipped the FTS5 'delete' sync on legacy
-                # rows). Runs BEFORE the videos row drop (the helper
-                # resolves video_id from it) and takes _db_lock itself.
-                _idx.delete_segments_for_video(fp)
-                with _idx._db_lock:
-                    _conn.execute(
-                        "DELETE FROM videos WHERE filepath = ? COLLATE NOCASE",
-                        (fp,))
-                    _conn.commit()
+            _prepared_kw = ({"prepared": prepared}
+                            if prepared.get("row_identity") else {})
+            cleanup = _idx.delete_media_copy(fp, **_prepared_kw)
+            if not cleanup.get("ok"):
+                raise RuntimeError(
+                    cleanup.get("error") or "Index cleanup failed")
         except Exception as _e:
+            finalized = _idx.finalize_copy_deletion_preparation(prepared)
             # Don't fail the whole call — the file is gone, that's the
             # primary contract. Surface the DB issue as a soft warning.
-            warning = f"File moved to trash but index cleanup failed: {_e}"
+            _log.warning("video_delete_file library cleanup failed: %s", _e)
+            if not finalized.get("ok"):
+                _log.warning(
+                    "video_delete_file recovery-marker cleanup failed: %s",
+                    finalized.get("error") or "unknown error",
+                )
+            warning = (
+                "The video was moved to Trash, but Browse and Search could "
+                "not be updated. Run Rescan archive to finish cleanup."
+            )
             return {"ok": False, "file_trashed": True,
                     "cleanup_failed": True, "error": warning,
                     "warning": warning,
                     "trashed_file_path": trashed.get("trashed_file_path"),
-                    "trashed_folder_path": trashed.get("trashed_folder_path")}
+                     "trashed_folder_path": trashed.get("trashed_folder_path")}
+        finalized = _idx.finalize_copy_deletion_preparation(prepared)
         # Also remove from recent_downloads if it was there.
         if config_is_writable():
             try:
-                cfg = self._video_config()
-                _before = len(cfg.get("recent_downloads", []) or [])
-                cfg["recent_downloads"] = [
-                    r for r in cfg.get("recent_downloads", []) or []
-                    if (r.get("filepath") or "").lower() != fp.lower()
-                ]
-                if len(cfg["recent_downloads"]) != _before:
-                    self._video_save_config(cfg)
+                def _drop_recent(cfg):
+                    cfg["recent_downloads"] = [
+                        r for r in cfg.get("recent_downloads", []) or []
+                        if (r.get("filepath") or "").lower() != fp.lower()
+                    ]
+
+                self._video_update_config(_drop_recent)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-        return {"ok": True,
+        response = {"ok": True,
                 "trashed_file_path": trashed.get("trashed_file_path"),
                 "trashed_folder_path": trashed.get("trashed_folder_path")}
+        if not finalized.get("ok"):
+            _log.warning(
+                "video_delete_file recovery-marker cleanup failed: %s",
+                finalized.get("error") or "unknown error",
+            )
+            response["warning"] = (
+                "The video was moved to Trash, but YTArchiver could not "
+                "finish its cleanup. Restart YTArchiver and run Rescan archive."
+            )
+        return response
 
 
     def video_redownload(self, video_id, title, resolution):
@@ -172,9 +250,15 @@ class VideoMixin:
         Looks up the video's channel + filepath via the index DB, then
         delegates to backend/redownload.py for the actual yt-dlp work.
         """
+        admission = getattr(self, "_work_admission_error", None)
+        if callable(admission):
+            blocked = admission("a video redownload")
+            if blocked is not None:
+                return blocked
         vid = (video_id or "").strip()
         if not vid:
-            return {"ok": False, "error": "Missing video_id"}
+            return {"ok": False,
+                    "error": "This video does not have a YouTube ID."}
         res = (str(resolution or "")).strip()
         if not res:
             return {"ok": False, "error": "Missing resolution"}
@@ -205,7 +289,8 @@ class VideoMixin:
         except Exception as e:
             return {"ok": False, "error": f"Lookup failed: {e}"}
         if not filepath or not channel_name:
-            return {"ok": False, "error": "Video has no filepath/channel"}
+            return {"ok": False,
+                    "error": "YTArchiver could not find this video's saved file."}
         # Find the channel config so we can hand the URL + folder to
         # the redownload pipeline.
         cfg = self._video_config()
@@ -258,6 +343,7 @@ class VideoMixin:
             # any stopped sync, ghost-cancelling this single-video
             # redownload instantly in that window.
             _vid_cancel = threading.Event()
+            task_id = f"video-redownload-{uuid.uuid4().hex}"
             def _run():
                 try:
                     _rd.redownload_channel(
@@ -275,7 +361,16 @@ class VideoMixin:
                 except Exception as e:
                     log_stream.emit_error(
                         f"Single-video redownload failed: {e}")
-            threading.Thread(target=_run, daemon=True).start()
+            start_managed_task(
+                self,
+                owner="redownload",
+                label=f"Redownload {title or vid}",
+                task_id=task_id,
+                cancel=_vid_cancel,
+                target=_run,
+                name="single-video-redownload",
+                thread_factory=threading.Thread,
+            )
             return {"ok": True, "title": title, "resolution": res}
         except Exception as e:
             return {"ok": False, "error": str(e)}

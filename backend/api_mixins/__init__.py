@@ -21,6 +21,7 @@ from .subs_mixin import SubsMixin
 from .sync_mixin import SyncMixin
 from .thumbnail_mixin import ThumbnailMixin
 from .transcribe_mixin import TranscribeMixin
+from .trash_mixin import TrashMixin
 from .video_mixin import VideoMixin
 from .window_mixin import WindowMixin
 
@@ -46,6 +47,7 @@ __all__ = [
     "SyncMixin",
     "ThumbnailMixin",
     "TranscribeMixin",
+    "TrashMixin",
     "VideoMixin",
     "WindowMixin",
 ]

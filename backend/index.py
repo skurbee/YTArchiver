@@ -16,18 +16,28 @@ Operations:
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
+import stat
 import threading
 import time
+import uuid
 from collections import OrderedDict
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .catalog_repository import (
+    CatalogConnection,
+    create_verified_legacy_catalog_backup,
+    install_catalog_schema,
+)
 from .log import get_logger
 from .ytarchiver_config import TRANSCRIPTION_DB
 
@@ -193,6 +203,192 @@ _reader_lock = threading.RLock()
 _schema_inited: bool = False
 
 
+def canonical_videos_cte_sql() -> str:
+    """Return the shared SQL CTE for one logical row per archived video.
+
+    ``videos`` stores physical copies, while a non-blank ``video_id`` owns
+    the logical transcript.  Consumers prepend this fragment with ``WITH``
+    and read from ``canonical_videos``.  Missing-ID rows deliberately group
+    only by their normalized filepath, never by title.
+
+    The ranked rows expose these additional columns:
+
+    * ``logical_video_key`` -- ``id:<video_id>`` or ``path:<filepath>``
+    * ``is_available_copy`` -- available/legacy-NULL catalog state
+    * ``is_primary_copy`` -- the current ``is_duplicate_of IS NULL`` hint
+    * ``canonical_rank`` and ``physical_copy_count``
+    * ``logical_duration_s`` / ``logical_upload_ts`` -- canonical metadata,
+      filled from a sibling copy only when the selected row is missing it
+
+    Ranking first prefers an available physical copy, then the existing
+    primary hint, then the lowest stable row id.  ``canonical_videos`` keeps
+    rank 1 even when every copy is unavailable; logical-reporting callers
+    that require playable media must additionally filter
+    ``is_available_copy = 1``.
+    """
+    logical_key = (
+        "CASE "
+        "WHEN trim(COALESCE(v.video_id, '')) <> '' "
+        "THEN 'id:' || trim(v.video_id) "
+        "WHEN trim(COALESCE(v.filepath, '')) <> '' "
+        "THEN 'path:' || lower(replace(trim(v.filepath), '/', char(92))) "
+        "ELSE 'row:' || CAST(v.id AS TEXT) END"
+    )
+    return f"""
+_ranked_video_copies AS (
+    SELECT
+        v.*,
+        {logical_key} AS logical_video_key,
+        CASE WHEN COALESCE(v.availability, 'available') = 'available'
+                  AND trim(COALESCE(v.filepath, '')) <> ''
+             THEN 1 ELSE 0 END AS is_available_copy,
+        CASE WHEN v.is_duplicate_of IS NULL THEN 1 ELSE 0 END
+             AS is_primary_copy,
+        ROW_NUMBER() OVER (
+            PARTITION BY {logical_key}
+            ORDER BY
+                CASE WHEN COALESCE(v.availability, 'available') = 'available'
+                          AND trim(COALESCE(v.filepath, '')) <> ''
+                     THEN 0 ELSE 1 END,
+                CASE WHEN v.is_duplicate_of IS NULL THEN 0 ELSE 1 END,
+                v.id
+        ) AS canonical_rank,
+        SUM(CASE WHEN trim(COALESCE(v.filepath, '')) <> '' THEN 1 ELSE 0 END)
+            OVER (PARTITION BY {logical_key}) AS physical_copy_count,
+        MAX(CASE WHEN v.duration_s > 0 THEN v.duration_s END)
+            OVER (PARTITION BY {logical_key})
+            AS copy_duration_fallback_s,
+        MIN(v.upload_ts) OVER (PARTITION BY {logical_key})
+            AS copy_upload_fallback_ts
+    FROM videos AS v
+),
+canonical_videos AS (
+    SELECT *,
+           CASE WHEN duration_s > 0 THEN duration_s
+                ELSE copy_duration_fallback_s END
+               AS logical_duration_s,
+           COALESCE(upload_ts, copy_upload_fallback_ts)
+               AS logical_upload_ts,
+           1 AS is_canonical
+    FROM _ranked_video_copies
+    WHERE canonical_rank = 1
+)
+""".strip()
+
+
+def channel_videos_cte_sql() -> str:
+    """Return one available physical copy per logical video in a channel.
+
+    ``is_duplicate_of`` identifies the primary copy for the whole library.
+    That primary can belong to a different channel, so filtering it before a
+    per-channel Browse read can hide a perfectly valid copy in the requested
+    channel. Rank only after the channel is selected: known YouTube IDs are
+    deduplicated within that channel, while missing-ID rows remain distinct by
+    normalized filepath just like :func:`canonical_videos_cte_sql`.
+
+    The returned CTE has one ``channel = ?`` parameter and exposes the chosen
+    rows as ``channel_videos``.
+    """
+    logical_key = (
+        "CASE "
+        "WHEN trim(COALESCE(v.video_id, '')) <> '' "
+        "THEN 'id:' || trim(v.video_id) "
+        "WHEN trim(COALESCE(v.filepath, '')) <> '' "
+        "THEN 'path:' || lower(replace(trim(v.filepath), '/', char(92))) "
+        "ELSE 'row:' || CAST(v.id AS TEXT) END"
+    )
+    return f"""
+_ranked_channel_copies AS (
+    SELECT
+        v.*,
+        {logical_key} AS logical_video_key,
+        ROW_NUMBER() OVER (
+            PARTITION BY {logical_key}
+            ORDER BY
+                CASE WHEN v.is_duplicate_of IS NULL THEN 0 ELSE 1 END,
+                v.id
+        ) AS channel_copy_rank
+    FROM videos AS v
+    WHERE v.channel = ? COLLATE NOCASE
+      AND COALESCE(v.availability, 'available') = 'available'
+      AND trim(COALESCE(v.filepath, '')) <> ''
+),
+channel_videos AS (
+    SELECT *
+    FROM _ranked_channel_copies
+    WHERE channel_copy_rank = 1
+)
+""".strip()
+
+
+_FTS_TABLES = frozenset({"segments_fts", "videos_fts"})
+
+
+def _fts_external_content_integrity_check(
+        conn: sqlite3.Connection, table: str) -> None:
+    """Raise when an FTS5 shadow disagrees with its external content.
+
+    The ``rank=1`` form is important: a normal SELECT from an
+    external-content FTS table reads columns from the content table and can
+    therefore hide stale tokens attached to a recycled rowid.
+    """
+    if table not in _FTS_TABLES:
+        raise ValueError(f"unsupported FTS table: {table}")
+    conn.execute(
+        f"INSERT INTO {table}({table}, rank) "
+        "VALUES('integrity-check', 1)")
+
+
+def _rebuild_all_fts(conn: sqlite3.Connection) -> None:
+    """Rebuild and verify both external-content FTS5 indexes."""
+    for table in ("segments_fts", "videos_fts"):
+        conn.execute(f"INSERT INTO {table}({table}) VALUES('rebuild')")
+    for table in ("segments_fts", "videos_fts"):
+        _fts_external_content_integrity_check(conn, table)
+
+
+def _install_fts_sync_triggers(conn: sqlite3.Connection) -> None:
+    """Install the sole source-row -> FTS lifecycle owner.
+
+    Keep direct writes to the two FTS shadow tables out of application code;
+    source inserts, indexed-text updates, and deletes are synchronized by
+    these triggers in the same transaction as the source mutation.
+    """
+    for statement in (
+        """CREATE TRIGGER IF NOT EXISTS segments_fts_ai_v4
+           AFTER INSERT ON segments BEGIN
+             INSERT INTO segments_fts(rowid, text) VALUES (new.id, new.text);
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS segments_fts_ad_v4
+           AFTER DELETE ON segments BEGIN
+             INSERT INTO segments_fts(segments_fts, rowid, text)
+             VALUES ('delete', old.id, old.text);
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS segments_fts_au_v4
+           AFTER UPDATE OF id, text ON segments BEGIN
+             INSERT INTO segments_fts(segments_fts, rowid, text)
+             VALUES ('delete', old.id, old.text);
+             INSERT INTO segments_fts(rowid, text) VALUES (new.id, new.text);
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS videos_fts_ai_v4
+           AFTER INSERT ON videos BEGIN
+             INSERT INTO videos_fts(rowid, title) VALUES (new.id, new.title);
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS videos_fts_ad_v4
+           AFTER DELETE ON videos BEGIN
+             INSERT INTO videos_fts(videos_fts, rowid, title)
+             VALUES ('delete', old.id, old.title);
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS videos_fts_au_v4
+           AFTER UPDATE OF id, title ON videos BEGIN
+             INSERT INTO videos_fts(videos_fts, rowid, title)
+             VALUES ('delete', old.id, old.title);
+             INSERT INTO videos_fts(rowid, title) VALUES (new.id, new.title);
+           END""",
+    ):
+        conn.execute(statement)
+
+
 def _reader_open() -> sqlite3.Connection | None:
     """Open or return the long-lived read-only connection used by
     Browse-style queries. Separate from `_conn` so writer contention
@@ -207,8 +403,15 @@ def _reader_open() -> sqlite3.Connection | None:
     if not _schema_inited:
         # Cold-start path: schema may not exist yet. Take the slow
         # route ONCE to make sure the DB file + tables exist.
-        try: _open()
-        except Exception as e: _log.debug("swallowed: %s", e)
+        try:
+            _open()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        # Do not open a reader against a half-created database.  A failed
+        # writer initialization resets _schema_inited so the next caller can
+        # retry the complete schema setup cleanly.
+        if not _schema_inited:
+            return None
     with _reader_lock:
         if _reader_conn is not None:
             return _reader_conn
@@ -246,15 +449,29 @@ def _open_independent() -> sqlite3.Connection | None:
 
     Caller is responsible for closing the connection when done.
     """
+    c: sqlite3.Connection | None = None
     try:
         TRANSCRIPTION_DB.parent.mkdir(parents=True, exist_ok=True)
-        c = sqlite3.connect(str(TRANSCRIPTION_DB),
-                            check_same_thread=False, timeout=30.0)
+        c = sqlite3.connect(
+            str(TRANSCRIPTION_DB),
+            check_same_thread=False,
+            timeout=30.0,
+            factory=CatalogConnection,
+        )
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
         c.execute("PRAGMA busy_timeout=30000")
         return c
     except Exception:
+        # A connection can be created successfully and then fail during its
+        # PRAGMA setup (for example, a transient pooled-drive lock).  Never
+        # abandon that half-initialized handle and leave SQLite to close it at
+        # garbage-collection time.
+        if c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
         return None
 
 
@@ -265,7 +482,7 @@ def _shutdown_index() -> None:
     stats are refreshed. Best-effort; never raises (audit: index.py shutdown
     checkpoint). NOTE: the window 'nuclear' TerminateProcess quit path bypasses
     atexit, so this covers clean exits only."""
-    global _conn, _reader_conn
+    global _conn, _reader_conn, _schema_inited
     with _db_lock:
         if _conn is not None:
             try:
@@ -283,6 +500,7 @@ def _shutdown_index() -> None:
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             _conn = None
+        _schema_inited = False
     with _reader_lock:
         if _reader_conn is not None:
             try:
@@ -299,13 +517,29 @@ atexit.register(_shutdown_index)
 
 def _open() -> sqlite3.Connection | None:
     """Open or return the cached connection. Returns None if DB can't be opened."""
-    global _conn
+    global _conn, _schema_inited
     with _db_lock:
-        if _conn is not None:
+        if _conn is not None and _schema_inited:
             return _conn
+        # A prior initialization may have failed after sqlite3.connect()
+        # populated the cache but before the schema was committed.  Never
+        # hand that poisoned connection back to callers.
+        if _conn is not None:
+            stale = _conn
+            _conn = None
+            _rollback_quietly(stale, "discard incomplete index init")
+            try:
+                stale.close()
+            except Exception as exc:
+                _log.debug("incomplete index connection close failed: %s", exc)
         try:
             TRANSCRIPTION_DB.parent.mkdir(parents=True, exist_ok=True)
-            _conn = sqlite3.connect(str(TRANSCRIPTION_DB), check_same_thread=False, timeout=30.0)
+            _conn = sqlite3.connect(
+                str(TRANSCRIPTION_DB),
+                check_same_thread=False,
+                timeout=30.0,
+                factory=CatalogConnection,
+            )
             # Check the PRAGMA result — on some filesystems (network
             # shares without shared-memory support and some pooled-filesystem
             # configs) WAL silently falls back to "delete" mode, and
@@ -327,6 +561,37 @@ def _open() -> sqlite3.Connection | None:
             # independent connections and punct_restore/repair_captions on the
             # same DB (audit: index.py busy_timeout).
             _conn.execute("PRAGMA busy_timeout=30000")
+            try:
+                _pre_schema_version = int(
+                    _conn.execute("PRAGMA user_version").fetchone()[0]
+                )
+            except Exception:
+                _pre_schema_version = 0
+            _catalog_upgrade_needed = False
+            _legacy_table = _conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='videos'"
+            ).fetchone()
+            if _pre_schema_version < 5 and _legacy_table is not None:
+                _legacy_rows = int(
+                    _conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+                )
+                if _legacy_rows:
+                    _catalog_upgrade_needed = True
+                    _log.info(
+                        "Preparing the library catalog for Patch 5. Large "
+                        "libraries can take a few minutes; downloads remain safe."
+                    )
+                    _backup_path = TRANSCRIPTION_DB.with_name(
+                        f"{TRANSCRIPTION_DB.stem}.pre-v5-catalog-backup.sqlite3"
+                    )
+                    _receipt = create_verified_legacy_catalog_backup(
+                        _conn, _backup_path,
+                    )
+                    _log.debug(
+                        "Verified pre-v5 catalog backup: %s rows at %s",
+                        _receipt["rows"], _backup_path,
+                    )
             # Schema matches YTArchiver.py:23448 verbatim
             _conn.execute("""CREATE TABLE IF NOT EXISTS segments (
                 id INTEGER PRIMARY KEY,
@@ -409,11 +674,8 @@ def _open() -> sqlite3.Connection | None:
             # that runs once and only once at startup. Current installs are at
             # version 1 (the implicit pre-versioning baseline after all the
             # ALTER statements below succeed).
-            try:
-                _current_v = _conn.execute("PRAGMA user_version").fetchone()[0]
-            except Exception:
-                _current_v = 0
-            _SCHEMA_VERSION = 3
+            _current_v = _pre_schema_version
+            _SCHEMA_VERSION = 5
             _MIGRATIONS: dict = {
                 # Populate videos_fts from the existing videos table so
                 # title search can use FTS5 MATCH instead of LIKE '%term%'.
@@ -425,6 +687,13 @@ def _open() -> sqlite3.Connection | None:
                 # The data invariant itself is enforced on every open by the
                 # partial-row quarantine after index creation.
                 3: lambda c: c.execute("SELECT 1"),
+                # Install-time reconciliation for the trigger-owned FTS
+                # lifecycle.  Rebuild BOTH shadows so pre-v4 stale tokens
+                # cannot survive beneath a newly installed trigger set.
+                4: _rebuild_all_fts,
+                # Additive logical-video / physical-media schema. The legacy
+                # videos table remains intact for Patch 4 rollback.
+                5: install_catalog_schema,
             }
             for stmt in (
                 "ALTER TABLE segments ADD COLUMN words TEXT DEFAULT ''",
@@ -550,10 +819,10 @@ def _open() -> sqlite3.Connection | None:
                 # when a row entered SQLite, including during later rescans.
                 #   SELECT channel, MAX(added_ts) FROM videos
                 #   WHERE is_duplicate_of IS NULL GROUP BY channel
-                # Measured at 689s (!) on a 104k-row / 20GB DB before this:
+                # Measured at several minutes on a large database before this:
                 # the planner used idx_vid_ch_yr_mo for the GROUP BY but had
                 # to random-fetch added_ts + is_duplicate_of from the big
-                # table for every row (104k cold lookups). This index carries
+                # table for every row (many cold lookups). This index carries
                 # both grouping cols, is filtered to live rows, and is
                 # covering — so the query runs index-only in ~0.01s. Also
                 # serves list_all_videos' "recent"/"newest" first-page sorts
@@ -594,6 +863,17 @@ def _open() -> sqlite3.Connection | None:
                     " OR lower(filepath) LIKE '%.ytdl')")
             except sqlite3.Error as exc:
                 _log.warning("partial-row quarantine failed: %s", exc)
+            # Triggers are an always-on schema invariant rather than a
+            # one-shot migration.  IF NOT EXISTS also repairs a database
+            # where a trigger was removed manually while user_version stayed
+            # current.  Migration v4 below rebuilds both shadows exactly once
+            # for existing installs.
+            _install_fts_sync_triggers(_conn)
+            # Treat this as an always-on invariant as well: if additive v2
+            # tables were removed manually while user_version stayed current,
+            # recreate them and keep normalized reads disabled until the
+            # CatalogConnection commit proves equivalence.
+            install_catalog_schema(_conn)
             # run pending migrations (none currently — framework
             # only) and bump user_version once we're at the target. Wrapped
             # in try/except so a future migration bug can't brick startup.
@@ -603,13 +883,18 @@ def _open() -> sqlite3.Connection | None:
                         _MIGRATIONS[_v](_conn)
                 if _current_v != _SCHEMA_VERSION:
                     _conn.execute(f"PRAGMA user_version = {int(_SCHEMA_VERSION)}")
+                # Repair headless/cyclic/singleton duplicate markers on every
+                # startup so direct Browse filters and canonical consumers
+                # expose the same logical rows without requiring a manual
+                # size refresh first.
+                _repair_all_video_copy_groups_locked(_conn)
             except Exception as e:
                 _log.error("schema migration step failed; user_version "
                            "left at %s: %s", _current_v, e)
                 raise
             _conn.commit()
             # REMOVED: `PRAGMA quick_check` used to run here. On a large
-            # archive it reads the ENTIRE database file (20GB / 9M+
+            # archive it reads the ENTIRE database file (potentially many
             # segments) — minutes of cold disk I/O — and it ran inside this
             # `_db_lock`-held connection-open on the FIRST _open() of every
             # startup. That blocked every other _open()/_reader_open()
@@ -621,11 +906,30 @@ def _open() -> sqlite3.Connection | None:
             # rare and run on a dedicated connection off the _db_lock.
             # Mark schema-ready so future _reader_open() calls can
             # skip the _db_lock-acquiring _open() call entirely.
-            global _schema_inited
             _schema_inited = True
+            if _catalog_upgrade_needed:
+                _log.info("Library catalog upgrade complete.")
             return _conn
-        except sqlite3.Error as e:
-            _log.error("Could not open DB %s: %s", TRANSCRIPTION_DB, e)
+        except Exception as e:
+            # Initialization is one atomic operation from the cache's point
+            # of view.  Roll back and close even for non-SQLite failures
+            # (mkdir errors, migration bugs, test hooks, etc.) so a later
+            # call gets a real retry instead of the partially initialized
+            # handle.
+            failed = _conn
+            _conn = None
+            _schema_inited = False
+            _rollback_quietly(failed, "index initialization")
+            if failed is not None:
+                try:
+                    failed.close()
+                except Exception as close_exc:
+                    _log.debug("failed index connection close failed: %s",
+                               close_exc)
+            # Simple mode needs a useful failure, not a private filesystem
+            # path. Keep the exact location available in Verbose diagnostics.
+            _log.error("Library database could not be opened: %s", e)
+            _log.debug("Library database path: %s", TRANSCRIPTION_DB)
             return None
 
 
@@ -971,19 +1275,6 @@ def register_video(filepath: str, channel: str, title: str | None = None,
                         _dur = _d
             except (TypeError, ValueError):
                 _dur = None
-            # Capture the pre-upsert FTS state. videos_fts is an external-
-            # content FTS5 table: a NEW row has nothing to delete (issuing the
-            # FTS5 'delete' for a never-indexed rowid raises DatabaseError
-            # "malformed"), and an UPDATE must delete using the row's OLD
-            # title, not the post-upsert one. The previous code always deleted
-            # with the new title — which threw on every freshly-downloaded
-            # video and, because the surrounding except only caught
-            # OperationalError, aborted the ENTIRE registration. Result: new
-            # downloads silently never landed in the index (register returned
-            # False with no error shown).
-            _fts_old = conn.execute(
-                "SELECT id, title FROM videos WHERE filepath=? COLLATE NOCASE",
-                (fp,)).fetchone()
             conn.execute(
                 """INSERT INTO videos
                    (title, channel, year, month, filepath, video_id, video_url,
@@ -1044,31 +1335,21 @@ def register_video(filepath: str, channel: str, title: str | None = None,
                  size, _dur, tx_status,
                  fp, time.time(), upload_ts),
             )
-            # Keep videos_fts in sync (T257). NEW row → insert only; UPDATE →
-            # delete the OLD entry (with its OLD title) then insert the new.
-            # Catch BOTH OperationalError (pre-migration DB without the FTS
-            # table) AND DatabaseError ("malformed" from a stray delete) so an
-            # FTS hiccup can never abort the registration of the video itself.
-            try:
-                _fts_new = conn.execute(
-                    "SELECT id, title FROM videos WHERE filepath=? COLLATE NOCASE",
-                    (fp,)
-                ).fetchone()
-                if _fts_new:
-                    _fts_id, _fts_title = _fts_new
-                    if _fts_old is not None:
-                        _old_id, _old_title = _fts_old
-                        conn.execute(
-                            "INSERT INTO videos_fts(videos_fts, rowid, title)"
-                            " VALUES('delete', ?, ?)",
-                            (_old_id, _old_title or "")
-                        )
-                    conn.execute(
-                        "INSERT INTO videos_fts(rowid, title) VALUES(?, ?)",
-                        (_fts_id, _fts_title or "")
-                    )
-            except (sqlite3.OperationalError, sqlite3.DatabaseError) as _fe:
-                _log.debug("videos_fts sync skipped: %s", _fe)
+            if vid_id:
+                try:
+                    _repair_video_copy_group_locked(conn, vid_id)
+                except sqlite3.OperationalError as exc:
+                    # Some import/repair callers intentionally provide a
+                    # legacy or minimal connection while its schema is being
+                    # upgraded.  Registration must remain usable there; the
+                    # normal schema migration repairs duplicate links once
+                    # ``is_duplicate_of`` exists.  Do not hide any other SQL
+                    # failure.
+                    if "no such column: is_duplicate_of" not in str(exc).lower():
+                        raise
+            # videos_fts is synchronized by the v4 source-table triggers.
+            # A shadow-index failure now aborts this transaction instead of
+            # committing a catalog row that title search cannot find.
             conn.commit()
 
         # Retry on a transient "database is locked"/"busy" — a concurrent
@@ -1396,45 +1677,1130 @@ def mark_video_no_speech(filepath: str,
     try:
         if use_override:
             conn = _conn_override
-            conn.execute("UPDATE videos SET tx_status='no_speech' "
-                          "WHERE filepath=? COLLATE NOCASE", (fp,))
             row = conn.execute(
-                "SELECT channel FROM videos WHERE filepath=? COLLATE NOCASE",
+                "SELECT channel, video_id FROM videos "
+                "WHERE filepath=? COLLATE NOCASE",
                 (fp,)).fetchone()
+            video_id = str(row[1] or "").strip() if row else ""
+            channels = {
+                str(value[0]) for value in conn.execute(
+                    "SELECT DISTINCT channel FROM videos "
+                    "WHERE filepath=? COLLATE NOCASE OR "
+                    "(?<>'' AND video_id=?)",
+                    (fp, video_id, video_id),
+                ).fetchall() if value[0]
+            }
+            conn.execute(
+                "UPDATE videos SET tx_status='no_speech' "
+                "WHERE filepath=? COLLATE NOCASE OR (?<>'' AND video_id=?)",
+                (fp, video_id, video_id))
             conn.commit()
         else:
             with _db_lock:
                 conn = _open()
                 if conn is None:
                     return False
-                conn.execute("UPDATE videos SET tx_status='no_speech' "
-                              "WHERE filepath=? COLLATE NOCASE", (fp,))
                 row = conn.execute(
-                    "SELECT channel FROM videos WHERE filepath=? COLLATE NOCASE",
+                    "SELECT channel, video_id FROM videos "
+                    "WHERE filepath=? COLLATE NOCASE",
                     (fp,)).fetchone()
+                video_id = str(row[1] or "").strip() if row else ""
+                channels = {
+                    str(value[0]) for value in conn.execute(
+                        "SELECT DISTINCT channel FROM videos "
+                        "WHERE filepath=? COLLATE NOCASE OR "
+                        "(?<>'' AND video_id=?)",
+                        (fp, video_id, video_id),
+                    ).fetchall() if value[0]
+                }
+                conn.execute(
+                    "UPDATE videos SET tx_status='no_speech' "
+                    "WHERE filepath=? COLLATE NOCASE OR "
+                    "(?<>'' AND video_id=?)",
+                    (fp, video_id, video_id))
                 conn.commit()
-        if row and row[0]:
-            try: invalidate_channel_videos(row[0])
+        for affected_channel in channels:
+            try: invalidate_channel_videos(affected_channel)
             except Exception as e: _log.debug("swallowed: %s", e)
         return True
     except sqlite3.Error:
         return False
 
 
-def delete_segments_for_video(filepath: str) -> int:
-    """FTS-safe removal of every transcript segment tied to a video FILE.
+def _media_path_presence(path: str) -> str:
+    """Return ``existing``, ``missing``, or ``unknown`` for one media path."""
+    if not (path or "").strip():
+        return "missing"
+    try:
+        mode = os.stat(path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return "missing"
+    except OSError:
+        return "unknown"
+    return "existing" if stat.S_ISREG(mode) else "missing"
 
-    Used by the Recent/Browse delete-file endpoints. Two things the old
-    inline cleanups got wrong: (1) they deleted by the per-video
-    "<stem>.jsonl" path, which matches ZERO rows in the aggregated
-    layout (segments.jsonl_path holds the per-folder aggregated file),
-    so deleted videos stayed searchable; (2) they skipped the
-    external-content FTS5 'delete' insert, leaving stale rowids in the
-    FTS shadow that map old text onto recycled rows later. This helper
-    deletes by video_id (idx_seg_video_id) with the proper FTS sync,
-    plus a legacy per-video-path cleanup for pre-aggregation rows.
-    Acquires _db_lock itself — call OUTSIDE any existing _db_lock block.
-    Returns the number of segment rows removed."""
+
+def _per_video_jsonl_paths(filepath: str) -> list[str]:
+    """Return supported per-video transcript paths for one media copy."""
+    base = os.path.splitext(os.path.normpath(filepath or ""))[0]
+    if not base:
+        return []
+    parent, stem = os.path.split(base)
+    return [base + ".jsonl", os.path.join(parent, "." + stem + ".jsonl")]
+
+
+def _path_comparison_key(path: str) -> str:
+    try:
+        return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def _lexical_path_comparison_key(path: str) -> str:
+    """Return a normalized path key without touching the filesystem."""
+    try:
+        return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def _path_key_is_within_any_root(target: str, root_keys: list[str]) -> bool:
+    if not target:
+        return False
+    for root_key in root_keys:
+        if not root_key or target == root_key:
+            continue
+        try:
+            if os.path.commonpath([target, root_key]) == root_key:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _path_is_within_any_root(path: str, roots: list[str]) -> bool:
+    target = _path_comparison_key(path)
+    return _path_key_is_within_any_root(
+        target,
+        [_path_comparison_key(root) for root in roots],
+    )
+
+
+def _segment_snapshot_from_rows(
+        video_id: str, rows: list[tuple[Any, ...]]) -> dict[str, Any]:
+    """Return a stable digest for one logical transcript snapshot."""
+    encoded = json.dumps(
+        [list(row) for row in rows],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "video_id": (video_id or "").strip(),
+        "count": len(rows),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _segment_snapshot_locked(
+        conn: sqlite3.Connection, video_id: str) -> dict[str, Any]:
+    rows = conn.execute(
+        "SELECT id, title, channel, year, month, start_time, end_time, "
+        "text, jsonl_path, words FROM segments WHERE video_id=? ORDER BY id",
+        ((video_id or "").strip(),),
+    ).fetchall()
+    return _segment_snapshot_from_rows(video_id, rows)
+
+
+def _validate_segment_snapshots_locked(
+        conn: sqlite3.Connection, snapshots: Any) -> None:
+    """Fail when a transcript changed after deletion preflight."""
+    if isinstance(snapshots, dict):
+        snapshots = [snapshots]
+    for expected in snapshots or []:
+        if not isinstance(expected, dict):
+            raise ValueError("Invalid transcript deletion snapshot.")
+        video_id = str(expected.get("video_id") or "").strip()
+        if not video_id:
+            raise ValueError("Transcript deletion snapshot has no video ID.")
+        actual = _segment_snapshot_locked(conn, video_id)
+        if (actual["count"] != expected.get("count")
+                or actual["sha256"] != expected.get("sha256")):
+            raise ValueError(
+                "Transcript changed while deletion was being prepared; "
+                "catalog cleanup was aborted.")
+
+
+def _video_row_identity(row: tuple[Any, ...]) -> dict[str, Any]:
+    return {
+        "id": int(row[0]),
+        "filepath": str(row[1] or ""),
+        "video_id": str(row[2] or ""),
+        "channel": str(row[3] or ""),
+        "title": str(row[4] or ""),
+    }
+
+
+def _validate_video_row_identities_locked(
+        conn: sqlite3.Connection, identities: Any,
+        *, expected_ids: set[int] | None = None) -> None:
+    """Prove preflight row IDs still name the same physical copies."""
+    if isinstance(identities, dict):
+        identities = [identities]
+    normalized = [value for value in (identities or [])
+                  if isinstance(value, dict)]
+    if expected_ids is not None:
+        identity_ids = {
+            int(value.get("id") or 0) for value in normalized
+            if int(value.get("id") or 0) > 0
+        }
+        if identity_ids != expected_ids:
+            raise ValueError("Catalog deletion identities do not match row IDs.")
+    for expected in normalized:
+        try:
+            row_id = int(expected.get("id") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid catalog deletion identity.") from exc
+        row = conn.execute(
+            "SELECT id, filepath, video_id, channel, title FROM videos "
+            "WHERE id=? LIMIT 1", (row_id,)).fetchone()
+        if row is None or _video_row_identity(row) != {
+                "id": row_id,
+                "filepath": str(expected.get("filepath") or ""),
+                "video_id": str(expected.get("video_id") or ""),
+                "channel": str(expected.get("channel") or ""),
+                "title": str(expected.get("title") or ""),
+        }:
+            raise ValueError(
+                "Catalog row changed while deletion was being prepared; "
+                "cleanup was aborted.")
+
+
+def _repair_video_copy_group_locked(
+        conn: sqlite3.Connection, video_id: str, *,
+        require_existing: bool = False) -> dict[str, Any]:
+    """Repair one non-blank logical video's primary/duplicate links.
+
+    Caller owns the surrounding transaction.  The chosen primary follows
+    the same precedence as :func:`canonical_videos_cte_sql` so write-side
+    repair and read-side canonicalization cannot disagree.
+    """
+    vid = (video_id or "").strip()
+    if not vid:
+        return {"primary_id": None, "primary_filepath": "",
+                "primary_exists": False, "unknown_present": False,
+                "repaired": 0, "channels": set()}
+    rows = conn.execute(
+        "SELECT id, filepath, is_duplicate_of, channel, availability "
+        "FROM videos "
+        "WHERE video_id=? ORDER BY "
+        "CASE WHEN COALESCE(availability, 'available')='available' "
+        "AND trim(COALESCE(filepath, ''))<>'' "
+        "THEN 0 ELSE 1 END, "
+        "CASE WHEN is_duplicate_of IS NULL THEN 0 ELSE 1 END, id",
+        (vid,)).fetchall()
+    if not rows:
+        return {"primary_id": None, "primary_filepath": "",
+                "primary_exists": False, "unknown_present": False,
+                "repaired": 0, "channels": set()}
+    presence: dict[int, str] = {}
+    if require_existing:
+        for row in rows:
+            row_id = int(row[0])
+            if row[4] == "partial":
+                presence[row_id] = "ineligible"
+                continue
+            state = _media_path_presence(str(row[1] or ""))
+            presence[row_id] = state
+            if state == "existing" and row[4] != "available":
+                conn.execute(
+                    "UPDATE videos SET availability='available' WHERE id=?",
+                    (row_id,))
+            elif state == "missing" and row[4] != "missing":
+                conn.execute(
+                    "UPDATE videos SET availability='missing' WHERE id=?",
+                    (row_id,))
+        rows.sort(key=lambda row: (
+            0 if presence[int(row[0])] == "existing" else 1,
+            0 if row[2] is None else 1,
+            int(row[0]),
+        ))
+    primary_id = int(rows[0][0])
+    primary_filepath = rows[0][1] or ""
+    repaired = 0
+    channels = {str(row[3]) for row in rows if row[3]}
+    for row_id, _filepath, old_link, _channel, _availability in rows:
+        desired = None if int(row_id) == primary_id else primary_filepath
+        if old_link != desired:
+            cur = conn.execute(
+                "UPDATE videos SET is_duplicate_of=? WHERE id=?",
+                (desired, row_id))
+            repaired += max(0, cur.rowcount or 0)
+    return {
+        "primary_id": primary_id,
+        "primary_filepath": primary_filepath,
+        "primary_exists": (
+            presence.get(primary_id) == "existing"
+            if require_existing else bool(primary_filepath)
+        ),
+        "unknown_present": any(
+            state == "unknown" for state in presence.values()),
+        "repaired": repaired,
+        "channels": channels,
+    }
+
+
+def _repair_all_video_copy_groups_locked(
+        conn: sqlite3.Connection) -> dict[str, Any]:
+    """Repair duplicate links, including stale singleton markers."""
+    repaired = 0
+    channels: set[str] = set()
+    video_ids = [row[0] for row in conn.execute(
+        "SELECT video_id FROM videos "
+        "WHERE video_id IS NOT NULL AND trim(video_id)<>'' "
+        "GROUP BY video_id "
+        "HAVING COUNT(*)>1 OR "
+        "SUM(CASE WHEN is_duplicate_of IS NOT NULL THEN 1 ELSE 0 END)>0"
+    ).fetchall()]
+    for video_id in video_ids:
+        result = _repair_video_copy_group_locked(conn, video_id)
+        repaired += int(result["repaired"] or 0)
+        channels.update(result["channels"])
+    channels.update(str(row[0]) for row in conn.execute(
+        "SELECT DISTINCT channel FROM videos "
+        "WHERE (video_id IS NULL OR trim(video_id)='') "
+        "AND is_duplicate_of IS NOT NULL AND channel IS NOT NULL"
+    ).fetchall() if row[0])
+    cleared = conn.execute(
+        "UPDATE videos SET is_duplicate_of=NULL "
+        "WHERE (video_id IS NULL OR trim(video_id)='') "
+        "AND is_duplicate_of IS NOT NULL"
+    ).rowcount or 0
+    return {"groups": len(video_ids),
+            "repaired": repaired + max(0, cleared),
+            "channels": channels}
+
+
+def _sidecar_matches_logical_video(
+        path: str, video_id: str, *, expected_title: str | None = None) -> bool:
+    """Reject malformed sidecars or rows explicitly owned by another ID."""
+    saw_record = False
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    return False
+                saw_record = True
+                row_video_id = str(value.get("video_id") or "").strip()
+                if row_video_id and row_video_id != video_id:
+                    return False
+                row_title = str(value.get("title") or "").strip()
+                if (expected_title is not None and row_title
+                        and row_title != expected_title):
+                    return False
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return saw_record
+
+
+def _write_derived_jsonl_source(
+        destination_jsonl: str, video_id: str,
+        segments: list[tuple[Any, ...]], *, canonical_title: str,
+        canonical_channel: str, staging_dir: str | None = None) -> str:
+    """Materialize indexed per-video rows for a durable sidecar handoff."""
+    parent = os.path.normpath(
+        staging_dir or os.path.dirname(destination_jsonl))
+    source_path = os.path.join(
+        parent,
+        f".{os.path.basename(destination_jsonl)}.derive-{uuid.uuid4().hex}",
+    )
+    try:
+        with open(source_path, "x", encoding="utf-8", newline="\n") as handle:
+            for title, channel, start_time, end_time, text, raw_words in segments:
+                try:
+                    words = json.loads(raw_words or "[]")
+                    if not isinstance(words, list):
+                        words = []
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    words = []
+                value = {
+                    "video_id": video_id,
+                    "title": canonical_title or title or "",
+                    "channel": canonical_channel or channel or "",
+                    "start": float(start_time or 0),
+                    "end": float(end_time or start_time or 0),
+                    "text": text or "",
+                    "words": words,
+                }
+                handle.write(json.dumps(value, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        try:
+            os.remove(source_path)
+        except OSError:
+            pass
+        raise
+    return source_path
+
+
+def _write_retargeted_jsonl_source(
+        source_jsonl: str, destination_jsonl: str, video_id: str, *,
+        canonical_title: str, canonical_channel: str,
+        staging_dir: str | None = None) -> str:
+    """Validate a disk-only transcript and retarget it to a surviving copy."""
+    loaded = _load_validated_jsonl_segments(source_jsonl)
+    if not loaded:
+        raise ValueError("Transcript sidecar contains no usable segments.")
+    segments: list[tuple[Any, ...]] = []
+    for segment in loaded:
+        row_video_id = str(segment.get("video_id") or "").strip()
+        if row_video_id and row_video_id != video_id:
+            raise ValueError(
+                "Transcript sidecar belongs to a different logical video.")
+        segments.append((
+            segment.get("title") or "",
+            "",
+            segment.get("start") or 0,
+            segment.get("end") or 0,
+            segment.get("text") or "",
+            json.dumps(segment.get("words") or [], ensure_ascii=False),
+        ))
+    return _write_derived_jsonl_source(
+        destination_jsonl,
+        video_id,
+        segments,
+        canonical_title=canonical_title,
+        canonical_channel=canonical_channel,
+        staging_dir=staging_dir,
+    )
+
+
+def _deletion_cleanup_tokens(prepared: Any) -> list[dict[str, Any]]:
+    if not isinstance(prepared, dict):
+        return []
+    tokens = prepared.get("cleanup_tokens") or []
+    return [token for token in tokens if isinstance(token, dict)]
+
+
+def rollback_copy_deletion_preparation(prepared: Any) -> dict[str, Any]:
+    """Undo only sidecars created by a deletion preflight."""
+    from .services.file_ops import rollback_preserved_sidecar
+    failures: list[str] = []
+    for token in reversed(_deletion_cleanup_tokens(prepared)):
+        result = rollback_preserved_sidecar(token)
+        if not result.get("ok"):
+            failures.append(str(result.get("error") or "rollback failed"))
+    return {"ok": not failures, "errors": failures}
+
+
+def finalize_copy_deletion_preparation(prepared: Any) -> dict[str, Any]:
+    """Commit prepared sidecars after filesystem and catalog deletion."""
+    from .services.file_ops import finalize_preserved_sidecar
+    failures: list[str] = []
+    for token in _deletion_cleanup_tokens(prepared):
+        result = finalize_preserved_sidecar(token)
+        if not result.get("ok"):
+            failures.append(str(result.get("error") or "finalize failed"))
+    return {"ok": not failures, "errors": failures}
+
+
+def is_registered_video_path(
+        filepath: str, *, video_id: str | None = None,
+        row_id: int | None = None) -> bool:
+    """Return whether *filepath* is an exact catalog-registered video path.
+
+    This is intentionally exact rather than root-based.  It supports manual
+    downloads saved to a user-selected folder while granting no authority to
+    sibling or parent paths.
+    """
+    fp = os.path.normpath(filepath or "")
+    if not fp:
+        return False
+    try:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return False
+            row = conn.execute(
+                "SELECT id, video_id FROM videos "
+                "WHERE filepath=? COLLATE NOCASE LIMIT 1",
+                (fp,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row_id is not None and int(row[0]) != int(row_id):
+                return False
+            if (video_id is not None
+                    and str(row[1] or "").strip() != str(video_id).strip()):
+                return False
+            return True
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return False
+
+
+def is_registered_video_identity(identity: Any) -> bool:
+    """Return whether a full preflighted catalog row is still unchanged."""
+    if not isinstance(identity, dict):
+        return False
+    try:
+        row_id = int(identity.get("id") or 0)
+    except (TypeError, ValueError):
+        return False
+    if row_id <= 0:
+        return False
+    try:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return False
+            row = conn.execute(
+                "SELECT id, filepath, video_id, channel, title FROM videos "
+                "WHERE id=? LIMIT 1", (row_id,)).fetchone()
+            return row is not None and _video_row_identity(row) == {
+                "id": row_id,
+                "filepath": str(identity.get("filepath") or ""),
+                "video_id": str(identity.get("video_id") or ""),
+                "channel": str(identity.get("channel") or ""),
+                "title": str(identity.get("title") or ""),
+            }
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return False
+
+
+def prepare_media_copy_deletion(
+        filepath: str, *, excluded_paths: set[str] | None = None,
+        excluded_channels: set[str] | None = None) -> dict[str, Any]:
+    """Fail-closed transcript-sidecar handoff before a copy enters trash."""
+    fp = os.path.normpath(filepath or "")
+    if not fp:
+        return {"ok": False, "error": "Missing filepath"}
+    cleanup_tokens: list[dict[str, Any]] = []
+    excluded_path_keys = {
+        key for path in (excluded_paths or set())
+        if (key := _path_comparison_key(path))
+    }
+    excluded_channel_keys = {
+        str(channel).strip().casefold()
+        for channel in (excluded_channels or set()) if str(channel).strip()
+    }
+    try:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return {"ok": False, "error": "Index database unavailable"}
+            row = conn.execute(
+                "SELECT id, filepath, video_id, channel, title FROM videos "
+                "WHERE filepath=? COLLATE NOCASE LIMIT 1", (fp,)).fetchone()
+            if row is None:
+                return {"ok": True, "needed": False}
+            row_identity = _video_row_identity(row)
+            row_id = int(row[0])
+            raw_video_id = row[2]
+            video_id = (raw_video_id or "").strip()
+            if not video_id:
+                return {"ok": True, "needed": False,
+                        "row_identity": row_identity}
+            candidates = conn.execute(
+                "SELECT id, filepath, video_id, channel, title FROM videos "
+                "WHERE video_id=? AND id<>? "
+                "AND trim(COALESCE(filepath, ''))<>'' "
+                "AND COALESCE(availability, 'available')<>'partial' "
+                "ORDER BY CASE WHEN is_duplicate_of IS NULL THEN 0 ELSE 1 END, id",
+                (video_id, row_id)).fetchall()
+            segment_records = conn.execute(
+                "SELECT id, title, channel, year, month, start_time, end_time, "
+                "text, jsonl_path, words FROM segments "
+                "WHERE video_id=? ORDER BY id", (video_id,)).fetchall()
+            segment_snapshot = _segment_snapshot_from_rows(
+                video_id, segment_records)
+            segment_rows = [
+                (record[1], record[2], record[5], record[6], record[7],
+                 record[9])
+                for record in segment_records
+            ]
+            segment_count = len(segment_records)
+        source_jsonl = ""
+        if not segment_count:
+            source_jsonl = next((
+                path for path in _per_video_jsonl_paths(fp)
+                if os.path.isfile(path)
+                and _sidecar_matches_logical_video(path, video_id)
+            ), "")
+        outside_candidates = [
+            candidate for candidate in candidates
+            if candidate[1]
+            and _path_comparison_key(candidate[1]) not in excluded_path_keys
+            and str(candidate[3] or "").strip().casefold()
+                not in excluded_channel_keys
+        ]
+        survivor_row = next(
+            (candidate for candidate in outside_candidates
+             if _media_path_presence(candidate[1]) == "existing"),
+            None,
+        )
+        if not segment_count and not source_jsonl:
+            result = {"ok": True, "needed": False,
+                      "row_identity": row_identity}
+            # Another logical copy means a transcript can legitimately land
+            # after preflight.  Validate the empty snapshot at catalog commit
+            # so that late transcript is never discarded without a sidecar.
+            if outside_candidates:
+                result["segment_snapshot"] = segment_snapshot
+            if survivor_row is not None:
+                result["survivor_identity"] = _video_row_identity(survivor_row)
+            return result
+        if survivor_row is None:
+            if outside_candidates:
+                return {
+                    "ok": False,
+                    "error": ("Cannot delete this copy: no outside logical "
+                              "survivor is currently present on disk."),
+                }
+            return {"ok": True, "needed": False,
+                    "row_identity": row_identity}
+        survivor_identity = _video_row_identity(survivor_row)
+        survivor = os.path.normpath(survivor_row[1])
+        survivor_channel = str(survivor_row[3] or "")
+        survivor_title = str(survivor_row[4] or "")
+        survivor_jsonl = os.path.splitext(survivor)[0] + ".jsonl"
+        from .services import file_ops
+        destination_guard = file_ops.authorize_sidecar_handoff_destination(
+            survivor_jsonl,
+            registered_video_identity=survivor_identity,
+        )
+        if not destination_guard.get("ok"):
+            return {
+                "ok": False,
+                "error": destination_guard.get("error") or (
+                    "YTArchiver could not safely preserve the transcript "
+                    "beside the surviving video."),
+            }
+        protected_sidecars = [survivor_jsonl]
+        source_path_keys = {
+            _path_comparison_key(path) for path in _per_video_jsonl_paths(fp)
+        }
+        shared_sidecar = (
+            _path_comparison_key(survivor_jsonl) in source_path_keys)
+        if shared_sidecar and os.path.isfile(survivor_jsonl):
+            if not _sidecar_matches_logical_video(
+                    survivor_jsonl, video_id):
+                return {
+                    "ok": False,
+                    "error": ("The shared survivor transcript sidecar is "
+                              "malformed or belongs to another video."),
+                }
+            return {
+                "ok": True,
+                "needed": True,
+                "jsonl_path": survivor_jsonl,
+                "existing": True,
+                "cleanup_tokens": cleanup_tokens,
+                "preserved_sidecar_paths": protected_sidecars,
+                "row_identity": row_identity,
+                "survivor_identity": survivor_identity,
+                "segment_snapshot": segment_snapshot,
+            }
+        staging_dir = os.path.dirname(fp)
+        staging_guard = file_ops.authorize_sidecar_handoff_staging_directory(
+            staging_dir,
+            registered_video_identity=row_identity,
+        )
+        if not staging_guard.get("ok"):
+            return {
+                "ok": False,
+                "error": staging_guard.get("error") or (
+                    "YTArchiver could not safely stage transcript recovery "
+                    "data before deleting this copy."),
+            }
+        if segment_count:
+            derived_source = _write_derived_jsonl_source(
+                survivor_jsonl, video_id, segment_rows,
+                canonical_title=survivor_title,
+                canonical_channel=survivor_channel,
+                staging_dir=staging_dir,
+            )
+        else:
+            derived_source = _write_retargeted_jsonl_source(
+                source_jsonl, survivor_jsonl, video_id,
+                canonical_title=survivor_title,
+                canonical_channel=survivor_channel,
+                staging_dir=staging_dir,
+            )
+        try:
+            result = file_ops.preserve_sidecar_no_overwrite(
+                derived_source, survivor_jsonl,
+                source_identity=fp,
+                registered_destination_identity=survivor_identity,
+                registered_source_identity=row_identity,
+            )
+        finally:
+            try:
+                os.remove(derived_source)
+            except OSError:
+                pass
+        if not result.get("ok"):
+            return {"ok": False, "error": result.get("error") or
+                    "Could not preserve transcript sidecar."}
+        cleanup_token = result.get("cleanup_token")
+        if isinstance(cleanup_token, dict):
+            cleanup_tokens.append(cleanup_token)
+        if not _sidecar_matches_logical_video(
+                survivor_jsonl, video_id, expected_title=survivor_title):
+            rollback_copy_deletion_preparation(
+                {"cleanup_tokens": cleanup_tokens})
+            return {"ok": False,
+                    "error": "Preserved transcript sidecar failed validation."}
+        return {"ok": True, "needed": True,
+                "jsonl_path": survivor_jsonl,
+                "existing": bool(result.get("existing")),
+                "cleanup_tokens": cleanup_tokens,
+                "preserved_sidecar_paths": protected_sidecars,
+                "row_identity": row_identity,
+                "survivor_identity": survivor_identity,
+                "segment_snapshot": segment_snapshot}
+    except (OSError, sqlite3.Error, UnicodeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def prepare_channel_copy_deletion(
+        channels: list[str], *,
+        folder_paths: list[str] | None = None) -> dict[str, Any]:
+    """Snapshot deleted copies and prepare every outside logical survivor.
+
+    Channel labels are metadata, not physical ownership.  ``folder_paths``
+    lets a folder deletion include every catalog row physically below the
+    folder even when a stale/renamed row carries a different channel label.
+    The returned row ids are the exact catalog deletion set.
+    """
+    names = [str(name).strip() for name in channels if str(name).strip()]
+    roots = [os.path.normpath(str(path)) for path in (folder_paths or [])
+             if str(path).strip()]
+    if not names and not roots:
+        return {"ok": True, "prepared": 0, "row_ids": []}
+    try:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return {"ok": False, "error": "Index database unavailable"}
+            rows = conn.execute(
+                "SELECT id, filepath, video_id, channel, title "
+                "FROM videos ORDER BY id"
+            ).fetchall()
+        name_keys = {name.casefold() for name in names}
+        # The catalog can contain hundreds of thousands of rows on a pooled
+        # archive drive. Calling realpath() for every row turns a small channel
+        # removal into minutes of filesystem I/O. First reject paths that are
+        # lexically outside the channel folder, then retain the canonical check
+        # for the few candidates so junction/symlink escapes are still excluded.
+        lexical_root_keys = [
+            key for root in roots
+            if (key := _lexical_path_comparison_key(root))
+        ]
+        canonical_root_keys = [
+            key for root in roots if (key := _path_comparison_key(root))
+        ]
+        targets = []
+        for row in rows:
+            # A configured channel folder is the physical deletion boundary.
+            # Channel labels are not ownership: a manual/custom download from
+            # the same uploader may live elsewhere and must survive.  Keep the
+            # legacy label match only for older callers that have no folder
+            # path to provide.
+            if (not roots
+                    and str(row[3] or "").strip().casefold() in name_keys):
+                targets.append(row)
+                continue
+            filepath = str(row[1] or "")
+            if not filepath:
+                continue
+            lexical_key = _lexical_path_comparison_key(filepath)
+            if not _path_key_is_within_any_root(
+                    lexical_key, lexical_root_keys):
+                continue
+            canonical_key = _path_comparison_key(filepath)
+            if _path_key_is_within_any_root(
+                    canonical_key, canonical_root_keys):
+                targets.append(row)
+        row_ids = [int(row[0]) for row in targets]
+        row_identities = [_video_row_identity(row) for row in targets]
+        paths = [str(row[1]) for row in targets if row[1]]
+        prepared = 0
+        cleanup_tokens: list[dict[str, Any]] = []
+        preserved_sidecars: set[str] = set()
+        segment_snapshots: dict[str, dict[str, Any]] = {}
+        survivor_identities: dict[int, dict[str, Any]] = {}
+        excluded_paths = {
+            path for path in paths if path
+        }
+        excluded_channels = set(names) if not roots else set()
+        for path in paths:
+            result = prepare_media_copy_deletion(
+                path,
+                excluded_paths=excluded_paths,
+                excluded_channels=excluded_channels,
+            )
+            if not result.get("ok"):
+                rollback_copy_deletion_preparation(
+                    {"cleanup_tokens": cleanup_tokens})
+                return {
+                    "ok": False,
+                    "error": result.get("error") or
+                             "Could not preserve the logical transcript.",
+                    "filepath": path,
+                    "prepared": prepared,
+                }
+            cleanup_tokens.extend(_deletion_cleanup_tokens(result))
+            survivor_identity = result.get("survivor_identity")
+            if isinstance(survivor_identity, dict):
+                try:
+                    survivor_id = int(survivor_identity.get("id") or 0)
+                except (TypeError, ValueError):
+                    survivor_id = 0
+                prior_survivor = survivor_identities.get(survivor_id)
+                if (survivor_id <= 0
+                        or (prior_survivor is not None
+                            and prior_survivor != survivor_identity)):
+                    rollback_copy_deletion_preparation(
+                        {"cleanup_tokens": cleanup_tokens})
+                    return {
+                        "ok": False,
+                        "error": ("The surviving catalog copy changed while "
+                                  "channel deletion was being prepared."),
+                        "filepath": path,
+                        "prepared": prepared,
+                    }
+                survivor_identities[survivor_id] = survivor_identity
+            snapshot = result.get("segment_snapshot")
+            if isinstance(snapshot, dict):
+                video_id = str(snapshot.get("video_id") or "").strip()
+                prior = segment_snapshots.get(video_id)
+                if prior is not None and prior != snapshot:
+                    rollback_copy_deletion_preparation(
+                        {"cleanup_tokens": cleanup_tokens})
+                    return {
+                        "ok": False,
+                        "error": ("Transcript changed while channel deletion "
+                                  "was being prepared; retry the deletion."),
+                        "filepath": path,
+                        "prepared": prepared,
+                    }
+                if video_id:
+                    segment_snapshots[video_id] = snapshot
+            preserved_sidecars.update(
+                str(path) for path in
+                (result.get("preserved_sidecar_paths") or []) if path)
+            prepared += int(bool(result.get("needed")))
+        return {"ok": True, "prepared": prepared,
+                "cleanup_tokens": cleanup_tokens,
+                "preserved_sidecar_paths": sorted(preserved_sidecars),
+                "row_ids": row_ids,
+                "row_identities": row_identities,
+                "survivor_identities": list(survivor_identities.values()),
+                "segment_snapshots": list(segment_snapshots.values()),
+                "folder_paths": roots}
+    except (OSError, sqlite3.Error, UnicodeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc), "prepared": 0}
+
+
+def _promoted_logical_tx_status(
+        statuses: list[Any], *, has_segments: bool) -> str:
+    if has_segments:
+        return "transcribed"
+    priority = {
+        "transcribed": 0,
+        "done": 0,
+        "no_speech": 1,
+        "no_captions": 2,
+        "failed": 3,
+        "pending": 4,
+    }
+    values = [str(value or "pending") for value in statuses]
+    return min(values or ["pending"], key=lambda value: (
+        priority.get(value, 5), value))
+
+
+def _recount_indexed_path_locked(
+        conn: sqlite3.Connection, path: str) -> None:
+    if not (path or "").strip():
+        return
+    count = int(conn.execute(
+        "SELECT COUNT(*) FROM segments WHERE jsonl_path=?",
+        (path,)).fetchone()[0] or 0)
+    if count:
+        conn.execute(
+            "UPDATE indexed_files SET segment_count=? "
+            "WHERE path=?",
+            (count, path))
+    else:
+        conn.execute(
+            "DELETE FROM indexed_files WHERE path=?", (path,))
+
+
+def _delete_media_copy_row_locked(
+        conn: sqlite3.Connection, row_id: int) -> dict[str, Any]:
+    """Delete one catalog row while preserving any valid logical holder."""
+    row = conn.execute(
+        "SELECT id, filepath, video_id, channel, tx_status FROM videos "
+        "WHERE id=? LIMIT 1", (row_id,)).fetchone()
+    if row is None:
+        return {
+            "found": False, "videos": 0, "segments": 0,
+            "primary_filepath": "", "duplicate_links_repaired": 0,
+            "channel": "", "channels": set(),
+        }
+    row_id, stored_filepath, raw_video_id, channel, deleted_tx_status = row
+    stored_filepath = stored_filepath or ""
+    video_id = (raw_video_id or "").strip()
+    legacy_jsonl = (
+        os.path.splitext(stored_filepath)[0] + ".jsonl"
+        if stored_filepath else ""
+    )
+    channels = {str(channel)} if channel else set()
+    old_segment_paths: set[str] = set()
+    if video_id:
+        old_segment_paths.update(
+            str(path_row[0]) for path_row in conn.execute(
+                "SELECT DISTINCT jsonl_path FROM segments WHERE video_id=? "
+                "AND trim(COALESCE(jsonl_path, ''))<>''",
+                (video_id,)).fetchall() if path_row[0]
+        )
+
+    deleted = conn.execute(
+        "DELETE FROM videos WHERE id=?", (row_id,)).rowcount or 0
+    segments_removed = 0
+    primary_filepath = ""
+    repaired = 0
+
+    if video_id:
+        repair = _repair_video_copy_group_locked(
+            conn, video_id, require_existing=True)
+        if (not repair.get("primary_exists")
+                and repair.get("unknown_present")):
+            raise OSError(
+                "Could not verify the surviving media copy; deletion aborted.")
+        if repair.get("primary_exists"):
+            primary_filepath = str(repair["primary_filepath"] or "")
+            repaired = int(repair["repaired"] or 0)
+            channels.update(repair["channels"])
+            promoted = conn.execute(
+                "SELECT id, title, channel, tx_status FROM videos "
+                "WHERE id=? LIMIT 1", (repair.get("primary_id"),)).fetchone()
+            if promoted:
+                promoted_id, promoted_title, promoted_channel, promoted_status = promoted
+                segment_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM segments WHERE video_id=?",
+                    (video_id,)).fetchone()[0] or 0)
+                logical_status = _promoted_logical_tx_status(
+                    [deleted_tx_status, promoted_status] + [
+                        status_row[0] for status_row in conn.execute(
+                            "SELECT tx_status FROM videos WHERE video_id=?",
+                            (video_id,)).fetchall()
+                    ],
+                    has_segments=segment_count > 0,
+                )
+                conn.execute(
+                    "UPDATE videos SET tx_status=? WHERE id=?",
+                    (logical_status, promoted_id))
+                conn.execute(
+                    "UPDATE segments SET title=?, channel=? WHERE video_id=?",
+                    (promoted_title or "", promoted_channel or "", video_id))
+                promoted_jsonl = (
+                    os.path.splitext(primary_filepath)[0] + ".jsonl"
+                    if primary_filepath else ""
+                )
+                if (promoted_jsonl and os.path.isfile(promoted_jsonl)
+                        and _sidecar_matches_logical_video(
+                            promoted_jsonl, video_id)):
+                    conn.execute(
+                        "UPDATE segments SET jsonl_path=? WHERE video_id=?",
+                        (promoted_jsonl, video_id))
+                    promoted_count = int(conn.execute(
+                        "SELECT COUNT(*) FROM segments "
+                        "WHERE jsonl_path=?",
+                        (promoted_jsonl,)).fetchone()[0] or 0)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO indexed_files"
+                        "(path, mtime, segment_count) VALUES(?, ?, ?)",
+                        (promoted_jsonl, os.path.getmtime(promoted_jsonl),
+                         promoted_count))
+        else:
+            cur = conn.execute(
+                "DELETE FROM segments WHERE video_id=?", (video_id,))
+            segments_removed = max(0, cur.rowcount or 0)
+    elif legacy_jsonl:
+        cur = conn.execute(
+            "DELETE FROM segments WHERE jsonl_path=?",
+            (legacy_jsonl,))
+        segments_removed = max(0, cur.rowcount or 0)
+
+    old_segment_paths.add(legacy_jsonl)
+    for old_path in old_segment_paths:
+        _recount_indexed_path_locked(conn, old_path)
+    return {
+        "found": True,
+        "videos": max(0, deleted),
+        "segments": segments_removed,
+        "primary_filepath": primary_filepath,
+        "duplicate_links_repaired": repaired,
+        "channel": str(channel or ""),
+        "channels": channels,
+    }
+
+
+def _delete_media_copy_locked(
+        conn: sqlite3.Connection, filepath: str) -> dict[str, Any]:
+    """Delete one catalog copy inside the caller's open transaction."""
+    fp = os.path.normpath(filepath or "")
+    row = conn.execute(
+        "SELECT id FROM videos "
+        "WHERE filepath=? COLLATE NOCASE LIMIT 1", (fp,)).fetchone()
+    if row is None:
+        return {
+            "found": False, "videos": 0, "segments": 0,
+            "primary_filepath": "", "duplicate_links_repaired": 0,
+            "channel": "", "channels": set(),
+        }
+
+    return _delete_media_copy_row_locked(conn, int(row[0]))
+
+
+def delete_media_copy(
+        filepath: str, *, prepared: dict[str, Any] | None = None
+        ) -> dict[str, Any]:
+    """Transactionally remove one physical copy from the logical catalog.
+
+    ``video_id`` owns the transcript.  Removing one of several copies keeps
+    those segments, promotes the best surviving copy when needed, and points
+    every remaining duplicate at that primary.  Only the final copy removes
+    the logical transcript.  FTS cleanup is trigger-owned and therefore
+    commits or rolls back with the source rows.
+    """
+    fp = os.path.normpath(filepath or "")
+    if not fp:
+        return {"ok": False, "error": "Missing filepath", "found": False}
+    channels: set[str] = set()
+    try:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return {"ok": False, "error": "Index database unavailable",
+                        "found": False}
+            if conn.in_transaction:
+                raise sqlite3.OperationalError(
+                    "Index connection has an unfinished transaction.")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if prepared is not None:
+                    identity = prepared.get("row_identity")
+                    if isinstance(identity, dict):
+                        _validate_video_row_identities_locked(conn, identity)
+                        if (_path_comparison_key(identity.get("filepath", ""))
+                                != _path_comparison_key(fp)):
+                            raise ValueError(
+                                "Deletion preparation does not match filepath.")
+                    _validate_video_row_identities_locked(
+                        conn,
+                        prepared.get("survivor_identities")
+                        or prepared.get("survivor_identity"),
+                    )
+                    snapshot = prepared.get("segment_snapshot")
+                    if snapshot is not None:
+                        _validate_segment_snapshots_locked(conn, snapshot)
+                if prepared is not None and isinstance(
+                        prepared.get("row_identity"), dict):
+                    result = _delete_media_copy_row_locked(
+                        conn, int(prepared["row_identity"]["id"]))
+                else:
+                    result = _delete_media_copy_locked(conn, fp)
+                channels.update(result.pop("channels", set()))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        for affected_channel in channels:
+            try:
+                invalidate_channel_videos(affected_channel)
+            except Exception as exc:
+                _log.debug("copy-delete cache invalidation failed: %s", exc)
+        if result.get("segments"):
+            _invalidate_top_words_cache()
+        return {"ok": True, **result}
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        _log.warning("delete_media_copy failed for %s: %s", filepath, exc)
+        return {"ok": False, "error": str(exc), "found": False}
+
+
+def delete_media_copy_rows(
+        row_ids: list[int], *, prepared: dict[str, Any] | None = None
+        ) -> dict[str, Any]:
+    """Atomically delete an exact preflighted set of physical catalog rows."""
+    try:
+        ids = sorted({int(row_id) for row_id in row_ids if int(row_id) > 0})
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "Invalid catalog row ids",
+                "videos": 0, "segments": 0}
+    if not ids:
+        return {"ok": True, "videos": 0, "segments": 0}
+    affected_channels: set[str] = set()
+    try:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return {"ok": False, "error": "Index database unavailable",
+                        "videos": 0, "segments": 0}
+            if conn.in_transaction:
+                raise sqlite3.OperationalError(
+                    "Index connection has an unfinished transaction.")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if prepared is not None:
+                    _validate_video_row_identities_locked(
+                        conn, prepared.get("row_identities"),
+                        expected_ids=set(ids))
+                    _validate_video_row_identities_locked(
+                        conn,
+                        prepared.get("survivor_identities")
+                        or prepared.get("survivor_identity"),
+                    )
+                    _validate_segment_snapshots_locked(
+                        conn, prepared.get("segment_snapshots"))
+                out = {"videos": 0, "segments": 0}
+                for row_id in ids:
+                    result = _delete_media_copy_row_locked(conn, row_id)
+                    out["videos"] += int(result["videos"] or 0)
+                    out["segments"] += int(result["segments"] or 0)
+                    affected_channels.update(result.pop("channels", set()))
+                placeholders = ",".join("?" for _ in ids)
+                remaining = int(conn.execute(
+                    f"SELECT COUNT(*) FROM videos WHERE id IN ({placeholders})",
+                    ids).fetchone()[0] or 0)
+                if remaining:
+                    raise sqlite3.IntegrityError(
+                        "preflighted catalog purge left matching video rows")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        for channel in affected_channels:
+            invalidate_channel_videos(channel)
+        if out["segments"]:
+            _invalidate_top_words_cache()
+        return {"ok": True, **out}
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        _log.warning("delete_media_copy_rows failed: %s", exc)
+        return {"ok": False, "error": str(exc), "videos": 0, "segments": 0}
+
+
+def delete_segments_for_video(filepath: str) -> int:
+    """Remove a logical video's transcript while retaining its media rows.
+
+    This compatibility API is now transcript-only.  File-deletion callers
+    must use :func:`delete_media_copy` so copy promotion and final-holder
+    cleanup occur atomically.  The v4 triggers synchronize FTS automatically.
+    """
     _fp = os.path.normpath(filepath or "")
     if not _fp:
         return 0
@@ -1450,19 +2816,11 @@ def delete_segments_for_video(filepath: str) -> int:
                 (_fp,)).fetchone()
             vid = (row[0] or "") if row else ""
             if vid:
-                conn.execute(
-                    "INSERT INTO segments_fts(segments_fts, rowid, text) "
-                    "SELECT 'delete', id, text FROM segments "
-                    "WHERE video_id=?", (vid,))
                 cur = conn.execute(
                     "DELETE FROM segments WHERE video_id=?", (vid,))
                 removed += cur.rowcount
-            conn.execute(
-                "INSERT INTO segments_fts(segments_fts, rowid, text) "
-                "SELECT 'delete', id, text FROM segments "
-                "WHERE jsonl_path=? COLLATE NOCASE", (_legacy_jsonl,))
             cur = conn.execute(
-                "DELETE FROM segments WHERE jsonl_path=? COLLATE NOCASE",
+                "DELETE FROM segments WHERE jsonl_path=?",
                 (_legacy_jsonl,))
             removed += cur.rowcount
             conn.commit()
@@ -1479,46 +2837,204 @@ def delete_channel_from_index(channel: str) -> dict[str, int]:
     of its transcript segments (FTS-safe).
 
     Called when a channel is removed via the UI WITH delete_files=True. The
-    Browse / Search / Videos views read the index DB, not the disk — so
-    without this the deleted channel's cards keep showing and 404 ("File not
-    found — index entry may be stale") when clicked. Mirrors
-    delete_segments_for_video's FTS sync, scoped to the channel: push a
-    'delete' into segments_fts for every row before dropping it so the FTS
-    shadow doesn't strand stale text on recycled rowids. Order matters —
-    segments are deleted BEFORE the videos rows the subquery depends on.
+    Browse / Search / Videos views read the index DB, not the disk.  Each
+    physical row goes through the same logical-copy primitive as one-file
+    deletion, so a cross-channel surviving copy keeps its transcript and is
+    promoted/relinked if this channel held the primary.
+
     Acquires _db_lock — call OUTSIDE any existing _db_lock block.
     Returns {videos, segments} removed counts."""
     out = {"videos": 0, "segments": 0}
     if not channel:
         return out
-    _sub = ("video_id IN (SELECT video_id FROM videos "
-            "WHERE channel=? COLLATE NOCASE AND video_id IS NOT NULL)")
+    affected_channels: set[str] = {channel}
     try:
         with _db_lock:
             conn = _open()
             if conn is None:
                 return out
-            # FTS-safe removal of this channel's segments first.
-            conn.execute(
-                "INSERT INTO segments_fts(segments_fts, rowid, text) "
-                "SELECT 'delete', id, text FROM segments WHERE " + _sub,
-                (channel,))
-            cur = conn.execute(
-                "DELETE FROM segments WHERE " + _sub, (channel,))
-            out["segments"] = cur.rowcount or 0
-            # Then the video rows for the channel.
-            cur = conn.execute(
-                "DELETE FROM videos WHERE channel=? COLLATE NOCASE",
-                (channel,))
-            out["videos"] = cur.rowcount or 0
-            conn.commit()
-        try:
-            invalidate_channel_videos(channel)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+            row_ids = [int(row[0]) for row in conn.execute(
+                "SELECT id FROM videos "
+                "WHERE channel=? COLLATE NOCASE ORDER BY id",
+                (channel,)).fetchall()]
+            conn.execute("SAVEPOINT delete_channel_index")
+            try:
+                pending = {"videos": 0, "segments": 0}
+                for row_id in row_ids:
+                    result = _delete_media_copy_row_locked(conn, row_id)
+                    pending["videos"] += int(result["videos"] or 0)
+                    pending["segments"] += int(result["segments"] or 0)
+                    affected_channels.update(result.pop("channels", set()))
+                conn.execute("RELEASE SAVEPOINT delete_channel_index")
+                conn.commit()
+                out = pending
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK TO SAVEPOINT delete_channel_index")
+                    conn.execute("RELEASE SAVEPOINT delete_channel_index")
+                finally:
+                    conn.rollback()
+                raise
+        for affected_channel in affected_channels:
+            try:
+                invalidate_channel_videos(affected_channel)
+            except Exception as exc:
+                _log.debug("channel-delete cache invalidation failed: %s", exc)
+        if out["segments"]:
+            _invalidate_top_words_cache()
     except sqlite3.Error as e:
-        _log.debug("delete_channel_from_index(%s) failed: %s", channel, e)
+        _log.warning("delete_channel_from_index(%s) failed: %s", channel, e)
+        return {"videos": 0, "segments": 0}
     return out
+
+
+def delete_catalog_under_root(root: str) -> dict[str, Any]:
+    """Remove catalog/Search rows beneath an index-only archive root.
+
+    Files are never touched.  This is the inverse of adding an Additional
+    archive folder in Settings: once the folder is removed, its videos and
+    transcript sidecars should disappear from Search as well.  Paths are
+    checked in Python with ``commonpath`` so SQL wildcard characters and
+    sibling prefixes cannot broaden the deletion.
+    """
+    raw_root = str(root or "").strip()
+    if not raw_root:
+        return {"ok": False, "error": "Archive folder is required.",
+                "videos": 0, "segments": 0}
+    root_abs = os.path.normcase(os.path.abspath(os.path.normpath(raw_root)))
+
+    def _under(candidate: str | None) -> bool:
+        if not candidate:
+            return False
+        try:
+            path = os.path.normcase(os.path.abspath(os.path.normpath(candidate)))
+            return os.path.commonpath([root_abs, path]) == root_abs
+        except (OSError, ValueError):
+            return False
+
+    affected_channels: set[str] = set()
+    out = {"videos": 0, "segments": 0}
+    try:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return {"ok": False, "error": "Index database unavailable",
+                        **out}
+            rows = conn.execute(
+                "SELECT id, filepath, channel FROM videos ORDER BY id"
+            ).fetchall()
+            row_ids = [int(row[0]) for row in rows if _under(row[1])]
+            row_id_set = set(row_ids)
+            affected_channels.update(
+                str(row[2]) for row in rows
+                if int(row[0]) in row_id_set and row[2]
+            )
+            conn.execute("SAVEPOINT delete_catalog_root")
+            try:
+                for row_id in row_ids:
+                    result = _delete_media_copy_row_locked(conn, row_id)
+                    out["videos"] += int(result.get("videos") or 0)
+                    out["segments"] += int(result.get("segments") or 0)
+                    affected_channels.update(result.pop("channels", set()))
+
+                # Aggregate transcript rows may not belong to an individual
+                # video row.  Re-query after copy promotion so a surviving
+                # duplicate's newly-relinked sidecar is preserved.
+                segment_paths = [
+                    row[0] for row in conn.execute(
+                        "SELECT DISTINCT jsonl_path FROM segments "
+                        "WHERE jsonl_path IS NOT NULL AND jsonl_path != ''"
+                    ).fetchall()
+                    if _under(row[0])
+                ]
+                for jsonl_path in segment_paths:
+                    cur = conn.execute(
+                        "DELETE FROM segments WHERE jsonl_path=?",
+                        (jsonl_path,),
+                    )
+                    out["segments"] += max(0, cur.rowcount or 0)
+                    conn.execute(
+                        "DELETE FROM indexed_files WHERE path=?",
+                        (jsonl_path,),
+                    )
+                # Clear stale fingerprint-only records too.
+                indexed_paths = [
+                    row[0] for row in conn.execute(
+                        "SELECT path FROM indexed_files"
+                    ).fetchall()
+                    if _under(row[0])
+                ]
+                conn.executemany(
+                    "DELETE FROM indexed_files WHERE path=?",
+                    [(path,) for path in indexed_paths],
+                )
+                conn.execute("RELEASE SAVEPOINT delete_catalog_root")
+                conn.commit()
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK TO SAVEPOINT delete_catalog_root")
+                    conn.execute("RELEASE SAVEPOINT delete_catalog_root")
+                finally:
+                    conn.rollback()
+                raise
+        for channel in affected_channels:
+            invalidate_channel_videos(channel)
+        if out["segments"]:
+            _invalidate_top_words_cache()
+        return {"ok": True, **out}
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        _log.warning("delete_catalog_under_root(%s) failed: %s", root, exc)
+        return {"ok": False, "error": str(exc), **out}
+
+
+def delete_channels_from_index(channels: list[str]) -> dict[str, Any]:
+    """Atomically purge every catalog row owned by a set of channel aliases."""
+    names = sorted({str(name).strip() for name in channels
+                    if str(name).strip()}, key=str.casefold)
+    if not names:
+        return {"ok": True, "videos": 0, "segments": 0}
+    affected_channels: set[str] = set(names)
+    try:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return {"ok": False, "error": "Index database unavailable",
+                        "videos": 0, "segments": 0}
+            where = " OR ".join(["channel=? COLLATE NOCASE"] * len(names))
+            row_ids = [int(row[0]) for row in conn.execute(
+                f"SELECT id FROM videos WHERE {where} ORDER BY id",
+                names).fetchall()]
+            conn.execute("SAVEPOINT delete_channels_index")
+            try:
+                out = {"videos": 0, "segments": 0}
+                for row_id in row_ids:
+                    result = _delete_media_copy_row_locked(conn, row_id)
+                    out["videos"] += int(result["videos"] or 0)
+                    out["segments"] += int(result["segments"] or 0)
+                    affected_channels.update(result.pop("channels", set()))
+                remaining = int(conn.execute(
+                    f"SELECT COUNT(*) FROM videos WHERE {where}",
+                    names).fetchone()[0] or 0)
+                if remaining:
+                    raise sqlite3.IntegrityError(
+                        "channel catalog purge left matching video rows")
+                conn.execute("RELEASE SAVEPOINT delete_channels_index")
+                conn.commit()
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK TO SAVEPOINT delete_channels_index")
+                    conn.execute("RELEASE SAVEPOINT delete_channels_index")
+                finally:
+                    conn.rollback()
+                raise
+        for affected_channel in affected_channels:
+            invalidate_channel_videos(affected_channel)
+        if out["segments"]:
+            _invalidate_top_words_cache()
+        return {"ok": True, **out}
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        _log.warning("delete_channels_from_index failed: %s", exc)
+        return {"ok": False, "error": str(exc), "videos": 0, "segments": 0}
 
 
 def update_video_path(old_path: str, new_path: str) -> bool:
@@ -1547,6 +3063,14 @@ def update_video_path(old_path: str, new_path: str) -> bool:
                 "SELECT channel, video_id FROM videos "
                 "WHERE filepath=? COLLATE NOCASE",
                 (_new,)).fetchone()
+            # Duplicate links point at the primary's physical filepath.  A
+            # primary move must repoint every sibling in the same transaction
+            # or deleting the old path later can leave the group headless.
+            if row and row[1]:
+                conn.execute(
+                    "UPDATE videos SET is_duplicate_of=? "
+                    "WHERE video_id=? AND is_duplicate_of=? COLLATE NOCASE",
+                    (_new, row[1], _old))
             # Re-point transcript sidecar references in the SAME
             # transaction. reorg moves the per-video .jsonl alongside
             # the .mp4; leaving segments.jsonl_path / indexed_files.path
@@ -1595,6 +3119,400 @@ def update_video_path(old_path: str, new_path: str) -> bool:
 
 # ── Transcript ingest (from .jsonl sidecar) ─────────────────────────────
 
+def _reject_json_constant(value: str) -> None:
+    """Reject JavaScript-style NaN/Infinity accepted by Python's decoder."""
+    raise ValueError(f"non-finite JSON number {value!r}")
+
+
+def _finite_segment_number(value: Any, field: str, line_number: int) -> float:
+    """Return one finite transcript timestamp or raise a useful error."""
+    if value is None or isinstance(value, bool):
+        raise ValueError(
+            f"line {line_number}: {field} must be a finite number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"line {line_number}: {field} must be a finite number") from exc
+    if not math.isfinite(number):
+        raise ValueError(
+            f"line {line_number}: {field} must be a finite number")
+    return number
+
+
+def _load_validated_jsonl_segments(jsonl_path: str) -> list[dict[str, Any]]:
+    """Parse and validate an entire transcript before the DB is mutated.
+
+    Both the legacy long keys and the short keys used by early web builds are
+    accepted. A single malformed non-blank line rejects the whole document;
+    callers can therefore preserve the last known-good indexed transcript.
+    """
+    segments: list[dict[str, Any]] = []
+    with open(jsonl_path, "r", encoding="utf-8") as source:
+        for line_number, raw_line in enumerate(source, 1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line, parse_constant=_reject_json_constant)
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise ValueError(
+                    f"line {line_number}: invalid JSON ({exc})") from exc
+            if not isinstance(obj, dict):
+                raise ValueError(
+                    f"line {line_number}: transcript entry must be an object")
+
+            start_raw = (obj["start"] if "start" in obj
+                         else obj.get("s", 0.0))
+            end_raw = (obj["end"] if "end" in obj
+                       else obj.get("e", 0.0))
+            start = _finite_segment_number(start_raw, "start", line_number)
+            end = _finite_segment_number(end_raw, "end", line_number)
+            if start < 0 or end < start:
+                raise ValueError(
+                    f"line {line_number}: timestamps must satisfy "
+                    "0 <= start <= end")
+
+            text_value = (obj["text"] if "text" in obj
+                          else obj.get("t", ""))
+            if not isinstance(text_value, str):
+                raise ValueError(
+                    f"line {line_number}: text must be a string")
+
+            words = (obj["words"] if "words" in obj
+                     else obj.get("w", []))
+            if not isinstance(words, list):
+                raise ValueError(
+                    f"line {line_number}: words must be a list")
+            for word_index, word in enumerate(words):
+                if not isinstance(word, dict):
+                    raise ValueError(
+                        f"line {line_number}: words[{word_index}] "
+                        "must be an object")
+                for long_key, short_key in (("start", "s"), ("end", "e")):
+                    if long_key in word:
+                        _finite_segment_number(
+                            word[long_key],
+                            f"words[{word_index}].{long_key}", line_number)
+                    elif short_key in word:
+                        _finite_segment_number(
+                            word[short_key],
+                            f"words[{word_index}].{short_key}", line_number)
+
+            seg_video_id = obj.get("video_id")
+            if seg_video_id is not None and not isinstance(seg_video_id, str):
+                raise ValueError(
+                    f"line {line_number}: video_id must be a string")
+            seg_title = obj.get("title")
+            if seg_title is not None and not isinstance(seg_title, str):
+                raise ValueError(
+                    f"line {line_number}: title must be a string")
+
+            segments.append({
+                "start": start,
+                "end": end,
+                "text": text_value,
+                "words": words,
+                "video_id": seg_video_id or "",
+                "title": seg_title or "",
+            })
+    return segments
+
+
+def _jsonl_generation_matches(path: str, expected: Any, *,
+                              sha256: str = "") -> bool:
+    """Return whether *path* is still the exact receipt generation."""
+    if not isinstance(expected, dict) or not expected.get("exists"):
+        return False
+    try:
+        info = os.stat(path)
+        if (int(info.st_mtime_ns) != int(expected.get("mtime_ns", -1))
+                or int(info.st_size) != int(expected.get("size", -1))):
+            return False
+        if sha256:
+            digest = hashlib.sha256()
+            with open(path, "rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != sha256:
+                return False
+            # Catch a writer that replaced the file while it was being read.
+            final_info = os.stat(path)
+            if (int(final_info.st_mtime_ns) != int(info.st_mtime_ns)
+                    or int(final_info.st_size) != int(info.st_size)):
+                return False
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _receipt_segment_rows(
+        receipt: dict[str, Any], video_filepath: str, channel: str,
+        jsonl_path: str) -> list[tuple[Any, ...]]:
+    """Validate canonical writer records and convert them to DB rows."""
+    video_id = str(receipt.get("video_id") or "").strip()
+    if _ID_RE_IN_NAME.fullmatch(f"[{video_id}]") is None:
+        raise ValueError("replacement receipt has no stable video ID")
+    records = receipt.get("canonical_records")
+    if not isinstance(records, list):
+        raise ValueError("replacement receipt has no canonical records")
+    year, month = _parse_year_month_from_path(video_filepath)
+    rows: list[tuple[Any, ...]] = []
+    for line_number, record in enumerate(records, 1):
+        if not isinstance(record, dict):
+            raise ValueError(
+                f"replacement record {line_number} must be an object")
+        record_video_id = record.get("video_id")
+        if not isinstance(record_video_id, str) or record_video_id != video_id:
+            raise ValueError(
+                f"replacement record {line_number} has the wrong video ID")
+        record_title = record.get("title")
+        if not isinstance(record_title, str):
+            raise ValueError(
+                f"replacement record {line_number} title must be a string")
+        db_title = record_title.strip() or str(receipt.get("title") or "")
+        start = _finite_segment_number(
+            record.get("start"), "start", line_number)
+        end = _finite_segment_number(record.get("end"), "end", line_number)
+        if start < 0 or end < start:
+            raise ValueError(
+                f"replacement record {line_number} timestamps are invalid")
+        text = record.get("text")
+        if not isinstance(text, str):
+            raise ValueError(
+                f"replacement record {line_number} text must be a string")
+        words = record.get("words")
+        if not isinstance(words, list):
+            raise ValueError(
+                f"replacement record {line_number} words must be a list")
+        for word_index, word in enumerate(words):
+            if not isinstance(word, dict):
+                raise ValueError(
+                    f"replacement record {line_number} words[{word_index}] "
+                    "must be an object")
+            for key in ("start", "end", "s", "e"):
+                if key in word:
+                    _finite_segment_number(
+                        word[key], f"words[{word_index}].{key}", line_number)
+        if not text.strip():
+            continue
+        rows.append((
+            video_id,
+            db_title,
+            channel,
+            year,
+            month,
+            start,
+            end,
+            text,
+            jsonl_path,
+            json.dumps(words, ensure_ascii=False, allow_nan=False),
+        ))
+    if not rows:
+        raise ValueError("replacement receipt has no searchable segments")
+    return rows
+
+
+class _IncrementalIngestFallback(ValueError):
+    """A verified guard miss that is safe to repair with a full ingest."""
+
+
+def replace_video_segments(
+        video_filepath: str, channel: str, receipt: dict[str, Any],
+        _conn_override: sqlite3.Connection | None = None,
+        ) -> dict[str, Any]:
+    """Apply one verified JSONL replacement without rebuilding its siblings.
+
+    This is intentionally a conservative retranscribe-only fast path.  The
+    sidecar writer supplies a receipt for the exact bytes it atomically wrote.
+    If identity, file generation, legacy rows, or existing tracker state cannot
+    be proven, this function returns ``ok=False`` and the caller performs the
+    established full validated ingest instead.
+    """
+    fallback = lambda reason, can_fallback=True: {
+        "ok": False,
+        "count": 0,
+        "used_delta": False,
+        "can_fallback": bool(can_fallback),
+        "reason": str(reason),
+    }
+    if not isinstance(receipt, dict) or receipt.get("version") != 1:
+        return fallback("missing or unsupported replacement receipt")
+    if receipt.get("removed_blank_video_id"):
+        return fallback("replacement touched legacy rows without video IDs")
+    if receipt.get("requires_full_reingest"):
+        return fallback("aggregate contains legacy rows needing full validation")
+    video_id = str(receipt.get("video_id") or "").strip()
+    if _ID_RE_IN_NAME.fullmatch(f"[{video_id}]") is None:
+        return fallback("replacement has no stable video ID")
+    fp = os.path.normpath(video_filepath)
+    jp = os.path.normpath(str(receipt.get("jsonl_path") or ""))
+    if not jp:
+        return fallback("replacement receipt has no JSONL path")
+    base_generation = receipt.get("base_generation")
+    final_generation = receipt.get("final_generation")
+    # The minimal fast path requires an existing, previously certified file.
+    # New files and crash-recovery generations take the full ingest path.
+    if not isinstance(base_generation, dict) or not base_generation.get("exists"):
+        return fallback("aggregate did not have a certified base generation")
+    if not _jsonl_generation_matches(
+            jp, final_generation,
+            sha256=str(receipt.get("final_sha256") or "")):
+        return fallback("aggregate changed after the replacement was written")
+    try:
+        rows = _receipt_segment_rows(receipt, fp, channel, jp)
+        base_count = int(receipt.get("base_searchable_count"))
+        final_count = int(receipt.get("final_searchable_count"))
+        removed_count = int(receipt.get("removed_searchable_count"))
+        base_mtime = float(base_generation.get("mtime"))
+        final_mtime = float(final_generation.get("mtime"))
+    except (TypeError, ValueError) as exc:
+        return fallback(exc)
+    if min(base_count, final_count, removed_count) < 0:
+        return fallback("replacement receipt contains invalid row counts")
+    if final_count != base_count - removed_count + len(rows):
+        return fallback("replacement receipt row counts do not balance")
+
+    use_override = _conn_override is not None
+    conn = _conn_override if use_override else _open()
+    if conn is None:
+        return fallback("library database is unavailable")
+    from contextlib import nullcontext as _nullcontext
+    ctx = _nullcontext() if use_override else _db_lock
+    path_lock = _ingest_lock_for(jp)
+    try:
+        with path_lock, ctx:
+            # An override belongs to its caller.  Committing or rolling back
+            # an already-active transaction here would also consume unrelated
+            # work in that transaction.  Require a clean writer boundary so
+            # this operation owns the complete atomic unit it later commits.
+            if conn.in_transaction:
+                return fallback(
+                    "incremental update requires a clean writer transaction",
+                    can_fallback=False,
+                )
+            conn.execute("BEGIN IMMEDIATE")
+            indexed = conn.execute(
+                "SELECT mtime, segment_count FROM indexed_files WHERE path=?",
+                (jp,),
+            ).fetchone()
+            actual_base_count = int(conn.execute(
+                "SELECT COUNT(*) FROM segments WHERE jsonl_path=?", (jp,),
+            ).fetchone()[0] or 0)
+            old_target_at_path = int(conn.execute(
+                "SELECT COUNT(*) FROM segments "
+                "WHERE video_id=? AND jsonl_path=?",
+                (video_id, jp),
+            ).fetchone()[0] or 0)
+            if old_target_at_path > removed_count:
+                raise _IncrementalIngestFallback(
+                    "indexed target has rows absent from the replacement receipt")
+            missing_target_rows = removed_count - old_target_at_path
+            if missing_target_rows:
+                target_elsewhere = int(conn.execute(
+                    "SELECT COUNT(*) FROM segments "
+                    "WHERE video_id=? AND jsonl_path<>?",
+                    (video_id, jp),
+                ).fetchone()[0] or 0)
+                if target_elsewhere == 0:
+                    raise _IncrementalIngestFallback(
+                        "aggregate base is missing unaccounted target rows")
+            expected_indexed_base = base_count - missing_target_rows
+            if indexed is None:
+                raise _IncrementalIngestFallback(
+                    "aggregate has no prior index receipt")
+            try:
+                indexed_mtime = float(indexed[0] or 0)
+                indexed_count = int(indexed[1] or 0)
+            except (TypeError, ValueError) as exc:
+                raise _IncrementalIngestFallback(
+                    "aggregate index receipt is invalid") from exc
+            if (indexed_mtime != base_mtime
+                    or indexed_count != actual_base_count
+                    or actual_base_count != expected_indexed_base):
+                raise _IncrementalIngestFallback(
+                    "aggregate index receipt is stale")
+            expected_final_count = (
+                actual_base_count - old_target_at_path + len(rows))
+            if expected_final_count != final_count:
+                raise _IncrementalIngestFallback(
+                    "replacement would leave an untracked row count")
+
+            displaced_paths = {
+                str(value[0]) for value in conn.execute(
+                    "SELECT DISTINCT jsonl_path FROM segments "
+                    "WHERE video_id=? "
+                    "AND trim(COALESCE(jsonl_path, ''))<>''",
+                    (video_id,),
+                ).fetchall() if value[0]
+            }
+            affected_channels = {
+                str(value[0]) for value in conn.execute(
+                    "SELECT DISTINCT channel FROM videos "
+                    "WHERE filepath=? COLLATE NOCASE OR video_id=?",
+                    (fp, video_id),
+                ).fetchall() if value[0]
+            }
+
+            # Source rows and their external-content FTS entries change in the
+            # same SQLite transaction through the installed v4 triggers.
+            conn.execute("DELETE FROM segments WHERE video_id=?", (video_id,))
+            conn.executemany(
+                """INSERT INTO segments
+                   (video_id, title, channel, year, month, start_time, end_time,
+                    text, jsonl_path, words)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                rows,
+            )
+            actual_final_count = int(conn.execute(
+                "SELECT COUNT(*) FROM segments WHERE jsonl_path=?", (jp,),
+            ).fetchone()[0] or 0)
+            if actual_final_count != final_count:
+                raise _IncrementalIngestFallback(
+                    "replacement produced an unexpected row count")
+            conn.execute(
+                "INSERT OR REPLACE INTO indexed_files(path, mtime, segment_count) "
+                "VALUES (?, ?, ?)",
+                (jp, final_mtime, actual_final_count),
+            )
+            for displaced_path in displaced_paths:
+                if (_path_comparison_key(displaced_path)
+                        != _path_comparison_key(jp)):
+                    _recount_indexed_path_locked(conn, displaced_path)
+            tx_cursor = conn.execute(
+                "UPDATE videos SET tx_status='transcribed' "
+                "WHERE filepath=? COLLATE NOCASE OR video_id=?",
+                (fp, video_id),
+            )
+            if not _jsonl_generation_matches(jp, final_generation):
+                raise _IncrementalIngestFallback(
+                    "aggregate changed while its index was being updated")
+            conn.commit()
+            _invalidate_top_words_cache()
+            for affected_channel in affected_channels:
+                try:
+                    invalidate_channel_videos(affected_channel)
+                except Exception as exc:
+                    _log.debug("channel cache invalidation failed: %s", exc)
+            if (tx_cursor.rowcount or 0) == 0:
+                _enqueue_tx_retry(fp)
+            return {
+                "ok": True,
+                "count": len(rows),
+                "used_delta": True,
+                "reason": "",
+            }
+    except _IncrementalIngestFallback as exc:
+        _rollback_quietly(conn, "replace_video_segments error")
+        _log.debug("per-video transcript index fallback for %s: %s", jp, exc)
+        return fallback(exc)
+    except Exception as exc:
+        _rollback_quietly(conn, "replace_video_segments error")
+        _log.error("per-video transcript index update failed for %s: %s",
+                   jp, exc)
+        return fallback(exc, can_fallback=False)
+
+
 def ingest_jsonl(video_filepath: str, jsonl_path: str,
                  title: str, channel: str,
                  _conn_override: sqlite3.Connection | None = None,
@@ -1624,18 +3542,11 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
     # "Foo [bar-channel] [abc12_def-3].mp4" should pick "abc12_def-3"
     # — but .search() returned the FIRST match ("bar-channel") and
     # the channel-tag-leading filename pattern stamped a fake id
-    # onto every segment (audit: index.py:526). Reject pure-letter
-    # matches too: real YT ids are random picks from the 64-char
-    # alphabet and statistically always include a digit, _, or -.
+    # onto every segment (audit: index.py:526). yt-dlp appends the real
+    # video ID last, and all-letter IDs are valid, so character mix must not
+    # influence selection.
     _matches = _ID_RE_IN_NAME.findall(os.path.basename(fp))
-    for _cand in reversed(_matches):
-        if not _cand.isalpha():
-            vid_id = _cand
-            break
-    if vid_id is None and _matches:
-        # Fall back to last match even if all-alpha — better than
-        # nothing for the rare valid YT id that happens to be all
-        # letters.
+    if _matches:
         vid_id = _matches[-1]
     year, month = _parse_year_month_from_path(fp)
 
@@ -1673,37 +3584,12 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
                             "WHERE filepath=? COLLATE NOCASE", (fp,))
                         conn.commit()
                         return _idx_count
-            segments = []
-            try:
-                with open(jp, "r", encoding="utf-8") as f:
-                    for ln in f:
-                        ln = ln.strip()
-                        if not ln:
-                            continue
-                        try:
-                            obj = json.loads(ln)
-                        except json.JSONDecodeError:
-                            continue
-                        segments.append(obj)
-            except OSError:
-                return 0
-
+            # Validate every non-blank line before beginning a write
+            # transaction or deleting the previous indexed transcript. One
+            # torn/malformed line must not silently produce a partial index.
+            segments = _load_validated_jsonl_segments(jp)
             if not segments:
                 return 0
-            # FTS5 external-content tables don't auto-sync
-            # when rows are deleted from the content table. Without
-            # the explicit FTS delete-from-content idiom, re-ingesting
-            # a .jsonl leaves orphan FTS rowids pointing at deleted
-            # segment IDs — searches return phantom hits that JOIN
-            # against an empty segments row. Do the FTS-side delete
-            # FIRST so rowids get cleaned out of the FTS index, then
-            # DELETE from segments, then re-INSERT.
-            conn.execute(
-                "INSERT INTO segments_fts(segments_fts, rowid, text) "
-                "SELECT 'delete', id, text FROM segments "
-                "WHERE jsonl_path=?", (jp,))
-            # Clear any existing segments for this jsonl (re-ingest)
-            conn.execute("DELETE FROM segments WHERE jsonl_path=?", (jp,))
             rows = []
             # Aggregated per-year transcript files (".<Channel> <Year>
             # Transcript.jsonl") carry a per-segment title but, in the OLD
@@ -1722,39 +3608,25 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
                 if hit is not None:
                     return hit
                 v = ""
-                try:
-                    _rs = conn.execute(
-                        "SELECT video_id FROM videos WHERE channel=? AND title=? "
-                        "AND video_id IS NOT NULL AND video_id<>'' GROUP BY video_id",
-                        (channel, seg_t)).fetchall()
-                    if len(_rs) == 1:
-                        v = _rs[0][0] or ""
-                except sqlite3.Error:
-                    v = ""
+                _rs = conn.execute(
+                    "SELECT video_id FROM videos WHERE channel=? AND title=? "
+                    "AND video_id IS NOT NULL AND video_id<>'' GROUP BY video_id",
+                    (channel, seg_t)).fetchall()
+                if len(_rs) == 1:
+                    v = _rs[0][0] or ""
                 _title_vid_cache[seg_t] = v
                 return v
             for seg in segments:
-                # Accept both key shapes so the FTS DB can ingest OLD's
-                # long-form JSONLs (they match now) AS WELL AS any stale
-                # short-form JSONLs left from earlier builds.
-                s_val = seg.get("start") if "start" in seg else seg.get("s", 0)
-                e_val = seg.get("end") if "end" in seg else seg.get("e", 0)
-                t_val = seg.get("text") if "text" in seg else seg.get("t", "")
-                w_val = seg.get("words") if "words" in seg else seg.get("w", [])
                 # audit L-17 / L-19: skip segments with no text content
                 # (Whisper sometimes emits silence-only segments with
-                # empty "t"). Inserting them bloats the FTS index with
-                # empty rows the user can never land on. Also skip if
-                # w_val is a malformed non-list — json.dumps would still
-                # succeed but the saved form would break word-cloud.
-                if not (t_val or "").strip():
+                # empty "t"). Inserting them bloats the FTS index with empty
+                # rows the user can never land on.
+                if not seg["text"].strip():
                     continue
-                if not isinstance(w_val, list):
-                    w_val = []
                 # Also prefer per-entry video_id/title if the JSONL carries
                 # them (OLD-compat long-form). Falls back to path-derived.
-                seg_vid = (seg.get("video_id") or vid_id or "").strip()
-                seg_title = (seg.get("title") or title or "").strip() or title
+                seg_vid = (seg["video_id"] or vid_id or "").strip()
+                seg_title = (seg["title"] or title or "").strip() or title
                 # OLD aggregated JSONLs lack per-entry video_id: recover it
                 # from the videos table by (channel, title) so the segment
                 # links to its real upload date instead of orphaning.
@@ -1766,12 +3638,53 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
                     channel,
                     year,
                     month,
-                    float(s_val or 0),
-                    float(e_val or 0),
-                    t_val,
+                    seg["start"],
+                    seg["end"],
+                    seg["text"],
                     jp,
-                    json.dumps(w_val, ensure_ascii=False),
+                    json.dumps(seg["words"], ensure_ascii=False),
                 ))
+            # A syntactically valid file containing no searchable text is not
+            # a replacement transcript. Preserve the prior indexed rows.
+            if not rows:
+                return 0
+
+            # One logical video must have exactly one transcript source in the
+            # catalog.  A copy promotion can move its rows from a shared
+            # aggregate JSONL to a per-video survivor sidecar while the old
+            # aggregate file still contains those historical lines.  When
+            # that aggregate changes later, path-only replacement would add a
+            # second copy of every segment.  Treat this ingest as authoritative
+            # for every non-blank ID it carries and retire the prior source in
+            # the same transaction.
+            incoming_video_ids = sorted({
+                str(row[0] or "").strip() for row in rows if row[0]
+            })
+
+            # Everything above is read-only. Begin the atomic replacement
+            # only after the complete document and all row values are known
+            # good.
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            # The v4 source-table triggers keep the FTS shadow in the same
+            # transaction as this content replacement.
+            displaced_paths: set[str] = set()
+            conn.execute("DELETE FROM segments WHERE jsonl_path=?", (jp,))
+            for offset in range(0, len(incoming_video_ids), 400):
+                batch = incoming_video_ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in batch)
+                displaced_paths.update(
+                    str(value[0]) for value in conn.execute(
+                        "SELECT DISTINCT jsonl_path FROM segments "
+                        f"WHERE video_id IN ({placeholders}) "
+                        "AND trim(COALESCE(jsonl_path, ''))<>''",
+                        batch,
+                    ).fetchall() if value[0]
+                )
+                conn.execute(
+                    f"DELETE FROM segments WHERE video_id IN ({placeholders})",
+                    batch,
+                )
             conn.executemany(
                 """INSERT INTO segments
                    (video_id, title, channel, year, month, start_time, end_time,
@@ -1779,17 +3692,16 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 rows,
             )
-            # Populate FTS
-            conn.execute(
-                "INSERT INTO segments_fts (rowid, text) "
-                "SELECT id, text FROM segments WHERE jsonl_path=?", (jp,),
-            )
             # Track indexed file mtime
             conn.execute(
                 "INSERT OR REPLACE INTO indexed_files(path, mtime, segment_count) "
                 "VALUES (?, ?, ?)",
                 (jp, jsonl_mtime, len(rows)),
             )
+            for displaced_path in displaced_paths:
+                if (_path_comparison_key(displaced_path)
+                        != _path_comparison_key(jp)):
+                    _recount_indexed_path_locked(conn, displaced_path)
             # flip tx_status='transcribed' on successful ingest so stats
             # reflect reality right away. Match on BOTH the video filepath
             # (per-video sidecar case: `fp` is the mp4) AND the segments'
@@ -1833,9 +3745,9 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
         # malformed entries are filtered out above (lines 442-451) but
         # still inflated the reported "ingested" total before this fix.
         return len(rows)
-    except sqlite3.Error as e:
+    except Exception as e:
         _rollback_quietly(conn, "ingest_jsonl error")
-        _log.error("ingest_jsonl failed for %s: %s", jsonl_path, e)
+        _log.error("ingest_jsonl rejected %s: %s", jsonl_path, e)
         return 0
 
 
@@ -1905,7 +3817,7 @@ _browse_cache_lock = threading.Lock()
 # invalidate_channel_videos (any video add/delete/re-transcribe in any
 # channel can change the global list). Shares _browse_cache_lock.
 _all_videos_cache: OrderedDict[
-    tuple[str, int, int, bool, str], dict[str, Any]
+    tuple[str, int, int, bool, str, tuple[str, ...] | None], dict[str, Any]
 ] = OrderedDict()
 
 # Per-channel thumbnail index cache. Keyed by channel-root path, value
@@ -2099,17 +4011,17 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         "most_viewed": "(view_count IS NULL) ASC, view_count DESC, "
                        "COALESCE(added_ts, 0) DESC",
     }.get(sort, "COALESCE(year, 0) DESC, COALESCE(month, 0) DESC, COALESCE(added_ts, 0) DESC")
+    channel_ctes = channel_videos_cte_sql()
     with _reader_lock:
         # Select removed_from_yt_ts last so older DBs (where the column
         # may not exist yet during the first run after upgrade) can be
         # handled via try/except fallback.
         try:
             cur = conn.execute(
+                f"WITH {channel_ctes} "
                 f"SELECT title, channel, filepath, video_id, size_bytes, year, month, "
                 f"tx_status, added_ts, removed_from_yt_ts, upload_ts, "
-                f"view_count, like_count FROM videos "
-                f"WHERE channel=? COLLATE NOCASE AND is_duplicate_of IS NULL "
-                f"AND COALESCE(availability, 'available')='available' "
+                f"view_count, like_count FROM channel_videos "
                 f"ORDER BY {order} LIMIT ?",
                 (channel, limit),
             )
@@ -2124,10 +4036,9 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
             } for r in cur.fetchall()]
         except Exception:
             cur = conn.execute(
+                f"WITH {channel_ctes} "
                 f"SELECT title, channel, filepath, video_id, size_bytes, year, month, "
-                f"tx_status, added_ts FROM videos "
-                f"WHERE channel=? COLLATE NOCASE AND is_duplicate_of IS NULL "
-                f"AND COALESCE(availability, 'available')='available' "
+                f"tx_status, added_ts FROM channel_videos "
                 f"ORDER BY {order} LIMIT ?",
                 (channel, limit),
             )
@@ -2367,7 +4278,7 @@ def list_videos_for_channel_page(
         off = 0
     if conn is None:
         return {"rows": [], "has_more": False, "offset": off,
-                "next_offset": off}
+                "next_offset": off, "error": "catalog unavailable"}
     order = {
         "newest": "upload_ts DESC, added_ts DESC",
         "oldest": "(upload_ts IS NULL) ASC, upload_ts ASC, "
@@ -2377,9 +4288,8 @@ def list_videos_for_channel_page(
         "most_viewed": "view_count DESC, added_ts DESC",
     }.get((sort or "newest").lower(),
           "upload_ts DESC, added_ts DESC")
-    where = ("WHERE channel=? COLLATE NOCASE "
-             "AND is_duplicate_of IS NULL "
-             "AND COALESCE(availability, 'available')='available'")
+    channel_ctes = channel_videos_cte_sql()
+    where = "WHERE 1=1"
     params: list[Any] = [channel]
     q = (query or "").strip()
     if q:
@@ -2390,17 +4300,18 @@ def list_videos_for_channel_page(
     try:
         with _reader_lock:
             cur = conn.execute(
+                f"WITH {channel_ctes} "
                 "SELECT title, channel, filepath, video_id, size_bytes, "
                 "year, month, tx_status, added_ts, upload_ts, view_count, "
                 "like_count, removed_from_yt_ts, duration_s "
-                f"FROM videos {where} "
+                f"FROM channel_videos {where} "
                 f"ORDER BY {order} LIMIT ? OFFSET ?",
                 params)
             raw = cur.fetchall()
     except sqlite3.Error as e:
         _log.debug("list_videos_for_channel_page query failed: %s", e)
         return {"rows": [], "has_more": False, "offset": off,
-                "next_offset": off}
+                "next_offset": off, "error": str(e)}
     has_more = len(raw) > lim
     raw = raw[:lim]
     out = [_build_browse_video_row(r, include_thumbs) for r in raw]
@@ -2495,13 +4406,15 @@ def channel_transcription_stats(channel: str) -> dict[str, int]:
         # that string. Earlier this query tested 'done' — a mismatch
         # that made fully-transcribed channels read as "0 / N" in the
         # Edit-channel disk-stats footer.
-        # exclude duplicate rows (is_duplicate_of NOT NULL)
-        # from the counts. The Browse grid hides duplicates already,
-        # so the footer "N/M transcribed" should match the visible
-        # row count, not include hidden dups.
+        # Use the same channel-scoped physical-copy ranking as the Browse
+        # grid. A library-wide primary may live in another channel; hiding
+        # its valid local copy here would make the footer disagree with the
+        # cards the user can actually open.
+        channel_ctes = channel_videos_cte_sql()
         with _reader_lock:
             row = conn.execute(
-                """SELECT
+                f"""WITH {channel_ctes}
+                   SELECT
                      COUNT(*) AS total,
                      SUM(CASE WHEN tx_status IN ('transcribed', 'done')
                               THEN 1 ELSE 0 END) AS done,
@@ -2510,10 +4423,7 @@ def channel_transcription_stats(channel: str) -> dict[str, int]:
                      SUM(CASE WHEN tx_status='failed' THEN 1 ELSE 0 END) AS failed,
                      SUM(CASE WHEN tx_status='no_speech'
                               THEN 1 ELSE 0 END) AS no_speech
-                   FROM videos
-                   WHERE channel = ? COLLATE NOCASE
-                     AND is_duplicate_of IS NULL
-                     AND COALESCE(availability, 'available')='available'""",
+                   FROM channel_videos""",
                 (channel,),
             ).fetchone()
         if row:
@@ -2770,7 +4680,11 @@ def find_thumbnail_channelwide(video_filepath: str,
 
 # ── Global "Videos" view: materialized view/like stats + paginated list ──
 
-def update_video_stats(updates) -> int:
+def update_video_stats(
+    updates,
+    *,
+    commit_allowed: Callable[[], bool] | None = None,
+) -> int:
     """Batch-write metadata fields into the videos table.
 
     `updates`: iterable of (video_id, view_count, like_count[, upload_date]).
@@ -2781,13 +4695,27 @@ def update_video_stats(updates) -> int:
     rows = [u for u in (updates or []) if u and u[0]]
     if not rows:
         return 0
+
+    def _may_commit() -> bool:
+        try:
+            return commit_allowed is None or bool(commit_allowed())
+        except Exception:
+            return False
+
+    if not _may_commit():
+        return 0
     try:
         with _db_lock:
+            if not _may_commit():
+                return 0
             conn = _open()
             if conn is None:
                 return 0
             n = 0
             for update in rows:
+                if not _may_commit():
+                    conn.rollback()
+                    return 0
                 try:
                     vid, vc, lc = update[:3]
                     upload_date = update[3] if len(update) > 3 else None
@@ -2802,6 +4730,9 @@ def update_video_stats(updates) -> int:
                     n += cur.rowcount or 0
                 except sqlite3.Error:
                     continue
+            if not _may_commit():
+                conn.rollback()
+                return 0
             conn.commit()
             if n:
                 invalidate_channel_videos(None)
@@ -3063,18 +4994,24 @@ def backfill_video_ids_from_sidecars(progress=None) -> dict:
         nonlocal fixed, pending
         if not pending:
             return
+        batch = pending
+        pending = []
+        c = None
         try:
             with _db_lock:
                 c = _open()
                 if c is not None:
                     c.executemany(
                         "UPDATE videos SET video_id=?, video_url=? WHERE id=?",
-                        pending)
+                        batch)
+                    for video_id in sorted({str(row[0]) for row in batch}):
+                        _repair_video_copy_group_locked(c, video_id)
                     c.commit()
-                    fixed += len(pending)
+                    fixed += len(batch)
         except sqlite3.Error as e:
+            if c is not None:
+                _rollback_quietly(c, "sidecar id backfill")
             _log.debug("id backfill flush failed: %s", e)
-        pending = []
 
     for i, (rid, fp) in enumerate(rows):
         vid = _resolve_id_from_sidecars(fp) if fp else ""
@@ -3086,6 +5023,8 @@ def backfill_video_ids_from_sidecars(progress=None) -> dict:
             try: progress({"done": i + 1, "total": total, "fixed": fixed})
             except Exception: pass
     _flush()
+    if fixed:
+        invalidate_channel_videos(None)
     return {"ok": True, "fixed": fixed, "null_rows": total}
 
 
@@ -3145,6 +5084,42 @@ def _manual_like_prefix(path: str) -> str:
     return n.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
+def _archive_path_filter(
+        archive_roots: list[str] | tuple[str, ...] | None,
+        ) -> tuple[str, list[str], tuple[str, ...] | None]:
+    """Return a bounded SQL path filter for Browse > Videos.
+
+    ``None`` preserves the lower-level catalog API's historical unfiltered
+    behavior.  The UI passes its current channel/archive roots explicitly;
+    an empty list therefore means there is no configured archive to show.
+    Directory prefixes include a trailing separator so ``Archive`` cannot
+    accidentally match a sibling such as ``Archive-old``.
+    """
+    if archive_roots is None:
+        return "", [], None
+    roots: list[str] = []
+    seen: set[str] = set()
+    for raw_root in archive_roots:
+        text = str(raw_root or "").strip()
+        if not text:
+            continue
+        normalized = os.path.normpath(text)
+        key = os.path.normcase(normalized)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        roots.append(normalized)
+    signature = tuple(os.path.normcase(root) for root in roots)
+    if not roots:
+        return " AND 0", [], signature
+    clauses = ["filepath LIKE ? ESCAPE '\\'" for _root in roots]
+    return (
+        " AND (" + " OR ".join(clauses) + ")",
+        [_manual_like_prefix(root) for root in roots],
+        signature,
+    )
+
+
 def _manual_where_and_params() -> tuple[str, list]:
     """Build the WHERE that classifies a `videos` row as a single/manual
     download: any indexed video NOT inside a channel archive tree (output_dir)
@@ -3178,7 +5153,8 @@ def _manual_where_and_params() -> tuple[str, list]:
     return (where, params)
 
 
-def list_manual_videos(include_thumbs: bool = True) -> list[dict]:
+def list_manual_videos(include_thumbs: bool = True, *,
+                       report_errors: bool = False) -> list[dict]:
     """All index rows that are single/manual downloads — i.e. saved in
     video_out_dir OR outside every managed archive root (custom 'Save to'
     locations). Channel downloads (under output_dir/<channel>/) and index-only
@@ -3187,6 +5163,8 @@ def list_manual_videos(include_thumbs: bool = True) -> list[dict]:
     """
     conn = _reader_open()
     if conn is None:
+        if report_errors:
+            raise RuntimeError("Search index is unavailable.")
         return []
     where, params = _manual_where_and_params()
     if not where:
@@ -3203,6 +5181,8 @@ def list_manual_videos(include_thumbs: bool = True) -> list[dict]:
             raw = cur.fetchall()
     except sqlite3.Error as e:
         _log.debug("list_manual_videos query failed: %s", e)
+        if report_errors:
+            raise RuntimeError(str(e)) from e
         return []
     out = []
     for r in raw:
@@ -3346,9 +5326,15 @@ def set_manual_video_id(filepath: str, video_id: str, video_url: str = "",
                     f"{_set_channel_sql} "
                     "WHERE filepath=? COLLATE NOCASE AND (video_id IS NULL OR video_id='')",
                     tuple(_args))
+            changed = (cur.rowcount or 0) > 0
+            if changed:
+                _repair_video_copy_group_locked(conn, video_id)
             conn.commit()
-            return (cur.rowcount or 0) > 0
+            if changed:
+                invalidate_channel_videos(None)
+            return changed
         except sqlite3.Error as e:
+            _rollback_quietly(conn, "set_manual_video_id")
             _log.warning("set_manual_video_id failed: %s", e)
             return False
 
@@ -3453,8 +5439,10 @@ def mark_manual_id_backfill_failed(filepath: str, *,
     }
 
 
-def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
-                    include_thumbs: bool = True, query: str = "") -> dict:
+def list_all_videos(
+        sort: str = "recent", limit: int = 60, offset: int = 0,
+        include_thumbs: bool = True, query: str = "",
+        archive_roots: list[str] | tuple[str, ...] | None = None) -> dict:
     """Paginated global video list across the whole archive (the Videos view).
 
     Sorts off materialized DB columns (added_ts / upload_ts / view_count /
@@ -3464,7 +5452,8 @@ def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
     """
     conn = _reader_open()
     if conn is None:
-        return {"rows": [], "has_more": False, "offset": offset}
+        return {"rows": [], "has_more": False, "offset": offset,
+                "error": "Search index is unavailable."}
     order = {
         "recent":  "(downloaded_ts IS NULL) ASC, downloaded_ts DESC, "
                    "COALESCE(added_ts, 0) DESC, id DESC",
@@ -3486,7 +5475,12 @@ def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
     # disk-walk that makes a cold open ~10s. Return copies so callers can't
     # mutate the cached page.
     _q = (query or "").strip()
-    _ck = ((sort or "recent").lower(), lim, off, bool(include_thumbs), _q.lower())
+    root_where, root_params, root_signature = _archive_path_filter(
+        archive_roots)
+    _ck = (
+        (sort or "recent").lower(), lim, off, bool(include_thumbs),
+        _q.lower(), root_signature,
+    )
     with _browse_cache_lock:
         _hit = _all_videos_cache.get(_ck)
         if _hit is not None:
@@ -3495,9 +5489,46 @@ def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
         return {"rows": [dict(r) for r in _hit["rows"]],
                 "has_more": _hit["has_more"], "offset": _hit["offset"]}
     try:
-        where = ("WHERE is_duplicate_of IS NULL AND "
-                 "COALESCE(availability, 'available')='available'")
-        params: list[Any] = []
+        query_prefix = ""
+        source = "videos"
+        if root_signature is None:
+            where = ("WHERE is_duplicate_of IS NULL AND "
+                     "COALESCE(availability, 'available')='available'")
+        else:
+            # Pick the canonical copy *after* constraining candidates to the
+            # configured archive.  The library-wide primary can be a manual
+            # custom-Save-to copy; filtering that primary afterward would
+            # hide a perfectly valid duplicate that is physically archived.
+            logical_key = (
+                "CASE "
+                "WHEN trim(COALESCE(video_id, '')) <> '' "
+                "THEN 'id:' || trim(video_id) "
+                "WHEN trim(COALESCE(filepath, '')) <> '' "
+                "THEN 'path:' || lower(replace(trim(filepath), '/', char(92))) "
+                "ELSE 'row:' || CAST(id AS TEXT) END"
+            )
+            query_prefix = f"""
+                WITH ranked_archive_copies AS (
+                    SELECT videos.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY {logical_key}
+                               ORDER BY
+                                   CASE WHEN is_duplicate_of IS NULL
+                                        THEN 0 ELSE 1 END,
+                                   id
+                           ) AS archive_copy_rank
+                    FROM videos
+                    WHERE COALESCE(availability, 'available')='available'
+                    {root_where}
+                ),
+                archive_videos AS (
+                    SELECT * FROM ranked_archive_copies
+                    WHERE archive_copy_rank=1
+                )
+            """
+            source = "archive_videos"
+            where = "WHERE 1=1"
+        params: list[Any] = list(root_params)
         if _q:
             # Filter by title OR channel (substring, case-insensitive via
             # LIKE). Escape LIKE metacharacters so a literal % / _ in the
@@ -3510,16 +5541,18 @@ def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
         params.extend([lim + 1, off])
         with _reader_lock:
             cur = conn.execute(
+                query_prefix +
                 "SELECT title, channel, filepath, video_id, size_bytes, year, month, "
                 "tx_status, added_ts, upload_ts, view_count, like_count, "
                 "removed_from_yt_ts, duration_s "
-                f"FROM videos {where} "
+                f"FROM {source} {where} "
                 f"ORDER BY {order} LIMIT ? OFFSET ?",
                 params)
             raw = cur.fetchall()
     except sqlite3.Error as e:
         _log.debug("list_all_videos query failed: %s", e)
-        return {"rows": [], "has_more": False, "offset": offset}
+        return {"rows": [], "has_more": False, "offset": offset,
+                "error": str(e)}
     has_more = len(raw) > lim
     raw = raw[:lim]
 
@@ -3943,22 +5976,34 @@ from .index_search import (  # noqa: F401
 
 # ── Stats ───────────────────────────────────────────────────────────────
 
-def summary() -> dict[str, Any]:
+def summary(report_errors: bool = False) -> dict[str, Any]:
+    """Return catalog totals, optionally distinguishing read failures.
+
+    The default keeps the long-standing zero-filled fallback used by existing
+    callers.  Status surfaces such as Health can opt into an explicit error so
+    an unavailable database is not presented as an empty catalog.
+    """
     # Read-only stats on an independent connection so full-table counts do
     # not hold the shared reader lock used by Browse/Search/Watch.
     conn = _open_independent()
     if conn is None:
+        if report_errors:
+            return {
+                "available": False,
+                "error": "Search index could not be read.",
+            }
         return {"segments": 0, "videos": 0, "channels": 0, "bookmarks": 0}
     try:
         seg = conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
+        canonical_ctes = canonical_videos_cte_sql()
         vid = conn.execute(
-            "SELECT COUNT(*) FROM videos WHERE is_duplicate_of IS NULL AND "
-            "COALESCE(availability, 'available')='available'").fetchone()[0]
+            f"WITH {canonical_ctes} "
+            "SELECT COUNT(*) FROM canonical_videos "
+            "WHERE is_available_copy=1").fetchone()[0]
         ch = conn.execute(
-            "SELECT COUNT(*) FROM ("
-            "SELECT 1 FROM videos WHERE channel IS NOT NULL "
-            "AND is_duplicate_of IS NULL AND "
-            "COALESCE(availability, 'available')='available' GROUP BY channel"
+            f"WITH {canonical_ctes} SELECT COUNT(*) FROM ("
+            "SELECT 1 FROM canonical_videos WHERE channel IS NOT NULL "
+            "AND is_available_copy=1 GROUP BY channel"
             ")"
         ).fetchone()[0]
         bm = conn.execute("SELECT COUNT(*) FROM bookmarks").fetchone()[0]
@@ -3966,6 +6011,11 @@ def summary() -> dict[str, Any]:
                 "bookmarks": bm}
     except sqlite3.Error as e:
         _log.warning("index summary failed: %s", e)
+        if report_errors:
+            return {
+                "available": False,
+                "error": "Search index could not be read.",
+            }
         return {"segments": 0, "videos": 0, "channels": 0, "bookmarks": 0}
     finally:
         try:
@@ -3984,6 +6034,8 @@ from .index_bookmarks import (  # noqa: F401
     bookmark_update_note,
 )
 from .index_maintenance import (  # noqa: F401
+    build_archive_scan_plan,
+    fts_health_check,
     prune_missing_videos,
     rebuild_fts_index,
     refresh_channel_file_sizes,

@@ -792,29 +792,11 @@ body.channel-editor-open { overflow: hidden; }
   max-width: 500px;
   box-shadow: 0 20px 60px rgba(0,0,0,0.6);
 }
-.yt-modal-body-welcome {
-  min-width: 460px;
-  max-width: 560px;
-}
 .yt-modal-title {
   font-size: var(--fs-xl); font-weight: 600; margin-bottom: 4px;
 }
 .yt-modal-sub {
   font-size: var(--fs-sm); color: var(--c-accent); margin-bottom: 14px;
-}
-.yt-modal-sub-spaced {
-  margin-top: 10px;
-}
-.yt-modal-path-row {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  margin-top: 18px;
-  margin-bottom: 14px;
-}
-.yt-modal-path-row .ctl-input {
-  flex: 1 1 auto;
-  min-width: 0;
 }
 .yt-modal-stats {
   font-size: 15px; font-weight: 600;

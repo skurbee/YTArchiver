@@ -30,7 +30,8 @@
   transition: background 120ms ease;
 }
 .watch-splitter:hover,
-.watch-splitter.dragging {
+.watch-splitter.dragging,
+.watch-splitter:focus-visible {
   background: rgba(108, 180, 238, 0.35);
 }
 /* Narrow-window graceful degradation.
@@ -121,7 +122,7 @@
   flex-shrink: 0;
 }
 /* Two-row split: row 1 holds the primary action buttons (+ ⋮ More for
-   the secondary actions), row 2 holds playback/overlay/follow controls.
+   the secondary actions), row 2 holds playback and overlay controls.
    Splitting keeps everything reachable at narrow widths instead of
    silently wrapping off the visible area. */
 .watch-actions-row1 { margin-top: 6px; }
@@ -135,6 +136,14 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+.watch-overlay-group {
+  /* Once Overlay is enabled, the extra Style/Mode controls can be wider
+     than the video pane at the minimum window size. Let the group take a
+     full wrapped line instead of creating horizontal overflow. */
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
 }
 .watch-overlay-extras.collapsed { display: none; }
 .overlay-sublabel {
@@ -551,7 +560,7 @@
 }
 
 /* ═══ Watch-view transcript source banner ═══
-   Mirrors ArchivePlayer's `.yt-src-banner` — one badge + line of text
+   Mirrors the companion viewer's source banner — one badge + line of text
    above the transcript body telling the user whether this transcript is
    from Whisper (authoritative) or YT auto-captions (approximate). */
 .watch-src-banner {
@@ -635,12 +644,18 @@
   font-weight: 600;
 }
 .watch-retranscribe-progress-text {
-  flex: 0 0 136px;
-  width: 136px;
+  flex: 0 0 190px;
+  width: 190px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   font-variant-numeric: tabular-nums;
+}
+.watch-retranscribe-progress.is-paused {
+  color: var(--c-dim);
+}
+.watch-retranscribe-progress.is-needs-attention {
+  color: var(--c-warn-fg);
 }
 .watch-retranscribe-bar {
   position: relative;
@@ -654,6 +669,10 @@
   background: rgba(255, 255, 255, 0.12);
   border: 1px solid rgba(255, 255, 255, 0.12);
 }
+.watch-retranscribe-progress.is-needs-attention .watch-retranscribe-bar {
+  background: color-mix(in srgb, var(--c-warn) 18%, transparent);
+  border-color: color-mix(in srgb, var(--c-warn-fg) 42%, var(--c-border));
+}
 .watch-retranscribe-fill {
   position: absolute;
   inset: 0 auto 0 0;
@@ -661,6 +680,9 @@
   border-radius: inherit;
   background: var(--c-accent);
   transition: width 0.18s ease;
+}
+.watch-retranscribe-fill.is-needs-attention {
+  background: var(--c-warn-fg);
 }
 @keyframes watch-retranscribe-indeterminate {
   0% { transform: translateX(-115%); }
@@ -672,7 +694,7 @@
 }
 
 /* Continuous transcript body — no per-segment margins, just one flowing
-   paragraph of words. Matches ArchivePlayer's `.yt-transcript-body`.
+   paragraph of words. Matches the companion viewer's transcript body.
    BUG FIX 2026-05-14: was `font-size: 13px` hardcoded — clobbered the
    `--watch-transcript-fz` variable set by the Aa-/Aa+ buttons on the
    parent `.watch-transcript` (symptom: the text size increase /

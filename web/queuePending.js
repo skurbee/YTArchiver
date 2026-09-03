@@ -4,7 +4,7 @@
    Extracted from app.js boot(). Owns:
      • The Queue Pending badge count (sum of channels with > 0 pending
        transcriptions or metadata fetches)
-     • Auto-hide of the button when nothing is pending
+      • The force-all action remains available when nothing is pending
      • Left-click: queue only channels with pending work
      • Right-click: queue ALL channels (after danger-style confirm)
      • Live re-count on Subs table re-render via MutationObserver
@@ -58,9 +58,9 @@
         if (qpBtn) qpBtn.hidden = false;
       } else {
         qpCount.hidden = true;
-        // Hide the whole button when nothing's pending — no point in
-        // showing a "Queue Pending" affordance with zero work to do.
-        if (qpBtn) qpBtn.hidden = true;
+        // Keep the button available: its context menu is also the explicit
+        // "Queue all" entry point, which remains useful at a zero count.
+        if (qpBtn) qpBtn.hidden = false;
       }
     };
 
@@ -89,45 +89,56 @@
         window._showToast?.("App still starting - try again in a moment.", "warn");
         return;
       }
-      const res = await bridgeCall("subs_queue_pending");
-      if (res?.ok) {
-        const parts = [];
-        if (res.transcribe_queued) parts.push(`${res.transcribe_queued} for transcribe`);
-        if (res.metadata_queued) parts.push(`${res.metadata_queued} for metadata`);
-        window._showToast?.(parts.length
-          ? `Queued ${parts.join(", ")}.`
-          : "No pending channels.", parts.length ? "ok" : "warn");
-      } else {
-        window._showToast?.(res?.error || "Queue pending failed.", "error");
+      try {
+        const res = await bridgeCall("subs_queue_pending");
+        if (res?.ok && res?.started) {
+          // This endpoint starts a background walk. Its final counts arrive
+          // through the backend event bus; do not invent synchronous totals.
+          window._showToast?.("Checking channels for pending work…");
+        } else {
+          window._showToast?.(res?.error || "Queue check did not start.", "error");
+        }
+      } catch (error) {
+        window._showToast?.(
+          "Queue check failed: " + (error?.message || error), "error");
       }
-      // Re-fetch channel rows so the badge reflects backend counter
-      // resets. Without this, chan_transcribe_pending can zero a
-      // channel's counter and the button badge happily keeps showing
-      // the pre-click count because the row cache never refreshed.
-      try { await window.refreshSubsTable?.(); } catch (_e) {}
-      setTimeout(updateBadge, 500);
     });
 
-    qpBtn.addEventListener("contextmenu", async (e) => {
-      e.preventDefault();
+    const queueAll = async () => {
       if (!nativeBridgeUp()) {
         window._showToast?.("App still starting - try again in a moment.", "warn");
         return;
       }
-      const ok = await window.askConfirm?.(
-        "Queue all channels",
-        "Add ALL channels to the transcribe queue? This may take a long time for large libraries.",
-        { confirm: "Queue all" });
-      if (!ok) return;
-      const res = await bridgeCall("subs_queue_all");
-      if (res?.ok) {
-        window._showToast?.(`Queued ${res.queued} channels.`, "ok");
-      } else {
-        window._showToast?.(res?.error || "Queue all failed.", "error");
+      try {
+        const ok = await window.askConfirm?.(
+          "Queue all channels",
+          "Add all channels to the transcription queue? This may take a long time for large libraries.",
+          { confirm: "Queue all" });
+        if (!ok) return;
+        const res = await bridgeCall("subs_queue_all");
+        if (res?.ok && res?.started) {
+          window._showToast?.("Checking all channels for transcription work…");
+        } else {
+          window._showToast?.(res?.error || "Queue-all check did not start.", "error");
+        }
+      } catch (error) {
+        window._showToast?.(
+          "Queue-all check failed: " + (error?.message || error), "error");
       }
+    };
+    qpBtn.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      queueAll();
+    });
+    qpBtn.addEventListener("keydown", (event) => {
+      if (event.key !== "ContextMenu"
+          && !(event.shiftKey && event.key === "F10")) return;
+      event.preventDefault();
+      queueAll();
     });
 
     qpBtn.title = "Left-click: queue channels with pending transcriptions / metadata\nRight-click: queue ALL channels";
+    qpBtn.setAttribute("aria-keyshortcuts", "Shift+F10");
   }
 
   window.initQueuePendingButton = initQueuePendingButton;

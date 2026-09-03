@@ -50,7 +50,7 @@ def archive_capacity_status(path: str, cfg: dict[str, Any] | None = None) -> dic
         return {
             "ok": False,
             "status": "fail",
-            "detail": "Not configured (Settings > Archive root)",
+            "detail": "Not configured (Settings > Storage & library)",
             "settings": settings,
         }
     if not os.path.isdir(base):

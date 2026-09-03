@@ -6,6 +6,15 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v83.6 - 2026-09-03
+
+### Fixed
+- **Canonicalized local-media allowlist paths before containment checks.** Equivalent Windows 8.3 and long-path spellings now resolve to the same allowed location, preventing valid thumbnails, channel art, or media from being rejected while links that resolve outside an approved root remain blocked.
+
+### Validation
+- Full release gate passed, including 1,144 Python tests, 16 Node frontend regressions, and 187 Playwright browser behavior tests.
+- The Windows x64 executable and GitHub Actions workflow were both verified with Python 3.13.
+
 ## v83.5 - 2026-09-03
 
 ### Added

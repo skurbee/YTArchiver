@@ -51,13 +51,21 @@ _request_token: str = ""
 _file_revisions: dict[str, int] = {}
 
 
-def _normalize_root(p: str) -> str:
-    """Return an absolute, lowercased, no-trailing-sep form of p.
-    Used to compare incoming request paths against the allowlist
-    without case or trailing-slash false-mismatches on Windows.
+def _canonical_path(p: str) -> str:
+    """Return a canonical, case-normalized, no-trailing-separator path.
+
+    ``realpath`` is important on Windows because a path can arrive through an
+    8.3 alias (for example ``RUNNER~1``) while the resolved file uses the long
+    directory name. Canonicalizing both the registered root and the requested
+    path keeps those equivalent spellings equal while still resolving links
+    before the containment check.
     """
     try:
-        return os.path.normcase(os.path.abspath(p)).rstrip("/\\")
+        raw_path = os.fspath(p)
+        if not raw_path:
+            return ""
+        absolute_path = os.path.abspath(raw_path)
+        return os.path.normcase(os.path.realpath(absolute_path)).rstrip("/\\")
     except Exception:
         return ""
 
@@ -68,14 +76,7 @@ def set_allowed_roots(roots: list[str]) -> None:
     absolute case-insensitive form.
     """
     global _allowed_roots
-    _allowed_roots = [r for r in (_normalize_root(x) for x in (roots or [])) if r]
-
-
-def _normalize_file(p: str) -> str:
-    try:
-        return os.path.normcase(os.path.realpath(p)).rstrip("/\\")
-    except Exception:
-        return ""
+    _allowed_roots = [r for r in (_canonical_path(x) for x in (roots or [])) if r]
 
 
 def allow_file(path: str) -> None:
@@ -87,7 +88,7 @@ def allow_file(path: str) -> None:
     file grant lets the localhost server serve that already-approved path
     without widening the root allowlist.
     """
-    p = _normalize_file(path or "")
+    p = _canonical_path(path or "")
     if p:
         _allowed_files.add(p)
 
@@ -98,7 +99,7 @@ def mark_file_changed(path: str) -> None:
     Thumbnail refreshes can atomically replace a file without changing its
     name. WebView2 otherwise reuses the old bitmap for up to a day.
     """
-    p = _normalize_file(path or "")
+    p = _canonical_path(path or "")
     if p:
         _file_revisions[p] = time.time_ns()
 
@@ -115,8 +116,8 @@ def _is_under_allowed_root(path: str) -> bool:
     the window. main.py must call set_allowed_roots() before relying on
     the fileserver.
     """
-    real_path = _normalize_file(path or "")
-    if real_path and real_path in _allowed_files:
+    canonical_path = _canonical_path(path or "")
+    if canonical_path and canonical_path in _allowed_files:
         return True
     if not _allowed_roots:
         try:
@@ -125,40 +126,16 @@ def _is_under_allowed_root(path: str) -> bool:
         except Exception:
             pass
         return False
-    try:
-        p = _normalize_root(path)
-    except Exception:
+    if not canonical_path:
         return False
-    if not p:
-        return False
-    # Also resolve symlinks so a malicious symlink under an allowed
-    # root can't tunnel to a path outside it (audit: local_fileserver
-    # H103). Use realpath on the ORIGINAL (un-normcased) path then
-    # re-normalize for the prefix check.
-    try:
-        _real = os.path.normcase(os.path.realpath(path)).rstrip("/\\")
-    except Exception:
-        _real = p
-    real_path = _normalize_file(path)
-    if real_path and real_path in _allowed_files:
-        return True
 
     for root in _allowed_roots:
         # os.path.normcase ensures case-insensitive prefix match on
         # Windows. The + os.sep guard prevents "/ArchiveBad" from
         # matching an allowed root "/Archive".
         root_prefixes = (root + os.sep, root + "/")
-        if p == root or p.startswith(root_prefixes):
-            # Belt + suspenders: also require the realpath under root.
-            if _real == root or _real.startswith(root_prefixes):
-                return True
-            try:
-                _log.warning(
-                    "local_fileserver: symlink escape blocked: %r → %r",
-                    path, _real)
-            except Exception:
-                pass
-            return False
+        if canonical_path == root or canonical_path.startswith(root_prefixes):
+            return True
     return False
 
 
@@ -395,7 +372,7 @@ def url_for(path: str) -> str:
     norm = os.path.abspath(path).replace("\\", "/")
     encoded = urllib.parse.quote(norm, safe="")
     token = urllib.parse.quote(_request_token, safe="")
-    revision = _file_revisions.get(_normalize_file(path))
+    revision = _file_revisions.get(_canonical_path(path))
     suffix = f"&v={revision}" if revision else ""
     return (
         f"http://127.0.0.1:{_server_port}/file/{encoded}?t={token}{suffix}"

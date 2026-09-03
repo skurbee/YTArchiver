@@ -230,6 +230,42 @@ class LocalFileServerAllowlistTests(unittest.TestCase):
 
             self.assertTrue(local_fileserver._is_under_allowed_root(path))
 
+    def test_equivalent_windows_short_path_alias_is_accepted(self) -> None:
+        short_root = r"C:\Profiles\RUNNER~1\Temp\Archive"
+        short_path = os.path.join(short_root, "thumb.jpg")
+
+        def expand_short_alias(value):
+            return os.path.normpath(str(value).replace("RUNNER~1", "runneradmin"))
+
+        with mock.patch.object(
+            local_fileserver.os.path,
+            "realpath",
+            side_effect=expand_short_alias,
+        ):
+            local_fileserver.set_allowed_roots([short_root])
+
+            self.assertTrue(local_fileserver._is_under_allowed_root(short_path))
+
+    def test_realpath_escape_below_allowed_root_is_rejected(self) -> None:
+        root = os.path.normpath(r"C:\Archive")
+        linked_path = os.path.join(root, "linked", "thumb.jpg")
+        escaped_path = os.path.normpath(r"C:\Outside\thumb.jpg")
+
+        def resolve_link(value):
+            normalized = os.path.normpath(str(value))
+            if os.path.normcase(normalized) == os.path.normcase(linked_path):
+                return escaped_path
+            return normalized
+
+        with mock.patch.object(
+            local_fileserver.os.path,
+            "realpath",
+            side_effect=resolve_link,
+        ):
+            local_fileserver.set_allowed_roots([root])
+
+            self.assertFalse(local_fileserver._is_under_allowed_root(linked_path))
+
     def test_exact_file_grant_accepts_file_outside_roots(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "manual.mp4")

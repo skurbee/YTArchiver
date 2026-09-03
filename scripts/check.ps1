@@ -26,9 +26,12 @@ function Invoke-Step([string]$Name, [scriptblock]$Action) {
 }
 
 function Get-TreeFingerprint {
-    $diff = (& git -c core.autocrlf=false -c core.safecrlf=false diff --binary --no-ext-diff -- . | Out-String)
+    # Use the checkout's normal Git attributes and line-ending rules. Forcing
+    # core.autocrlf off here makes an unchanged Windows checkout look dirty as
+    # soon as Git has to re-read a CRLF file instead of trusting its stat cache.
+    $diff = (& git diff --binary --no-ext-diff -- . | Out-String)
     if ($LASTEXITCODE -ne 0) { throw 'git diff failed.' }
-    $cached = (& git -c core.autocrlf=false -c core.safecrlf=false diff --cached --binary --no-ext-diff -- . | Out-String)
+    $cached = (& git diff --cached --binary --no-ext-diff -- . | Out-String)
     if ($LASTEXITCODE -ne 0) { throw 'git diff --cached failed.' }
     $untracked = (& git ls-files --others --exclude-standard | Sort-Object | Out-String)
     if ($LASTEXITCODE -ne 0) { throw 'git untracked-file query failed.' }
@@ -222,6 +225,16 @@ try {
 
     $FinalFingerprint = Get-TreeFingerprint
     if ($FinalFingerprint -ne $InitialFingerprint) {
+        Write-Host ''
+        Write-Host 'Source-tree changes detected:' -ForegroundColor Yellow
+        $FinalStatus = @(& git status --short --untracked-files=all)
+        if ($LASTEXITCODE -ne 0) { throw 'git status failed.' }
+        if ($FinalStatus.Count -eq 0) {
+            Write-Host '  Git reports a clean tree; the fingerprint changed unexpectedly.'
+        }
+        else {
+            $FinalStatus | ForEach-Object { Write-Host "  $_" }
+        }
         throw 'A quality check changed the source tree; review the generated changes.'
     }
     Write-Host ""

@@ -6,6 +6,16 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v84.0 - 2026-09-03
+
+### Fixed
+- **Stopped the Windows release check from reporting a clean checkout as changed.** The final clean-tree check now follows the repository's normal line-ending rules, still catches real file changes, and lists the affected files when it fails.
+- **Stopped release tags from running the same Windows gate a second time.** A release tag now points to the commit already tested on `main` instead of launching a duplicate ten-minute run and duplicate failure notification.
+
+### Validation
+- Reproduced the false result in a fresh Windows checkout: the forced raw comparison reported ordinary CRLF files as changed while normal Git status and diff both remained clean.
+- Added release coverage that rejects the unsafe line-ending override and keeps push testing scoped to `main`.
+
 ## v83.9 - 2026-09-03
 
 ### Fixed

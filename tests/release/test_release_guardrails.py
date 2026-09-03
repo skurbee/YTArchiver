@@ -214,6 +214,9 @@ def test_windows_gate_and_ci_cover_required_stages() -> None:
         assert required in gate
     assert "runs-on: windows-latest" in workflow
     assert "-Bootstrap -RequireCleanTree" in workflow
+    assert "core.autocrlf=false" not in gate
+    assert "core.safecrlf=false" not in gate
+    assert "push:\n    branches:\n      - main" in workflow
 
 
 def test_pe_header_reader_accepts_only_x64_pe(tmp_path: Path) -> None:

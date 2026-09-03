@@ -1,0 +1,5 @@
+# The generated app shell is compared byte-for-byte with its source files.
+# Keep every HTML input and output on LF in Windows checkouts so local builds
+# and GitHub Actions assemble identical bytes regardless of core.autocrlf.
+web/*.html text eol=lf
+web/partials/*.html text eol=lf

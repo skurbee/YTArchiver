@@ -6,6 +6,15 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v83.9 - 2026-09-03
+
+### Fixed
+- **Made generated HTML reproducible in fresh Windows checkouts.** Git now keeps the app-shell template, partials, and generated file on the same line endings, so the byte-for-byte release check no longer mistakes Windows newline conversion for stale UI content.
+
+### Validation
+- Reproduced the GitHub failure in a fresh Windows clone with automatic line-ending conversion enabled.
+- Verified that the same fresh-clone check passes with the committed line-ending policy while retaining the exact generated-file comparison.
+
 ## v83.8 - 2026-09-03
 
 ### Fixed

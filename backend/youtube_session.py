@@ -38,18 +38,43 @@ _background_rate_limit_scope = False
 _background_cancel_event: threading.Event | None = None
 
 
-def is_cookie_auth_error(text: str) -> bool:
-    """Return True for yt-dlp/browser-cookie authentication failures."""
-    low = str(text or "").lower()
+def _line_is_cookie_auth_error(line: str) -> bool:
+    """Classify one yt-dlp diagnostic without cross-line word matches."""
+    low = str(line or "").lower()
+    # Keep the extraction fallback failure-shaped. yt-dlp's youtube:tab
+    # disclaimer also contains the words "cookies" and "extract", but only
+    # says a failed channel page *may not extract correctly*. A stale
+    # handle/404 therefore used to look like a Firefox logout.
+    cookie_extract_failed = (
+        "cookie" in low
+        and any(fragment in low for fragment in (
+            "failed to extract",
+            "unable to extract",
+            "could not extract",
+            "failed extracting",
+            "cookie extraction failed",
+            "cookies extraction failed",
+        ))
+    )
     return (
         "sign in to confirm" in low
         or "cookies are missing" in low
         or "cookies are invalid" in low
+        or "cookies are no longer valid" in low
         or "unable to extract cookies" in low
         or "could not get firefox cookies" in low
         or ("failed to extract any player response" in low and "sign in" in low)
+        or cookie_extract_failed
         or ("error:" in low and "cookie" in low
-            and ("extract" in low or "sign in" in low or "expired" in low))
+            and ("sign in" in low or "expired" in low))
+    )
+
+
+def is_cookie_auth_error(text: str) -> bool:
+    """Return True for yt-dlp/browser-cookie authentication failures."""
+    return any(
+        _line_is_cookie_auth_error(line)
+        for line in str(text or "").splitlines()
     )
 
 

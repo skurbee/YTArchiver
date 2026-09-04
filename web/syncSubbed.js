@@ -538,6 +538,36 @@
     });
   })();
 
+  // A channel owner can change their public @handle. The backend emits this
+  // only after the old and new URLs have been tied to the same permanent
+  // YouTube channel ID and the saved subscription has committed. Dialogs are
+  // serialized so two distinct repairs are both shown; duplicate delivery of
+  // the same transition is ignored for the rest of this app session.
+  (function wireChannelUrlChangedListener() {
+    const seen = new Set();
+    let dialogChain = Promise.resolve();
+    window.addEventListener("yt-control", (ev) => {
+      const d = ev?.detail;
+      if (!d || d.kind !== "channel_url_changed") return;
+      const key = [d.channel_id || "", d.old_url || "", d.new_url || ""]
+        .join("\u0000");
+      if (seen.has(key)) return;
+      seen.add(key);
+      dialogChain = dialogChain.catch(() => {}).then(() =>
+        window.askConfirm?.(
+          "YouTube channel address updated",
+          `“${d.channel_name || "This channel"}” changed its YouTube ` +
+          "address.\n\n" +
+          `Old: ${d.old_url || "Unknown"}\n` +
+          `New: ${d.new_url || "Unknown"}\n\n` +
+          "YTArchiver matched YouTube’s permanent channel ID, updated " +
+          "the saved address automatically, and continued syncing.",
+          { confirm: "Got it", noCancel: true, danger: false }
+        )
+      );
+    });
+  })();
+
   // Rate-limit alarm uses the same always-wired control channel.  The
   // backend pauses before emitting this, so no further channel/video calls
   // can compound the block while the dialog is open.

@@ -183,13 +183,73 @@ def validate_channel_url(url: str) -> tuple[bool, str]:
     return True, ""
 
 
+_CHANNEL_TAB_NAMES = frozenset({
+    "videos", "shorts", "streams", "playlists", "community", "podcasts",
+    "channels", "featured", "about", "store", "releases",
+})
+
+
+def _channel_url_identity_key(value: object) -> str:
+    """Return a comparison key without corrupting permanent channel IDs.
+
+    Schemes, YouTube host aliases, query strings, fragments, and channel-tab
+    suffixes are cosmetic.  Handles and legacy custom/user names are compared
+    case-insensitively, while the payload of ``/channel/UC...`` is preserved
+    exactly because YouTube's permanent IDs are case-sensitive.
+    """
+    normalized = normalize_channel_url(str(value or "").strip())
+    if not normalized:
+        return ""
+    try:
+        parsed = urlparse(normalized)
+    except (TypeError, ValueError):
+        return normalized.rstrip("/")
+
+    host = (parsed.hostname or "").casefold()
+    if host in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
+        host = "youtube.com"
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if segments and segments[-1].casefold() in _CHANNEL_TAB_NAMES:
+        segments.pop()
+    if not segments:
+        return host
+
+    first = segments[0]
+    if first.startswith("@") or first.casefold() in {"c", "user"}:
+        path = "/".join(segments).casefold()
+    elif first.casefold() == "channel" and len(segments) >= 2:
+        path = "channel/" + "/".join(segments[1:])
+    else:
+        path = "/".join(segments)
+    return f"{host}/{path}" if host else path
+
+
+def _permanent_channel_id_from_url(value: object) -> str:
+    """Return an exact ``UC...`` payload from a permanent channel URL."""
+    normalized = normalize_channel_url(str(value or "").strip())
+    try:
+        parsed = urlparse(normalized)
+    except (TypeError, ValueError):
+        return ""
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if segments and segments[-1].casefold() in _CHANNEL_TAB_NAMES:
+        segments.pop()
+    if (len(segments) == 2 and segments[0].casefold() == "channel"
+            and re.fullmatch(r"UC[A-Za-z0-9_-]{22}", segments[1])):
+        return segments[1]
+    return ""
+
+
 def _find_channel(channels: list[dict[str, Any]], match: dict[str, str]) -> int | None:
     """Find the index of a channel matching by url, name, or folder."""
-    match_url = (normalize_channel_url(match.get("url", "")).rstrip("/")
-                 if match.get("url") else "")
+    match_channel_id = str(match.get("channel_id") or "").strip()
+    match_url = _channel_url_identity_key(match.get("url"))
     match_name = (match.get("name") or match.get("folder") or "").strip().lower()
     for i, ch in enumerate(channels):
-        ch_url = normalize_channel_url(ch.get("url", "")).rstrip("/")
+        channel_id = str(ch.get("channel_id") or "").strip()
+        if match_channel_id and channel_id == match_channel_id:
+            return i
+        ch_url = _channel_url_identity_key(ch.get("url"))
         if match_url and ch_url == match_url:
             return i
         ch_name = (ch.get("name") or ch.get("folder") or "").strip().lower()
@@ -470,6 +530,10 @@ def add_channel(payload: dict[str, Any]) -> dict[str, Any]:
         else:
             raise SubsError("Folder name is required (and auto-fetch from URL failed).")
     new_ch = _payload_to_channel(payload)
+    # This URL was just chosen by the user. It is allowed to establish its
+    # permanent ID on the first successful sync even if an old cache record
+    # happens to exist for the same recycled handle.
+    new_ch["channel_identity_rebind_pending"] = True
     # Final sanity: after all mapping+stripping, name must be non-blank.
     # Belt-and-suspenders guard so we never persist a channel that would
     # route downloads to _unnamed/ at sync time.
@@ -825,6 +889,11 @@ def update_channel(
             "transcription_complete", "transcription_pending",
             "metadata_pending",
             "folder_override",
+            # Hidden permanent YouTube identity. It survives ordinary setting
+            # edits, but is cleared below when the user intentionally points
+            # this subscription at a different URL.
+            "channel_id",
+            "channel_identity_rebind_pending",
             # Legacy builds stored this value. The current Processing queue
             # is per-file, but an ordinary edit must not erase the field.
             "compress_batch_size",
@@ -832,6 +901,16 @@ def update_channel(
         for key in _preserve:
             if key in existing and key not in payload:
                 updated[key] = existing[key]
+
+    old_url_identity = _channel_url_identity_key(existing.get("url"))
+    new_url_identity = _channel_url_identity_key(updated.get("url"))
+    if old_url_identity and new_url_identity != old_url_identity:
+        # A manual URL edit may deliberately switch this subscription to a
+        # different channel. Never let the old permanent ID silently bless
+        # that new target; the next successful sync will learn and persist the
+        # new ID from yt-dlp's channel-scoped identity record.
+        updated.pop("channel_id", None)
+        updated["channel_identity_rebind_pending"] = True
 
     if not str(updated.get("name") or "").strip():
         raise SubsError(
@@ -1048,6 +1127,137 @@ def update_channel(
                 committed["_recovery_required"] = True
                 committed["_recovery_error"] = detail
     return committed
+
+
+class _VerifiedIdentityUnchanged(RuntimeError):
+    """Abort a config transaction whose verified identity is already saved."""
+
+    def __init__(self, channel: dict[str, Any]) -> None:
+        super().__init__("verified channel identity is already current")
+        self.channel = channel
+
+
+def update_verified_channel_identity(
+        identity: dict[str, str], *, expected_url: str,
+        channel_id: str, current_url: str,
+        cancel_event=None, pause_event=None, stop_event=None) -> dict[str, Any]:
+    """Persist a YouTube identity only after the caller proves an exact ID.
+
+    This deliberately bypasses the user-facing edit path: no folder rename or
+    settings conversion belongs in an automatic handle repair.  The expected
+    URL is a compare-and-swap guard, so a user edit that lands while a probe is
+    running wins and the stale background result is discarded.
+    """
+    stable_id = str(channel_id or "").strip()
+    if not re.fullmatch(r"UC[A-Za-z0-9_-]{22}", stable_id):
+        raise SubsError("YouTube returned an invalid permanent channel ID.")
+    old_url = normalize_channel_url(str(expected_url or "")).rstrip("/")
+    new_url = normalize_channel_url(str(current_url or "")).rstrip("/")
+    old_url_key = _channel_url_identity_key(old_url)
+    new_url_key = _channel_url_identity_key(new_url)
+    ok, error = validate_channel_url(new_url)
+    if not old_url_key or not new_url_key or not ok:
+        raise SubsError(error or "The verified channel URL is invalid.")
+
+    def _stop_requested() -> bool:
+        return bool(
+            (cancel_event is not None and cancel_event.is_set())
+            or (pause_event is not None and pause_event.is_set())
+            or (stop_event is not None and stop_event.is_set())
+        )
+
+    if _stop_requested():
+        raise SubsError("Channel identity verification was stopped.")
+
+    committed: dict[str, Any] | None = None
+    changed_url = False
+    saved_url_raw = ""
+    try:
+        with config_transaction() as cfg:
+            if _stop_requested():
+                raise SubsError("Channel identity verification was stopped.")
+            channels = cfg.setdefault("channels", [])
+            idx = _find_channel(channels, identity)
+            if idx is None:
+                raise SubsError("Channel changed or was removed during verification.")
+            channel = channels[idx]
+            saved_url_raw = str(channel.get("url") or "").strip()
+            saved_url = normalize_channel_url(saved_url_raw).rstrip("/")
+            saved_url_key = _channel_url_identity_key(saved_url)
+            if saved_url_key not in {old_url_key, new_url_key}:
+                raise SubsError(
+                    "Channel URL changed again while verification was running.")
+            saved_id = (
+                str(channel.get("channel_id") or "").strip()
+                or _permanent_channel_id_from_url(saved_url)
+            )
+            if saved_id and saved_id != stable_id:
+                raise SubsError(
+                    "The permanent YouTube channel ID does not match the saved channel.")
+
+            for other_index, other in enumerate(channels):
+                if other_index == idx or not isinstance(other, dict):
+                    continue
+                other_id = str(other.get("channel_id") or "").strip()
+                other_url = _channel_url_identity_key(other.get("url"))
+                if other_id and other_id == stable_id:
+                    raise SubsError(
+                        "Another subscription already has that permanent channel ID.")
+                if other_url and other_url == new_url_key:
+                    raise SubsError(
+                        "Another subscription already has the verified channel URL.")
+
+            # A permanent /channel/UC... URL is already an immutable address
+            # for this exact channel. Keep it when yt-dlp also reports the
+            # current friendly @handle; that is identity learning, not an
+            # address repair and must not produce a misleading notice.
+            saved_url_is_same_permanent_id = (
+                _permanent_channel_id_from_url(saved_url) == stable_id
+            )
+            changed_url = (
+                saved_url_key != new_url_key
+                and not saved_url_is_same_permanent_id
+            )
+            if (not changed_url and saved_id == stable_id
+                    and not channel.get("channel_identity_rebind_pending")):
+                raise _VerifiedIdentityUnchanged(copy.deepcopy(channel))
+            channel["channel_id"] = stable_id
+            channel.pop("channel_identity_rebind_pending", None)
+            if changed_url:
+                channel["url"] = new_url
+            committed = copy.deepcopy(channel)
+    except _VerifiedIdentityUnchanged as exc:
+        return {
+            "ok": True,
+            "changed": False,
+            "url_changed": False,
+            "channel": exc.channel,
+        }
+
+    if committed is None:
+        raise SubsError("Verified channel identity was not saved.")
+
+    if changed_url:
+        try:
+            from . import channel_cache
+            channel_cache.move_url(saved_url_raw, new_url)
+        except Exception as exc:
+            _log.debug("channel ID cache URL move failed: %s", exc)
+        try:
+            from . import archive_scan
+            archive_scan.invalidate_channel(saved_url_raw)
+            archive_scan.invalidate_channel(new_url)
+        except Exception as exc:
+            _log.debug("archive cache URL invalidation failed: %s", exc)
+    return {
+        "ok": True,
+        "changed": True,
+        "url_changed": changed_url,
+        "old_url": saved_url_raw or old_url,
+        "new_url": str(committed.get("url") or new_url),
+        "channel_id": stable_id,
+        "channel": committed,
+    }
 
 
 def remove_channel(

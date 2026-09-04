@@ -27,8 +27,8 @@ from datetime import datetime as _dt
 from datetime import timedelta as _td
 from typing import Any
 
+from .. import channel_identity, youtube_traffic
 from .. import utils as _utils
-from .. import youtube_traffic
 from ..log import get_logger, swallow
 from ..process_runner import PROCESS_REGISTRY, popen_ytdlp, run_ytdlp
 from ..ytarchiver_config import config_transaction
@@ -245,6 +245,7 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
         "--flat-playlist", "--lazy-playlist",
         "--playlist-end", str(int(check_count)),
         "--print", print_expr,
+        "--print", channel_identity.CHANNEL_TRACK_PRINT,
         "--no-warnings",
     ]
     cmd += _find_cookie_source() or []
@@ -256,6 +257,7 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
     checked: list[str] = []
     fresh: list[str] = []
     filtered: list[str] = []
+    channel_tracks: list[dict[str, str]] = []
     def _duration_filtered(duration_raw: str, live_status: str) -> bool:
         status = (live_status or "").strip().lower()
         if status in ("is_live", "is_upcoming"):
@@ -321,6 +323,10 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
         raw = raw.strip()
         if not raw:
             continue
+        channel_track = channel_identity.parse_channel_track_line(raw)
+        if channel_track is not None:
+            channel_tracks.append(channel_track)
+            continue
         if use_duration_filter and "|||" in raw:
             parts = raw.split("|||", 2)
             vid = parts[0].strip()
@@ -344,11 +350,12 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
     if not checked:
         _record_quickcheck_bad(ch_url, "empty")
         return {"ok": True, "has_new": True,
-                "checked": 0, "fresh_ids": [], "empty_probe": True}
+                "checked": 0, "fresh_ids": [], "empty_probe": True,
+                "channel_tracks": channel_tracks}
     _clear_quickcheck_bad(ch_url)
     return {"ok": True, "has_new": bool(fresh),
             "checked": len(checked), "fresh_ids": fresh,
-            "filtered_ids": filtered}
+            "filtered_ids": filtered, "channel_tracks": channel_tracks}
 
 
 def _check_batch_cooldown(ch: dict[str, Any]) -> tuple[bool, str]:

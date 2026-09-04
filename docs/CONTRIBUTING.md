@@ -27,8 +27,7 @@ YTArchiver/
 ├── icon.ico
 ├── README.md               # GitHub landing page
 ├── LICENSE                 # MIT
-├── pyproject.toml          # Project metadata (Python tooling)
-├── ruff.toml               # Linter config
+├── pyproject.toml          # Project metadata + Python tool config
 ├── docs/                   # Project docs
 │   ├── ARCHITECTURE.md     # System architecture
 │   ├── BUILD.md            # PyInstaller build workflow

@@ -83,6 +83,100 @@ def get_cached_ids(url: str) -> list[str] | None:
         return list(ids) if isinstance(ids, list) else None
 
 
+def get_known_ids(url: str, limit: int = 20) -> list[str]:
+    """Return saved IDs even when the enumeration cache is stale.
+
+    Freshness only decides whether sync may skip a playlist walk.  The IDs
+    themselves remain useful provenance for a rare channel-handle recovery:
+    resolving two videos that were previously enumerated under the saved URL
+    lets YTArchiver compare YouTube's permanent channel ID without trusting a
+    mutable display name or handle.
+    """
+    wanted = max(0, int(limit or 0))
+    if wanted == 0:
+        return []
+    with _lock:
+        _load_locked()
+        rec = _cache.get(url)
+        if not isinstance(rec, dict):
+            return []
+        ids = rec.get("ids", [])
+        if not isinstance(ids, list):
+            return []
+        return [value for value in ids if isinstance(value, str) and value][
+            :wanted
+        ]
+
+
+def move_url(old_url: str, new_url: str) -> bool:
+    """Move/merge one URL-keyed record after a verified handle change.
+
+    The config update is authoritative, while this cache is an optimization.
+    Still, moving it prevents the first sync under the new handle from losing
+    known-ID and duration-filter history.  A failed save restores the exact
+    in-memory snapshot so disk and memory never diverge.
+    """
+    old_key = str(old_url or "").strip()
+    new_key = str(new_url or "").strip()
+    if not old_key or not new_key:
+        return False
+    if old_key == new_key:
+        return True
+
+    with _lock:
+        _load_locked()
+        old_rec = _cache.get(old_key)
+        if not isinstance(old_rec, dict):
+            return True
+        before = dict(_cache)
+        old_copy = dict(old_rec)
+        old_copy["ids"] = list(old_rec.get("ids", [])) \
+            if isinstance(old_rec.get("ids"), list) else []
+        new_rec = _cache.get(new_key)
+        if isinstance(new_rec, dict):
+            merged = dict(new_rec)
+            new_ids = list(new_rec.get("ids", [])) \
+                if isinstance(new_rec.get("ids"), list) else []
+            old_ids = old_copy["ids"]
+            merged["ids"] = old_ids + [
+                value for value in new_ids if value not in set(old_ids)
+            ]
+            try:
+                merged["last_refreshed"] = max(
+                    float(old_copy.get("last_refreshed", 0) or 0),
+                    float(new_rec.get("last_refreshed", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                merged["last_refreshed"] = 0.0
+
+            old_filtered = old_copy.get("filtered_ids")
+            new_filtered = new_rec.get("filtered_ids")
+            if isinstance(old_filtered, dict) or isinstance(new_filtered, dict):
+                combined: dict[str, list[str]] = {}
+                for source in (old_filtered, new_filtered):
+                    if not isinstance(source, dict):
+                        continue
+                    for rule, values in source.items():
+                        if not isinstance(values, list):
+                            continue
+                        bucket = combined.setdefault(str(rule), [])
+                        bucket.extend(
+                            value for value in values
+                            if isinstance(value, str) and value not in bucket
+                        )
+                merged["filtered_ids"] = combined
+        else:
+            merged = old_copy
+
+        _cache.pop(old_key, None)
+        _cache[new_key] = merged
+        if _save_locked():
+            return True
+        _cache.clear()
+        _cache.update(before)
+        return False
+
+
 def set_cached_ids(url: str, ids: Iterable[str]):
     with _lock:
         _load_locked()

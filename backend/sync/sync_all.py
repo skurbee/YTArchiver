@@ -21,7 +21,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from .. import youtube_session
+from .. import channel_identity, youtube_session
 from ..log import get_logger, swallow
 from ..log_stream import LogStreamer
 from ..services.channel_leases import (
@@ -178,6 +178,42 @@ def _channel_folder_has_media(cfg: dict[str, Any], ch: dict[str, Any]) -> bool:
     except Exception as e:
         swallow("quick-check empty-folder probe", e)
         return True
+
+
+def _channel_folder_path(cfg: dict[str, Any], ch: dict[str, Any]) -> str:
+    """Return this channel's archive folder, or "" when it can't be resolved."""
+    try:
+        base = (cfg.get("output_dir") or "").strip()
+        if not base:
+            return ""
+        from .ytdlp_proc import channel_folder_name as _cfn
+        folder = os.path.join(base, _cfn(ch))
+        return folder if os.path.isdir(folder) else ""
+    except Exception as e:
+        swallow("channel folder resolve", e)
+        return ""
+
+
+def _channel_folder_media_confirmed(cfg: dict[str, Any],
+                                    ch: dict[str, Any]) -> bool:
+    """Return True only when this channel's folder demonstrably holds media.
+
+    Deliberately NOT `_channel_folder_has_media`. That probe fails OPEN so a
+    transient hiccup can't downgrade a pass into full channel walks; reusing it
+    here would invert into failing CLOSED, and a blank `output_dir` or one
+    scandir error would block every channel from syncing at all. Identity
+    evidence must be positively observed, so anything unknown answers False and
+    the decision falls back to the saved row's own history flags.
+    """
+    folder = _channel_folder_path(cfg, ch)
+    if not folder:
+        return False
+    try:
+        from ..fs_search import walk_channel_videos as _wcv
+        return any(True for _ in _wcv(folder))
+    except Exception as e:
+        swallow("channel identity media probe", e)
+        return False
 
 
 def _task_result_failure_state(result: dict[str, Any]) -> tuple[int, bool]:
@@ -1400,6 +1436,75 @@ def _sync_all_impl(stream: LogStreamer,
                                bracket_tag=_row_bracket)
             _last_live["name"] = ""
             continue
+        # Legacy configs predate permanent channel IDs. Before a mutable
+        # @handle may enumerate or download, bind it against video IDs that
+        # were previously cached under this exact saved URL. This also catches
+        # the rarer (and more dangerous) case where an abandoned handle was
+        # reassigned instead of returning 404.
+        _identity_preflight = channel_identity.preflight_channel_identity(
+            ch,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            kill_current=skip_event,
+            stream=stream,
+            has_local_history=(
+                False
+                if (channel_identity.has_stable_identity(ch)
+                    or ch.get("channel_identity_rebind_pending"))
+                else _channel_folder_media_confirmed(cfg, ch)
+            ),
+            # Subscriptions saved before permanent IDs existed may have no
+            # per-URL ID cache left. The folder scan corroborates filenames
+            # against the catalog and sidecars, so an ordinary legacy archive
+            # can still prove itself instead of stalling forever.
+            archive_folder=_channel_folder_path(cfg, ch),
+        )
+        if _autosync_rate_limited():
+            _last_live["name"] = ""
+            break
+        if cancel_event is not None and cancel_event.is_set():
+            _last_live["name"] = ""
+            break
+        if _requeue_paused_task(
+                queued_ch, ch_name, i, total, reason="channel identity check",
+                bracket_tag=_row_bracket):
+            continue
+        if skip_event is not None and skip_event.is_set():
+            _sync_row_emit(
+                stream, i, total, ch_name,
+                summary="skipped",
+                name_tag="simpleline", summary_tag="dim",
+                bracket_tag=_row_bracket,
+            )
+            _last_live["name"] = ""
+            continue
+        if not _identity_preflight.get("ok"):
+            sum_err += 1
+            _sync_row_emit(
+                stream, i, total, ch_name,
+                summary="channel identity check failed",
+                name_tag="red", summary_tag="red",
+                bracket_tag=_row_bracket,
+            )
+            stream.emit_error(
+                f"Stopped {ch_name} before downloading because YTArchiver "
+                "couldn't prove that this saved address still belongs to "
+                "the archived channel.",
+                detail=str(
+                    _identity_preflight.get("error") or "verification failed"),
+            )
+            _last_live["name"] = ""
+            continue
+        if _identity_preflight.get("url_changed"):
+            channel_identity.emit_url_changed(stream, _identity_preflight)
+        _identity_channel = _identity_preflight.get("channel")
+        if isinstance(_identity_channel, dict):
+            _updated_ch = dict(_identity_channel)
+            for _key, _value in ch.items():
+                if _key not in _updated_ch:
+                    _updated_ch[_key] = _value
+            ch = _updated_ch
+
         # ── Quick-check fast path ────────────────────────────────────
         # Extra speedup on top of `--break-on-existing`: probe the first
         # 5 video IDs via `--flat-playlist --lazy-playlist --playlist-end
@@ -1415,7 +1520,8 @@ def _sync_all_impl(stream: LogStreamer,
         # (in case a mid-channel video is missing and needs backfill).
         # For sub/date modes, the main break-on-existing path is already
         # fast enough — no need for the probe.
-        _ch_url = (ch.get("url") or "").strip()
+        _configured_ch_url = (ch.get("url") or "").strip()
+        _ch_url = channel_identity.operational_channel_url(ch)
         _ch_mode = (ch.get("mode") or "full").lower()
         _ch_sync_ok = bool(ch.get("sync_complete", False))
         if ch.get("init_complete", False):
@@ -1466,11 +1572,45 @@ def _sync_all_impl(stream: LogStreamer,
                     queued_ch, ch_name, i, total, reason="quick check",
                     bracket_tag=_row_bracket):
                 continue
+            _qc_tracks = _qc.get("channel_tracks")
+            if isinstance(_qc_tracks, list) and _qc_tracks:
+                _learned_identity = channel_identity.record_observed_identity(
+                    ch, _qc_tracks)
+                if _learned_identity.get("ok"):
+                    if _learned_identity.get("url_changed"):
+                        channel_identity.emit_url_changed(
+                            stream, _learned_identity)
+                    _saved_channel = _learned_identity.get("channel")
+                    if isinstance(_saved_channel, dict):
+                        _updated_ch = dict(_saved_channel)
+                        for _key, _value in ch.items():
+                            if _key not in _updated_ch:
+                                _updated_ch[_key] = _value
+                        ch = _updated_ch
+                        _configured_ch_url = (
+                            ch.get("url") or _configured_ch_url
+                        ).strip()
+                elif (not _learned_identity.get("ok")
+                      and ch.get("channel_id")
+                      and _learned_identity.get("identity_mismatch")):
+                    sum_err += 1
+                    _sync_row_emit(
+                        stream, i, total, ch_name,
+                        summary="channel identity check failed",
+                        name_tag="red", summary_tag="red",
+                        bracket_tag=_row_bracket,
+                    )
+                    stream.emit_error(
+                        f"Stopped {ch_name} before downloading because "
+                        "YouTube's permanent channel ID did not match the "
+                        "saved subscription.")
+                    _last_live["name"] = ""
+                    continue
             if _qc.get("filtered_ids"):
                 try:
                     from .. import channel_cache as _cc
                     _cc.append_filtered_ids(
-                        _ch_url, _qc.get("filtered_ids") or [],
+                        _configured_ch_url, _qc.get("filtered_ids") or [],
                         _qc_opts.min_duration, _qc_opts.max_duration)
                     _known_for_channel.update(_qc.get("filtered_ids") or [])
                 except Exception as e:

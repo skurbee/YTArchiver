@@ -6,6 +6,25 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v84.2 - 2026-09-04
+
+### Added
+- **Channels are now identified by their permanent YouTube ID rather than their public handle.** A creator can rename or change their `@handle` without breaking the subscription: an ordinary sync learns the permanent ID from the metadata it already requests, at no extra cost, and later syncs address the channel by its stable URL.
+- **Automatic repair of a changed channel address.** When a saved address stops resolving, YTArchiver resolves previously downloaded videos and the proposed replacement address, and updates the saved address only when both prove the same permanent channel ID. The old and new address are then reported in the app. If the match cannot be proven, nothing is changed and the channel is skipped instead of downloading from a different channel.
+
+### Fixed
+- **Browser cookie expiry was read in the wrong units.** Recent Firefox versions store cookie expiry in milliseconds; comparing that value against seconds made expired sign-in cookies appear valid indefinitely.
+- **A channel page that failed to load was misreported as a sign-in problem.** The downloader prints a generic authentication note whenever a channel page cannot be fetched. That note is now classified per line, so an address that no longer exists is no longer mistaken for an expired browser login.
+- **Channel verification no longer depends on a single video.** Verification previously extracted the channel's newest upload, so a members-only, age-restricted, region-blocked, premiering, or live newest video failed the check and blocked that channel from syncing. The identity is now read from the channel listing itself and never extracts an individual video.
+- Channel enumeration now walks the main channel listing before individual retry URLs, so a failed address cannot commit work before the address is checked.
+
+### Changed
+- Linter configuration moved from `ruff.toml` into `pyproject.toml`.
+
+### Validation
+- Added a test module covering identity parsing, stale-address recovery, permanent-ID persistence, interruptible probes, and the exact verification command shape.
+- Full Windows quality gate passes: lint, import graph, Python test suite, browser unit tests, packaged build and build verification.
+
 ## v84.0 - 2026-09-03
 
 ### Fixed

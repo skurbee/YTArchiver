@@ -16,6 +16,9 @@ Path(_TEST_APPDATA.name, "YTArchiver").mkdir(parents=True, exist_ok=True)
 from backend import archive_scan, channel_art, channel_cache, index, livestreams, subs, utils
 from backend.sync import core as sync_core
 
+STABLE_CHANNEL_ID = "UCaaaaaaaaaaaaaaaaaaaaaa"
+STABLE_CHANNEL_URL = f"https://www.youtube.com/channel/{STABLE_CHANNEL_ID}"
+
 
 class _FakePipe:
     def __init__(self, lines: list[str]) -> None:
@@ -103,6 +106,10 @@ class SyncArchiveBookkeepingTests(unittest.TestCase):
             "name": "Test Channel",
             "folder": "Test Channel",
             "url": "https://www.youtube.com/@test-channel",
+            # An established subscription carries its verified permanent ID,
+            # so syncs enumerate through the immutable /channel/ address and
+            # the identity preflight is a no-op.
+            "channel_id": STABLE_CHANNEL_ID,
             "mode": "full",
             "resolution": "1080",
             "auto_transcribe": True,
@@ -220,8 +227,7 @@ class SyncArchiveBookkeepingTests(unittest.TestCase):
             )
 
         self.assertEqual(len(commands), 2)
-        self.assertEqual(
-            commands[0][-1], "https://www.youtube.com/@test-channel")
+        self.assertEqual(commands[0][-1], STABLE_CHANNEL_URL)
         self.assertEqual(
             commands[1][-1], f"https://www.youtube.com/watch?v={missing}")
         self.assertIn("--break-on-existing", commands[0])
@@ -266,8 +272,7 @@ class SyncArchiveBookkeepingTests(unittest.TestCase):
 
         self.assertEqual(result["downloaded"], 1)
         self.assertEqual(len(commands), 1)
-        self.assertEqual(
-            commands[0][-1], "https://www.youtube.com/@test-channel")
+        self.assertEqual(commands[0][-1], STABLE_CHANNEL_URL)
 
     def test_empty_folder_downloads_are_recorded_in_global_archive(self) -> None:
         video_id = "abc123def45"

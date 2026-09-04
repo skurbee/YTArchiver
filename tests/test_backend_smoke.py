@@ -1855,6 +1855,42 @@ class YouTubeSessionGuardTests(unittest.TestCase):
         self.assertIn({"kind": "cookie_alert",
                        "context": "refreshing metadata"}, controls)
 
+    def test_youtubetab_authcheck_disclaimer_does_not_pause(self) -> None:
+        stream = mock.Mock()
+        pause_event = threading.Event()
+        queue_state = mock.Mock()
+        youtube_session.configure(stream, pause_event, queue_state)
+        disclaimer = (
+            "ERROR: [youtube:tab] @OldHandle: Playlists that require "
+            "authentication may not extract correctly without a successful "
+            "webpage download. If you are not downloading private content, "
+            "or your cookies are only for the first account and channel, "
+            "pass --extractor-args youtubetab:skip=authcheck"
+        )
+
+        kind = youtube_session.handle_youtube_failure_text(
+            "WARNING: Unable to download webpage: HTTP Error 404: Not Found\n"
+            + disclaimer,
+            context="downloading a channel",
+        )
+
+        self.assertEqual(kind, "")
+        self.assertFalse(pause_event.is_set())
+        queue_state.set_sync_paused.assert_not_called()
+        stream.emit.assert_not_called()
+        self.assertIn(
+            "channel page",
+            sync_core._humanize_ytdlp_error(disclaimer.lower()),
+        )
+
+        # A real cookie-extraction error in the same stderr block must still
+        # win; the generic disclaimer only suppresses its own line.
+        self.assertTrue(youtube_session.is_cookie_auth_error(
+            disclaimer + "\nERROR: unable to extract cookies from firefox"))
+        self.assertTrue(youtube_session.is_cookie_auth_error(
+            "WARNING: The provided YouTube account cookies are no longer "
+            "valid."))
+
     def test_rate_limit_auto_pauses_without_generic_false_positive(self) -> None:
         stream = mock.Mock()
         pause_event = threading.Event()
@@ -1918,6 +1954,54 @@ class YouTubeSessionGuardTests(unittest.TestCase):
         queue_state.set_sync_paused.assert_not_called()
         stream.emit_error.assert_not_called()
         stream.emit.assert_not_called()
+
+
+class FirefoxCookieStatusTests(unittest.TestCase):
+    def _write_cookie_db(self, root: Path, *, schema: int,
+                         expiry: int) -> None:
+        profile = root / "Mozilla" / "Firefox" / "Profiles" / "profile"
+        profile.mkdir(parents=True)
+        con = sqlite3.connect(profile / "cookies.sqlite")
+        try:
+            con.execute(f"PRAGMA user_version={schema}")
+            con.execute(
+                "CREATE TABLE moz_cookies "
+                "(host TEXT, name TEXT, expiry INTEGER)")
+            con.execute(
+                "INSERT INTO moz_cookies VALUES (?, ?, ?)",
+                (".youtube.com", "LOGIN_INFO", expiry),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def test_schema_17_millisecond_expiry_is_not_treated_as_seconds(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+                os.environ, {"APPDATA": td}):
+            self._write_cookie_db(
+                Path(td), schema=17,
+                expiry=int((time.time() - 3600) * 1000),
+            )
+
+            status = deps_installer.firefox_cookie_status()
+
+        self.assertTrue(status["has_yt_cookies"])
+        self.assertFalse(status["signed_in"])
+        self.assertTrue(status["expired_auth_cookies"])
+
+    def test_legacy_schema_second_expiry_remains_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+                os.environ, {"APPDATA": td}):
+            self._write_cookie_db(
+                Path(td), schema=15,
+                expiry=int(time.time() + 3600),
+            )
+
+            status = deps_installer.firefox_cookie_status()
+
+        self.assertTrue(status["signed_in"])
+        self.assertFalse(status["expired_auth_cookies"])
 
 
 class MetadataJsonlTests(unittest.TestCase):
@@ -8729,6 +8813,9 @@ class SyncCoreTests(unittest.TestCase):
                 "initialized": True,
                 "init_complete": True,
                 "sync_complete": True,
+                # Established channels carry a verified permanent ID, so
+                # the identity preflight is a no-op here.
+                "channel_id": "UCaaaaaaaaaaaaaaaaaaaaaa",
             }
             folder = Path(td) / "Chan"
             folder.mkdir()

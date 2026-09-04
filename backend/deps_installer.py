@@ -409,6 +409,14 @@ def firefox_cookie_status() -> dict:
                 uri = db.as_uri() + "?mode=ro&immutable=1"
                 con = _sql.connect(uri, uri=True, timeout=2.0)
                 try:
+                    schema_version = con.execute(
+                        "PRAGMA user_version").fetchone()[0]
+                    # Firefox 142 / cookies DB schema 16 changed ``expiry``
+                    # from Unix seconds to Unix milliseconds. Comparing a
+                    # 13-digit value to time.time() seconds makes every
+                    # schema-16+ auth cookie look unexpired indefinitely.
+                    expiry_now = int(time.time() * (
+                        1000 if schema_version >= 16 else 1))
                     yt_n = con.execute(
                         "SELECT COUNT(*) FROM moz_cookies "
                         "WHERE host LIKE '%youtube.com%'").fetchone()[0]
@@ -422,7 +430,7 @@ def firefox_cookie_status() -> dict:
                         "(host LIKE '%youtube.com%' OR host LIKE '%google.com%') "
                         f"AND name IN ({ph}) "
                         "AND (expiry=0 OR expiry>?)",
-                        (*AUTH, int(time.time()))).fetchone()[0]
+                        (*AUTH, expiry_now)).fetchone()[0]
                 finally:
                     con.close()
                 if yt_n > 0:

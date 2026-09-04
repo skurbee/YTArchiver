@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .. import channel_identity as _channel_identity
 from .. import utils as _utils
 from ..executor_utils import LinkedCancelEvent, cancel_executor, drain_executor
 from ..log import get_logger, swallow
@@ -869,6 +870,14 @@ def _humanize_ytdlp_error(low: str) -> str:
             or "unable to rename" in low or "unable to move" in low):
         return ("Couldn't save the file — it may be open in another "
                 "program. Will retry on the next sync.")
+    # youtube:tab prints this generic authentication disclaimer whenever the
+    # channel webpage could not be loaded, including a stale @handle returning
+    # HTTP 404 with otherwise-valid Firefox cookies.  Keep the user focused on
+    # the channel URL instead of incorrectly describing a video failure.
+    if ("playlists that require authentication" in low
+            and "successful webpage download" in low):
+        return ("Couldn't load this channel page — its YouTube URL may have "
+                "changed, or the channel may be unavailable.")
     # Age / sign-in gates
     if ("confirm your age" in low or "age-restricted" in low
             or "age restricted" in low
@@ -1111,7 +1120,12 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
         persist_migration=_persist_duration_migration,
     )
     name = opts.name
-    url = opts.url
+    configured_url = opts.url
+    # Once learned, the permanent /channel/UC... address is the only URL used
+    # for enumeration. A public @handle can be changed or reassigned; fetching
+    # through it after we know the stable ID could archive the wrong channel
+    # before a late identity marker exposed the mismatch.
+    url = _channel_identity.operational_channel_url(channel) or configured_url
     resolution = opts.resolution
     auto_tx = opts.auto_transcribe
     min_dur = opts.min_duration
@@ -1121,7 +1135,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     split_years = opts.split_years
     split_months = opts.split_months
 
-    if not url:
+    if not configured_url:
         return SyncResult(ok=False, reason="No URL", downloaded=0, errors=0)
 
     # Queue ownership is established transactionally by sync_all before this
@@ -1271,6 +1285,10 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
         # authoritative ID to its staged file and registration record.
         "--print",
         "after_video:DLTRACK:::%(title)s:::%(uploader)s:::%(upload_date)s:::%(filesize,filesize_approx)s:::%(duration)s:::%(id)s",
+        # Learn the permanent channel ID and current handle from the channel
+        # process already running. The playlist-scoped marker is consumed
+        # internally below and adds no separate YouTube request.
+        "--print", _channel_identity.CHANNEL_TRACK_PRINT,
     ]
     # Write VTT captions ONLY when auto-transcribe is enabled for this
     # channel. The transcribe fast-path (_try_auto_captions) parses the VTT
@@ -1431,15 +1449,13 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                 and _vid not in _quickcheck_vids):
             _quickcheck_vids.append(_vid)
 
-    # Preserve prior-failure ordering, then run the normal channel walk, then
-    # repair quick-check gaps before /streams.  The channel must precede the
-    # quick-check targets: when 6+ brand-new uploads exist, targeting the first
-    # five up front would add them to the private archive and make the normal
-    # --break-on-existing walk stop at upload #1, permanently hiding #6+.
-    # Running the channel first downloads every leading fresh upload until the
-    # true archive boundary; the exact URLs then reach any bounded gaps behind
-    # that boundary. Every target still shares one private archive and commit
-    # pipeline, so repeats are safe skips rather than duplicate downloads.
+    # Run the main channel first, then explicit prior failures and quick-check
+    # gaps, then /streams. Besides preserving complete leading-upload walks,
+    # this makes a stale channel address fail before any independent retry URL
+    # can commit a download, so handle recovery retains the clean zero-work
+    # transaction boundary used below. Every target still shares one private
+    # archive and commit pipeline, so repeats are safe skips rather than
+    # duplicate downloads.
     _retry_urls = [f"https://www.youtube.com/watch?v={_v}"
                    for _v in _retry_vids]
     _retry_set = set(_retry_vids)
@@ -1449,7 +1465,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
         if _v not in _retry_set
     }
     _quickcheck_urls = list(_quickcheck_url_ids)
-    _urls_to_run = _retry_urls + [url] + _quickcheck_urls
+    _urls_to_run = [url] + _retry_urls + _quickcheck_urls
     if _streams_url and _streams_url != url:
         _urls_to_run.append(_streams_url)
 
@@ -1501,6 +1517,12 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     # streams); without this, Simple mode would print the same plain-English
     # notice two or three times per video.
     _simple_err_shown: set = set()
+    # youtube:tab emits a generic authentication disclaimer when a channel
+    # page fails to load. A stale @handle returning HTTP 404 is one common
+    # cause; this is a recovery trigger, not proof of cookie expiry.
+    _channel_page_unavailable = False
+    _channel_tracks: list[dict[str, str]] = []
+    _main_channel_tracks: list[dict[str, str]] = []
     # nsig "unable to extract n function" failures this channel. These are
     # dimmed per-line as transient, but a whole pass of them with zero
     # downloads = an out-of-date yt-dlp (see the end-of-pass nudge below).
@@ -1984,6 +2006,20 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
             s = line.rstrip()
             if not s:
                 continue
+
+            _channel_track = _channel_identity.parse_channel_track_line(s)
+            if _channel_track is not None:
+                _channel_tracks.append(_channel_track)
+                if _target_url == url:
+                    _main_channel_tracks.append(_channel_track)
+                continue
+
+            _is_channel_page_unavailable_line = (
+                _target_url == url
+                and _channel_identity.is_channel_page_unavailable_error(s)
+            )
+            if _is_channel_page_unavailable_line:
+                _channel_page_unavailable = True
 
             # Track video_id across the lifecycle of the current video so
             # the Destination handler below can store it alongside the
@@ -3086,7 +3122,11 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                     else:
                         _kind = "currently live"
                     if vid:
-                        _ls.defer(vid, title=_clean_title, channel_url=url)
+                        _ls.defer(
+                            vid,
+                            title=_clean_title,
+                            channel_url=configured_url,
+                        )
                         stream.emit([
                             [" [Live] ", "livestream"],
                             [f"Deferred \u2014 {_clean_title[:80] or vid} "
@@ -3270,7 +3310,9 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                              "sync.\n", ["red", "error_detail"]],
                             [s, "error_raw"],
                         ])
-                elif "error" in low and low.strip() not in ("error:", "error"):
+                elif ("error" in low
+                      and low.strip() not in ("error:", "error")
+                      and not _is_channel_page_unavailable_line):
                     # Any other real ERROR line. Simple mode must ALWAYS be
                     # human readable, so translate yt-dlp's cryptic text into
                     # a plain-English notice (Verbose already showed the raw
@@ -3366,8 +3408,37 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
         # _ok check. None = terminated mid-flight without wait (treated
         # below as not-a-failure if any other pass succeeded).
         _pass_returncodes.append(proc.returncode)
+        if (_target_url == url and _channel_page_unavailable
+                and not _main_channel_tracks):
+            # A failed main channel cannot make later gap or /streams probes
+            # trustworthy. Give the wrapper a clean recovery point now.
+            break
         # End of per-URL pass (main /videos or /streams). Loop picks up the
         # next URL if there is one.
+
+    # Stop before the ordinary post-sync/activity path when the main channel
+    # page never produced a permanent identity marker or any completed work.
+    # The main target runs before independent retry URLs, preserving this clean
+    # transaction boundary. sync_channel's wrapper proves a changed handle and
+    # retries once.
+    if (_channel_page_unavailable and not _main_channel_tracks
+            and downloaded == 0
+            and not (cancel_event is not None and cancel_event.is_set())
+            and not (pause_event is not None and pause_event.is_set())
+            and not (kill_current is not None and kill_current.is_set())):
+        try:
+            if _meta_guard is not None:
+                _meta_guard.close(cancelled=True)
+        except Exception as exc:
+            swallow("channel URL recovery metadata cleanup", exc)
+        _finalize_download_archive()
+        return SyncResult(
+            ok=False,
+            reason="channel_page_unavailable",
+            downloaded=downloaded,
+            errors=max(1, errors),
+            channel_tracks=_channel_tracks,
+        )
 
     if _disk_low_stop:
         _finalize_download_archive()
@@ -3675,7 +3746,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     if (not _sync_interrupted_now) and _filtered_this_run:
         try:
             from .. import channel_cache as _cc
-            _cc.append_filtered_ids(url, sorted(_filtered_this_run),
+            _cc.append_filtered_ids(configured_url, sorted(_filtered_this_run),
                                     min_dur, max_dur)
         except Exception as e:
             swallow("channel-cache filtered append", e)
@@ -3683,7 +3754,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     if committed_ids and (cancel_event is None or not cancel_event.is_set()):
         try:
             from .. import channel_cache as _cc
-            _cc.append_ids(url, committed_ids)
+            _cc.append_ids(configured_url, committed_ids)
         except Exception as e:
             swallow("channel-cache append", e)
 
@@ -3703,9 +3774,12 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
         # path forever.
         try:
             from .. import subs as _subs_norm
-            _url_norm = _subs_norm.normalize_channel_url(url) or url
+            _url_norm = (
+                _subs_norm.normalize_channel_url(configured_url)
+                or configured_url
+            )
         except Exception:
-            _url_norm = url
+            _url_norm = configured_url
         _url_norm = (_url_norm or "").strip().rstrip("/")
         _config_write_err: str | None = None
         try:
@@ -3740,7 +3814,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                     except Exception:
                         _c_norm = _c_url
                     _c_norm = (_c_norm or "").strip().rstrip("/")
-                    if _c_norm != _url_norm and _c_url != url:
+                    if _c_norm != _url_norm and _c_url != configured_url:
                         continue
                     _matched_any = True
                     _was_bootstrap_pass = (not c.get("initialized", False)
@@ -3787,7 +3861,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                 # fast-path.
                 _config_write_err = (
                     f"config update: no channel matched URL "
-                    f"{url!r} (normalized {_url_norm!r}) — "
+                    f"{configured_url!r} (normalized {_url_norm!r}) — "
                     f"last_sync/initialized/sync_complete not written.")
         except ConfigUnchanged:
             pass
@@ -3847,7 +3921,8 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     if not _post_sync_cancelled:
         try:
             from .. import channel_art as _ca
-            _ca.fetch_channel_art(url or "", str(ch_dir), force=False)
+            _ca.fetch_channel_art(
+                url or "", str(ch_dir), force=False)
         except Exception as _ae:
             stream.emit_dim(f" (channel-art refresh skipped: {_ae})")
 
@@ -3964,6 +4039,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
         _exit_for_caller = next(iter(_crashed), proc.returncode if proc else 0)
     return SyncResult(ok=_ok, downloaded=downloaded, errors=errors,
                       took=took, exit=_exit_for_caller,
+                      channel_tracks=_channel_tracks,
                       total=(downloaded + _archived_skipped
                              + _existing_file_skipped
                              + len(_filtered_this_run)))
@@ -3991,6 +4067,19 @@ from .active_state import (  # noqa: F401
 )
 
 
+def _identity_archive_folder(channel: dict[str, Any]) -> str:
+    """Return this channel's existing archive folder, or "" if unresolvable."""
+    try:
+        base = str(load_config().get("output_dir") or "").strip()
+        if not base:
+            return ""
+        folder = os.path.join(base, channel_folder_name(channel))
+        return folder if os.path.isdir(folder) else ""
+    except Exception as e:
+        swallow("channel identity folder resolve", e)
+        return ""
+
+
 def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                  cancel_event: threading.Event | None = None,
                  queues=None, transcribe_mgr=None,
@@ -4005,8 +4094,50 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     name = channel.get("name") or channel.get("folder") or "?"
     set_sync_active(name)
     try:
-        return _sync_channel_impl(
+        preflight = _channel_identity.preflight_channel_identity(
             channel,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            kill_current=kill_current,
+            stream=stream,
+            # A legacy row whose per-URL ID cache was lost can still prove
+            # itself from the archive folder it already owns, so a single-
+            # channel sync has the same migration path Sync Subbed does.
+            archive_folder=_identity_archive_folder(channel),
+        )
+        active_channel = dict(
+            preflight.get("channel")
+            if isinstance(preflight.get("channel"), dict)
+            else channel
+        )
+        for key, value in channel.items():
+            if key not in active_channel:
+                active_channel[key] = value
+        stopped = bool(
+            (cancel_event is not None and cancel_event.is_set())
+            or (pause_event is not None and pause_event.is_set())
+            or (kill_current is not None and kill_current.is_set())
+        )
+        if not preflight.get("ok"):
+            if not stopped:
+                stream.emit_error(
+                    f"Stopped {name} before downloading because YTArchiver "
+                    "couldn't prove that this saved address still belongs "
+                    "to the archived channel.",
+                    detail=str(preflight.get("error") or "verification failed"),
+                )
+            return SyncResult(
+                ok=False,
+                reason=("paused" if pause_event is not None
+                        and pause_event.is_set() else "cancelled" if stopped
+                        else "channel_identity_unverified"),
+                downloaded=0,
+                errors=0 if stopped else 1,
+            )
+        if preflight.get("url_changed"):
+            _channel_identity.emit_url_changed(stream, preflight)
+        result = _sync_channel_impl(
+            active_channel,
             stream,
             cancel_event=cancel_event,
             queues=queues,
@@ -4017,6 +4148,70 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             pass_total=pass_total,
             quickcheck_fresh_ids=quickcheck_fresh_ids,
         )
+        if (result.get("reason") == "channel_page_unavailable"
+                and not (cancel_event is not None and cancel_event.is_set())
+                and not (pause_event is not None and pause_event.is_set())
+                and not (kill_current is not None and kill_current.is_set())):
+            recovery = _channel_identity.recover_stale_channel(
+                active_channel,
+                cancel_event=cancel_event,
+                pause_event=pause_event,
+                kill_current=kill_current,
+                stream=stream,
+            )
+            _recovery_stopped = bool(
+                (cancel_event is not None and cancel_event.is_set())
+                or (pause_event is not None and pause_event.is_set())
+                or (kill_current is not None and kill_current.is_set())
+            )
+            if recovery.get("ok") and not _recovery_stopped:
+                if recovery.get("url_changed"):
+                    _channel_identity.emit_url_changed(stream, recovery)
+                previous_channel = active_channel
+                active_channel = dict(
+                    recovery.get("channel")
+                    if isinstance(recovery.get("channel"), dict)
+                    else previous_channel
+                )
+                # Saved subscriptions do not carry queue-only fields such as
+                # task_id. Keep those fields on the immediate retry.
+                for key, value in previous_channel.items():
+                    if key not in active_channel:
+                        active_channel[key] = value
+                result = _sync_channel_impl(
+                    active_channel,
+                    stream,
+                    cancel_event=cancel_event,
+                    queues=queues,
+                    transcribe_mgr=transcribe_mgr,
+                    pause_event=pause_event,
+                    kill_current=kill_current,
+                    pass_idx=pass_idx,
+                    pass_total=pass_total,
+                    quickcheck_fresh_ids=quickcheck_fresh_ids,
+                )
+            elif not _recovery_stopped and not recovery.get("ok"):
+                detail = str(recovery.get("error") or "verification failed")
+                stream.emit_error(
+                    f"Couldn't load {name}'s saved YouTube URL. It may have "
+                    "changed, but YTArchiver couldn't prove that a replacement "
+                    "belongs to the same channel, so nothing was changed.",
+                    detail=detail,
+                )
+
+        tracks = result.get("channel_tracks")
+        if isinstance(tracks, list) and tracks:
+            learned = _channel_identity.record_observed_identity(
+                active_channel, tracks)
+            if learned.get("ok") and learned.get("url_changed"):
+                _channel_identity.emit_url_changed(stream, learned)
+            elif not learned.get("ok"):
+                _log.debug(
+                    "channel identity marker was not persisted for %s: %s",
+                    name,
+                    learned.get("error") or "unknown error",
+                )
+        return result
     finally:
         # Every early return and unexpected exception must release the marker.
         # Otherwise unrelated maintenance remains deferred for the session.

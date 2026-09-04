@@ -78,6 +78,36 @@ function clickClose(row) {
   });
 }
 
+function loadSyncControlHarness(askConfirm) {
+  const listeners = new Map();
+  const document = { getElementById: () => null };
+  const window = {
+    YT: { bridge: { isUp: () => false } },
+    askConfirm,
+    addEventListener(kind, fn) {
+      const entries = listeners.get(kind) || [];
+      entries.push(fn);
+      listeners.set(kind, entries);
+    },
+  };
+  vm.runInNewContext(
+    fs.readFileSync(path.join(__dirname, "..", "web", "syncSubbed.js"), "utf8"),
+    { window, document, console, Promise, Set, confirm: () => true },
+    { filename: "syncSubbed.js" },
+  );
+  return {
+    dispatchControl(detail) {
+      for (const listener of listeners.get("yt-control") || []) {
+        listener({ detail });
+      }
+    },
+  };
+}
+
+function flushAsyncWork() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 test("duplicate sync rows remove only the clicked task ID after success", async () => {
   let release;
   const calls = [];
@@ -419,4 +449,98 @@ test("popover queue controls toast rejected bridge promises", async () => {
   assert.deepEqual(toasts, [[
     "Couldn't start processing. Error: bridge offline", "error",
   ]]);
+});
+
+test("channel URL repair notice shows verified old/new copy and one-button options", async () => {
+  const dialogs = [];
+  const harness = loadSyncControlHarness(async (...args) => {
+    dialogs.push(args);
+    return true;
+  });
+
+  harness.dispatchControl({ kind: "clear_line", marker: "sync-progress" });
+  await flushAsyncWork();
+  assert.equal(dialogs.length, 0, "unrelated controls must be ignored");
+
+  harness.dispatchControl({
+    kind: "channel_url_changed",
+    channel_name: "Example Channel",
+    channel_id: "UC_permanent_id",
+    old_url: "https://www.youtube.com/@OldHandle",
+    new_url: "https://www.youtube.com/@NewHandle",
+  });
+  await flushAsyncWork();
+
+  assert.equal(dialogs.length, 1);
+  const [title, message, options] = dialogs[0];
+  assert.equal(title, "YouTube channel address updated");
+  assert.equal(
+    message,
+    "“Example Channel” changed its YouTube address.\n\n" +
+    "Old: https://www.youtube.com/@OldHandle\n" +
+    "New: https://www.youtube.com/@NewHandle\n\n" +
+    "YTArchiver matched YouTube’s permanent channel ID, updated " +
+    "the saved address automatically, and continued syncing.",
+  );
+  assert.equal(options.confirm, "Got it");
+  assert.equal(options.noCancel, true);
+  assert.equal(options.danger, false);
+});
+
+test("channel URL repair notice deduplicates the same transition for the session", async () => {
+  const dialogs = [];
+  const harness = loadSyncControlHarness(async (...args) => {
+    dialogs.push(args);
+    return true;
+  });
+  const transition = {
+    kind: "channel_url_changed",
+    channel_name: "Example Channel",
+    channel_id: "UC_permanent_id",
+    old_url: "https://www.youtube.com/@OldHandle",
+    new_url: "https://www.youtube.com/@NewHandle",
+  };
+
+  harness.dispatchControl(transition);
+  harness.dispatchControl({ ...transition });
+  await flushAsyncWork();
+  harness.dispatchControl({ ...transition });
+  await flushAsyncWork();
+
+  assert.equal(dialogs.length, 1);
+});
+
+test("distinct channel URL repair notices are serialized instead of dropped", async () => {
+  const dialogs = [];
+  let releaseFirst;
+  const firstDialog = new Promise((resolve) => { releaseFirst = resolve; });
+  const harness = loadSyncControlHarness((...args) => {
+    dialogs.push(args);
+    return dialogs.length === 1 ? firstDialog : Promise.resolve(true);
+  });
+
+  harness.dispatchControl({
+    kind: "channel_url_changed",
+    channel_name: "First Channel",
+    channel_id: "UC_first",
+    old_url: "https://www.youtube.com/@FirstOld",
+    new_url: "https://www.youtube.com/@FirstNew",
+  });
+  harness.dispatchControl({
+    kind: "channel_url_changed",
+    channel_name: "Second Channel",
+    channel_id: "UC_second",
+    old_url: "https://www.youtube.com/@SecondOld",
+    new_url: "https://www.youtube.com/@SecondNew",
+  });
+  await flushAsyncWork();
+
+  assert.equal(dialogs.length, 1, "second dialog must wait for the first");
+  assert.match(dialogs[0][1], /First Channel/);
+
+  releaseFirst(true);
+  await flushAsyncWork();
+
+  assert.equal(dialogs.length, 2);
+  assert.match(dialogs[1][1], /Second Channel/);
 });

@@ -286,6 +286,10 @@ def install_catalog_schema(conn: sqlite3.Connection) -> None:
            WHERE trim(COALESCE(video_id, '')) <> ''"""
     )
     conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_logical_videos_chan_title_date
+           ON logical_videos(channel, title, upload_ts)"""
+    )
+    conn.execute(
         """CREATE TABLE IF NOT EXISTS media_files (
                media_id INTEGER PRIMARY KEY,
                logical_video_id INTEGER NOT NULL,

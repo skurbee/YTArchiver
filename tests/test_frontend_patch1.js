@@ -138,6 +138,8 @@ test("startup hydration waits for the canonical bridge-ready promise", async () 
   const document = baseDocument();
   document.body = { dataset: {} };
   const window = {
+    addEventListener() {},
+    removeEventListener() {},
     YT: {
       bridge: {
         isUp: () => bridgeUp,

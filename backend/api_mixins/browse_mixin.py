@@ -2570,6 +2570,7 @@ class BrowseMixin:
             # still a current subscription without changing the long-lived
             # frontend bridge call shape.
             catalog_row = None
+            summary = {}
             if video_id:
                 try:
                     from backend.index import _reader_lock, _reader_open
@@ -2577,12 +2578,20 @@ class BrowseMixin:
                     if rconn is not None:
                         with _reader_lock:
                             catalog_row = rconn.execute(
-                                "SELECT filepath, title, channel FROM videos "
+                                "SELECT filepath, title, channel, duration_s, "
+                                "upload_ts, view_count, added_ts FROM videos "
                                 "WHERE video_id=? LIMIT 1",
                                 (video_id,),
                             ).fetchone()
                 except Exception:
                     catalog_row = None
+            if catalog_row:
+                from backend.index import _fmt_video_duration, _format_compact_count
+                summary = {
+                    "duration": _fmt_video_duration(catalog_row[3]),
+                    "upload_ts": catalog_row[4] or catalog_row[6],
+                    "views": _format_compact_count(catalog_row[5]),
+                }
             jp = os.path.normpath(jsonl_path or "")
             if jp and os.path.isfile(jp):
                 base = os.path.splitext(jp)[0]
@@ -2612,6 +2621,7 @@ class BrowseMixin:
                         return {
                             "ok": True,
                             "filepath": cand,
+                            **summary,
                             "title": title or os.path.basename(base),
                             "channel": _ch_guess,
                             "video_id": video_id or "",
@@ -2631,6 +2641,7 @@ class BrowseMixin:
                     return {
                         "ok": True,
                         "filepath": catalog_row[0],
+                        **summary,
                         "title": catalog_row[1] or title or "",
                         "channel": catalog_row[2] or "",
                         "video_id": video_id,
@@ -2754,7 +2765,7 @@ class BrowseMixin:
                 continue
         return False
 
-    def list_manual_videos(self, sort="newest", limit=60, offset=0):
+    def list_manual_videos(self, sort="newest", limit=60, offset=0, query=""):
         """List single/manual downloads for the Manual Downloads view.
 
         Single downloads can be saved anywhere — the dedicated video_out_dir
@@ -2842,6 +2853,13 @@ class BrowseMixin:
             except OSError as e:
                 _log.debug("list_manual_videos scandir failed: %s", e)
 
+        # Filter the complete merged collection before slicing a page.
+        total = len(rows)
+        query = str(query or "").strip().casefold()
+        if query:
+            rows = [r for r in rows if query in str(r.get("title") or "").casefold()
+                    or query in str(r.get("channel") or "").casefold()]
+
         # Sort (newest/oldest by YT upload date → added → file mtime, all secs).
         def _tkey(r):
             return (r.get("upload_ts") or r.get("added_ts")
@@ -2927,7 +2945,7 @@ class BrowseMixin:
                 r["manual_badges"] = badges
 
         result = {"rows": page, "has_more": has_more, "folder": folder,
-                  "total": len(rows)}
+                  "total": len(rows), "unfiltered_total": total}
         if index_error:
             if rows:
                 result["warning"] = (

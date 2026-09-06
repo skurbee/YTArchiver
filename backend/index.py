@@ -46,6 +46,52 @@ _log = get_logger(__name__)
 
 _db_lock = threading.RLock()
 
+_INTERACTIVE_LOCK_SECONDS = 2.0
+_INTERACTIVE_QUERY_SECONDS = 8.0
+
+
+class LibraryQueryTimeout(TimeoutError):
+    """An interactive library operation ended without a complete result."""
+
+
+@contextmanager
+def _bounded_sql(conn, operation: str, seconds: float, *, check_complete: bool = True):
+    """Limit SQL work while the caller exclusively owns this connection."""
+    deadline = time.monotonic() + seconds
+    old_busy = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    conn.execute(f"PRAGMA busy_timeout={max(1, min(500, int(seconds * 1000)))}")
+    conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+    try:
+        yield conn
+        if check_complete and time.monotonic() >= deadline:
+            raise LibraryQueryTimeout(f"{operation} took too long. Please try again with a narrower selection.")
+    except sqlite3.OperationalError as exc:
+        if getattr(exc, "sqlite_errorcode", None) in (
+                sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            _log.warning("%s stopped during SQL work: %s", operation, exc)
+            raise LibraryQueryTimeout(
+                f"{operation} could not finish while the library was busy. Please try again.") from exc
+        raise
+    finally:
+        conn.set_progress_handler(None, 0)
+        conn.execute(f"PRAGMA busy_timeout={int(old_busy)}")
+
+
+@contextmanager
+def _interactive_reader(operation: str):
+    """Bound reader contention and SQL work for foreground library requests."""
+    conn = _reader_open()
+    if conn is None:
+        raise RuntimeError("The library index is unavailable. Please try again shortly.")
+    if not _reader_lock.acquire(timeout=_INTERACTIVE_LOCK_SECONDS):
+        _log.warning("%s timed out waiting for the library reader", operation)
+        raise LibraryQueryTimeout(f"{operation} is waiting for another library operation. Please try again.")
+    try:
+        with _bounded_sql(conn, operation, _INTERACTIVE_QUERY_SECONDS):
+            yield conn
+    finally:
+        _reader_lock.release()
+
 # Pending tx_status='transcribed' retries — coalesces the burst that
 # arrives when ingest races sync_write_video INSERTs (audit: index.py
 # H109). One drain thread processes all pending fps serially instead
@@ -400,6 +446,10 @@ def _reader_open() -> sqlite3.Connection | None:
     `_db_lock`.
     """
     global _reader_conn
+    # Returning a cached handle does not use it. Callers serialize actual SQL
+    # with _reader_lock; foreground callers can now bound that acquisition.
+    if _reader_conn is not None and _schema_inited:
+        return _reader_conn
     if not _schema_inited:
         # Cold-start path: schema may not exist yet. Take the slow
         # route ONCE to make sure the DB file + tables exist.
@@ -636,6 +686,8 @@ def _open() -> sqlite3.Connection | None:
                 created REAL DEFAULT (strftime('%s','now')),
                 FOREIGN KEY (segment_id) REFERENCES segments(id) ON DELETE SET NULL
             )""")
+            _conn.execute("CREATE INDEX IF NOT EXISTS idx_bookmarks_video_time "
+                          "ON bookmarks(video_id, start_time)")
             _conn.execute("""CREATE TABLE IF NOT EXISTS videos (
                 id INTEGER PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -2792,6 +2844,60 @@ def delete_media_copy_rows(
     except (OSError, sqlite3.Error, ValueError) as exc:
         _log.warning("delete_media_copy_rows failed: %s", exc)
         return {"ok": False, "error": str(exc), "videos": 0, "segments": 0}
+
+
+def clear_missing_transcripts_under_root(root: str) -> dict[str, Any]:
+    """Forget deleted transcripts in one folder, retaining other roots/media."""
+    root_key = os.path.normcase(os.path.abspath(root))
+
+    def under(path):
+        if not path:
+            return False
+        try:
+            return os.path.commonpath([
+                root_key, os.path.normcase(os.path.abspath(path))]) == root_key
+        except (OSError, ValueError):
+            return False
+
+    conn = _open()
+    if conn is None:
+        return {"ok": False, "error": "Index database unavailable"}
+    try:
+        with _db_lock:
+            paths = {row[0] for row in conn.execute(
+                "SELECT DISTINCT jsonl_path FROM segments UNION SELECT path FROM indexed_files"
+            ) if under(row[0])}
+        # Disk access stays outside the writer lock. Failed file deletions and
+        # untouched transcript representations retain their index entries.
+        missing = [path for path in paths if not os.path.isfile(path)]
+        with _db_lock:
+            if conn.in_transaction:
+                raise sqlite3.OperationalError("Index has an unfinished transaction")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                removed = 0
+                for path in missing:
+                    removed += max(0, conn.execute(
+                        "DELETE FROM segments WHERE jsonl_path=?", (path,)).rowcount)
+                    conn.execute("DELETE FROM indexed_files WHERE path=?", (path,))
+                affected = [row[0] for row in conn.execute(
+                    "SELECT id, filepath FROM videos WHERE tx_status='transcribed'")
+                    if under(row[1])]
+                conn.executemany(
+                    "UPDATE videos SET tx_status='pending' WHERE id=? AND NOT EXISTS ("
+                    "SELECT 1 FROM segments s WHERE "
+                    "(COALESCE(videos.video_id,'')<>'' AND s.video_id=videos.video_id) OR "
+                    "(COALESCE(videos.video_id,'')='' AND s.title=videos.title "
+                    "AND s.channel=videos.channel))", [(identity,) for identity in affected])
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        invalidate_channel_videos(None)
+        _invalidate_top_words_cache()
+        return {"ok": True, "segments": removed, "indexed_files": len(missing)}
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def delete_segments_for_video(filepath: str) -> int:
@@ -5644,28 +5750,58 @@ def video_tx_status(video_id: str | None = None,
     return ""
 
 
+def _corroborated_watch_filename_id(conn, filepath: str, resolved_id: str,
+                                  title: str, channel: str) -> str:
+    """Recover a stale indexed ID only with unique transcript evidence."""
+    if not (resolved_id and title and channel):
+        return ""
+    from .text_utils import extract_video_id, normalize_title
+    candidate = extract_video_id(filepath, reject_alpha_only=True)
+    if not candidate or candidate == resolved_id:
+        return ""
+    # A bracket copied into a title often refers to an unrelated video. Do
+    # not scan title/channel identities unless that ID has matching evidence.
+    if conn.execute(
+            "SELECT 1 FROM segments WHERE video_id=? AND title=? COLLATE NOCASE "
+            "AND channel=? COLLATE NOCASE LIMIT 1", (candidate, title, channel)).fetchone() is None:
+        return ""
+    wanted = _transcript_identity_title_keys(title, normalize_title)
+    # A valid indexed-ID transcript wins even when the filename has a
+    # misleading bracket. Preserve normal title/date normalization and
+    # legacy blank-channel handling when evaluating that existing evidence.
+    for stored_title, stored_channel in conn.execute(
+            "SELECT DISTINCT title,channel FROM segments WHERE video_id=?", (resolved_id,)):
+        channel_matches = not stored_channel or stored_channel.casefold() == channel.casefold()
+        if channel_matches and wanted & _transcript_identity_title_keys(stored_title or "", normalize_title):
+            return ""
+    # Recovery requires stronger evidence: an exact title/channel pair
+    # belongs to only the bracket ID. Reused titles with different IDs must
+    # remain unresolved instead of selecting whichever transcript is newest.
+    matching_ids = {row[0] for row in conn.execute(
+        "SELECT DISTINCT video_id FROM segments WHERE title=? COLLATE NOCASE "
+        "AND channel=? COLLATE NOCASE AND COALESCE(video_id,'')!='' LIMIT 2", (title, channel))}
+    return candidate if matching_ids == {candidate} else ""
+
+
 def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
                  title: str | None = None, channel: str | None = None,
                  filepath: str | None = None,
                  strict_identity: bool = False) -> list[dict[str, Any]]:
+    """Read a complete transcript, or raise a bounded, retryable timeout."""
+    with _interactive_reader("Loading the transcript") as conn:
+        return _get_segments(conn, video_id, jsonl_path, title, channel, filepath, strict_identity)
+
+
+def _get_segments(conn, video_id: str | None = None, jsonl_path: str | None = None,
+                  title: str | None = None, channel: str | None = None,
+                  filepath: str | None = None,
+                  strict_identity: bool = False) -> list[dict[str, Any]]:
     """Return ordered segments for a video.
 
-    Uses `_reader_open()` (lock-free reader connection) so the user's
-    Watch-view click doesn't queue behind sweep_new_videos' FTS-ingest
-    transactions during startup. Same migration list_videos_for_channel
-    and the Recent tab already had — this path was missed, which made
-    clicks during startup-sweep hang for many seconds at a time.
-    SQLite WAL mode lets the reader connection read concurrently with
-    the writer's ongoing transaction; falls back to _open() only if
-    the reader connection somehow failed to initialize.
+    The caller owns the reader lock and SQL deadline. SQLite WAL permits
+    this reader to work alongside the writer's ongoing transaction.
     """
-    conn = _reader_open()
     lock = _reader_lock
-    if conn is None:
-        conn = _open()
-        lock = _db_lock
-    if conn is None:
-        return []
     # When only video_id is supplied (the Watch-view click path —
     # frontend doesn't know which jsonl_path), pick a canonical
     # jsonl_path for this video first: the one with the
@@ -5703,6 +5839,11 @@ def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
                     conn=conn,
                     reject_alpha_only=True,
                 )
+                if strict_identity:
+                    corroborated = _corroborated_watch_filename_id(
+                        conn, filepath, _file_video_id or video_id or "", title or "", channel or "")
+                    if corroborated:
+                        _file_video_id = corroborated
             except Exception as e:
                 _log.debug("watch filepath id resolve failed: %s", e)
             if _file_video_id:
@@ -5728,17 +5869,36 @@ def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
                     "GROUP BY jsonl_path ORDER BY MAX(id) DESC LIMIT 1",
                     (video_id,)
                 ).fetchone()
-                if canon and canon[0]:
+                if canon:
+                    # A row with a NULL/empty source path still proves an
+                    # exact ID match. Keep that source group authoritative.
                     jsonl_path = canon[0]
                     _jp_from_canon = True
                 elif title:
-                    # No segments carry this video_id -> match by title.
+                    # Only genuinely ID-less, unambiguous legacy material
+                    # can substitute for a missing stable-ID transcript.
+                    legacy_channels = conn.execute(
+                        "SELECT DISTINCT LOWER(COALESCE(channel,'')) FROM segments "
+                        "WHERE title=? AND COALESCE(video_id,'')='' "
+                        + ("AND channel=? COLLATE NOCASE" if channel else ""),
+                        (title, channel) if channel else (title,),
+                    ).fetchall()
+                    if len(legacy_channels) != 1:
+                        return []
+                    channel = channel or legacy_channels[0][0]
+                    catalog_ids = {row[0] for row in conn.execute(
+                        "SELECT DISTINCT video_id FROM videos WHERE title=? "
+                        "AND COALESCE(channel,'')=? COLLATE NOCASE "
+                        "AND COALESCE(video_id,'')!=''", (title, channel))}
+                    if catalog_ids and catalog_ids != {video_id}:
+                        return []
                     _match_by_title = True
                     try:
                         if channel:
                             tcanon = conn.execute(
                                 "SELECT jsonl_path FROM segments "
                                 "WHERE title=? AND channel=? COLLATE NOCASE "
+                                "AND COALESCE(video_id,'')='' "
                                 "GROUP BY jsonl_path "
                                 "ORDER BY MAX(id) DESC LIMIT 1",
                                 (title, channel),
@@ -5746,6 +5906,7 @@ def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
                         else:
                             tcanon = conn.execute(
                                 "SELECT jsonl_path FROM segments WHERE title=? "
+                                "AND COALESCE(video_id,'')='' "
                                 "GROUP BY jsonl_path "
                                 "ORDER BY MAX(id) DESC LIMIT 1",
                                 (title,),
@@ -5763,11 +5924,13 @@ def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
             where.append("video_id=?"); args.append(video_id)
         if _match_by_title and title:
             where.append("title=?"); args.append(title)
+            if video_id:
+                where.append("COALESCE(video_id,'')=''")
             if channel:
                 where.append("channel=? COLLATE NOCASE")
                 args.append(channel)
-        if jsonl_path:
-            where.append("jsonl_path=?")
+        if _jp_from_canon or jsonl_path:
+            where.append("jsonl_path IS ?" if _jp_from_canon else "jsonl_path=?")
             args.append(jsonl_path if _jp_from_canon
                         else os.path.normpath(jsonl_path))
         if title and not where:

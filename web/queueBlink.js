@@ -221,7 +221,8 @@
     const anyAlive = s.running || g.running;
     const pausedWithItems =
       (s.paused && s.count > 0) || (g.paused && g.count > 0);
-    const enable = anyAlive || pausedWithItems || _isYouTubeLimitHold(s);
+    const enable = anyAlive || pausedWithItems || s.count > 0 || g.count > 0
+      || _isYouTubeLimitHold(s);
     const btn = document.getElementById("btn-pause");
     if (btn) {
       btn.disabled = !enable;
@@ -388,7 +389,8 @@
       const syncPausedWithItems = !s.running && s.paused && s.count > 0;
       const gpuPausedWithItems = !g.running && g.paused && g.count > 0;
       const anyPaused = syncActive || gpuActive ||
-                        syncPausedWithItems || gpuPausedWithItems;
+                         syncPausedWithItems || gpuPausedWithItems;
+      const idleQueued = !s.running && !g.running && (s.count > 0 || g.count > 0);
       const trafficWaiting = !!s.trafficWaiting;
       const sessionLimited = !!s.sessionLimited;
       const limitWaiting = trafficWaiting || sessionLimited;
@@ -401,7 +403,7 @@
       const anyPending = _isPipelinePending(s) || _isPipelinePending(g);
       let visState = limitWaiting
         ? "traffic-wait"
-        : (anyPaused ? "paused" : "running");
+        : (idleQueued ? "start" : (anyPaused ? "paused" : "running"));
       if (anyPending) visState = "pending";
       pauseBtn.dataset.pauseState = visState;
       pauseBtn.classList.toggle("pause-pending", anyPending);
@@ -415,6 +417,8 @@
             ? "Waiting for a YouTube traffic slot — click to override"
             : sessionLimited
             ? "Paused by YouTube's session rate limit"
+            : idleQueued
+            ? "Start queued work (Auto stays off)"
             : anyPaused
             ? "Resume all queues"
             : "Pause all queues (current jobs finish first)");
@@ -423,7 +427,7 @@
       pauseBtn.removeAttribute("title");
       const svg = pauseBtn.querySelector("svg");
       if (svg) {
-        const want = (anyPaused || limitWaiting) ? "play" : "bars";
+        const want = (idleQueued || anyPaused || limitWaiting) ? "play" : "bars";
         if (svg.dataset.icon !== want) {
           svg.dataset.icon = want;
           svg.innerHTML = want === "play"
@@ -441,7 +445,7 @@
     // handlers below). Also hide the Pause/Cancel pair entirely when the
     // queue is empty — nothing to act on means no buttons.
     _paintPopoverPauseBtn("btn-pause-sync-queue",
-                           _blinkState.sync, "Sync", false);
+                           _blinkState.sync, "Sync", true);
     _paintPopoverPauseBtn("btn-pause-gpu-queue",
                            _blinkState.gpu, "Processing", true);
     // Sync popover: no sibling buttons in the footer — hide the entire
@@ -495,7 +499,7 @@
     // gaming. Clicking does a one-shot drain (Auto stays off). Takes
     // precedence over the Resume label so a queued-but-idle Processing queue
     // reads "Start", not the nonsensical "Pause". Sync has its own Sync
-    // Subbed button, so canStart is false there and behavior is unchanged.
+    // Subbed button. Both queues also support starting their queued work here.
     const startable = !!canStart && !state.running && state.count > 0;
     // Pause-pending: requested but worker still finishing current op.
     // Also held for a minimum window after the click so a fast pause

@@ -464,8 +464,8 @@
           },
           y: { ticks: { color: "#a0aabb" }, grid: { color: "#2a2c30" }, beginAtZero: true,
                title: {
-                 display: !!data.normalize,
-                 text: data.normalize ? "matches per 1000 segments" : "",
+                 display: true,
+                 text: data.normalize ? "Matching segments per 1,000 segments" : "Matching transcript segments",
                  color: "#a0aabb",
                } },
         },
@@ -561,6 +561,8 @@
     const m2 = /^(\d{4})-(\d{2})$/.exec(bucketLabel || "");
     const mw = /^(\d{4})-W(\d{2})$/.exec(bucketLabel || "");
     let range = null;
+    if (yf) yf.value = "";
+    if (yt) yt.value = "";
     if (m1) { if (yf) yf.value = m1[1]; if (yt) yt.value = m1[1]; }
     else if (m2) {
       if (yf) yf.value = m2[1];
@@ -569,19 +571,21 @@
       const end = new Date(Number(m2[1]), Number(m2[2]), 1);
       range = { fromTs: start.getTime() / 1000, toTs: end.getTime() / 1000 };
     } else if (mw) {
-      if (yf) yf.value = mw[1];
-      if (yt) yt.value = mw[1];
       const jan4 = new Date(Number(mw[1]), 0, 4);
       const mondayOffset = (jan4.getDay() + 6) % 7;
       const start = new Date(Number(mw[1]), 0,
         4 - mondayOffset + (Number(mw[2]) - 1) * 7);
       const end = new Date(start);
       end.setDate(end.getDate() + 7);
+      if (yf) yf.value = String(start.getFullYear());
+      if (yt) yt.value = String(new Date(end.getTime() - 1).getFullYear());
       range = { fromTs: start.getTime() / 1000, toTs: end.getTime() / 1000 };
     }
     window._searchExactDateRange = range
       ? { ...range, label: String(bucketLabel), query: String(word) }
       : null;
+    window._paintSearchDateFilter?.();
+    window._setSearchSelectedChannels?.([]);
     if (scope && channel) {
       // Set the hidden compat select so the legacy path picks up the
       // single-channel scope.
@@ -597,6 +601,7 @@
         const rows = window._subsAllRows || [];
         const match = rows.find(r => r.folder === channel || r.name === channel);
         const folder = match?.folder || channel;
+        window._setSearchSelectedChannels?.([folder]);
         const wrap = document.getElementById("search-channel-multi");
         if (wrap && wrap._searchSelected) {
           wrap._searchSelected.clear();
@@ -744,6 +749,17 @@
       for (let i = 0; i < rowCount; i++) {
         rows.push([labels[i], values[i] ?? ""]);
       }
+    }
+    if (!_graphLastData.cloud && rows.length) {
+      rows[0].push("units", "channel_scope", "normalization", "bucket_size", "counting_rule");
+      const context = [
+        _graphLastData.normalize ? "Matching segments per 1,000 segments" : "Matching transcript segments",
+        _graphLastData.channel || "All channels",
+        _graphLastData.normalize ? "Per 1,000 segments" : "Off",
+        _graphLastData.bucket || "month",
+        "Matching indexed transcript segments; Search removes duplicates and may use different dates when upload dates are missing",
+      ];
+      for (let i = 1; i < rows.length; i++) rows[i].push(...context);
     }
     const csv = rows.map(r => r.map(c => {
       const s = String(c ?? "");

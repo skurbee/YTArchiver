@@ -715,7 +715,7 @@ test.describe("catalog-backed screen loading", () => {
     // resurrect the channel name over the destination's header.
     const destinations = [
       ["recent", "Videos"],
-      ["search", "Search transcripts"],
+      ["search", "Search library"],
       ["graph", "Word frequency"],
       ["bookmarks", "Bookmarks"],
       ["manual", "Manual Downloads"],
@@ -1405,7 +1405,7 @@ test.describe("catalog-backed screen loading", () => {
     await hit.click();
     await expect(page.locator("#search-viewer-body")).toHaveText(
       "No transcript available for this title match. "
-      + "Double-click to open the video.");
+      + "Choose Open in Watch to play the video.");
     await expect.poll(() => page.evaluate(() =>
       window.__bridgeCallsFor("browse_search_context").length)).toBe(0);
 
@@ -1762,7 +1762,7 @@ test.describe("catalog-backed screen loading", () => {
     });
 
     await expect(page.locator("#index-stats-text"))
-      .toContainText("Channels: 9");
+      .toContainText("Subscribed channels: 9");
     await expect(page.locator("#index-stats-text"))
       .toContainText("Segments: 99");
     const readState = await page.evaluate(() => ({

@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Any
 
 from .. import channel_identity, youtube_session
+from ..executor_utils import LinkedCancelEvent
 from ..log import get_logger, swallow
 from ..log_stream import LogStreamer
 from ..services.channel_leases import (
@@ -37,6 +38,23 @@ from ..ytarchiver_config import ARCHIVE_FILE, config_transaction, load_config
 # The flag is reset at pass start; mutate it via the imported module
 # object so the change is visible inside sync_channel.
 from . import core as _core
+
+
+class _SyncTaskCancel(LinkedCancelEvent):
+    """A task cancellation stays latched after the shared Skip signal resets."""
+
+    def __init__(self, parent, skip):
+        super().__init__(parent)
+        self._skip = skip
+
+    def is_set(self):
+        if self._skip is not None and self._skip.is_set():
+            self.set()
+        return super().is_set()
+
+    def finish(self):
+        self.is_set()
+        self._skip = None
 
 # Helpers used by sync_all
 from .active_state import (
@@ -240,10 +258,9 @@ def _sync_all_impl(stream: LogStreamer,
     Sync every channel in config["channels"] sequentially.
 
     `pause_event`: while set, the loop blocks between channels (~0.5s poll).
-    `skip_event`: if set mid-channel, the cancel_event is fired to kill the
-                   current yt-dlp subprocess; the outer loop then clears both
-                   events and advances to the next channel. Total cancellation
-                   still works via cancel_event directly.
+    `skip_event`: cancels the current task through its linked token. After the
+                  worker acknowledges completion, the signal clears before the
+                  next task starts. `cancel_event` stops the entire pass.
     """
     cfg = load_config()
     if _lease_guard is None:
@@ -290,37 +307,33 @@ def _sync_all_impl(stream: LogStreamer,
             swallow("stale current-sync recovery", exc)
 
     # ENQUEUE DECISION:
-    # - `add_downloads_from_config=True` (Sync Subbed) AND no
-    # download tasks queued yet → add every subscribed channel as
-    # a download task. `sync_enqueue` dedupes on (kind, url) so
+    # - `add_downloads_from_config=True` (Sync Subbed) adds every missing
+    # subscribed channel. `sync_enqueue` dedupes on (kind, url) so
     # pre-existing metadata tasks stay intact; downloads append
     # alongside.
     # - `add_downloads_from_config=False` (worker started just to
     # drain the queue, e.g. from `metadata_queue_all`) → never
     # touch the queue. Process whatever is there and stop.
-    # - `add_downloads_from_config=True` BUT download tasks already
-    # exist (paused-then-resumed Sync Subbed) → resume mode, keep
-    # the existing queue as-is.
     # a user hit bug where queuing 103 metadata tasks auto-fired the
     # worker via sync_start_all, which in turn added 103 downloads —
     # "Sync pass starting (206 channels)" when he only asked for 103
     # metadata checks.
-    _resume_mode = False
     if queues is not None:
         try:
-            _sync_snapshot = queues.sync_snapshot()
-            existing_dl = any(
-                (c.get("kind") or "download").lower() == "download"
-                for c in _sync_snapshot
-            )
-            if existing_dl:
-                _resume_mode = True
-            elif add_downloads_from_config:
-                for _ch in channels:
-                    queues.sync_enqueue(_ch)
+            if add_downloads_from_config:
+                full_enqueue = getattr(type(queues), "sync_enqueue_full_library", None)
+                if callable(full_enqueue):
+                    staged = queues.sync_enqueue_full_library(channels)
+                    if not staged.get("ok"):
+                        _queue_transition_failed = True
+                        stream.emit_error(staged.get("error") or "Full sync could not be saved.")
+                else:
+                    for _ch in channels:
+                        queues.sync_enqueue(_ch)
             # else: worker was started just to drain the queue — do
             # not touch it.
         except Exception as e:
+            _queue_transition_failed = True
             swallow("queue snapshot / enqueue", e)
 
     # Per-pass unique id — stashed on a thread-local that
@@ -348,8 +361,8 @@ def _sync_all_impl(stream: LogStreamer,
         _core._STALE_YTDLP_NUDGE_FIRED = False
 
     # Start-of-pass header — show total remaining work, not len(config).
-    # In resume mode that's the restored queue size; fresh mode it's the
-    # whole channel list we just enqueued. Exclude kind=redownload
+    # For queue-only starts that's the pending queue size; full requests use
+    # the whole channel list we just enqueued. Exclude kind=redownload
     # entries — those are handled by Api._redwnl_worker and appear in
     # the queue only for popover visibility; counting them in "Sync
     # pass starting (N channels)" would over-report.
@@ -408,13 +421,8 @@ def _sync_all_impl(stream: LogStreamer,
         _unit = "task" if _starting_total == 1 else "tasks"
     else:
         _unit = "channel" if _starting_total == 1 else "channels"
-    if _resume_mode:
-        stream.emit([[f"=== Resuming {_label.lower()} ", "header"],
-                     [f"({_starting_total} {_unit} remaining) ===\n",
-                      "header"]])
-    else:
-        stream.emit([[f"=== {_label} starting ", "header"],
-                     [f"({_starting_total} {_unit}) ===\n", "header"]])
+    stream.emit([[f"=== {_label} starting ", "header"],
+                 [f"({_starting_total} {_unit}) ===\n", "header"]])
 
     sum_dl = 0
     sum_err = 0
@@ -589,6 +597,20 @@ def _sync_all_impl(stream: LogStreamer,
     # Exact ID this invocation promoted and subsequently finished. Only this
     # ID may be acknowledged at the next iteration/end-of-pass boundary.
     _owned_current_task_id = ""
+    _owned_download_success = False
+    _task_cancel = None
+
+    def _finish_owned_task() -> bool:
+        finish = getattr(type(queues), "sync_finish_task_durable", None)
+        if callable(finish):
+            return queues.sync_finish_task_durable(
+                _owned_current_task_id,
+                _owned_download_success and not (
+                    _task_cancel is not None and _task_cancel.is_set()))
+        durable_replace = getattr(type(queues), "replace_current_task_durable", None)
+        return bool(callable(durable_replace)
+                    and queues.replace_current_task_durable(
+                        "sync", None, expected_task_id=_owned_current_task_id))
     # Snapshot the queue size through QueueState.sync_snapshot() so the
     # count we display in [N/total] matches what sync_pop will actually
     # deliver. Without a locked snapshot, an enqueue happening between
@@ -627,7 +649,8 @@ def _sync_all_impl(stream: LogStreamer,
         if _autosync_rate_limited():
             return False
         if (pause_event is None or not pause_event.is_set()
-                or queues is None):
+                or queues is None
+                or (skip_event is not None and skip_event.is_set())):
             return False
         try:
             durable_requeue = getattr(
@@ -748,15 +771,8 @@ def _sync_all_impl(stream: LogStreamer,
         # user-facing pause wait.  Manual runs retain pause/resume semantics.
         if _autosync_rate_limited():
             break
-        # Clear a stale skip flag left over from the previous channel.
-        # sync_skip_current now only sets _sync_skip (no longer overloads
-        # _sync_cancel), so we just need to drain the skip event here so
-        # it doesn't mis-fire on the NEXT channel.
-        if skip_event is not None and skip_event.is_set():
-            skip_event.clear()
         # A mid-download pause requeues the in-flight channel at the front.
         # Wait before popping again so the paused row stays visible in Tasks.
-        _wait_if_paused()
         if cancel_event is not None and cancel_event.is_set():
             stream.emit([["\n\u26d4 Pass cancelled.\n", "red"]])
             break
@@ -764,12 +780,7 @@ def _sync_all_impl(stream: LogStreamer,
         # A pre-existing/stale current belongs to recovery, not to this pass.
         if queues is not None and _owned_current_task_id:
             try:
-                durable_replace = getattr(
-                    type(queues), "replace_current_task_durable", None)
-                if (not callable(durable_replace)
-                        or not queues.replace_current_task_durable(
-                            "sync", None,
-                            expected_task_id=_owned_current_task_id)):
+                if not _finish_owned_task():
                     _queue_transition_failed = True
                     stream.emit_error(
                         "Sync queue recovery state could not be finalized; "
@@ -780,6 +791,14 @@ def _sync_all_impl(stream: LogStreamer,
                 _queue_transition_failed = True
                 swallow("durable previous sync completion", exc)
                 break
+        # A cancellation signal is published under the same queue lock as the
+        # exact current-slot transition. Drain it only AFTER acknowledging that
+        # slot, so a late click cannot cancel the next item.
+        if _task_cancel is not None:
+            _task_cancel.finish()
+        if skip_event is not None:
+            skip_event.clear()
+        _wait_if_paused()
         # Pop next channel off the queue. When the queue is empty, we're
         # done — this is how the loop terminates, naturally supporting
         # both fresh passes (queue was fully enqueued above) and resume
@@ -884,6 +903,7 @@ def _sync_all_impl(stream: LogStreamer,
                     "could not be saved. The task remains queued.")
                 break
             _owned_current_task_id = task_id
+        _owned_download_success = False
         # The queue can wait for minutes or survive a restart. Resolve the
         # channel record and folder from a fresh config snapshot only now,
         # after this exact task has been durably promoted for execution.
@@ -931,6 +951,7 @@ def _sync_all_impl(stream: LogStreamer,
             break
         assert admission.lease is not None
         _lease_guard["lease"] = admission.lease
+        _task_cancel = _SyncTaskCancel(cancel_event, skip_event)
         # Kind dispatch. Download items (the default / no `kind` key)
         # take the full sync_channel path; metadata items take the
         # fetch_channel_metadata path. This is how metadata recheck
@@ -976,7 +997,7 @@ def _sync_all_impl(stream: LogStreamer,
                 # on-disk videos to that year before processing. None
                 # for whole-channel tasks (existing behavior unchanged).
                 _res = _meta.fetch_channel_metadata(
-                    ch, stream, cancel_event,
+                    ch, stream, _task_cancel,
                     refresh=bool(ch.get("refresh")),
                     pause_event=pause_event,
                     scope=ch.get("scope"),
@@ -1091,7 +1112,7 @@ def _sync_all_impl(stream: LogStreamer,
             try:
                 from .. import metadata as _meta
                 _res = _meta.refresh_channel_comments(
-                    ch, stream, cancel_event=cancel_event,
+                    ch, stream, cancel_event=_task_cancel,
                     pause_event=pause_event,
                     only_recent_days=ch.get("only_recent_days"),
                     queues=queues)
@@ -1218,7 +1239,7 @@ def _sync_all_impl(stream: LogStreamer,
                 from .. import metadata as _meta
                 _mode = ch.get("mode") or "fast"
                 _res = _meta.backfill_video_ids(
-                    ch, stream, cancel_event=cancel_event,
+                    ch, stream, cancel_event=_task_cancel,
                     pause_event=pause_event,
                     queues=queues,
                     mode=_mode)
@@ -1286,7 +1307,7 @@ def _sync_all_impl(stream: LogStreamer,
                     video_id=ch.get("video_id") or None,
                     dry_run=bool(ch.get("dry_run")),
                     log_stream=stream,
-                    cancel_event=cancel_event,
+                    cancel_event=_task_cancel,
                     pause_event=pause_event,
                     queues=queues,
                     scope_url=(ch.get("url") or "").strip() or None,
@@ -1340,7 +1361,7 @@ def _sync_all_impl(stream: LogStreamer,
                     video_id=ch.get("video_id") or None,
                     dry_run=bool(ch.get("dry_run")),
                     log_stream=stream,
-                    cancel_event=cancel_event,
+                    cancel_event=_task_cancel,
                     pause_event=pause_event,
                     queues=queues,
                     scope_url=(ch.get("url") or "").strip() or None,
@@ -1394,7 +1415,7 @@ def _sync_all_impl(stream: LogStreamer,
                     do_mp4=bool(ch.get("do_mp4", True)),
                     dry_run=bool(ch.get("dry_run")),
                     log_stream=stream,
-                    cancel_event=cancel_event,
+                    cancel_event=_task_cancel,
                     pause_event=pause_event,
                     queues=queues,
                     scope_url=(ch.get("url") or "").strip() or None,
@@ -1443,7 +1464,7 @@ def _sync_all_impl(stream: LogStreamer,
         # reassigned instead of returning 404.
         _identity_preflight = channel_identity.preflight_channel_identity(
             ch,
-            cancel_event=cancel_event,
+            cancel_event=_task_cancel,
             pause_event=pause_event,
             kill_current=skip_event,
             stream=stream,
@@ -1559,7 +1580,7 @@ def _sync_all_impl(stream: LogStreamer,
                 _ch_url, _known_for_channel, check_count=5, timeout_sec=30,
                 min_duration=_qc_opts.min_duration,
                 max_duration=_qc_opts.max_duration,
-                cancel_event=cancel_event, pause_event=pause_event,
+                cancel_event=_task_cancel, pause_event=pause_event,
                 stream=stream)
             if _autosync_rate_limited():
                 _last_live["name"] = ""
@@ -1616,6 +1637,7 @@ def _sync_all_impl(stream: LogStreamer,
                 except Exception as e:
                     swallow("quickcheck filtered-id append", e)
             if _qc.get("ok") and not _qc.get("has_new"):
+                _owned_download_success = True
                 _sync_row_emit(stream, i, total, ch_name,
                                summary="no new videos",
                                name_tag="simpleline", summary_tag="dim")
@@ -1654,7 +1676,7 @@ def _sync_all_impl(stream: LogStreamer,
         # is_any_sync_active() lie and hold transcribe [Trnscr] rows
         # forever.
         try:
-            res = sync_channel(ch, stream, cancel_event,
+            res = sync_channel(ch, stream, _task_cancel,
                                queues=queues, transcribe_mgr=transcribe_mgr,
                                pause_event=pause_event,
                                kill_current=skip_event,
@@ -1682,6 +1704,7 @@ def _sync_all_impl(stream: LogStreamer,
                 queued_ch, ch_name, i, total, reason="download"):
             # Loop will hit _wait_if_paused() on next iter and block.
             continue
+        _owned_download_success = bool(res.get("ok")) and _err == 0
         # Replace the live row with a compact summary.
         _sync_row_emit(stream, i, total, ch_name,
                        summary=_short_summary(_dl, _err),
@@ -1704,6 +1727,8 @@ def _sync_all_impl(stream: LogStreamer,
             set_batch_cooldown(ch.get("url", ""))
 
     final_channel_lease = _lease_guard.pop("lease", None)
+    if _task_cancel is not None:
+        _task_cancel.finish()
     if final_channel_lease is not None:
         final_channel_lease.release()
     rate_limited = _autosync_rate_limited()
@@ -1811,12 +1836,7 @@ def _sync_all_impl(stream: LogStreamer,
                 and (not _cancelled or rate_limited)
                 and not _queue_transition_failed):
             try:
-                durable_replace = getattr(
-                    type(queues), "replace_current_task_durable", None)
-                if (not callable(durable_replace)
-                        or not queues.replace_current_task_durable(
-                            "sync", None,
-                            expected_task_id=_owned_current_task_id)):
+                if not _finish_owned_task():
                     _queue_transition_failed = True
                     stream.emit_error(
                         "Sync queue recovery state could not be finalized; "
@@ -1826,22 +1846,20 @@ def _sync_all_impl(stream: LogStreamer,
             except Exception as exc:
                 _queue_transition_failed = True
                 swallow("durable current-sync finalization", exc)
-    # Global "Last Full Sync" timestamp \u2014 written here at pass
-    # completion (and only for a download-kind pass, and only when not
-    # cancelled) so the UI's "Last Full Sync: \u2026" label genuinely means
-    # "a full Sync Subbed pass finished at this time". Previously this
-    # was written inside sync_channel whenever any channel downloaded,
-    # so the label advanced mid-pass after the first channel with new
-    # videos \u2014 making it look like a sync "completed" at the moment the
-    # FIRST channel finished a download, not at the actual end of pass.
+    # Publish only an explicit full-library checklist whose exact tasks all
+    # succeeded. Its timestamp survives pause/restart and publishing retries.
     _cancelled_for_ts = (cancel_event is not None and cancel_event.is_set())
-    if (_label == "Sync pass" and not _cancelled_for_ts
+    if (queues is not None and not _cancelled_for_ts
             and not rate_limited and not _queue_transition_failed
-            and _lease_busy is None):
+            and _lease_busy is None and sum_err == 0):
         try:
-            with config_transaction() as _cfg_end:
-                _cfg_end["last_sync"] = datetime.now().strftime(
-                    "%Y-%m-%d %H:%M")
+            completion = getattr(type(queues), "full_sync_completion", None)
+            completed = queues.full_sync_completion() if callable(completion) else None
+            if completed:
+                with config_transaction() as _cfg_end:
+                    _cfg_end["last_sync"] = datetime.fromtimestamp(
+                        completed["completed_at"]).strftime("%Y-%m-%d %H:%M")
+                queues.clear_full_sync_completion(completed["id"])
         except Exception as _ce:
             _log.debug("end-of-pass last_sync write failed: %s", _ce)
     # Clean up the pass-progress decoration. Queue rows and the running slot

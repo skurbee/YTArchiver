@@ -504,6 +504,24 @@ def stats_for_channel(channel: dict[str, Any], cache: dict[str, Any] | None = No
     }
 
 
+def publish_scan_stats(scanned: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Publish fresh counts without overwriting concurrent subscriber metadata."""
+    fields = ("num_vids", "physical_copies", "size_bytes", "last_updated",
+              "count_semantics_version")
+    with _CACHE_LOCK:
+        cache = load_disk_cache()
+        for url, fresh in scanned.items():
+            current = cache.get(url)
+            if not isinstance(current, dict):
+                current = cache[url] = {}
+            if float(current.get("last_updated") or 0) > float(fresh.get("last_updated") or 0):
+                continue
+            current.update({key: fresh[key] for key in fields if key in fresh})
+        if not save_disk_cache(cache):
+            raise OSError("Could not save refreshed archive counts")
+        return cache
+
+
 def enrich_channels_with_stats(channels: list, cache: dict[str, Any] | None = None) -> list:
     """Attach n_vids / size_gb to each channel dict in-place. Returns the list."""
     if cache is None:
@@ -569,6 +587,57 @@ import threading as _threading
 _CACHE_LOCK = _threading.Lock()
 
 
+def _cache_record_complete(record: Any) -> bool:
+    """Recognize usable current count records, including genuine zero counts."""
+    if not isinstance(record, dict):
+        return False
+    if _cache_int(record.get("count_semantics_version"), 0) < _COUNT_SEMANTICS_VERSION:
+        return False
+    for key in ("num_vids", "size_bytes"):
+        if key not in record or _cache_int(record[key], -1) < 0:
+            return False
+    if "physical_copies" in record and _cache_int(record["physical_copies"], -1) < 0:
+        return False
+    try:
+        updated = float(record.get("last_updated") or 0)
+        if not 0 <= updated < float("inf"):
+            return False
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return True
+
+
+def cache_coverage(channels: list[dict[str, Any]],
+                   cache: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Describe saved-count coverage without scanning folders or the catalog.
+
+    Each distinct nonblank subscription URL is counted once. A subscription
+    without a URL is always incomplete because no saved scan can identify it.
+    ``missing_channels`` contains display names, falling back to folder, URL,
+    then ``Unnamed channel``. Missing, malformed, and legacy count records all
+    need a new scan; a valid record containing zero videos is complete.
+    """
+    if cache is None:
+        cache = load_disk_cache()
+    seen_urls: set[str] = set()
+    total = cached = 0
+    missing = []
+    for channel in channels:
+        url = str(channel.get("url") or "").strip()
+        if url and url in seen_urls:
+            continue
+        if url:
+            seen_urls.add(url)
+        total += 1
+        if url and _cache_record_complete(cache.get(url)):
+            cached += 1
+        else:
+            missing.append(str(channel.get("name") or channel.get("folder")
+                               or url or "Unnamed channel"))
+    return {"complete": cached == total, "cached_channels": cached,
+            "total_channels": total, "missing_channels": missing}
+
+
 def heal_malformed_cache_entries() -> int:
     """Drop cache entries that lack `num_vids`/`size_bytes` so the next
     Subs render triggers a proper rescan instead of showing `—`.
@@ -592,11 +661,7 @@ def heal_malformed_cache_entries() -> int:
         cache = load_disk_cache()
         dropped = []
         for url, rec in list(cache.items()):
-            if (not isinstance(rec, dict)
-                    or "num_vids" not in rec
-                    or "size_bytes" not in rec
-                    or _cache_int(rec.get("count_semantics_version"), 0)
-                       < _COUNT_SEMANTICS_VERSION):
+            if not _cache_record_complete(rec):
                 dropped.append(url)
         if not dropped:
             return 0
@@ -819,12 +884,21 @@ def index_summary() -> dict[str, Any]:
     cache = load_disk_cache()
     channels = cfg.get("channels", [])
 
-    tot = archive_totals(cache)
+    coverage = cache_coverage(channels, cache)
+    # A saved cache can retain records for removed subscriptions or be only
+    # partly populated. Sum usable current subscriptions and report coverage
+    # explicitly so the UI cannot present a partial scan as a library total.
+    active_cache = {}
+    for channel in channels:
+        url = str(channel.get("url") or "").strip()
+        if url and _cache_record_complete(cache.get(url)):
+            active_cache[url] = cache[url]
+    tot = archive_totals(active_cache)
     # Count how many channels have auto_transcribe ON
     transcribed_channels = sum(1 for c in channels if c.get("auto_transcribe"))
     per_channel = []
     for ch in channels:
-        st = stats_for_channel(ch, cache)
+        st = stats_for_channel(ch, active_cache)
         per_channel.append({
             "folder": ch.get("name") or ch.get("folder", ""),
             "n_vids": st["n_vids"],
@@ -837,6 +911,9 @@ def index_summary() -> dict[str, Any]:
     return {
         "cards": {
             "channels": len(channels),
+            "scan_complete": coverage["complete"],
+            "scanned_channels": coverage["cached_channels"],
+            "total_channels": coverage["total_channels"],
             "videos": tot["videos"],
             "physical_copies": tot["physical_copies"],
             "size_gb": tot["size_gb"],
@@ -862,15 +939,15 @@ def index_db_stats() -> dict[str, Any]:
     JOIN aggregate run for many seconds — long enough to hang the
     boot sequence if it ran inline. Settings panel calls this async.
 
-    Returns: {segments, hours, index_db_bytes, index_db_size_label}
-    All numeric fields default to 0 on any error (frontend renders
-    "0" instead of "\u2014").
+    Numeric fields retain their legacy zero fallback on failure. An explicit
+    ``ok=False`` and ``error`` distinguish a failed read from an empty catalog.
     """
     segments_count = 0
     hours = 0.0
     index_db_bytes = 0
     transcribed_videos = 0
     total_videos = 0
+    error = None
     try:
         from . import index as _idx
         from .ytarchiver_config import TRANSCRIPTION_DB as _DB
@@ -937,8 +1014,10 @@ def index_db_stats() -> dict[str, Any]:
                 except Exception as _ce:
                     _log.debug("swallowed: %s", _ce)
     except Exception as e:
-        _log.debug("swallowed: %s", e)
-    return {
+        _log.warning("catalog statistics could not be read: %s", e)
+        error = "Catalog statistics could not be read. Try again in a moment."
+    result = {
+        "ok": error is None,
         "segments": segments_count,
         "hours": round(hours, 1) if hours > 0 else 0,
         "index_db_bytes": index_db_bytes,
@@ -946,3 +1025,6 @@ def index_db_stats() -> dict[str, Any]:
         "transcribed_videos": transcribed_videos,
         "total_videos": total_videos,
     }
+    if error:
+        result["error"] = error
+    return result

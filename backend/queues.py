@@ -86,6 +86,9 @@ class QueueState:
         # Current in-flight items (not yet re-queued, but shown in popover)
         self.current_sync: dict[str, Any] | None = None
         self.current_gpu: dict[str, Any] | None = None
+        # Only an explicit full-library request creates this durable checklist.
+        # Queue drains and individual channels cannot imply a full sync.
+        self._full_sync_batch: dict[str, Any] | None = None
 
         # Sync-pass progress: when "Sync Subbed" runs, we don't enqueue 103
         # individual channel items into `self.sync` — we iterate them
@@ -302,6 +305,9 @@ class QueueState:
             elif isinstance(replacement, dict):
                 normalized, _changed = self._normalize_task(
                     replacement, normalized_lane)
+                if ((previous or {}).get("cancel_requested")
+                        and normalized.get("task_id") == current_id):
+                    normalized["cancel_requested"] = True
             else:
                 return False
             if previous == normalized:
@@ -566,6 +572,8 @@ class QueueState:
         gpu_normalized = gpu_normalized or gpu_deduped
         with self._lock:
             self.sync = sync_items
+            self._full_sync_batch = self._read_full_sync_batch(
+                data.get("full_sync_batch"))
             # Unknown keys from older queue schemas are intentionally ignored.
             self.gpu = gpu_items
             self.gpu_paused = bool(data.get("gpu_paused", False))
@@ -617,6 +625,19 @@ class QueueState:
             resuming_normalized = False
             for lane in ("sync", "gpu"):
                 item = self._loaded_resuming.get(lane)
+                if (lane == "sync" and isinstance(item, dict)
+                        and item.get("cancel_requested")):
+                    # A cancelled running attempt must not restart after a
+                    # crash. Any separately saved deferred copy stays pending.
+                    batch = self._full_sync_batch
+                    task_id = item.get("task_id")
+                    if (batch and task_id in batch["required"]
+                            and not any(pending.get("task_id") == task_id
+                                        for pending in self.sync)):
+                        batch["failed"] = True
+                        batch["completed_at"] = None
+                    resuming_normalized = True
+                    continue
                 if not isinstance(item, dict):
                     if item is not None:
                         resuming_normalized = True
@@ -684,6 +705,8 @@ class QueueState:
             "gpu_paused": self.gpu_paused,
             "sync_paused": self.sync_paused,
         }
+        if self._full_sync_batch is not None:
+            payload["full_sync_batch"] = copy.deepcopy(self._full_sync_batch)
         # Preserve loaded-but-not-yet-consumed recovery slots during schema
         # migration. Startup removes them explicitly after requeueing; a
         # background migration save must not erase them first.
@@ -923,6 +946,137 @@ class QueueState:
 
     def sync_enqueue(self, channel: dict[str, Any]) -> bool:
         return self.sync_enqueue_with_id(channel) is not None
+
+    @staticmethod
+    def _read_full_sync_batch(value) -> dict[str, Any] | None:
+        """Accept only an intact explicit checklist; legacy queues have none."""
+        if not isinstance(value, dict) or not isinstance(value.get("id"), str):
+            return None
+        required, completed = value.get("required"), value.get("completed")
+        if (not value["id"] or not isinstance(required, list) or not required
+                or not isinstance(completed, list)
+                or not all(isinstance(item, str) and item
+                           for item in required + completed)
+                or len(set(required)) != len(required)
+                or len(set(completed)) != len(completed)
+                or not set(completed).issubset(required)
+                or not isinstance(value.get("failed"), bool)):
+            return None
+        result = copy.deepcopy(value)
+        stamp = result.get("completed_at")
+        if stamp is not None:
+            if (type(stamp) not in (int, float) or not 0 < stamp < 253402300800
+                    or result["failed"] or set(completed) != set(required)):
+                return None
+        elif set(completed) == set(required):
+            return None
+        return result
+
+    def sync_enqueue_full_library(self, channels) -> dict[str, Any]:
+        """Atomically stage a full request and its exact completion scope."""
+        with self._lock:
+            previous_sync = copy.deepcopy(self.sync)
+            previous_batch = copy.deepcopy(self._full_sync_batch)
+            used_ids = {str(item.get("task_id") or "")
+                        for item in self.sync + self.gpu}
+            if self.current_sync:
+                used_ids.add(str(self.current_sync.get("task_id") or ""))
+            required = []
+            queued = skipped = 0
+            for channel in channels:
+                key = self._sync_identity_key(channel)
+                existing = next((item for item in self.sync
+                                 if key is not None
+                                 and self._sync_identity_key(item) == key), None)
+                if existing is None:
+                    existing, _ = self._normalize_task(channel, "sync", used_ids)
+                    self.sync.append(existing)
+                    queued += 1
+                else:
+                    skipped += 1
+                task_id = existing["task_id"]
+                if task_id not in required:
+                    required.append(task_id)
+            self._full_sync_batch = ({
+                "id": uuid.uuid4().hex, "required": required,
+                "completed": [], "failed": False, "completed_at": None,
+            } if required else None)
+            if not self.save_now():
+                self.sync = previous_sync
+                self._full_sync_batch = previous_batch
+                return {"ok": False, "error": "The full sync queue could not be saved. Nothing was added."}
+            total_queued = len(self.sync)
+        self._notify()
+        return {"ok": True, "queued": queued, "skipped": skipped,
+                "total_queued": total_queued}
+
+    def sync_record_full_sync_result(self, task_id: str, success: bool) -> bool:
+        """Save an outcome before acknowledging its current recovery slot.
+
+        Defer/pause keeps the same ID pending; only its eventual completed
+        attempt counts. Removed tasks stay outstanding, never becoming success.
+        """
+        with self._lock:
+            batch = self._full_sync_batch
+            if batch is None or task_id not in batch["required"]:
+                return True
+            if any(item.get("task_id") == task_id for item in self.sync):
+                return True
+            previous = copy.deepcopy(batch)
+            if (self.current_sync
+                    and self.current_sync.get("task_id") == task_id
+                    and self.current_sync.get("cancel_requested")):
+                success = False
+            if success:
+                if task_id not in batch["completed"]:
+                    batch["completed"].append(task_id)
+            else:
+                batch["failed"] = True
+                batch["completed_at"] = None
+            if (not batch["failed"]
+                    and set(batch["completed"]) == set(batch["required"])
+                    and batch["completed_at"] is None):
+                batch["completed_at"] = time.time()
+            if self.save_now():
+                return True
+            self._full_sync_batch = previous
+            return False
+
+    def full_sync_completion(self) -> dict[str, Any] | None:
+        with self._lock:
+            batch = self._full_sync_batch
+            if batch and batch.get("completed_at") and not batch["failed"]:
+                # The outcome is committed before the current slot is cleared.
+                # Do not publish the timestamp until that clear also succeeds.
+                current_id = (self.current_sync or {}).get("task_id")
+                recovered_id = (self._loaded_resuming.get("sync") or {}).get("task_id")
+                if (current_id not in batch["required"]
+                        and recovered_id not in batch["required"]
+                        and not any(item.get("task_id") in batch["required"]
+                                    for item in self.sync)):
+                    return copy.deepcopy(batch)
+            return None
+
+    def sync_finish_task_durable(self, task_id: str, success: bool) -> bool:
+        """Acknowledge an outcome and current slot under the cancellation lock."""
+        with self._lock:
+            if (self.current_sync or {}).get("task_id") != task_id:
+                return False
+            if not self.sync_record_full_sync_result(task_id, success):
+                return False
+            return self.replace_current_task_durable(
+                "sync", None, expected_task_id=task_id)
+
+    def clear_full_sync_completion(self, batch_id: str) -> bool:
+        with self._lock:
+            previous = self._full_sync_batch
+            if not previous or previous["id"] != batch_id:
+                return True
+            self._full_sync_batch = None
+            if self.save_now():
+                return True
+            self._full_sync_batch = previous
+            return False
 
     def sync_reserve_task(self, channel: dict[str, Any]) -> str | None:
         """Durably claim or create one logical sync-lane task.
@@ -1869,24 +2023,30 @@ class QueueState:
         # snapshot race). Persist immediately because a Windows force-kill
         # skips atexit and a 0.5s debounce can lose this transition (H106).
         with self._lock:
+            previous = self.current_sync
             if ch:
                 self.current_sync, _changed = self._normalize_task(
                     ch, "sync")
+                if ((previous or {}).get("cancel_requested")
+                        and self.current_sync.get("task_id") == previous.get("task_id")):
+                    self.current_sync["cancel_requested"] = True
             else:
                 self.current_sync = None
             _payload = (self._build_resuming_payload_locked()
                         if config_is_writable() else None)
-        self._notify()
-        if _payload is not None:
-            try:
-                if not self._write_resuming_payload(_payload):
+            # Keep cursor/label decoration serialized with durable cancellation;
+            # a stale sidecar snapshot must not undo an accepted Cancel.
+            if _payload is not None:
+                try:
+                    if not self._write_resuming_payload(_payload):
+                        self._mark_identity_persistence_failed()
+                        self.save_debounced()
+                except Exception:
                     self._mark_identity_persistence_failed()
                     self.save_debounced()
-            except Exception:
+            else:
                 self._mark_identity_persistence_failed()
-                self.save_debounced()
-        else:
-            self._mark_identity_persistence_failed()
+        self._notify()
 
     def set_sync_pass_progress(self, index: int, total: int) -> None:
         """Record `(index, total)` so the popover label reads
@@ -1981,6 +2141,7 @@ class QueueState:
                 "task_id": cur_sync["task_id"],
                 "name": label,
                 "status": "running",
+                "cancel_requested": bool(cur_sync.get("cancel_requested")),
                 "kind": (cur_sync.get("kind") or "download"),
                 "url": (cur_sync.get("url") or "").strip(),
                 "channel_name": (cur_sync.get("name")

@@ -43,6 +43,7 @@ class TranscribeProgressStateTests(unittest.TestCase):
             }],
         }))
         manager._proc = process
+        manager._loaded_model = "small"
         manager._line_queue = responses
 
         job = {

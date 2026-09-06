@@ -45,7 +45,100 @@
     const rowsEl = document.getElementById("diag-rows");
     const summaryEl = document.getElementById("diag-summary");
     const integrityEl = document.getElementById("diag-integrity-results");
-    if (!bd) return;
+    if (!bd || bd.dataset.diagnosticsReady) return;
+    bd.dataset.diagnosticsReady = "true";
+    if (refreshBtn) {
+      refreshBtn.textContent = "Recheck dependencies";
+      refreshBtn.title = "Check installed tools and app dependencies. This does not scan your archive.";
+    }
+    if (integrityBtn) integrityBtn.textContent = "Deep archive check…";
+    const background = document.createElement("button");
+    background.type = "button";
+    background.className = "integrity-background-status";
+    background.hidden = true;
+    document.body.appendChild(background);
+    let scanState = null;
+    let pollTimer = null;
+    let polling = false;
+    let viewedJob = null;
+    const elapsed = seconds => {
+      const value = Math.max(0, Math.floor(Number(seconds) || 0));
+      return `${Math.floor(value / 60)}m ${String(value % 60).padStart(2, "0")}s`;
+    };
+    function updateBackground() {
+      const running = !!scanState?.running;
+      background.hidden = !bd.hidden || !scanState?.job_id
+        || (!running && viewedJob === scanState.job_id);
+      background.textContent = running
+        ? `Deep check: ${scanState.cancel_requested ? "stopping" : scanState.phase} · ${elapsed(scanState.elapsed_seconds)} — View`
+        : "Deep archive check finished — View results";
+      if (closeBtn) closeBtn.textContent = running ? "Close — continues in background" : "Close";
+      if (integrityBtn) {
+        integrityBtn.disabled = running;
+        integrityBtn.textContent = running ? "Deep check running…" : "Deep archive check…";
+      }
+    }
+
+    function renderProgress() {
+      let cancel = integrityEl.querySelector("#diag-integrity-cancel");
+      if (!cancel) {
+        showIntegrityMessage("");
+        integrityEl.firstElementChild.setAttribute("role", "status");
+        const note = document.createElement("div");
+        note.className = "diag-integrity-notice";
+        note.textContent = "Read-only check. Closing this window continues the check in the background. Large Search indexes can take several minutes.";
+        cancel = document.createElement("button");
+        cancel.type = "button";
+        cancel.className = "btn";
+        cancel.id = "diag-integrity-cancel";
+        integrityEl.append(note, cancel);
+        cancel.addEventListener("click", async () => {
+          cancel.disabled = true;
+          try {
+            const result = await bridgeCall("integrity_scan_cancel", scanState.job_id);
+            if (!result?.ok) throw new Error(result?.error || "Could not request cancellation");
+            scanState.cancel_requested = true;
+            renderProgress();
+            updateBackground();
+          } catch (error) {
+            cancel.disabled = false;
+            note.textContent = `Cancellation could not be confirmed: ${String(error)}. The check may still be running.`;
+          }
+        });
+      }
+      integrityEl.firstElementChild.textContent = `${scanState.cancel_requested ? "Stopping after the current read…" : scanState.phase}`
+        + ` · ${Number(scanState.completed || 0).toLocaleString()} ${scanState.unit || "items checked"}`
+        + ` · ${elapsed(scanState.elapsed_seconds)} elapsed`;
+      cancel.textContent = scanState.cancel_requested ? "Stopping…" : "Cancel deep check";
+      cancel.disabled = !!scanState.cancel_requested;
+    }
+
+    async function pollScan() {
+      if (polling) return;
+      polling = true;
+      try {
+        const state = await bridgeCall("integrity_scan_state");
+        if (!state?.ok) throw new Error(state?.error || "Status is unavailable");
+        if (state.job_id) scanState = state;
+        if (scanState?.running) renderProgress();
+        else if (scanState?.result) {
+          renderIntegrity(scanState.result);
+          if (!bd.hidden) viewedJob = scanState.job_id;
+        }
+        updateBackground();
+      } catch (error) {
+        const message = `Deep check status is temporarily unavailable: ${String(error)}. The check may still be running.`;
+        if (scanState?.running) {
+          renderProgress();
+          integrityEl.children[1].textContent = message;
+        } else {
+          showIntegrityMessage(message, "diag-integrity-error");
+        }
+      } finally {
+        polling = false;
+        if (scanState?.running) pollTimer = setTimeout(pollScan, 1000);
+      }
+    }
 
     function showIntegrityMessage(message, className) {
       if (!integrityEl) return;
@@ -154,7 +247,7 @@
         } else if (warnN > 0) {
           summaryEl.textContent = `${okN} ok - ${warnN} warning${warnN === 1 ? "" : "s"}`;
         } else {
-          summaryEl.textContent = `All ${okN} checks passed`;
+          summaryEl.textContent = `All ${okN} dependency checks passed`;
         }
       } catch (e) {
         rowsEl.innerHTML = `<div class="browse-empty askq-empty-padded">Error: ${escapeHtml(String(e))}</div>`;
@@ -169,41 +262,42 @@
       }
       const proceed = askConfirm
         ? await askConfirm(
-          "Preview archive integrity",
-          "This read-only scan may take a while on a large archive. It lists recommended repairs but does not change any files. Continue?",
-          { confirm: "Run preview" },
+          "Deep archive check",
+          "This read-only check can take several minutes on a large archive. It compares saved videos, transcripts, and Search data, and lists recommended repairs without changing files. You can cancel it or close this window to continue in the background.",
+          { confirm: "Start deep check" },
         )
         : true;
       if (!proceed) return;
 
       integrityBtn.disabled = true;
-      const oldLabel = integrityBtn.textContent;
-      integrityBtn.textContent = "Scanning…";
-      showIntegrityMessage(
-        "Checking archive files, library data, queues, transcripts, and Search…",
-      );
+      integrityBtn.textContent = "Starting…";
+      showIntegrityMessage("Starting deep archive check…");
       try {
-        const result = await bridgeCall("integrity_scan_preview");
-        renderIntegrity(result);
-        if (summaryEl && result?.summary) {
-          const count = Number(result.summary.issues || 0);
-          summaryEl.textContent = count
-            ? `${count} integrity item${count === 1 ? "" : "s"} to review`
-            : "Integrity preview clean";
-        }
+        const result = await bridgeCall("integrity_scan_start");
+        if (!result?.ok) throw new Error(result?.error || "Could not start the check");
+        scanState = { job_id: result.job_id, running: true, phase: "Starting deep archive check" };
+        clearTimeout(pollTimer);
+        await pollScan();
       } catch (error) {
         showIntegrityMessage(
           `Integrity preview failed: ${String(error)}`,
           "diag-integrity-error",
         );
       } finally {
-        integrityBtn.disabled = false;
-        integrityBtn.textContent = oldLabel;
+        updateBackground();
       }
     }
 
-    const show = () => { bd.hidden = false; run(); };
-    const hide = () => { bd.hidden = true; };
+    const show = () => {
+      bd.hidden = false;
+      if (!scanState?.running) viewedJob = scanState?.job_id;
+      updateBackground();
+      run();
+      clearTimeout(pollTimer);
+      pollScan();
+    };
+    const hide = () => { bd.hidden = true; updateBackground(); };
+    background.addEventListener("click", show);
     openBtn?.addEventListener("click", show);
     closeBtn?.addEventListener("click", hide);
     refreshBtn?.addEventListener("click", run);

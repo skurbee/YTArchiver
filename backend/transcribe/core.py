@@ -529,6 +529,10 @@ class TranscribeManager:
                 channel=job.get("channel", ""),
                 quality=followup.get("quality", "Average"),
                 output_res=str(followup.get("output_res", "720")),
+                # Inherit the parent transcribe's nesting so the
+                # compress line lands under the same video row its
+                # Metadata / Transcription siblings used.
+                from_download=bool(job.get("from_download")),
             )
         except Exception as exc:
             _log.warning("compression follow-up enqueue failed: %s", exc)
@@ -1347,7 +1351,8 @@ class TranscribeManager:
     def compress_enqueue(self, path: str, title: str = "",
                          channel: str = "", quality: str = "Average",
                          output_res: str = "720",
-                         on_complete: Callable | None = None) -> bool:
+                         on_complete: Callable | None = None,
+                         from_download: bool = False) -> bool:
         """Queue a video for AV1 NVENC compression via the same GPU
         worker that handles transcription.
 
@@ -1392,6 +1397,7 @@ class TranscribeManager:
             "channel": channel,
             "quality": quality,
             "output_res": str(output_res),
+            "from_download": bool(from_download),
             "cb": on_complete,
             "cancel": threading.Event(),
         }
@@ -2011,6 +2017,7 @@ class TranscribeManager:
                     job["_pending_decremented"] = True
             except Exception as exc:
                 _log.debug("pending counter cleanup failed: %s", exc)
+        self._release_compress_slots(removed_jobs)
         self._notify_jobs_cancelled(removed_jobs)
         return True
 
@@ -2299,6 +2306,7 @@ class TranscribeManager:
                     job["_pending_decremented"] = True
             except Exception as e:
                 _log.debug("pending counter cleanup failed: %s", e)
+        self._release_compress_slots(removed_jobs)
         self._notify_jobs_cancelled(removed_jobs)
         return len(removed_jobs)
 
@@ -2427,6 +2435,7 @@ class TranscribeManager:
                         self._stop_subprocess(force=True)
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
+        self._release_compress_slots(discarded_jobs)
         self._notify_jobs_cancelled(discarded_jobs)
         return True
 
@@ -2536,6 +2545,48 @@ class TranscribeManager:
         except Exception as exc:
             _log.debug("transcription state callback failed: %s", exc)
 
+    @staticmethod
+    def _job_holds_compress_slot(job: dict[str, Any]) -> bool:
+        """Does this job own a reserved compress log slot?
+
+        sync.py emits a `Compression queued…` placeholder under the
+        video's own row the moment a compress is requested, so the later
+        `Encoding…`/progress/`✓ Compressed` lines replace it in place
+        instead of appending under an unrelated channel. Only the encode
+        itself ever fills that slot, so work that dies before the encode
+        starts has to take the placeholder with it.
+        """
+        if not isinstance(job, dict):
+            return False
+        if str(job.get("kind") or "") == "compress":
+            return True
+        # A transcribe job still carrying an un-enqueued follow-up: the
+        # compress it promised will now never be queued.
+        return bool(job.get("compress_after")
+                    and not job.get("_followup_enqueued"))
+
+    def _release_compress_slot(self, job: dict[str, Any]) -> None:
+        """Drop *job*'s reserved compress log slot, if it holds one."""
+        if not self._job_holds_compress_slot(job):
+            return
+        path = str(job.get("path") or "")
+        if not path:
+            return
+        try:
+            from ..compress import clear_compress_marker
+            clear_compress_marker(self._stream, path)
+        except Exception as exc:
+            _log.debug("compress slot release failed: %s", exc)
+
+    def _release_compress_slots(self, jobs: list[dict[str, Any]]) -> None:
+        """Same, for a batch of jobs dropped before the worker saw them."""
+        seen: set[int] = set()
+        for job in jobs or []:
+            if id(job) in seen:
+                continue
+            seen.add(id(job))
+            self._release_compress_slot(job)
+
     @classmethod
     def _notify_jobs_cancelled(cls, jobs: list[dict[str, Any]]) -> None:
         """Clear UI state for jobs removed before the worker can see them."""
@@ -2612,6 +2663,7 @@ class TranscribeManager:
             payload.update({
                 "quality": job.get("quality", "Average"),
                 "output_res": str(job.get("output_res", "720")),
+                "from_download": bool(job.get("from_download")),
             })
         else:
             payload.update({
@@ -2674,6 +2726,8 @@ class TranscribeManager:
                         job.update({
                             "quality": item.get("quality", "Average"),
                             "output_res": str(item.get("output_res", "720")),
+                            "from_download": bool(
+                                item.get("from_download")),
                         })
                     else:
                         job.update({
@@ -3211,11 +3265,7 @@ class TranscribeManager:
                     return self._retry_no_speech_classification(job)
                 if job_kind == "compress":
                     return self._compress_one(job)
-                return (
-                    self._transcribe_one(job)
-                    if self._prepare_job_model(job)
-                    else _WorkerOutcome.FAILED
-                )
+                return self._transcribe_one(job)
 
             def _invalid_result(returned, job_kind=_job_kind) -> None:
                 self._stream.emit_error(
@@ -3354,6 +3404,11 @@ class TranscribeManager:
                     outcome = _WorkerOutcome.CLEANUP_FAILED
 
                 self._restore_job_after_outcome(job, outcome)
+                if outcome is _WorkerOutcome.CANCELLED:
+                    # FAILED/RETRY keep the task in Processing, so their
+                    # reserved compress slot stays valid until the retry
+                    # fills it. A cancelled job is gone for good.
+                    self._release_compress_slot(job)
                 if execution_decision(outcome).pause_for_retry:
                     # A deterministic failure must not hot-loop. The task
                     # remains first in both queues; Start/Resume retries it.
@@ -3624,6 +3679,7 @@ class TranscribeManager:
                     cancel_event=job["cancel"],
                     process_owner="processing",
                     task_id=str(job.get("task_id") or ""),
+                    from_download=bool(job.get("from_download")),
                 )
         except Exception as e:
             self._stream.emit_error(f"Compress: {e}")
@@ -3847,7 +3903,11 @@ class TranscribeManager:
                 job_tag=job_tag,
                 video_id_hint=job.get("video_id", ""),
                 from_download=bool(job.get("from_download")),
+                combined_override=job.get("combined_override"),
+                cancel_event=job.get("cancel"),
                 update_pending=False))
+            if caption_outcome is _CaptionOutcome.CANCELLED:
+                return _WorkerOutcome.CANCELLED
             if caption_outcome is _CaptionOutcome.SUCCESS:
                 if not self._finish_successful_job(
                         job, {"auto_captions": True}):
@@ -3888,6 +3948,11 @@ class TranscribeManager:
             self._stream.emit_error(
                 "Whisper: Python 3.11 not found. Install from python.org "
                 "to enable transcription. Task kept for retry.")
+            return _WorkerOutcome.FAILED
+
+        if job["cancel"].is_set() or self._cancel_all.is_set():
+            return _WorkerOutcome.CANCELLED
+        if not self._prepare_job_model(job):
             return _WorkerOutcome.FAILED
 
         proc, _line_q = self._snapshot_worker_io()
@@ -4530,23 +4595,9 @@ class TranscribeManager:
                 elif not self._graceful_cancel_current():
                     self._stop_subprocess(force=True)
                 return _WorkerOutcome.CANCELLED, None
-            # pause also polled inside the read loop so a
-            # long chunk mid-transcription can actually pause, not
-            # just at chunk boundaries. Signal "actually paused" so the
-            # Resume button stops blinking once we land in the wait.
-            if (self._paused.is_set()
-                    and not job["cancel"].is_set()
-                    and not self._cancel_all.is_set()):
-                if self._queues is not None:
-                    try: self._queues.set_gpu_paused_active(True)
-                    except Exception as e: _log.debug("swallowed: %s", e)
-                while (self._paused.is_set()
-                       and not job["cancel"].is_set()
-                       and not self._cancel_all.is_set()):
-                    time.sleep(0.5)
-                if self._queues is not None:
-                    try: self._queues.set_gpu_paused_active(False)
-                    except Exception as e: _log.debug("swallowed: %s", e)
+            # Whisper cannot pause inference in flight. Continue draining its
+            # result and keep the UI in "finishing current task" until the next
+            # chunk/job boundary, where the worker can actually become idle.
             if job["cancel"].is_set() or self._cancel_all.is_set():
                 if self._cancel_all.is_set():
                     self._stop_subprocess(force=True)
@@ -4638,14 +4689,12 @@ class TranscribeManager:
         # a transcript to disk (audit: transcribe/core.py:783-799 +
         # transcribe H60 — previously only `_cancel_all` was checked,
         # letting a per-job `job["cancel"]` slip past).
-        if self._cancel_all.is_set():
+        def _output_cancelled():
+            per_job = job.get("cancel") if isinstance(job, dict) else None
+            return self._cancel_all.is_set() or (per_job is not None and per_job.is_set())
+
+        if _output_cancelled():
             return _WorkerOutcome.CANCELLED
-        try:
-            _job_cancel_ev = (job or {}).get("cancel") if isinstance(job, dict) else None
-            if _job_cancel_ev is not None and _job_cancel_ev.is_set():
-                return _WorkerOutcome.CANCELLED
-        except Exception:
-            pass
         if not title:
             title = os.path.basename(video_path).rsplit(".", 1)[0]
             # Strip any trailing " [videoId]" if the stem has one
@@ -4691,6 +4740,8 @@ class TranscribeManager:
         else:
             txt_path, jsonl_path, _y, _m, upload_date = paths
 
+        if _output_cancelled():
+            return _WorkerOutcome.CANCELLED
         text = (result.get("text") or "").strip()
         segs = result.get("segments", []) or []
 
@@ -4780,6 +4831,8 @@ class TranscribeManager:
             _log.debug("swallowed: %s", e)
 
         duration = segs[-1].get("end", segs[-1].get("e", 0)) if segs else 0
+        if _output_cancelled():
+            return _WorkerOutcome.CANCELLED
         if not self._arm_output_write_intent(job):
             return _WorkerOutcome.FAILED
 
@@ -4817,6 +4870,10 @@ class TranscribeManager:
                     f"{os.path.basename(jsonl_path)}: backup capture "
                     f"failed ({_bke}). Files left untouched.")
                 return _WorkerOutcome.FAILED
+            # Backup capture and journal writes can take time. Accept Cancel
+            # until the first output changes, then finish the paired commit.
+            if _output_cancelled():
+                return _WorkerOutcome.CANCELLED
             try:
                 extra_titles = _replace_jsonl_entry(
                     jsonl_path, title, vid_id, segs,
@@ -4906,6 +4963,8 @@ class TranscribeManager:
                 return _WorkerOutcome.FAILED
             _hide_per_video_transcript_txt_if_needed(video_path, txt_path)
         else:
+            if _output_cancelled():
+                return _WorkerOutcome.CANCELLED
             if not _write_transcript_entry(txt_path, title, upload_date,
                                            duration, source_tag, text,
                                            video_id=vid_id):

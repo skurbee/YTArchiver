@@ -1274,10 +1274,10 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 return
             try:
                 from backend.archive_scan import (
-                    archive_totals,
+                    cache_coverage,
                     heal_malformed_cache_entries,
-                    load_disk_cache,
-                    save_disk_cache,
+                    index_summary,
+                    publish_scan_stats,
                     scan_all_channels,
                 )
                 # issue #134: drop any cache entries that only contain a
@@ -1286,11 +1286,13 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 # show as "—" in Subs table + Index summary. Force a
                 # walk when any are found so the next pass fills them in.
                 dropped = heal_malformed_cache_entries()
+                coverage = cache_coverage(load_config().get("channels", []))
                 stale_hours = int(cfg.get("disk_scan_staleness_hours", 24) or 0)
                 last_ts = float(cfg.get("last_disk_scan_ts", 0) or 0)
                 age_hours = (_time.time() - last_ts) / 3600.0 if last_ts > 0 else 1e9
                 do_walk = ((stale_hours <= 0) or (age_hours >= stale_hours)
-                           or (last_ts == 0) or (dropped > 0))
+                           or (last_ts == 0) or (dropped > 0)
+                           or not coverage["complete"])
 
                 if do_walk:
                     dots_state["sweep"]["phase"] = "Scanning disk"
@@ -1314,9 +1316,13 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                             " Disk scan deferred — sync or foreground work "
                             "started; existing cache preserved.")
                         _flush_now()
-                        return
+                        return False
                     if walked:
-                        save_disk_cache(walked)
+                        # Merge counts into the current cache so concurrent
+                        # subscriber metadata and newer sync results survive.
+                        published = publish_scan_stats(walked)
+                        coverage = cache_coverage(
+                            load_config().get("channels", []), published)
                         # Persist the timestamp so next boot can decide
                         # staleness. Previously the exception handler
                         # silently swallowed failures — reported
@@ -1326,15 +1332,16 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                         # off, disk full, permissions, etc.) is visible
                         # in the log instead of mysteriously rescanning
                         # forever.
-                        try:
-                            _unused, c2 = update_config(
-                                lambda live: live.__setitem__(
-                                    "last_disk_scan_ts", _time.time()))
-                            self._config = c2
-                        except Exception as _se:
-                            s.emit_error(
-                                f"Disk scan timestamp save raised: {_se}")
-                            _flush_now()
+                        if coverage["complete"]:
+                            try:
+                                _unused, c2 = update_config(
+                                    lambda live: live.__setitem__(
+                                        "last_disk_scan_ts", _time.time()))
+                                self._config = c2
+                            except Exception as _se:
+                                s.emit_error(
+                                    f"Disk scan timestamp save raised: {_se}")
+                                _flush_now()
                 else:
                     # Explicit dim log line when we SKIP the scan so
                     # the user can tell it's honoring the staleness
@@ -1346,9 +1353,12 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                         f"staleness threshold is {stale_hours}h.")
                     _flush_now()
                 # Emit the milestone from the freshly-walked (or still-cached) totals.
-                cache = load_disk_cache()
-                t = archive_totals(cache)
-                if t["videos"] > 0:
+                t = index_summary()["cards"]
+                if not t["scan_complete"]:
+                    s.emit_dim(
+                        " Saved disk scan is incomplete "
+                        f"({t['scanned_channels']}/{t['total_channels']} channels).")
+                elif t["videos"] > 0:
                     s.emit_text(
                         f"--- Disk scan complete ({t['channels']} channels \u00b7 "
                         f"{t['videos']:,} videos \u00b7 "
@@ -1368,7 +1378,15 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     if self._window is not None:
                         self._window.evaluate_js(
                             "if (window.refreshSubsTable) "
-                            "window.refreshSubsTable();")
+                            "window.refreshSubsTable();"
+                            "if (document.getElementById('panel-health')"
+                            "?.classList.contains('active')) {"
+                            "if (!document.getElementById('settings-view-library')"
+                            "?.hidden && window._refreshIndexStats) "
+                            "window._refreshIndexStats();"
+                            "if (!document.getElementById('settings-view-overview')"
+                            "?.hidden && window._refreshHealthOverview) "
+                            "window._refreshHealthOverview();}")
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
             except Exception as e:
@@ -1513,26 +1531,32 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             except Exception as e:
                 _log.debug("swallowed: %s", e)
 
-            stage3_done.set()
-            # Wait > the animator's 0.4s sleep cycle so its loop
-            # definitely sees stage3_done and exits before cleanup.
-            cancel_event.wait(0.5)
-            _clear_loading()
-            # Clear the live indexing indicator.
-            try:
-                _push_indicator("sweep", None)
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-
         # Sequential stages on one background thread — each milestone
         # fires the moment its stage finishes.
         def _run_stages():
             """Run slow startup stages in order on the boot worker thread."""
             try:
-                if not cancel_event.is_set():
-                    _stage2_disk_walk()
-                if not cancel_event.is_set():
-                    _stage3_sweep()
+                try:
+                    disk_scan_deferred = False
+                    if not cancel_event.is_set():
+                        disk_scan_deferred = _stage2_disk_walk() is False
+                    if not cancel_event.is_set():
+                        _stage3_sweep()
+                    # The sweep yields to active work. Retry a disk count that
+                    # was interrupted during launch once that work has settled,
+                    # rather than leaving partial counts until the next launch.
+                    if disk_scan_deferred and not cancel_event.is_set():
+                        _stage2_disk_walk()
+                finally:
+                    # Keep progress visible through a deferred count retry.
+                    stage3_done.set()
+                    # Let the animator observe completion before clearing it.
+                    cancel_event.wait(0.5)
+                    _clear_loading()
+                    try:
+                        _push_indicator("sweep", None)
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
                 # Start only after the local sweep finishes: it guarantees
                 # normal cache rows exist and avoids racing the sweep's final
                 # disk-cache merge. This remains independent background work,

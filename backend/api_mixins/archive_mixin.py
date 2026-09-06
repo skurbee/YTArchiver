@@ -388,6 +388,7 @@ class ArchiveMixin:
         if (hasattr(self, "_archive_single_lock")
                 and hasattr(self, "_archive_single_inflight")
                 and hasattr(self, "_archive_single_cancel_events")
+                and hasattr(self, "_archive_single_jobs")
                 and hasattr(self, "_archive_single_threads")):
             return
         with _archive_init_lock:
@@ -399,6 +400,19 @@ class ArchiveMixin:
                 self._archive_single_cancel_events = {}
             if not hasattr(self, "_archive_single_threads"):
                 self._archive_single_threads = {}
+            if not hasattr(self, "_archive_single_jobs"):
+                self._archive_single_jobs = {}
+
+    def archive_single_status(self) -> dict:
+        """Active manual downloads, including cancellation awaiting worker exit."""
+        self._ensure_archive_single_tracking()
+        with self._archive_single_lock:
+            return {"ok": True, "tasks": [
+                {**job, "state": (
+                    "cancelling" if self._archive_single_cancel_events[task_id].is_set()
+                    else "running")}
+                for task_id, job in self._archive_single_jobs.items()
+                if task_id in self._archive_single_cancel_events]}
 
     def archive_single_is_running(self) -> bool:
         try:
@@ -463,6 +477,17 @@ class ArchiveMixin:
     # ─── Single-URL archive (Enter on URL field) ───────────────────────
 
     def archive_single_video(self, url, options=None):
+        """Start a manual download and release admission state on setup failure."""
+        cleanup = []
+        try:
+            return self._archive_single_video_inner(url, options, cleanup)
+        except Exception as exc:
+            for release in cleanup:
+                release()
+            _log.exception("manual download setup failed")
+            return {"ok": False, "started": False, "error": str(exc)}
+
+    def _archive_single_video_inner(self, url, options, cleanup):
         """Download a single YouTube URL immediately (no channel walk).
 
         Normal output layout mirrors YTArchiver.py:17313 build_video_cmd:
@@ -470,7 +495,7 @@ class ArchiveMixin:
             no `%(uploader)s` subfolder.
           - Filename: `{title}.mp4` or `{title} (MM.DD.YY).mp4` when add_date.
           - Custom name sanitizer: `[<>:"/\\|?*\x00-\x1f]` → `_`.
-          - `--mtime` when date_file is True so mtime = YT upload date.
+          - Stamp the final file with the reported upload date when date_file is True.
 
         YouTube downloads stage with ``[video-id]`` attached. The suffix is
         removed after a verified commit when the classic destination is free;
@@ -498,6 +523,8 @@ class ArchiveMixin:
         def _canonicalize_yt_url(u: str) -> str:
             try:
                 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+                if not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", u):
+                    u = "https:" + u if u.startswith("//") else "https://" + u
                 p = urlparse(u)
                 # Drop fragment always.
                 # Keep only v= on watch URLs; keep everything on short URLs
@@ -524,7 +551,10 @@ class ArchiveMixin:
         # non-YouTube yt-dlp-supported sites still work.
         try:
             from urllib.parse import urlparse as _up2
-            if _up2(url).scheme not in ("http", "https"):
+            parsed = _up2(url)
+            if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                    or parsed.hostname.startswith("-")
+                    or any(c.isspace() for c in parsed.netloc)):
                 return {"ok": False,
                         "error": "Only http(s) URLs can be downloaded."}
         except Exception:
@@ -544,6 +574,8 @@ class ArchiveMixin:
                         "error": "Already downloading this URL"}
             self._archive_single_inflight.add(url)
             self._archive_single_cancel_events[task_id] = cancel_event
+            self._archive_single_jobs[task_id] = {
+                "task_id": task_id, "url": url, "title": url}
 
         def _release_download_tracking() -> None:
             try:
@@ -551,6 +583,7 @@ class ArchiveMixin:
                     self._archive_single_inflight.discard(url)
                     self._archive_single_cancel_events.pop(task_id, None)
                     self._archive_single_threads.pop(task_id, None)
+                    self._archive_single_jobs.pop(task_id, None)
                 lease = channel_lease[0]
                 if lease is not None:
                     lease.release()
@@ -558,6 +591,7 @@ class ArchiveMixin:
             except Exception as exc:
                 swallow("manual download tracking cleanup", exc)
 
+        cleanup.append(_release_download_tracking)
         if not sync_backend.find_yt_dlp():
             # audit DT-1: DON'T record URL in history on a failed
             # launch. History write is moved to the success path
@@ -675,6 +709,10 @@ class ArchiveMixin:
             def _emit_dwnld(suffix=""):
                 """Replace the inplace [Dwnld] line. suffix is e.g.
                 ' - 42%' or ' - Done.' or '' (no progress yet)."""
+                with self._archive_single_lock:
+                    job = self._archive_single_jobs.get(task_id)
+                    if job is not None:
+                        job["title"] = _state["fname"]
                 self._log_stream.emit([
                     ["[Dwnld] ", ["simpleline_green", _marker_tag]],
                     [f"{_state['fname']}{suffix}\n",
@@ -691,8 +729,9 @@ class ArchiveMixin:
                    # yt-dlp's defaults (~10 retries x ~20s connect timeout)
                    # instead of giving up in ~45s.
                    "--retries", "3", "--socket-timeout", "15"]
-            if date_file:
-                cmd.append("--mtime")
+            # HTTP Last-Modified is not the publication date. Stamp the verified
+            # final media from DLTRACK only after collision-safe promotion.
+            cmd.append("--no-mtime")
             cmd += ["--format", fmt]
             if res != "audio":
                 cmd += ["--merge-output-format", "mp4", "--ppa", "Merger:-c copy"]
@@ -860,7 +899,7 @@ class ArchiveMixin:
                     proc,
                     on_stdout_line=_handle_output_line,
                     cancel_event=cancel_event,
-                    timeout=900,
+                    idle_timeout=900,
                     owner="manual-download",
                     task_id=task_id,
                     role="download",
@@ -878,7 +917,7 @@ class ArchiveMixin:
                     except Exception:
                         pass
                     self._log_stream.emit_error(
-                        "[Dwnld] Watchdog: yt-dlp hung; killed after 15 min.")
+                        "[Dwnld] Download stopped after 15 minutes without output.")
                 elif stream_result.cancelled:
                     self._log_stream.emit([
                         ["[Dwnld] ", ["red", _marker_tag]],
@@ -981,6 +1020,14 @@ class ArchiveMixin:
                                     ["dlwarn", _marker_tag, "error_detail"],
                                 ]])
                         if final_path and os.path.isfile(final_path):
+                            if date_file and _bundle_ready and not cancel_event.is_set():
+                                try:
+                                    published = datetime.strptime(_upload_date, "%Y%m%d")
+                                    original = os.stat(final_path)
+                                    os.utime(final_path, (original.st_atime, published.timestamp()))
+                                except (ValueError, TypeError, OSError) as exc:
+                                    self._log_stream.emit_dim(
+                                        f" (upload date unavailable; file date unchanged: {exc})")
                             _state["final_path"] = final_path
                             try:
                                 _state["final_size"] = os.path.getsize(final_path)

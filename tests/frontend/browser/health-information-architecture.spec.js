@@ -15,6 +15,9 @@ const LIVE_RESPONSES = {
   get_index_summary: {
     cards: {
       channels: 2,
+      scan_complete: true,
+      scanned_channels: 2,
+      total_channels: 2,
       videos: 12,
       physical_copies: 13,
       size_label: "4 GB",
@@ -128,7 +131,7 @@ test("Health uses three task-based destinations and keeps Overview as the defaul
   await expect(page.locator("#health-overview-metadata-value"))
     .toHaveText("2 missing video IDs");
   await expect(page.locator("#health-overview-index-value"))
-    .toHaveText("12 videos indexed");
+    .toHaveText("12 available videos");
   await expect(page.locator("#health-overview-transcripts-value"))
     .toHaveText("11 / 12 transcribed");
   await expect(page.locator("#health-overview-system-value"))
@@ -348,9 +351,9 @@ test("Health Overview flags a full backup that is 14 or more days old", async ({
   await expect(page.locator('[data-health-target="backups"]'))
     .toHaveClass(/is-warn/);
   await expect(page.locator("#health-attention-list"))
-    .toContainText("The last full app backup was 20 days ago.");
+    .toContainText("(20d ago).");
   await expect(page.locator("#backup-age-display"))
-    .toContainText("⚠ Last backup: 20 days ago");
+    .toContainText("(20d ago)");
 });
 
 test("Health Overview distinguishes missing yt-dlp from an unreadable check", async ({ page }) => {

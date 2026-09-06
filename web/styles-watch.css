@@ -60,10 +60,10 @@
 /* Extra-narrow — let the page scroll as a whole rather than forcing
    a tiny 200px transcript pane. Keeps content legible when the
    user drags the window very narrow. */
-@media (max-width: 520px) {
+@media (max-width: 900px) and (max-height: 650px), (max-width: 520px) {
   #view-watch { overflow-y: auto; }
   .watch-layout {
-    grid-template-rows: auto auto;
+    grid-template-rows: auto minmax(200px, auto);
     height: auto;
     min-height: 100%;
   }
@@ -332,6 +332,8 @@
    the centre (current-word) column stays pinned to the video's centre no
    matter how long the previous / next words are. */
 .cap-ovl {
+  --cap-scale: 1;
+  --cap-base-size: 13px;
   position: absolute;
   left: 50%;
   bottom: 14%;
@@ -348,7 +350,11 @@
   z-index: 4;
 }
 .cap-ovl.show { display: grid; }
-.cap-ovl-cell { padding: 2px 6px; white-space: nowrap; }
+.cap-ovl-cell {
+  padding: calc(2px * var(--cap-scale)) calc(6px * var(--cap-scale));
+  font-size: calc(var(--cap-base-size) * var(--cap-scale));
+  white-space: nowrap;
+}
 .cap-ovl-prev { justify-self: end;    text-align: right; opacity: 0.55; }
 .cap-ovl-cur  { justify-self: center; text-align: center; font-weight: 600; }
 .cap-ovl-next { justify-self: start;  text-align: left;  opacity: 0.55; }
@@ -356,10 +362,11 @@
    box doesn't show a stray sliver next to the current word. */
 .cap-ovl-prev:empty, .cap-ovl-next:empty { padding: 0; }
 
-/* Size — matches the old ::cue size steps. */
-.cap-ovl[data-cap-size="small"]  .cap-ovl-cell { font-size: var(--fs-xl); }
-.cap-ovl[data-cap-size="medium"] .cap-ovl-cell { font-size: 26px; }
-.cap-ovl[data-cap-size="large"]  .cap-ovl-cell { font-size: 40px; }
+/* Size steps at a 640 x 360 player; all dimensions scale with the player. */
+.cap-ovl[data-cap-size="xsmall"] { --cap-base-size: 6px; }
+.cap-ovl[data-cap-size="small"]  { --cap-base-size: 13px; }
+.cap-ovl[data-cap-size="medium"] { --cap-base-size: 20px; }
+.cap-ovl[data-cap-size="large"]  { --cap-base-size: 26px; }
 
 /* Background — applied per cell so the box hugs each word. */
 .cap-ovl[data-cap-bg="translucent"] .cap-ovl-cell:not(:empty) {
@@ -367,15 +374,16 @@
 }
 .cap-ovl[data-cap-bg="outline"] .cap-ovl-cell {
   background: transparent;
-  text-shadow: -1px -1px 0 #000, 1px -1px 0 #000,
-               -1px  1px 0 #000, 1px  1px 0 #000,
-                0    0   4px #000;
+  text-shadow: calc(-1px * var(--cap-scale)) calc(-1px * var(--cap-scale)) 0 #000,
+               calc(1px * var(--cap-scale)) calc(-1px * var(--cap-scale)) 0 #000,
+               calc(-1px * var(--cap-scale)) calc(1px * var(--cap-scale)) 0 #000,
+               calc(1px * var(--cap-scale)) calc(1px * var(--cap-scale)) 0 #000,
+               0 0 calc(4px * var(--cap-scale)) #000;
 }
 .cap-ovl[data-cap-bg="none"] .cap-ovl-cell { background: transparent; }
 
-/* Default mode mirrors conventional YouTube captions: a stable phrase,
-   centered near the bottom, balanced into no more than two opaque-backed
-   lines. The word-at-a-time modes keep the pinned three-column layout. */
+/* YT style reveals words on the bottom row and rolls completed lines up
+   through a fixed two-row viewport. The other modes keep their word grid. */
 .cap-ovl[data-cap-mode="default"] {
   width: 86%;
   grid-template-columns: minmax(0, 1fr);
@@ -385,11 +393,11 @@
 .cap-ovl[data-cap-mode="default"] .cap-ovl-prev,
 .cap-ovl[data-cap-mode="default"] .cap-ovl-next { display: none; }
 .cap-ovl[data-cap-mode="default"] .cap-ovl-cur {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
+  display: block;
+  position: relative;
+  height: calc(var(--cap-row-height, 26px) * 2 + 2px * var(--cap-scale));
+  overflow: hidden;
   justify-self: stretch;
-  gap: 2px;
   min-width: 0;
   padding: 0;
   background: transparent !important;
@@ -398,22 +406,37 @@
 }
 .cap-ovl-line {
   display: block;
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  box-sizing: border-box;
+  height: var(--cap-row-height, 26px);
   max-width: 100%;
-  padding: 2px 7px;
-  line-height: 1.25;
-  text-align: center;
+  text-align: left;
   white-space: nowrap;
 }
-.cap-ovl[data-cap-mode="default"][data-cap-bg="translucent"] .cap-ovl-line {
+.cap-ovl-text {
+  display: inline-block;
+  box-sizing: border-box;
+  height: var(--cap-row-height, 26px);
+  max-width: 100%;
+  padding: calc(2px * var(--cap-scale)) calc(7px * var(--cap-scale));
+  line-height: calc(var(--cap-row-height, 26px) - 4px * var(--cap-scale));
+  white-space: nowrap;
+}
+.cap-ovl-line[data-row="current"] {
+  top: calc(var(--cap-row-height, 26px) + 2px * var(--cap-scale));
+}
+.cap-ovl-line:empty { visibility: hidden; }
+.cap-ovl[data-cap-mode="default"][data-cap-bg="translucent"] .cap-ovl-text {
   background: rgba(0, 0, 0, 0.78);
 }
-.cap-ovl[data-cap-mode="default"][data-cap-bg="outline"] .cap-ovl-line {
+.cap-ovl[data-cap-mode="default"][data-cap-bg="outline"] .cap-ovl-text {
   background: transparent;
-  text-shadow: -1px -1px 0 #000, 1px -1px 0 #000,
-               -1px  1px 0 #000, 1px  1px 0 #000,
-                0    0   4px #000;
+  text-shadow: inherit;
 }
-.cap-ovl[data-cap-mode="default"][data-cap-bg="none"] .cap-ovl-line {
+.cap-ovl[data-cap-mode="default"][data-cap-bg="none"] .cap-ovl-text {
   background: transparent;
 }
 

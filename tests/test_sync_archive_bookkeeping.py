@@ -61,6 +61,44 @@ class _FakeWatchdog:
         self.stop_event.set()
 
 
+class SimpleModeTitleTests(unittest.TestCase):
+    """Simple mode is plain English — it must never show the 11-char video ID.
+
+    Regression: the ID strip is end-anchored, but yt-dlp's Destination line
+    names the per-track temp file, so the stem is `Title [id].f137`. Stripping
+    the ID before the format selector meant the anchor never matched and the
+    in-progress row showed the ID while the finished row looked clean.
+    """
+
+    def test_format_selector_is_removed_before_the_video_id(self) -> None:
+        self.assertEqual(
+            sync_core._clean_display_title("Some Title [O2cWok-i0E0].f137"),
+            "Some Title",
+        )
+        for suffix in (".f140-16", ".f251-drc", ""):
+            self.assertEqual(
+                sync_core._clean_display_title(f"Some Title [O2cWok-i0E0]{suffix}"),
+                "Some Title",
+            )
+
+    def test_ordinary_titles_are_left_alone(self) -> None:
+        for title in (
+            "Plain title with no id",
+            "Title with dots. Like this. Sentence",
+            "Ends in .f but not format.fabulous",
+        ):
+            self.assertEqual(sync_core._clean_display_title(title), title)
+
+    def test_a_name_that_is_only_an_id_is_kept(self) -> None:
+        # Better a bare ID than an empty row.
+        self.assertEqual(
+            sync_core._clean_display_title("[O2cWok-i0E0]"), "[O2cWok-i0E0]")
+
+    def test_blank_input_is_safe(self) -> None:
+        self.assertEqual(sync_core._clean_display_title(""), "")
+        self.assertEqual(sync_core._clean_display_title(None), "")
+
+
 class SyncArchiveBookkeepingTests(unittest.TestCase):
     def test_existing_notice_only_matches_final_media(self) -> None:
         self.assertIsNone(sync_core._existing_final_media_path(
@@ -273,6 +311,45 @@ class SyncArchiveBookkeepingTests(unittest.TestCase):
         self.assertEqual(result["downloaded"], 1)
         self.assertEqual(len(commands), 1)
         self.assertEqual(commands[0][-1], STABLE_CHANNEL_URL)
+
+    def test_download_row_never_shows_the_video_id(self) -> None:
+        video_id = "O2cWok-i0E0"
+        title = "They put this on Fox SPECIFICALLY so Trump would see it"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            archive = root / "download-archive.txt"
+            channel_dir = root / "Test Channel"
+            channel_dir.mkdir()
+            # yt-dlp announces the per-track temp file, so the stem carries
+            # the format selector AFTER the [id] bracket.
+            staged = channel_dir / f"{title} [{video_id}].f137.mp4"
+            final = channel_dir / f"{title} [{video_id}].mp4"
+            lines = [
+                f"[youtube] {video_id}: Downloading webpage",
+                f"[download] Destination: {staged}",
+                "[download]  47.3% of 5.60MiB at 1.00MiB/s",
+                f'[Merger] Merging formats into "{final}"',
+                (f"DLTRACK:::{title}:::Test Channel:::20260904:::5:::"
+                 f"30:::{video_id}"),
+            ]
+
+            _result, stream = self._run_sync(
+                root, archive, lines, create_media_on_launch=final)
+
+        # Inspect only the segments tagged for Simple mode. Verbose keeps
+        # yt-dlp's own lines, filename and ID included, and that is fine.
+        simple_parts: list[str] = []
+        for call in stream.emit.call_args_list:
+            for segment in call.args[0]:
+                text, tag = segment[0], segment[1]
+                tags = tag if isinstance(tag, (list, tuple)) else [tag]
+                if any("simpleline" in str(t) for t in tags):
+                    simple_parts.append(str(text))
+        simple = "".join(simple_parts)
+
+        self.assertIn(title, simple)
+        self.assertNotIn(video_id, simple)
+        self.assertNotIn(".f137", simple)
 
     def test_empty_folder_downloads_are_recorded_in_global_archive(self) -> None:
         video_id = "abc123def45"

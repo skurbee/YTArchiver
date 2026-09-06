@@ -10,7 +10,8 @@ from ..ytarchiver_config import ConfigUnchanged
 _log = get_logger(__name__)
 
 
-def stamp_channel_refresh(channel: dict[str, Any], field: str) -> bool:
+def stamp_channel_refresh(channel: dict[str, Any], field: str,
+                          *, details: dict[str, Any] | None = None) -> bool:
     """Persist a successful channel-level refresh/check timestamp."""
     name = channel.get("name") or channel.get("folder") or "?"
     try:
@@ -22,6 +23,8 @@ def stamp_channel_refresh(channel: dict[str, Any], field: str) -> bool:
                 saved_url = (saved_channel.get("url") or "").rstrip("/")
                 if saved_url == channel_url:
                     saved_channel[field] = time.time()
+                    if details:
+                        saved_channel.update(details)
                     return True
             raise ConfigUnchanged()
     except ConfigUnchanged:

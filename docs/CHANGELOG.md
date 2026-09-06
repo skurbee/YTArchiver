@@ -6,6 +6,56 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v84.3 - Smoother captions and everyday fixes
+
+09.05.26 11:25pm
+
+This update adds smoother video captions and makes everyday controls, library checks, and recovery more consistent.
+
+### Captions and playback
+
+- Added **YT Style captions**: words appear as they are spoken on the bottom line, with one completed line above. The lines scroll upward smoothly.
+- **YT Style is now the default** when the app starts and whenever captions are turned on. The menu is ordered YT Style, 3 Words, then 1 Word.
+- Added **X-small** and rebalanced all four caption sizes from tiny to a more restrained Large. Captions scale with the video player, including when resized, paused, or expanded to fill the window.
+- Videos and descriptions load without waiting for transcripts. Switching videos or seeking no longer lets an earlier caption request change the current playback view.
+- Fixed cases where videos with missing or conflicting details could open another video's transcript or save a bookmark against the wrong video.
+
+### Browsing and everyday controls
+
+- Search results have a clear **Open in Watch** or **Play at** action. Date ranges selected from Graph stay visible as filters that can be removed.
+- Added filters for Manual downloads and Bookmarks, clearer matching counts, and a quick way to clear channel filters. Channel filters are kept when returning from Watch.
+- Bookmark notes support multiple lines. Saving shows progress and reports failures clearly; retrying the same save does not create another copy.
+- Improved keyboard navigation, stacked dialogs, nested menus, and controls in smaller windows. Returning from a dialog restores focus to the right control.
+- Graph labels and exports explain what is counted, the selected channels, and how results are grouped over time.
+
+### Downloads, syncing, and transcription
+
+- New channels start with **automatic metadata and transcription on, and compression off**. Existing channel settings and saved defaults are respected.
+- Improved support for channels that publish only livestreams. Channel checks no longer require a Videos tab, and suggested folder names no longer include the Live tab suffix.
+- The prompt after adding a channel summarizes what will be downloaded and where. Queue and auto-sync messages better explain starting, resuming, cancelling, and waiting.
+- Individual downloads have a **Cancel** button. Downloads that are still making progress no longer stop simply because fifteen minutes have passed. Links pasted without `https://` are also accepted, and the upload-date option applies the actual upload date when available.
+- Cancelling one channel no longer cancels the next, and active jobs remain visible while cancellation finishes. Pending transcription work is retained if the search index is temporarily unavailable.
+- **Last Full Sync** updates only after a successful full-library sync. A full-library request keeps its scope after pausing or restarting.
+- Redownloading a year, month, or individual file respects that selection. Sample preview prompts close when cancelled or expired, and a failed confirmation stops the redownload.
+- Existing YouTube captions are checked before starting AI transcription, unless AI retranscription is explicitly requested. Both methods follow the chosen transcript layout, and batch transcription asks for missing layout choices.
+- Fixed punctuation processing in the packaged app. Pause correctly shows when the current task must finish, and transcription and compression check cancellation again before saving final output.
+- Livestream reminder buttons clearly distinguish snoozing or hiding a reminder from scheduling a download.
+
+### Library health, backups, and recovery
+
+- **The video catalog count in Health now covers all configured archive folders.** Saved channel scans are labelled separately, and an incomplete scan is no longer presented as the whole library. Unavailable statistics show an error instead of zero.
+- **Backups include bookmarks and notes even when the search database is omitted.** Restore checks them before making changes and retains recovery files if a restore cannot finish safely.
+- Backup previews show the backup's date, location, and contents, including whether bookmarks and notes will be restored.
+- Deep archive checks show progress, elapsed time, and cancellation controls. Closing the dialog leaves a visible way to follow the check in the background.
+- Deleting transcripts updates search entries only for the selected folder, preserving the rest of the library even if deletion is cancelled or only partly completes.
+- Folder reorganization preserves conflicting files, and locating an archive folder cannot assign the same folder to two subscriptions.
+- Metadata refreshes, additional archive folders, cleared duration limits, and changes to the primary archive folder are reflected correctly in the app.
+- **Fixed startup connection errors opening first-time setup.** A delayed connection can recover automatically or through **Retry startup load**, and the warning clears after recovery.
+
+### Project documentation
+
+- Updated the build guide, contributor instructions, architecture notes, and file map to match the current app.
+
 ## v84.2 - 2026-09-04
 
 ### Added

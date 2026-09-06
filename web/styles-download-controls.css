@@ -578,3 +578,12 @@
   border-radius: 50%;
   background: var(--c-text);
 }
+
+#manual-download-list .channel-nudge-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#manual-download-list .btn { flex-shrink: 0; }

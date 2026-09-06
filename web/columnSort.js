@@ -526,6 +526,8 @@
         allTrs.forEach(t => t.classList.remove("row-selected"));
         allTrs[next].classList.add("row-selected");
         allTrs[next].scrollIntoView({ block: "nearest" });
+        _subsLastClickedIdx = next;
+        _updateSubsBulkBar();
       }
     });
 

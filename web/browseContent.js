@@ -43,9 +43,23 @@
   }
 
   function _currentVideoFilter() {
-    if (_browseState.view !== "videos") return "";
-    return (document.getElementById("browse-filter")?.value || "").trim();
+    if (_browseState.view !== "videos") return window._currentChannelVideoFilter();
+    const input = document.getElementById("browse-filter");
+    const channel = _browseState.currentChannel;
+    const name = channel?.folder || channel?.name || "";
+    return (input?.dataset.channel === name ? input.value
+      : window._currentChannelVideoFilter()).trim();
   }
+  const channelFilters = new Map();
+  window._rememberChannelVideoFilter = (value) => {
+    const channel = _browseState.currentChannel;
+    const name = channel?.folder || channel?.name;
+    if (name) channelFilters.set(name, String(value || ""));
+  };
+  window._currentChannelVideoFilter = () => {
+    const channel = _browseState.currentChannel;
+    return channelFilters.get(channel?.folder || channel?.name) || "";
+  };
 
   // ─── Manual-queue Whisper model picker ───────────────────────
   // Mirrors YTArchiver.py:22030 `_ask_whisper_model_dialog`. Shows a 4-option
@@ -199,6 +213,8 @@
     } else {
       ++_watchOpenIntentToken;
     }
+    window._cancelWatchPlaybackIntent?.();
+    const playbackIntent = window._watchPlaybackIntent;
     const myToken = ++_watchOpenToken;
     // Ensure we're on the Browse tab and in Watch view.
     document.querySelector('.tab[data-tab="browse"]')?.click();
@@ -237,6 +253,16 @@
     // Forward gesture, this helper) gets identical treatment without
     // each handler having to remember to call it.
 
+    // Media and saved details are independent of the transcript database.
+    // Paint this identity immediately; a later transcript response must never
+    // reload the player or seek it back to the original entry timestamp.
+    window.renderWatchView(video, [], null, { playbackIntent, transcriptLoading: true });
+    const seekTo = Number(video._seek_to);
+    if (Number.isFinite(seekTo) && seekTo > 0
+        && playbackIntent === window._watchPlaybackIntent) {
+      window._seekWatchTo?.(seekTo);
+    }
+    let transcriptError = "";
     let transcript = null;
     let sourceInfo = null;
     if (nativeBridgeUp()) {
@@ -253,6 +279,8 @@
         if (myToken !== _watchOpenToken) return;
         if (Array.isArray(res)) {
           transcript = res;
+        } else if (res?.ok === false || res?.error) {
+          throw new Error(res.error || "The transcript could not be loaded.");
         } else if (res && res.segments) {
           transcript = res.segments;
           sourceInfo = res.source || null;
@@ -267,6 +295,8 @@
         // Surface bridge errors so the user knows the transcript
         // couldn't load (was: silent swallow → empty "No transcript
         // available" with no clue why; audit: browseContent H149).
+        if (myToken !== _watchOpenToken) return;
+        transcriptError = e?.message || String(e);
         console.warn("browse_get_transcript failed:", e);
         try {
           window._showToast?.(
@@ -292,7 +322,8 @@
     }
     if (myToken !== _watchOpenToken) return;
     if (_browseState.view !== "watch") return;
-    window.renderWatchView(video, transcript, sourceInfo);
+    window.renderWatchView(video, transcript, sourceInfo,
+      { playbackIntent, skipVideoReload: true, transcriptError });
     // feature F5: if we arrived from a search result, pre-fill the
     // transcript Find box with the query so Enter/Shift+Enter cycle
     // between hits in this specific video. Saves the round-trip of
@@ -309,29 +340,6 @@
         try {
           _watchFind.dispatchEvent(new Event("input", { bubbles: true }));
         } catch {}
-      }
-    }
-    // If the caller passed a seek target (bookmark jump, search-result jump,
-    // transcript-segment click from elsewhere), seek the <video> element
-    // once it's ready. Wait for `loadedmetadata` so duration is known.
-    // Treat 0 / unset _seek_to as "no seek requested" — callers who
-    // want to land on Watch view paused at the natural start used to
-    // accidentally trigger an auto-seek-and-play because `>= 0`
-    // accepted 0 as a real value (audit: browseContent.js:204).
-    // Matches the pattern at line ~598 elsewhere in this file.
-    const seekTo = Number(video._seek_to);
-    if (Number.isFinite(seekTo) && seekTo > 0) {
-      const vEl = document.querySelector("#watch-video video") ||
-                  document.getElementById("watch-video");
-      if (vEl) {
-        const doSeek = () => {
-          try {
-            vEl.currentTime = seekTo;
-            vEl.play().catch(() => {});
-          } catch { /* noop */ }
-        };
-        if (vEl.readyState >= 1) doSeek();
-        else vEl.addEventListener("loadedmetadata", doSeek, { once: true });
       }
     }
   };
@@ -390,10 +398,18 @@
     const name = channel.folder || channel.name || "";
     const parts = [];
     const vids = channel.n_vids ?? channel.video_count;
+    const query = _currentVideoFilter().toLowerCase();
     if (vids !== undefined && vids !== null && Number.isFinite(Number(vids))) {
-      parts.push(`${Number(vids).toLocaleString()} videos`);
+      if (query && _browseState.view === "videos") {
+        const paged = _channelPage.active && !_channelGroupingEnabled();
+        const matches = (_browseState.videos || []).filter(v =>
+          (v.title || "").toLowerCase().includes(query)).length;
+        parts.push(_channelPage.loading
+          ? `Filtering ${Number(vids).toLocaleString()} videos…`
+          : `${matches.toLocaleString()}${paged && _channelPage.hasMore ? "+" : ""} of ${Number(vids).toLocaleString()} videos`);
+      } else parts.push(`${Number(vids).toLocaleString()} videos`);
     }
-    if (channel.size) parts.push(String(channel.size));
+    if (channel.size) parts.push(String(channel.size) + (query ? " total in channel" : ""));
     // Live sync state for this channel.
     let state = "";
     try { state = window._queueHasSyncForChannel?.(name) || ""; } catch (e) { /* ignore */ }
@@ -412,6 +428,7 @@
     if (syncBtn) syncBtn.disabled = !!state;
     header.hidden = false;
   }
+  window._updateChannelFilterSummary = () => _updateChannelHeader(_browseState.currentChannel);
 
   function _channelNameKey(channel) {
     return String(channel?.folder || channel?.name || "")
@@ -640,8 +657,7 @@
   }
 
   function _nearBottom(el) {
-    if (!el) return false;
-    return (el.scrollHeight - el.scrollTop - el.clientHeight) < 700;
+    return window.YT.util.nearScrollBottom(el);
   }
 
   let _channelScrollRaf = null;
@@ -686,6 +702,7 @@
     // (matches "Nm/Nh/Nd/Nmo" style above). Was a dead ternary.
     return years + "y ago";
   }
+  window._formatBrowseUploadAge = _formatAddedTs;
 
   // Map one backend browse_list_videos row into the in-memory video shape
   // used by _browseState.videos. Shared by loadVideosFor and the live
@@ -738,7 +755,10 @@
   }
 
   function sortCurrentVideos(sortBy) {
-    const vids = _browseState.videos.slice();
+    const query = _currentVideoFilter().toLowerCase();
+    const vids = _browseState.videos.filter(v => !query ||
+      (v.title || "").toLowerCase().includes(query));
+    if (_browseState.view === "videos") _updateChannelHeader(_browseState.currentChannel);
     if (sortBy === "newest") vids.sort((a, b) => b.upload_ts - a.upload_ts);
     else if (sortBy === "oldest") vids.sort((a, b) => a.upload_ts - b.upload_ts);
     else if (sortBy === "most_viewed") vids.sort((a, b) => b.view_count - a.view_count);
@@ -911,43 +931,14 @@
           `Could not open channel folder: ${error?.message || error}`, "error");
       }
     });
-    // ⋮ More — reuse the FULL channel-card context menu (reorg, redownload,
-    // re-transcribe, remove, open-on-YouTube, …) by dispatching a
-    // contextmenu on this channel's grid card, anchored at the button. No
-    // menu duplication; the card menu stays the single source of truth.
+    // Both header and cards use the same menu built from channel identity.
     document.getElementById("cph-more")?.addEventListener("click", (e) => {
       e.stopPropagation();
-      const ch = _cphChannel;
-      if (!ch) return;
-      const folder = String(ch.folder || "").trim().toLowerCase();
-      const name = String(ch.name || ch.folder || "").trim().toLowerCase();
-      const card = [...document.querySelectorAll(
-        "#channel-grid .channel-card")].find(
-        (candidate) => folder
-          ? String(candidate.dataset.channelFolder || "").trim().toLowerCase()
-            === folder
-          : String(candidate.dataset.channelName || "").trim().toLowerCase()
-            === name);
-      if (!card) return;
+      if (!_cphChannel) return;
       const r = e.currentTarget.getBoundingClientRect();
-      const menuWidth = 180; // .ctx-menu min-width; keeps dropdown right-aligned to ⋮.
-      card.dispatchEvent(new MouseEvent("contextmenu", {
-        bubbles: true, cancelable: true,
-        clientX: Math.min(window.innerWidth - 8, Math.max(8, r.right - menuWidth)),
-        clientY: Math.min(window.innerHeight - 8, r.bottom),
-      }));
-      // Drop the redundant "Sync now" item — the header already has a
-      // dedicated Sync now button (reuse the card menu, minus that one row).
-      const menu = document.querySelector("#ctx-menu-root .ctx-menu");
-      if (menu) {
-        menu.querySelectorAll(":scope > .ctx-menu-item").forEach((item) => {
-          if (!item.classList.contains("ctx-submenu-wrap")
-              && (item.textContent || "").trim().toLowerCase() === "sync now") {
-            item.remove();
-          }
-        });
-        window._markBrowseContextTrigger?.(e.currentTarget);
-      }
+      window._openChannelContextMenu?.(_cphChannel,
+        Math.min(window.innerWidth - 8, Math.max(8, r.right - 180)),
+        Math.min(window.innerHeight - 8, r.bottom), e.currentTarget, { omitSync: true });
     });
   }
 
@@ -1372,13 +1363,42 @@
         return _browseState.view === "videos" && activeName === shown;
       };
       if (_channelPage.active && !_channelGroupingEnabled()) {
-        if (channelViewIsVisible()) {
-          await loadVideosFor(cur);
-        } else {
-          // Refresh paged data without the title/header/month-control writes
-          // performed by loadVideosFor(). The page loader only touches the
-          // hidden channel grid and keeps its offset/has-more state coherent.
-          await _loadChannelPage(cur, true, loadSeq);
+        const depth = _channelPage.offset;
+        const query = _channelPage.query;
+        if (_channelPage.loading) return;
+        const mapped = [];
+        let offset = 0;
+        let hasMore = true;
+        while (hasMore && offset < Math.max(depth, CHANNEL_VIDEO_PAGE_SIZE)) {
+          const count = Math.min(500, Math.max(depth, CHANNEL_VIDEO_PAGE_SIZE) - offset);
+          const outcome = await window.YT.bridge.catalogRead(
+            "channel-videos-refresh",
+            () => bridgeCall("browse_list_videos_page", shown, sort, count, offset, query),
+            { label: "channel videos" });
+          if (outcome.stale) return;
+          const result = outcome.value;
+          if (result?.error || !Array.isArray(result?.rows)) return;
+          if ((loadVideosFor._seq || 0) !== loadSeq || _channelPage.offset !== depth
+              || _channelPage.query !== query || _channelPage.loading) return;
+          mapped.push(...result.rows.map(row => _mapVideoRow(row, shown)));
+          const next = Number(result.next_offset ?? offset + result.rows.length);
+          hasMore = !!result.has_more;
+          if (next <= offset) break;
+          offset = next;
+        }
+        const currentName = _browseState.currentChannel?.folder || _browseState.currentChannel?.name;
+        if (currentName !== shown) return;
+        const same = mapped.map(_videoRowSig).join("|")
+          === (_browseState.videos || []).map(_videoRowSig).join("|");
+        _channelPage.offset = offset;
+        _channelPage.hasMore = hasMore;
+        if (!same) {
+          const scrolls = [document.getElementById("view-videos"), document.scrollingElement]
+            .filter(Boolean).map(el => [el, el.scrollTop]);
+          _browseState.videos = mapped;
+          sortCurrentVideos(sort);
+          for (const [el, top] of scrolls) el.scrollTop = top;
+          if (channelViewIsVisible()) _updateChannelHeader(cur);
         }
         return;
       }

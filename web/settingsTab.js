@@ -7,6 +7,22 @@
 (function () {
   "use strict";
 
+  // Shared with Health so the same timestamp has the same meaning everywhere.
+  window.YT = window.YT || {};
+  window.YT.backupDates = {
+    format(timestamp) {
+      const ts = Number(timestamp);
+      const date = new Date(ts * 1000);
+      if (!Number.isFinite(ts) || ts <= 0 || !Number.isFinite(date.getTime())) return "unknown";
+      const seconds = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+      const relative = seconds < 60 ? "just now"
+        : seconds < 3600 ? `${Math.floor(seconds / 60)}m ago`
+        : seconds < 86400 ? `${Math.floor(seconds / 3600)}h ago`
+        : `${Math.floor(seconds / 86400)}d ago`;
+      return `${date.toLocaleString()} (${relative})`;
+    },
+  };
+
   const _browseState = window._browseState || {};
   const askConfirm = window.askConfirm;
   const askDanger = window.askDanger;
@@ -42,6 +58,7 @@
     const bkImpBtn = document.getElementById("btn-import-backup");
     if (!panel) return;
     let _lastAutomaticBackupTs = 0;
+    let _lastAutomaticBackupPath = "";
     if (autorunModeSel) {
       autorunModeSel.dataset.savedValue = autorunModeSel.value || "clock";
     }
@@ -78,6 +95,9 @@
         const res = await bridgeCall("settings_save", { [key]: value });
         if (res?.ok) {
           flashSaved(true);
+          if (key === "output_dir") {
+            window.dispatchEvent(new Event("archive-roots-changed"));
+          }
           return true;
         } else {
           flashSaved(false);
@@ -326,28 +346,24 @@
 
     // RAM estimate is intentionally a range: real rows vary with title,
     // path depth, thumbnails, and Python object overhead.
-    function _fmtBackupAge(ts) {
+    function _fmtBackupAge(ts, path = "") {
       if (!ts) return "Last backup: never";
       const days = Math.floor((Date.now() / 1000 - ts) / 86400);
-      const label = days === 0 ? "today"
-        : days === 1 ? "yesterday"
-        : `${days} days ago`;
+      const label = window.YT.backupDates.format(ts);
+      const location = path ? ` · Saved to: ${path}` : "";
       return days >= 14
-        ? `⚠ Last backup: ${label} — consider exporting soon`
-        : `Last backup: ${label}`;
+        ? `⚠ Last backup: ${label} — consider exporting soon${location}`
+        : `Last backup: ${label}${location}`;
     }
 
     function _fmtAutomaticBackupAge(ts, interval) {
-      if (interval === "off") return "Automatic backups are off.";
+      const prefix = interval === "off" ? "Automatic backups are off. " : "";
       if (!ts) {
-        return "No automatic backup has run yet. YTArchiver checks while the app is open.";
+        return prefix + "No automatic backup has run yet."
+          + (interval === "off" ? "" : " YTArchiver checks while the app is open.");
       }
-      const days = Math.max(0,
-        Math.floor((Date.now() / 1000 - Number(ts)) / 86400));
-      const label = days === 0 ? "today"
-        : days === 1 ? "yesterday"
-        : `${days} days ago`;
-      return `Last automatic backup: ${label}`;
+      return prefix + `Last automatic backup: ${window.YT.backupDates.format(ts)}`
+        + (_lastAutomaticBackupPath ? ` · Saved to: ${_lastAutomaticBackupPath}` : "");
     }
 
     function _renderAutomaticBackupAge(interval) {
@@ -475,6 +491,7 @@
             ? ab : "off";
           abEl.dataset.savedValue = abEl.value;
           _lastAutomaticBackupTs = Number(s.last_auto_backup_ts) || 0;
+          _lastAutomaticBackupPath = s.last_auto_backup_path || "";
           _renderAutomaticBackupAge(abEl.value);
         }
         const trashRetentionEl = document.getElementById(
@@ -543,7 +560,7 @@
         });
         // Backup age (T295)
         const bkAgeEl = document.getElementById("backup-age-display");
-        if (bkAgeEl) bkAgeEl.textContent = _fmtBackupAge(s.last_backup_ts || 0);
+        if (bkAgeEl) bkAgeEl.textContent = _fmtBackupAge(s.last_backup_ts || 0, s.last_backup_path);
         const vEl = document.getElementById("settings-ytdlp-version");
         if (vEl) vEl.textContent = "checking\u2026";
         try {
@@ -1543,15 +1560,19 @@
         if (res.fts_skipped) {
           window._showToast?.(
             `Backup saved (${res.files} files), but the Search index was ` +
-              "too large to include. Search can be rebuilt after a restore.",
+              "too large to include. Search can be rebuilt after a restore. " +
+              (res.bookmarks_included
+                ? "Your bookmarks and notes are included."
+                : "This backup does not separately preserve bookmarks or notes."),
             "warn",
             { ttlMs: 12000 }
           );
         } else {
-          window._showToast?.(`Backup saved (${res.files} files).`, "ok");
+          window._showToast?.(`Backup saved (${res.files} files).` +
+            (res.bookmarks_included ? " Your bookmarks and notes are included." : ""), "ok");
         }
         const bkAgeEl = document.getElementById("backup-age-display");
-        if (bkAgeEl) bkAgeEl.textContent = _fmtBackupAge(res.last_backup_ts || Date.now() / 1000);
+        if (bkAgeEl) bkAgeEl.textContent = _fmtBackupAge(res.last_backup_ts || Date.now() / 1000, res.path);
       } else if (!res?.cancelled) {
         window._showToast?.(res?.error || "Backup failed.", "error");
       }
@@ -1601,8 +1622,33 @@
              ${_esc(backupIndexNote)}
            </div>`
         : "";
+      const bookmarkNote = prev.bookmarks_included
+        ? "Bookmarks and notes will be restored from this backup."
+        : "This older backup has no bookmark data. Your current bookmarks and notes " +
+          "will be retained if they can be read safely. Restoring will stop if they cannot.";
+      const zipName = prev.zip_name || String(prev.zip_path || "Selected backup").split(/[\\/]/).pop();
+      const created = Number(prev.created_at || prev.manifest?.created_at);
+      const backupDate = created > 0 && Number.isFinite(created)
+        ? `Created: ${window.YT.backupDates.format(created)}`
+        : "Creation time was not recorded in this older backup."
+          + (prev.zip_modified_at ? ` ZIP file modified: ${window.YT.backupDates.format(prev.zip_modified_at)}` : "");
+      const indexIncluded = prev.index_included ?? prev.manifest?.fts_db_included;
+      const names = (prev.items || []).map(item => String(item.name));
+      const hasConfig = names.some(name => /(?:^|\/)ytarchiver_config\.json$/.test(name));
+      const content = [
+        hasConfig ? "Settings and subscriptions included" : "Settings file not found",
+        prev.bookmarks_included ? "Bookmarks and notes included" : "Bookmarks retained from this installation",
+        indexIncluded ? "Search index included" : "Search index not included — can be rebuilt",
+      ];
       const previewHtml =
-        `<div class="backup-preview-frame">
+        `<div class="backup-preview-identity">
+           <strong>${_esc(zipName)}</strong>
+           <p>${_esc(backupDate)}</p>
+           <p>${_esc(content.join(" · "))}</p>
+           <p>${_esc(prev.zip_path || "")}</p>
+         </div>
+         <details><summary>Included files (${(prev.items || []).length})</summary>
+         <div class="backup-preview-frame">
            <table class="backup-preview-table">
              <thead>
                <tr>
@@ -1612,11 +1658,11 @@
              </thead>
              <tbody>${rows}</tbody>
            </table>
-         </div>
+         </div></details>
          <div class="backup-preview-total">
-           Total: ${prev.items.length} file(s) \u2014 ${_esc(prev.total_label)}.
+           Total: ${(prev.items || []).length} file(s) \u2014 ${_esc(prev.total_label)}.
            Your current settings are backed up before anything is replaced.
-         </div>${ftsWarn}`;
+         </div>${ftsWarn}<div class="backup-preview-total">${_esc(bookmarkNote)}</div>`;
       const confirmRestore = await askQuestion({
         title: "Restore this backup?",
         message: "Review the backup contents before restoring.",
@@ -1632,8 +1678,13 @@
 
     function _handleImportResult(res) {
       if (res?.ok) {
+        const bookmarkMessage = res.bookmarks_source === "current_installation"
+          ? "Your current bookmarks and notes were retained. "
+          : res.bookmarks_source === "backup"
+            ? "Bookmarks and notes were restored from the backup. " : "";
         window._showToast?.(
           `Restored ${res.files_restored || res.files || "?"} files. ` +
+          bookmarkMessage +
           `Restart to apply.`,
           "ok",
           { ttlMs: 10000, action: { label: "Restart now", onClick: () => {

@@ -18,6 +18,11 @@
 
   window.YT = window.YT || {};
   const YT = window.YT;
+  const modalLayers = [];
+  const staticModalSyncs = new Set();
+  function ownsModalInput(backdrop) {
+    return modalLayers.filter(entry => isVisible(entry.backdrop)).at(-1)?.backdrop === backdrop;
+  }
   const escapeHtml = (YT.util && YT.util.escapeHtml) || (s => String(s ?? ""));
   const FOCUSABLE_SEL = [
     "a[href]",
@@ -60,14 +65,23 @@
     const previousFocus = document.activeElement;
     const dialog = prepareDialogSemantics(backdrop, opts.dialogSelector)
       || backdrop;
+    const layer = { backdrop, focusInitial: null };
+    const oldZIndex = backdrop.style.zIndex;
+    const topZIndex = modalLayers.reduce((z, entry) =>
+      Math.max(z, Number(window.getComputedStyle?.(entry.backdrop)?.zIndex) || 0), 10000);
+    backdrop.style.zIndex = String(topZIndex + 1);
+    modalLayers.push(layer);
     const focusInitial = () => {
+      if (!ownsModalInput(backdrop)) return;
       const explicit = opts.initialFocus
         ? backdrop.querySelector(opts.initialFocus)
         : null;
       const target = explicit || visibleFocusables(dialog)[0] || dialog;
       try { target.focus(); } catch {}
     };
+    layer.focusInitial = focusInitial;
     const onKey = (e) => {
+      if (!ownsModalInput(backdrop)) return;
       if (e.key === "Escape" && typeof opts.onEscape === "function") {
         e.preventDefault();
         opts.onEscape();
@@ -82,7 +96,10 @@
       }
       const first = nodes[0];
       const last = nodes[nodes.length - 1];
-      if (e.shiftKey && document.activeElement === first) {
+      if (!dialog.contains(document.activeElement)) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      } else if (e.shiftKey && document.activeElement === first) {
         e.preventDefault();
         last.focus();
       } else if (!e.shiftKey && document.activeElement === last) {
@@ -93,11 +110,20 @@
     document.addEventListener("keydown", onKey, true);
     setTimeout(focusInitial, 30);
     return () => {
+      // Static dialogs are already hidden when their observer releases the
+      // trap. Include the closing layer while determining who owned focus.
+      const wasTop = modalLayers.filter(entry => entry === layer
+        || isVisible(entry.backdrop)).at(-1) === layer;
+      const index = modalLayers.indexOf(layer);
+      if (index >= 0) modalLayers.splice(index, 1);
+      backdrop.style.zIndex = oldZIndex;
       document.removeEventListener("keydown", onKey, true);
-      if (opts.restoreFocus === false) return;
-      if (previousFocus && previousFocus.isConnected) {
+      if (!wasTop || opts.restoreFocus === false) return;
+      const underlying = modalLayers.filter(entry => isVisible(entry.backdrop)).at(-1);
+      if (previousFocus && previousFocus.isConnected
+          && (!underlying || underlying.backdrop.contains(previousFocus))) {
         try { previousFocus.focus(); } catch {}
-      }
+      } else underlying?.focusInitial();
     };
   }
 
@@ -113,12 +139,14 @@
       }
     };
     const observer = new MutationObserver(sync);
+    staticModalSyncs.add(sync);
     observer.observe(modal, {
       attributes: true,
       attributeFilter: ["hidden", "style", "class", "aria-hidden"],
     });
     sync();
     return () => {
+      staticModalSyncs.delete(sync);
       observer.disconnect();
       if (releaseTrap) releaseTrap();
     };
@@ -135,6 +163,9 @@
   // Most callers compose this directly. askQuestion/askChoice/askTextInput
   // are pre-built wrappers.
   function openModal(opts) {
+    // A static dialog may have opened in this same event turn. Register it
+    // before this prompt; its MutationObserver has not necessarily run yet.
+    for (const sync of staticModalSyncs) sync();
     const cfg = Object.assign({
       buildBody: null,        // (resolve) => element OR string
       bodyHtml: "",           // alternative to buildBody — raw HTML
@@ -176,19 +207,27 @@
         setTimeout(() => backdrop.remove(), 120);
         document.removeEventListener("keydown", onKey);
         releaseFocusTrap();
+        backdrop.inert = true;
+        backdrop.setAttribute("aria-hidden", "true");
+        backdrop.style.pointerEvents = "none";
         resolve(val);
       }
 
       function onKey(e) {
+        if (_resolved || !ownsModalInput(backdrop)) return;
         if (cfg.onKey) {
-          const handled = cfg.onKey(e, resolveOuter);
+          const handled = cfg.onKey(e, resolveOuter, backdrop);
           if (handled) return;
         }
-        if (e.key === "Escape") resolveOuter(cfg.escapeValue);
+        if (e.key === "Escape") {
+          e.preventDefault();
+          e.stopImmediatePropagation?.();
+          resolveOuter(cfg.escapeValue);
+        }
       }
       document.addEventListener("keydown", onKey);
       backdrop.addEventListener("click", (e) => {
-        if (e.target === backdrop) resolveOuter(cfg.outsideClickValue);
+        if (e.target === backdrop && ownsModalInput(backdrop)) resolveOuter(cfg.outsideClickValue);
       });
 
       if (cfg.onMount) {
@@ -232,7 +271,7 @@
       initialFocus: cfg.danger
         ? (cfg.noCancel ? ".askq-dialog" : '[data-act="cancel"]')
         : '[data-act="confirm"]',
-      onKey: (e, resolveOuter) => {
+      onKey: (e, resolveOuter, backdrop) => {
         if (e.key !== "Enter") return false;
 
         // Respect the button the user actually selected.  In particular,
@@ -240,7 +279,8 @@
         // `true` here ran before the focused button's native click and turned
         // that visibly-safe default into approval.
         const focused = document.activeElement;
-        const focusedAction = focused?.closest?.("[data-act]")?.dataset?.act;
+        const focusedAction = backdrop.contains(focused)
+          ? focused?.closest?.("[data-act]")?.dataset?.act : null;
         const decision = questionEnterDecision(cfg.danger, focusedAction);
         if (decision === "cancel") {
           e.preventDefault();
@@ -427,6 +467,8 @@
       confirm: "Save",
       cancel: "Cancel",
       allowEmpty: false,
+      multiline: false,
+      maxLength: null,
     }, opts || {});
 
     return openModal({
@@ -434,7 +476,9 @@
         <div class="askq-dialog">
           <div class="askq-header"></div>
           <div class="askq-body"></div>
-          <input type="text" class="askq-input" />
+          ${cfg.multiline
+            ? '<textarea class="askq-input askq-input-multiline" rows="5"></textarea>'
+            : '<input type="text" class="askq-input" />'}
           <div class="askq-buttons">
             <button class="btn btn-ghost" data-act="cancel"></button>
             <button class="btn btn-primary" data-act="confirm"></button>
@@ -450,6 +494,8 @@
         const input = root.querySelector(".askq-input");
         input.placeholder = cfg.placeholder || "";
         input.value = cfg.initial || "";
+        input.setAttribute("aria-label", cfg.title);
+        if (Number.isInteger(cfg.maxLength) && cfg.maxLength > 0) input.maxLength = cfg.maxLength;
         root.querySelector('[data-act="cancel"]').textContent = cfg.cancel;
         root.querySelector('[data-act="confirm"]').textContent = cfg.confirm;
         const save = () => {
@@ -461,7 +507,9 @@
         root.querySelector('[data-act="cancel"]').addEventListener(
           "click", () => resolveOuter(null));
         input.addEventListener("keydown", (e) => {
-          if (e.key === "Enter") { e.preventDefault(); save(); }
+          if (e.key === "Enter" && (!cfg.multiline || e.ctrlKey || e.metaKey)) {
+            e.preventDefault(); save();
+          }
         });
         setTimeout(() => { input.focus(); input.select(); }, 30);
       },
@@ -511,6 +559,7 @@
     if (e.key !== "Escape") return;
     const entry = topVisibleEscapeEntry();
     if (!entry) return;
+    if (modalLayers.length && !ownsModalInput(entry.backdrop)) return;
     const askOpen = Array.from(document.querySelectorAll(".askq-backdrop"))
       .some((backdrop) => backdrop !== entry.backdrop && isVisible(backdrop));
     if (askOpen) return;
@@ -566,6 +615,7 @@
     });
     bindStaticModal(document.getElementById("redwnl-sample-modal"), {
       dialogSelector: ".yt-modal",
+      initialFocus: "#redwnl-sample-cancel",
     });
   });
 

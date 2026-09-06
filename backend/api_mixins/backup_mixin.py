@@ -9,6 +9,8 @@ when moving them out of main.py.
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 from typing import Any
 
 from backend import subs as subs_backend
@@ -20,6 +22,7 @@ from backend import subs as subs_backend
 from backend.auto_backup import (
     BACKUP_MANIFEST_NAME as _BACKUP_MANIFEST_NAME,
 )
+from backend.auto_backup import BOOKMARK_BACKUP_NAME
 from backend.auto_backup import (
     BackupCancelled as _BackupCancelled,
 )
@@ -45,6 +48,7 @@ def _allowed_backup_top_names() -> set[str]:
     return {name for name, _path in _backup_file_entries()} | {
         _BACKUP_MANIFEST_NAME,
         TRANSCRIPTION_DB.name,
+        BOOKMARK_BACKUP_NAME,
     }
 
 
@@ -68,6 +72,7 @@ _CHANNEL_IMPORT_ALLOWED_KEYS = frozenset(_CHANNEL_IMPORT_STRING_LIMITS) | {
     "split_years",
     "split_months",
     "auto_transcribe",
+    "transcript_combined",
     "auto_metadata",
     "compress_enabled",
     "compress_batch_size",
@@ -76,6 +81,7 @@ _CHANNEL_IMPORT_BOOL_KEYS = {
     "split_years",
     "split_months",
     "auto_transcribe",
+    "transcript_combined",
     "auto_metadata",
     "compress_enabled",
 }
@@ -108,6 +114,11 @@ def _clean_import_channel(ch: dict[str, Any]) -> tuple[dict[str, Any] | None, st
                 clean[key] = max(0, int(val))
             except (TypeError, ValueError):
                 continue
+    channel_id = str(ch.get("channel_id") or "").strip()
+    if channel_id:
+        if not re.fullmatch(r"UC[A-Za-z0-9_-]{22}", channel_id):
+            return None, "invalid permanent channel ID"
+        clean["channel_id"] = channel_id
     if not (clean.get("name") or clean.get("folder")):
         return None, "missing channel name/folder"
     if not clean.get("name"):
@@ -339,8 +350,8 @@ class BackupMixin:
                     _backup_ts = _bk_time.time()
                     try:
                         update_config(
-                            lambda cfg: cfg.__setitem__(
-                                "last_backup_ts", _backup_ts))
+                            lambda cfg: cfg.update(
+                                last_backup_ts=_backup_ts, last_backup_path=out_path))
                     except Exception:
                         pass
             except _BackupCancelled as exc:
@@ -351,6 +362,8 @@ class BackupMixin:
                 }
             _resp = {"ok": True, "path": out_path,
                      "files": _stats["files"],
+                     "bookmarks_included": _stats.get("bookmarks_included", False),
+                     "bookmark_count": _stats.get("bookmark_count", 0),
                      "last_backup_ts": _backup_ts}
             if _stats["fts_skipped_reason"]:
                 _resp["fts_skipped"] = _stats["fts_skipped_reason"]
@@ -375,7 +388,7 @@ class BackupMixin:
 
             import webview as _wv
 
-            from backend.ytarchiver_config import APP_DATA_DIR
+            from backend.ytarchiver_config import APP_DATA_DIR, TRANSCRIPTION_DB
             if self._window is None:
                 return {"ok": False, "error": "No window"}
             paths = self._window.create_file_dialog(
@@ -396,6 +409,8 @@ class BackupMixin:
                             manifest = json.loads(
                                 zf.read(_BACKUP_MANIFEST_NAME).decode("utf-8"))
                     except Exception:
+                        manifest = {}
+                    if not isinstance(manifest, dict):
                         manifest = {}
                     for info in zf.infolist():
                         if info.is_dir():
@@ -432,8 +447,14 @@ class BackupMixin:
             return {
                 "ok": True,
                 "zip_path": zip_path,
+                "zip_name": Path(zip_path).name,
+                "created_at": manifest.get("created_at"),
+                "zip_modified_at": Path(zip_path).stat().st_mtime,
                 "items": items,
                 "manifest": manifest,
+                "index_included": any(item["name"] == TRANSCRIPTION_DB.name for item in items),
+                "bookmarks_included": any(item["name"] in {
+                    BOOKMARK_BACKUP_NAME, TRANSCRIPTION_DB.name} for item in items),
                 "fts_skipped": manifest.get("fts_skipped_reason", ""),
                 "total_bytes": total_bytes,
                 "total_label": self._fmt_bytes_short(total_bytes),

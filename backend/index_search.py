@@ -179,6 +179,19 @@ def search_video_titles(query: str,
                           date_from_ts: float | None = None,
                           date_to_ts: float | None = None,
                           ) -> list[dict[str, Any]]:
+    if not query or not query.strip():
+        return []
+    idx = _index_module()
+    with idx._interactive_reader("Searching video titles") as conn:
+        return _search_video_titles(conn, query, channel, limit, sort, year_from, year_to,
+                                     date_from_ts, date_to_ts)
+
+
+def _search_video_titles(conn, query: str, channel: Any | None = None,
+                         limit: int = 200, sort: str = "newest",
+                         year_from: int | None = None, year_to: int | None = None,
+                         date_from_ts: float | None = None,
+                         date_to_ts: float | None = None) -> list[dict[str, Any]]:
     """Global title-only search across the archive's videos.
 
     `channel` scopes the search: None / empty list → all channels;
@@ -203,9 +216,6 @@ def search_video_titles(query: str,
     # single writer at the file level; only Python's _db_lock was
     # serializing everything before this swap.
     idx = _index_module()
-    conn = idx._reader_open()
-    if conn is None:
-        return []
     # Allow multi-word queries to match in any order — split on
     # whitespace and AND each word together.
     parts = [p.strip() for p in query.strip().split() if p.strip()]
@@ -325,6 +335,9 @@ def search_video_titles(query: str,
                         fts_args)
                 rows = cur.fetchall()
     except sqlite3.Error as exc:
+        if getattr(exc, "sqlite_errorcode", None) in (
+                sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            raise
         _log.debug("search_video_titles FTS5 failed (%s); falling back to LIKE", exc)
         rows = []
     # ── LIKE fallback — used when FTS table missing or query bad ────────
@@ -375,6 +388,9 @@ def search_video_titles(query: str,
                         like_args)
                 rows = cur.fetchall()
         except sqlite3.Error as exc:
+            if getattr(exc, "sqlite_errorcode", None) in (
+                    sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise
             _log.warning("search_video_titles LIKE fallback failed: %s", exc)
             return []
     result = [{
@@ -405,6 +421,18 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
                date_from_ts: float | None = None,
                date_to_ts: float | None = None,
                ) -> list[dict[str, Any]]:
+    if not query.strip():
+        return []
+    idx = _index_module()
+    with idx._interactive_reader("Searching transcripts") as conn:
+        return _search_fts(conn, query, channel, limit, year_from, year_to, sort,
+                           date_from_ts, date_to_ts)
+
+
+def _search_fts(conn, query: str, channel: Any | None = None, limit: int = 200,
+                year_from: int | None = None, year_to: int | None = None,
+                sort: str = "relevance", date_from_ts: float | None = None,
+                date_to_ts: float | None = None) -> list[dict[str, Any]]:
     """Run FTS5 MATCH against segments. Returns hits with context.
 
     Query semantics: power-user operators (AND / OR / NOT / "phrase" / word*)
@@ -424,11 +452,6 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
       "channel"   → channel name ASC, then in-video chronological
       "title"     → video title ASC, then in-video chronological
     """
-    # Reader connection — see search_video_titles above for rationale.
-    idx = _index_module()
-    conn = idx._reader_open()
-    if conn is None or not query.strip():
-        return []
     use_v2 = normalized_reads_enabled(conn)
     video_table = "logical_videos" if use_v2 else "videos"
     # Pull v.upload_ts via LEFT JOIN so newest/oldest sort works even
@@ -442,21 +465,18 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
     # undated segments leak through any year window — e.g. a flat,
     # Tesla-heavy channel still showed 2024 results under a 2008 filter even
     # after the upload_ts fix, because ~4.6% of segments globally have an
-    # empty video_id. The derived table is pre-grouped (one row per
-    # channel+title) so it can never duplicate result rows, and it's only
-    # joined when a year filter is set, so plain searches pay no cost.
-    # Backed by idx_vid_chan_title(channel, title, upload_ts).
+    # empty video_id. Resolve only a matching segment's title/channel through
+    # the covering catalog index, instead of grouping the entire catalog for
+    # every dated query. MIN preserves the existing fallback date semantics.
     _year_active = any(value is not None for value in (
         year_from, year_to, date_from_ts, date_to_ts))
-    _vt_join = (
-        f" LEFT JOIN (SELECT channel, title, MIN(upload_ts) AS uts FROM {video_table} "
-        " WHERE upload_ts IS NOT NULL GROUP BY channel, title) vt "
-        " ON v.upload_ts IS NULL AND vt.channel = s.channel AND vt.title = s.title "
-    ) if _year_active else ""
+    _upload_expr = (
+        f"COALESCE(v.upload_ts, (SELECT MIN(vt.upload_ts) FROM {video_table} vt "
+        "WHERE vt.channel=s.channel AND vt.title=s.title AND vt.upload_ts IS NOT NULL))"
+        if _year_active else "v.upload_ts"
+    )
     _ts_expr = (
-        "COALESCE(v.upload_ts, vt.uts, v.added_ts, 0)"
-        if _year_active else
-        "COALESCE(v.upload_ts, v.added_ts, 0)"
+        f"COALESCE({_upload_expr}, v.added_ts, 0)"
     )
     q = ("SELECT s.id, s.video_id, s.title, s.channel, s.start_time, s.text, "
          " s.jsonl_path, snippet(segments_fts, 0, '<mark>', '</mark>', '...', 8) as snip, "
@@ -464,7 +484,7 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
          " FROM segments_fts JOIN segments s ON s.id = segments_fts.rowid "
          f" LEFT JOIN {video_table} v"
          " ON s.video_id <> '' AND v.video_id = s.video_id "
-         + _vt_join +
+         + ("AND trim(COALESCE(v.video_id,''))<>'' " if use_v2 else "") +
          " WHERE segments_fts MATCH ?")
     requested_limit = max(1, int(limit))
     # Dedupe happens after SQLite returns rows because the duplicates differ
@@ -498,15 +518,15 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
     # upload_ts is missing, and stay lenient (include the row) only when
     # BOTH sources are unknown.
     if year_from is not None:
-        suffix += (" AND (CAST(strftime('%Y', COALESCE(v.upload_ts, vt.uts), 'unixepoch') AS INTEGER) >= ?"
-                   " OR (COALESCE(v.upload_ts, vt.uts) IS NULL AND s.year >= ?)"
-                   " OR (COALESCE(v.upload_ts, vt.uts) IS NULL AND s.year IS NULL))")
+        suffix += (f" AND (CAST(strftime('%Y', {_upload_expr}, 'unixepoch') AS INTEGER) >= ?"
+                   f" OR ({_upload_expr} IS NULL AND s.year >= ?)"
+                   f" OR ({_upload_expr} IS NULL AND s.year IS NULL))")
         args_suffix.append(int(year_from))
         args_suffix.append(int(year_from))
     if year_to is not None:
-        suffix += (" AND (CAST(strftime('%Y', COALESCE(v.upload_ts, vt.uts), 'unixepoch') AS INTEGER) <= ?"
-                   " OR (COALESCE(v.upload_ts, vt.uts) IS NULL AND s.year <= ?)"
-                   " OR (COALESCE(v.upload_ts, vt.uts) IS NULL AND s.year IS NULL))")
+        suffix += (f" AND (CAST(strftime('%Y', {_upload_expr}, 'unixepoch') AS INTEGER) <= ?"
+                   f" OR ({_upload_expr} IS NULL AND s.year <= ?)"
+                   f" OR ({_upload_expr} IS NULL AND s.year IS NULL))")
         args_suffix.append(int(year_to))
         args_suffix.append(int(year_to))
     if date_from_ts is not None:
@@ -541,11 +561,10 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
     suffix += " LIMIT ? OFFSET ?"
 
     def _run(q_text: str, offset: int = 0):
-        with idx._reader_lock:
-            cur = conn.execute(
-                q + suffix,
-                [q_text] + args_suffix + [query_limit, int(offset)])
-            return cur.fetchall()
+        cur = conn.execute(
+            q + suffix,
+            [q_text] + args_suffix + [query_limit, int(offset)])
+        return cur.fetchall()
 
     def _run_until_full(q_text: str) -> list[Any]:
         all_rows: list[Any] = []
@@ -575,6 +594,9 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
     try:
         rows = _run_until_full(_qnorm)
     except sqlite3.Error as exc:
+        if getattr(exc, "sqlite_errorcode", None) in (
+                sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            raise
         _log.warning("search_fts query failed before sanitize retry: %s", exc)
         # Roll back any aborted txn state on the shared reader
         # connection before retrying — otherwise the second _run
@@ -590,6 +612,9 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
             try:
                 rows = _run_until_full(cleaned)
             except sqlite3.Error as exc:
+                if getattr(exc, "sqlite_errorcode", None) in (
+                        sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise
                 # Bug [52]: returning [{"error": ...}] poisoned the
                 # iterator since callers access r["segment_id"] etc.
                 # Log the error and return an empty list so the UI

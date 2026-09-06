@@ -439,7 +439,7 @@ def _verify_candidate_url(
         url: str, *, context: dict[str, Any]) -> str:
     if not context.get("ok"):
         return ""
-    from .subs import ensure_videos_suffix
+    from .subs import normalize_channel_url
 
     command = [
         context["yt"],
@@ -458,7 +458,9 @@ def _verify_candidate_url(
         # channel whose playlist scope comes back empty still verifies.
         "--print", _VERIFY_PRINT,
         *context.get("cookies", []),
-        ensure_videos_suffix(url),
+        # The channel root also resolves channels with only a Live tab.
+        # Forcing /videos would reject their otherwise valid identity.
+        normalize_channel_url(url),
     ]
     result = _run_identity_probe(
         command,

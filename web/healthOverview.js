@@ -88,7 +88,7 @@
     return {
       days,
       short: relativeTime(ts),
-      long: days === 0 ? "today" : days === 1 ? "yesterday" : `${days} days ago`,
+      long: window.YT?.backupDates?.format(ts) || `${new Date(ts * 1000).toLocaleString()} (${relativeTime(ts)})`,
     };
   }
 
@@ -108,6 +108,7 @@
     const destinations = {
       "archive-files": { view: "library", anchor: "health-library-archive" },
       metadata: { view: "library", anchor: "health-library-metadata" },
+      "missing-ids": { view: "library", anchor: "health-library-metadata" },
       index: { view: "library", anchor: "health-library-index" },
       transcripts: { view: "library", anchor: "health-library-transcripts" },
       "backup-restore": { view: "backups" },
@@ -129,6 +130,10 @@
     }
 
     requestAnimationFrame(() => {
+      if (target === "missing-ids") {
+        window.initMetadataTab?.();
+        window._filterMetadataMissingIds?.();
+      }
       const element = anchor ? document.getElementById(anchor) : null;
       if (element) {
         const disclosure = element.matches("details")
@@ -234,7 +239,8 @@
       const unavailable = [];
 
       // Archive files — fast disk-cache summary from get_index_summary.
-      if (archive.ok && archive.value && typeof archive.value === "object") {
+      if (archive.ok && archive.value && typeof archive.value === "object"
+          && archive.value.ok !== false) {
         const cards = (archive.value.cards && typeof archive.value.cards === "object")
           ? archive.value.cards : archive.value;
         const videos = numberOrNull(cards.videos ?? archive.value.total_videos);
@@ -242,19 +248,30 @@
         const physical = numberOrNull(cards.physical_copies);
         const sizeLabel = typeof cards.size_label === "string"
           ? cards.size_label.trim() : "";
+        const scanned = numberOrNull(cards.scanned_channels);
+        const total = numberOrNull(cards.total_channels);
+        const coverageKnown = typeof cards.scan_complete === "boolean"
+          && scanned !== null && total !== null;
         if (videos !== null || channels !== null || physical !== null || sizeLabel) {
-          const primary = videos !== null
+          const primary = !coverageKnown ? "Scan coverage unknown"
+            : !cards.scan_complete ? "Incomplete saved scan"
+            : total === 0 ? "No subscribed channels"
+            : videos !== null
             ? `${formatCount(videos)} video${videos === 1 ? "" : "s"}`
             : channels !== null
               ? `${formatCount(channels)} channel${channels === 1 ? "" : "s"}`
               : sizeLabel;
           const parts = [];
-          if (channels !== null && videos !== null) {
-            parts.push(`${formatCount(channels)} channel${channels === 1 ? "" : "s"}`);
+          if (coverageKnown) {
+            parts.push(`${formatCount(scanned)} of ${formatCount(total)} current channels`);
+          } else parts.push("Current-channel coverage unavailable");
+          if (videos !== null && (!coverageKnown || !cards.scan_complete)) {
+            parts.push(`${formatCount(videos)} videos`);
           }
-          if (physical !== null) parts.push(`${formatCount(physical)} files on disk`);
+          if (physical !== null) parts.push(`${formatCount(physical)} files`);
           if (sizeLabel) parts.push(sizeLabel);
-          paintCard("archive", primary, parts.join(" · ") || "Library summary available");
+          paintCard("archive", primary, `Saved channel scan · ${parts.join(" · ")}`,
+            coverageKnown && cards.scan_complete ? "" : "warn");
         } else {
           unavailable.push("archive summary");
           paintUnavailable("archive", "Archive summary");
@@ -313,7 +330,7 @@
           }
           if (missingIds > 0) {
             attention.push({
-              target: "metadata",
+              target: "missing-ids",
               text: `${formatCount(missingIds)} tracked video${missingIds === 1 ? " is" : "s are"} missing a video ID.`,
             });
           }
@@ -329,9 +346,9 @@
             paintCard(
               "transcripts",
               `${formatCount(txWith)} / ${formatCount(txTotal)} transcribed`,
-              gap > 0
-                ? `${formatCount(gap)} video${gap === 1 ? " is" : "s are"} not marked transcribed`
-                : "All tracked videos are marked transcribed",
+              "Saved status · current subscriptions, main archive · " + (gap > 0
+                ? `${formatCount(gap)} not marked transcribed`
+                : "All tracked videos marked transcribed"),
             );
           } else {
             paintUnavailable("transcripts", "Transcript coverage");
@@ -351,14 +368,14 @@
         const channels = numberOrNull(index.value.channels);
         if (videos !== null || segments !== null || channels !== null) {
           const primary = videos !== null
-            ? `${formatCount(videos)} video${videos === 1 ? "" : "s"} indexed`
+            ? `${formatCount(videos)} available video${videos === 1 ? "" : "s"}`
             : segments !== null
               ? `${formatCount(segments)} transcript segments`
               : `${formatCount(channels)} indexed channel${channels === 1 ? "" : "s"}`;
           const parts = [];
           if (segments !== null) parts.push(`${formatCount(segments)} transcript segments`);
           if (channels !== null) parts.push(`${formatCount(channels)} channels`);
-          paintCard("index", primary, parts.join(" · ") || "Index summary available");
+          paintCard("index", primary, `Full catalog · all archive roots · ${parts.join(" · ")}`);
         } else {
           unavailable.push("search-index status");
           paintUnavailable("index", "Search index status");
@@ -386,7 +403,8 @@
             setText(
               "backup-age-display",
               `${needsBackup ? "⚠ " : ""}Last backup: ${age.long}` +
-                (needsBackup ? " — consider exporting soon" : ""),
+                (needsBackup ? " — consider exporting soon" : "") +
+                (settings.value.last_backup_path ? ` · Saved to: ${settings.value.last_backup_path}` : ""),
             );
             if (needsBackup) {
               attention.push({

@@ -1043,8 +1043,8 @@
   animation: md-cm-pop 0.08s ease-out;
 }
 @keyframes md-cm-pop {
-  from { opacity: 0; transform: scale(0.97); }
-  to   { opacity: 1; transform: scale(1); }
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 .md-cm-item {
   display: block;
@@ -1066,9 +1066,8 @@
 }
 .md-cm-warn { color: var(--c-warn-fg); }
 .md-cm-warn:hover, .md-cm-warn:focus { color: var(--c-log-sum); }
-/* Submenu wrapper — parent holds the head row + a hidden flyout. The
-   flyout appears to the right when the head is hovered or focused
-   inside. CSS-only show/hide, no JS state. */
+/* Flyouts are positioned within the viewport by the row-menu controller.
+   Hover opens them for a mouse; aria-expanded controls keyboard opening. */
 .md-cm-sub-wrap { position: relative; }
 .md-cm-has-sub { display: flex; align-items: center; }
 .md-cm-chev {
@@ -1078,7 +1077,7 @@
   font-weight: 600;
 }
 .md-cm-sub {
-  position: absolute;
+  position: fixed;
   left: 100%;
   top: -5px;
   min-width: 150px;
@@ -1089,8 +1088,27 @@
   padding: 4px 0;
   display: none;
 }
+
+.integrity-background-status {
+  position: fixed;
+  bottom: 12px;
+  right: 16px;
+  z-index: 9400;
+  max-width: min(560px, calc(100vw - 32px));
+  border: 1px solid var(--c-accent);
+  border-radius: 5px;
+  padding: 8px 12px;
+  color: var(--c-text);
+  background: var(--c-menu-bg);
+  font: inherit;
+  cursor: pointer;
+}
+.integrity-background-status[hidden] { display: none; }
+.backup-preview-identity { margin-bottom: 12px; overflow-wrap: anywhere; }
+.backup-preview-identity p { margin: 5px 0; }
+.metadata-filter-notice { display: flex; gap: 12px; align-items: center; margin: 8px 0; }
+.metadata-filter-notice[hidden] { display: none; }
 .md-cm-sub-wrap:hover > .md-cm-sub,
-.md-cm-sub-wrap:focus-within > .md-cm-sub,
 .md-cm-has-sub[aria-expanded="true"] + .md-cm-sub {
   display: block;
 }

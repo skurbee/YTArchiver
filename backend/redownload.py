@@ -61,6 +61,7 @@ def _resolve_redownload_target(
     ch_url: str,
     folder: str,
     only_filepath: str,
+    scope: dict[str, Any] | None = None,
 ) -> tuple[str, str, str, str, frozenset[str]]:
     """Resolve current config identity/folder and retain stale path aliases."""
     supplied_folder = str(folder or "").strip()
@@ -99,8 +100,22 @@ def _resolve_redownload_target(
             resolved_name = str(match.get("name") or ch_name)
             resolved_url = str(match.get("url") or ch_url)
             if current_folder:
-                resolved_folder = os.path.realpath(current_folder)
-            paths = [path for path in (supplied_folder, resolved_folder) if path]
+                current_root = os.path.realpath(current_folder)
+                resolved_folder = current_root
+                if scope:
+                    resolved_folder = scoped_redownload_folder(current_root, scope)
+                elif supplied_folder:
+                    # Direct callers may already supply a year/month directory.
+                    # Keep that scope when it is beneath the current channel.
+                    supplied_real = os.path.realpath(supplied_folder)
+                    try:
+                        if canonical_path(os.path.commonpath(
+                                [current_root, supplied_real])) == canonical_path(current_root):
+                            resolved_folder = supplied_real
+                    except ValueError:
+                        pass
+            paths = [path for path in (supplied_folder, resolved_folder,
+                                      current_folder) if path]
             aliases.update(channel_aliases(match, paths=paths))
             if only_filepath and supplied_folder and resolved_folder:
                 old_root = os.path.realpath(supplied_folder)
@@ -113,6 +128,8 @@ def _resolve_redownload_target(
                 if inside and canonical_path(old_root) != canonical_path(resolved_folder):
                     resolved_file = os.path.join(
                         resolved_folder, os.path.relpath(file_path, old_root))
+    except ValueError:
+        raise
     except Exception as exc:
         _log.debug("redownload lease identity resolution failed: %s", exc)
 
@@ -125,6 +142,32 @@ def _resolve_redownload_target(
         resolved_file,
         frozenset(aliases),
     )
+
+
+def scoped_redownload_folder(root: str, scope: dict[str, Any] | None) -> str:
+    """Apply a selected relative year/month without broadening or escaping it."""
+    if not scope:
+        return root
+    if not isinstance(scope, dict):
+        raise ValueError("Invalid redownload scope")
+    year = str(scope.get("year") or "").strip()
+    if not year or year in (".", "..") or any(c in year for c in "/\\:"):
+        raise ValueError("Choose a valid year folder for redownload")
+    target = os.path.join(root, year)
+    if scope.get("month") is not None:
+        from .reorg import _MONTH_FOLDERS
+        try:
+            month = _MONTH_FOLDERS[int(scope["month"])]
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ValueError("Choose a valid month for redownload") from exc
+        target = os.path.join(target, month)
+    try:
+        if canonical_path(os.path.commonpath([os.path.realpath(root),
+                                             os.path.realpath(target)])) != canonical_path(root):
+            raise ValueError("Redownload scope must stay inside the channel folder")
+    except ValueError as exc:
+        raise ValueError("Redownload scope must stay inside the channel folder") from exc
+    return target
 
 
 def _requeue_busy_redownload(queues) -> bool:
@@ -289,7 +332,7 @@ def _extract_id_from_filename(name: str, known_ids=None) -> str | None:
 
 
 def _scan_local_files(folder: str) -> dict[str, str]:
-    """Walk channel folder, return {filename: fullpath} for all video files.
+    """Walk channel folder, return {relative_path: fullpath} for all video files.
 
     Skips temp subdirs (_BACKLOG_TEMP, _TEMP_COMPRESS, _REDOWNLOAD_TEMP) so
     orphan downloads from a previous failed redownload pass don't get
@@ -312,7 +355,8 @@ def _scan_local_files(folder: str) -> dict[str, str]:
             # standalone archive videos, and must never enter replacement.
             if _YTDLP_FRAGMENT_RE.search(f):
                 continue
-            out[f] = os.path.join(dp, f)
+            fullpath = os.path.join(dp, f)
+            out[os.path.relpath(fullpath, folder)] = fullpath
     return out
 
 
@@ -703,7 +747,8 @@ def _match_files_to_ids(local_files: dict[str, str],
     meta_semantic = _unique_semantic_index(
         ((rec or {}).get("title") or "", vid)
         for vid, rec in meta_by_id.items())
-    for fname, fpath in local_files.items():
+    for relative_path, fpath in local_files.items():
+        fname = os.path.basename(relative_path)
         stem = os.path.splitext(fname)[0]
         # 1. The app's archive index is the authoritative local identity map.
         # It is path-exact and does not depend on mutable/sanitized titles.
@@ -1053,8 +1098,8 @@ def _already_at_target(filepath: str, new_res: str,
         target = int(new_res)
     except Exception:
         return False
-    # try .Metadata.jsonl first — it's a single line
-    # read vs spawning ffprobe (~50-200ms). Fall back to ffprobe on miss.
+    # Source metadata describes YouTube's formats, not the local file after
+    # compression. Only measured local dimensions prove the selected quality.
     width, height, embedded_id = _ffprobe_media_info(filepath)
     # Resolution alone is insufficient: a stale index row may point this
     # filename at a different video's ID. Force a repair when the container
@@ -1062,10 +1107,7 @@ def _already_at_target(filepath: str, new_res: str,
     if (expected_video_id and embedded_id
             and embedded_id != expected_video_id):
         return False
-    if _dimensions_match_target(width, height, target):
-        return True
-    h = _height_from_metadata_jsonl(filepath)
-    return bool(h is not None and abs(h - target) <= 8)
+    return _dimensions_match_target(width, height, target)
 
 
 def _redownload_refusal_reason(orig_h: int, new_h: int, target_h: int,
@@ -1491,9 +1533,9 @@ def _redownload_channel_impl(ch_name: str, ch_url: str, folder: str, new_res: st
             local, yt_titles, meta_index=empty_meta,
             filepath_to_id=filepath_ids)
         if len(matched) < len(local):
-            matched_names = {m["filename"] for m in matched}
+            matched_paths = {_path_key(m["filepath"]) for m in matched}
             unresolved = {name: path for name, path in local.items()
-                          if name not in matched_names}
+                          if _path_key(path) not in matched_paths}
             meta_index = _build_metadata_index(folder)
             matched.extend(_match_files_to_ids(
                 unresolved, yt_titles, meta_index=meta_index,
@@ -2003,9 +2045,9 @@ def _redownload_channel_impl(ch_name: str, ch_url: str, folder: str, new_res: st
                         stream.emit([
                             ["  \u2014", "simpleline_redwnl"],
                             [f" sample-confirm callback errored: {e}. "
-                             f"Continuing.\n", "red"],
+                             f"Cancelling.\n", "red"],
                         ])
-                        choice = "continue"
+                        choice = "cancel"
                     if choice == "cancel":
                         stream.emit([
                             ["  \u2014", "simpleline_redwnl"],
@@ -2164,10 +2206,14 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                        only_video_id: str = "",
                        only_filepath: str = "",
                        only_title: str = "",
+                       scope: dict[str, Any] | None = None,
                        ) -> dict[str, Any]:
     """Run a redownload while holding the channel's live identity/path lease."""
-    (ch_name, ch_url, folder, only_filepath, aliases) = _resolve_redownload_target(
-        ch_name, ch_url, folder, only_filepath)
+    try:
+        (ch_name, ch_url, folder, only_filepath, aliases) = _resolve_redownload_target(
+            ch_name, ch_url, folder, only_filepath, scope)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     task_id = ""
     if queues is not None:
         try:

@@ -181,8 +181,8 @@
         "Final confirmation",
         `All ${total.toLocaleString()} transcript-related file(s) will be ` +
         "permanently deleted. Transcript search results for this folder " +
-        "will also be cleared. The next sync will need to recreate " +
-        "transcripts for every video.",
+        "will also be cleared. Those videos will need new transcripts " +
+        "before they can appear in transcript search again.",
         "Yes, DELETE EVERYTHING");
       if (!ok2) return;
       let res;
@@ -430,6 +430,7 @@
     });
 
     renderRoots();
+    window.addEventListener("archive-roots-changed", renderRoots);
     // Re-fetch once pywebview is ready (initial calls may have fired before
     // the bridge was live).
     window.addEventListener("pywebviewready", () => {

@@ -26,6 +26,23 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
+  const _bookmarkSaves = new Set();
+  window._saveBookmark = async function (payload) {
+    const key = JSON.stringify([payload.video_id, payload.start_time, payload.text || "", payload.note || ""]);
+    if (_bookmarkSaves.has(key)) return { pending: true };
+    _bookmarkSaves.add(key);
+    const pending = window._showToast?.({ msg: "Saving bookmark…", persist: true });
+    try {
+      const result = await bridgeCall("bookmark_add", payload);
+      return result || { ok: false, error: "No save confirmation received. Check Bookmarks before trying again." };
+    } catch (error) {
+      return { ok: false, error: `Bookmark save could not be confirmed: ${error?.message || error}. Check Bookmarks before retrying.` };
+    } finally {
+      pending?.dismiss?.(true);
+      _bookmarkSaves.delete(key);
+    }
+  };
+
   function _isTrackedChannel(channel) {
     const key = String(channel || "").trim().toLowerCase();
     if (!key) return false;
@@ -48,15 +65,7 @@
   }
 
   function _fmtDate(value) {
-    const s = String(value || "").trim();
-    if (!s) return "";
-    const d = new Date(s);
-    if (Number.isNaN(d.getTime())) return s;
-    return d.toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
+    return window.YT.util.formatCalendarDate(value);
   }
 
   function _gradientFor(name) {
@@ -239,16 +248,23 @@
     } catch (e) { _showBookmarksLoadError(list, e); }
   }
 
+  let _bookmarksLoadSeq = 0;
   async function refreshBookmarksGrid() {
     const list = document.getElementById("bookmarks-list");
     if (!list || !nativeBridgeUp()) return;
+    const seq = ++_bookmarksLoadSeq;
+    const query = document.getElementById("bookmarks-filter")?.value.trim() || "";
     _beginBookmarksLoad(list);
     try {
-      const res = await bridgeCall("bookmark_list");
+      const res = await bridgeCall("bookmark_list", query);
+      if (seq !== _bookmarksLoadSeq) return;
       const rows = _rowsFromBookmarkResult(res);
       _finishBookmarksLoad(list, true);
+      const count = document.getElementById("bookmarks-filter-count");
+      if (count) count.textContent = query ? `${rows.length} shown` : "";
       if (!rows || rows.length === 0) {
         list.innerHTML = _BOOKMARK_EMPTY_HTML;
+        if (query) list.firstElementChild.textContent = `No bookmarks match "${query}".`;
         return;
       }
       const frag = document.createDocumentFragment();
@@ -370,6 +386,8 @@
                 // allowEmpty so an existing note can be cleared by
                 // saving an empty field; Cancel returns null.
                 allowEmpty: true,
+                multiline: true,
+                maxLength: 4000,
               })
             : Promise.resolve(prompt("Note:", b.note || "")));
           if (entered === null || entered === undefined) return; // cancelled
@@ -431,6 +449,10 @@
               window._openVideoInWatch(openObj);
               return;
             }
+            if (openObj.video_id) {
+              window._showToast?.("The source video for this bookmark is unavailable. Rescan the archive after reconnecting or restoring its files.", "warn");
+              return;
+            }
             const r = await bridgeCall("recent_resolve", title, channel);
             if (r?.ok && r.filepath && typeof window._openVideoInWatch === "function") {
               window._openVideoInWatch({
@@ -454,6 +476,7 @@
           jump();
         });
         card.addEventListener("keydown", (e) => {
+          if (e.target !== card) return;
           if (e.key !== "Enter" && e.key !== " ") return;
           e.preventDefault();
           jump();
@@ -463,6 +486,7 @@
       list.innerHTML = "";
       list.appendChild(frag);
     } catch (e) {
+      if (seq !== _bookmarksLoadSeq) return;
       _showBookmarksLoadError(list, e);
     }
   }
@@ -775,6 +799,12 @@
   }
 
   window.refreshBookmarks = refreshBookmarksGrid;
+  let bookmarkFilterTimer = null;
+  document.getElementById("bookmarks-filter")?.addEventListener("input", () => {
+    ++_bookmarksLoadSeq;
+    clearTimeout(bookmarkFilterTimer);
+    bookmarkFilterTimer = setTimeout(refreshBookmarksGrid, 200);
+  });
   window._primeBrowse = _primeBrowse;
   window._refreshBrowseWeekSummary = _refreshBrowseWeekSummary;
   window._askRedownload = _askRedownload;

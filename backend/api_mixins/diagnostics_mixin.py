@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import threading
+import time
+import uuid
 
 from backend.archive_capacity import archive_capacity_status
 from backend.services.managed_work import start_managed_task
@@ -17,6 +19,8 @@ from backend.version import APP_VERSION
 from backend.ytarchiver_config import CONFIG_FILE, load_config
 
 from ._shared import _log
+
+_integrity_init_lock = threading.Lock()
 
 
 class DiagnosticsMixin:
@@ -428,6 +432,9 @@ class DiagnosticsMixin:
 
 
     def integrity_scan_preview(self):
+        return self._run_integrity_scan()
+
+    def _run_integrity_scan(self, *, cancel_event=None, progress=None):
         """Run Patch 5's archive reconciliation audit without changing data.
 
         Every path is resolved here from the application's active config and
@@ -454,6 +461,9 @@ class DiagnosticsMixin:
                 TRANSCRIPTION_DB,
             )
 
+            optional = {}
+            if cancel_event is not None:
+                optional.update(cancel_event=cancel_event, progress=progress)
             result = scan_integrity(
                 archive_path=archive_path,
                 config_path=CONFIG_FILE,
@@ -464,6 +474,7 @@ class DiagnosticsMixin:
                     APP_DATA_DIR / "ytarchiver_pending_transcribe.json"
                 ),
                 activity_history_path=ACTIVITY_HISTORY_FILE,
+                **optional,
             )
             result["backup_notice"] = (
                 "This was a read-only preview. Export and verify a full backup "
@@ -479,3 +490,70 @@ class DiagnosticsMixin:
                 "repair_available": False,
                 "error": f"Integrity preview could not finish: {exc}",
             }
+
+    def _integrity_job_state(self):
+        # First calls can arrive on separate bridge threads.
+        with _integrity_init_lock:
+            if not hasattr(self, "_integrity_job_lock"):
+                self._integrity_job_lock = threading.Lock()
+                self._integrity_job = None
+        return self._integrity_job_lock
+
+    def integrity_scan_start(self):
+        """Start one supervised read-only scan without occupying a bridge call."""
+        lock = self._integrity_job_state()
+        with lock:
+            if self._integrity_job and self._integrity_job["running"]:
+                return {"ok": True, "started": False, "job_id": self._integrity_job["job_id"]}
+            job = {"job_id": uuid.uuid4().hex, "running": True,
+                   "cancel_requested": False, "cancel": threading.Event(),
+                   "started": time.monotonic(), "phase": "Starting deep archive check",
+                   "completed": 0, "unit": "items checked", "result": None}
+            self._integrity_job = job
+
+        def progress(update):
+            with lock:
+                job.update(update)
+
+        def run():
+            try:
+                result = self._run_integrity_scan(cancel_event=job["cancel"], progress=progress)
+            except Exception as exc:
+                _log.exception("background integrity preview failed")
+                result = {"ok": False, "preview_only": True, "repairs_applied": False,
+                          "error": f"Deep archive check could not finish: {exc}"}
+            with lock:
+                job.update(running=False, result=result,
+                           elapsed_seconds=time.monotonic() - job["started"])
+
+        try:
+            start_managed_task(self, owner="integrity-scan", label="Deep archive check",
+                               task_id=job["job_id"], target=run, cancel=job["cancel"],
+                               name="integrity-scan")
+        except Exception as exc:
+            with lock:
+                job.update(running=False, result={"ok": False, "error": str(exc)})
+            return {"ok": False, "error": f"Could not start deep archive check: {exc}"}
+        return {"ok": True, "started": True, "job_id": job["job_id"]}
+
+    def integrity_scan_state(self):
+        lock = self._integrity_job_state()
+        with lock:
+            job = self._integrity_job
+            if not job:
+                return {"ok": True, "running": False, "job_id": None}
+            state = {key: value for key, value in job.items() if key not in ("cancel", "started")}
+            state["ok"] = True
+            if job["running"]:
+                state["elapsed_seconds"] = time.monotonic() - job["started"]
+            return state
+
+    def integrity_scan_cancel(self, job_id=None):
+        lock = self._integrity_job_state()
+        with lock:
+            job = self._integrity_job
+            if not job or not job["running"] or (job_id and job_id != job["job_id"]):
+                return {"ok": False, "error": "That deep archive check is no longer running."}
+            job["cancel_requested"] = True
+            job["cancel"].set()
+            return {"ok": True, "cancel_requested": True}

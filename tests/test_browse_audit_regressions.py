@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 
 from backend import index as _backend_index  # noqa: F401 - initializes split index modules
 from backend import index_bookmarks, index_search
@@ -79,6 +80,10 @@ class _FakeIndex:
     def _reader_open(self):
         return self.connection
 
+    @contextmanager
+    def _interactive_reader(self, _operation):
+        yield self.connection
+
     def execute(self, sql, args):
         self.calls.append((sql, list(args)))
         return _Cursor(self.rows)
@@ -100,8 +105,10 @@ def test_transcript_search_applies_exact_graph_bucket_timestamps(monkeypatch):
 
     assert len(rows) == 1
     sql, args = fake.calls[0]
-    assert "COALESCE(v.upload_ts, vt.uts, v.added_ts, 0) >= ?" in sql
-    assert "COALESCE(v.upload_ts, vt.uts, v.added_ts, 0) < ?" in sql
+    assert "SELECT MIN(vt.upload_ts) FROM videos vt" in sql
+    assert "vt.channel=s.channel AND vt.title=s.title" in sql
+    assert ", v.added_ts, 0) >= ?" in sql
+    assert ", v.added_ts, 0) < ?" in sql
     assert start in args
     assert end in args
 
@@ -160,7 +167,7 @@ def test_segment_resolver_uses_catalog_channel_above_year_folder(
     video_path.write_bytes(b"fixture")
 
     fake = _FakeIndex([(
-        str(video_path), "Fixture", "Current Channel",
+        str(video_path), "Fixture", "Current Channel", 240, 1704067200, 1200, None,
     )])
     monkeypatch.setattr(_backend_index, "_reader_open", fake._reader_open)
     monkeypatch.setattr(
@@ -186,6 +193,9 @@ def test_segment_resolver_uses_catalog_channel_above_year_folder(
     assert result["ok"] is True
     assert result["channel"] == "Current Channel"
     assert result["tracked"] is True
+    assert result["duration"] == "4:00"
+    assert result["views"] == "1.2K"
+    assert result["upload_ts"] == 1704067200
 
 
 def test_bookmark_catalog_unavailable_raises_instead_of_looking_empty(

@@ -11,6 +11,30 @@ os.environ["APPDATA"] = _TEST_APPDATA.name
 Path(_TEST_APPDATA.name, "YTArchiver").mkdir(parents=True, exist_ok=True)
 
 
+def test_xsmall_caption_preference_survives_other_saves_and_settings_reload():
+    from backend import ytarchiver_config as config
+    from backend.api_mixins.settings_mixin import SettingsMixin
+
+    seed = copy.deepcopy(config.DEFAULT_CONFIG)
+    seed["caption_overlay_size"] = "small"
+    seed["caption_overlay_mode"] = "phrase3"
+    assert config.save_config(seed)
+
+    class Api(SettingsMixin):
+        _log_stream = SimpleNamespace()
+
+        def _reload_config(self):
+            pass
+
+    api = Api()
+    assert api.settings_save({"caption_overlay_size": "xsmall"})["ok"]
+    assert api.settings_save({"caption_overlay_bg": "outline"})["ok"]
+    restored = Api().settings_load()
+    assert restored["caption_overlay_size"] == "xsmall"
+    assert restored["caption_overlay_bg"] == "outline"
+    assert restored["caption_overlay_mode"] == "phrase3"
+
+
 def test_stale_settings_snapshot_cannot_erase_new_window_state(monkeypatch):
     from backend import window_state
     from backend import ytarchiver_config as config

@@ -31,6 +31,21 @@ from backend.ytarchiver_config import load_config, update_config
 from ._shared import ALLOWED_REDOWNLOAD_RESOLUTIONS, _log
 
 
+def channel_transcript_layout(channel, folder):
+    """Return the saved/inferred output layout, or None for a first choice."""
+    if not channel.get("split_years"):
+        return True
+    saved = channel.get("transcript_combined")
+    if isinstance(saved, bool):
+        return saved
+    for current, _dirs, files in os.walk(folder):
+        if any(name.endswith(("Transcript.txt", "Transcript.jsonl"))
+               for name in files):
+            return os.path.normcase(os.path.abspath(current)) == os.path.normcase(
+                os.path.abspath(folder))
+    return None
+
+
 class ChannelMixin:
 
     # ─── Channel context actions ───────────────────────────────────────
@@ -385,6 +400,9 @@ class ChannelMixin:
         try:
             from backend.index import _open as _idx_open
             conn = _idx_open()
+            if conn is None:
+                return {"ok": False, "queued": 0,
+                        "error": "Index is unavailable. Pending work was kept; retry after the index is ready."}
             if conn is not None:
                 placeholders = ",".join(["?"] * len(pending_ids))
                 rows = conn.execute(
@@ -398,7 +416,9 @@ class ChannelMixin:
                     if vid and fp:
                         id_to_path[vid] = (fp, title, txs)
         except Exception as e:
-            _log.warning("FTS index unavailable for Queue Pending resolve; all IDs treated as unresolved: %s", e)
+            _log.warning("Queue Pending index lookup failed; pending IDs retained: %s", e)
+            return {"ok": False, "queued": 0,
+                    "error": "Index lookup failed. Pending work was kept; retry after the index is ready."}
 
         queued = 0
         skipped = 0
@@ -450,40 +470,14 @@ class ChannelMixin:
              + (f", {len(unresolved)} unresolved" if unresolved else "")
              + "\n", "simpleline"],
         ])
-        # Log unresolved IDs so the user can see what's dangling — a
-        # deleted-since-download video, or an FTS index gap. Dropping
-        # those from the list keeps the counter honest.
+        # A missing catalog row or temporarily unavailable drive is not proof
+        # that the user no longer wants this transcript. Keep unresolved IDs.
         if unresolved:
             for u in unresolved:
                 self._log_stream.emit([
                     ["[GPU] ", "trans_bracket"],
-                    [f"  \u2014 dropping unresolved id: {u}\n", "dim"],
+                    [f"  \u2014 kept pending; could not locate video: {u}\n", "dim"],
                 ])
-            try:
-                def _prune_unresolved(live_cfg):
-                    for channel in live_cfg.get("channels", []):
-                        if (channel.get("name") or "") != name:
-                            continue
-                        ids = channel.get("pending_tx_ids") or []
-                        ids = [x for x in ids if x not in unresolved]
-                        channel["pending_tx_ids"] = ids
-                        channel["transcription_pending"] = len(ids)
-                        if not ids:
-                            channel["transcription_complete"] = True
-                        break
-
-                _result, cfg2 = update_config(_prune_unresolved)
-                # Refresh in-memory config so the next caller reads the
-                # pruned list instead of the pre-prune state.
-                self._config = cfg2
-            except OSError as e:
-                self._log_stream.emit_dim(
-                    " (missing-ID cleanup could not be saved)")
-                _log.warning(
-                    "unresolved-id prune save failed; stale IDs will "
-                    "persist until next launch: %s", e)
-            except Exception as e:
-                _log.warning("unresolved-id prune save failed; stale IDs will persist until next launch: %s", e)
         self._log_stream.flush()
         return {"ok": True, "queued": queued, "skipped": skipped,
                 "unresolved": len(unresolved)}
@@ -510,26 +504,26 @@ class ChannelMixin:
         ch, folder = resolved
         split_years = bool(ch.get("split_years"))
         split_months = bool(ch.get("split_months"))
-
-        # First-time-choice logic: for organized channels with no existing
-        # transcripts, ask the user whether to follow org or combine.
-        # Match OLD's dialog at YTArchiver.py:5918-5952.
-        if combined is None and split_years:
-            has_existing = False
-            if os.path.isdir(folder):
-                for dp, _dns, fns in os.walk(folder):
-                    if any(fn.endswith(("Transcript.txt",
-                                        "Transcript.jsonl")) for fn in fns):
-                        has_existing = True
-                        break
-            if not has_existing:
+        if combined is not None and not isinstance(combined, bool):
+            return {"ok": False, "error": "Choose Combined or Follow organization."}
+        explicit_layout = combined is not None
+        if combined is None:
+            combined = channel_transcript_layout(ch, folder)
+            if combined is None:
                 org_label = "Year/Month" if split_months else "Year"
                 return {"ok": True, "needs_choice": True,
                         "channel": name, "org_label": org_label}
-            # Has existing transcripts → follow whatever org they picked last time
-            combined = False
-        elif combined is None:
-            combined = True # unorganized channels always combine
+        if explicit_layout and split_years:
+            def save_layout(live_cfg):
+                for channel in live_cfg.get("channels", []):
+                    if channel.get("url") == ch.get("url") and ch.get("url") \
+                            or channel.get("name") == name:
+                        channel["transcript_combined"] = combined
+                        return
+            try:
+                update_config(save_layout)
+            except OSError as exc:
+                return {"ok": False, "error": f"Could not save transcript layout: {exc}"}
 
         # Build a dict of already-transcribed titles (normalized) + stored
         # video IDs from every aggregate Transcript.txt under this folder.
@@ -615,12 +609,15 @@ class ChannelMixin:
                 # to the right aggregated file. Respects the user's choice
                 # even when it conflicts with the channel's split_years flag.
                 # bulk_id coalesces the popover display.
-                self._transcribe.enqueue(video, plain_title, channel=name,
+                accepted = self._transcribe.enqueue(video, plain_title, channel=name,
                                          combined=bool(combined),
                                          bulk_id=bulk_id, bulk_total=bulk_total,
                                          bulk_index=idx,
                                          video_id=vid_id)
-                queued += 1
+                if accepted:
+                    queued += 1
+                else:
+                    skipped += 1
         self._log_stream.emit([
             ["[GPU] ", "trans_bracket"],
             [f"Transcribe all for {name}: ", "simpleline_blue"],
@@ -845,8 +842,9 @@ class ChannelMixin:
         thread. JS polls via chan_scan_resolution_mismatch_poll(token).
         """
         try:
-            import subprocess as _sp
             import uuid as _uuid
+
+            from backend.redownload import _dimensions_match_target, _ffprobe_media_info
             name = self._coerce_channel_name(folder_or_name)
             if not name:
                 return {"ok": False, "error": "channel name required"}
@@ -855,6 +853,7 @@ class ChannelMixin:
                 return {"ok": False, "error": f"Unsupported resolution: {target}"}
             if target == "best":
                 return {"ok": True, "mismatch": 0, "total": 0,
+                        "complete": True, "unknown": 0,
                         "note": "Best mode can't be scanned ahead of time."}
             target_h = int(target)
             ch = subs_backend.get_channel({"name": name})
@@ -879,6 +878,7 @@ class ChannelMixin:
                 total = 0
                 mismatch = 0
                 scanned = 0
+                unknown = 0
                 _exts = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v")
                 for dp, _dns, fns in os.walk(folder):
                     if cancel.is_set():
@@ -891,31 +891,25 @@ class ChannelMixin:
                         total += 1
                         fp_ = os.path.join(dp, fn)
                         try:
-                            r = _sp.run(
-                                ["ffprobe", "-v", "error",
-                                 "-select_streams", "v:0",
-                                 "-show_entries", "stream=height",
-                                 "-of", "default=noprint_wrappers=1:nokey=1", fp_],
-                                capture_output=True, text=True, timeout=6,
-                                creationflags=(0x08000000 if os.name == "nt" else 0))
-                            height = int((r.stdout or "0").strip() or 0)
+                            width, height, _video_id = _ffprobe_media_info(fp_)
+                            if not any(isinstance(d, (int, float)) and d > 0
+                                       for d in (width, height)):
+                                unknown += 1
+                                continue
                             scanned += 1
-                            # Redownload supports intentional downsizing, so a
-                            # 720p file is also a mismatch for a selected 360p
-                            # target. The old one-sided `< target` check only
-                            # detected upgrades and reported the whole archive
-                            # as "already at 360p or higher."
-                            if height > 0 and abs(height - target_h) > 8:
+                            if not _dimensions_match_target(width, height, target_h):
                                 mismatch += 1
                         except Exception:
-                            continue
+                            unknown += 1
                 import time as _t_mod
                 with self._pending_res_scans_lock:
                     self._pending_res_scans[token] = {
                         "done": True,
                         "_ts": _t_mod.time(),
                         "result": {"ok": not cancel.is_set(),
-                                   "cancelled": cancel.is_set(),
+                                    "cancelled": cancel.is_set(),
+                                    "complete": not cancel.is_set(),
+                                    "unknown": unknown,
                                    "mismatch": mismatch,
                                    "total": total, "scanned": scanned,
                                    "target": target_h},
@@ -1026,23 +1020,13 @@ class ChannelMixin:
         # channel redownload (audit r2). The `_scan_local_files` walker handles
         # any folder path, so pointing it at a subfolder just narrows the set.
         scope_label = ""
-        if isinstance(scope, dict) and scope.get("year"):
-            y = str(scope["year"])
-            sub = os.path.join(folder, y)
-            if scope.get("month"):
-                try:
-                    m = int(scope["month"])
-                    from backend.reorg import _MONTH_FOLDERS
-                    mf = _MONTH_FOLDERS.get(m)
-                    if mf:
-                        sub = os.path.join(sub, mf)
-                        scope_label = f"{y} / {mf}"
-                    else:
-                        scope_label = f"{y}"
-                except Exception:
-                    scope_label = f"{y}"
-            else:
-                scope_label = f"{y}"
+        if scope:
+            from backend.redownload import scoped_redownload_folder
+            try:
+                sub = scoped_redownload_folder(folder, scope)
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+            scope_label = os.path.relpath(sub, folder).replace(os.sep, " / ")
             if not os.path.isdir(sub):
                 return {"ok": False,
                         "error": f"Scope folder missing: {sub}"}
@@ -1221,6 +1205,7 @@ class ChannelMixin:
                         # the list and sets the event under the same
                         # lock) can't interleave between pop and clear.
                         self._redwnl_cancel.clear()
+                        self._sync_skip.clear()
                     # Atomically promote the about-to-run durable row into the
                     # crash-resumable current slot.  Removing the pending row
                     # first left a kill window where neither store owned it.
@@ -1344,7 +1329,6 @@ class ChannelMixin:
         _fixdates_cancel = threading.Event()
         self._fixdates_cancel = _fixdates_cancel
         task_id = f"fix-dates-{uuid.uuid4().hex}"
-        lease = None
         def _run():
             try:
                 if _fixdates_cancel.is_set():
@@ -1361,8 +1345,6 @@ class ChannelMixin:
                     if getattr(self, "_fixdates_cancel", None) is _fixdates_cancel:
                         self._fixdates_cancel = None
                     self._fixdates_running = False
-                    if lease is not None:
-                        lease.release()
 
         try:
             with admitted_operation(
@@ -1372,21 +1354,8 @@ class ChannelMixin:
                 task_id=task_id,
                 cancel=_fixdates_cancel,
             ):
-                admission = channel_leases.try_acquire(
-                    channel_aliases(ch, paths=[folder]),
-                    LeaseOwner(
-                        owner="file-date-maintenance",
-                        job_id=task_id,
-                        task_id=task_id,
-                        label=f"Fix file dates for {ch_name or 'channel'}",
-                        kind="maintenance",
-                    ),
-                    cancel_event=_fixdates_cancel,
-                )
-                if not admission.ok or admission.lease is None:
-                    self._fixdates_cancel = None
-                    return lease_busy_result(admission)
-                lease = admission.lease
+                # The reorg wrapper acquires the channel lease in this worker.
+                # Taking a second lease here would make it conflict with itself.
                 self._fixdates_running = True
                 try:
                     start_managed_task(
@@ -1400,7 +1369,6 @@ class ChannelMixin:
                         thread_factory=threading.Thread,
                     )
                 except Exception:
-                    lease.release()
                     self._fixdates_cancel = None
                     self._fixdates_running = False
                     raise

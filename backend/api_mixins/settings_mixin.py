@@ -310,6 +310,8 @@ class SettingsMixin:
             "archive_capacity_warning_free_gb": cap["free_gb"],
             "last_disk_scan_ts": float(cfg.get("last_disk_scan_ts", 0) or 0),
             "last_backup_ts": float(cfg.get("last_backup_ts", 0) or 0),
+            "last_backup_path": str(cfg.get("last_backup_path") or ""),
+            "last_auto_backup_path": str(cfg.get("last_auto_backup_path") or ""),
             "last_auto_backup_ts": float(
                 cfg.get("last_auto_backup_ts", 0) or 0),
             # Automatic full-backup cadence shown beside manual backup tools.
@@ -549,7 +551,7 @@ class SettingsMixin:
         # toolbar selects write these keys via settings_save, but until
         # this audit they had no save clause and were silently dropped.
         # Validated enums match the frontend's caption preference sets.
-        if data.get("caption_overlay_size") in ("off", "small", "medium", "large"):
+        if data.get("caption_overlay_size") in ("off", "xsmall", "small", "medium", "large"):
             cfg["caption_overlay_size"] = data["caption_overlay_size"]
         if data.get("caption_overlay_bg") in ("translucent", "outline", "none"):
             cfg["caption_overlay_bg"] = data["caption_overlay_bg"]

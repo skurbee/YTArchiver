@@ -78,6 +78,11 @@
         </div>
       </fieldset>
 
+      <fieldset class="video-opts-panel" id="manual-download-jobs" hidden>
+        <legend>Active downloads</legend>
+        <div id="manual-download-list" aria-live="polite"></div>
+      </fieldset>
+
       <!-- Channel nudge: when a channel URL is pasted but not in subs, show
            a handoff button to pre-populate the shared Add-Channel form.
            Mirrors YTArchiver.py:4458 channel_nudge_panel. -->
@@ -196,12 +201,12 @@
              snooze the drawer so it stops nagging until that time. -->
         <div class="deferred-retry-wrap">
           <button class="btn btn-ghost btn-thin" id="btn-deferred-retry"
-                   title="Retry options" aria-haspopup="menu"
-                   aria-controls="deferred-retry-menu" aria-expanded="false">Retry &#x25BE;</button>
+                   title="Sync or reminder options" aria-haspopup="menu"
+                   aria-controls="deferred-retry-menu" aria-expanded="false">Options &#x25BE;</button>
           <div class="deferred-retry-menu" id="deferred-retry-menu" role="menu" hidden>
-            <button data-retry="now" role="menuitem">Now</button>
-            <button data-retry="24h" role="menuitem">in 24 hours</button>
-            <button data-retry="1w" role="menuitem">in 1 week</button>
+            <button data-retry="now" role="menuitem">Sync Subbed now</button>
+            <button data-retry="24h" role="menuitem">Remind me in 24 hours</button>
+            <button data-retry="1w" role="menuitem">Remind me in 1 week</button>
           </div>
         </div>
         <button class="btn btn-ghost btn-thin" id="btn-deferred-clear"

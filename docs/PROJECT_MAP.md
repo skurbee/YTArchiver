@@ -1,7 +1,9 @@
 # YTArchiver — Project Map
 
-A tour of every file in this repo, what it does, and the
-important functions inside it.
+A guide to the runtime files, their responsibilities, and the main paths
+through the application. Test suites and supporting assets are grouped by
+purpose. For change and build procedures, see [CONTRIBUTING.md](CONTRIBUTING.md)
+and [BUILD.md](BUILD.md).
 ---
 
 ## What YTArchiver is
@@ -14,7 +16,7 @@ and stores everything in a structured folder tree on disk. The point
 is to own a permanent, offline-accessible copy of content that might
 disappear in the future.
 
-A small SQLite index makes everything searchable across all channels,
+A SQLite catalog and transcript index make the archive searchable across channels,
 including full-text search inside transcripts. The UI shows you each
 channel's history, lets you browse / play videos in an embedded
 player with karaoke-style word highlighting on the transcript, and
@@ -28,12 +30,16 @@ CSS + JavaScript rendered inside a `pywebview` window. The two sides
 talk through a tiny bridge: JavaScript calls `window.pywebview.api.<method>(...)`
 to invoke Python methods, and Python pushes streaming updates back to
 JS by calling `window._logBatch(...)` and a handful of other globals.
-There's no Flask, no HTTP, no two-process split — the UI literally
-runs inside the Python process, so the bridge is just function calls.
+The Python host owns the application services and the native WebView2 window.
+The UI uses the pywebview bridge rather than a Flask application server.
+Separate HTTP services provide local media playback and a command API.
+The command server defaults to loopback, allows unauthenticated GET status
+reads, and requires a token for POST actions. Worker subprocesses perform
+transcription and external-tool work.
 
 The exe is built with PyInstaller (see `YTArchiver.spec`). Whisper
-runs in its own subprocess on Python 3.11 because its CUDA wheels
-don't exist for Python 3.13 (which is what the main app uses).
+runs in its own Python 3.11 environment, with CPU/CUDA dependency locks kept
+separate from the Python 3.13 main application.
 
 ---
 
@@ -41,22 +47,25 @@ don't exist for Python 3.13 (which is what the main app uses).
 
 ### `main.py`
 The entry point. Defines the `Api` class, which is the single object
-exposed to JavaScript via `pywebview`. Every user-facing action the
-UI can trigger — adding a channel, starting a sync, scrubbing through
-a transcript, deleting a bookmark — is a method on this class.
+exposed to JavaScript via `pywebview`. Backend operations such as adding a
+channel, starting a sync, loading transcripts, and deleting bookmarks are
+methods on this class. Playback seeking and other local UI interactions
+remain in JavaScript.
 
 Also handles app startup: single-instance mutex, config loading, tray
 icon, log streamer setup, autorun scheduler, transcription manager,
 window state restore, and signal handling for clean shutdown.
 
 **Key things to find inside:**
-- `class Api` — the JS bridge. Hundreds of methods, organized into
-  sections by comment headers (Subs, Browse, Watch, Settings, etc).
+- `class Api` — the JS bridge, composed from `backend/api_mixins/`.
+  Its constructor connects shared services, managers, queues, and callbacks;
+  most feature endpoints live in the mixins.
 - `backend/version.py` — the single source of truth for `APP_VERSION` and
   `APP_VERSION_DATE`.
-- Bottom of file: `if __name__ == "__main__":` block — initializes
-  everything in order, creates the pywebview window, starts the
-  main loop.
+- `main()` and the final `if __name__ == "__main__":` block — initialize
+  the host, create the pywebview window, and start its event loop.
+- Startup stages — load cached library state first, then run supervised
+  background catalog and disk checks that yield to foreground work.
 
 ### `YTArchiver.spec`
 PyInstaller "recipe". Tells PyInstaller how to bundle `main.py` plus
@@ -71,11 +80,17 @@ the verified gate in `scripts/check.ps1`, not a bare PyInstaller command.
 - `requirements/*.lock` contains exact, hash-verified locks for the app,
   build/test tools, and CPU/CUDA worker environments.
 - `package.json` and `package-lock.json` pin the Playwright browser-test
-  harness.
+  harness; `playwright.config.js` controls headless browser selection and output.
+- `pyproject.toml` owns Ruff configuration. `.gitignore` and `.gitattributes`
+  define generated-file exclusions and repository text handling.
 - `THIRD_PARTY_NOTICES.md` and `licenses/` carry the notices and license text
   packaged with the executable.
 - `.github/workflows/quality.yml` runs the same Windows quality gate used
-  locally and publishes only an executable that passes build verification.
+  locally and uploads the verified executable as a CI artifact.
+- `docs/ARCHITECTURE.md`, `docs/PROJECT_MAP.md`, `docs/CONTRIBUTING.md`, and
+  `docs/BUILD.md` describe design, file ownership, contribution, and builds;
+  `docs/CHANGELOG.md` records release notes. `docs/requirements.txt` is a
+  broad dependency reference; reproducible builds use `requirements/*.lock`.
 
 See [`BUILD.md`](BUILD.md) for the complete command and gate stages.
 
@@ -87,30 +102,64 @@ Bundled into the exe via the spec file.
 
 ## `backend/` — the Python package
 
-Every server-side module the app uses at runtime. The presence of
+The application's Python modules and worker entry points. The presence of
 `__init__.py` is what makes Python treat this folder as an importable
 package (so `from backend.sync import sync_channel` works).
 
 ### `__init__.py`
-Empty file in terms of code, but contains a docstring overview of
-every module in the package and how they relate. **Read this first**
-if you want a one-shot mental model of the backend.
+Contains a short package overview. The detailed file inventory and current
+ownership boundaries are described below.
+
+### `api_mixins/`  ·  feature endpoints on `main.Api`
+
+`__init__.py` exports the mixin classes; `_shared.py` holds shared imports and
+compatibility helpers. Endpoint ownership is divided as follows:
+
+- `archive_mixin.py`, `index_mixin.py` — archive discovery/rescans and index operations.
+- `subs_mixin.py`, `channel_mixin.py` — subscriptions, defaults, and channel actions.
+- `sync_mixin.py`, `queue_mixin.py` — sync admission, worker lifecycle, and queue commands.
+- `browse_mixin.py`, `recent_mixin.py`, `bookmark_mixin.py` — library lists,
+  transcript/file resolution, recent items, and bookmarks.
+- `video_mixin.py`, `media_ops_mixin.py`, `redownload_mixin.py` — video actions,
+  media tools, and redownload workflows.
+- `metadata_mixin.py`, `thumbnail_mixin.py`, `transcribe_mixin.py` — metadata,
+  thumbnails, and transcription controls.
+- `backup_mixin.py`, `trash_mixin.py` — app-state backup/restore and recoverable Trash.
+- `diagnostics_mixin.py` — diagnostic reports and cancellable integrity-preview jobs.
+- `settings_mixin.py`, `info_mixin.py`, `onboarding_mixin.py` — preferences,
+  runtime information, and first-run setup.
+- `startup_mixin.py`, `window_mixin.py`, `livestreams_mixin.py` — startup helpers,
+  native-window operations, and deferred livestream controls.
+
+Feature mixins share `self.services` and the managers wired by `main.Api`.
+Use the service or repository owning the data when tracing a mutation.
 
 ### `archive_scan.py`  ·  filesystem reality check
 Walks the channel folder tree on disk and produces per-channel video
 counts, total sizes, and recency stats. The Subs and Browse tabs
-render directly from these stats. Has an on-disk JSON cache so the
+use these saved stats alongside catalog data. Has an on-disk JSON cache so the
 walk doesn't have to happen every time the UI repaints.
 
 **Key functions:** `scan_channel_folder`, `scan_all_channels`,
-`enrich_channels_with_stats`, `index_summary`, `archive_totals`.
+`enrich_channels_with_stats`, `cache_coverage`, `publish_scan_stats`,
+`index_summary`, `index_db_stats`, `archive_totals`.
+
+`index_summary` describes saved scans of current subscriptions and includes
+explicit scanned/total-channel coverage. `index_db_stats` reads the full
+catalog independently. A partial cache must never stand in for the full
+catalog's video count. Startup schedules a disk walk when coverage is incomplete,
+even when the previous scan timestamp is recent; only complete coverage earns
+a completed-scan timestamp.
 
 ### `auto_backup.py`  ·  scheduled backups + the archive's info folder
 Maintains `<archive root>/YTArchiver Info/`: a generated
 `ABOUT THIS ARCHIVE.txt` documenting every file convention in the
 archive, a copy of the running exe (frozen builds), and scheduled
 full-state backup ZIPs (config, subscriptions, download-ID archive,
-queue, filters). Owns `build_backup_zip` — the single zip-writing core
+queue and recovery sidecar, filters, activity history, independently saved
+bookmarks/notes, and a database snapshot when available). Bookmarks are kept
+even when the full database snapshot is omitted. The ZIP manifest records its
+creation time and resource checksums. Owns `build_backup_zip` — the single zip-writing core
 that the Health tab's manual Export (backup_mixin) also calls. The
 newest 4 scheduled backups are kept; older scheduled ZIPs are removed
 automatically. Manual backup exports are not part of this rotation.
@@ -121,9 +170,10 @@ automatically. Manual backup exports are not part of this rotation.
 `refresh_info_folder`.
 
 ### `autorun.py`  ·  recurring background sync
-Schedules sync passes on a recurring interval (every X minutes). Also
-owns the activity-log history that's written to `config.autorun_history`
-and rendered in the Settings tab's history view.
+Schedules sync passes using interval timers or clock-aligned times, including
+configurable anchors for the 12-hour and daily schedules. Also
+uses `activity_history.py` for durable activity-log history. It reports the
+next scheduled time, running state, and any workload delaying a due run.
 
 **Key classes/functions:** `class AutorunScheduler` (the timer-driven
 job), `append_history_entry`, `clear_history`, `format_history_entry`.
@@ -144,15 +194,18 @@ re-walk a 2,000-video channel's full catalog every time you sync.
 `clear`, `counts`.
 
 ### `cmd_server.py`  ·  localhost HTTP shim
-A tiny HTTP server (Python `http.server`) bound to localhost that
-external tools can hit to read app state without going through the
-GUI. Endpoints return version, current sync job, etc.
+A tiny HTTP server (Python `http.server`) that external tools can use without
+driving the GUI. It binds to localhost by default; a non-loopback bind requires
+both `YTARCHIVER_CMD_BIND` and `YTARCHIVER_CMD_ALLOW_LAN=1`. GET status routes
+are unauthenticated. POST actions require the installation token through
+`X-Auth-Token` or the token query parameter. `main.py` registers ping,
+GPU-status, and retranscription routes.
 
 **Key functions:** `start_server`, `stop_server`, `register_handler`.
 
 ### `compress.py`  ·  re-encode old downloads
-Drives ffmpeg to re-encode older videos to AV1 / HEVC at lower
-bitrates, replacing the original in place. Used by the per-channel
+Drives ffmpeg's AV1 NVENC encoder at a configured quality and resolution,
+validates the output, and promotes it over the original. Used by the per-channel
 "compress" toggle to save disk over time.
 
 **Key functions:** `compress_video` (one file), `compress_videos_batch`
@@ -167,10 +220,12 @@ If it goes away mid-sync the app pauses gracefully instead of corrupting state.
 `_check_directory_writable`.
 
 ### `drift_scan.py`  ·  catch silent drift
-Compares each channel's files on disk against the SQLite index and
-the per-channel `Transcript.txt`. Flags missing files, orphan
-transcript entries, and FTS-search "phantoms" (rows that no longer
-have a real file). Used by the maintenance pass in Settings.
+Compares transcript records in a channel's text and JSONL sidecars. Reports
+entries present in only one representation and uses catalog IDs to resolve
+identity where possible; ambiguous same-title matches cannot be repaired
+automatically. It also reports global FTS integrity-check failures. The
+legacy `fts_phantoms` result key aliases an unhealthy-index count, not a count
+of missing video files. Used by the drift-check tools in Health.
 
 **Key functions:** `scan_channel`, `apply_channel`,
 `rebuild_fts_index`.
@@ -182,7 +237,8 @@ them. SQLite is opened immutable/read-only. The report compares FTS and
 transcripts, legacy and normalized catalog links, saved-media IDs, queue and
 transcription recovery records, folder overrides, activity history, and
 migration state. It reports proposed repairs but deliberately has no repair
-entry point.
+entry point. `api_mixins/diagnostics_mixin.py` wraps it in a supervised job
+with progress, elapsed time, cancellation, and a final report for the UI.
 
 **Key functions:** `scan_integrity`, `run_integrity_scan`.
 
@@ -207,9 +263,10 @@ re-exports for back-compat.
 `new_videos_in_last_n_days`, `channel_transcription_stats`,
 `get_segments`, `get_segment_context`, `summary`.
 
-**Connection primitives:** `_open` (writer-shared), `_reader_open`
-(parallel reader for non-mutating queries), `_open_independent`
-(fresh per-thread connection for long-running writes like sweep).
+**Connection primitives:** `_open` (shared writer), `_reader_open`
+(separate shared reader), `_open_independent` (a connection owned by the
+calling operation), `_interactive_reader` and `_bounded_sql` (bounded lock
+and SQL waits for interactive reads).
 
 ### `catalog_repository.py`  ·  logical videos and physical media
 
@@ -222,7 +279,7 @@ The staged migration creates and verifies a separate legacy-catalog backup,
 projects old rows, compares deterministic digests, and enables normalized
 reads only after equivalence passes. Compatibility triggers mark identities
 dirty when an older executable writes `videos`; `CatalogConnection` reconciles
-those identities in the same transaction as the next Patch 5 commit.
+those identities in the same transaction as the next compatible catalog commit.
 
 **Key classes/functions:** `CatalogConnection`, `CatalogStatus`,
 `create_verified_legacy_catalog_backup`, `verify_legacy_catalog_backup`,
@@ -238,6 +295,8 @@ prevents duplicate physical copies from multiplying search results.
 
 **Key functions:** `search_video_titles` (LIKE-based titles), `search_fts`
 (FTS5 MATCH over transcript segments), `_sanitize_fts_query`.
+Interactive title/transcript queries use bounded database access. Transcript
+resolution validates catalog identity before accepting filename-derived IDs.
 
 ### `index_graph.py`  ·  word-frequency graphing
 Powers Browse > Graph.
@@ -249,13 +308,17 @@ Powers Browse > Graph.
 
 ### `index_bookmarks.py`  ·  bookmark CRUD
 Contains the index-backed bookmark operations.
+Writes use the admitted shared writer with bounded waits and duplicate-save
+protection. The list query filters title, channel, and note before its result
+limit is applied.
 
 **Key functions:** `bookmark_add`, `bookmark_list`, `bookmark_remove`,
 `bookmark_update_note`.
 
 ### `index_maintenance.py`  ·  archive sweep + prune + FTS rebuild
-The startup sweep, the "Rescan archive" button, and the "Rebuild FTS
-index" button all live here.
+Owns catalog sweeps, missing-file reconciliation, and FTS rebuild work.
+The bridge mixins admit and supervise these operations for startup and
+Health's archive/search-index controls.
 
 **Key functions:** `sweep_new_videos`, `prune_missing_videos`,
 `rebuild_fts_index`.
@@ -280,15 +343,15 @@ in the lower-right shows what's pending; the next sync retries them.
 ### `local_fileserver.py`  ·  serve local files to the embedded page
 The pywebview page can't load `file://` URLs reliably, so this is a
 localhost HTTP server (random port, allowlist of allowed roots) that
-serves the archive's .mp4 / .vtt / .txt files to the embedded video
-player and transcript viewer.
+serves local media, captions, channel artwork, and thumbnails to the embedded
+page. Requests are tokenized and restricted to allowed roots/files.
 
 **Key functions:** `set_allowed_roots`, `start_server`, `stop_server`,
 `url_for`.
 
 ### `log_stream.py`  ·  Python → JS log pipe
 Backend code writes log "segments" (a tuple of text + style tag) to
-the `LogStreamer`, which batches them every ~60ms and pushes them
+the `LogStreamer`, which batches them and pushes them
 into JS via `window._logBatch(payload)`. This is the bus that the
 Sync Log, mini-logs, and activity rows ride on.
 
@@ -298,12 +361,12 @@ Sync Log, mini-logs, and activity rows ride on.
 simple-mode filter that hides chatty output).
 
 ### `metadata/`  ·  views / likes / comments refresh  ·  package
-yt-dlp metadata refresh pipeline for already-downloaded videos. Pulls
-view counts, like counts, comments, and descriptions; writes a sidecar
-`.txt` and updates the index DB. The Settings > Metadata tab drives
-this.
+yt-dlp metadata refresh pipeline for downloaded videos. Pulls view counts,
+like counts, comments, and descriptions; updates metadata sidecars and the
+catalog. Health > Library owns the channel-information table and bulk tools;
+individual video actions also use this package.
 
-Package layout (all symbols re-exported via `metadata/__init__.py`):
+Package layout (`metadata/__init__.py` preserves the public compatibility surface):
 - `core.py` — title-match strategies + bulk-stats pipeline
 - `fetcher.py` — per-video / per-batch yt-dlp metadata fetch
 - `refresh.py` — re-export shim
@@ -314,6 +377,10 @@ Package layout (all symbols re-exported via `metadata/__init__.py`):
   refresh modules above
 - `normalize.py`, `scan.py`, `thumbnails_ops.py` — text utils,
   metadata-row scanning, thumbnail housekeeping
+- `io.py` — metadata JSONL paths and validated sidecar reads/writes
+- `refresh_state.py` — successful refresh timestamps on channel records
+- `manual_backfill.py` — candidate matching for manual videos missing IDs;
+  ambiguous matches are saved for review instead of assigned automatically
 
 **Key functions:** `fetch_single_video_metadata`,
 `fetch_metadata_for_videos` (batch), `bulk_refresh_views_likes`,
@@ -372,14 +439,13 @@ so it inherits pause / resume / cancel.
 `_upgrade_txt_file`, `_embed_one`, `_mp4_worklist`.
 
 ### `punct_worker.py`  ·  punctuation restoration subprocess
-Whisper outputs ALL CAPS or all-lowercase raw text with no commas /
-periods. This subprocess runs a HuggingFace punctuation model that
+This subprocess runs a punctuation model that
 reads in raw text and writes out punctuated + capitalized text.
 Stays alive between transcribe jobs so the model only loads once.
 
-**No top-level functions** — it's a standalone script that reads
-JSON requests from stdin and writes responses to stdout. The
-`PunctuationManager` class in `transcribe.py` is what manages it.
+The standalone script reads JSON requests from stdin and writes responses
+to stdout. The
+`PunctuationManager` class in `transcribe/punct_manager.py` manages it.
 
 ### `queues.py`  ·  Sync + GPU task queues
 Two persistent queues backed by `ytarchiver_queue.json`: the Sync
@@ -390,16 +456,19 @@ header render these.
 `QueueState` owns the in-memory state machine. File parsing and commits are
 delegated to `services/queue_repository.py`, which preserves malformed input
 as a sidelined backup and never replaces the last known-good file with an
-invalid object.
+invalid object. Full-library sync runs also retain a ledger of their exact
+task IDs, so pause/restart resumes the same batch and only a successfully
+completed batch advances the global "Last Full Sync" timestamp.
 
 **Key classes/functions:** `class QueueState` (enqueue, pop, remove, reorder,
 clear, current-running tracking, pause flags, UI payload formatting),
 `QueueRepository` (main/resuming load and atomic commit).
 
-### `redownload.py`  ·  fetch existing video at higher res
-Right-click a video and pick "Redownload at 1080p" — this module
+### `redownload.py`  ·  replace media at a chosen resolution
+Per-video and per-channel redownload actions use this module. It
 finds the existing file, identifies its current resolution via
-ffprobe, and re-fetches via yt-dlp at the new target.
+ffprobe, and re-fetches via yt-dlp at the selected target. A lower target
+can deliberately reduce resolution; "at target" checks account for that.
 
 **Key functions:** `redownload_channel`, `_fetch_yt_catalog`,
 `_match_files_to_ids`, `_ffprobe_height`, `_already_at_target`,
@@ -425,6 +494,13 @@ re-filtering the same title.
 Channel-subscription create / read / update / delete. Validates a
 YouTube channel URL, normalizes its shape, prevents duplicates, and
 applies defaults to new channel records.
+Channel roots are normalized without forcing a `/videos` tab, allowing
+streams-only channels. `channel_identity.py` owns durable YouTube channel-ID
+verification and recovery from changed handles.
+
+The Add Channel UI's default switches come from `SubsMixin.subs_get_defaults`:
+Auto-metadata and Auto-transcribe on, Compress off, unless an explicit saved
+default overrides them. Existing channel records retain their own settings.
 
 **Key functions:** `normalize_channel_url`, `validate_channel_url`,
 `fetch_channel_display_name`, `add_channel`, `update_channel`,
@@ -437,7 +513,7 @@ subprocess for each channel sync, parses its stdout line by line,
 emits log lines through the LogStreamer, and dispatches inline
 metadata + transcribe jobs as each video completes.
 
-Package layout (all symbols re-exported via `sync/__init__.py`):
+Package layout (`sync/__init__.py` preserves the public compatibility surface):
 - `core.py` — `sync_channel`, the per-channel orchestration giant
 - `sync_all.py` — `sync_all`, the multi-channel batch coordinator
 - `download_commit.py` — validates durable final media and performs the one
@@ -448,7 +524,8 @@ Package layout (all symbols re-exported via `sync/__init__.py`):
 - `log_rows.py` — activity-log row emission + persistence
   (`emit_consolidated_auto_row`, `emit_metadata_activity_row`,
   `_sync_row_emit`, `_persist_row_history`)
-- `quickcheck.py` — fast "are there new uploads?" probe
+- `quickcheck.py` — fast "are there new uploads?" probe using channel roots,
+  including channels that only have a Live tab
 - `options.py` — normalized per-channel sync options and match filters
 - `ytdlp_proc.py` — yt-dlp executable lookup, cookies, format strings, and batch-file helpers
 - `ytdlp_events.py` — yt-dlp output parsing helpers
@@ -487,15 +564,20 @@ cancelled / crashed yt-dlp invocations.
 `startup_cleanup_temps`.
 
 ### `transcribe/`  ·  Whisper manager  ·  package
-Owns the transcription pipeline. Two paths:
-1. **Fast path:** if YouTube has captions, just download those via
-   yt-dlp and parse the VTT — no Whisper needed.
-2. **Slow path:** queue a Whisper job in the GPU subprocess (Python
-   3.11 → faster-whisper → CUDA), then run punctuation restoration
-   on the output, then write the per-video `.txt` and the merged
-   channel `Transcript.txt`.
+Owns the transcription pipeline:
 
-Package layout (all symbols re-exported via `transcribe/__init__.py`):
+1. Already-saved, already-punctuated captions can commit inline after a
+   recovery marker is persisted. Unfinished work is promoted to the ordinary
+   Processing queue using the same durable task identity.
+2. Queued jobs normally try saved/fetched YouTube captions before Whisper.
+   A successful caption path includes durable sidecar/index commits and
+   recovery cleanup. Cancellation and partial/failed commits remain explicit
+   outcomes requiring the appropriate recovery policy.
+3. Jobs without usable captions run faster-whisper in the Python 3.11 worker
+   with CUDA or CPU, optionally restore punctuation, and commit transcript
+   text and JSONL. Explicit Whisper re-transcription bypasses caption reuse.
+
+Package layout (`transcribe/__init__.py` preserves the public compatibility surface):
 - `core.py` — `TranscribeManager` + worker loop
 - `job_execution.py` — explicit worker outcomes and cancel/defer/shutdown
   policy after file-changing work stops
@@ -503,6 +585,7 @@ Package layout (all symbols re-exported via `transcribe/__init__.py`):
   `_extract_video_id`, `_bump_transcription_pending`,
   `_resolve_transcript_paths`, `_ffprobe_duration`, chunk constants)
 - `punct_manager.py` — `PunctuationManager` subprocess wrapper
+- `paths.py` — aggregate/per-video transcript naming and JSONL sidecar paths
 - `transcribe_vtt.py` — fast-path: `_try_auto_captions`,
   `_fetch_captions_via_ytdlp`, `_parse_vtt`
 - `transcribe_files.py` — file I/O: `_write_jsonl_entry`,
@@ -520,8 +603,8 @@ Package layout (all symbols re-exported via `transcribe/__init__.py`):
 - `_try_auto_captions`, `_fetch_captions_via_ytdlp`, `_parse_vtt`
   — the fast-path.
 - `_write_jsonl_entry`, `_write_transcript_entry` — append to the
-  per-video JSONL (for word-timestamp data) and the channel-wide
-  `Transcript.txt`.
+  selected JSONL sidecar (word-timestamp data) and transcript text;
+  paths may aggregate a channel's videos or belong to one manual download.
 - `_replace_jsonl_entry`, `_replace_txt_entry` — surgical replace
   for re-transcribe.
 
@@ -533,7 +616,7 @@ sync, badge overlay for pending tasks, and "On top" toggle.
 tooltip / set badge / start / stop spin / set autorun menu).
 
 ### `utils.py`  ·  shared low-level helpers
-Common helpers reused across modules: subprocess env setup, byte
+Compatibility exports and remaining helpers reused across modules: subprocess env setup, byte
 decoding with cp1252 fallback, time/size/duration formatting, disk
 space check, process kill helper, ffprobe-based "is this video
 already compressed?" check.
@@ -551,12 +634,13 @@ its own Python version so the main app can stay on 3.13. Reads JSON
 job descriptions from stdin and writes transcript results (with word-
 level timestamps) to stdout.
 
-**No top-level functions** — it's a standalone script. Includes the
-30-second segment-cap re-segmentation logic that makes the karaoke
-transcript viewer behave on long monologues.
+Standalone worker script with a stdin-reader thread and explicit result
+messages. Includes the segment-cap re-segmentation logic that makes the
+karaoke transcript viewer behave on long monologues.
 
 ### `window_state.py`  ·  remember window geometry
-Persists the pywebview window size, position, and last-active tab
+Persists the pywebview window size, position, maximized/on-top state,
+splitter position, and column widths
 inside `ytarchiver_config.json` (under the `window_state` key, so it
 roams with the user's other settings) on close, restores on launch.
 
@@ -578,29 +662,69 @@ recent-download history, autorun-history-for-Activity-log).
 `autorun_history_entries_for_ui`, `append_pending_tx_id`,
 `remove_pending_tx_id`.
 
+### Supporting backend modules
+
+| Files | Responsibility |
+|---|---|
+| `activity_history.py` | Stable-ID activity history in its own durable store; reads legacy formats during migration. |
+| `archive_capacity.py` | Archive-drive free-space warnings. |
+| `channel_identity.py` | Learn permanent `UC…` channel IDs and verify handle recovery before changing saved URLs. |
+| `subscriber_counts.py` | Background recovery and caching of channel subscriber counts. |
+| `youtube_session.py` | Shared authentication/rate-limit failure handling and visible pause state. |
+| `youtube_traffic.py` | Persistent operation budgets, spacing, admission reservations, and traffic projections; a yt-dlp launch is an operation rather than an exact HTTP-request count. |
+| `deps_installer.py` | Optional external-tool and worker-environment installation helpers. |
+| `process_runner.py` | Child-process registry and supervised yt-dlp/ffmpeg execution. |
+| `proc_utils.py`, `subprocess_util.py` | Subprocess environment, decoding, Windows launch flags, and process helpers. |
+| `executor_utils.py`, `pause_helpers.py` | Bounded thread-pool submission and shared pause/cancel coordination. |
+| `fs_search.py` | Canonical media-extension sets, partial-file detection, and channel file walkers. |
+| `fs_safety.py`, `fs_attrs.py` | Containment, atomic I/O, disk checks, sidecar cleanup, and Windows visibility attributes. |
+| `fmt_utils.py`, `view_format.py` | Shared byte/time/duration formatting and UI-specific display formats. |
+| `text_utils.py` | Canonical title normalization and matching helpers. |
+| `log.py` | Python logging adapter for the UI log stream. |
+| `thumbnails.py` | Validated thumbnail downloads, atomic cache writes, and status helpers. |
+| `repair_captions.py` | Re-fetch and repair saved YouTube caption word/timestamp data. |
+| `punct_restore.py`, `punct_alignment.py` | Restore punctuation in existing transcripts and align punctuated text with word timing. |
+| `trash_manager.py` | Validated Trash listing, restoration, and permanent deletion through recovery manifests and opaque entry IDs. |
+| `trash_retention.py` | Retention timing, workload deferral, and lifecycle of automatic Trash cleanup. |
+| `taskbar_overlay.py` | Native Windows taskbar overlay, separate from the system-tray icon. |
+| `version.py` | Application version and version date used by runtime and build verification. |
+
 ---
 
 ## `web/` — the frontend
 
-Plain HTML / CSS / JS — no React, no build step, no transpilation.
-What's in source is what runs in the browser. The whole UI is
+Plain HTML / CSS / JS with a small HTML assembly step and no JavaScript
+transpilation. The whole UI is
 rendered inside the pywebview window using the embedded Edge WebView2
 on Windows.
 
-### `index.html`
-The single page. Defines:
-- Header strip (title + version)
-- Tab row (Download / Subs / Browse / Health / Settings)
-- Five tab panels — each is a full screen of UI
-- Floating overlays (modals, context menu, drawers, popups)
-- Script tags loading util.js / bridge.js / ~55 feature modules,
-  then `logs.js`, then the rendering modules
-  (`queueRender.js`, `tables.js`, `browseGrids.js`, `videosView.js`,
-  `watchView.js`),
-  then `app.js`
+### `index.template.html`, `partials/`, and `index.html`
 
-The top-of-file comment in this file lists every section so a new dev
-can navigate.
+Edit the template or a partial, then regenerate `index.html` through
+`backend/html_assembler.py`. The generated page is packaged with the app;
+`scripts/check_generated_html.py` checks that it matches its sources.
+
+The template defines:
+- Header strip (title + version)
+- Four default visible tabs: Download / Browse / Health / Settings. The
+  `data-tab="subs"` element is hidden in the template and retained for the
+  optional Dense Subs compatibility view, controlled by its saved preference.
+- Tab panels and their included partials
+- Floating overlays (modals, context menu, drawers, popups)
+- Script tags loading foundation modules, feature controllers, renderers,
+  and finally `app.js` in dependency order
+
+The partials own these surfaces:
+
+- `tab-download.html` — URL entry, download options, queues, and activity/main logs.
+- `tab-subs.html` — Dense Subs table and the shared Add/Edit Channel controls.
+- `tab-browse.html` — Channels, Videos, Manual, Recent, Search, Graph,
+  Bookmarks, Trash, and Watch views.
+- `tab-health.html` — Overview, Library, and Backups sections.
+- `tab-settings.html` — application preferences and archive-folder configuration.
+- `popovers.html` — queue and status popovers.
+- `dialogs.html`, `modals.html` — feature dialogs and shared modal structures.
+- `onboarding.html` — first-run setup overlay.
 
 ### `styles.css` + `styles-*.css`
 All visual styling. Dark theme. CSS variables (`:root` block in
@@ -609,7 +733,7 @@ Split into themed sheets that load in cascade order:
 
 - `styles.css` — `:root` vars, base, header, tab row,
   tab panels
-- `styles-settings.css` — Settings page
+- `styles-settings.css` — Settings and Health pages
 - `styles-download-controls.css` — Download tab controls
 - `styles-logs.css` — Activity log + main log + tag classes
 - `styles-tabs-data.css` — Subs table, data panels, queue popovers
@@ -617,6 +741,7 @@ Split into themed sheets that load in cascade order:
 - `styles-browse-grids.css` — Channel + Video grids
 - `styles-watch.css` — Watch view + captions + drawer
 - `styles-dialogs.css` — Dark dialogs + toasts + modals
+- `styles-onboarding.css` — first-run setup overlay
 
 ### Frontend module split
 
@@ -661,7 +786,8 @@ later modules read earlier modules' globals.
 - `util.js` — `escapeHtml`, `escapeAttr`, `_formatTs`,
   `onceIdempotent`; namespaced as `YT.util.*`.
 - `bridge.js` — `window.pywebview.api` shim + `bridgeCall(method,
-  ...)` helper that tolerates calls before the bridge is ready.
+  ...)` helper, readiness, admission/result handling, and queued catalog
+  reads with per-screen stale-response guards and loading state.
 - `eventState.js` — stable named-topic `publish` / `subscribe` / `snapshot`
   owner for shared bridge-pushed state. `window.setQueueState` publishes the
   `queue-state` topic instead of being repeatedly wrapped by consumers.
@@ -671,6 +797,9 @@ later modules read earlier modules' globals.
 **Shell + chrome:**
 - `chrome.js` — header strip, tab buttons, view switcher.
 - `shortcuts.js` — global keyboard shortcuts.
+- `navigationHistory.js` — Browse navigation history and back/forward handling.
+- `commandPalette.js` — searchable application commands and destinations.
+- `statusBar.js` — current Sync/Processing/index state, errors, and YouTube traffic limits.
 - `queueBlink.js` — pause/resume button + queue badge state machine.
   Subscribes to `queue-state` and `queue-payload` independently of the status
   bar.
@@ -679,7 +808,9 @@ later modules read earlier modules' globals.
 - `logContextMenu.js` — log-line right-click (copy / open URL / etc).
 - `toasts.js` — `window._showToast(text, kind)`.
 - `modals.js` — `askConfirm`, `askDanger`, `askQuestion`,
-  `askChoice`, `askTextInput`.
+  `askChoice`, `askTextInput`, including multiline note entry.
+- `uxPolish.js` — shared tooltip and focus behavior.
+- `onboarding.js` — first-run setup state, validation, and transitions.
 
 **Rendering modules (the heavy ones):**
 - `queueRender.js` — Sync / GPU task popover row builder.
@@ -695,30 +826,64 @@ later modules read earlier modules' globals.
   Publishes `renderChannelGrid`, `renderVideoGrid`, `_buildVideoCard`
   (also reused by the archive-wide Videos and Manual grids).
 - `watchView.js` — Embedded video player + transcript karaoke +
-  WebVTT caption overlay + metadata drawer.
+  timed DOM caption overlay + metadata drawer.
   Publishes `renderWatchView`, `loadWatchMetadataDrawer`,
   `_onRetranscribeComplete`, `setCaptionPref`.
+  Playback and metadata can become usable while transcript loading continues;
+  late transcript responses are guarded against replacing a newer video.
+  The YT-style overlay reveals timed words on the bottom row and smoothly rolls
+  completed lines through a fixed two-row viewport. Its measured line layout
+  is cached and rebuilt when the caption font or player dimensions change.
+  X-small through Large scale text and spacing with the player in all modes,
+  including paused playback and window fullscreen; hidden geometry retains
+  the last usable scale. YT Style is the startup and Off-to-on default;
+  explicitly selected word modes remain active while the overlay stays on.
 
 **Per-feature controllers (one file per UI feature):**
 - `downloadUrl.js`, `downloadDragDrop.js` — download URL bar +
   drag-and-drop ingestion.
-- `clearButton.js`, `editChannel.js`, `syncSubbed.js` — Subs tab
-  buttons.
+- `clearButton.js`, `syncSubbed.js` — log clearing and the primary Sync Subbed action.
+- `editChannel.js` — shared Browse dialog/Dense Subs Add/Edit Channel controller,
+  asynchronous defaults, dirty tracking, and post-add single-channel sync prompt.
+  Add/reset defaults are Auto-metadata on, Auto-transcribe on, Compress off;
+  saved defaults and existing-channel values take precedence when loaded.
+- `removeChannel.js`, `queuePending.js`, `refreshSizes.js` — channel removal,
+  pending-transcription queuing, and saved-size refresh controls.
 - `autoSync.js`, `liveDrawer.js` — autorun controls + livestreams
   drawer.
 - `columnSort.js`, `columnWidth.js` — Subs table column sort + resize.
 - `browseContextMenus.js` — right-click menus on Browse cards.
 - `browseView.js`, `browseContent.js`, `browseSearch.js`, `videosView.js` —
   Browse-tab view switching, content rendering, search, and the archive-wide
-  Videos grid.
-- `bookmarks.js`, `watchActions.js` — Watch view actions + bookmarks.
-- `graphTab.js` — Chart.js-driven word-frequency graphs.
-- `settingsTab.js`, `indexControls.js`, `aboutDialog.js`,
-  `diagnosticsDialog.js`, `manualTranscribe.js`, `autorunHistory.js`,
-  `logMode.js`, `scanArchive.js` — Settings tab pieces.
+  Videos grid. Search owns the explicit Play/Open in Watch action and the
+  visible date filter carried over from Graph.
+- `manualView.js`, `manualReview.js` — Manual Downloads listing/filtering and
+  review of ambiguous video-ID candidates.
+- `bookmarks.js`, `watchActions.js` — bookmark listing/filtering, pending-save
+  feedback, note editing, and Watch actions.
+- `trashView.js` — Trash filtering, selection, restore, and permanent-delete workflows.
+- `graphTab.js` — Chart.js word-frequency graphs, Search drill-down, and CSV
+  export with units, channel scope, normalization, and bucket context.
+- `settingsTab.js`, `settingsInfra.js` — preferences, Settings/Health navigation,
+  and additional archive folders.
+- `healthOverview.js` — read-only status cards and links to the relevant Health tools.
+- `indexControls.js` — Health > Library catalog statistics and search-index controls.
+  The catalog video count comes from `get_index_db_stats`; saved scan totals
+  have separate labels and explicit current-channel coverage.
+- `metadataTab.js` — Health > Library channel-information table, filtering,
+  sorting, missing-ID visibility, and metadata/thumbnail actions.
+- `scanArchive.js` — archive rescan progress and completion feedback.
+- `diagnosticsDialog.js` — diagnostic output and cancellable integrity-scan preview.
+- `driftScanDialog.js`, `compressDryRunDialog.js`, `repairCaptionsDialog.js`,
+  `punctRestoreDialog.js`, `provenanceDialog.js` — maintenance previews and
+  their progress/action dialogs.
+- `aboutDialog.js`, `manualTranscribe.js`, `autorunHistory.js`, `logMode.js` —
+  About, manual transcription, activity history, and log presentation controls.
 - `activityLogVis.js`, `seedLogs.js`, `missingFolders.js` —
   miscellaneous helpers.
 - `appDialogs.js`, `redownloadSampleModal.js` — modal dialogs.
+- `smallInits.js` — last-full-sync ticker, Subs filter, splitter persistence,
+  and archive-rescan completion handling.
 
 ### `vendor/chart.umd.min.js`
 Vendored Chart.js library. Renders the bar / line charts in the
@@ -730,9 +895,9 @@ Browse > Graph view. Third-party, do not edit.
 
 ### `tests/`
 
-Python regression modules cover the backend by patch/domain. Patch 5 adds
-focused coverage for the normalized catalog, integrity preview, queue/config
-repositories, download/transcription boundaries, and durable sidecar store.
+Python regression modules cover the backend by domain and change family,
+including normalized catalog identity, integrity preview, queue/config
+repositories, download/transcription boundaries, and durable sidecar storage.
 The Windows gate runs each Python test module in a fresh interpreter with
 disposable app-data directories so process-lifetime state cannot leak between
 unrelated modules.
@@ -744,7 +909,16 @@ Frontend tests have two layers:
   `web/index.html` with a deterministic `window.pywebview.api` stub. They cover
   modal safety, startup bridge timing, exact queue identity, stale async Watch
   responses, hidden-player shortcuts, backend error handling, and isolated
-  event-state subscribers.
+  event-state subscribers. Health coverage tests distinguish full catalog
+  counts from partial saved scans; library-polish tests exercise filters,
+  explicit playback, bookmark feedback/notes, and Graph export context.
+
+Useful focused entry points include `test_health_archive_count_coverage.py`,
+`test_startup_disk_count_recovery.py`, `test_physical_ui_library_reads.py`,
+`test_physical_ui_bookmark_writes.py`, and `test_ui_polish_sync_scope.py`.
+The browser fixture in `tests/frontend/browser/fixtures.js` supplies synthetic
+bridge responses; browser assertions do not by themselves prove real-archive
+performance or successful external downloads.
 
 `tests/release/test_release_guardrails.py` verifies the guardrails themselves:
 dependency locks, generated HTML, bridge scanning, privacy scanning, version
@@ -754,12 +928,18 @@ ownership, CI stages, x64 PE parsing, and packaged notices.
 
 - `check.ps1` — authoritative Windows gate and clean verified build
 - `lock_dependencies.ps1` — validates or intentionally refreshes lock files
-- `import_check.py` — compiles and imports every backend module
+- `import_check.py` — compiles backend code and `main.py`, then imports backend
+  modules and runtime dependencies in disposable app-data directories;
+  `main.py` and the Whisper/punctuation worker entry points are not imported
 - `check_generated_html.py` — fails when generated `index.html` is stale
 - `check_bridge_contract.py` — reports frontend bridge calls with no Python API
 - `repository_scan.py` — blocks known secret and publication-privacy patterns
 - `verify_build.py` — verifies x64 PE structure, version resources, and required
   files inside the PyInstaller executable
+- `smoke.py` — older focused smoke helper; it can regenerate a stale HTML
+  artifact. The full Windows gate remains the build/validation entry point.
+- `check.sh` — Git Bash compatibility wrapper that delegates to `check.ps1`;
+  use the PowerShell entry point directly for the isolated workflow.
 
 The CI workflow in `.github/workflows/quality.yml` invokes
 `scripts/check.ps1 -Bootstrap -RequireCleanTree`, so local and hosted release
@@ -767,17 +947,43 @@ checks use the same implementation.
 
 ---
 
+## How library counts differ
+
+- Health's **Search index** card (`index.summary`) and **Videos in catalog**
+  (`archive_scan.index_db_stats`) count available logical videos across the
+  full catalog. Multiple physical copies are represented separately in
+  `media_files` and do not multiply that logical count.
+- **Saved channel scan** comes from disk-cache entries for current
+  subscriptions. Its scanned/total-channel coverage describes whether those
+  subtotals cover every current channel; it does not cover every possible
+  additional archive or manual-download folder.
+- A direct `.mp4` file count has a different scope: it counts physical MP4s
+  under the chosen folder, excludes other supported formats, and includes
+  duplicate copies. Compare both scope and units before treating differing
+  values as missing media.
+- `indexControls.js` keeps database values loading until the database reply,
+  displays unavailable values on errors, and labels saved scan totals
+  independently. `healthOverview.js` flags incomplete saved scan coverage.
+
 ## How a sync actually works (end-to-end)
 
 Helpful to trace:
 
-1. User clicks the green **Sync Subbed** button in the Subs tab.
-2. `app.js` calls `window.pywebview.api.start_sync_all()`.
-3. `main.py`'s `Api.start_sync_all` spawns a background thread that
-   calls `backend.sync.sync_all(...)`.
-4. `sync_all` iterates over every channel and calls `sync_channel`
-   for each one.
-5. `sync_channel` builds a yt-dlp command and `Popen`s it.
+1. The user clicks **Sync Subbed**. `web/syncSubbed.js` handles the action
+   through the bridge's `sync_start_all` endpoint.
+2. `SyncMixin.sync_start_all` checks admission and protects worker startup
+   against concurrent requests. A full-library request enqueues persistent
+   download tasks for current subscriptions. With Auto off, the request can
+   stage the queue for a later Start instead of immediately running it.
+3. The supervised sync worker calls `backend.sync.sync_all(...)`, whose
+   implementation in `sync/sync_all.py` drains the persistent Sync queue.
+   This queue can contain downloads and other kinds of channel work.
+4. Download tasks resolve their current channel record and call
+   `sync/core.py:sync_channel`. Queued single-channel requests use the same
+   persistence and worker lifecycle without claiming a full-library run.
+5. `sync_channel` checks channel identity, applies channel options, and
+   launches yt-dlp through shared process/traffic controls. The stored channel
+   root and the streams pass support archived livestreams as well as uploads.
 6. As yt-dlp writes lines to stdout, `sync_channel` parses each one:
    `[youtube] VIDID:` → track current video id;
    `[download] Destination:` → emit "Downloading <title>" log row;
@@ -787,48 +993,57 @@ Helpful to trace:
    the final output. `download_commit.commit_download` verifies that the file
    is durable and performs one catalog registration before the UI reports a
    successful completion.
-7. Inline metadata task fires immediately via a single-worker
-   ThreadPoolExecutor (so we don't hammer YouTube). It refreshes
-   views / likes / comments and writes the metadata sidecar through the
-   shared durable sidecar store.
-8. Transcribe task enqueues onto the GPU queue. The
-   `TranscribeManager` worker picks it up, tries auto-captions first,
-   falls back to Whisper on the 3.11 subprocess, and returns an explicit
-   worker outcome for completion/retry policy.
-9. After every video, `sync_channel` writes a `[Dwnld]` row to the
-   activity log (consolidated across the channel's videos so far).
+7. When enabled, per-video metadata work refreshes saved information and
+   writes sidecars through the shared durable store. Shared YouTube traffic
+   and session controls apply to metadata requests too.
+8. When transcription is enabled, `TranscribeManager` can commit already-saved,
+   already-punctuated captions inline after persisting a recovery marker.
+   Work requiring models, failed/unfinished caption commits, or unfinished
+   follow-up compression uses the ordinary Processing queue/recovery path.
+   Queued transcription normally tries captions before the Python 3.11 Whisper
+   worker and returns an explicit outcome for completion/retry policy.
+9. Download and processing progress update a consolidated activity row;
+   `activity_history.py` preserves durable activity records independently
+   of whole-config saves.
 10. When the channel finishes, the consolidated row is finalized,
     optional channel-art refresh runs, optional .vtt cleanup runs,
     and config is updated with `last_sync` timestamp.
-11. When `sync_all` finishes ALL channels, the autorun scheduler
-    decides when to fire again (or not, if autorun is off).
+11. Each full-library task records its outcome against the saved batch ledger.
+    Only successful completion of that batch advances **Last Full Sync**.
+    Cancelled, failed, or removed tasks and single-channel runs cannot present
+    themselves as a completed full pass. The autorun scheduler tracks its next
+    due time and any workload that postpones it.
 
 Every step above writes log segments through the `LogStreamer`, which
-batches them every ~60ms and pushes them into JS via
+batches them and pushes them into JS via
 `window._logBatch(...)`, which then inserts them into the main log
 and the mini-logs.
 
 ## How a Whisper transcription works (end-to-end)
 
-1. A finished download submits a transcribe task — either inline from
-   `sync_channel` (auto-transcribe channels) or from a right-click
-   menu in Browse.
-2. The task enqueues onto `TranscribeManager`'s internal queue.
-3. The worker thread pops the next task. If YouTube has captions for
-   this video (`_try_auto_captions`), the fast path downloads the
-   VTT, parses it, and we're done — no Whisper at all.
-4. Otherwise, the worker spawns (or reuses) the Python 3.11 subprocess
-   that runs `faster-whisper`. The subprocess receives the video
-   path via a JSON message and runs whisper transcription on it.
+1. A finished download requests transcription for an auto-transcribe channel,
+   or the user requests it from Browse.
+2. `TranscribeManager` first persists recovery state. Eligible saved,
+   already-punctuated captions can finish inline; other work is coordinated
+   with the shared persistent `QueueState` GPU lane and current/recovery records.
+3. A queued job normally tries saved/fetched captions through
+   `_try_auto_captions`. Parsing VTT is only preparation: success requires
+   durable transcript/JSONL/index commits and cleanup of recovery state.
+   Cancellation and partial/failed commits preserve recovery rather than
+   silently continuing into another append. Explicit Whisper re-transcription
+   skips this caption path.
+4. When captions are unavailable or Whisper was explicitly requested, the
+   manager spawns (or reuses) the Python 3.11 subprocess running `faster-whisper`.
+   The subprocess receives the media path in a JSON message and transcribes it.
 5. Whisper returns segments with word-level timestamps. The worker
-   re-segments anything longer than 30 seconds (see `whisper_worker.py`)
+   caps long segments (see `whisper_worker.py`)
    so the karaoke viewer stays usable.
-6. The raw text gets shipped to the `punct_worker.py` subprocess for
-   punctuation + capitalization restoration.
-7. The worker writes a per-video `.jsonl` sidecar (word-level timestamps) and
-   updates the channel's merged `Transcript.txt` through validated atomic
-   sidecar commits. Multi-store operations retain a reconciliation marker
-   until every store is committed.
+6. When punctuation is enabled, text is sent to the `punct_worker.py`
+   subprocess and aligned back to timed segments.
+7. The manager uses `transcribe/paths.py` and `transcribe_files.py` to write
+   transcript text and its hidden JSONL sidecar. Subscribed-channel paths can
+   aggregate multiple videos; manual downloads use per-video transcript paths.
+   Validated atomic commits and reconciliation markers protect multi-store updates.
 8. It registers / updates the video and ingests transcript segments in the
    SQLite index, which immediately makes the transcript searchable in the UI.
 9. Throughout, progress updates flow back to the UI via the log
@@ -838,13 +1053,12 @@ and the mini-logs.
 
 ## Reading order
 
-to learn codebase, read in this order:
+To learn the codebase, read in this order:
 
 1. **This document**
-2. **`backend/__init__.py`** — one-line summary of every backend
-   module, all in one place.
-3. **`main.py`** top section — the `Api` class is how the UI talks
-   to everything else; skim its method names to see the surface.
+2. **`docs/ARCHITECTURE.md`** — service ownership, persistence, and lifecycle boundaries.
+3. **`main.py`** and **`backend/api_mixins/`** — service wiring and the
+   JS-callable feature surface.
 4. **`backend/sync/core.py`** — the heart of the app. `sync_channel`
    builds the yt-dlp command, loops over stdout, handles each line
    type. (Submodules under `sync/` are mostly extracted helpers — read
@@ -854,8 +1068,9 @@ to learn codebase, read in this order:
    projection.
 6. **`backend/services/`** — persistence, lifecycle, lease, and restore
    ownership boundaries.
-7. **`web/index.html`** + **`web/eventState.js`** + **`web/app.js`** — the page
-   structure + section map are at the top of each file.
+7. **`web/index.template.html`**, **`web/partials/`**, **`web/bridge.js`**,
+   **`web/eventState.js`**, and **`web/app.js`** — page sources, async bridge
+   state, shared events, and boot order.
 8. **`backend/transcribe/core.py`** + **`backend/whisper_worker.py`**
    — the transcription pipeline, only if you need to touch it.
 9. **`scripts/check.ps1`** — the executable definition of done for a change.

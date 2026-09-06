@@ -6,17 +6,33 @@ just cloned the repo and wants to find their bearings.
 
 ## Quick start
 
-1. **Install Python 3.13** (required for builds; 3.11 also needed for the
-   Whisper transcribe subprocess).
-2. **Install dependencies**: `pip install -r docs/requirements.txt`
-3. **Install external tools** on PATH:
-   - `yt-dlp` (latest)
-   - `ffmpeg` + `ffprobe`
-4. **Run from source**:
-   ```
-   python main.py
-   ```
-   The pywebview window opens. No build step required for development.
+Run commands from the repository root on Windows x64. Install the exact
+Python 3.13 patch version in `.python-version` and Node version in `.nvmrc`.
+Browser tests use installed Chrome by default; see [BUILD.md](BUILD.md) for
+browser selection and dependency setup.
+
+The standard check without an executable build is:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check.ps1 -Bootstrap -SkipBuild
+```
+
+This creates a temporary environment from the hash-locked Python dependencies,
+runs the isolated checks, and removes that environment afterward. The floating
+ranges in `docs/requirements.txt` are not the reproducible development or build
+installation path. [BUILD.md](BUILD.md) also describes a reusable locked
+environment for focused work.
+
+Python 3.11 and the separate worker locks are needed for optional Whisper and
+punctuation execution, not for packaging the desktop runtime. Downloads and
+media processing additionally need yt-dlp, ffmpeg, and ffprobe. Dependency
+diagnostics and **Run setup again** are under **Settings → About & troubleshooting**.
+
+A source launch with `.venv\Scripts\python.exe main.py` opens the application
+and uses the selected application-data profile. Native UI checks are a separate,
+explicitly approved action: use disposable application data and archive folders,
+or state specifically approved for that check. Do not close or replace a running
+instance as part of an automated check.
 
 ## Project layout
 
@@ -28,13 +44,20 @@ YTArchiver/
 ├── README.md               # GitHub landing page
 ├── LICENSE                 # MIT
 ├── pyproject.toml          # Project metadata + Python tool config
+├── .python-version, .nvmrc # Exact quality-gate toolchain versions
+├── requirements/           # Hash-locked desktop/build/dev/worker profiles
+├── package.json            # Browser-test commands
+├── package-lock.json       # Pinned browser-test dependencies
+├── playwright.config.js    # Headless browser + fixture-test configuration
+├── scripts/                # Windows gate, locks, import/HTML/bridge/build checks
+├── tests/                  # Python, Node, and frontend/browser regressions
 ├── docs/                   # Project docs
 │   ├── ARCHITECTURE.md     # System architecture
 │   ├── BUILD.md            # PyInstaller build workflow
 │   ├── CHANGELOG.md        # Release notes
 │   ├── CONTRIBUTING.md     # This file
 │   ├── PROJECT_MAP.md      # File-by-file index
-│   └── requirements.txt    # `pip install -r docs/requirements.txt`
+│   └── requirements.txt    # Range-based convenience dependency list
 ├── backend/                # All Python backend modules
 │   ├── api_mixins/         # JS-callable methods (see api_mixins/README.md)
 │   ├── version.py          # APP_VERSION + APP_VERSION_DATE
@@ -80,7 +103,7 @@ YTArchiver/
 │   ├── html_assembler.py   # builds web/index.html from partials
 │   ├── queues.py           # Persistent multi-queue (sync/gpu/etc)
 │   ├── compress.py         # AV1 NVENC encode pipeline
-│   ├── redownload.py       # Resolution upgrade pipeline
+│   ├── redownload.py       # Replace selected copies at a chosen resolution
 │   ├── reorg.py            # Folder reorganization
 │   ├── archive_scan.py     # Disk scan (counts + sizes)
 │   ├── drift_scan.py       # Audit txt vs jsonl drift
@@ -118,15 +141,15 @@ YTArchiver/
     │   ├── tab-download.html, tab-subs.html, tab-browse.html,
     │   │   tab-health.html, tab-settings.html, onboarding.html,
     │   │   popovers.html, dialogs.html, modals.html
-    ├── app.js              # Bootstrap + tab init orchestrator (~230 lines)
-    ├── logs.js             # Log rendering (~990 lines)
+    ├── app.js              # Bootstrap + tab init orchestrator
+    ├── logs.js             # Log rendering
     ├── watchView.js        # Watch view + karaoke + captions
     ├── browseGrids.js      # Channel grid + Video grid + card builder
-    ├── tables.js           # Subs table
+    ├── tables.js           # Optional compact Subs table
     ├── queueRender.js      # Sync/GPU task popover row builder
-    ├── metadataTab.js      # Settings → Metadata refresh status
+    ├── metadataTab.js      # Health → Library metadata and repair controls
     ├── settingsTab.js, settingsInfra.js, indexControls.js
-    ├── …~55 more feature modules (see docs/PROJECT_MAP.md for full list)
+    ├── …other feature modules (see docs/PROJECT_MAP.md for the full list)
     ├── styles.css             # vars + base (rest in styles-*.css)
     ├── styles-settings.css, styles-download-controls.css,
     │   styles-logs.css, styles-tabs-data.css, styles-browse.css,
@@ -134,18 +157,31 @@ YTArchiver/
     └── vendor/chart.umd.min.js
 ```
 
+The default main tabs are Download, Browse, Health, and Settings. The optional
+compact (Dense) Subs tab is hidden by default and can be enabled with **Show
+compact Subs tab** in Settings. Channel management is also in **Browse → Channels**.
+Health contains Overview, Library, and Backups. Settings is a single preferences
+page. Search, Bookmarks, Graph, Videos, Manual, and Trash are Browse views; keep
+those locations in mind when changing labels or navigation.
+
+`web/index.html` is generated. Change `web/index.template.html` or the relevant
+partial, then regenerate and review the HTML diff before checking the tree.
+The exact regeneration and verification commands are in [BUILD.md](BUILD.md).
+
 ## Architecture
 
 ### Threading model
 
 - **Main thread**: pywebview window event loop.
-- **JS bridge thread(s)**: pywebview invokes Python on a worker pool when
-  JS calls `pywebview.api.<method>`. Long-running handlers must offload
-  to a background thread or the UI freezes.
+- **JS bridge threads**: calls to `pywebview.api.<method>` can overlap. Keep
+  foreground queries bounded; a long query holding a shared lock can stall
+  other views even while the window remains responsive. Long-running jobs
+  use the application's supervised workers and cancellation controls.
 - **Sync worker thread**: `Api._sync_thread`, spawned for sync passes.
-- **GPU worker thread**: managed inside `TranscribeManager` — single
-  Whisper subprocess held open across multiple videos.
-- **Punctuation worker thread**: same shape as GPU but Python 3.11 subprocess.
+- **Processing worker**: `TranscribeManager` runs queued transcription and
+  compression work. Whisper uses a persistent Python 3.11 subprocess.
+- **Punctuation worker**: a separate Python 3.11 subprocess handles punctuation
+  restoration when requested.
 
 State is shared via locks declared on the relevant objects (`Api._redwnl_lock`,
 `QueueState._lock`, etc.). The cross-mixin `self.<attr>` contracts are
@@ -156,27 +192,34 @@ documented in `backend/api_mixins/README.md`.
 1. User adds a channel URL → `subs.add_channel` writes to config.
 2. Autorun scheduler (or manual "Sync" button) triggers `sync.sync_all`.
 3. For each channel, `sync.sync_channel` runs yt-dlp, downloads new videos.
-4. Each video lands → `transcribe.TranscribeManager.enqueue` for Whisper.
-5. Whisper output → `punct_restore` for punctuation → `_write_jsonl_entry`
-   stores per-segment timestamps.
-6. `index.register_video` indexes the file in SQLite + FTS5.
-7. User searches via UI → `index.search_segments` returns ranked snippets.
+4. A downloaded file is registered in the video catalog. Enabled post-processing
+   can use YouTube captions or queue Whisper and compression work.
+5. Transcript writers store text and timed JSONL segments in the selected
+   combined, year, month, or individual-video layout.
+6. JSONL ingestion updates the SQLite transcript table and FTS5 index;
+   `index.register_video` maintains the separate video catalog.
+7. Search calls `index.search_fts` for transcript snippets and
+   `index.search_video_titles` for video-title results.
 
 ### Persistence
 
 - **Config**: `%APPDATA%\YTArchiver\ytarchiver_config.json` (single file).
 - **Index**: `%APPDATA%\YTArchiver\transcription_index.db` (SQLite + FTS5).
-- **Queue state**: `%APPDATA%\YTArchiver\ytarchiver_queue.json` (debounced).
+- **Queue state**: `%APPDATA%\YTArchiver\ytarchiver_queue.json` plus
+  `ytarchiver_queue_resuming.json` for current-task recovery. Exact task
+  transitions use durable saves; routine updates can be debounced.
 - **Auth token**: `%APPDATA%\YTArchiver\cmd_token` (cmd-server auth).
-- **Transcripts**: `<channel>/{year}/{month}/<channel> Transcript.txt` (aggregated)
-  + `<channel>/{year}/{month}/.<channel> Transcript.jsonl` (hidden, per-segment).
+- **Transcripts**: channel-root, year, or month transcript files according to
+  the channel's output preference; individual videos use their own sidecars.
+  The timed JSONL sidecar shares the text file's stem with a leading dot.
 - **Thumbnails**: `<channel>/.Thumbnails/<title> [<vid>].jpg` (hidden).
 - **Metadata**: `<channel>/.<channel> Metadata.jsonl` (hidden, per-video).
 
 ## Code style
 
 - Python: PEP 8-ish. Type hints on new code.
-- JS: ES2026 (no transpile). No `var`. Optional chaining `?.` welcome.
+- JS: browser JavaScript without a transpilation step. Match the existing
+  feature modules and supported WebView2 runtime; Node is used for checks.
 - Comments: explain WHY, not WHAT. The patch-history comments
   (`Patch N (vXX.Y)`) document non-obvious history.
 
@@ -186,26 +229,44 @@ See [`BUILD.md`](BUILD.md).
 
 ## Submitting changes
 
-This is a personal project. PRs are welcome but expect a real
-review. Each PR should:
-- Bump `APP_VERSION` in `backend/version.py` by 0.1 (see version rule).
+PRs are welcome and are reviewed before integration. Each PR should:
+
 - Be one concern per PR.
-- Include a note explaining the WHY in the commit message.
+- Explain the user-visible problem, resulting behavior, and verification.
+- Include meaningful regression coverage where behavior changes.
+- Preserve unrelated changes and keep public examples free of private paths
+  or archive details.
 
 ### Version rule
 
-Every git push bumps `APP_VERSION` by 0.1. Single-decimal versioning,
-always carry the ten: `v37.9 + 0.1 = v38.0` (never `v37.10`).
+Maintainer pushes require a version increment in `backend/version.py` and an
+entry in `docs/CHANGELOG.md`; keep `APP_VERSION_DATE` aligned with the release.
+Single-decimal versioning carries the ten: `v37.9 + 0.1 = v38.0`
+(never `v37.10`). Coordinate the version with the maintainer. Local edits,
+testing, building, committing, pushing, and publishing are separate actions;
+do not infer permission for later steps from an earlier one.
 
-## Known gaps
+## Verification
 
-- A backend smoke suite lives at `tests/test_backend_smoke.py`. Run it with
-  `py -3.13 scripts/smoke.py` before patches that touch imports, re-exports,
-  sync helpers, generated HTML, frontend JS, or bridge-facing backend behavior.
-- End-to-end UI testing is still manual — run `python main.py` and exercise
-  the flow you touched.
-- `web/app.js` modularization is complete (10,218 → ~230 lines across
-  ~65 focused modules). Remaining work is small-cleanup passes only.
+- Use the Windows gate above for the complete automated check without building.
+  Omit `-SkipBuild` only when an executable build is intended.
+- Run **one Python test file per fresh interpreter**, with disposable `APPDATA`
+  and `LOCALAPPDATA` set before imports. Never use aggregate `pytest`,
+  including `pytest tests/`. Test modules can change process-wide
+  configuration and shutdown state. [BUILD.md](BUILD.md) has a safe focused
+  test example, including `tests/test_backend_smoke.py`.
+- Prefer `scripts/check.ps1` directly. `scripts/check.sh` is the Git Bash
+  compatibility entry point that forwards arguments to the same Windows
+  PowerShell gate; it does not run a separate aggregate Python suite.
+- `scripts/smoke.py` is a legacy subset: it does not isolate its application-data
+  environment, regenerates stale HTML, and skips JavaScript syntax checks if
+  Node is unavailable. It is not a replacement for the gate.
+- Node regressions are `tests/test_frontend*.js`. Browser behavior tests live in
+  `tests/frontend/browser` and run with `npm run test:browser` against the real
+  HTML and a fixture bridge. They run headlessly; native WebView/media behavior
+  still benefits from a separately approved manual check.
+- Edit the template or partials, regenerate HTML, and review that output before
+  the gate. The gate verifies freshness without repairing the generated file.
 
 ## Where to learn more
 

@@ -60,6 +60,29 @@
     let _rows = [];
     let _sortKey = "views";   // matches data-sort-active in HTML
     let _sortDir = "asc";     // oldest-first by default
+    let _missingIdsOnly = false;
+    let _missingIdsFirst = false;
+    const filterNotice = document.createElement("div");
+    filterNotice.className = "metadata-filter-notice";
+    filterNotice.hidden = true;
+    const filterText = document.createElement("span");
+    const clearFilter = document.createElement("button");
+    clearFilter.type = "button";
+    clearFilter.className = "btn btn-ghost btn-thin";
+    clearFilter.textContent = "Show all channels";
+    filterNotice.append(filterText, clearFilter);
+    table.before(filterNotice);
+    clearFilter.addEventListener("click", () => {
+      _missingIdsOnly = false;
+      render();
+      table.querySelector("thead th[data-sort]")?.focus?.();
+    });
+    window._filterMetadataMissingIds = () => {
+      _missingIdsOnly = true;
+      _missingIdsFirst = true;
+      render();
+      clearFilter.focus();
+    };
     // Whether the bulk thumbnail walk has returned at least once for the
     // currently-rendered rows. Used to swap the Thumbnails column between
     // "loading…" (spinner) and the real percentage. Cleared on each
@@ -120,11 +143,11 @@
         try { window._refreshMetadataTab?.({ force: true }); } catch (e) {}
       }, 2000);
     };
-    // Cutoff for the "Still on YT" column. bulk_refresh_views_likes only
-    // started populating `removed_from_yt_ts` after 2026-05-13. Channels
-    // whose `last_views_refresh_ts` predates that have no real signal —
-    // the column shows "—" instead of a misleading "✓ 100%".
-    const REMOVED_DETECTION_SINCE = 1778630400; // 2026-05-13 00:00 UTC
+    // A views refresh may cover only one year or a recent window. Only
+    // a completed availability scan covering every tracked file is evidence.
+    const hasFullAvailabilityCheck = r => Number(r.last_availability_check_ts) > 0
+      && Number(r.availability_checked_count) === Number(r.id_total)
+      && Number(r.id_with_id) === Number(r.id_total);
 
     // Format a timestamp relative to now ("2h ago", "3d ago", "never").
     // "Never" and >90d get a color class so they're easy to spot.
@@ -242,10 +265,8 @@
       let idTot = 0, idWith = 0;
       let thTot = 0, thWith = 0;
       let txTot = 0, txWith = 0;
-      // For Still-on-YT: only aggregate channels that have actually been
-      // bulk-checked since the removed-from-YT detection shipped. Sum-
-      // ming the others would dilute the percentage with channels whose
-      // `removed_from_yt` is 0 only because nobody ever checked.
+      // Unknown or partial availability coverage must not dilute the checked
+      // percentage with channels whose zero removals are only a default.
       let onTotChecked = 0, onRemovedChecked = 0;
       let onChannelsChecked = 0;
       for (const r of _rows) {
@@ -256,8 +277,7 @@
         thWith += (r.thumb_with || 0);
         txTot += (r.tx_total || 0);
         txWith += (r.tx_transcribed || 0);
-        const _vts = r.last_views_refresh_ts || 0;
-        if (_vts >= REMOVED_DETECTION_SINCE) {
+        if (hasFullAvailabilityCheck(r)) {
           onTotChecked += (r.id_total || 0);
           onRemovedChecked += (r.removed_from_yt || 0);
           onChannelsChecked++;
@@ -394,6 +414,7 @@
 
     const render = () => {
       _renderTotals();
+      filterNotice.hidden = !_missingIdsOnly;
       // Update th sort indicators.
       table.querySelectorAll("thead th").forEach(th => {
         if (!th.dataset.sort) {
@@ -402,7 +423,7 @@
           th.removeAttribute("aria-sort");
           return;
         }
-        if (th.dataset.sort === _sortKey) {
+        if (!(_missingIdsOnly && _missingIdsFirst) && th.dataset.sort === _sortKey) {
           th.setAttribute("data-sort-active", "");
           th.setAttribute("data-sort-dir", _sortDir);
           th.setAttribute("aria-sort",
@@ -417,7 +438,16 @@
         tbody.innerHTML = '<tr><td colspan="9" class="md-empty">No channels configured.</td></tr>';
         return;
       }
-      const sorted = sortRows(_rows);
+      const visible = _missingIdsOnly ? _rows.filter(row => Number(row.id_missing) > 0) : _rows;
+      const sorted = _missingIdsOnly && _missingIdsFirst
+        ? [...visible].sort((a, b) => Number(b.id_missing) - Number(a.id_missing))
+        : sortRows(visible);
+      filterText.textContent = `Showing ${sorted.length} channels with missing video IDs`
+        + (_missingIdsFirst ? ", most missing first" : "") + ". Totals above cover all channels.";
+      if (!sorted.length && _missingIdsOnly) {
+        tbody.innerHTML = '<tr><td colspan="9" class="md-empty">No channels with missing video IDs in the saved status.</td></tr>';
+        return;
+      }
       tbody.innerHTML = sorted.map(r => {
         const v = fmtRel(r.last_views_refresh_ts);
         const c = fmtRel(r.last_comments_refresh_ts);
@@ -537,27 +567,20 @@
           }
         }
 
-        // "Still on YT" column. `removed_from_yt` is populated by
-        // bulk_refresh_views_likes \u2014 files whose video_id disappeared
-        // from YouTube's flat-playlist response between syncs. The
-        // detection code shipped on 2026-05-13; any channel last
-        // views-refreshed BEFORE that has no real signal to report
-        // (its column was never populated by a sweep that knew to
-        // look). Show "\u2014" + tooltip in that case rather than a
-        // misleading "100%" \u2014 which used to be the bug.
+        // A completed full catalog comparison is separate from views freshness.
+        // Counts must still cover the current archive to show a percentage.
         const onTotal = idTotal;
         const onRemoved = r.removed_from_yt || 0;
         const onLive = Math.max(0, onTotal - onRemoved);
-        const _viewsTs = r.last_views_refresh_ts || 0;
-        const _checkedRecently = _viewsTs >= REMOVED_DETECTION_SINCE;
+        const _checkedRecently = hasFullAvailabilityCheck(r);
         let onYtHtml;
         if (onTotal === 0) {
           onYtHtml = '<span class="md-id-dim" title="No tracked videos">&mdash;</span>';
         } else if (!_checkedRecently) {
-          onYtHtml = `<span class="md-id-dim" title="Availability has not been checked yet. Run Refresh views/likes.">&mdash;</span>`;
+          onYtHtml = `<span class="md-id-dim" title="Availability has not been fully checked for the current archive. Run Refresh views/likes for the entire channel; partial checks do not cover every video.">&mdash;</span>`;
         } else if (onRemoved === 0) {
           // We DID check, found zero removed \u2014 show a real 100%.
-          onYtHtml = `<span class="md-id-ok" title="${onTotal.toLocaleString()} video(s) on disk, all still on YouTube as of the last bulk refresh.">\u2713 100%</span>`;
+          onYtHtml = `<span class="md-id-ok" title="${onTotal.toLocaleString()} video(s) on disk, all still on YouTube as of the full availability check on ${escapeHtml(new Date(r.last_availability_check_ts * 1000).toLocaleString())}.">\u2713 100%</span>`;
         } else {
           const pct = onLive / onTotal;
           const pctStr = fmtPct(onLive, onTotal);
@@ -757,6 +780,7 @@
           _sortKey = key;
           _sortDir = (key === "name") ? "asc" : "desc";
         }
+        _missingIdsFirst = false;
         render();
       };
       th.addEventListener("click", activateSort);
@@ -993,6 +1017,23 @@
         try { trigger.focus(); } catch {}
       }
     };
+    const _positionRowSubmenu = head => {
+      const sub = head?.nextElementSibling;
+      if (!sub?.classList.contains("md-cm-sub")) return;
+      const wasDisplay = sub.style.display;
+      sub.style.display = "block";
+      const rect = sub.getBoundingClientRect();
+      const parent = head.getBoundingClientRect();
+      const margin = 4;
+      const available = Math.max(0, window.innerHeight - margin * 2);
+      sub.style.maxHeight = `${available}px`;
+      sub.style.overflowY = "auto";
+      const left = parent.right + rect.width + margin <= window.innerWidth
+        ? parent.right : parent.left - rect.width;
+      sub.style.left = `${Math.max(margin, Math.min(left, window.innerWidth - rect.width - margin))}px`;
+      sub.style.top = `${Math.max(margin, Math.min(parent.top - 5, window.innerHeight - Math.min(rect.height, available) - margin))}px`;
+      sub.style.display = wasDisplay;
+    };
     const _openRowMenu = (tr, clientX, clientY) => {
       _closeRowMenu();
       _activeMenuTrigger = tr;
@@ -1098,6 +1139,7 @@
             head.setAttribute("aria-expanded", "false"));
           btn.setAttribute("aria-expanded", String(!expanded));
           if (!expanded) {
+            _positionRowSubmenu(btn);
             btn.nextElementSibling?.querySelector(".md-cm-item")?.focus?.();
           }
           return;
@@ -1126,6 +1168,10 @@
       if (y + r.height + margin > vh) y = Math.max(margin, vh - r.height - margin);
       menu.style.left = x + "px";
       menu.style.top = y + "px";
+      menu.querySelectorAll(".md-cm-has-sub").forEach(head => {
+        head.parentElement.addEventListener("mouseenter", () => _positionRowSubmenu(head));
+        head.addEventListener("focus", () => _positionRowSubmenu(head));
+      });
 
       setTimeout(() => {
         const first = menu.querySelector(
@@ -1149,6 +1195,7 @@
         const head = document.activeElement;
         _activeMenu.querySelectorAll(".md-cm-has-sub").forEach(other =>
           other.setAttribute("aria-expanded", String(other === head)));
+        _positionRowSubmenu(head);
         head.nextElementSibling?.querySelector(".md-cm-item")?.focus?.();
       } else if (_activeMenu && e.key === "ArrowLeft"
                  && document.activeElement?.closest?.(".md-cm-sub")) {
@@ -1430,6 +1477,9 @@
               const metaRows = await bridgeCall(
                 "get_channel_metadata_status", true);
               if (!context.isCurrent()) return null;
+              if (!Array.isArray(metaRows)) {
+                throw new Error(metaRows?.error || "Channel information is unavailable.");
+              }
               const thRes = await bridgeCall("thumbnail_status_bulk", true);
               return { metaRows, thRes };
             },

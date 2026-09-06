@@ -49,7 +49,8 @@ test.describe("user actions report backend failures truthfully", () => {
       window.__bridgeCallsFor("video_redownload").length)).toBe(1);
     expect(await page.evaluate(() =>
       window.__bridgeCallsFor("video_redownload")[0].args))
-      .toEqual(["watch-redownload-fixture", "Watch redownload fixture", "720"]);
+      .toEqual(["watch-redownload-fixture", "Watch redownload fixture", "720",
+        "C:\\FixtureArchive\\watch-redownload-fixture.mp4"]);
     await expect(page.locator("#toast-root .toast.error").last())
       .toHaveText("The redownload queue refused this video.");
     await expect(page.locator("#toast-root")).not.toContainText(

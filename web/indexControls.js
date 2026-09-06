@@ -110,14 +110,25 @@
             "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
           }[ch])));
         const _loading = '<span class="spinner-inline"></span>loading…';
+        const coverageKnown = c && typeof c.scan_complete === "boolean"
+          && Number.isFinite(c.scanned_channels) && Number.isFinite(c.total_channels);
+        const scanCoverage = !c ? "Unavailable"
+          : coverageKnown
+            ? `${fmt(c.scanned_channels)} of ${fmt(c.total_channels)} current channels`
+              + (c.scan_complete ? " (complete)" : " (incomplete)")
+            : "Coverage unknown";
         return [
-          `Channels: ${_esc(fmt(c.channels))}`,
-          `Videos in catalog: ${_esc(fmt(c.videos))}`,
-          `Files on disk: ${_esc(fmt(c.physical_copies))}`,
+          `Videos in catalog: ${db ? _esc(fmt(db.total_videos)) : _loading}`,
           `Segments: ${db ? _esc(_zeroOK(db.segments)) : _loading}`,
           `Video hours: ${db ? _esc(_zeroOK(db.hours)) : _loading}`,
           `Transcribed: ${db ? _esc(txPct) : _loading}`,
           `Search database size: ${db ? _esc(db.index_db_size_label || "—") : _loading}`,
+          "",
+          `Subscribed channels: ${_esc(fmt(c?.channels))}`,
+          `Saved channel scan: ${_esc(scanCoverage)}`,
+          `Videos in saved scan: ${_esc(fmt(c?.videos))}`,
+          `Files in saved scan: ${_esc(fmt(c?.physical_copies))}`,
+          `Size in saved scan: ${_esc(c?.size_label || "—")}`,
         ].join("\n");
       };
       const _paintCatalogStatus = (status) => {
@@ -146,8 +157,16 @@
         const outcome = await window.YT.bridge.catalogRead(
           "index-stats",
           async (context) => {
-            const idx = await bridgeCall("get_index_summary");
-            const c = (idx && idx.cards) || {};
+            let c = null;
+            try {
+              const idx = await bridgeCall("get_index_summary");
+              if (idx && !idx.error && idx.ok !== false
+                  && idx.cards && typeof idx.cards === "object") c = idx.cards;
+            } catch (error) {
+              // A saved channel scan is independent of the full catalog.
+              // Its absence must not prevent the real catalog count loading.
+              try { console.warn("get_index_summary failed:", error); } catch (_e) {}
+            }
             if (!context.isCurrent()) return null;
             // Paint cheap summary values before the detailed aggregate.
             statsEl.innerHTML = _renderLines(c, null);
@@ -156,6 +175,9 @@
             let dbError = null;
             try {
               db = await bridgeCall("get_index_db_stats");
+              if (!db || typeof db !== "object" || db.ok === false) {
+                throw new Error(db?.error || "Detailed statistics unavailable");
+              }
               // The backend intentionally returns a render-safe object when
               // its aggregate fails. Treat its explicit error field as a
               // failure instead of displaying those placeholder zeros as

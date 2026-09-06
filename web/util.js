@@ -160,6 +160,33 @@
     return normalizeSubsChannels(resp);
   }
 
+  function isElementVisible(el) {
+    if (!el || el.isConnected === false) return false;
+    for (let node = el; node; node = node.parentElement) {
+      if (node.hidden || node.getAttribute?.("aria-hidden") === "true") return false;
+      const style = window.getComputedStyle?.(node);
+      if (style?.display === "none" || style?.visibility === "hidden") return false;
+    }
+    return true;
+  }
+
+  function nearScrollBottom(el, distance = 700) {
+    if (!isElementVisible(el) || el.clientHeight <= 0
+        || el.scrollHeight <= el.clientHeight + 1) return false;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < distance;
+  }
+
+  function formatCalendarDate(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    const match = /^(\d{4})-?(\d{2})-?(\d{2})$/.exec(raw);
+    const date = match
+      ? new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]))
+      : parseDateValue(value);
+    if (!date || !Number.isFinite(date.getTime())) return raw;
+    return date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  }
+
   YT.util = {
     escapeHtml,
     escapeAttr,
@@ -171,6 +198,9 @@
     onceIdempotent,
     normalizeSubsChannels,
     loadSubsChannels,
+    isElementVisible,
+    nearScrollBottom,
+    formatCalendarDate,
   };
 
   // Compatibility aliases for modules that still consume global helpers.

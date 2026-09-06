@@ -226,11 +226,16 @@ class SyncMixin:
                 if not bool(cfg.get("autorun_sync", False)):
                     # Don't double-queue if a prior Sync Subbed already
                     # staged all the download tasks.
-                    existing_dl = any(
-                        (c.get("kind") or "download").lower() == "download"
-                        for c in self._queues.sync)
-                    queued = 0
-                    if not existing_dl:
+                    full_enqueue = getattr(
+                        type(self._queues), "sync_enqueue_full_library", None)
+                    if callable(full_enqueue):
+                        staged = self._queues.sync_enqueue_full_library(
+                            cfg.get("channels", []))
+                        if not staged.get("ok"):
+                            return staged
+                        queued = staged["queued"]
+                    else:
+                        queued = 0
                         for ch in cfg.get("channels", []):
                             if self._queues.sync_enqueue(ch):
                                 queued += 1
@@ -245,13 +250,11 @@ class SyncMixin:
                     except Exception:
                         total_queued = queued
                     return {"ok": True, "started": False,
+                            "can_start": bool(total_queued),
                             "queued": queued,
                             "total_queued": total_queued}
-            except Exception:
-                # If anything goes wrong here, fall through to the
-                # old behavior (start the worker). Better to over-fire
-                # than to silently drop the user's action.
-                pass
+            except Exception as exc:
+                return _api_err("QUEUE_SAVE_FAILED", str(exc))
         # Clear every event that could have been left set by a previous pass:
         # cancel — fired by "Clear Queue" or the Cancel button
         # skip — fired by "Skip current"
@@ -626,6 +629,13 @@ class SyncMixin:
         try:
             cfg = self._config or load_config()
             channels = cfg.get("channels", []) or []
+            full_enqueue = getattr(
+                type(self._queues), "sync_enqueue_full_library", None)
+            if callable(full_enqueue):
+                result = self._queues.sync_enqueue_full_library(channels)
+                if result.get("ok"):
+                    self._on_queue_changed()
+                return result
             queued = 0
             skipped = 0
             for ch in channels:
@@ -763,32 +773,32 @@ class SyncMixin:
 
 
     def sync_skip_current(self, task_id=""):
-        """Skip the currently-running sync item and advance to the next.
-
-        Sets _sync_skip only. sync_all passes _sync_skip as `kill_current`
-        to sync_channel, which terminates the in-flight yt-dlp subprocess
-        when it sees the flag — no longer overloading _sync_cancel, so a
-        rapid Skip+Cancel sequence can't swallow the Cancel.
-        """
+        """Commit cancellation intent; keep the row until its worker stops."""
         try:
             wanted = str(task_id or "").strip()
-            current_id = str(
-                (self._queues.current_sync or {}).get("task_id") or "").strip()
-            if not wanted or wanted != current_id:
-                return {"ok": False,
-                        "error": "Queue changed; task is no longer running"}
-            if not self._queues.replace_current_task_durable(
-                    "sync", None, expected_task_id=wanted):
-                return {"ok": False,
-                        "error": "Current sync task could not be saved as cancelled"}
-            # The durable queue/current transition is the commit point.  Do
-            # not signal yt-dlp before it succeeds or a failed API response
-            # could still cancel recoverable work.
-            self._sync_skip.set()
+            with self._queues._lock:
+                current_id = str(
+                    (self._queues.current_sync or {}).get("task_id") or "").strip()
+                if not wanted or wanted != current_id:
+                    return {"ok": False,
+                            "error": "Queue changed; task is no longer running"}
+                cancelling = dict(self._queues.current_sync)
+                cancelling["cancel_requested"] = True
+                if not self._queues.replace_current_task_durable(
+                        "sync", cancelling, expected_task_id=wanted):
+                    return {"ok": False,
+                            "error": "Current sync task could not be saved as cancelled"}
+                # Do not let completion advance the slot between durable intent
+                # and signalling the currently owned worker.
+                self._sync_skip.set()
+                if (cancelling.get("kind") or "").lower() == "redownload":
+                    redownload_cancel = getattr(self, "_redwnl_cancel", None)
+                    if redownload_cancel is not None:
+                        redownload_cancel.set()
             try:
                 self._log_stream.emit([
                     ["[Sync] ", "sync_bracket"],
-                    ["Skip current channel \u2014 moving on\n", "simpleline"],
+                    ["Cancelling current task \u2014 waiting for it to stop\n", "simpleline"],
                 ])
                 self._log_stream.flush()
             except Exception as exc:
@@ -850,6 +860,7 @@ class SyncMixin:
             if cur:
                 deferred = dict(cur)
                 deferred.pop("_pass_start_ts", None)
+                deferred.pop("cancel_requested", None)
                 if not self._queues.sync_defer_task(deferred):
                     return {"ok": False,
                             "error": "Deferred task could not be saved"}

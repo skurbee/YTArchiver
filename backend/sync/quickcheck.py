@@ -26,13 +26,15 @@ import time
 from datetime import datetime as _dt
 from datetime import timedelta as _td
 from typing import Any
+from urllib.parse import urlparse
 
 from .. import channel_identity, youtube_traffic
 from .. import utils as _utils
 from ..log import get_logger, swallow
 from ..process_runner import PROCESS_REGISTRY, popen_ytdlp, run_ytdlp
+from ..subs import normalize_channel_url
 from ..ytarchiver_config import config_transaction
-from .ytdlp_proc import _ensure_videos_tab, _find_cookie_source, find_yt_dlp
+from .ytdlp_proc import _find_cookie_source, find_yt_dlp
 
 _log = get_logger(__name__)
 
@@ -46,8 +48,27 @@ _quickcheck_bad: dict[str, dict[str, float]] = {}
 _quickcheck_bad_lock = threading.Lock()
 
 
+def _quickcheck_target(ch_url: str, check_count: int) -> tuple[str, int]:
+    url = normalize_channel_url(ch_url or "").strip()
+    parsed = urlparse(url)
+    channel = re.fullmatch(
+        r"/(@[^/]+|(?:channel|c|user)/[^/]+)"
+        r"(?:/(?:videos|shorts|streams|playlists|community|podcasts|"
+        r"channels|featured|about))?/?",
+        parsed.path, flags=re.IGNORECASE,
+    )
+    count = max(1, int(check_count))
+    if parsed.hostname in ("youtube.com", "www.youtube.com", "m.youtube.com") and channel:
+        # A channel root expands to Videos, Live and Shorts playlists. The
+        # limit also applies to that outer list, so values below three would
+        # omit whole tabs. Each available tab gets this bounded recent sample.
+        url = parsed._replace(path="/" + channel[1], params="", query="", fragment="").geturl()
+        count = max(3, count)
+    return url, count
+
+
 def _quickcheck_key(ch_url: str) -> str:
-    return _ensure_videos_tab(ch_url or "").strip().lower()
+    return _quickcheck_target(ch_url, 5)[0].lower()
 
 
 def _quickcheck_skip_state(ch_url: str) -> dict[str, Any] | None:
@@ -211,12 +232,11 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
                             pause_event=None,
                             stream=None,
                             ) -> dict[str, Any]:
-    """Probe the first N videos of a channel to see if any are NOT in our
+    """Probe recent uploads across the channel's available tabs for videos NOT in our
     archive already. Short-circuit for channels with nothing new.
 
-    Mirrors YTArchiver.py:17943 _quick_check_new_uploads exactly:
-      - `_ensure_videos_tab(url)` so the multi-tab playlist doesn't suck
-        in the Live/Shorts tabs
+      - A channel root includes Videos, Live and Shorts when present.
+      - At least three entries per tab keep the outer tab list untruncated.
       - `--lazy-playlist` so yt-dlp stops enumerating once it has enough
       - `--playlist-end N` (not `--playlist-items 1:N`) — the OLD flag
       - `archived_ids` can be a list or set; we coerce to a set for O(1)
@@ -228,7 +248,7 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
     skipped = _quickcheck_skip_state(ch_url)
     if skipped is not None:
         return skipped
-    qc_url = _ensure_videos_tab(ch_url)
+    qc_url, probe_count = _quickcheck_target(ch_url, check_count)
     def _clean_duration(value: object) -> int:
         try:
             return max(0, int(value or 0))
@@ -238,12 +258,11 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
     min_dur = _clean_duration(min_duration)
     max_dur = _clean_duration(max_duration)
     use_duration_filter = bool(min_dur or max_dur)
-    print_expr = ("%(id)s|||%(duration)s|||%(live_status)s"
-                  if use_duration_filter else "id")
+    print_expr = "%(id)s|||%(duration)s|||%(live_status)s"
     cmd = [
         yt_dlp,
         "--flat-playlist", "--lazy-playlist",
-        "--playlist-end", str(int(check_count)),
+        "--playlist-end", str(probe_count),
         "--print", print_expr,
         "--print", channel_identity.CHANNEL_TRACK_PRINT,
         "--no-warnings",
@@ -255,13 +274,11 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
     else:
         archived_set = {x.strip() for x in (archived_ids or []) if x}
     checked: list[str] = []
+    checked_set: set[str] = set()
     fresh: list[str] = []
     filtered: list[str] = []
     channel_tracks: list[dict[str, str]] = []
-    def _duration_filtered(duration_raw: str, live_status: str) -> bool:
-        status = (live_status or "").strip().lower()
-        if status in ("is_live", "is_upcoming"):
-            return True
+    def _duration_filtered(duration_raw: str) -> bool:
         try:
             dur = float((duration_raw or "").strip())
         except (TypeError, ValueError):
@@ -327,7 +344,7 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
         if channel_track is not None:
             channel_tracks.append(channel_track)
             continue
-        if use_duration_filter and "|||" in raw:
+        if "|||" in raw:
             parts = raw.split("|||", 2)
             vid = parts[0].strip()
             duration_raw = parts[1] if len(parts) > 1 else ""
@@ -338,10 +355,17 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
             live_status = ""
         if not re.fullmatch(r'[A-Za-z0-9_-]{11}', vid):
             continue
+        if vid in checked_set:
+            continue
+        checked_set.add(vid)
         checked.append(vid)
         if vid in archived_set:
             continue
-        if use_duration_filter and _duration_filtered(duration_raw, live_status):
+        if live_status.strip().lower() in ("is_live", "is_upcoming", "post_live"):
+            # These can become downloadable VODs later. Do not persist them
+            # in filtered_ids, which callers cache as already handled.
+            continue
+        if use_duration_filter and _duration_filtered(duration_raw):
             filtered.append(vid)
             continue
         fresh.append(vid)
@@ -352,6 +376,13 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
         return {"ok": True, "has_new": True,
                 "checked": 0, "fresh_ids": [], "empty_probe": True,
                 "channel_tracks": channel_tracks}
+    if proc.returncode != 0:
+        # One tab may have succeeded while another failed. Its archived IDs
+        # cannot prove the entire channel is unchanged; keep any fresh IDs.
+        _record_quickcheck_bad(ch_url, "partial")
+        return {"ok": True, "has_new": True, "checked": len(checked),
+                "fresh_ids": fresh, "filtered_ids": filtered,
+                "channel_tracks": channel_tracks, "partial_probe": True}
     _clear_quickcheck_bad(ch_url)
     return {"ok": True, "has_new": bool(fresh),
             "checked": len(checked), "fresh_ids": fresh,

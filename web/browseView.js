@@ -37,7 +37,7 @@
   const BROWSE_SUBMODE_TITLES = Object.freeze({
     channels: "Channels",
     recent: "Videos",
-    search: "Search transcripts",
+    search: "Search library",
     graph: "Word frequency",
     bookmarks: "Bookmarks",
     manual: "Manual Downloads",
@@ -189,11 +189,22 @@
     // Filter input
     document.getElementById("browse-filter")?.addEventListener("input", (e) => {
       const value = e.target.value;
+      const clear = document.getElementById("browse-filter-clear");
+      if (clear) clear.hidden = !value;
+      if (_browseState.view === "videos") window._rememberChannelVideoFilter?.(value);
       if (_browseFilterTimer) clearTimeout(_browseFilterTimer);
       _browseFilterTimer = setTimeout(() => {
         _browseFilterTimer = null;
         filterCurrentView(value);
       }, 200);
+    });
+
+    document.getElementById("browse-filter-clear")?.addEventListener("click", () => {
+      const input = document.getElementById("browse-filter");
+      if (!input) return;
+      input.value = "";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.focus();
     });
 
     // Channel-grid sort dropdown
@@ -274,6 +285,7 @@
       const filtered = !q
         ? _browseState.videos
         : _browseState.videos.filter(v => (v.title || "").toLowerCase().includes(q));
+      window._updateChannelFilterSummary?.();
       const groupByYear = !!document.getElementById("browse-group-year")?.checked;
       const groupByMonth = !!document.getElementById("browse-group-month")?.checked;
       window.renderVideoGrid(filtered, (v) => {
@@ -447,6 +459,7 @@
   // `load()` cuts the stream so the browser releases the file handle
   // too (matters for the local_fileserver 206-range requests).
   function _stopWatchVideo() {
+    window._cancelWatchPlaybackIntent?.();
     // Full teardown — used when the user is DONE watching (Back
     // button, Library sidebar click). Pauses + unloads the media
     // resource. After this, returning to the Watch view shows the
@@ -465,6 +478,7 @@
   window._stopWatchVideo = _stopWatchVideo;
 
   function _pauseWatchVideo() {
+    window._cancelWatchPlaybackIntent?.();
     // Soft pause — used when the user navigates AWAY from Browse to
     // a different top-level tab while a video is loaded. Keeps src +
     // playhead intact so returning to Browse resumes right where they
@@ -525,6 +539,8 @@
       if (chanSortWrap) chanSortWrap.hidden = false;
       if (addChannelBtn) addChannelBtn.hidden = false;
       if (filter) { filter.placeholder = "Filter channels\u2026"; filter.value = ""; }
+      const clear = document.getElementById("browse-filter-clear");
+      if (clear) clear.hidden = true;
       if (findWrap) findWrap.hidden = false;
       // Re-render the grid to match the just-cleared filter. Without this,
       // a grid left filtered from a previous visit (or a stale per-channel
@@ -544,7 +560,13 @@
       sortWrap.hidden = false;
       if (chanSortWrap) chanSortWrap.hidden = true;
       if (addChannelBtn) addChannelBtn.hidden = true;
-      if (filter) { filter.placeholder = "Filter videos\u2026"; filter.value = ""; }
+      if (filter) {
+        filter.placeholder = "Filter videos\u2026";
+        filter.dataset.channel = _browseState.currentChannel?.folder || _browseState.currentChannel?.name || "";
+        filter.value = window._currentChannelVideoFilter?.() || "";
+      }
+      const clear = document.getElementById("browse-filter-clear");
+      if (clear) clear.hidden = !filter?.value;
       if (findWrap) findWrap.hidden = false;
     } else if (viewName === "watch") {
       document.getElementById("view-watch").hidden = false;
@@ -579,6 +601,11 @@
   // drawer body. Idempotent — safe to call repeatedly.
   function _paintWatchLoadingState(video) {
     try {
+      const bookmark = document.getElementById("btn-bookmark-now");
+      if (bookmark) {
+        bookmark.disabled = true;
+        bookmark.title = "Video is loading…";
+      }
       const titleEl = document.getElementById("watch-title");
       const metaEl = document.getElementById("watch-meta");
       if (titleEl) {

@@ -195,9 +195,9 @@
       { success: "Queued for Whisper.", failure: "Could not queue transcription." });
   }
 
-  async function queueVideoRedownload(videoId, title, resolution) {
+  async function queueVideoRedownload(videoId, title, resolution, filepath) {
     return checkedAction(
-      () => bridgeCall("video_redownload", videoId, title, resolution),
+      () => bridgeCall("video_redownload", videoId, title, resolution, filepath),
       {
         success: `Redownload queued at ${resolution}.`,
         failure: "Could not queue redownload.",
@@ -496,6 +496,218 @@
   };
 
   // ─── Browse tab context menus ────────────────────────────────────────
+  window._openChannelContextMenu = function (channel, x, y, trigger, options = {}) {
+    const name = channel.folder || channel.name || "";
+    if (!name) return;
+    const channelRef = { name, folder: channel.folder || "", url: channel.url || "" };
+    const api = window.YT?.api;
+    // Live counters are stashed on the card by renderChannelGrid.
+    const _pendTx = Math.max(
+      0, parseInt(channel.transcription_pending || "0", 10) || 0);
+    const _pendMeta = parseInt(channel.metadata_pending || "0", 10) || 0;
+    const _missingInfoLabel = _pendMeta > 0
+      ? `Fix missing information (${_pendMeta} pending)`
+      : "Fix missing information";
+    const _hasPendingRedownload = !!channel._pending_redownload;
+    const _redownloadRes = channel._redownload_res || "best";
+    const _redownloadResLabel = _redownloadRes === "best"
+      ? "Best available"
+      : `${_redownloadRes}p`;
+    const items = [
+      { header: "Open & manage" },
+      { label: "Open videos", cls: "primary", action: () => { window._browseState.currentChannel = channel; window.loadVideosFor?.(channel); window.showView?.("videos"); } },
+      { label: "Open folder", cls: "primary",
+        action: () => checkedAction(
+          () => api?.chan_open_folder?.(name),
+          { failure: "Could not open channel folder." }) },
+      { label: "Open channel on YouTube", cls: "primary",
+        action: () => checkedAction(
+          () => api?.chan_open_url?.(name),
+          { failure: "Could not open the channel on YouTube." }) },
+      { sep: true },
+      { label: "Sync now", cls: "primary",
+        action: async () => {
+          try {
+            const result = await api?.sync_one_channel?.({ name });
+            window.YT?.bridge?.reportSyncOneResult?.(result, name);
+          } catch (error) {
+            window.YT?.bridge?.reportSyncOneResult?.({
+              ok: false,
+              error: "Sync failed: " + (error?.message || error),
+            }, name);
+          }
+        }},
+      { label: "Edit settings", cls: "primary",
+        action: () => window._editChannelFromBrowse?.(name) },
+      { sep: true },
+      { header: "Maintenance" },
+      // right-click → re-transcribe whole channel
+      // with a Whisper model picker. Same API as the Subs context
+      // menu version.
+      { label: "Re-transcribe channel…",
+        title: "Redo every video with Whisper, replacing existing transcripts (use this to fix bad/corrupted ones)",
+        action: async () => {
+        const model = await (window._askWhisperModel?.(`channel "${name}"`));
+        if (!model) return;
+        const ok = await askDanger(
+          "Re-transcribe entire channel",
+          `Queue every video in "${name}" for re-transcription with `
+            + `Whisper ${model}?\n\nThis can take hours on large channels.`,
+          "Queue all");
+        if (!ok) return;
+        const res = await api?.transcribe_retranscribe_channel?.(
+          { name }, model);
+        if (res?.ok) {
+          window._showToast?.(
+            `Queued ${res.queued} video(s) from ${name} for Whisper ${model}.`,
+            "ok");
+        } else {
+          window._showToast?.(res?.error || "Channel retranscribe failed.",
+                              "error");
+        }
+      }},
+      { label: "Metadata",
+        title: "Repair missing information or update saved YouTube details",
+        submenu: [
+          { label: _missingInfoLabel,
+            title: "Fetch information and thumbnails only where they are missing",
+            action: () => checkedAction(
+              () => api?.metadata_fill_missing_channel?.({ name }),
+              { success: "Missing-information check started.",
+                failure: "Missing-information check did not start." }) },
+          { label: "Repair missing thumbnails",
+            title: "Download only thumbnail image files that are missing",
+            action: async () => {
+              const r = await api?.refetch_thumbnails?.({ name });
+              if (r?.started) {
+                window._showToast?.(
+                  `Thumbnail repair started for ${name}.`, "ok");
+              } else {
+                window._showToast?.(
+                  r?.error || "Thumbnail repair did not start.", "error");
+              }
+            }},
+          { sep: true },
+          { label: "Refresh views & likes",
+            title: "Refresh views, likes, comment totals, and YouTube availability",
+            submenu: [
+              { label: "Last 7 days",
+                action: () => checkedAction(
+                  () => api?.metadata_refresh_views_channel?.({ name }, 7),
+                  { success: "Video-statistics refresh started.", failure: "Video-statistics refresh did not start." }) },
+              { label: "Last 30 days",
+                action: () => checkedAction(
+                  () => api?.metadata_refresh_views_channel?.({ name }, 30),
+                  { success: "Video-statistics refresh started.", failure: "Video-statistics refresh did not start." }) },
+              { label: "Last 90 days",
+                action: () => checkedAction(
+                  () => api?.metadata_refresh_views_channel?.({ name }, 90),
+                  { success: "Video-statistics refresh started.", failure: "Video-statistics refresh did not start." }) },
+              { label: "All videos (slow)",
+                action: () => checkedAction(
+                  () => api?.metadata_refresh_views_channel?.({ name }, null),
+                  { success: "Video-statistics refresh started.", failure: "Video-statistics refresh did not start." }) },
+            ]},
+          { label: "Refresh comments",
+            title: "Fetch updated saved comments for archived videos",
+            submenu: [
+              { label: "Last 7 days",
+                action: () => checkedAction(
+                  () => api?.metadata_refresh_comments_channel?.({ name }, 7),
+                  { success: "Comments refresh started.", failure: "Comments refresh did not start." }) },
+              { label: "Last 30 days",
+                action: () => checkedAction(
+                  () => api?.metadata_refresh_comments_channel?.({ name }, 30),
+                  { success: "Comments refresh started.", failure: "Comments refresh did not start." }) },
+              { label: "Last 90 days",
+                action: () => checkedAction(
+                  () => api?.metadata_refresh_comments_channel?.({ name }, 90),
+                  { success: "Comments refresh started.", failure: "Comments refresh did not start." }) },
+              { label: "All videos (slow)",
+                action: () => checkedAction(
+                  () => api?.metadata_refresh_comments_channel?.({ name }, null),
+                  { success: "Comments refresh started.", failure: "Comments refresh did not start." }) },
+            ]},
+        ]},
+      { label: "Transcribe all missing",
+        count: _pendTx,
+        countDim: _pendTx === 0,
+        countAriaLabel: `Transcribe all missing, ${_pendTx} untranscribed video${_pendTx === 1 ? "" : "s"}`,
+        title: "Transcribe only videos that don't have a transcript yet (YouTube captions first, Whisper fallback)",
+        action: () => window._askTranscribeChannel?.(channelRef) },
+      { sep: true },
+      { label: "Reorg folder",
+        submenu: [
+          { label: "Flat (no split)", action: () => checkedAction(
+            () => api?.reorg_channel_folder?.({ name }, false, false, false),
+            { success: "Folder reorganization started.", failure: "Folder reorganization did not start." }) },
+          { label: "Split by year", action: () => checkedAction(
+            () => api?.reorg_channel_folder?.({ name }, true, false, false),
+            { success: "Folder reorganization started.", failure: "Folder reorganization did not start." }) },
+          { label: "Split by year + month", action: () => checkedAction(
+            () => api?.reorg_channel_folder?.({ name }, true, true, false),
+            { success: "Folder reorganization started.", failure: "Folder reorganization did not start." }) },
+          { label: "Re-check dates + year/month", action: () => checkedAction(
+            () => api?.reorg_channel_folder?.({ name }, true, true, true),
+            { success: "Date check and reorganization started.", failure: "Date check did not start." }) },
+          { label: "Fix file dates only", action: () => checkedAction(
+            () => api?.chan_fix_file_dates?.({ name }),
+            { success: "File-date repair started.", failure: "File-date repair did not start." }) },
+          { sep: true },
+          // Cancel affordance for the two long passes above — both
+          // were previously unstoppable from the UI (audit S4).
+          { label: "Cancel running reorg / date fix",
+            action: () => window._cancelFolderOps?.() },
+        ]},
+      // "Fetch channel art" removed — now bundled with the metadata sweep.
+      _hasPendingRedownload
+        ? {
+            label: `Continue redownload at ${_redownloadResLabel}`,
+            action: async () => {
+              const r = await api?.chan_redownload?.(
+                { name }, _redownloadRes);
+              if (r?.ok) {
+                window._showToast?.(
+                  r.queued
+                    ? `Queued redownload of ${name}.`
+                    : `Resumed redownload of ${name}.`,
+                  "ok");
+              } else {
+                window._showToast?.(
+                  r?.error || "Resume failed.", "error");
+              }
+            },
+          }
+        : {
+            label: "Redownload at\u2026",
+            submenu: [
+              { label: "Best available",
+                action: () => window._askRedownload?.(name, "best") },
+              { label: "2160p (4K)",
+                action: () => window._askRedownload?.(name, "2160") },
+              { label: "1440p",
+                action: () => window._askRedownload?.(name, "1440") },
+              { label: "1080p",
+                action: () => window._askRedownload?.(name, "1080") },
+              { label: "720p",
+                action: () => window._askRedownload?.(name, "720") },
+              { label: "480p",
+                action: () => window._askRedownload?.(name, "480") },
+              { label: "360p",
+                action: () => window._askRedownload?.(name, "360") },
+             ],
+          },
+      { sep: true },
+      { label: "Remove channel…",
+        cls: "danger",
+        title: "Stop syncing this channel and choose whether to keep its downloaded files",
+        action: () => removeChannelAndLeaveDetail(name) },
+    ];
+    showContextMenu(x, y, options.omitSync
+      ? items.filter(item => item.label !== "Sync now" && item.label !== "Open videos") : items);
+    if (trigger) markContextTrigger(trigger);
+  };
+
   function initBrowseContextMenus() {
     // Channel grid cards
     const channelGrid = document.getElementById("channel-grid");
@@ -504,218 +716,16 @@
         const card = e.target.closest(".channel-card");
         if (!card) return;
         e.preventDefault();
-        const name = card.dataset.channelName
-          || card.querySelector(".channel-card-name")?.firstChild?.textContent
-          || "";
-        const channelRef = {
-          name,
+        const channel = {
+          name: card.dataset.channelName || "",
           folder: card.dataset.channelFolder || "",
           url: card.dataset.channelUrl || "",
+          transcription_pending: card.dataset.pendingTx,
+          metadata_pending: card.dataset.pendingMeta,
+          _pending_redownload: card.dataset.pendingRedownload === "1",
+          _redownload_res: card.dataset.redownloadRes,
         };
-        const api = window.YT?.api;
-        // Live counters are stashed on the card by renderChannelGrid.
-        const _pendTx = Math.max(
-          0, parseInt(card.dataset.pendingTx || "0", 10) || 0);
-        const _pendMeta = parseInt(card.dataset.pendingMeta || "0", 10) || 0;
-        const _missingInfoLabel = _pendMeta > 0
-          ? `Fix missing information (${_pendMeta} pending)`
-          : "Fix missing information";
-        const _hasPendingRedownload = card.dataset.pendingRedownload === "1";
-        const _redownloadRes = card.dataset.redownloadRes || "best";
-        const _redownloadResLabel = _redownloadRes === "best"
-          ? "Best available"
-          : `${_redownloadRes}p`;
-        showContextMenu(e.clientX, e.clientY, [
-          { header: "Open & manage" },
-          { label: "Open videos", cls: "primary", action: () => card.click() },
-          { label: "Open folder", cls: "primary",
-            action: () => checkedAction(
-              () => api?.chan_open_folder?.(name),
-              { failure: "Could not open channel folder." }) },
-          { label: "Open channel on YouTube", cls: "primary",
-            action: () => checkedAction(
-              () => api?.chan_open_url?.(name),
-              { failure: "Could not open the channel on YouTube." }) },
-          { sep: true },
-          { label: "Sync now", cls: "primary",
-            action: async () => {
-              try {
-                const result = await api?.sync_one_channel?.({ name });
-                window.YT?.bridge?.reportSyncOneResult?.(result, name);
-              } catch (error) {
-                window.YT?.bridge?.reportSyncOneResult?.({
-                  ok: false,
-                  error: "Sync failed: " + (error?.message || error),
-                }, name);
-              }
-            }},
-          { label: "Edit settings", cls: "primary",
-            action: () => window._editChannelFromBrowse?.(name) },
-          { sep: true },
-          { header: "Maintenance" },
-          // right-click → re-transcribe whole channel
-          // with a Whisper model picker. Same API as the Subs context
-          // menu version.
-          { label: "Re-transcribe channel…",
-            title: "Redo every video with Whisper, replacing existing transcripts (use this to fix bad/corrupted ones)",
-            action: async () => {
-            const model = await (window._askWhisperModel?.(`channel "${name}"`));
-            if (!model) return;
-            const ok = await askDanger(
-              "Re-transcribe entire channel",
-              `Queue every video in "${name}" for re-transcription with `
-                + `Whisper ${model}?\n\nThis can take hours on large channels.`,
-              "Queue all");
-            if (!ok) return;
-            const res = await api?.transcribe_retranscribe_channel?.(
-              { name }, model);
-            if (res?.ok) {
-              window._showToast?.(
-                `Queued ${res.queued} video(s) from ${name} for Whisper ${model}.`,
-                "ok");
-            } else {
-              window._showToast?.(res?.error || "Channel retranscribe failed.",
-                                  "error");
-            }
-          }},
-          { label: "Metadata",
-            title: "Repair missing information or update saved YouTube details",
-            submenu: [
-              { label: _missingInfoLabel,
-                title: "Fetch information and thumbnails only where they are missing",
-                action: () => checkedAction(
-                  () => api?.metadata_fill_missing_channel?.({ name }),
-                  { success: "Missing-information check started.",
-                    failure: "Missing-information check did not start." }) },
-              { label: "Repair missing thumbnails",
-                title: "Download only thumbnail image files that are missing",
-                action: async () => {
-                  const r = await api?.refetch_thumbnails?.({ name });
-                  if (r?.started) {
-                    window._showToast?.(
-                      `Thumbnail repair started for ${name}.`, "ok");
-                  } else {
-                    window._showToast?.(
-                      r?.error || "Thumbnail repair did not start.", "error");
-                  }
-                }},
-              { sep: true },
-              { label: "Refresh views & likes",
-                title: "Refresh views, likes, comment totals, and YouTube availability",
-                submenu: [
-                  { label: "Last 7 days",
-                    action: () => checkedAction(
-                      () => api?.metadata_refresh_views_channel?.({ name }, 7),
-                      { success: "Video-statistics refresh started.", failure: "Video-statistics refresh did not start." }) },
-                  { label: "Last 30 days",
-                    action: () => checkedAction(
-                      () => api?.metadata_refresh_views_channel?.({ name }, 30),
-                      { success: "Video-statistics refresh started.", failure: "Video-statistics refresh did not start." }) },
-                  { label: "Last 90 days",
-                    action: () => checkedAction(
-                      () => api?.metadata_refresh_views_channel?.({ name }, 90),
-                      { success: "Video-statistics refresh started.", failure: "Video-statistics refresh did not start." }) },
-                  { label: "All videos (slow)",
-                    action: () => checkedAction(
-                      () => api?.metadata_refresh_views_channel?.({ name }, null),
-                      { success: "Video-statistics refresh started.", failure: "Video-statistics refresh did not start." }) },
-                ]},
-              { label: "Refresh comments",
-                title: "Fetch updated saved comments for archived videos",
-                submenu: [
-                  { label: "Last 7 days",
-                    action: () => checkedAction(
-                      () => api?.metadata_refresh_comments_channel?.({ name }, 7),
-                      { success: "Comments refresh started.", failure: "Comments refresh did not start." }) },
-                  { label: "Last 30 days",
-                    action: () => checkedAction(
-                      () => api?.metadata_refresh_comments_channel?.({ name }, 30),
-                      { success: "Comments refresh started.", failure: "Comments refresh did not start." }) },
-                  { label: "Last 90 days",
-                    action: () => checkedAction(
-                      () => api?.metadata_refresh_comments_channel?.({ name }, 90),
-                      { success: "Comments refresh started.", failure: "Comments refresh did not start." }) },
-                  { label: "All videos (slow)",
-                    action: () => checkedAction(
-                      () => api?.metadata_refresh_comments_channel?.({ name }, null),
-                      { success: "Comments refresh started.", failure: "Comments refresh did not start." }) },
-                ]},
-            ]},
-          { label: "Transcribe all missing",
-            count: _pendTx,
-            countDim: _pendTx === 0,
-            countAriaLabel: `Transcribe all missing, ${_pendTx} untranscribed video${_pendTx === 1 ? "" : "s"}`,
-            title: "Transcribe only videos that don't have a transcript yet (YouTube captions first, Whisper fallback)",
-            action: () => window._askTranscribeChannel?.(channelRef) },
-          { sep: true },
-          { label: "Reorg folder",
-            submenu: [
-              { label: "Flat (no split)", action: () => checkedAction(
-                () => api?.reorg_channel_folder?.({ name }, false, false, false),
-                { success: "Folder reorganization started.", failure: "Folder reorganization did not start." }) },
-              { label: "Split by year", action: () => checkedAction(
-                () => api?.reorg_channel_folder?.({ name }, true, false, false),
-                { success: "Folder reorganization started.", failure: "Folder reorganization did not start." }) },
-              { label: "Split by year + month", action: () => checkedAction(
-                () => api?.reorg_channel_folder?.({ name }, true, true, false),
-                { success: "Folder reorganization started.", failure: "Folder reorganization did not start." }) },
-              { label: "Re-check dates + year/month", action: () => checkedAction(
-                () => api?.reorg_channel_folder?.({ name }, true, true, true),
-                { success: "Date check and reorganization started.", failure: "Date check did not start." }) },
-              { label: "Fix file dates only", action: () => checkedAction(
-                () => api?.chan_fix_file_dates?.({ name }),
-                { success: "File-date repair started.", failure: "File-date repair did not start." }) },
-              { sep: true },
-              // Cancel affordance for the two long passes above — both
-              // were previously unstoppable from the UI (audit S4).
-              { label: "Cancel running reorg / date fix",
-                action: () => window._cancelFolderOps?.() },
-            ]},
-          // "Fetch channel art" removed — now bundled with the metadata sweep.
-          _hasPendingRedownload
-            ? {
-                label: `Continue redownload at ${_redownloadResLabel}`,
-                action: async () => {
-                  const r = await api?.chan_redownload?.(
-                    { name }, _redownloadRes);
-                  if (r?.ok) {
-                    window._showToast?.(
-                      r.queued
-                        ? `Queued redownload of ${name}.`
-                        : `Resumed redownload of ${name}.`,
-                      "ok");
-                  } else {
-                    window._showToast?.(
-                      r?.error || "Resume failed.", "error");
-                  }
-                },
-              }
-            : {
-                label: "Redownload at\u2026",
-                submenu: [
-                  { label: "Best available",
-                    action: () => window._askRedownload?.(name, "best") },
-                  { label: "2160p (4K)",
-                    action: () => window._askRedownload?.(name, "2160") },
-                  { label: "1440p",
-                    action: () => window._askRedownload?.(name, "1440") },
-                  { label: "1080p",
-                    action: () => window._askRedownload?.(name, "1080") },
-                  { label: "720p",
-                    action: () => window._askRedownload?.(name, "720") },
-                  { label: "480p",
-                    action: () => window._askRedownload?.(name, "480") },
-                  { label: "360p",
-                    action: () => window._askRedownload?.(name, "360") },
-                 ],
-              },
-          { sep: true },
-          { label: "Remove channel…",
-            cls: "danger",
-            title: "Stop syncing this channel and choose whether to keep its downloaded files",
-            action: () => removeChannelAndLeaveDetail(name) },
-        ]);
-        markContextTrigger(card);
+        window._openChannelContextMenu(channel, e.clientX, e.clientY, card);
       });
       wireKeyboardContextMenu(channelGrid, ".channel-card");
     }
@@ -855,7 +865,7 @@
             // "undefinedp" / "redownload every video in <title>" bug.
             const _res = await (window._askVideoRedownload?.(title));
             if (!_res) return;
-            await queueVideoRedownload(videoId, title, _res);
+            await queueVideoRedownload(videoId, title, _res, filepath);
           }}] : []),
           { sep: true },
           { label: "Move file to trash\u2026", cls: "danger",
@@ -958,7 +968,7 @@
             // was the wrong (whole-channel) function.
             const _res = await (window._askVideoRedownload?.(title));
             if (!_res) return;
-            await queueVideoRedownload(videoId, title, _res);
+            await queueVideoRedownload(videoId, title, _res, filepath);
           }}] : []),
           { sep: true },
           { label: "Move file to trash\u2026", cls: "danger",
@@ -1085,7 +1095,7 @@
             }
             // right-click on a transcript segment always
             // creates a timestamped bookmark with no note prompt.
-            const res = await api?.bookmark_add?.({
+            const res = await window._saveBookmark({
               video_id: v.video_id || "",
               title: v.title || "",
               channel: v.channel || "",
@@ -1093,6 +1103,7 @@
               text: text,
               note: "",
             });
+            if (res?.pending) return;
             if (res?.ok) {
               window._showToast?.("Bookmarked.", "ok");
               try { window.refreshBookmarks?.(); } catch {}
@@ -1189,7 +1200,7 @@
       window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn");
       return;
     }
-    const res = await api?.bookmark_add?.({
+    const res = await window._saveBookmark({
       video_id: videoId || "",
       title: title || "",
       channel: channel || "",
@@ -1197,6 +1208,7 @@
       text: "",
       note: "",
     });
+    if (res?.pending) return;
     if (res?.ok) {
       window._showToast?.("Video bookmarked.", "ok");
       try { window.refreshBookmarks?.(); } catch {}

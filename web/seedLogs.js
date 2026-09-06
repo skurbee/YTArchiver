@@ -29,7 +29,31 @@
 
   function clearSeedRetry() {
     document.getElementById("boot-issue-retry-seed")?.remove();
+    window._clearBootIssue?.("Startup data");
+    window._clearBootIssue?.("App connection");
+    window.removeEventListener("pywebviewready", retrySeedAfterBridgeReady);
+    _retryOnBridgeReady = false;
     _lastSeedFailure = "";
+  }
+
+  function retrySeedAfterBridgeReady() {
+    _retryOnBridgeReady = false;
+    // If readiness arrives during a failed seed, retry after that attempt
+    // settles instead of accidentally returning its in-flight promise.
+    Promise.resolve(_seedInFlight).then(() => seedLogs());
+  }
+
+  function offerBridgeReadyRetry() {
+    if (_retryOnBridgeReady) return;
+    _retryOnBridgeReady = true;
+    window.addEventListener("pywebviewready", retrySeedAfterBridgeReady, { once: true });
+  }
+
+  function requireSuccessfulReply(reply, description) {
+    if (reply?.ok === false) {
+      throw new Error(String(reply.error || `${description} was not returned`));
+    }
+    return reply;
   }
 
   function offerSeedRetry(message) {
@@ -72,6 +96,7 @@
             return true;
           } catch (e) {
             failedSteps.push(name);
+            offerBridgeReadyRetry();
             console.error(`[seed] ${name} failed:`, e);
             return false;
           }
@@ -87,13 +112,19 @@
         // The Python side guards re-entry via `_startup_fired`, so the
         // duplicate call at the end is a harmless no-op.
         await step("startup_ready_early", async () => {
-          await bridgeCall("startup_ready");
+          requireSuccessfulReply(await bridgeCall("startup_ready"), "startup readiness");
         });
 
         await step("runtime_info", async () => {
-          const info = await bridgeCall("get_runtime_info");
-          if (!info || typeof info !== "object" || Array.isArray(info)) {
-            throw new Error("runtime information was not returned");
+          const info = requireSuccessfulReply(await bridgeCall("get_runtime_info"), "runtime information");
+          // An unavailable native method returns an error object, not a
+          // fresh-install record. Only complete, typed runtime information
+          // may decide whether the first-time setup wizard is needed.
+          if (!info || typeof info !== "object" || Array.isArray(info)
+              || typeof info.onboarded !== "boolean"
+              || typeof info.has_config_file !== "boolean"
+              || typeof info.output_dir !== "string") {
+            throw new Error("complete runtime information was not returned");
           }
           console.info("[api] runtime_info:", info);
           const sel = document.getElementById("log-mode-select");
@@ -157,7 +188,7 @@
         // self-loads from api.list_all_videos when its submode is opened.)
 
         await step("index_summary", async () => {
-          const idx = await bridgeCall("get_index_summary");
+          const idx = requireSuccessfulReply(await bridgeCall("get_index_summary"), "index summary");
           if (!idx || typeof idx !== "object" || Array.isArray(idx)) {
             throw new Error("index summary was not returned");
           }
@@ -165,7 +196,7 @@
         });
 
         await step("queues", async () => {
-          const q = await bridgeCall("get_queues");
+          const q = requireSuccessfulReply(await bridgeCall("get_queues"), "queue state");
           if (!q || typeof q !== "object" || Array.isArray(q)) {
             throw new Error("queue state was not returned");
           }
@@ -173,7 +204,7 @@
         });
 
         await step("startup_ready", async () => {
-          await bridgeCall("startup_ready");
+          requireSuccessfulReply(await bridgeCall("startup_ready"), "startup readiness");
         });
 
         if (failedSteps.length) {
@@ -192,17 +223,12 @@
         );
         // If the bridge arrives after its canonical timeout, retry
         // automatically as well as leaving the visible manual retry.
-        if (!_retryOnBridgeReady) {
-          _retryOnBridgeReady = true;
-          window.addEventListener("pywebviewready", () => {
-            _retryOnBridgeReady = false;
-            seedLogs();
-          }, { once: true });
-        }
+        offerBridgeReadyRetry();
         console.warn("[seed] pywebview bridge not detected — startup load is retryable");
         return false;
       }
     } catch (e) {
+      offerBridgeReadyRetry();
       offerSeedRetry(`Startup data load failed: ${e?.message || e}`);
       console.error("seedLogs failed:", e);
       return false;

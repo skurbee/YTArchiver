@@ -88,8 +88,8 @@
         e.preventDefault();
         const browsePanel = document.getElementById("panel-browse");
         const viewWatch = document.getElementById("view-watch");
-        if (browsePanel && !browsePanel.hidden
-            && viewWatch && !viewWatch.hidden) {
+        if (window.YT.util.isElementVisible(browsePanel)
+            && window.YT.util.isElementVisible(viewWatch)) {
           const watchFind = document.getElementById("watch-find");
           if (watchFind) { watchFind.focus(); watchFind.select(); }
           return;
@@ -97,8 +97,8 @@
         const searchInput = document.getElementById("search-query");
         const browseTab = document.querySelector('.tab[data-tab="browse"]');
         const viewSearch = document.getElementById("view-search");
-        const searchVisible = !!(browsePanel && !browsePanel.hidden
-          && viewSearch && !viewSearch.hidden);
+        const searchVisible = window.YT.util.isElementVisible(browsePanel)
+          && window.YT.util.isElementVisible(viewSearch);
         if (!searchVisible) {
           browseTab?.click();
           document.querySelector('[data-submode="search"]')?.click();

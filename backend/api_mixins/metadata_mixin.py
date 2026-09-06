@@ -329,14 +329,20 @@ class MetadataMixin:
             # When force=True, rescan disk for fresh n_vids/size before
             # enriching. Otherwise enrich pulls from the cached disk
             # scan (cheap and fast — same data shown across the app).
+            fresh_cache = None
             if force:
-                try:
-                    archive_scan.scan_all_channels()
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-            archive_scan.enrich_channels_with_stats(ch_copy)
+                scanned = archive_scan.scan_all_channels()
+                if scanned is None:
+                    raise RuntimeError("Archive scan was interrupted")
+                fresh_cache = archive_scan.publish_scan_stats(scanned)
+            if fresh_cache is None:
+                archive_scan.enrich_channels_with_stats(ch_copy)
+            else:
+                archive_scan.enrich_channels_with_stats(ch_copy, fresh_cache)
         except Exception as e:
             _log.debug("swallowed: %s", e)
+            if force or report_errors:
+                return {"ok": False, "error": str(e)}
         # Pull video-id DB counts so the Metadata tab can show a
         # per-channel status indicator (green if every on-disk file
         # has a resolvable video_id, warn if some missing, red if
@@ -396,6 +402,8 @@ class MetadataMixin:
                 "video_count": int(ch.get("n_vids") or 0),
                 "last_views_refresh_ts": ch.get("last_views_refresh_ts"),
                 "last_comments_refresh_ts": ch.get("last_comments_refresh_ts"),
+                "last_availability_check_ts": ch.get("last_availability_check_ts"),
+                "availability_checked_count": ch.get("availability_checked_count", 0),
                 "id_total": _idstats.get("total", 0),
                 "id_with_id": _idstats.get("with_id", 0),
                 "id_missing": _idstats.get("missing", 0),

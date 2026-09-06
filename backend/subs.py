@@ -471,7 +471,7 @@ def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> str | None:
         # of the bare channel name — e.g. "Deep Dive Documentaries - Videos".
         # Strip common tab suffixes. Same treatment as OLD YTArchiver.
         for suffix in (" - Videos", " - Playlists", " - Shorts",
-                       " - Streams", " - Home"):
+                       " - Streams", " - Live", " - Home"):
             if name.endswith(suffix):
                 name = name[:-len(suffix)].strip()
                 break
@@ -887,6 +887,7 @@ def update_channel(
             "initialized", "init_complete", "init_batch_after",
             "batch_resume_index",
             "transcription_complete", "transcription_pending",
+            "transcript_combined",
             "metadata_pending",
             "folder_override",
             # Hidden permanent YouTube identity. It survives ordinary setting

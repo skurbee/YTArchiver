@@ -1,3 +1,4 @@
+import contextlib
 import sqlite3
 import threading
 from types import SimpleNamespace
@@ -112,6 +113,7 @@ def test_search_fts_appended_end_time_does_not_shift_public_result_fields(
     fake_index = SimpleNamespace(
         _reader_open=lambda: conn,
         _reader_lock=threading.Lock(),
+        _interactive_reader=lambda _operation: contextlib.nullcontext(conn),
     )
     monkeypatch.setattr(index_search, "_index_module", lambda: fake_index)
 

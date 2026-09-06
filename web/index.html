@@ -157,6 +157,11 @@
         </div>
       </fieldset>
 
+      <fieldset class="video-opts-panel" id="manual-download-jobs" hidden>
+        <legend>Active downloads</legend>
+        <div id="manual-download-list" aria-live="polite"></div>
+      </fieldset>
+
       <!-- Channel nudge: when a channel URL is pasted but not in subs, show
            a handoff button to pre-populate the shared Add-Channel form.
            Mirrors YTArchiver.py:4458 channel_nudge_panel. -->
@@ -275,12 +280,12 @@
              snooze the drawer so it stops nagging until that time. -->
         <div class="deferred-retry-wrap">
           <button class="btn btn-ghost btn-thin" id="btn-deferred-retry"
-                   title="Retry options" aria-haspopup="menu"
-                   aria-controls="deferred-retry-menu" aria-expanded="false">Retry &#x25BE;</button>
+                   title="Sync or reminder options" aria-haspopup="menu"
+                   aria-controls="deferred-retry-menu" aria-expanded="false">Options &#x25BE;</button>
           <div class="deferred-retry-menu" id="deferred-retry-menu" role="menu" hidden>
-            <button data-retry="now" role="menuitem">Now</button>
-            <button data-retry="24h" role="menuitem">in 24 hours</button>
-            <button data-retry="1w" role="menuitem">in 1 week</button>
+            <button data-retry="now" role="menuitem">Sync Subbed now</button>
+            <button data-retry="24h" role="menuitem">Remind me in 24 hours</button>
+            <button data-retry="1w" role="menuitem">Remind me in 1 week</button>
           </div>
         </div>
         <button class="btn btn-ghost btn-thin" id="btn-deferred-clear"
@@ -443,7 +448,7 @@
             <div class="edit-field edit-field-grow">
               <label class="edit-gl" for="edit-folder">Folder Name</label>
               <input type="text" class="ctl-input" id="edit-folder"
-                     placeholder="Auto-fills from the URL"
+                     placeholder="Auto-fills from @handle links"
                      aria-describedby="edit-channel-validation" />
             </div>
           </div>
@@ -570,7 +575,7 @@
                 <span>Auto-metadata</span>
               </label>
               <label class="checkbox-label">
-                <input type="checkbox" id="edit-transcribe" />
+                <input type="checkbox" id="edit-transcribe" checked />
                 <span>Auto-transcribe</span>
               </label>
               <label class="checkbox-label">
@@ -1107,29 +1112,29 @@
 
               <div class="metadata-bulk-row">
                 <button class="btn btn-ghost btn-thin" id="btn-md-refresh-all-views"
-                        title="Choose a recent-upload time range, then queue a views/likes refresh for every subscribed channel">
-                  Refresh views/likes &mdash; all channels
+                        title="Fetch current views and likes from YouTube for every subscribed channel. Choose which upload dates to check; this uses the network.">
+                  Update views and likes from YouTube&hellip;
                 </button>
                 <button class="btn btn-ghost btn-thin" id="btn-md-refresh-all-comments"
-                        title="Queue a comments refresh for every channel. Prompts for scope: 1 month / 1 year / all.">
-                  Refresh comments &mdash; all channels
+                        title="Fetch comments from YouTube for all channels. Choose a recent-upload range or all uploads; this uses the network.">
+                  Update comments from YouTube&hellip;
                 </button>
                 <button class="btn btn-ghost btn-thin" id="btn-md-backfill-all-ids"
-                        title="Try to find and record missing YouTube video IDs for every channel. This is especially useful for older imported archives.">
+                        title="Find and save missing video IDs for all channels using local records and YouTube when needed. This can use the network.">
                   Fix missing video IDs &mdash; all channels
                 </button>
                 <button class="btn btn-ghost btn-thin" id="btn-md-refetch-all-thumbs"
                         title="Download missing thumbnail images for every channel using saved YouTube information. Runs in the background; progress appears in the log.">
-                  Refetch missing thumbnails &mdash; all channels
+                  Download missing thumbnails &mdash; all channels
                 </button>
                 <button class="btn btn-ghost btn-thin" id="btn-md-recheck-thumbs"
-                        title="Bypass caches and recompute every stat from scratch. Use if numbers look stale or you edited files outside the app.">
-                  Force recheck &mdash; all stats
+                        title="Recount local video IDs, transcripts, and thumbnail files from disk and catalog. Does not fetch current views, likes, or comments from YouTube.">
+                  Recount local files and coverage
                   <span class="md-recheck-progress" id="md-recheck-progress" hidden></span>
                 </button>
                 <div class="spacer"></div>
                 <button class="btn btn-ghost btn-thin" id="btn-md-reload"
-                        title="Re-query per-channel refresh times">Reload</button>
+                        title="Display the latest saved channel status. Does not contact YouTube or force a new disk scan.">Reload saved status</button>
               </div>
 
               <div class="metadata-table-wrap">
@@ -1283,7 +1288,7 @@
         <div class="settings-view" id="settings-view-backups" hidden>
           <label class="subs-section-label">Backups</label>
           <div class="health-view-intro">
-            Backups save YTArchiver's settings, subscriptions, queues, and app history. They do not copy downloaded videos or transcripts.
+            Backups save YTArchiver's settings, subscriptions, queues, app history, bookmarks, and notes. They do not copy downloaded videos or transcript files. The Search index is included when it fits the backup size limit and can be rebuilt when omitted; bookmarks and notes are still included.
           </div>
           <div class="edit-grid health-backup-grid">
             <label class="edit-gl" for="settings-auto-backup">Automatic backups</label>
@@ -1305,7 +1310,7 @@
             <div class="edit-gv-stack settings-field-with-help">
               <div class="edit-gv-inline edit-gap-6">
                 <button class="btn btn-ghost btn-thin" id="btn-export-backup"
-                        title="Save app settings, unfinished work, and activity history to a zip file">Save backup&hellip;</button>
+                        title="Save app settings, subscriptions, unfinished work, history, bookmarks, and notes to a ZIP file">Save backup&hellip;</button>
                 <button class="btn btn-ghost btn-thin" id="btn-import-backup"
                         title="Restore a backup zip after safely saving the current app settings">Restore&hellip;</button>
               </div>
@@ -1419,6 +1424,8 @@
             <span class="search-icon">&#128269;</span>
             <input type="text" class="ctl-input find-input" id="browse-filter"
                    aria-label="Filter channels or videos" placeholder="Filter&hellip;" />
+            <button type="button" class="filter-clear" id="browse-filter-clear"
+                    aria-label="Clear channel or video filter" hidden>&times;</button>
           </div>
         </div>
 
@@ -1511,7 +1518,7 @@
                 <button class="btn btn-ghost btn-thin" id="btn-open-external"
                         title="Open in system default player (VLC etc.)">Open in player</button>
                 <button class="btn btn-ghost btn-thin" id="btn-bookmark-now"
-                        title="Bookmark current segment (B)">Bookmark</button>
+                        title="Select a video to bookmark" disabled>Bookmark</button>
                 <button class="btn btn-ghost btn-thin watch-more-btn" id="btn-watch-more"
                         aria-haspopup="menu" aria-expanded="false"
                         title="More actions (Redownload, Re-transcribe, Refresh metadata)">More&hellip;</button>
@@ -1542,11 +1549,12 @@
                      (size != Off), so the default state isn't confusing. -->
                 <div class="watch-overlay-group">
                   <label class="ctl-label ctl-label-thin watch-overlay-label"
-                         title="Show the current transcript word overlaid on the video.&#10;Works in windowed and fullscreen.">Overlay:</label>
+                         title="Show timed captions over the video.&#10;Choose one word, three words, or two rolling lines.&#10;Works in windowed and fullscreen.">Overlay:</label>
                   <select class="ctl-select" id="watch-cap-size"
                           aria-label="Overlay size"
-                          title="Overlay text size — Off hides the overlay">
+                          title="Overlay text size scales with the video player. Off hides the overlay.">
                     <option value="off" selected>Off</option>
+                    <option value="xsmall">X-small</option>
                     <option value="small">Small</option>
                     <option value="medium">Medium</option>
                     <option value="large">Large</option>
@@ -1563,10 +1571,10 @@
                     <label class="overlay-sublabel">mode</label>
                     <select class="ctl-select" id="watch-cap-mode"
                             aria-label="Caption overlay mode"
-                            title="1 word: just the spoken word.&#10;3 words: previous + current + next (neighbors dimmer).&#10;Default: YouTube-style phrases in up to two lines.">
-                      <option value="single" selected>1 word</option>
-                      <option value="phrase3">3 words</option>
-                      <option value="default">Default</option>
+                            title="YT Style: words appear on the bottom line as spoken, with one completed line above. Lines scroll upward smoothly.&#10;3 Words: previous + current + next (neighbors dimmer).&#10;1 Word: just the spoken word.">
+                      <option value="default" selected>YT Style</option>
+                      <option value="phrase3">3 Words</option>
+                      <option value="single">1 Word</option>
                     </select>
                   </span>
                 </div>
@@ -1732,6 +1740,11 @@
               <div class="spacer"></div>
               <span class="status-text" id="search-count">&mdash;</span>
             </div>
+            <div class="search-date-filter" id="search-date-filter" hidden>
+              <span id="search-date-filter-label"></span>
+              <button type="button" class="btn btn-ghost btn-thin" id="search-date-filter-clear"
+                      aria-label="Clear selected date range">&times; Clear date filter</button>
+            </div>
             <!-- Split panel: results list on the left, context viewer right.
                  Mirrors YTArchiver.py:29598 PanedWindow with tree + viewer.
                  Click a result row → right pane shows ~600 chars before +
@@ -1746,6 +1759,7 @@
                 <div class="search-viewer-head">
                   <span class="search-viewer-title" id="search-viewer-title">Select a result to read</span>
                   <span class="search-viewer-meta" id="search-viewer-meta"></span>
+                  <button type="button" class="btn btn-thin" id="search-viewer-play" hidden>Open in Watch</button>
                 </div>
                 <button class="btn btn-ghost btn-thin search-viewer-loadmore"
                         id="search-viewer-earlier" hidden
@@ -1813,7 +1827,8 @@
               <div class="spacer"></div>
               <button class="btn btn-ghost btn-thin" id="btn-graph-export-csv"
                       title="Save the current plot data as CSV">Export CSV</button>
-              <span class="co-hint" id="graph-drill-hint">Click a point to drill into search</span>
+              <span class="co-hint" id="graph-drill-hint"
+                    title="Graph counts matching transcript segments. Search removes duplicates and may use different dates when upload dates are missing.">Click a point to search. Search counts may differ.</span>
             </div>
             <div class="graph-canvas-wrap">
                <canvas id="graph-canvas" width="800" height="360" role="img"
@@ -1836,6 +1851,9 @@
             <div class="bookmarks-toolbar">
               <span class="subs-section-label">Bookmarked videos &amp; moments</span>
               <div class="spacer"></div>
+              <input type="search" class="ctl-input library-filter" id="bookmarks-filter"
+                     aria-label="Filter bookmarks" placeholder="Filter title, channel or note&hellip;" />
+              <span id="bookmarks-filter-count" class="status-text" aria-live="polite"></span>
               <button class="btn btn-ghost btn-thin" id="btn-bookmarks-export"
                       title="Download all bookmarks as a CSV file (title, channel, timestamp, segment text)"
                       disabled>Export CSV</button>
@@ -1901,6 +1919,8 @@
               <span class="recent-label" id="manual-folder-label">Single-video downloads</span>
               <span class="manual-bulk-status" id="manual-bulk-status" hidden></span>
               <div class="spacer"></div>
+              <input type="search" class="ctl-input library-filter" id="manual-filter"
+                     aria-label="Filter manual downloads" placeholder="Filter title or channel&hellip;" />
                <label class="ctl-label ctl-label-thin browse-toolbar-spaced"
                       for="manual-sort">Sort:</label>
               <select class="ctl-select" id="manual-sort">

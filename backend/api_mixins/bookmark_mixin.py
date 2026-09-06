@@ -19,7 +19,27 @@ class BookmarkMixin:
 
     # ─── Bookmarks ──────────────────────────────────────────────────────
 
-    def bookmark_list(self):
+    def _bookmark_mutation(self, operation, callback):
+        # Recheck admission under the same lock shutdown uses to close the
+        # writer. A previously admitted synchronous write finishes before the
+        # database can be replaced; a later click cannot reopen it mid-restore.
+        lock = index_backend._db_lock
+        if not lock.acquire(timeout=index_backend._INTERACTIVE_LOCK_SECONDS):
+            index_backend._log.warning("%s timed out acquiring API writer admission", operation)
+            return {"ok": False, "error": f"{operation} could not start while the library was busy. Please try again.",
+                    "retryable": True}
+        try:
+            check = getattr(self, "_work_admission_error", None)
+            denied = check(operation) if callable(check) else None
+            if denied:
+                return denied
+            return callback()
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "retryable": isinstance(exc, TimeoutError)}
+        finally:
+            lock.release()
+
+    def bookmark_list(self, query=""):
         # Consistent {ok, rows} shape matching the other bookmark_*
         # methods. Previously returned the raw list, which diverged
         # from the {ok: bool} shape of bookmark_add/remove/update_note
@@ -27,7 +47,8 @@ class BookmarkMixin:
         # array. Legacy callers that iterated directly would stop
         # working — the one known caller has been updated.
         try:
-            rows = index_backend.bookmark_list() or []
+            rows = (index_backend.bookmark_list(query=query) if query
+                    else index_backend.bookmark_list()) or []
             return {"ok": True, "rows": rows}
         except Exception as e:
             return {"ok": False, "rows": [], "error": str(e)}
@@ -40,16 +61,22 @@ class BookmarkMixin:
         the user highlighted, and an optional note. Returns the new row
         id so the UI can refer to this bookmark later (for edit/remove)."""
         payload = payload or {}
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "Invalid bookmark details"}
         try:
             start_time = float(payload.get("start_time", 0) or 0)
         except (TypeError, ValueError):
             start_time = 0.0
-        bid = index_backend.bookmark_add(
-            payload.get("video_id", ""), payload.get("title", ""),
-            payload.get("channel", ""), start_time,
-            payload.get("text", ""), payload.get("note", ""),
-        )
-        return {"ok": bid is not None, "id": bid}
+        def save():
+            bid = index_backend.bookmark_add(
+                payload.get("video_id", ""), payload.get("title", ""),
+                payload.get("channel", ""), start_time,
+                payload.get("text", ""), payload.get("note", ""),
+            )
+            if bid is None:
+                return {"ok": False, "id": None, "error": "A video is required to save a bookmark."}
+            return {"ok": True, "id": bid}
+        return self._bookmark_mutation("Saving the bookmark", save)
 
 
     def bookmark_remove(self, bm_id):
@@ -59,7 +86,8 @@ class BookmarkMixin:
             rid = int(bm_id)
         except (TypeError, ValueError):
             return {"ok": False, "error": "Invalid bookmark id"}
-        return {"ok": index_backend.bookmark_remove(rid)}
+        return self._bookmark_mutation(
+            "Removing the bookmark", lambda: {"ok": index_backend.bookmark_remove(rid)})
 
 
     def bookmark_update_note(self, bm_id, note):
@@ -69,7 +97,8 @@ class BookmarkMixin:
             rid = int(bm_id)
         except (TypeError, ValueError):
             return {"ok": False, "error": "Invalid bookmark id"}
-        return {"ok": index_backend.bookmark_update_note(rid, note or "")}
+        return self._bookmark_mutation(
+            "Updating the bookmark note", lambda: {"ok": index_backend.bookmark_update_note(rid, note or "")})
 
 
     def bookmark_export_csv(self):

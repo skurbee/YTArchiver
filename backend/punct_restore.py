@@ -393,8 +393,8 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
                     except Exception as e: _log.debug("swallowed: %s", e)
                 continue
 
-            # Run each segment's text through punctuate(). Failures fall
-            # through to "no change" — better than dropping the video.
+            # A failed punctuation request leaves the video untouched and
+            # eligible for retry; unchanged text alone is not proof of success.
             # Cancel check INSIDE the per-segment loop so a click during
             # a long video doesn't get ignored until the next video
             # boundary (audit: punct_restore.py:355). A 1000-segment
@@ -402,6 +402,7 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
             # Cancel button before this fix.
             new_segs = []
             _cancelled_mid = False
+            _punct_error = ""
             for seg in segs:
                 if _cancelled():
                     _cancelled_mid = True
@@ -411,12 +412,22 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
                     new_segs.append(seg)
                     continue
                 try:
-                    new_text = punct_mgr.punctuate(old_text, timeout_sec=30.0)
-                except Exception:
-                    new_text = old_text
+                    checked = getattr(type(punct_mgr), "punctuate_checked", None)
+                    if callable(checked):
+                        new_text = punct_mgr.punctuate_checked(old_text, timeout_sec=30.0)
+                    else:
+                        new_text = punct_mgr.punctuate(old_text, timeout_sec=30.0)
+                except Exception as exc:
+                    _punct_error = str(exc)
+                    break
                 ns = dict(seg)
                 ns["text"] = new_text or old_text
                 new_segs.append(ns)
+            if _punct_error:
+                fail_count += 1
+                log_stream.emit_error(
+                    f"   [{i}/{len(work)}] FAIL {vid} — punctuation: {_punct_error}\n")
+                continue
             if _cancelled_mid:
                 cancelled_early = True
                 log_stream.emit_text(

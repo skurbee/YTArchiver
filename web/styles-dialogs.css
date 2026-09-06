@@ -56,7 +56,7 @@
   min-width: 440px;
 }
 .askq-dialog-history {
-  min-width: 680px;
+  min-width: min(680px, 90vw);
   max-width: 900px;
   width: 90vw;
 }
@@ -405,14 +405,16 @@ body.channel-editor-open { overflow: hidden; }
   text-decoration: underline dotted;
   cursor: help;
 }
-.askq-compact-grid {
+.edit-grid.askq-compact-grid {
+  display: grid;
   grid-template-columns: auto 1fr;
   gap: 8px 12px;
 }
 .askq-small-label {
   font-size: var(--fs-sm);
 }
-.askq-manual-grid {
+.edit-grid.askq-manual-grid {
+  display: grid;
   grid-template-columns: auto 1fr;
   gap: 8px 14px;
 }

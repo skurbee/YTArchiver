@@ -496,6 +496,7 @@ def supervise_streaming_process(
         on_stderr_line: Callable[[str], None] | None = None,
         cancel_event: threading.Event | None = None,
         timeout: float | None = None,
+        idle_timeout: float | None = None,
         owner: str = "unowned",
         task_id: str = "",
         role: str = "streaming",
@@ -567,6 +568,7 @@ def supervise_streaming_process(
     stderr_thread.start()
 
     started = time.monotonic()
+    last_activity = started
     operation_deadline = (
         None if timeout is None
         else started + max(0.0, float(timeout))
@@ -583,6 +585,8 @@ def supervise_streaming_process(
             _log.debug("stream callback failed: %s", exc)
 
     def _consume(channel: str, line: str, *, callbacks: bool = True) -> None:
+        nonlocal last_activity
+        last_activity = time.monotonic()
         if channel == "stderr":
             stderr_tail.append(line.rstrip())
             if callbacks:
@@ -639,9 +643,10 @@ def supervise_streaming_process(
                 _terminate_owned()
                 break
             returncode = _poll_process()
-            if (operation_deadline is not None
-                    and now >= operation_deadline
-                    and returncode is None):
+            if (returncode is None and (
+                    (operation_deadline is not None and now >= operation_deadline)
+                    or (idle_timeout is not None
+                        and now - last_activity >= idle_timeout))):
                 timed_out = True
                 _terminate_owned()
                 break

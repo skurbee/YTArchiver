@@ -74,8 +74,7 @@ class AutorunScheduler:
         self._stream = stream
         # Optional callable: returns True (or a short reason string) if work
         # that must not overlap an autorun sync is currently running.
-        # Used to postpone a fire (classic _sync_pipeline_busy) AND to
-        # hold the countdown visible-but-paused via get_state().
+        # Used to postpone a fire and explain a due schedule's blocker.
         self._sync_busy_fn = sync_busy_fn
         self._interval_mins = 0
         # Timer mode (default): next fire = now + interval. Clock mode:
@@ -99,8 +98,8 @@ class AutorunScheduler:
         self._timer: threading.Timer | None = None
         self._next_fire_ts: float | None = None
         # True between _fire() kicking sync and notify_sync_done() firing.
-        # While set, get_state() surfaces seconds_remaining=None so the UI
-        # shows "Syncing..." and the timer isn't rearmed until completion.
+        # While set, get_state() identifies our scheduled sync; the timer
+        # isn't rearmed until completion.
         self._waiting_for_sync_done = False
         self._budget_impossible = False
         self._budget_message = ""
@@ -421,27 +420,29 @@ class AutorunScheduler:
         # Check sync busy state OUTSIDE the lock — the callback may
         # acquire its own locks and could deadlock if we hold this one.
         busy = False
+        busy_reason = ""
         if self._sync_busy_fn:
-            try: busy = bool(self._sync_busy_fn())
+            try:
+                busy_value = self._sync_busy_fn()
+                busy = bool(busy_value)
+                if isinstance(busy_value, str):
+                    busy_reason = busy_value.strip()
             except Exception: busy = False
         with self._lock:
-            # "Waiting" covers two cases: (a) we fired a sync ourselves
-            # and are awaiting notify_sync_done, OR (b) ANY sync is
-            # currently running (manual Sync Subbed, single-channel sync,
-            # etc.) — classic's _tick_countdown shows "Waiting for queue..."
-            # for all such cases.
-            waiting = self._waiting_for_sync_done or busy
+            # Unrelated work cannot hide a future deadline. Only report a
+            # blocker once this schedule is due, keeping its actual reason.
+            now = time.time()
+            due = self._next_fire_ts is not None and self._next_fire_ts <= now
+            waiting = self._waiting_for_sync_done or (busy and due)
             overdue = 0
-            if waiting:
-                remaining = None
-            elif self._next_fire_ts:
+            if self._next_fire_ts:
                 # Bug [27]: also surface negative deltas (autorun is
                 # past-due but hasn't fired yet — e.g., system asleep
                 # past the scheduled time, or a long modal blocked the
                 # tick thread). seconds_remaining stays clamped at 0
                 # for backwards compat with the existing UI; new
                 # overdue_seconds lets a future UI display "Overdue by X".
-                _delta = int(self._next_fire_ts - time.time())
+                _delta = int(self._next_fire_ts - now)
                 remaining = max(0, _delta)
                 if _delta < 0:
                     overdue = -_delta
@@ -454,6 +455,8 @@ class AutorunScheduler:
                 "seconds_remaining": remaining,
                 "overdue_seconds": overdue,
                 "waiting_for_sync": waiting,
+                "scheduled_sync_running": self._waiting_for_sync_done,
+                "busy_reason": busy_reason if busy and due else "",
                 # Clock-aligned mode: the UI shows "Next at 7:00pm" using
                 # next_fire_ts (epoch seconds) instead of a countdown.
                 "mode": "clock" if self._clock_mode else "timer",

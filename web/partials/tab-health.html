@@ -118,29 +118,29 @@
 
               <div class="metadata-bulk-row">
                 <button class="btn btn-ghost btn-thin" id="btn-md-refresh-all-views"
-                        title="Choose a recent-upload time range, then queue a views/likes refresh for every subscribed channel">
-                  Refresh views/likes &mdash; all channels
+                        title="Fetch current views and likes from YouTube for every subscribed channel. Choose which upload dates to check; this uses the network.">
+                  Update views and likes from YouTube&hellip;
                 </button>
                 <button class="btn btn-ghost btn-thin" id="btn-md-refresh-all-comments"
-                        title="Queue a comments refresh for every channel. Prompts for scope: 1 month / 1 year / all.">
-                  Refresh comments &mdash; all channels
+                        title="Fetch comments from YouTube for all channels. Choose a recent-upload range or all uploads; this uses the network.">
+                  Update comments from YouTube&hellip;
                 </button>
                 <button class="btn btn-ghost btn-thin" id="btn-md-backfill-all-ids"
-                        title="Try to find and record missing YouTube video IDs for every channel. This is especially useful for older imported archives.">
+                        title="Find and save missing video IDs for all channels using local records and YouTube when needed. This can use the network.">
                   Fix missing video IDs &mdash; all channels
                 </button>
                 <button class="btn btn-ghost btn-thin" id="btn-md-refetch-all-thumbs"
                         title="Download missing thumbnail images for every channel using saved YouTube information. Runs in the background; progress appears in the log.">
-                  Refetch missing thumbnails &mdash; all channels
+                  Download missing thumbnails &mdash; all channels
                 </button>
                 <button class="btn btn-ghost btn-thin" id="btn-md-recheck-thumbs"
-                        title="Bypass caches and recompute every stat from scratch. Use if numbers look stale or you edited files outside the app.">
-                  Force recheck &mdash; all stats
+                        title="Recount local video IDs, transcripts, and thumbnail files from disk and catalog. Does not fetch current views, likes, or comments from YouTube.">
+                  Recount local files and coverage
                   <span class="md-recheck-progress" id="md-recheck-progress" hidden></span>
                 </button>
                 <div class="spacer"></div>
                 <button class="btn btn-ghost btn-thin" id="btn-md-reload"
-                        title="Re-query per-channel refresh times">Reload</button>
+                        title="Display the latest saved channel status. Does not contact YouTube or force a new disk scan.">Reload saved status</button>
               </div>
 
               <div class="metadata-table-wrap">
@@ -294,7 +294,7 @@
         <div class="settings-view" id="settings-view-backups" hidden>
           <label class="subs-section-label">Backups</label>
           <div class="health-view-intro">
-            Backups save YTArchiver's settings, subscriptions, queues, and app history. They do not copy downloaded videos or transcripts.
+            Backups save YTArchiver's settings, subscriptions, queues, app history, bookmarks, and notes. They do not copy downloaded videos or transcript files. The Search index is included when it fits the backup size limit and can be rebuilt when omitted; bookmarks and notes are still included.
           </div>
           <div class="edit-grid health-backup-grid">
             <label class="edit-gl" for="settings-auto-backup">Automatic backups</label>
@@ -316,7 +316,7 @@
             <div class="edit-gv-stack settings-field-with-help">
               <div class="edit-gv-inline edit-gap-6">
                 <button class="btn btn-ghost btn-thin" id="btn-export-backup"
-                        title="Save app settings, unfinished work, and activity history to a zip file">Save backup&hellip;</button>
+                        title="Save app settings, subscriptions, unfinished work, history, bookmarks, and notes to a ZIP file">Save backup&hellip;</button>
                 <button class="btn btn-ghost btn-thin" id="btn-import-backup"
                         title="Restore a backup zip after safely saving the current app settings">Restore&hellip;</button>
               </div>

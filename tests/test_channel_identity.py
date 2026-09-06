@@ -345,7 +345,29 @@ class CandidateUrlVerificationTests(unittest.TestCase):
         # Playlist-scoped print: the ID is read off the channel itself.
         self.assertIn(
             "playlist:CHVERIFY:::%(channel_id)s:::%(uploader_url)s", command)
-        self.assertEqual(command[-1], "https://www.youtube.com/@handle/videos")
+        self.assertEqual(command[-1], "https://www.youtube.com/@handle")
+
+    def test_streams_only_channel_verifies_without_a_videos_tab(self) -> None:
+        def _probe(command, **kwargs):
+            if command[-1].endswith("/videos"):
+                return {
+                    "ok": False, "stdout": "",
+                    "error": "This channel does not have a videos tab",
+                }
+            self.assertEqual(command[-1], "https://www.youtube.com/@streams_only")
+            return {
+                "ok": True,
+                "stdout": f"CHVERIFY:::{CHANNEL_ID}:::https://www.youtube.com/@streams_only",
+            }
+
+        with mock.patch.object(
+                channel_identity, "_run_identity_probe", side_effect=_probe):
+            resolved = channel_identity._verify_candidate_url(
+                "@streams_only",
+                context={"ok": True, "yt": "yt-dlp", "cookies": []},
+            )
+
+        self.assertEqual(resolved, CHANNEL_ID)
 
     def test_playlist_scoped_identity_is_accepted(self) -> None:
         resolved, _command = self._run(f"CHVERIFY:::{CHANNEL_ID}:::x")

@@ -167,6 +167,52 @@ from .ytdlp_session import (
 )
 
 _ID_IN_FILENAME = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
+_TRAILING_ID_RE = re.compile(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$")
+
+
+# Compress log-slot reservation. Imported lazily so `backend.sync` keeps
+# working in the trimmed test/import graphs that never pull in ffmpeg
+# helpers, and so a broken compress module can never take a sync pass
+# down over a cosmetic log line.
+def _emit_compress_placeholder(stream: LogStreamer, path: str) -> None:
+    """Reserve the compress log slot under the video row we just wrote."""
+    try:
+        from ..compress import emit_compress_placeholder
+        emit_compress_placeholder(stream, path)
+    except Exception as e:
+        swallow("compress placeholder emit", e)
+
+
+def _clear_compress_placeholder(stream: LogStreamer, path: str) -> None:
+    """Drop a reserved compress slot that will never be filled."""
+    try:
+        from ..compress import clear_compress_marker
+        clear_compress_marker(stream, path)
+    except Exception as e:
+        swallow("compress placeholder clear", e)
+
+
+def _clean_display_title(name: str) -> str:
+    """Turn a yt-dlp filename stem into a title fit for Simple mode.
+
+    Two suffixes have to come off, in this order. yt-dlp's Destination
+    lines name the per-track temp file, so the stem can carry a format
+    selector (`.f137`, `.f140-16`, `.f251-drc`) AFTER the `[videoid]`
+    bracket. Stripping the ID first therefore never matches — its regex is
+    end-anchored — and Simple mode ends up showing the raw 11-character ID
+    on in-progress rows while the finished row looks clean.
+
+    Simple mode is plain English for the user, so the ID never belongs in
+    it. Verbose mode is unaffected: it prints yt-dlp's own lines untouched,
+    filename and all.
+    """
+    title = str(name or "").strip()
+    if "." in title:
+        last = title.rsplit(".", 1)[-1]
+        if len(last) >= 2 and last[0] == "f" and last[1].isdigit():
+            title = title.rsplit(".", 1)[0]
+    # Keep the bare ID if that is genuinely all the name was.
+    return _TRAILING_ID_RE.sub("", title).strip() or title
 
 # ── Progress parsing ───────────────────────────────────────────────────
 
@@ -2822,6 +2868,20 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                                      ["simpleline", _m]],
                                 ])
 
+                            # The compress follow-up runs from the GPU
+                            # queue minutes later, long after this
+                            # channel block has scrolled away. Reserve
+                            # its slot now (same trick as meta_done_ /
+                            # tx_done_) so "Encoding ...", the progress
+                            # bar and the "\u2713 Compressed" done line all
+                            # render under THIS video rather than under
+                            # whichever channel is printing when the
+                            # encode finally starts. Same 6-space indent
+                            # as the Metadata / Transcription rows.
+                            if _compress_after:
+                                _emit_compress_placeholder(
+                                    stream, final_path)
+
                             _tx_route = transcribe_mgr.route_download_transcription(
                                 final_path, _title_for_tx,
                                 channel=name,
@@ -2844,16 +2904,29 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                             _comp_lvl = channel.get("compress_level") or "Average"
                             _comp_res = str(channel.get("compress_output_res") or "720")
                             if transcribe_mgr is not None:
+                                # Same reserved slot as the auto-transcribe
+                                # path above — this is the only line this
+                                # video gets, so it has to sit under the
+                                # video row, not at the log bottom.
+                                _emit_compress_placeholder(stream, final_path)
                                 try:
-                                    transcribe_mgr.compress_enqueue(
+                                    _queued = transcribe_mgr.compress_enqueue(
                                         final_path,
                                         title=os.path.splitext(
                                             os.path.basename(final_path))[0],
                                         channel=name,
                                         quality=_comp_lvl,
-                                        output_res=_comp_res)
+                                        output_res=_comp_res,
+                                        from_download=True)
                                 except Exception as _e:
+                                    _queued = False
                                     stream.emit_error(f"Couldn't queue video compression: {_e}")
+                                if not _queued:
+                                    # Rejected (shutdown, duplicate,
+                                    # containment) — nothing will ever
+                                    # replace the placeholder, so drop it.
+                                    _clear_compress_placeholder(
+                                        stream, final_path)
                             else:
                                 # A detached fallback thread has no durable
                                 # queue owner and can overwrite media after a
@@ -2955,17 +3028,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                     stream.emit([[f" {s[:140]}\n", "dim"]])
                     continue
                 current_title = os.path.basename(dest_path).rsplit(".", 1)[0]
-                display_title = re.sub(
-                    r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", current_title
-                ).strip() or current_title
-                if "." in display_title:
-                    _last_bit = display_title.rsplit(".", 1)[-1]
-                    # Same `f<digit>...` pattern as _resolve_final_mp4 —
-                    # handles .f137 (single track) and .f140-16 / .f251-drc
-                    # (multi-track / DRC) suffix cases consistently.
-                    if (len(_last_bit) >= 2 and _last_bit[0] == "f"
-                            and _last_bit[1].isdigit()):
-                        display_title = display_title.rsplit(".", 1)[0]
+                display_title = _clean_display_title(current_title)
                 # Announce once per merged .mp4 — yt-dlp emits a Destination
                 # per intermediate track (.f137, .f139) + the merge target.
                 if not _title_announced.get(final_path):
@@ -3101,12 +3164,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                     # filename stem which often still carries yt-dlp's
                     # format-selector suffix (e.g. `.f140-4`, `.f137`).
                     # Strip it so the drawer shows a readable title.
-                    _clean_title = (current_title or "").strip()
-                    if "." in _clean_title:
-                        _last = _clean_title.rsplit(".", 1)[-1]
-                        if (len(_last) >= 2 and _last[0] == "f"
-                                and _last[1].isdigit()):
-                            _clean_title = _clean_title.rsplit(".", 1)[0]
+                    _clean_title = _clean_display_title(current_title)
                     # Classify which kind of live-state for a tight
                     # single-line log message. "is_upcoming" /
                     # "premieres in" / "scheduled" → upcoming premiere.
@@ -3226,7 +3284,8 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                 if "members-only content" in low or "get access to members" in low:
                     _vid_m = re.search(r"\b([A-Za-z0-9_-]{11})\b", s)
                     _vid_id = _vid_m.group(1) if _vid_m else ""
-                    _title = current_title or (_vid_id or "video")
+                    _title = (_clean_display_title(current_title)
+                              or (_vid_id or "video"))
                     stream.emit([
                         ["[SKIP]", "filterskip"],
                         [f" {_title} \u2014 Members-only content.\n",
@@ -3322,7 +3381,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                         if current_vid_id:
                             _simple_err_shown.add(current_vid_id)
                         _reason = _humanize_ytdlp_error(low)
-                        _who = (current_title or "").strip()
+                        _who = _clean_display_title(current_title)
                         if _who:
                             stream.emit([
                                 [f" ⚠ {_who} — {_reason}\n",

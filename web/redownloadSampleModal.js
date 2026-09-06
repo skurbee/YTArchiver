@@ -1,140 +1,126 @@
 /**
- * web/redownloadSampleModal.js — 10-sample confirm modal wiring.
- *
- * The Python redownload worker pauses after the first 10 videos and emits
- * a `__control__`-tagged log payload (kind=redownload_sample) with stats.
- * logs.js intercepts the control and re-dispatches as a `yt-control`
- * CustomEvent. This module listens for that event, paints the modal,
- * starts a 5-minute auto-continue countdown (pauses on hover), and calls
- * back `api.redownload_sample_confirm()` with the user's choice.
- *
- * Self-wired on script load — no init function needed; just include
- * the script tag before the modal can fire.
+ * Redownload sample confirmation. The backend owns the deadline and defaults
+ * to Cancel; an exact sample ID prevents late answers reaching a later job.
  */
 (function () {
   "use strict";
 
-  function bridgeCall(method, ...args) {
-    const fn = window.YT?.bridge?.bridgeCall;
-    if (fn) return fn(method, ...args);
-    return undefined;
-  }
-
-  function nativeBridgeUp() {
-    return !!window.YT?.bridge?.isUp?.();
-  }
-
   const modal = () => document.getElementById("redwnl-sample-modal");
-  const sub = () => document.getElementById("redwnl-sample-sub");
-  const stats = () => document.getElementById("redwnl-sample-stats");
   const countdown = () => document.getElementById("redwnl-sample-countdown");
   const picker = () => document.getElementById("redwnl-sample-res-picker");
-
+  let active = null;
   let tickHandle = null;
-  let remaining = 300;
   let releaseFocusTrap = null;
 
-  function stopTick() {
-    if (tickHandle) { clearInterval(tickHandle); tickHandle = null; }
-  }
-  function startTick() {
-    stopTick();
-    remaining = 300;
-    const paint = () => {
-      const m = Math.floor(remaining / 60);
-      const s = String(remaining % 60).padStart(2, "0");
-      const el = countdown();
-      if (el) el.textContent = `Auto-continuing in ${m}:${s}…`;
-    };
-    paint();
-    tickHandle = setInterval(() => {
-      remaining -= 1;
-      if (remaining <= 0) {
-        stopTick();
-        answer("continue");
-        return;
-      }
-      paint();
-    }, 1000);
+  function setBusy(busy) {
+    modal()?.querySelectorAll("button, input").forEach(element => {
+      element.disabled = busy;
+    });
+    modal()?.toggleAttribute("aria-busy", busy);
   }
 
-  function answer(choice) {
-    stopTick();
-    if (releaseFocusTrap) {
-      releaseFocusTrap();
-      releaseFocusTrap = null;
-    }
+  function close(sampleId) {
+    if (active?.id !== sampleId) return;
+    active = null;
+    if (tickHandle !== null) clearInterval(tickHandle);
+    tickHandle = null;
+    releaseFocusTrap?.();
+    releaseFocusTrap = null;
     const m = modal();
     if (m) m.hidden = true;
-    if (!nativeBridgeUp()) return;
-    try { bridgeCall("redownload_sample_confirm", choice); }
-    catch (e) { console.error("redownload_sample_confirm failed:", e); }
+    setBusy(false);
+  }
+
+  function paintCountdown() {
+    if (!active) return;
+    const remaining = Math.max(0, Math.ceil((active.deadline - Date.now()) / 1000));
+    if (countdown()) {
+      const minutes = Math.floor(remaining / 60);
+      const seconds = String(remaining % 60).padStart(2, "0");
+      countdown().textContent = remaining > 0
+        ? `Cancelling in ${minutes}:${seconds} unless you choose to continue…`
+        : "Confirmation timed out. Waiting for cancellation…";
+    }
+    setBusy(active.answering || remaining === 0);
+  }
+
+  async function answer(choice) {
+    const sample = active;
+    if (!sample || sample.answering || Date.now() >= sample.deadline) return;
+    if (!window.YT?.bridge?.isUp?.()) {
+      window._showToast?.("The connection is unavailable. Your answer was not sent.", "error");
+      return;
+    }
+    sample.answering = true;
+    paintCountdown();
+    try {
+      const result = await window.YT.bridge.bridgeCall(
+        "redownload_sample_confirm", choice, sample.id);
+      if (active !== sample) return;
+      if (result?.ok || result?.expired) {
+        close(sample.id);
+        if (result.expired) window._showToast?.("This sample confirmation has already closed.", "warn");
+      } else {
+        window._showToast?.(result?.error || "Your answer was not accepted. Try again.", "error");
+      }
+    } catch (error) {
+      if (active === sample) window._showToast?.("Could not send your answer: " + error, "error");
+    } finally {
+      if (active === sample) {
+        sample.answering = false;
+        paintCountdown();
+      }
+    }
   }
 
   function showPicker(show) {
-    const p = picker();
-    if (p) p.hidden = !show;
-    const focusId = show ? "redwnl-sample-res-ok" : "redwnl-sample-continue";
-    setTimeout(() => document.getElementById(focusId)?.focus(), 30);
+    if (picker()) picker().hidden = !show;
+    const focusId = show ? "redwnl-sample-res-ok" : "redwnl-sample-cancel";
+    document.getElementById(focusId)?.focus();
   }
 
-  function wireHoverPause(m) {
-    if (!m || m._redwnlHoverWired) return;
-    m._redwnlHoverWired = true;
-    m.addEventListener("mouseenter", () => { stopTick(); });
-    m.addEventListener("mouseleave", () => {
-      if (!tickHandle && !m.hidden) startTick();
-    });
-  }
-
-  window.addEventListener("yt-control", (ev) => {
-    const d = ev && ev.detail;
-    if (!d || d.kind !== "redownload_sample") return;
+  window.addEventListener("yt-control", event => {
+    const data = event?.detail;
+    if (data?.kind === "redownload_sample_closed") {
+      close(data.sample_id);
+      return;
+    }
+    if (data?.kind !== "redownload_sample") return;
+    const deadline = Number(data.deadline_ts) * 1000;
+    if (!data.sample_id || !Number.isFinite(deadline) || deadline <= Date.now()) return;
     const m = modal();
     if (!m) return;
-    if (sub()) {
-      sub().textContent =
-        `${d.sample_n || 10} files redownloaded at ${d.res_label || ""}`;
+    if (active) close(active.id);
+    active = { id: data.sample_id, deadline, answering: false };
+    const sub = document.getElementById("redwnl-sample-sub");
+    if (sub) sub.textContent = `${data.sample_n || 10} files redownloaded at ${data.res_label || ""}`;
+    const stats = document.getElementById("redwnl-sample-stats");
+    if (stats) {
+      const direction = data.direction || "smaller";
+      stats.textContent = `Average size change: ${Math.round(Math.abs(data.avg_pct || 0))}% ${direction}`;
+      stats.classList.toggle("larger", direction === "larger");
     }
-    if (stats()) {
-      const dir = d.direction || "smaller";
-      const pct = Math.round(Math.abs(d.avg_pct || 0));
-      stats().textContent = `Average size change:  ${pct}% ${dir}`;
-      stats().classList.toggle("larger", dir === "larger");
-    }
-    showPicker(false);
-    wireHoverPause(m);
     m.hidden = false;
-    if (releaseFocusTrap) releaseFocusTrap();
+    setBusy(false);
+    showPicker(false);
     releaseFocusTrap = window.YT?.modals?.activateFocusTrap?.(m, {
       dialogSelector: ".yt-modal",
-      initialFocus: "#redwnl-sample-continue",
+      initialFocus: "#redwnl-sample-cancel",
       onEscape: () => answer("cancel"),
     }) || null;
-    startTick();
+    paintCountdown();
+    tickHandle = setInterval(paintCountdown, 250);
   });
 
   document.addEventListener("DOMContentLoaded", () => {
-    const btnC = document.getElementById("redwnl-sample-continue");
-    const btnX = document.getElementById("redwnl-sample-cancel");
-    const btnR = document.getElementById("redwnl-sample-change");
-    const btnResOk = document.getElementById("redwnl-sample-res-ok");
-    const btnResBack = document.getElementById("redwnl-sample-res-back");
-    if (btnC) btnC.addEventListener("click", () => answer("continue"));
-    if (btnX) btnX.addEventListener("click", () => answer("cancel"));
-    if (btnR) btnR.addEventListener("click", () => {
-      // Swap to res-picker; keep the countdown ticking so an unattended
-      // run still auto-continues if the user walked away.
-      showPicker(true);
+    const bind = (id, action) => document.getElementById(id)?.addEventListener("click", action);
+    bind("redwnl-sample-continue", () => answer("continue"));
+    bind("redwnl-sample-cancel", () => answer("cancel"));
+    bind("redwnl-sample-change", () => showPicker(true));
+    bind("redwnl-sample-res-ok", () => {
+      const selected = document.querySelector('input[name="redwnl-sample-res"]:checked');
+      if (selected) answer(selected.value);
     });
-    if (btnResOk) btnResOk.addEventListener("click", () => {
-      const picked = document.querySelector(
-        'input[name="redwnl-sample-res"]:checked');
-      if (!picked) return;
-      answer(picked.value);
-    });
-    if (btnResBack) btnResBack.addEventListener("click", () => {
-      showPicker(false);
-    });
+    bind("redwnl-sample-res-back", () => showPicker(false));
   });
 })();

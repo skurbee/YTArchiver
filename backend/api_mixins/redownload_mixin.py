@@ -7,11 +7,16 @@ private Api attributes kept as fallback state.
 """
 from __future__ import annotations
 
+import json
 import threading
+import time
+import uuid
 
 from backend.ytarchiver_config import load_config
 
 from ._shared import ALLOWED_REDOWNLOAD_RESOLUTIONS, _log
+
+_SAMPLE_CONFIRM_TIMEOUT_SEC = 300
 
 
 class RedownloadMixin:
@@ -123,6 +128,7 @@ class RedownloadMixin:
         from backend import redownload as _rd
         queues = self._redownload_queues()
         log_stream = self._redownload_log_stream()
+        cancel_event = self._redwnl_cancel
         _scope_text = f" [{scope_label}]" if scope_label else ""
         _rd_task = dict(rd_task) if isinstance(rd_task, dict) else dict(ch)
         _rd_task["kind"] = "redownload"
@@ -146,7 +152,7 @@ class RedownloadMixin:
             durable_replace = getattr(
                 type(queues), "replace_current_task_durable", None)
             published = bool(
-                _rd_task_id and callable(durable_replace)
+                not cancel_event.is_set() and _rd_task_id and callable(durable_replace)
                 and queues.replace_current_task_durable(
                     "sync", _rd_task, expected_task_id=_rd_task_id)
             )
@@ -161,6 +167,8 @@ class RedownloadMixin:
             _log.warning(
                 "redownload: current-task decoration failed safely: %s", e)
         try:
+            if cancel_event.is_set():
+                return
             log_stream.emit([
                 ["[Sync] ", "sync_bracket"],
                 [f"Redownload {_rd_task.get('name','?')}{_scope_text} \u2192 ",
@@ -171,85 +179,26 @@ class RedownloadMixin:
             log_stream.flush()
 
             def _confirm(avg_pct, direction, res_label, sample_n):
-                ev = threading.Event()
-                # Per-job key so a concurrent sample-confirm step can't
-                # overwrite this one's pending dict. Each call captures
-                # its own `pending` local and reads choice from THAT —
-                # never from `self._redwnl_sample` — so a second job
-                # writing the single-slot attribute can't mis-resolve
-                # this one (audit: redownload_mixin.py C4).
-                _job_key = (ch.get("url") or ch.get("name") or "")
-                pending = {
-                    "avg_pct": float(avg_pct),
-                    "direction": str(direction),
-                    "res_label": str(res_label),
-                    "sample_n": int(sample_n),
-                    "event": ev,
-                    # Default is now `cancel` on timeout. Old default
-                    # was `continue`, so a user who walked away for
-                    # 5+ minutes had the redownload silently proceed
-                    # without their consent.
-                    "choice": "cancel",
-                    "_job_key": _job_key,
-                    "_timed_out": False,
-                }
-                if not hasattr(self, "_redwnl_samples") or \
-                        self._redwnl_samples is None:
-                    self._redwnl_samples = {}
-                self._redwnl_samples[_job_key] = pending
-                # Legacy single-slot kept for the resolver fast-path and
-                # any external introspection; resolver also walks the
-                # keyed dict so multiple-pending overlaps still resolve.
-                self._redwnl_sample = pending
-                try:
-                    import json as _json
-                    _payload = _json.dumps({
-                        "kind": "redownload_sample",
-                        "avg_pct": float(avg_pct),
-                        "direction": str(direction),
-                        "res_label": str(res_label),
-                        "sample_n": int(sample_n),
-                    })
-                    log_stream.emit([
-                        [_payload, "__control__"],
-                    ])
-                    log_stream.flush()
-                except Exception as e:
-                    _log.warning("redownload sample-confirm dialog emit failed; worker will time out after 300s: %s", e)
-                _signaled = ev.wait(timeout=300)
-                if not _signaled:
-                    # User never answered. Mark as timeout and treat
-                    # as cancel — surface a log line so they know
-                    # later that the redownload stopped, not silently
-                    # progressed.
-                    try:
-                        pending["_timed_out"] = True
-                        log_stream.emit_dim(
-                            "[Sync] Redownload sample-confirm timed out "
-                            "(5 min) — cancelling rather than proceeding.")
-                        log_stream.flush()
-                    except Exception:
-                        pass
-                try:
-                    self._redwnl_samples.pop(_job_key, None)
-                except Exception:
-                    pass
-                return pending.get("choice", "cancel")
+                return self._wait_redownload_sample(
+                    avg_pct, direction, res_label, sample_n,
+                    cancel_event, log_stream)
 
             _rd.redownload_channel(
                 ch.get("name", ""), ch.get("url", ""), folder, new_res,
                 stream=log_stream,
-                cancel_ev=self._redwnl_cancel,
+                cancel_ev=cancel_event,
                 pause_ev=self._sync_pause,
                 confirm_cb=_confirm,
                 queues=queues,
                 only_video_id=_rd_task.get("only_video_id", ""),
                 only_filepath=_rd_task.get("only_filepath", ""),
                 only_title=_rd_task.get("only_title", ""),
+                scope=_rd_task.get("scope"),
             )
         except Exception as e:
             log_stream.emit_error(f"Redownload crashed: {e}")
         finally:
+            cleared = False
             try:
                 current = queues.current_sync
                 if current is None:
@@ -269,6 +218,32 @@ class RedownloadMixin:
             except Exception as e:
                 _log.warning(
                     "redownload finally: durable current clear failed: %s", e)
+            if cleared and cancel_event.is_set():
+                # Defer persists the same task at the durable queue's tail.
+                # Reattach its execution companion only after this worker has
+                # stopped and acknowledged its current slot. A normal Cancel
+                # has no matching pending row, and Stop must not restart work.
+                try:
+                    with self._redwnl_lock:
+                        stopped = getattr(self, "_sync_cancel", None)
+                        task_id = str(_rd_task.get("task_id") or "").strip()
+                        deferred = None
+                        if task_id and not (stopped and stopped.is_set()):
+                            deferred = next((dict(task) for task in queues.sync_snapshot()
+                                             if str(task.get("task_id") or "").strip() == task_id
+                                             and task.get("kind") == "redownload"), None)
+                        if deferred is not None and not any(
+                                str((item.get("rd_task") or {}).get("task_id") or "").strip() == task_id
+                                for item in self._redwnl_pending):
+                            deferred.pop("cancel_requested", None)
+                            self._redwnl_pending.append({
+                                "ch": dict(ch), "folder": folder,
+                                "new_res": deferred.get("redownload_res") or new_res,
+                                "scope_label": scope_label, "scope": deferred.get("scope"),
+                                "only_video": dict(only_video), "rd_task": deferred,
+                            })
+                except Exception as exc:
+                    _log.warning("deferred redownload runtime restoration failed: %s", exc)
             log_stream.flush()
             try:
                 from backend import archive_scan as _as
@@ -291,7 +266,68 @@ class RedownloadMixin:
                 _log.debug("swallowed: %s", e)
 
 
-    def redownload_sample_confirm(self, choice):
+    def _sample_state(self):
+        # The redownload lane is serial; this also serializes bridge answers
+        # with the worker's deadline and cleanup.
+        if not hasattr(self, "_redwnl_samples_lock"):
+            self._redwnl_samples_lock = threading.Lock()
+        if not isinstance(getattr(self, "_redwnl_samples", None), dict):
+            self._redwnl_samples = {}
+        return self._redwnl_samples_lock, self._redwnl_samples
+
+    def _wait_redownload_sample(self, avg_pct, direction, res_label, sample_n,
+                               cancel_event, stream):
+        sample_id = uuid.uuid4().hex
+        pending = {"event": threading.Event(), "choice": "cancel",
+                   "answered": False, "sample_id": sample_id,
+                   "deadline_ts": time.time() + _SAMPLE_CONFIRM_TIMEOUT_SEC}
+        lock, samples = self._sample_state()
+        with lock:
+            samples[sample_id] = pending
+            self._redwnl_sample = pending
+
+        def emit(kind, **fields):
+            stream.emit([[json.dumps({"kind": kind, "sample_id": sample_id,
+                                     **fields}), "__control__"]])
+            stream.flush()
+
+        reason = "timeout"
+        try:
+            emit("redownload_sample", avg_pct=float(avg_pct),
+                 direction=str(direction), res_label=str(res_label),
+                 sample_n=int(sample_n), deadline_ts=pending["deadline_ts"])
+            while True:
+                with lock:
+                    if cancel_event.is_set():
+                        pending["choice"] = "cancel"
+                        reason = "cancelled"
+                        break
+                    if pending["answered"]:
+                        reason = "answered"
+                        break
+                    remaining = pending["deadline_ts"] - time.time()
+                    if remaining <= 0:
+                        break
+                pending["event"].wait(min(remaining, 0.2))
+        except Exception as exc:
+            _log.warning("redownload sample dialog failed: %s", exc)
+            reason = "cancelled"
+            pending["choice"] = "cancel"
+        finally:
+            with lock:
+                samples.pop(sample_id, None)
+                if getattr(self, "_redwnl_sample", None) is pending:
+                    self._redwnl_sample = None
+            try:
+                emit("redownload_sample_closed", reason=reason)
+                if reason == "timeout":
+                    stream.emit_dim("[Sync] Sample confirmation timed out — redownload cancelled.")
+                    stream.flush()
+            except Exception as exc:
+                _log.debug("redownload sample close notification failed: %s", exc)
+        return pending["choice"]
+
+    def redownload_sample_confirm(self, choice, sample_id=None):
         """UI → Python bridge for the "check 10 then re-ask" popup.
 
         Called from app.js when the user clicks Continue / Cancel / picks
@@ -304,27 +340,21 @@ class RedownloadMixin:
           - "best" / "2160" / "1440" / "1080" / "720" / "480" / "360"
             / "240" / "144" → switch to that resolution and resample
         """
-        samples = getattr(self, "_redwnl_samples", None) or {}
-        pending_list = list(samples.values())
-        if not pending_list:
-            # Fall back to legacy single-slot in case nothing was keyed
-            # (paths that haven't been migrated yet).
-            legacy = getattr(self, "_redwnl_sample", None)
-            if legacy:
-                pending_list = [legacy]
-        if not pending_list:
-            return {"ok": False, "error": "no pending sample-confirm"}
-        c = str(choice or "continue").strip().lower()
+        c = str(choice or "").strip().lower()
         if c not in ("continue", "cancel", *ALLOWED_REDOWNLOAD_RESOLUTIONS):
             return {"ok": False, "error": f"invalid choice: {c}"}
-        # In normal (serial) operation there's exactly one pending. If
-        # multiple ever overlap, apply the user's choice to all rather
-        # than dropping any — leaving one stranded would hang the worker
-        # for the full 5-minute timeout.
-        for pending in pending_list:
+        lock, samples = self._sample_state()
+        with lock:
+            pending = samples.get(str(sample_id or ""))
+            if not sample_id and len(samples) == 1:
+                pending = next(iter(samples.values()))
+            if not pending or pending["deadline_ts"] <= time.time():
+                return {"ok": False, "expired": True,
+                        "error": "This sample confirmation has expired or closed."}
+            if pending["answered"]:
+                return {"ok": False, "error": "This sample already has an answer."}
             pending["choice"] = c
-            ev = pending.get("event")
-            if ev is not None:
-                try: ev.set()
-                except Exception as e: _log.warning("redownload sample-confirm: ev.set() failed; worker will hang until 300s timeout: %s", e)
-        return {"ok": True, "choice": c, "resolved": len(pending_list)}
+            pending["answered"] = True
+            pending["event"].set()
+            return {"ok": True, "choice": c, "resolved": 1,
+                    "sample_id": pending["sample_id"]}

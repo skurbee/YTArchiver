@@ -35,6 +35,81 @@ from .log_stream import LogStreamer
 _log = get_logger(__name__)
 
 
+# Lead indent for a compress line. Mirrors the identical rule in
+# transcribe/core.py `_build_transcription_done_segments`: six spaces when
+# the line nests under a sync download's " \u2014 \u2713 <title> (size)" video
+# row, one space for a standalone compress (right-click \u2192 Compress, Subs
+# batch Compress) that has no parent row to nest under.
+_DOWNLOAD_LEAD = "      "
+_STANDALONE_LEAD = " "
+
+
+def compress_lead(from_download: bool) -> str:
+    """Return the leading indent for this compress's log lines."""
+    return _DOWNLOAD_LEAD if from_download else _STANDALONE_LEAD
+
+
+# In-place log marker for one file's whole compression lifecycle.
+#
+# Every line a single compress produces — the "Compression queued…"
+# placeholder sync.py reserves under the video's own row, the "Encoding …"
+# header, each progress-bar tick, and the final "✓ Compressed" summary —
+# carries this same tag, so logs.js `_inplaceKind` replaces them all at ONE
+# scroll position instead of appending the done line minutes later under
+# whichever channel the sync pass happens to have reached by then.
+#
+# Hash the basename so non-ascii / spaces / quotes are safe inside the tag
+# string (it has to survive CSS attribute selectors in logs.js).
+def compress_marker_tag(path: str) -> str:
+    """Return the stable `compress_done_<hash>` tag for *path*."""
+    import hashlib as _hashlib
+    return "compress_done_" + _hashlib.md5(
+        os.path.basename(str(path)).encode("utf-8", "replace")
+    ).hexdigest()[:12]
+
+
+def emit_compress_placeholder(stream: LogStreamer, path: str,
+                              from_download: bool = True) -> None:
+    """Reserve this file's compress slot in the log, under its video row.
+
+    Callers queue a compress long before the encode actually starts, so
+    without a reserved slot the whole "Encoding ... -> progress ->
+    Compressed" chain lands wherever the log happens to be when the GPU
+    worker picks the job up — typically several channels further down.
+    Emitting a placeholder under the same `compress_done_<hash>` marker
+    pins the chain here instead.
+
+    The line MUST carry a non-verbose-only tag or Simple mode filters it
+    out, the marker never reaches the DOM, and the done line falls back
+    to appending at log bottom — the exact bug this fixes.
+    """
+    _tag = compress_marker_tag(path)
+    _lead = compress_lead(from_download)
+    stream.emit([
+        [f"{_lead}\u2014 \u23F3 ", ["compress_bracket", _tag]],
+        ["Compression queued\u2026\n", ["simpleline", _tag]],
+    ])
+
+
+def clear_compress_marker(stream: LogStreamer, path: str) -> None:
+    """Drop this file's reserved compress slot from the log.
+
+    Called on every path where the encode will NOT go on to emit a done
+    line (ffmpeg missing, input gone, user cancelled, follow-up never
+    queued). Without it the reserved "Compression queued…" placeholder —
+    or a half-drawn progress bar — sits under the video's row forever.
+    """
+    try:
+        import json as _json_mark
+        stream.emit([
+            [_json_mark.dumps({"kind": "clear_line",
+                               "marker": compress_marker_tag(path)}),
+             "__control__"],
+        ])
+    except Exception as _e:
+        _log.debug("swallowed compress marker clear: %s", _e)
+
+
 _COMPRESS_PRESETS = {
     # 2160 (4K) and 1440 (1440p) used to be missing, causing
     # silent fallback to 1080p bitrates — 4K output at Generous would
@@ -202,6 +277,7 @@ def compress_video(input_path: str, stream: LogStreamer,
                    dry_run: bool = False,
                    process_owner: str = "processing",
                    task_id: str = "",
+                   from_download: bool = False,
                    ) -> dict[str, Any]:
     """
     Encode one video with av1_nvenc at quality+res preset.
@@ -214,8 +290,10 @@ def compress_video(input_path: str, stream: LogStreamer,
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         stream.emit_error("Video compression isn't available — the compression tool (ffmpeg) is missing.")
+        clear_compress_marker(stream, input_path)
         return {"ok": False, "error": "ffmpeg missing"}
     if not os.path.isfile(input_path):
+        clear_compress_marker(stream, input_path)
         return {"ok": False, "error": "input not found"}
     if dry_run:
         orig_size = os.path.getsize(input_path)
@@ -252,6 +330,7 @@ def compress_video(input_path: str, stream: LogStreamer,
     except OSError as _le:
         stream.emit_error(
             f"Could not protect the compression temp file with a .lock: {_le}")
+        clear_compress_marker(stream, input_path)
         return {"ok": False, "error": str(_le), "reason": "lock_failed"}
 
     try:
@@ -260,12 +339,13 @@ def compress_video(input_path: str, stream: LogStreamer,
         # another at the same scroll position. Without this the progress
         # bar persisted next to the per-video block while the done line
         # landed minutes later at log bottom, under unrelated channels.
-        # Hash the basename so any non-ascii / spaces / quotes are safe in
-        # the tag string (must match \w+ rules in logs.js _inplaceKind).
-        import hashlib as _hashlib
-        _marker_tag = "compress_done_" + _hashlib.md5(
-            os.path.basename(input_path).encode("utf-8", "replace")
-        ).hexdigest()[:12]
+        # The slot itself is reserved by sync.py the moment the compress is
+        # queued, so this whole chain renders under the video it belongs to
+        # even when the encode only starts several channels later.
+        _marker_tag = compress_marker_tag(input_path)
+        # Every line below shares one indent so the in-place chain never
+        # shifts horizontally as it redraws.
+        _lead = compress_lead(from_download)
 
         # Determine bitrates
         mb_per_hr = get_bitrate(quality, output_res)
@@ -315,7 +395,7 @@ def compress_video(input_path: str, stream: LogStreamer,
         # simpleline_compress painter output (brackets/em-dashes colored,
         # body text default).
         stream.emit([
-            ["  \u2014 ", ["simpleline_compress", _marker_tag]],
+            [f"{_lead}\u2014 ", ["simpleline_compress", _marker_tag]],
             ["Encoding ", ["simpleline", _marker_tag]],
             [f'"{display}"', ["encode_title", _marker_tag]],
             [f" \u2014 {quality} / {output_res}p\n", ["dim", _marker_tag]],
@@ -424,6 +504,10 @@ def compress_video(input_path: str, stream: LogStreamer,
                 except OSError:
                     pass
                 stream.emit_text(" \u26d4 Encode cancelled.", "red")
+                # Drop the reserved slot: a cancelled encode never emits a
+                # done line, so its half-drawn progress bar would otherwise
+                # stay parked under the video row.
+                clear_compress_marker(stream, input_path)
                 return {"ok": False, "reason": "cancelled"}
             try:
                 line = _stderr_q.get(timeout=0.25)
@@ -452,7 +536,7 @@ def compress_video(input_path: str, stream: LogStreamer,
                     last_pct = pct
                     first_progress_emitted = True
                     stream.emit([
-                        [" ", [_marker_tag]],
+                        [_lead, [_marker_tag]],
                         ["\u2588" * (pct // 5), ["encode_progress", _marker_tag]],
                         ["\u2591" * (20 - pct // 5), ["dim", _marker_tag]],
                         [f" {pct}%", ["encode_pct", _marker_tag]],
@@ -595,6 +679,19 @@ def compress_video(input_path: str, stream: LogStreamer,
         took = time.time() - t0
         saved_pct = 100.0 * (1 - new_size / orig_size)
 
+        def _cancel_before_promotion():
+            if cancel_event is None or not cancel_event.is_set():
+                return False
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            clear_compress_marker(stream, input_path)
+            stream.emit_text(" Encode cancelled; original kept.", "dim")
+            return True
+
+        if _cancel_before_promotion():
+            return {"ok": False, "reason": "cancelled"}
         if replace_original:
             # retry the replace a couple of times on transient
             # Windows file locks (VLC preview, antivirus, Explorer preview-
@@ -618,6 +715,8 @@ def compress_video(input_path: str, stream: LogStreamer,
             except OSError:
                 _orig_st = None
             for _try in range(3):
+                if _cancel_before_promotion():
+                    return {"ok": False, "reason": "cancelled"}
                 try:
                     os.replace(temp_path, input_path)
                     _replace_err = None
@@ -682,7 +781,7 @@ def compress_video(input_path: str, stream: LogStreamer,
         # REPLACES the bar in place (issue #146) instead of appending at
         # log bottom after unrelated channels have scrolled past.
         stream.emit([
-            [" \u2014 \u2713 ", ["simpleline_green", _marker_tag]],
+            [f"{_lead}\u2014 \u2713 ", ["simpleline_green", _marker_tag]],
             ["Compressed ", ["simpleline", _marker_tag]],
             [f"\u2014 {orig_size/1024/1024:.0f}MB \u2192 {new_size/1024/1024:.0f}MB ",
              ["dim", _marker_tag]],

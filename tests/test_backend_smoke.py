@@ -1733,7 +1733,7 @@ class SubscriberCountTests(unittest.TestCase):
             "https://www.youtube.com/@examplechannel/about", runner=runner)
 
         self.assertEqual(result, {"ok": True, "count": 21100000})
-        self.assertIn("https://www.youtube.com/@examplechannel/videos",
+        self.assertIn("https://www.youtube.com/@examplechannel",
                       runner.calls[0])
         self.assertIn("--flat-playlist", runner.calls[0])
         self.assertIn("--playlist-end", runner.calls[0])
@@ -7088,9 +7088,11 @@ class TranscribeManagerQueueTests(unittest.TestCase):
         )
         record.assert_called_once_with("Channel")
         enqueue.assert_not_called()
+        # from_download rides along so the compress line nests under the
+        # download's video row instead of sitting at log bottom.
         compress.assert_called_once_with(
             "Video.mp4", title="Video", channel="Channel",
-            quality="High", output_res="1080")
+            quality="High", output_res="1080", from_download=True)
 
     def test_download_route_queues_model_work_before_followup_compression(self) -> None:
         stream = mock.Mock()
@@ -9106,7 +9108,7 @@ class QuickcheckTests(unittest.TestCase):
 
     def test_quick_check_treats_duration_filtered_ids_as_known(self) -> None:
         url = "https://youtube.com/@example"
-        proc = mock.Mock()
+        proc = mock.Mock(returncode=0, stderr="")
         proc.stdout = (
             "KNOWNVIDEO1|||300|||not_live\n"
             "SHORTVIDEO1|||60|||not_live\n"
@@ -9886,7 +9888,7 @@ class FrontendBrowseSourceTests(unittest.TestCase):
             encoding="utf-8")
 
         self.assertIn("if (wasAdd && addedChannelName)", editor)
-        self.assertIn('"Channel added. Sync now?"', editor)
+        self.assertIn('window.askConfirm("Channel added", syncSummary', editor)
         self.assertIn('bridgeCall("sync_one_channel"', editor)
         refresh = editor[editor.index("async function refreshSubsTable"):]
         self.assertIn("window._primeBrowse(data[0]);", refresh)

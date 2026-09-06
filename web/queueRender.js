@@ -193,6 +193,7 @@
       // Whitelist status → a fixed class; never interpolate a raw backend
       // string into class/innerHTML below (defense-in-depth, audit r2).
       const _rawStatus = t.status || "queued";
+      const cancelling = !!t.cancel_requested;
       const statusCls = (_rawStatus === "running" || _rawStatus === "paused")
         ? _rawStatus : "queued";
       row.className = `queue-task-row ${statusCls}`;
@@ -212,7 +213,8 @@
                                   "○";
 
       // Color the verb (Downloading/Transcribing/Metadata) in tag color
-      const nameHtml = colorizeTaskName(t.name || t.title || "");
+      const nameHtml = colorizeTaskName(
+        (cancelling ? "Cancelling… " : "") + (t.name || t.title || ""));
 
       // Cycling dots after the active task's name ("..."/".. "/". ") —
       // pure CSS animation via ::after content keyframes. Matches
@@ -273,6 +275,7 @@
       row.addEventListener("contextmenu", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
+        if (cancelling) return;
         const idx = _findRowIndex(queueKind, taskId);
         const api = window.pywebview?.api;
         const items = [];

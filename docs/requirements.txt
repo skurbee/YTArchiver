@@ -1,21 +1,24 @@
-# YTArchiver — Python dependencies
+# YTArchiver - loose direct runtime dependencies (convenience list)
 #
-# Main app (Python 3.13). The whisper + punctuation workers run in a
-# separate Python 3.11 venv with their own deps — see below.
+# Main app: Python 3.13. This list permits version ranges and does not
+# reproduce the release environment. For development, verification, and
+# builds, follow docs/BUILD.md and use the hash-verified profiles under
+# requirements/ (runtime.lock, build.lock, and dev.lock).
 #
-# Install:  pip install -r docs/requirements.txt
-# (run from the repo root)
+# Optional loose runtime install, from the repository root in a Python 3.13
+# environment: python -m pip install -r docs/requirements.txt
 
 pywebview>=6.2,<7
 pystray>=0.19,<0.20
 Pillow>=11,<13
 psutil>=7,<8
 
-# ─── Worker subprocesses (Python 3.11 venv, installed separately) ───
-# faster-whisper>=1.0    # GPU Whisper transcription (CUDA wheels)
-# torch                  # CUDA + ctranslate2 backend
-# transformers           # Punctuation restoration model
+# Worker subprocesses (Python 3.11, installed separately)
+# Whisper and punctuation workers use the app-managed environment and the
+# appropriate requirements/worker-cpu.lock or requirements/worker-cuda.lock.
+# Worker packages are not installed by this file or bundled into the desktop
+# runtime; the worker scripts themselves are packaged with the app.
 
-# ─── External tools (not Python packages) ───
-# yt-dlp     — install separately, must be on PATH
-# ffmpeg     — install separately, must be on PATH (provides ffprobe too)
+# External tools (not Python packages)
+# yt-dlp and ffmpeg/ffprobe can be installed through app setup. Existing
+# compatible tools can also be resolved from the app's tool locations or PATH.

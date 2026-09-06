@@ -68,6 +68,7 @@ datas = [
     # punct_worker.py is launched by path, so PyInstaller cannot discover
     # it through static analysis. Bundle it explicitly.
     (str(PROJECT_ROOT / 'backend' / 'punct_worker.py'), 'backend'),
+    (str(PROJECT_ROOT / 'backend' / 'punct_alignment.py'), 'backend'),
     # Reproducible optional-worker installation and distributed notices.
     (str(PROJECT_ROOT / 'requirements'), 'requirements'),
     (str(PROJECT_ROOT / 'licenses'), 'licenses'),

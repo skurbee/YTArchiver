@@ -69,8 +69,10 @@ or roll back an interrupted multi-resource change.
 | State | Owner | Storage |
 |---|---|---|
 | Configuration | `ConfigRepository` via `AppServices` | `%APPDATA%\YTArchiver\ytarchiver_config.json` |
-| Sync/GPU queues | `QueueState` + `QueueRepository` | `ytarchiver_queue.json` and `_resuming.json` |
+| Sync/GPU queues | `QueueState` + `QueueRepository` | `ytarchiver_queue.json` and `ytarchiver_queue_resuming.json` |
 | Catalog and transcript index | `index.py` + `catalog_repository.py` | `transcription_index.db` (SQLite + FTS5) |
+| Saved channel counts and sizes | `archive_scan.py` | `ytarchiver_disk_cache.json` |
+| Bookmarks and notes | `index_bookmarks.py` | `bookmarks` table in the index database; separate resource in app-state backups |
 | Metadata sidecars | metadata services + `sidecar_store.py` | hidden per-channel JSONL |
 | Transcript sidecars | transcription services + `sidecar_store.py` | hidden per-segment JSONL and visible aggregate text |
 | Thumbnails | thumbnail services | hidden `.Thumbnails` files |
@@ -83,10 +85,83 @@ corruption preservation; malformed queue files are moved aside rather than
 silently overwritten. Domain code should ask those repositories for state
 instead of opening the persistence files itself.
 
+### Queue recovery and completion
+
+Pending lists and active tasks are separate: `current_sync` and `current_gpu`
+own running work, while the resuming records preserve that work across an
+interruption. Stable `task_id` values identify the same task across queue,
+worker, and recovery transitions. Restoring a queue does not by itself start
+its worker. Once recovered work is durably returned to its lane, its old
+resuming slot must be cleared so the next launch cannot resurrect it.
+
+A full-library sync also persists an explicit checklist of required task IDs
+in `full_sync_batch`. Only successful completion of that whole checklist,
+followed by durable clearing of its current/recovery slots, can publish the
+full-sync completion time. An empty queue, a single-channel sync, cancelled
+work, or a removed task cannot stand in for a completed full-library sync.
+Pause/defer retains the task's identity and its outstanding checklist entry.
+These transitions live in [`queues.py`](../backend/queues.py); the sync
+service and [`sync_mixin.py`](../backend/api_mixins/sync_mixin.py) consume
+their results.
+
+## Startup and saved-count recovery
+
+The frontend validates the complete runtime installation status before opening
+first-time setup. Error objects and incomplete bridge replies stay on the startup
+retry path. Failed seed steps can retry after `pywebviewready`, including when
+that event arrives during the failing attempt; successful recovery clears the
+startup-data and connection warnings while retaining unrelated boot issues.
+
+[`main.py`](../main.py) runs local startup stages sequentially under one
+supervised owner. Initial checks make the UI ready to accept work; slower
+archive scans continue in the background:
+
+1. Refresh saved channel counts when the scan is stale, has never completed,
+   or has missing, malformed, or old-format records for current subscriptions.
+2. Sweep configured channel folders and additional archive roots for catalog
+   and transcript updates, yielding to foreground Browse, sync, and processing
+   work.
+3. Retry the count scan once after the sweep if foreground work interrupted
+   its first attempt. Keep the startup progress indicator alive through this
+   retry, then run subscriber-count backfill.
+
+A cancelled/deferred count scan does not publish its partial walk. Successful
+counts are merged into the latest cache, preserving newer per-channel results
+and subscriber metadata. The global freshness timestamp advances only after
+publication succeeds and coverage of the current subscriptions is complete.
+The scan's age alone is never proof of completeness. Auto-sync and trash
+retention receive separate readiness signals from startup checks and indexing.
+
+### Count scopes
+
+Health exposes several related measurements; they must not be substituted for
+one another:
+
+| Measurement | Source and scope |
+|---|---|
+| Videos in catalog | `archive_scan.index_db_stats()` counts available logical videos across the catalog, selecting one canonical media copy per identity. |
+| Saved channel scan | `archive_scan.index_summary()` totals usable saved records for current subscription URLs, excluding orphan cache entries. It reports `scan_complete`, `scanned_channels`, and `total_channels`. |
+| Files in saved scan | Physical files in those channel records; multiple copies can represent one logical video. |
+| Channel information coverage | `get_channel_metadata_status()` combines subscription metadata with catalog ID/transcript coverage restricted to current channel keys and the main archive. |
+
+`cache_coverage()` reads saved records without scanning folders or querying
+the catalog. A valid zero-video record is complete; an absent record is not a
+zero-video channel. Duplicate subscription URLs are counted once for coverage
+and saved totals. The frontend labels partial or unknown scan coverage rather
+than presenting its subtotal as the full catalog. A failed catalog statistics
+query returns an explicit error so an unavailable count is not displayed as
+an empty library.
+
+The saved scan groups known IDs within each channel and retains unknown files
+by path. The full-catalog count groups identities across the library. Raw
+`videos`, `media_files`, or `logical_videos` row counts can include physical
+duplicates or records without available media and are not interchangeable
+with either displayed video total.
+
 ## Normalized catalog
 
-The original `videos` table is retained as the rollback contract. Patch 5
-adds a normalized projection:
+The original `videos` table is retained as the compatibility write contract.
+The normalized projection adds:
 
 ```
 legacy videos row(s)
@@ -113,13 +188,19 @@ passes. Compatibility triggers on `videos` mark identities dirty; they do not
 attempt a second write model. `CatalogConnection.commit()` reconciles those
 dirty identities in the same SQLite transaction as the legacy write.
 
-Patch 4 and earlier executables can therefore continue to read and write the
-legacy table. A later Patch 5 open detects those writes, rebuilds the affected
-normalized rows, compares them, and only then resumes normalized reads.
+Executables that use the legacy table can continue to read and write it. A
+later normalized-catalog open detects those writes, rebuilds the affected
+projection, compares it, and only then resumes normalized reads.
 
 FTS transcript segments remain in their existing tables. Normalized title and
 FTS result queries select a logical record/canonical media path so multiple
 physical copies do not duplicate user-visible results.
+
+Per-channel Browse uses a channel-scoped canonical selection. A valid copy
+must remain visible within its own channel even when the library's primary
+copy is elsewhere. The shared selection helpers are
+`canonical_videos_cte_sql()` and `channel_videos_cte_sql()` in
+[`index.py`](../backend/index.py).
 
 ## Sidecar durability
 
@@ -149,7 +230,7 @@ registration both succeeded. Existing-file, ID-less, and normal download
 paths all use this contract, so a download is not announced as committed when
 the final media or catalog registration failed.
 
-`backend/transcribe/job_execution.py` gives each transcription/compression
+`backend/transcribe/job_execution.py` gives each queued transcription/compression
 operation an explicit `WorkerOutcome`. The executor converts exceptions and
 invalid legacy return values into a known result; the owner then applies
 cancel, defer, and shutdown signals after file-changing work has stopped.
@@ -171,7 +252,8 @@ download_commit validates final non-empty media
                             `-- same transaction reconciles normalized catalog
         |
         +-- fetch metadata through durable sidecar writers
-        `-- enqueue transcription work
+        +-- eligible saved captions -> inline durable sidecar/index commit
+        `-- other transcription work -> queue processing
                             |
                             v
                  explicit WorkerOutcome
@@ -179,6 +261,99 @@ download_commit validates final non-empty media
                             +-- durable transcript/JSONL sidecars
                             `-- transcript segment ingest into SQLite/FTS5
 ```
+
+### Captions, Whisper, and Watch
+
+[`transcribe/core.py`](../backend/transcribe/core.py) can finish already-saved,
+already-punctuated native captions without loading a model or entering the
+ordinary Processing queue. It first persists a recovery marker; failures or
+unfinished follow-up compression promote the same durable task into normal
+recovery rather than losing the work.
+
+The queued transcription path normally tries saved/fetched YouTube captions
+before Whisper. [`transcribe_vtt.py`](../backend/transcribe/transcribe_vtt.py)
+distinguishes unavailable captions, cancellation, successful commits, and
+partial/failed commits. A partial caption write requires recovery; it must
+not silently fall through into a second transcript append. An explicit
+Whisper re-transcription bypasses the caption fast path. Punctuation is an
+optional shared worker, and transcript source tags distinguish Whisper, raw
+YouTube captions, and captions processed for punctuation. `no_speech` is a
+durable terminal classification, distinct from a transcribed video or a
+pending retry.
+
+Watch starts media and saved-detail loading independently of transcript
+retrieval. A slow or unavailable transcript must not block playback. The
+transcript response is checked against the current video before repainting;
+its arrival does not reload the media or reset the requested seek position.
+Caption/karaoke bindings are cleared when changing videos or showing loading
+and error states. See [`browseContent.js`](../web/browseContent.js) and
+[`watchView.js`](../web/watchView.js).
+
+The on-video overlay offers one-word, three-word, and YT-style rolling modes.
+Rolling captions retain the existing `default` preference value. A separate,
+chronologically sorted word view and cached font-measured line layout reconstruct
+the previous completed line and the current spoken prefix at any playback time.
+The fixed two-row viewport clips a transient outgoing row during smooth rolls;
+word arrivals do not restart the animation. Seeks and preference/layout changes
+refresh the view immediately, and a speech gap beyond the short hold interval
+clears the previous context. This changes presentation only, not saved transcripts.
+
+The overlay's X-small, Small, Medium, and Large steps are 6, 13, 20, and 26
+CSS pixels at a 640-by-360 player. Text, padding, row spacing, outlines, and
+scroll distances use the smaller of the player width/640 and height/360 ratios.
+Resize observation and media metadata/resize events update all modes while
+paused as well as playing; hidden or zero-sized players retain their last usable
+scale. The player box controls this scale independently of the application font
+size and encoded video resolution. Size and background choices are restored.
+Mode starts in YT Style at launch and on each Off-to-on transition, ignoring
+previously saved modes. Explicit one/three-word choices remain active through
+size changes, resizing, and video changes while enabled. Startup hydration does
+not save fallback preferences over the stored settings, and a late response is
+ignored after a user interacts with any caption control.
+
+## Metadata and authored state
+
+[`backend/metadata/`](../backend/metadata/) separates sidecar I/O, scans,
+remote fetches, views/likes and comment refreshes, and thumbnail operations.
+Reloading saved metadata status is different from contacting YouTube.
+`get_channel_metadata_status(force=True)` recounts channel files and catalog
+coverage, publishing refreshed disk counts; the UI's recount action also
+requests fresh thumbnail coverage. Remote refresh actions use their own
+queued operations and completion timestamps.
+
+Bookmarks are authored state even though their table resides in the search
+database. [`index_bookmarks.py`](../backend/index_bookmarks.py) uses the
+admitted catalog writer and an explicit transaction with bounded lock/SQL
+waits. Identical retries are deduplicated, and success is returned after
+commit. The frontend keeps a pending save visible and suppresses overlapping
+identical requests. Bookmark title/channel/note filtering happens before the
+result limit, so an older matching bookmark is not hidden merely because it
+is outside the first unfiltered page.
+
+## App-state backups and restore
+
+Manual export and scheduled backup share
+[`auto_backup.build_backup_zip()`](../backend/auto_backup.py). They save app
+state, not the downloaded media/transcript archive. Queue resources come
+from one coherent `QueueState` snapshot rather than independent reads of the
+main queue and its faster-moving resuming file. A versioned manifest records
+creation time, resource sizes/hashes, and whether the index was included.
+
+An included index uses SQLite's backup API for a consistent WAL-aware
+snapshot. The index is omitted at or above the code-level size cap; it can
+be rebuilt from archived material. Bookmarks and notes are
+always exported separately as `ytarchiver_bookmarks.json`, including when the
+large index is omitted. Scheduled backups run while the app is open, retain
+the newest four scheduled ZIPs, and do not rotate arbitrary manual exports.
+
+[`restore_coordinator.py`](../backend/services/restore_coordinator.py)
+validates and stages an archive before replacing live state, quiesces owned
+work, and uses its journal/rollback resources to recover interruption. If a
+backup has bookmarks but no index, restore seeds the authored state into a
+database whose catalog can be rebuilt. For an older backup containing neither,
+restore preserves current bookmarks after quiescing instead of discarding
+them or carrying a stale catalog into the restored configuration. A failure
+to preserve those bookmarks aborts restore before live replacement.
 
 ## Read-only integrity preview
 
@@ -194,6 +369,14 @@ records, folder overrides, activity history, and catalog migration state.
 Every finding contains a proposed next action, but `preview_only` remains true.
 Any future repair command must be a separate reviewed operation with a
 verified backup taken first.
+
+The interactive deep-check flow is a supervised background job exposed by
+`integrity_scan_start`, `integrity_scan_state`, and `integrity_scan_cancel` in
+[`diagnostics_mixin.py`](../backend/api_mixins/diagnostics_mixin.py). The UI
+polls phase, progress, elapsed time, and the eventual report; cancellation is
+cooperative between work items and during SQLite checks. Starting or polling
+this diagnostic does not apply its proposed repairs. The synchronous
+`integrity_scan_preview` endpoint remains available for compatibility.
 
 ## JS/Python bridge and frontend state
 
@@ -213,6 +396,33 @@ receiving the update. Log indicator state follows the same named-topic model.
 Long-running bridge handlers must still offload work because pywebview invokes
 Python methods on bridge worker threads. See the threading rules in
 [`../backend/api_mixins/README.md`](../backend/api_mixins/README.md).
+
+Catalog reads use frontend request generations to ignore stale results and
+separate foreground Browse/Search work from diagnostic/background lanes.
+Interactive search/transcript reads also have bounded backend lock/SQL waits;
+the slow Health aggregates use a dedicated SQLite connection so they do not
+hold the shared reader lock throughout the calculation. These mechanisms are
+not a replacement for offloading a genuinely long-running operation.
+
+## Local HTTP boundaries
+
+The pywebview bridge remains the application's primary API. Two separate
+HTTP helpers serve narrower purposes:
+
+- [`local_fileserver.py`](../backend/local_fileserver.py) serves allowlisted
+  archive media and thumbnails on a random loopback port. File requests need
+  a per-run token; canonical path checks enforce allowed roots or explicitly
+  allowed individual files, and an empty allowlist fails closed. Byte-range
+  responses let the Watch video element seek without loading the whole file.
+- [`cmd_server.py`](../backend/cmd_server.py) exposes a small companion-tool
+  command registry. It defaults to loopback; non-loopback binding requires
+  both the bind setting and an explicit LAN opt-in. Read-only status endpoints
+  and authenticated mutations are distinct: POST commands require the
+  installation token and are subject to a bounded request body.
+
+Neither helper is a general replacement for the bridge or permission to
+serve arbitrary filesystem content. Their shutdown hooks are part of app
+cleanup, alongside managed workers and registered child processes.
 
 ## Verification and release guardrails
 

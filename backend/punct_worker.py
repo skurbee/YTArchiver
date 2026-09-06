@@ -22,7 +22,11 @@ import os
 import re
 import sys
 
-from backend.punct_alignment import joined_text_and_word_ends
+if __package__:
+    from .punct_alignment import joined_text_and_word_ends
+else:
+    # This worker is launched as a standalone script by an external interpreter.
+    from punct_alignment import joined_text_and_word_ends
 
 _out = sys.stdout
 sys.stdout = io.StringIO()

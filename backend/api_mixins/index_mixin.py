@@ -188,7 +188,7 @@ class IndexMixin:
         if not folder or not os.path.isdir(folder):
             return {"ok": False, "error": "Folder not found"}
         # Containment: this is the most destructive bridge method (recursive
-        # delete of transcripts + a full FTS wipe). The `folder` arg crosses
+        # delete of transcripts + their index entries). The `folder` arg crosses
         # the JS trust boundary, so refuse anything outside the archive roots
         # this app manages — incl. tp_archive_roots (audit r2).
         from backend.utils import is_within_managed_roots
@@ -255,21 +255,22 @@ class IndexMixin:
                             log_stream.flush()
                     except Exception:
                         errors += 1
-            # Also clear the FTS index — no point keeping ingested data that
-            # points to files we just deleted.
+            # Reconcile only actually missing transcript sources in this
+            # folder, including a partially cancelled/failed deletion pass.
+            index_cleared = False
             try:
-                conn = None if cancel.is_set() else index_backend._open()
-                if conn is not None:
-                    with index_backend._db_lock:
-                        conn.execute("DELETE FROM segments")
-                        conn.execute("DELETE FROM indexed_files")
-                        conn.execute("UPDATE videos SET tx_status='pending'")
-                        conn.commit()
+                result = index_backend.clear_missing_transcripts_under_root(folder)
+                index_cleared = bool(result.get("ok"))
+                if not index_cleared:
+                    errors += 1
+                    log_stream.emit_error(result.get("error") or "Index cleanup failed")
             except Exception as e:
+                errors += 1
                 _log.debug("swallowed: %s", e)
             log_stream.emit_text(
                 f"\u2014 Deleted {deleted} transcript file(s), {errors} errors. "
-                "Search index cleared.",
+                + ("Search entries updated for this folder." if index_cleared
+                   else "Search cleanup needs a retry."),
                 "simpleline_red")
             log_stream.flush()
             try:

@@ -58,7 +58,7 @@
           <span class="deferred-id"></span>
           <span class="deferred-title"></span>
           <button data-ignore class="deferred-ignore"
-                  title="Never try this video again">Ignore</button>
+                  title="Hide this reminder permanently; future syncs can still download the video">Hide reminder</button>
           <button data-drop title="Forget this one for now (may reappear on next sync)">&times;</button>
         `;
         row.querySelector(".deferred-id").textContent = it.video_id;
@@ -81,9 +81,9 @@
             ? it.title.slice(0, 80)
             : `(no title)  ${it.video_id}`;
           const ok = await window.askQuestion?.({
-            title: "Ignore this video?",
-            message: `Permanently skip "${_name}"? Future sync passes will not re-defer it.`,
-            confirm: "Ignore",
+            title: "Hide this reminder permanently?",
+            message: `Hide the reminder for "${_name}"? Future syncs can still download the video when it becomes available.`,
+            confirm: "Hide reminder",
             cancel: "Keep",
             danger: true,
           });
@@ -95,7 +95,7 @@
                 result?.error || "Couldn't ignore video.", "error");
               return;
             }
-            window._showToast?.("Ignored. Won't appear again.", "ok");
+            window._showToast?.("Reminder hidden permanently.", "ok");
             refreshDeferredLivestreams();
           } catch (e) {
             window._showToast?.("Couldn't ignore video: " + e, "error");
@@ -107,7 +107,7 @@
   }
 
   function initDeferredLivestreams() {
-    // Retry dropdown — Now kicks a sync immediately; 24h / 1 week
+    // Reminder options — Now requests a sync; 24h / 1 week
     // snooze the drawer so it stops nagging until that time.
     const retryBtn = document.getElementById("btn-deferred-retry");
     const retryMenu = document.getElementById("deferred-retry-menu");
@@ -144,7 +144,8 @@
           const result = await bridgeCall("sync_start_all");
           window._showToast?.(
             result?.ok
-              ? "Retrying deferred livestreams via Sync Subbed."
+              ? (result.started ? "Sync Subbed started."
+                : "Channels queued. Click Start in Sync Tasks to run them.")
               : (result?.error || "Sync Subbed did not start."),
             result?.ok ? "ok" : "error");
         } else if (mode === "24h") {
@@ -153,7 +154,7 @@
             : { ok: false, error: "YTArchiver isn't ready yet. Try again in a moment." };
           window._showToast?.(
             result?.ok
-              ? "Deferred livestreams snoozed for 24 hours."
+              ? "Reminders hidden for 24 hours. This does not schedule a download."
               : (result?.error || "Could not snooze deferred livestreams."),
             result?.ok ? "ok" : "error");
           if (result?.ok) refreshDeferredLivestreams();
@@ -163,7 +164,7 @@
             : { ok: false, error: "YTArchiver isn't ready yet. Try again in a moment." };
           window._showToast?.(
             result?.ok
-              ? "Deferred livestreams snoozed for 1 week."
+              ? "Reminders hidden for 1 week. This does not schedule a download."
               : (result?.error || "Could not snooze deferred livestreams."),
             result?.ok ? "ok" : "error");
           if (result?.ok) refreshDeferredLivestreams();

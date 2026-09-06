@@ -15,7 +15,7 @@
     const tbody = document.getElementById("subs-table-body");
     if (!tbody) return;
     window._subsAllRows = rows || [];
-    _renderSubsFiltered(window._subsAllRows);
+    window._applySubsFilter(document.getElementById("subs-filter")?.value || "");
 
     const totalEl = document.getElementById("subs-total-size");
     if (totalEl && totalLabel) totalEl.textContent = totalLabel;

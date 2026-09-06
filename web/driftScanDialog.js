@@ -49,9 +49,10 @@
         String(s).replace(/[&<>"']/g, c => (
           {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])));
 
-      const _loadChannels = async () => {
+      const _loadChannels = async (generation) => {
         try {
           const channels = await window.YT?.util?.loadSubsChannels?.() || [];
+          if (generation !== _scanGeneration) return;
           chanSel.innerHTML = "";
           for (const ch of channels) {
             const nm = ch.displayName || ch.folder || ch.name || "";
@@ -71,6 +72,7 @@
             chanSel.appendChild(opt);
           }
         } catch (e) {
+          if (generation !== _scanGeneration) return;
           console.warn("drift: failed to load channels", e);
           window._showToast?.(`Could not load channels: ${e}`, "warn");
         }
@@ -253,6 +255,7 @@
 
       const _fix = async () => {
         if (!_lastScan?.ok) return;
+        const generation = _scanGeneration;
         // Use the identity FROM _lastScan, not chanSel.value — the
         // user could have changed the dropdown between Scan and Fix,
         // and we want to fix what we just scanned (audit:
@@ -277,7 +280,7 @@
               + (ftsIssues > 0 ? `, then rebuild the search index. ` : `. `)
               + `Proceed?`,
             "Fix all");
-          if (!ok) return;
+          if (!ok || generation !== _scanGeneration) return;
         }
         fixBtn.disabled = true;
         scanBtn.disabled = true;
@@ -291,10 +294,12 @@
             return;
           }
           let res = await bridgeCall("drift_apply_channel", identity);
+          if (generation !== _scanGeneration) return;
           if (res?.pending && res?.token) {
             res = await _pollUntilDone(
               res, (t) => bridgeCall("drift_apply_channel_poll", t), 10 * 60 * 1000);
           }
+          if (generation !== _scanGeneration) return;
           if (!res?.ok) {
             body.innerHTML = `<div class="browse-empty askq-empty-padded askq-empty-danger">`
               + `${escapeHtml(res?.error || "Fix failed.")}</div>`;
@@ -316,16 +321,21 @@
             + `</div>`;
           window._showToast?.(`Transcript fixes applied: ${parts.join(" · ")}.`, "ok");
         } catch (e) {
+          if (generation !== _scanGeneration) return;
           body.innerHTML = `<div class="browse-empty askq-empty-padded askq-empty-danger">`
             + `${escapeHtml(String(e))}</div>`;
         } finally {
-          scanBtn.disabled = false;
-          chanSel.disabled = false;
-          chanSel._ytddRepaint?.();
+          if (generation === _scanGeneration) {
+            scanBtn.disabled = false;
+            chanSel.disabled = false;
+            chanSel._ytddRepaint?.();
+          }
         }
       };
 
       const _open = async () => {
+        const generation = ++_scanGeneration;
+        _scanInFlight = false;
         chanSel.disabled = false;
         scanBtn.disabled = false;
         chanSel._ytddRepaint?.();
@@ -334,7 +344,8 @@
         if (summary) summary.textContent = "";
         fixBtn.disabled = true;
         _lastScan = null;
-        await _loadChannels();
+        await _loadChannels(generation);
+        if (generation !== _scanGeneration) return;
         body.innerHTML = `<div class="browse-empty askq-empty-padded">`
           + `Pick a channel and click Scan.</div>`;
       };

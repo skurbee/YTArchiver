@@ -36,11 +36,13 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import threading
 import time
 import zipfile
 from datetime import datetime
+from pathlib import Path
 
 from .activity_history import ACTIVITY_HISTORY_FILE
 from .log import get_logger, swallow
@@ -75,6 +77,76 @@ _LEGACY_ROTATED_BACKUP_RE = re.compile(
     r"^ytarchiver_backup_\d{4}-\d{2}-\d{2}_\d{6}(?:\.\d+)?\.zip$")
 
 BACKUP_MANIFEST_NAME = "ytarchiver_backup_manifest.json"
+BOOKMARK_BACKUP_NAME = "ytarchiver_bookmarks.json"
+BOOKMARK_COLUMNS = ("id", "segment_id", "video_id", "title", "channel",
+                    "start_time", "text", "note", "created")
+BOOKMARK_SCHEMA = """CREATE TABLE bookmarks (
+    id INTEGER PRIMARY KEY, segment_id INTEGER, video_id TEXT, title TEXT,
+    channel TEXT, start_time REAL, text TEXT, note TEXT DEFAULT '',
+    created REAL DEFAULT (strftime('%s','now')),
+    FOREIGN KEY (segment_id) REFERENCES segments(id) ON DELETE SET NULL
+)"""
+
+
+def read_bookmark_backup(database_path) -> dict:
+    """Read user-authored state independently of the rebuildable search data."""
+    path = Path(database_path)
+    if not path.exists():
+        return {"version": 1, "bookmarks": []}
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+    try:
+        connection.row_factory = sqlite3.Row
+        if not connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bookmarks'").fetchone():
+            return {"version": 1, "bookmarks": []}
+        rows = connection.execute("SELECT * FROM bookmarks ORDER BY id").fetchall()
+        payload = {"version": 1, "bookmarks": [
+            {key: row[key] if key in row.keys() else None for key in BOOKMARK_COLUMNS}
+            for row in rows
+        ]}
+        validate_bookmark_backup(payload)
+        return payload
+    finally:
+        connection.close()
+
+
+def validate_bookmark_backup(payload) -> None:
+    """Reject malformed bookmark resources before any restore mutation."""
+    import math
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError("Unsupported bookmark backup version")
+    rows = payload.get("bookmarks")
+    if not isinstance(rows, list):
+        raise ValueError("Bookmark backup must contain a bookmarks list")
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != set(BOOKMARK_COLUMNS):
+            raise ValueError("Invalid bookmark record fields")
+        identity = row["id"]
+        if type(identity) is not int or identity <= 0 or identity in seen:
+            raise ValueError("Invalid or duplicate bookmark ID")
+        seen.add(identity)
+        for value in row.values():
+            if value is not None and not isinstance(value, (str, int, float)):
+                raise ValueError("Invalid bookmark value")
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError("Non-finite bookmark value")
+
+
+def write_bookmark_database(path, payload) -> None:
+    """Create a staged index seed with intact notes and no stale segment links."""
+    validate_bookmark_backup(payload)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(BOOKMARK_SCHEMA)
+        connection.executemany(
+            "INSERT INTO bookmarks (" + ",".join(BOOKMARK_COLUMNS) + ") VALUES (?,?,?,?,?,?,?,?,?)",
+            [tuple(None if key == "segment_id" else row[key] for key in BOOKMARK_COLUMNS)
+             for row in payload["bookmarks"]],
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 # FTS index DB rides along only when small enough for ZIP deflate to
 # stay reasonable (see backup_mixin's original rationale).
@@ -221,14 +293,15 @@ def build_backup_zip(out_path: str, *, queue_state=None,
                     f"The search index was not included because it is larger "
                     f"than 2 GB ({fts_size / (1024**3):.1f} GB). It can be "
                     f"rebuilt from saved transcripts after a restore.")
-    except OSError:
-        pass
+    except OSError as exc:
+        raise RuntimeError("Could not inspect the database for bookmark backup") from exc
 
     n = 0
     resources: dict[str, dict[str, int | str]] = {}
     tmp_path = out_path + ".tmp"
     try:
         with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            bookmark_payload = None
             for arcname, p in entries:
                 _raise_if_cancelled(cancel_event)
                 if arcname in queue_resources:
@@ -277,17 +350,26 @@ def build_backup_zip(out_path: str, *, queue_state=None,
                         )
                     )
                     n += 1
+                    bookmark_payload = read_bookmark_backup(_snap)
                 finally:
                     try: os.remove(_snap)
                     except OSError: pass
+            if bookmark_payload is None:
+                bookmark_payload = read_bookmark_backup(TRANSCRIPTION_DB)
+            resources[BOOKMARK_BACKUP_NAME] = _write_zip_bytes_resource(
+                zf, json.dumps(bookmark_payload, ensure_ascii=False, allow_nan=False).encode("utf-8"),
+                BOOKMARK_BACKUP_NAME, cancel_event)
+            n += 1
             _raise_if_cancelled(cancel_event)
             zf.writestr(BACKUP_MANIFEST_NAME, json.dumps({
                 "manifest_version": 2,
                 "app": "YTArchiver",
                 "backup_type": "app-state",
+                "created_at": time.time(),
                 "fts_db_included": bool(include_fts),
                 "fts_db_size": fts_size,
                 "fts_skipped_reason": fts_skipped_reason,
+                "bookmarks_included": True,
                 "resources": resources,
             }, indent=2, sort_keys=True))
             n += 1
@@ -308,7 +390,8 @@ def build_backup_zip(out_path: str, *, queue_state=None,
         except OSError: pass
         raise
     return {"files": n, "fts_included": include_fts, "fts_size": fts_size,
-            "fts_skipped_reason": fts_skipped_reason}
+            "fts_skipped_reason": fts_skipped_reason,
+            "bookmarks_included": True, "bookmark_count": len(bookmark_payload["bookmarks"])}
 
 
 # ─── ABOUT THIS ARCHIVE.txt ────────────────────────────────────────────
@@ -529,8 +612,10 @@ def run_backup(output_dir: str, *, mark_auto: bool = True,
     try:
         with config_transaction() as cfg:
             cfg["last_backup_ts"] = now
+            cfg["last_backup_path"] = out_path
             if mark_auto:
                 cfg["last_auto_backup_ts"] = now
+                cfg["last_auto_backup_path"] = out_path
     except Exception as e:
         swallow("auto_backup ts save", e)
     return {"ok": True, "path": out_path, "files": stats["files"],

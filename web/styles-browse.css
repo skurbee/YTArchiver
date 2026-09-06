@@ -431,7 +431,7 @@
 
 /* Search */
 .search-panel { display: flex; flex-direction: column; gap: 8px; height: 100%; }
-.search-inputs { display: flex; gap: 8px; align-items: center; }
+.search-inputs { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .search-inputs .search-main-input { flex: 1 1 auto; font-size: var(--fs-md); padding: 6px 10px; }
 .search-hint-label {
   color: var(--c-dim);
@@ -466,6 +466,7 @@
 }
 .search-filters {
   display: flex; gap: 14px; align-items: center;
+  flex-wrap: wrap;
   padding: 4px 2px; font-size: var(--fs-sm);
   border-bottom: 1px solid var(--c-border);
 }
@@ -570,6 +571,15 @@
   grid-template-columns: minmax(300px, 1fr) minmax(320px, 1.3fr);
   gap: 10px;
   min-height: 0;
+}
+@media (max-width: 1000px) {
+  .search-panel { overflow-y: auto; }
+  .search-inputs .search-main-input { min-width: 0; flex-basis: 100%; }
+  .search-split {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(150px, 1fr) minmax(180px, 1fr);
+    min-height: 350px;
+  }
 }
 .search-results {
   overflow-y: auto;
@@ -1747,3 +1757,42 @@
   gap: 6px;
   flex-wrap: wrap;
 }
+
+.browse-find-wrap { position: relative; }
+.browse-find-wrap:has(.filter-clear:not([hidden])) input { padding-right: 28px; }
+.filter-clear {
+  position: absolute;
+  right: 5px;
+  border: 0;
+  background: transparent;
+  color: var(--c-text-muted);
+  cursor: pointer;
+  font-size: 18px;
+}
+.library-filter { width: 225px; max-width: 100%; min-width: 140px; }
+.search-date-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  color: var(--c-text-muted);
+}
+.search-date-filter[hidden] { display: none; }
+.search-viewer-head { flex-wrap: wrap; gap: 6px; }
+.search-viewer-head .search-viewer-title { min-width: 0; }
+.askq-input-multiline {
+  display: block;
+  box-sizing: border-box;
+  width: calc(100% - 32px);
+  margin: 0 16px 12px;
+  min-height: 100px;
+  resize: vertical;
+  font: inherit;
+  color: var(--c-text);
+  background: var(--c-bg);
+  border: 1px solid var(--c-border);
+  padding: 8px;
+}
+.bookmark-card-note { white-space: pre-wrap; overflow-wrap: anywhere; }
+#view-manual .recent-header, .bookmarks-toolbar { flex-wrap: wrap; }
+#manual-folder-label { flex: 1 1 100%; overflow-wrap: anywhere; }

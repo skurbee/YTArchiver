@@ -86,7 +86,12 @@
   }
 
   function _renderBootIssues() {
-    if (!YT.bootIssues.length || !document.body) return;
+    if (!document.body) return;
+    if (!YT.bootIssues.length) {
+      const banner = document.getElementById("boot-issue-banner");
+      if (banner) banner.hidden = true;
+      return;
+    }
     const banner = _ensureBootIssueBanner();
     const summary = banner.querySelector("#boot-issue-summary");
     if (summary) {
@@ -116,6 +121,11 @@
       window._showToast(
         "Some features did not finish loading. See the banner for details.", "warn");
     }
+  };
+
+  window._clearBootIssue = function (name) {
+    YT.bootIssues = YT.bootIssues.filter(issue => issue.name !== name);
+    _renderBootIssues();
   };
 
   // ── Ready promise ────────────────────────────────────────────────

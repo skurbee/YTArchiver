@@ -66,6 +66,7 @@ class _CaptionOutcome(StrEnum):
     UNAVAILABLE = "unavailable"
     FAILED = "failed"
     PARTIAL = "partial"
+    CANCELLED = "cancelled"
 
     def __bool__(self) -> bool:
         return self is _CaptionOutcome.SUCCESS
@@ -298,7 +299,9 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
                         from_download: bool = False,
                         allow_fetch: bool = True,
                         prepunctuated_only: bool = False,
-                        update_pending: bool = True) -> _CaptionOutcome:
+                        update_pending: bool = True,
+                        combined_override: bool | None = None,
+                        cancel_event=None) -> _CaptionOutcome:
     """If yt-dlp wrote a .en.vtt (or similar) next to the video, parse it
     into the aggregated channel Transcript.txt + hidden JSONL sidecar,
     then ingest into FTS — skip Whisper entirely.
@@ -332,6 +335,8 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     and PARTIAL are falsey. PARTIAL means at least one durable output may
     already have changed and callers must use replacement semantics on retry.
     """
+    if cancel_event is not None and cancel_event.is_set():
+        return _CaptionOutcome.CANCELLED
     base = os.path.splitext(video_path)[0]
     candidates = [
         f"{base}.en.vtt", f"{base}.en-US.vtt", f"{base}.en-GB.vtt",
@@ -401,7 +406,10 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
         return _CaptionOutcome.UNAVAILABLE
 
     # Resolve aggregated transcript paths for this channel (matches OLD layout).
-    paths = _resolve_transcript_paths(video_path, title, channel)
+    if cancel_event is not None and cancel_event.is_set():
+        return _CaptionOutcome.CANCELLED
+    paths = _resolve_transcript_paths(
+        video_path, title, channel, combined_override=combined_override)
     if paths is None:
         return _CaptionOutcome.FAILED
     txt_path, jsonl_path, _year, _month, upload_date = paths
@@ -490,6 +498,8 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
                 # Watch-view karaoke text) is punctuated consistently.
                 # Matches NEW's Whisper flow's per-segment pass.
                 for seg in segs:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return _CaptionOutcome.CANCELLED
                     t = (seg.get("t") or "").strip()
                     if t:
                         try:
@@ -502,6 +512,10 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
         except Exception as _pe:
             stream.emit_dim(f" (punctuation skipped: {_pe})")
 
+    # Cancellation is accepted until this multi-store commit begins. Once TXT
+    # commits, finish JSONL/index coherently or retain the recovery marker.
+    if cancel_event is not None and cancel_event.is_set():
+        return _CaptionOutcome.CANCELLED
     marker_path = reconciliation_marker_path(
         Path(APP_DATA_DIR) / "reconciliation",
         operation="auto-caption",

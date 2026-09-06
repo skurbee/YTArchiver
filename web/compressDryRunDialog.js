@@ -75,6 +75,9 @@
           const _hrs = Number.isFinite(Number(t.hours)) ? Number(t.hours) : 0;
           summary.textContent =
             `${_vids.toLocaleString()} videos · ${_hrs.toLocaleString()} hours`;
+          if (Number(t.unknown_videos) > 0) {
+            summary.textContent += ` · ${Number(t.unknown_videos).toLocaleString()} with unknown duration (${_fmt(t.unknown_gb)} kept at current size)`;
+          }
         }
         // Build a simple table. Per-channel rows sorted by current_gb
         // desc (matches backend query); grand total pinned at top.
@@ -109,7 +112,7 @@
           html += `<tr>`;
           html += `<td>${escapeHtml(c.name || "(unknown)")}</td>`;
           html += `<td class="cell-num">${_n(c.videos).toLocaleString()}</td>`;
-          html += `<td class="cell-num">${_n(c.hours).toLocaleString()}</td>`;
+          html += `<td class="cell-num" title="${_n(c.unknown_videos)} video(s) have unknown duration; their current size is retained in each estimate.">${_n(c.hours).toLocaleString()}${_n(c.unknown_videos) ? " *" : ""}</td>`;
           html += `<td class="cell-num">${_fmt(c.current_gb)}</td>`;
           html += `<td class="cell-num">${_fmt(c.generous_gb)}</td>`;
           html += `<td class="cell-num">${_fmt(c.average_gb)}</td>`;
@@ -119,8 +122,9 @@
         html += `</tbody></table>`;
         html += `<div class="edit-dim compress-dry-note">`
               + `Projections use MB/hour bitrate presets applied to each channel's `
-              + `total indexed duration. Videos without duration metadata are `
-              + `skipped (so real savings can be LARGER than shown).</div>`;
+              + `known duration. Videos with unknown duration keep their current size `
+              + `in every estimate; no savings are assumed for them. `
+              + `Actual compression results may differ.</div>`;
         body.innerHTML = html;
       };
       // Block backdrop-close while a compute is mid-flight so the

@@ -94,8 +94,8 @@ test("Settings uses one page with three task-based sections and unique controls"
     expect(backups).toContain(`id="${id}"`);
     expectIdOnce(`${settings}\n${health}`, id);
   }
-  expect(backups).toContain("settings, subscriptions, queues, and app history");
-  expect(backups).toContain("do not copy downloaded videos or transcripts");
+  expect(backups).toContain("settings, subscriptions, queues, app history, bookmarks, and notes");
+  expect(backups).toContain("do not copy downloaded videos or transcript files");
   expect(backups).toContain("While YTArchiver is open");
   expect(backups).toContain("Keeps the newest four");
 });

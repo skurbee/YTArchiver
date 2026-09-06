@@ -188,7 +188,7 @@
       const _meta = document.getElementById("edit-metadata");
       if (_meta) _meta.checked = true;
       const _tx = document.getElementById("edit-transcribe");
-      if (_tx) _tx.checked = false;
+      if (_tx) _tx.checked = true;
       const _res = document.getElementById("edit-resolution");
       if (_res) _res.value = "720";
       const _org = document.getElementById("edit-folder-org");
@@ -345,7 +345,8 @@
       const folder = document.getElementById("edit-folder");
       if (row) {
         row.textContent = state.message;
-        row.hidden = state.valid;
+        row.hidden = false;
+        row.classList.toggle("is-valid", state.valid);
         row.classList.toggle("is-error", state.isError);
       }
       if (state.urlInvalid) url?.setAttribute("aria-invalid", "true");
@@ -360,6 +361,7 @@
       if (row) {
         row.hidden = true;
         row.classList.remove("is-error");
+        row.classList.remove("is-valid");
       }
       document.getElementById("edit-url")?.removeAttribute("aria-invalid");
       document.getElementById("edit-folder")?.removeAttribute("aria-invalid");
@@ -572,6 +574,7 @@
     };
 
     const closePanel = () => {
+      _releaseSaveControls?.();
       // Invalidate any channel-record fetch or save callback that belongs
       // to the panel being closed. A late response must never populate or
       // close a different channel editor that the user opened meanwhile.
@@ -635,6 +638,10 @@
       "edit-date-year", "edit-date-month", "edit-date-day",
     ];
     const _checkEditChanges = () => {
+      if (_savingGeneration === _editorGeneration) {
+        update.disabled = true;
+        return;
+      }
       const snap = window._editOriginalSnapshot;
       if (!snap) {
         update.disabled = !_paintAddValidation();
@@ -857,16 +864,16 @@
           window._showToast?.(startRes?.error || "Scan failed.", "error");
           return;
         }
-        let res = startRes;
+        let res = startRes.complete === true ? startRes : null;
         if (startRes.token && startRes.started) {
           const deadline = Date.now() + 30 * 60 * 1000;
-          while (Date.now() < deadline) {
+          while (Date.now() < deadline && scanGeneration === _editorGeneration) {
             await new Promise(r => setTimeout(r, 500));
             const p = await bridgeCall("chan_scan_resolution_mismatch_poll", startRes.token);
             if (!p?.pending) { res = p; break; }
           }
           if (scanGeneration !== _editorGeneration) return;
-          if (!res || res.pending) {
+          if (!res || res.pending || (res.ok && res.complete !== true)) {
             window._showToast?.("Scan timed out.", "error");
             return;
           }
@@ -875,14 +882,21 @@
           window._showToast?.(res?.error || "Scan failed.", "error");
           return;
         }
+        if (res.complete !== true) {
+          window._showToast?.("Resolution scan did not finish. Try again.", "warn");
+          return;
+        }
         const mismatch = res.mismatch || 0;
         const total = res.total || 0;
         const scanned = Number(res.scanned ?? total) || 0;
+        const unknown = Number(res.unknown ?? (total - scanned)) || 0;
         if (mismatch === 0) {
-          if (scanned < total) {
+          if (unknown > 0) {
             window._showToast?.(
               `Checked ${scanned} of ${total} video(s); ` +
-              `${total - scanned} could not be read.`, "warn");
+              `${unknown} could not be read; their resolution is unknown.`, "warn");
+          } else if (total === 0) {
+            window._showToast?.("No video files were found to check.", "warn");
           } else {
             window._showToast?.(
               `All ${total} video(s) match ${targetLabel}.`, "ok");
@@ -895,6 +909,7 @@
           "Redownload at target resolution",
           `${mismatch} of ${scanned || total} checked video(s) in "${name}" ` +
           `have a different resolution. Redownload them at ${lab}?\n\n` +
+          (unknown ? `${unknown} additional video(s) could not be read and may also need redownloading.\n\n` : "") +
           "This scans local files, fetches the YouTube catalog, matches by ID, " +
           "downloads each video, and replaces the originals. Progress is saved — " +
           "you can cancel and resume later.",
@@ -912,7 +927,7 @@
       document.getElementById("edit-resolution").value = defs.resolution || "720";
       document.getElementById("edit-min-dur").value = defs.min_duration || "";
       document.getElementById("edit-max-dur").value = defs.max_duration || "";
-      document.getElementById("edit-transcribe").checked = !!defs.auto_transcribe;
+      document.getElementById("edit-transcribe").checked = defs.auto_transcribe !== false;
       document.getElementById("edit-metadata").checked =
         defs.auto_metadata !== false;
       document.getElementById("edit-compress").checked = !!defs.compress_enabled;
@@ -981,19 +996,9 @@
         document.getElementById("edit-min-dur")?.value ?? "").trim();
       const maximumRaw = String(
         document.getElementById("edit-max-dur")?.value ?? "").trim();
-      // A blank field on an existing channel means "leave this saved limit
-      // alone".  Omitting the key is important: JSON drops undefined values,
-      // while serializing a literal zero silently clears the setting.  In Add
-      // mode a blank is the visible no-limit value until configured defaults
-      // finish loading, so preserve the established zero fallback there.
-      if (minimumRaw || !_editingIdentity) {
-        payload.min_duration = minimumRaw
-          ? Number.parseInt(minimumRaw, 10) : 0;
-      }
-      if (maximumRaw || !_editingIdentity) {
-        payload.max_duration = maximumRaw
-          ? Number.parseInt(maximumRaw, 10) : 0;
-      }
+      // Blank is the visible no-limit state and must clear a saved limit.
+      payload.min_duration = minimumRaw ? Number.parseInt(minimumRaw, 10) : 0;
+      payload.max_duration = maximumRaw ? Number.parseInt(maximumRaw, 10) : 0;
       return payload;
     };
 
@@ -1039,9 +1044,12 @@
 
     let _editingIdentity = null;
     let _editorGeneration = 0;
+    let _savingGeneration = null;
+    let _releaseSaveControls = null;
     let _channelLoadSeq = 0;
     const _origOpenPanel = openPanel;
     const wrappedOpenPanel = (mode, channel, options = {}) => {
+      _releaseSaveControls?.();
       _editorGeneration++;
       const generation = _editorGeneration;
       presentEditorShell(mode, channel, true, options);
@@ -1069,7 +1077,7 @@
           (document.querySelector('input[name="edit-range"]:checked')?.value || "");
         const initialSignature = signature();
         bridgeCall("subs_get_defaults").then((defs) => {
-          if (generation !== _editorGeneration
+          if (generation !== _editorGeneration || _savingGeneration === generation
               || signature() !== initialSignature || !defs) return;
           applyEditorDefaults(defs);
         }).catch(() => {});
@@ -1086,6 +1094,7 @@
       // legitimate one before saving.
       const chan = { folder, url: urlGuess || "" };
       const loadSeq = ++_channelLoadSeq;
+      _releaseSaveControls?.();
       // Retire the previous editor immediately, before the asynchronous
       // channel fetch. Leaving its identity and enabled Save button in the
       // shared form made it possible to click B, still see A briefly, and
@@ -1186,10 +1195,29 @@
       // nulls it, which would otherwise make the post-await toast
       // report the wrong action ("Channel added" vs "Channel
       // updated") if the user clicked Cancel mid-flight.
-      if (update.disabled) return;
-      update.disabled = true;
+      if (update.disabled || _savingGeneration === _editorGeneration) return;
       const _savedIdentity = _editingIdentity;
       const _saveGeneration = _editorGeneration;
+      _savingGeneration = _saveGeneration;
+      // Keep the submitted form stable through the duplicate check and save.
+      // Dirty listeners cannot reopen a second save or let a successful
+      // response discard edits made after the submitted snapshot.
+      const disabledStates = Array.from(box.querySelectorAll("input, select, textarea, button"))
+        .map(element => [element, element.disabled]);
+      disabledStates.forEach(([element]) => {
+        element.disabled = true;
+        element._ytddRepaint?.();
+      });
+      box.setAttribute("aria-busy", "true");
+      _releaseSaveControls = () => {
+        disabledStates.forEach(([element, disabled]) => {
+          element.disabled = disabled;
+          element._ytddRepaint?.();
+        });
+        box.removeAttribute("aria-busy");
+        _savingGeneration = null;
+        _releaseSaveControls = null;
+      };
       try {
       const payload = collectPayload();
       const validationError = validatePayload(payload);
@@ -1288,12 +1316,24 @@
         // A newer panel owns the shared UI now; do not put an old Add flow's
         // follow-up prompt over it.
         if (!saveStillOwnsEditor) return;
+        const savedChannel = { ...payload, ...res.channel };
+        const mode = savedChannel.mode || savedChannel.range;
+        const scope = mode === "full" || mode === "all" ? "Entire channel"
+          : ["date", "fromdate"].includes(mode)
+            ? `Videos from ${savedChannel.from_date || savedChannel.date_after || payload.from_date}`
+            : "New videos only";
+        const resolution = String(savedChannel.resolution || payload.resolution);
+        const resolutionLabel = resolution === "audio" ? "Audio only"
+          : resolution === "best" ? "Best available" : `${resolution.replace(/p$/, "")}p`;
+        const syncSummary = `${addedChannelName} was added.\n\n` +
+          `Scope: ${scope}\nResolution: ${resolutionLabel}\n` +
+          `Archive folder: ${savedChannel.folder || payload.folder}\n\nSync this channel now?`;
         const syncNow = await (window.askConfirm
-          ? window.askConfirm("Channel added", "Channel added. Sync now?", {
+          ? window.askConfirm("Channel added", syncSummary, {
               confirm: "Sync now",
               cancel: "Later",
             })
-          : Promise.resolve(confirm("Channel added. Sync now?")));
+          : Promise.resolve(confirm(syncSummary)));
         if (syncNow) {
           try {
             const syncRes = await bridgeCall("sync_one_channel", {
@@ -1310,7 +1350,10 @@
       }
       } finally {
         // Do not re-enable the shared button for a different channel panel.
-        if (_saveGeneration === _editorGeneration) update.disabled = false;
+        if (_saveGeneration === _editorGeneration) {
+          _releaseSaveControls?.();
+          _checkEditChanges();
+        }
       }
     });
 

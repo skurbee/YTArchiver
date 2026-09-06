@@ -96,19 +96,19 @@
         && (a.channel || "") === (b.channel || "");
     }
 
-    function _watchActionVideo() {
+    function _watchActionVideo(quiet = false) {
       const rendered = window._watchCurrentVideo || null;
       const pending = _browseState.currentVideo || null;
       const openToken = window._watchOpenToken;
       const renderedToken = window._watchRenderedToken;
       if (rendered && pending && !_sameWatchVideo(rendered, pending)) {
-        window._showToast?.("Video is still loading - try again in a moment.", "warn");
+        if (!quiet) window._showToast?.("Video is still loading - try again in a moment.", "warn");
         return null;
       }
       if (rendered && Number.isFinite(openToken)
           && Number.isFinite(renderedToken)
           && renderedToken !== openToken) {
-        window._showToast?.("Video is still loading - try again in a moment.", "warn");
+        if (!quiet) window._showToast?.("Video is still loading - try again in a moment.", "warn");
         return null;
       }
       return rendered || pending;
@@ -261,7 +261,7 @@
       }
       try {
         const result = await _bridgeCall(
-          "video_redownload", v.video_id || "", v.title || "", pick);
+          "video_redownload", v.video_id || "", v.title || "", pick, v.filepath);
         if (result?.ok) {
           window._showToast?.(`Redownload queued at ${pick}.`, "ok");
         } else {
@@ -374,15 +374,19 @@
       _applyTxFontSize(cur + 1);
     });
 
-    // Caption overlay size + background + mode controls (persisted).
+    // Size and background are restored. Mode starts in YT Style on each
+    // launch and each Off -> on transition; explicit choices last while on.
     const _capSizeKey = "ytarchiver_caption_size";
     const _capBgKey   = "ytarchiver_caption_bg";
     const _capModeKey = "ytarchiver_caption_mode";
-    const _CAP_SIZES = new Set(["off", "small", "medium", "large"]);
+    const _CAP_SIZES = new Set(["off", "xsmall", "small", "medium", "large"]);
     const _CAP_BGS   = new Set(["translucent", "outline", "none"]);
     const _CAP_MODES = new Set(["single", "phrase3", "default"]);
-    function _applyCapSize(size) {
+    let _capPrefsEdited = false;
+    function _applyCapSize(size, { persist = true } = {}) {
       const v = _CAP_SIZES.has(size) ? size : "off";
+      const wasOn = window._captionPrefs?.size && window._captionPrefs.size !== "off";
+      if (v !== "off" && !wasOn) _applyCapMode("default", { persist });
       window.setCaptionPref?.("size", v);
       const sel = document.getElementById("watch-cap-size");
       if (sel && sel.value !== v) sel.value = v;
@@ -391,60 +395,61 @@
       const extras = document.getElementById("watch-overlay-extras");
       if (extras) extras.classList.toggle("collapsed", v === "off");
       try { localStorage.setItem(_capSizeKey, v); } catch {}
-      if (_nativeBridgeUp()) {
+      if (persist && _nativeBridgeUp()) {
         try { _bridgeCall("settings_save", { caption_overlay_size: v }); } catch {}
       }
     }
-    function _applyCapBg(bg) {
+    function _applyCapBg(bg, { persist = true } = {}) {
       const v = _CAP_BGS.has(bg) ? bg : "translucent";
       window.setCaptionPref?.("bg", v);
       const sel = document.getElementById("watch-cap-bg");
       if (sel && sel.value !== v) sel.value = v;
       try { localStorage.setItem(_capBgKey, v); } catch {}
-      if (_nativeBridgeUp()) {
+      if (persist && _nativeBridgeUp()) {
         try { _bridgeCall("settings_save", { caption_overlay_bg: v }); } catch {}
       }
     }
-    function _applyCapMode(mode) {
-      const v = _CAP_MODES.has(mode) ? mode : "single";
+    function _applyCapMode(mode, { persist = true } = {}) {
+      const v = _CAP_MODES.has(mode) ? mode : "default";
       window.setCaptionPref?.("mode", v);
       const sel = document.getElementById("watch-cap-mode");
       if (sel && sel.value !== v) sel.value = v;
       try { localStorage.setItem(_capModeKey, v); } catch {}
-      if (_nativeBridgeUp()) {
+      if (persist && _nativeBridgeUp()) {
         try { _bridgeCall("settings_save", { caption_overlay_mode: v }); } catch {}
       }
     }
+    _applyCapMode("default", { persist: false });
     try {
       const _sz = localStorage.getItem(_capSizeKey);
-      if (_sz && _CAP_SIZES.has(_sz)) _applyCapSize(_sz);
+      if (_sz && _CAP_SIZES.has(_sz)) _applyCapSize(_sz, { persist: false });
       const _bg = localStorage.getItem(_capBgKey);
-      if (_bg && _CAP_BGS.has(_bg)) _applyCapBg(_bg);
-      const _md = localStorage.getItem(_capModeKey);
-      if (_md && _CAP_MODES.has(_md)) _applyCapMode(_md);
+      if (_bg && _CAP_BGS.has(_bg)) _applyCapBg(_bg, { persist: false });
     } catch {}
     (async () => {
       try {
         if (!_nativeBridgeUp()) return;
         const s = await _bridgeCall("settings_load");
+        // Slow startup hydration must not undo newer dropdown choices.
+        if (_capPrefsEdited) return;
         if (s?.caption_overlay_size && _CAP_SIZES.has(s.caption_overlay_size)) {
-          _applyCapSize(s.caption_overlay_size);
+          _applyCapSize(s.caption_overlay_size, { persist: false });
         }
         if (s?.caption_overlay_bg && _CAP_BGS.has(s.caption_overlay_bg)) {
-          _applyCapBg(s.caption_overlay_bg);
-        }
-        if (s?.caption_overlay_mode && _CAP_MODES.has(s.caption_overlay_mode)) {
-          _applyCapMode(s.caption_overlay_mode);
+          _applyCapBg(s.caption_overlay_bg, { persist: false });
         }
       } catch {}
     })();
     document.getElementById("watch-cap-size")?.addEventListener("change", (ev) => {
+      _capPrefsEdited = true;
       _applyCapSize(ev.target.value);
     });
     document.getElementById("watch-cap-bg")?.addEventListener("change", (ev) => {
+      _capPrefsEdited = true;
       _applyCapBg(ev.target.value);
     });
     document.getElementById("watch-cap-mode")?.addEventListener("change", (ev) => {
+      _capPrefsEdited = true;
       _applyCapMode(ev.target.value);
     });
 
@@ -977,9 +982,10 @@
 
     document.getElementById("btn-bookmark-now")?.addEventListener("click", async () => {
       const _vEl = document.getElementById("watch-video");
-      let v = _watchActionVideo();
+      let v = _watchActionVideo(true);
       if (!v) {
-        window._showToast?.("No video loaded.", "warn");
+        window._showToast?.(_browseState.currentVideo
+          ? "Video is still loading - try again in a moment." : "No video loaded.", "warn");
         return;
       }
       if (!v.video_id) {
@@ -1013,7 +1019,7 @@
           }
         }
       }
-      const res = await _bridgeCall("bookmark_add", {
+      const res = await window._saveBookmark({
         video_id: v.video_id || "",
         title: v.title || "",
         channel: v.channel || "",
@@ -1021,6 +1027,7 @@
         text: text.slice(0, 200),
         note: "",
       });
+      if (res?.pending) return;
       if (res?.ok) {
         window._showToast?.(
           kind === "yes"

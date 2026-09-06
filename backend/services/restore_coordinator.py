@@ -24,7 +24,14 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from backend.activity_history import ACTIVITY_HISTORY_FILE
-from backend.auto_backup import BACKUP_MANIFEST_NAME, backup_file_entries
+from backend.auto_backup import (
+    BACKUP_MANIFEST_NAME,
+    BOOKMARK_BACKUP_NAME,
+    backup_file_entries,
+    read_bookmark_backup,
+    validate_bookmark_backup,
+    write_bookmark_database,
+)
 from backend.services.channel_leases import (
     LeaseOwner,
     channel_leases,
@@ -57,6 +64,8 @@ class _StagedRestore:
     manifest: dict[str, Any]
     digests: dict[str, str]
     total_bytes: int
+    bookmarks_source: str = "none"
+    bookmark_count: int = 0
 
 
 class RestoreError(RuntimeError):
@@ -66,6 +75,7 @@ class RestoreError(RuntimeError):
 def _resource_targets() -> dict[str, Path]:
     targets = {str(name): Path(path) for name, path in backup_file_entries()}
     targets[TRANSCRIPTION_DB.name] = TRANSCRIPTION_DB
+    targets[BOOKMARK_BACKUP_NAME] = APP_DATA_DIR / BOOKMARK_BACKUP_NAME
     return targets
 
 
@@ -166,6 +176,8 @@ def _validate_json_resource(name: str, path: Path) -> None:
     if name == CONFIG_FILE.name:
         if not isinstance(value, dict) or not isinstance(value.get("channels", []), list):
             raise RestoreError("Restored config has an invalid channels list")
+    if name == BOOKMARK_BACKUP_NAME:
+        validate_bookmark_backup(value)
     if name.endswith("_queue.json"):
         if not isinstance(value, dict):
             raise RestoreError("Restored queue must be a JSON object")
@@ -362,6 +374,20 @@ def stage_backup(
             elif name == TRANSCRIPTION_DB.name:
                 _validate_sqlite(staged)
 
+        bookmarks_source = "none"
+        bookmark_count = 0
+        if BOOKMARK_BACKUP_NAME in included:
+            payload = json.loads(included[BOOKMARK_BACKUP_NAME].read_text(encoding="utf-8"))
+            bookmarks_source = "backup"
+            bookmark_count = len(payload["bookmarks"])
+            if TRANSCRIPTION_DB.name not in included:
+                seeded = live_dir / TRANSCRIPTION_DB.name
+                write_bookmark_database(seeded, payload)
+                included[TRANSCRIPTION_DB.name] = seeded
+        elif TRANSCRIPTION_DB.name in included:
+            payload = read_bookmark_backup(included[TRANSCRIPTION_DB.name])
+            bookmarks_source = "backup"
+            bookmark_count = len(payload["bookmarks"])
         return _StagedRestore(
             root=root,
             live_dir=live_dir,
@@ -369,6 +395,8 @@ def stage_backup(
             manifest=manifest,
             digests=digests,
             total_bytes=total_bytes,
+            bookmarks_source=bookmarks_source,
+            bookmark_count=bookmark_count,
         )
     except Exception:
         shutil.rmtree(root, ignore_errors=True)
@@ -644,7 +672,26 @@ def restore_backup(
         if not acquired.ok or acquired.lease is None:
             raise RestoreError(acquired.explanation)
         lease = acquired.lease
+        # Older backups sometimes omitted the whole index, including notes.
+        # Extract only authored state after quiescing; do not keep a stale
+        # catalog against the newly restored configuration.
+        if TRANSCRIPTION_DB.name not in stage.included:
+            try:
+                payload = read_bookmark_backup(TRANSCRIPTION_DB)
+                if payload["bookmarks"]:
+                    seeded = stage.live_dir / TRANSCRIPTION_DB.name
+                    write_bookmark_database(seeded, payload)
+                    stage.included[TRANSCRIPTION_DB.name] = seeded
+                    stage.bookmarks_source = "current_installation"
+                    stage.bookmark_count = len(payload["bookmarks"])
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                raise RestoreError(
+                    "This older backup contains no bookmarks and current bookmarks "
+                    "could not be preserved; no application state was changed: "
+                    + str(exc)) from exc
         snapshot = _snapshot_current_config()
+        bookmarks_source = stage.bookmarks_source
+        bookmark_count = stage.bookmark_count
         committed = _commit_staged(stage)
         stage = None
         return {
@@ -655,8 +702,10 @@ def restore_backup(
             "pre_restore_snapshot": snapshot,
             "needs_restart": True,
             "state_already_committed": True,
+            "bookmarks_source": bookmarks_source,
+            "bookmark_count": bookmark_count,
         }
-    except (OSError, ValueError, zipfile.BadZipFile, RestoreError) as exc:
+    except (OSError, ValueError, sqlite3.Error, zipfile.BadZipFile, RestoreError) as exc:
         result = {
             "ok": False,
             "error": str(exc),
@@ -668,5 +717,5 @@ def restore_backup(
     finally:
         if lease is not None:
             lease.release()
-        if stage is not None:
+        if stage is not None and not RESTORE_JOURNAL.exists():
             shutil.rmtree(stage.root, ignore_errors=True)

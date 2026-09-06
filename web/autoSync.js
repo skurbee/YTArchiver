@@ -135,6 +135,8 @@
           label: st.label,
           mins: st.mins,
           waiting_for_sync: !!st.waiting_for_sync,
+          scheduled_sync_running: !!st.scheduled_sync_running,
+          busy_reason: st.busy_reason || "",
           seconds_remaining: st.seconds_remaining,
           mode: st.mode || "timer",
           next_fire_ts: st.next_fire_ts || null,
@@ -171,8 +173,11 @@
       if (!cd || !_anchor) { if (cd) cd.textContent = ""; return; }
       const st = _anchor;
       const enabled = st.mins !== 0;
-      if (enabled && st.waiting_for_sync) {
-        cd.textContent = "waiting for queue\u2026";
+      const futureDeadline = st.next_fire_ts && st.next_fire_ts > Date.now() / 1000;
+      if (enabled && st.waiting_for_sync && !futureDeadline) {
+        cd.textContent = st.scheduled_sync_running ? "scheduled sync running\u2026"
+          : st.busy_reason ? `waiting for ${st.busy_reason}\u2026`
+          : "waiting for current work to finish\u2026";
       } else if (st.startup_waiting) {
         cd.textContent = "waiting for startup to finish\u2026";
       } else if (st.budget_mode && st.budget_impossible) {

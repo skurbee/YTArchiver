@@ -196,6 +196,7 @@
       const gpuDeadPausedWithItems = !g.running && g.paused && g.count > 0;
       const deadPausedWithItems =
         syncDeadPausedWithItems || gpuDeadPausedWithItems;
+      const idleWithItems = !s.running && !g.running && (s.count > 0 || g.count > 0);
       try {
         if (s.trafficWaiting) {
           const wait = s.trafficWait || {};
@@ -239,7 +240,7 @@
           await checkedQueueApi(
             api, "queue_resume", "both",
             "Resumed.", "ok", "Resume failed.");
-        } else if (deadPausedWithItems) {
+        } else if (deadPausedWithItems || idleWithItems) {
           // Clear pause flags AND start the sync thread so the queue
           // actually drains. Using sync_start_all (not queue_resume)
           // because queue_resume alone just clears flags — without a
@@ -248,7 +249,7 @@
           // we DON'T enqueue a full Sync Subbed pass on resume. The
           // user's intent is "drain what's queued", not "start a
           // brand new sync of every subscribed channel".
-          if (typeof api.sync_start_all === "function") {
+          if (s.count > 0 && typeof api.sync_start_all === "function") {
             let redownloadOnly = false;
             try {
               const snap = queueStateSnapshot();
@@ -280,8 +281,13 @@
                 window._showToast?.(res?.error || "Resume failed.", "error");
               }
             }
-          } else {
+          } else if (s.count > 0) {
             window._showToast?.("Resume failed.", "error");
+          }
+          if (g.count > 0 && !g.running) {
+            await checkedQueueApi(api, "gpu_start", "gpu",
+              "Processing started — draining the queue.", "ok",
+              "Couldn't start processing.");
           }
         } else {
           await checkedQueueApi(
@@ -309,7 +315,7 @@
       const s = blinkState().sync;
       const threadAlive = s.running;
       const st = await api.queue_is_paused();
-      if (st?.sync) {
+      if (st?.sync || (!threadAlive && s.count > 0)) {
         if (!threadAlive && s.count > 0 && typeof api.sync_start_all === "function") {
           // before firing sync_start_all (which runs a
           // regular Sync Subbed pass), check whether the queue has

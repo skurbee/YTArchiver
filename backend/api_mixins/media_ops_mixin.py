@@ -1222,15 +1222,16 @@ class MediaOpsMixin:
             if not presets:
                 return {"ok": False,
                         "error": f"No compress preset for output_res={output_res!r}"}
-            # Aggregate per-channel: videos + duration + size. Duration
-            # may be NULL for older rows — treat those as 0 hours so
-            # they don't inflate projected savings (worst-case the real
-            # savings are larger than reported).
+            # Unknown-duration media keep their current bytes in projections;
+            # counting their duration as zero must not promise zero-size output.
             with _idx._reader_lock:
                 rows = rconn.execute(
                     "SELECT channel, COUNT(*), "
-                    "       COALESCE(SUM(duration_s), 0), "
-                    "       COALESCE(SUM(size_bytes), 0) "
+                    "       COALESCE(SUM(CASE WHEN duration_s > 0 THEN duration_s ELSE 0 END), 0), "
+                    "       COALESCE(SUM(size_bytes), 0), "
+                    "       SUM(CASE WHEN duration_s IS NULL OR duration_s <= 0 THEN 1 ELSE 0 END), "
+                    "       COALESCE(SUM(CASE WHEN duration_s IS NULL OR duration_s <= 0 "
+                    "THEN size_bytes ELSE 0 END), 0) "
                     "FROM videos "
                     "WHERE is_duplicate_of IS NULL "
                     "GROUP BY channel "
@@ -1244,16 +1245,21 @@ class MediaOpsMixin:
             tot_gen = 0.0
             tot_avg = 0.0
             tot_below = 0.0
-            for name, n, dur_s, bytes_ in rows:
+            tot_unknown = 0
+            tot_unknown_gb = 0.0
+            for name, n, dur_s, bytes_, unknown_n, unknown_bytes in rows:
                 hours = float(dur_s) / 3600.0 if dur_s else 0.0
                 current_gb = float(bytes_) / (1024 ** 3) if bytes_ else 0.0
+                unknown_gb = float(unknown_bytes) / (1024 ** 3)
                 # MB/hr → GB for the whole channel at each tier
-                gen_gb = (presets["Generous"] * hours) / 1024
-                avg_gb = (presets["Average"] * hours) / 1024
-                below_gb = (presets["Below Average"] * hours) / 1024
+                gen_gb = unknown_gb + (presets["Generous"] * hours) / 1024
+                avg_gb = unknown_gb + (presets["Average"] * hours) / 1024
+                below_gb = unknown_gb + (presets["Below Average"] * hours) / 1024
                 out_channels.append({
                     "name": name or "(unknown)",
                     "videos": int(n),
+                    "unknown_videos": int(unknown_n),
+                    "unknown_gb": round(unknown_gb, 1),
                     "hours": round(hours, 1),
                     "current_gb": round(current_gb, 1),
                     "generous_gb": round(gen_gb, 1),
@@ -1266,12 +1272,16 @@ class MediaOpsMixin:
                 tot_gen += gen_gb
                 tot_avg += avg_gb
                 tot_below += below_gb
+                tot_unknown += int(unknown_n)
+                tot_unknown_gb += unknown_gb
             return {
                 "ok": True,
                 "output_res": str(output_res),
                 "channels": out_channels,
                 "total": {
                     "videos": tot_videos,
+                    "unknown_videos": tot_unknown,
+                    "unknown_gb": round(tot_unknown_gb, 1),
                     "hours": round(tot_hours, 1),
                     "current_gb": round(tot_current, 1),
                     "generous_gb": round(tot_gen, 1),

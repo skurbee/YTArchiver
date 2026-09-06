@@ -106,7 +106,7 @@ test("Search preferences stay with Storage while Health keeps index maintenance"
     '.yt-dd:has(+ #settings-auto-backup) .yt-dd-trigger')).toBeVisible();
   await expect(page.locator("#settings-auto-backup")).toHaveValue("weekly");
   await expect(page.locator("#backup-auto-age-display"))
-    .toHaveText("Last automatic backup: 2 days ago");
+    .toContainText("(2d ago)");
 });
 
 test("Auto-sync keeps timing mode in Settings and only shows a needed clock picker", async ({ page }) => {

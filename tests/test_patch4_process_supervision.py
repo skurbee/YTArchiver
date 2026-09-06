@@ -465,7 +465,8 @@ def test_archive_manual_download_uses_supervisor_owner_and_timeout(
     assert supervise_kwargs["owner"] == "manual-download"
     assert supervise_kwargs["task_id"] == result["task_id"]
     assert supervise_kwargs["role"] == "download"
-    assert supervise_kwargs["timeout"] == 900
+    assert supervise_kwargs["idle_timeout"] == 900
+    assert supervise_kwargs.get("timeout") is None
     assert isinstance(supervise_kwargs["cancel_event"], threading.Event)
     assert not api.archive_single_is_running()
 

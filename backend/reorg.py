@@ -50,8 +50,8 @@ _CAPTION_LANG_RE = re.compile(
 # "01 January", "02 February", etc. and reorg must produce the same names
 # so the two apps never create sibling folders for the same month.
 # Shared with metadata.py + transcribe.py — see backend.utils.MONTH_FOLDERS.
+from .fs_safety import files_equal
 from .utils import MONTH_FOLDERS as _MONTH_FOLDERS
-from .utils import sampled_files_equal
 
 _REORG_SKIP_DIRS = ("_TEMP_COMPRESS", "_BACKLOG_TEMP", "_REDOWNLOAD_TEMP")
 
@@ -218,14 +218,24 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer,
         return True
     target_dir.mkdir(parents=True, exist_ok=True)
     dst = target_dir / video.name
+    sidecars = _sidecars_for(video)
+    has_sibling = _has_video_sibling(video)
+    # A duplicate video does not prove its transcripts/metadata are duplicates.
+    # Check the entire bundle before moving anything, preserving both versions
+    # for a visible conflict instead of silently choosing one sidecar.
+    for sidecar in sidecars:
+        destination = target_dir / sidecar.name
+        if destination.exists() and not files_equal(sidecar, destination):
+            stream.emit_error(
+                f" [conflict] different sidecar already at destination: "
+                f"{sidecar.name} — leaving both video bundles in place.")
+            return False
     if dst.exists():
         # destination collision. Before, we silently left
         # the source in place AND kept going, which for a previously-
         # interrupted reorg produced duplicate files in both folders
-        # with no dedupe. Now: if dst and src look identical
-        # (same size + mtime within 2s AND first-MB + last-MB byte
-        # content matches), assume this is a resumed reorg and remove
-        # the source as cleanup. If they differ, emit an error so the
+        # with no dedupe. If size and mtime agree, compare all bytes
+        # before removing the source as cleanup. If they differ, emit an error so the
         # user can investigate instead of silent leak.
         try:
             _s_stat = video.stat()
@@ -236,12 +246,8 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer,
             _same_meta = False
         _same = False
         if _same_meta:
-            # Content-sample compare (size + head/mid/tail 1MB windows) before
-            # treating dst as a duplicate and moving/removing the source.
-            # Shared helper so this delete path uses the SAME 3-window check as
-            # redownload's replace path \u2014 reorg previously had only head+tail
-            # (audit: sampled_files_equal).
-            _same = sampled_files_equal(str(video), str(dst))
+            # Permanent deduplication requires exact equality, not samples.
+            _same = files_equal(video, dst)
         if _same:
             # Handle sidecars FIRST (move or remove). The source video
             # is deleted LAST so that any sidecar failure mid-loop
@@ -249,11 +255,14 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer,
             # recoverable) instead of deleted while half its sidecars
             # are stranded at the source path.
             _sc_err = None
-            for _sc in _sidecars_for(video):
+            for _sc in sidecars:
                 _sc_dst = target_dir / _sc.name
                 try:
                     if _sc_dst.exists():
-                        _sc.unlink()
+                        if not has_sibling:
+                            _sc.unlink()
+                    elif has_sibling:
+                        shutil.copy2(str(_sc), str(_sc_dst))
                     else:
                         shutil.move(str(_sc), str(_sc_dst))
                 except OSError as _se:
@@ -279,8 +288,6 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer,
                 f" [conflict] different file already at destination "
                 f"for {video.name} \u2014 leaving both in place.")
             return False
-    sidecars = _sidecars_for(video)
-    has_sibling = _has_video_sibling(video)
     # Refuse cross-volume reorg moves. shutil.move falls back to
     # copy+delete across volumes, which is NOT atomic — a cancel or
     # crash between the copy and the delete leaves the file in BOTH

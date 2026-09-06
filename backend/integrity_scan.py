@@ -20,8 +20,69 @@ import sqlite3
 import time
 from collections import defaultdict
 from collections.abc import Iterable
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
+
+
+class IntegrityScanCancelled(Exception):
+    """A read-only check was stopped before producing a complete result."""
+
+
+class _ScanControl:
+    def __init__(self, cancel_event=None, progress=None):
+        self.cancel_event = cancel_event
+        self.progress = progress
+        self.started = time.monotonic()
+        self.last_report = 0.0
+        self.phase = "Reading saved app data"
+        self.completed = 0
+        self.unit = "items checked"
+        self.connections = []
+
+    def cancelled(self):
+        return bool(self.cancel_event is not None and self.cancel_event.is_set())
+
+    def check(self, advance=0, *, force=False):
+        if self.cancelled():
+            raise IntegrityScanCancelled()
+        self.completed += advance
+        if not force and self.completed % 256:
+            return
+        now = time.monotonic()
+        if self.progress and (force or now - self.last_report >= 0.25):
+            self.last_report = now
+            self.progress({"phase": self.phase, "completed": self.completed,
+                           "unit": self.unit, "elapsed_seconds": now - self.started})
+
+    def sql_progress(self):
+        # SQLite invokes this even while a single DISTINCT/join/sort has not
+        # yielded a row, so cancellation does not wait for that query to end.
+        return int(self.cancelled())
+
+    def watch_connection(self, connection):
+        connection.set_progress_handler(self.sql_progress, 10_000)
+        self.connections.append(connection)
+
+
+_CONTROL: ContextVar[_ScanControl | None] = ContextVar("integrity_scan_control", default=None)
+
+
+def _checkpoint(advance=1):
+    if control := _CONTROL.get():
+        control.check(advance)
+
+
+def _phase(label, unit="items checked"):
+    if control := _CONTROL.get():
+        control.phase, control.unit, control.completed = label, unit, 0
+        control.check(force=True)
+
+
+def _checked_rows(rows):
+    for row in rows:
+        _checkpoint()
+        yield row
 
 _MEDIA_EXTENSIONS = frozenset({
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv", ".wmv",
@@ -86,6 +147,7 @@ def _read_jsonl(path: Path) -> tuple[list[Any], list[str]]:
     try:
         with path.open("r", encoding="utf-8") as stream:
             for line_no, line in enumerate(stream, 1):
+                _checkpoint()
                 if not line.strip():
                     continue
                 try:
@@ -100,7 +162,10 @@ def _read_jsonl(path: Path) -> tuple[list[Any], list[str]]:
 def _open_database_read_only(path: Path) -> sqlite3.Connection:
     """Open one immutable snapshot without journal/WAL side effects."""
     uri = f"{path.as_uri()}?mode=ro&immutable=1"
-    return sqlite3.connect(uri, uri=True)
+    connection = sqlite3.connect(uri, uri=True)
+    if control := _CONTROL.get():
+        control.watch_connection(connection)
+    return connection
 
 
 def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
@@ -143,15 +208,22 @@ def _fts_token_signatures(
     connection.execute(
         f'CREATE VIRTUAL TABLE temp."{vocab_name}" '
         f'USING fts5vocab(main, "{fts}", instance)')
+    label = {"segments_fts": "transcript search", "videos_fts": "video title search",
+             "logical_videos_fts": "catalog title search"}.get(fts, "Search")
+    _phase(f"Checking saved {label} entries", "search entries checked")
     actual_count = 0
     actual_sum = 0
     modulus = 1 << 128
     for term, doc, _column, offset in connection.execute(
             f'SELECT term,doc,col,offset FROM temp."{vocab_name}"'):
+        _checkpoint()
         actual_count += 1
         actual_sum = (actual_sum + _token_part(term, doc, offset)) % modulus
 
     tokenizer = sqlite3.connect(":memory:")
+    if control := _CONTROL.get():
+        control.watch_connection(tokenizer)
+    _phase(f"Comparing source text for {label}", "search entries checked")
     expected_count = 0
     expected_sum = 0
     try:
@@ -162,6 +234,7 @@ def _fts_token_signatures(
         cursor = connection.execute(
             f'SELECT rowid,"{source_column}" FROM "{source}" ORDER BY rowid')
         while True:
+            _checkpoint(0)
             rows = cursor.fetchmany(batch_size)
             if not rows:
                 break
@@ -171,6 +244,7 @@ def _fts_token_signatures(
             )
             for term, doc, _column, offset in tokenizer.execute(
                     "SELECT term,doc,col,offset FROM expected_vocab"):
+                _checkpoint()
                 expected_count += 1
                 expected_sum = (
                     expected_sum + _token_part(term, doc, offset)) % modulus
@@ -213,14 +287,17 @@ def _walk_archive(
         return media_paths, transcript_sources, ids_by_path, errors
 
     try:
-        iterator = os.walk(archive_path, followlinks=False)
+        iterator = os.walk(archive_path, followlinks=False,
+                           onerror=lambda exc: errors.append(str(exc)))
         for dirpath, _dirs, filenames in iterator:
+            _checkpoint()
             folder = Path(dirpath)
             folder_channel = folder.relative_to(archive_path).parts[0] \
                 if folder != archive_path else ""
             channel = (channel_aliases or {}).get(
                 _norm_text(folder_channel), folder_channel)
             for filename in filenames:
+                _checkpoint()
                 file_path = folder / filename
                 suffix = file_path.suffix.casefold()
                 if suffix in _MEDIA_EXTENSIONS:
@@ -234,6 +311,7 @@ def _walk_archive(
                     try:
                         with file_path.open("r", encoding="utf-8") as stream:
                             for line_no, line in enumerate(stream, 1):
+                                _checkpoint()
                                 match = _TXT_HEADER_RE.match(line.rstrip("\r\n"))
                                 if match:
                                     transcript_sources["txt"].append({
@@ -254,6 +332,7 @@ def _walk_archive(
                 try:
                     with file_path.open("r", encoding="utf-8") as stream:
                         for line_no, line in enumerate(stream, 1):
+                            _checkpoint()
                             if not line.strip():
                                 continue
                             try:
@@ -303,6 +382,7 @@ def _fts_integrity(
     )
     result: dict[str, dict[str, Any]] = {}
     for category, source, source_column, fts in checks:
+        _checkpoint()
         if not _table_exists(connection, source):
             continue
         if not _table_exists(connection, fts):
@@ -323,10 +403,12 @@ def _fts_integrity(
             )
             result[fts] = {"ok": False, "source_rows": None, "indexed_rows": None}
             continue
-        source_ids = {int(row[0]) for row in connection.execute(
-            f'SELECT rowid FROM "{source}"')}
-        indexed_ids = {int(row[0]) for row in connection.execute(
-            f'SELECT id FROM "{docsize}"')}
+        label = "transcripts" if source == "segments" else "video titles"
+        _phase(f"Checking Search records for {label}", "records checked")
+        source_ids = {int(row[0]) for row in _checked_rows(connection.execute(
+            f'SELECT rowid FROM "{source}"'))}
+        indexed_ids = {int(row[0]) for row in _checked_rows(connection.execute(
+            f'SELECT id FROM "{docsize}"'))}
         missing = sorted(source_ids - indexed_ids)
         extra = sorted(indexed_ids - source_ids)
         token_error = ""
@@ -337,6 +419,7 @@ def _fts_integrity(
                 actual_tokens, expected_tokens = _fts_token_signatures(
                     connection, source, source_column, fts)
             except sqlite3.Error as exc:
+                _checkpoint(0)
                 token_error = str(exc)
         token_drift = (
             actual_tokens is not None and expected_tokens is not None
@@ -393,12 +476,13 @@ def _load_database_records(
         ]
         cursor = connection.execute(
             "SELECT " + ",".join(f'"{name}"' for name in wanted) + " FROM videos")
-        videos = [dict(zip(wanted, row, strict=True)) for row in cursor]
+        videos = [dict(zip(wanted, row, strict=True)) for row in _checked_rows(cursor)]
     segment_columns = _columns(connection, "segments")
     if {"title", "channel"}.issubset(segment_columns):
         id_expr = "video_id" if "video_id" in segment_columns else "''"
         for video_id, channel, title in connection.execute(
             f"SELECT DISTINCT {id_expr}, channel, title FROM segments"):
+            _checkpoint()
             segment_identities.add(_record_identity(video_id, channel, title))
     return videos, segment_identities
 
@@ -415,6 +499,7 @@ def _scan_transcript_agreement(
     all_identities = set().union(*by_source.values())
     mismatches = 0
     for identity in sorted(all_identities):
+        _checkpoint()
         present = sorted(name for name, rows in by_source.items() if identity in rows)
         missing = sorted(set(by_source) - set(present))
         if not missing:
@@ -456,12 +541,14 @@ def _scan_catalog_links(
 ) -> dict[str, int]:
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in videos:
+        _checkpoint()
         if video_id := _valid_video_id(row.get("video_id")):
             groups[video_id].append(row)
 
     duplicate_groups = 0
     link_issues = 0
     for video_id, rows in sorted(groups.items()):
+        _checkpoint()
         if len(rows) < 2:
             if rows[0].get("is_duplicate_of"):
                 link_issues += 1
@@ -528,9 +615,11 @@ def _scan_normalized_catalog_links(
     ).fetchall()
     groups: dict[int, list[tuple[Any, ...]]] = defaultdict(list)
     for row in rows:
+        _checkpoint()
         groups[int(row[0])].append(row)
     disagreements = 0
     for logical_id, copies in groups.items():
+        _checkpoint()
         primaries = [row for row in copies if bool(row[5])]
         canonical_row_id = copies[0][2]
         primary_matches = (
@@ -563,6 +652,7 @@ def _scan_same_title_collisions(
     groups: dict[tuple[str, str], dict[str, list[dict[str, Any]]]] = defaultdict(
         lambda: defaultdict(list))
     for row in videos:
+        _checkpoint()
         channel = _norm_text(row.get("channel"))
         title = _norm_text(row.get("title"))
         if not title:
@@ -572,6 +662,7 @@ def _scan_same_title_collisions(
         groups[(channel, title)][identity].append(row)
     collisions = 0
     for (channel, title), identities in sorted(groups.items()):
+        _checkpoint()
         meaningful = [identity for identity in identities if identity != "path:"]
         if len(meaningful) < 2:
             continue
@@ -595,6 +686,7 @@ def _parse_download_archive(path: Path) -> tuple[set[str], list[str]]:
     try:
         with path.open("r", encoding="utf-8", errors="replace") as stream:
             for line_no, line in enumerate(stream, 1):
+                _checkpoint()
                 parts = line.strip().split()
                 if len(parts) >= 2 and parts[0] == "youtube" and _valid_video_id(parts[1]):
                     video_ids.add(parts[1])
@@ -612,11 +704,13 @@ def _scan_saved_media(
 ) -> dict[str, int]:
     saved_ids = set().union(*filename_ids.values()) if filename_ids else set()
     for row in videos:
+        _checkpoint()
         if _media_exists(row.get("filepath"), archive_media):
             if video_id := _valid_video_id(row.get("video_id")):
                 saved_ids.add(video_id)
     missing_archive_ids = sorted(download_ids - saved_ids)
     for video_id in missing_archive_ids:
+        _checkpoint()
         _add_issue(
             issues, "saved_media", "download_archive_id_without_media", video_id,
             "The yt-dlp download archive marks this ID downloaded, but no saved media was found.",
@@ -626,6 +720,7 @@ def _scan_saved_media(
 
     downloaded_without_media = 0
     for row in videos:
+        _checkpoint()
         try:
             downloaded = float(row.get("downloaded_ts") or 0) > 0
         except (TypeError, ValueError):
@@ -694,7 +789,9 @@ def _scan_recovery_records(
     journal_by_key = {_task_key(row): row for row in journal_jobs if _task_key(row)}
     orphan_count = 0
     for source, rows in (("queue", queue_by_key), ("transcription journal", journal_by_key)):
+        _checkpoint()
         for key, row in sorted(rows.items()):
+            _checkpoint()
             path = str(row.get("path") or row.get("filepath") or "").strip()
             if not path or _norm_path(path) in archive_media or Path(path).is_file():
                 continue
@@ -709,6 +806,7 @@ def _scan_recovery_records(
     queue_only = sorted(set(queue_by_key) - set(journal_by_key))
     journal_only = sorted(set(journal_by_key) - set(queue_by_key))
     for key in queue_only:
+        _checkpoint()
         row = queue_by_key[key]
         if str(row.get("kind") or "transcribe").casefold() not in {
             "transcribe", "retranscribe", "punctuate", "punctuation", "compress",
@@ -720,6 +818,7 @@ def _scan_recovery_records(
             "Reconcile both recovery stores from the queue task before allowing Processing to start.",
         )
     for key in journal_only:
+        _checkpoint()
         _add_issue(
             issues, "recovery_records", "journal_only_processing_recovery", key,
             "A transcription recovery journal row has no matching persisted Processing task.",
@@ -745,6 +844,7 @@ def _channel_aliases(config: dict[str, Any]) -> dict[str, str]:
     if not isinstance(channels, list):
         return aliases
     for channel in channels:
+        _checkpoint()
         if not isinstance(channel, dict):
             continue
         name = str(channel.get("name") or channel.get("folder") or "").strip()
@@ -763,6 +863,7 @@ def _scan_folder_overrides(
     if not isinstance(channels, list):
         return count
     for index, channel in enumerate(channels):
+        _checkpoint()
         if not isinstance(channel, dict):
             continue
         name = str(channel.get("name") or channel.get("folder") or "").strip()
@@ -794,6 +895,7 @@ def _scan_folder_overrides(
 def _history_entries(values: Iterable[Any]) -> list[str]:
     result: list[str] = []
     for value in values:
+        _checkpoint()
         if isinstance(value, str) and value:
             result.append(value)
         elif isinstance(value, dict) and isinstance(value.get("entry"), str):
@@ -810,6 +912,7 @@ def _scan_activity_history(
         if isinstance(config.get("autorun_history"), list) else []
     canonical = _history_entries(activity_rows)
     for error in activity_errors:
+        _checkpoint()
         _add_issue(
             issues, "activity_history", "activity_history_parse_error",
             "activity history", error,
@@ -922,7 +1025,7 @@ def _scan_migration_state(
     return state
 
 
-def scan_integrity(
+def _scan_integrity(
     *,
     archive_path: str | os.PathLike[str] | Path,
     config_path: str | os.PathLike[str] | Path,
@@ -991,16 +1094,44 @@ def scan_integrity(
         )
     activity_rows, activity_errors = _read_jsonl(activity_file)
 
-    archive_media, transcript_sources, filename_ids, archive_errors = \
-        _walk_archive(archive, _channel_aliases(config))
-    if not archive.is_dir():
-        _add_issue(
-            issues, "inputs", "archive_unavailable", str(archive),
-            "The explicit archive root is missing or not a directory.",
-            "Correct the archive path before evaluating file-based repair proposals.",
-            severity="error",
-        )
+    candidates = [archive]
+    candidates.extend(_path(value) for value in (config.get("tp_archive_roots") or [])
+                      if isinstance(value, str) and value.strip())
+    if str(config.get("video_out_dir") or "").strip():
+        candidates.append(_path(config["video_out_dir"]))
+    roots = []
+    for candidate in sorted(set(candidates), key=lambda value: len(str(value))):
+        _checkpoint()
+        if any(candidate.is_relative_to(previous) for previous in roots):
+            continue
+        roots.append(candidate)
+    inputs["archive_roots"] = [str(root) for root in roots]
+    archive_media = set()
+    transcript_sources = {"txt": [], "jsonl": []}
+    filename_ids = {}
+    archive_errors = []
+    media_scan_complete = True
+    _phase("Reading archive files and transcript sidecars")
+    for root in roots:
+        _checkpoint()
+        media, transcripts, ids, errors = _walk_archive(root, _channel_aliases(config))
+        archive_media.update(media)
+        filename_ids.update(ids)
+        archive_errors.extend(errors)
+        for kind in transcript_sources:
+            _checkpoint()
+            transcript_sources[kind].extend(transcripts[kind])
+        if not root.is_dir():
+            media_scan_complete = False
+            _add_issue(
+                issues, "inputs", "archive_unavailable", str(root),
+                "A configured archive root is missing or not a directory.",
+                "Restore access to this folder before evaluating missing-file proposals.",
+                severity="error",
+            )
     for error in archive_errors:
+        _checkpoint()
+        media_scan_complete = False
         _add_issue(
             issues, "inputs", "archive_read_error", str(archive), error,
             "Retry the preview after archive access is restored.", severity="error",
@@ -1015,10 +1146,23 @@ def scan_integrity(
         database_error = "missing"
     else:
         try:
+            _phase("Reading video and transcript catalog", "records checked")
             connection = _open_database_read_only(database)
             videos, segment_identities = _load_database_records(connection)
+            # Manual downloads can live outside every configured root. A
+            # registered, intact physical file is still saved media.
+            for video in videos:
+                _checkpoint()
+                filepath = str(video.get("filepath") or "").strip()
+                if filepath and _norm_path(filepath) not in archive_media:
+                    try:
+                        if Path(filepath).is_file():
+                            archive_media.add(_norm_path(filepath))
+                    except OSError:
+                        pass
             fts = _fts_integrity(connection, issues)
         except sqlite3.Error as exc:
+            _checkpoint(0)
             database_error = str(exc)
     if database_error:
         _add_issue(
@@ -1028,21 +1172,27 @@ def scan_integrity(
         )
 
     try:
+        _phase("Comparing transcript files and catalog", "records checked")
         transcript_summary = _scan_transcript_agreement(
             transcript_sources, segment_identities, issues)
-        link_summary = _scan_catalog_links(videos, archive_media, issues)
+        _phase("Checking video locations and identities", "records checked")
+        link_summary = (_scan_catalog_links(videos, archive_media, issues)
+                        if media_scan_complete else {"deferred": True})
         link_summary["normalized_primary_issues"] = \
             _scan_normalized_catalog_links(connection, issues)
         collision_count = _scan_same_title_collisions(videos, issues)
         download_ids, download_errors = _parse_download_archive(download_file)
         for error in download_errors:
+            _checkpoint()
             _add_issue(
                 issues, "saved_media", "download_archive_parse_error",
                 str(download_file), error,
                 "Preserve valid IDs and rewrite malformed archive entries atomically.",
             )
-        media_summary = _scan_saved_media(
+        media_summary = (_scan_saved_media(
             videos, archive_media, filename_ids, download_ids, issues)
+            if media_scan_complete else {"deferred": True})
+        _phase("Checking saved downloads, interrupted work, and history")
         recovery_summary = _scan_recovery_records(
             queue, resuming, journal, archive_media, issues)
         folder_override_count = _scan_folder_overrides(config, archive, issues)
@@ -1054,8 +1204,10 @@ def scan_integrity(
         if connection is not None:
             connection.close()
 
+    _phase("Completing report")
     categories: dict[str, int] = defaultdict(int)
     for issue in issues:
+        _checkpoint()
         categories[issue["category"]] += 1
     return {
         "ok": not any(issue["category"] == "inputs" for issue in issues),
@@ -1086,6 +1238,38 @@ def scan_integrity(
         },
         "issues": issues,
     }
+
+
+def scan_integrity(*, cancel_event=None, progress=None, **paths) -> dict[str, Any]:
+    """Inspect explicit paths, reporting progress and accepting a stop event.
+
+    A cancelled check never reports a healthy archive or a complete list of
+    repairs. Both SQLite connections and ordinary file iteration cooperate.
+    """
+    control = _ScanControl(cancel_event, progress)
+    token = _CONTROL.set(control)
+    try:
+        control.check(force=True)
+        result = _scan_integrity(**paths)
+        control.check(force=True)
+        return result
+    except IntegrityScanCancelled:
+        return {"ok": False, "cancelled": True, "preview_only": True,
+                "repairs_applied": False, "repair_available": False,
+                "error": "Deep archive check cancelled. No files were changed; results are incomplete."}
+    except sqlite3.OperationalError:
+        if not control.cancelled():
+            raise
+        return {"ok": False, "cancelled": True, "preview_only": True,
+                "repairs_applied": False, "repair_available": False,
+                "error": "Deep archive check cancelled. No files were changed; results are incomplete."}
+    finally:
+        for connection in control.connections:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+        _CONTROL.reset(token)
 
 
 run_integrity_scan = scan_integrity

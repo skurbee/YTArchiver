@@ -24,6 +24,7 @@
 
   const PAGE = 60;
   let _sort = "newest";
+  let _query = "";
   let _offset = 0;
   let _loading = false;
   let _hasMore = true;
@@ -511,13 +512,14 @@
     const myId = ++_seq;
     if (reset) { _offset = 0; _hasMore = true; }
     const sortAtCall = _sort;
+    const queryAtCall = _query;
     const g = grid();
     const moreEl = $("manual-load-more");
     if (reset && g) {
       // Instant paint instead of a bare spinner: last-known cards (memory
       // or last session) if any, else shaped skeletons. Fresh data below
       // replaces this the moment the query returns.
-      const cached = _loadCachedPage1();
+      const cached = queryAtCall ? null : _loadCachedPage1();
       if (cached && cached.length) { _paintRows(g, cached); g.classList.add("is-refreshing"); }
       else { g.innerHTML = _skeletonHtml(8); }
     } else if (moreEl) { moreEl.hidden = false; }
@@ -525,7 +527,7 @@
     try {
       const outcome = await window.YT.bridge.catalogRead(
         "manual",
-        () => bridgeCall("list_manual_videos", sortAtCall, PAGE, pageOffset),
+        () => bridgeCall("list_manual_videos", sortAtCall, PAGE, pageOffset, queryAtCall),
         {
           label: "manual downloads",
           onStatus: (status) => _paintManualCatalogStatus(status, reset),
@@ -537,7 +539,7 @@
       _mergeEarlyBackgroundPatches(rows);
       if (reset) {
         _firstPageSig = _pageSig(rows);
-        _saveCachedPage1(rows);
+        if (!queryAtCall) _saveCachedPage1(rows);
         if (g) g.classList.remove("is-refreshing");
       }
       if (reset && g) g.innerHTML = "";
@@ -550,7 +552,8 @@
       // Update folder label
       const lbl = $("manual-folder-label");
       if (lbl && res?.folder) {
-        const n = (res.total != null) ? ` (${res.total})` : "";
+        const n = (res.total != null) ? (queryAtCall
+          ? ` (${res.total} of ${res.unfiltered_total ?? res.total})` : ` (${res.total})`) : "";
         lbl.textContent = `Manual downloads${n} — ${res.folder}`;
       }
 
@@ -561,6 +564,12 @@
               folder.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))
             }</code>.</div>`
           : '<div class="browse-empty">Set an Individual video folder in Settings &gt; Storage &amp; library to see manual downloads here.</div>';
+        if (queryAtCall) {
+          const empty = document.createElement("div");
+          empty.className = "browse-empty";
+          empty.textContent = `No manual downloads match "${queryAtCall}".`;
+          g.replaceChildren(empty);
+        }
       }
       if (res?.warning) {
         window._showToast?.(res.warning, "warn");
@@ -586,8 +595,7 @@
   }
 
   function _nearBottom(el) {
-    if (!el) return false;
-    return (el.scrollHeight - el.scrollTop - el.clientHeight) < 700;
+    return window.YT.util.nearScrollBottom(el);
   }
 
   let _scrollRaf = null;
@@ -610,6 +618,13 @@
   function wireOnce() {
     if (_wired) return;
     _wired = true;
+    let filterTimer = null;
+    $("manual-filter")?.addEventListener("input", (event) => {
+      _query = event.target.value.trim();
+      ++_seq;
+      clearTimeout(filterTimer);
+      filterTimer = setTimeout(() => loadPage(true), 200);
+    });
     $("manual-sort")?.addEventListener("change", (e) => {
       _sort = e.target.value || "newest";
       loadPage(true);
@@ -831,15 +846,16 @@
     if (!isActive() || _loading) return;
     if (!nativeBridgeUp()) return;
     const sortAtCall = _sort;
+    const queryAtCall = _query;
     try {
       const outcome = await window.YT.bridge.catalogRead(
         "manual",
-        () => bridgeCall("list_manual_videos", sortAtCall, PAGE, 0),
+        () => bridgeCall("list_manual_videos", sortAtCall, PAGE, 0, queryAtCall),
         { label: "manual downloads" });
       if (outcome.stale) return;
       const res = outcome.value;
       if (res?.error) throw new Error(res.error);
-      if (sortAtCall !== _sort || _loading) return;
+      if (sortAtCall !== _sort || queryAtCall !== _query || _loading) return;
       const rows = (res && res.rows) || [];
       const newSig = _pageSig(rows);
       if (newSig === _firstPageSig) return;
@@ -850,11 +866,21 @@
           const g = grid();
           if (g) {
             const frag = document.createDocumentFragment();
+            const existing = new Map([...g.querySelectorAll(".video-card")]
+              .map(card => [card.dataset.filepath, card]));
+            let added = 0;
             for (let i = 0; i < splitIdx; i++) {
               const c = _cardFor(rows[i]);
-              if (c) frag.appendChild(c);
+              if (c) {
+                const previous = existing.get(rows[i].filepath);
+                if (previous) previous.remove();
+                else added++;
+                existing.set(rows[i].filepath, c);
+                frag.appendChild(c);
+              }
             }
             g.insertBefore(frag, g.firstChild);
+            _offset += added;
             _firstPageSig = newSig;
             return;
           }

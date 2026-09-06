@@ -301,6 +301,9 @@
 .edit-validation-row.is-error {
   color: var(--c-log-red, #e66);
 }
+.edit-validation-row.is-valid {
+  visibility: hidden;
+}
 .edit-validation-row[hidden] {
   display: none;
 }

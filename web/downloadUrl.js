@@ -28,8 +28,12 @@
       return { ok: false, error: "YTArchiver isn't ready yet. Try again in a moment." };
     }
     try {
-      const result = await bridgeCall("archive_single_video", url, options || {});
-      if (result?.ok) return result;
+      const normalized = parseYouTubeUrl(url)?.href || String(url || "").trim();
+      const result = await bridgeCall("archive_single_video", normalized, options || {});
+      if (result?.ok) {
+        window._refreshManualDownloads?.();
+        return result;
+      }
       return {
         ok: false,
         error: result?.error || "The download could not be queued.",
@@ -115,6 +119,109 @@
   window._urlLooksLikeYouTube = (value) => !!parseYouTubeUrl(value);
   window._urlLooksLikeVideo = urlLooksLikeVideo;
 
+  function initManualDownloads() {
+    const panel = document.getElementById("panel-download");
+    const wrap = document.getElementById("manual-download-jobs");
+    const list = document.getElementById("manual-download-list");
+    if (!panel || !wrap || !list || wrap.dataset.bound) return;
+    wrap.dataset.bound = "1";
+    const rows = new Map();
+    const cancelling = new Set();
+    let timer = null;
+    let inFlight = false;
+    let generation = 0;
+    let disposed = false;
+    const active = () => !disposed && !document.hidden && !panel.hidden
+      && panel.classList.contains("active");
+    const stopTimer = () => { clearTimeout(timer); timer = null; };
+    const schedule = () => {
+      stopTimer();
+      if (active()) timer = setTimeout(refresh, 1500);
+    };
+    function render(tasks) {
+      const live = new Set();
+      for (const task of tasks) {
+        const id = String(task.task_id || "");
+        if (!id) continue;
+        live.add(id);
+        let row = rows.get(id);
+        if (!row) {
+          row = document.createElement("div");
+          row.className = "vo-row";
+          row.dataset.taskId = id;
+          const title = document.createElement("span");
+          title.className = "channel-nudge-text";
+          const button = document.createElement("button");
+          button.className = "btn btn-ghost btn-thin";
+          button.type = "button";
+          button.addEventListener("click", async () => {
+            if (cancelling.has(id)) return;
+            cancelling.add(id);
+            button.disabled = true;
+            button.textContent = "Cancelling…";
+            try {
+              const result = await bridgeCall("archive_single_cancel", id);
+              if (!result?.ok) throw new Error(result?.error || "Download could not be cancelled.");
+            } catch (error) {
+              cancelling.delete(id);
+              button.disabled = false;
+              button.textContent = "Cancel";
+              window._showToast?.(error?.message || String(error), "error");
+            }
+            refresh();
+          });
+          row.append(title, button);
+          rows.set(id, row);
+          list.appendChild(row);
+        }
+        const stopping = task.state === "cancelling" || cancelling.has(id);
+        row.firstElementChild.textContent = String(task.title || task.url || "Download");
+        row.firstElementChild.title = row.firstElementChild.textContent;
+        const button = row.lastElementChild;
+        button.disabled = stopping;
+        button.textContent = stopping ? "Cancelling…" : "Cancel";
+      }
+      for (const [id, row] of rows) {
+        if (live.has(id)) continue;
+        row.remove();
+        rows.delete(id);
+        cancelling.delete(id);
+      }
+      wrap.hidden = rows.size === 0;
+    }
+    async function refresh() {
+      stopTimer();
+      if (!active() || inFlight) return;
+      if (!nativeBridgeUp()) { schedule(); return; }
+      inFlight = true;
+      const request = generation;
+      try {
+        const result = await bridgeCall("archive_single_status");
+        if (request === generation && active() && result?.ok && Array.isArray(result.tasks)) {
+          render(result.tasks);
+        }
+      } catch (error) { console.debug("manual download status:", error); }
+      finally { inFlight = false; schedule(); }
+    }
+    const visibilityChanged = () => {
+      generation += 1;
+      stopTimer();
+      if (active()) refresh();
+    };
+    const observer = new MutationObserver(visibilityChanged);
+    observer.observe(panel, { attributes: true, attributeFilter: ["class", "hidden"] });
+    document.addEventListener("visibilitychange", visibilityChanged);
+    window.addEventListener("pagehide", () => {
+      disposed = true;
+      generation += 1;
+      stopTimer();
+      observer.disconnect();
+      document.removeEventListener("visibilitychange", visibilityChanged);
+    }, { once: true });
+    window._refreshManualDownloads = refresh;
+    refresh();
+  }
+
   function initUrlField() {
     const input = document.getElementById("url-input");
     const btn = document.getElementById("btn-download-single");
@@ -123,6 +230,7 @@
     const voPanel = document.getElementById("video-opts-panel");
     const nudgePanel = document.getElementById("channel-nudge-panel");
     if (!input || !btn) return;
+    initManualDownloads();
     // Hydrate bridge-backed defaults both now and when pywebview becomes
     // ready. The Download tab is initialized before bridge injection on a
     // normal launch, so a one-shot early return left the defaults blank.
@@ -273,7 +381,8 @@
 
     let submitInFlight = false;
     const submit = async () => {
-      const url = (input.value || "").trim();
+      const rawUrl = (input.value || "").trim();
+      const url = parseYouTubeUrl(rawUrl)?.href || rawUrl;
       if (!urlLooksLikeVideo(url)) {
         window._showToast?.("Paste a YouTube video URL first.", "warn");
         return;
@@ -310,12 +419,12 @@
           const msg = result.error || "The download could not be queued.";
           // Keep the URL available for correction/retry.  Do not overwrite an
           // even newer URL the user typed while this bridge call was pending.
-          if ((input.value || "").trim() === url) setErr(msg);
+          if ((input.value || "").trim() === rawUrl) setErr(msg);
           window._showToast?.(msg, "error");
           return;
         }
         window._showToast?.("Queued: " + url.slice(0, 60), "ok");
-        if ((input.value || "").trim() === url) {
+        if ((input.value || "").trim() === rawUrl) {
           input.value = "";
           updateBtnVisibility();
         }

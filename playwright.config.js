@@ -19,6 +19,7 @@ module.exports = defineConfig({
     // select Edge with YTARCHIVER_BROWSER_CHANNEL=msedge.
     channel: process.env.YTARCHIVER_BROWSER_CHANNEL || "chrome",
     headless: true,
+    launchOptions: { args: ["--disable-gpu"] },
     viewport: { width: 1440, height: 1000 },
     actionTimeout: 5_000,
     trace: "retain-on-failure",

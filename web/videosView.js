@@ -221,8 +221,7 @@
   }
 
   function _nearBottom(el) {
-    if (!el) return false;
-    return (el.scrollHeight - el.scrollTop - el.clientHeight) < 700;
+    return window.YT.util.nearScrollBottom(el);
   }
   // RAF-debounced scroll handler: layout reads (scrollHeight / clientHeight)
   // are batched into one rAF tick per scroll burst instead of firing on
@@ -326,11 +325,21 @@
           const g = grid();
           if (g) {
             const frag = document.createDocumentFragment();
+            const existing = new Map([...g.querySelectorAll(".video-card")]
+              .map(card => [card.dataset.filepath, card]));
+            let added = 0;
             for (let i = 0; i < splitIdx; i++) {
               const c = _cardFor(rows[i]);
-              if (c) frag.appendChild(c);
+              if (c) {
+                const previous = existing.get(rows[i].filepath);
+                if (previous) previous.remove();
+                else added++;
+                existing.set(rows[i].filepath, c);
+                frag.appendChild(c);
+              }
             }
             g.insertBefore(frag, g.firstChild);
+            _offset += added;
             _firstPageSig = newSig;
             _queueThumbnailPage(sortAtCall, 0, filterAtCall, rows.length);
             return; // done — no blank flash, scroll position preserved

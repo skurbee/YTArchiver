@@ -549,14 +549,14 @@ test.describe("YTArchiver real frontend behavior", () => {
       const payload = window.__bridgeCallsFor("subs_update_channel")[0].args[1];
       const serialized = JSON.parse(JSON.stringify(payload));
       return {
-        valueIsUndefined: payload.min_duration === undefined,
+        minimum: payload.min_duration,
         serializedHasMinimum: Object.prototype.hasOwnProperty.call(
           serialized, "min_duration"),
       };
     });
     expect(editPayloadState).toEqual({
-      valueIsUndefined: true,
-      serializedHasMinimum: false,
+      minimum: 0,
+      serializedHasMinimum: true,
     });
   });
 });

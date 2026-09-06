@@ -937,7 +937,7 @@ class SubsMixin:
             "min_duration": max(0, raw_min_secs // 60),
             "max_duration": 0,
             "auto_metadata": bool(cfg.get("default_auto_metadata", True)),
-            "auto_transcribe": bool(cfg.get("default_auto_transcribe", False)),
+            "auto_transcribe": bool(cfg.get("default_auto_transcribe", True)),
             "compress_enabled": bool(cfg.get("default_compress_enabled", False)),
             "mode": (cfg.get("default_mode") or "new"),
             "folder_org": (cfg.get("default_folder_org") or "years"),
@@ -1313,7 +1313,7 @@ class SubsMixin:
 
 
 
-    def subs_queue_all(self):
+    def subs_queue_all(self, combined=None):
         """Right-click of the "↺ Queue Pending" button — queues ALL channels
         for transcribe. Matches YTArchiver.py:5844 _queue_all_transcriptions.
 
@@ -1321,6 +1321,23 @@ class SubsMixin:
         bridge call returns immediately. Final tally toast lands via
         evaluate_js when the worker finishes.
         """
+        if combined is not None and not isinstance(combined, bool):
+            return {"ok": False, "started": False,
+                    "error": "Choose Combined or Follow organization."}
+        if combined is None:
+            from .channel_mixin import channel_transcript_layout
+            cfg = load_config() or {}
+            base = str(cfg.get("output_dir") or "").strip()
+            choices = []
+            for channel in cfg.get("channels") or []:
+                if not isinstance(channel, dict) or not channel.get("split_years"):
+                    continue
+                folder = os.path.join(base, sync_backend.channel_folder_name(channel))
+                if channel_transcript_layout(channel, folder) is None:
+                    choices.append(channel.get("name") or channel.get("folder") or "")
+            if choices:
+                return {"ok": True, "started": False, "needs_choice": True,
+                        "channels": choices, "org_label": "Year / month"}
         if not hasattr(self, "_subs_queue_walk_lock"):
             self._subs_queue_walk_lock = threading.Lock()
         with self._subs_queue_walk_lock:
@@ -1347,13 +1364,17 @@ class SubsMixin:
                 if not name:
                     continue
                 try:
-                    r = self.chan_transcribe_all(name)
+                    r = (self.chan_transcribe_all(name) if combined is None
+                         else self.chan_transcribe_all(name, combined=combined))
                     if not r or not r.get("ok"):
                         failed.append({
                             "name": name,
                             "reason": ((r or {}).get("error")
                                        or "Transcription work could not be checked."),
                         })
+                    elif r.get("needs_choice"):
+                        failed.append({"name": name,
+                                       "reason": "Choose a transcript output layout, then retry Queue All."})
                     elif r.get("queued", 0) > 0:
                         queued += 1
                 except Exception as e:
@@ -1430,7 +1451,8 @@ class SubsMixin:
         Mirrors YTArchiver.py:33700 "locate" branch of the missing-folder
         dialog. Never moves files — just updates the config pointer.
         """
-        if not identity or not new_folder_name:
+        if (not isinstance(identity, dict) or not identity
+                or not isinstance(new_folder_name, str) or not new_folder_name):
             return {"ok": False, "error": "identity + new_folder_name required"}
         cfg = load_config()
         base = (cfg.get("output_dir") or "").strip()
@@ -1465,6 +1487,18 @@ class SubsMixin:
                 return {"ok": False, "error": "identity needs a url or name"}
 
             folder_override = os.path.basename(target)
+            index = subs_backend._find_channel(cfg.get("channels") or [], identity)
+            if index is None:
+                return {"ok": False, "error": "Channel not found"}
+            original = dict(cfg["channels"][index])
+            old_folder = sync_backend.channel_folder_name(original)
+            old_path = os.path.join(base, old_folder)
+            updated = {**original, "folder_override": folder_override}
+            admission = subs_backend._mutation_lease(
+                original, updated_channel=updated, paths=(old_path, target),
+                label=f"Locate archive for {original.get('name') or old_folder}")
+            if not admission.ok or admission.lease is None:
+                return {"ok": False, "busy": True, "error": admission.explanation}
 
             def _relocate(live_cfg):
                 live_base = (live_cfg.get("output_dir") or "").strip()
@@ -1475,16 +1509,35 @@ class SubsMixin:
                         != os.path.normcase(os.path.realpath(target))):
                     raise RuntimeError(
                         "Archive root changed while relocating; try again")
-                for channel in live_cfg.get("channels", []):
-                    if ((_id_url and channel.get("url") == _id_url)
-                            or (_id_name and channel.get("name") == _id_name)):
-                        channel["folder_override"] = folder_override
-                        return True
-                return False
+                if not os.path.isdir(live_target) or not _direct_child_realpath(live_base, live_target):
+                    raise RuntimeError("The chosen archive folder changed. Choose it again.")
+                channels = live_cfg.get("channels") or []
+                live_index = subs_backend._find_channel(channels, identity)
+                if live_index is None:
+                    return False
+                channel = channels[live_index]
+                if sync_backend.channel_folder_name(channel) != old_folder:
+                    raise RuntimeError("The channel folder changed. Reload and try again.")
+                for position, other in enumerate(channels):
+                    if position == live_index or not isinstance(other, dict):
+                        continue
+                    other_path = os.path.join(live_base, sync_backend.channel_folder_name(other))
+                    if os.path.normcase(os.path.realpath(other_path)) == os.path.normcase(os.path.realpath(live_target)):
+                        raise RuntimeError(
+                            f"Another channel already uses this archive folder: {other.get('name') or other.get('folder') or 'channel'}.")
+                channel["folder_override"] = folder_override
+                return True
 
-            found, _snapshot = update_config(_relocate)
+            with admission.lease:
+                found, _snapshot = update_config(_relocate)
             if not found:
                 return {"ok": False, "error": "Channel not found"}
+            try:
+                archive_scan.invalidate_channel(original.get("url") or "")
+                from backend import index as index_backend
+                index_backend.invalidate_channel_videos(original.get("name") or old_folder)
+            except Exception as exc:
+                _log.debug("Relocated channel cache invalidation failed: %s", exc)
             self._reload_config()
             return {"ok": True, "folder_override": folder_override}
         except OSError as e:

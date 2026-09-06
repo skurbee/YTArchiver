@@ -242,7 +242,7 @@ class VideoMixin:
         return response
 
 
-    def video_redownload(self, video_id, title, resolution):
+    def video_redownload(self, video_id, title, resolution, filepath=None):
         """Re-download a single video at a new resolution. Used by the
         Watch-view "Redownload" button — previously had no backing
         backend method and the action silently failed (audit U-4).
@@ -262,7 +262,12 @@ class VideoMixin:
         res = (str(resolution or "")).strip()
         if not res:
             return {"ok": False, "error": "Missing resolution"}
-        # Look up the video's filepath + channel from the index DB.
+        selected_path = str(filepath or "").strip()
+        if selected_path and not os.path.isfile(selected_path):
+            return {"ok": False,
+                    "error": "The selected saved file no longer exists. Refresh Browse and try again."}
+        # Preserve the physical copy chosen in Browse, including nonprimary
+        # copies. A matching video ID alone does not identify that file.
         # Reader connection so this lookup doesn't queue behind writers
         # holding `_db_lock` during startup sweep / ingest.
         try:
@@ -278,13 +283,19 @@ class VideoMixin:
                         "error": "Index is still initializing — try again "
                                  "in a moment."}
             with _idx._reader_lock:
-                row = _rconn.execute(
-                    "SELECT filepath, channel FROM videos "
-                    "WHERE video_id = ? LIMIT 1",
-                    (vid,)).fetchone()
+                if selected_path:
+                    row = _rconn.execute(
+                        "SELECT filepath, channel FROM videos "
+                        "WHERE video_id = ? AND filepath = ? COLLATE NOCASE",
+                        (vid, selected_path)).fetchone()
+                else:
+                    row = _rconn.execute(
+                        "SELECT filepath, channel FROM videos "
+                        "WHERE video_id = ? AND is_duplicate_of IS NULL LIMIT 1",
+                        (vid,)).fetchone()
             if not row:
                 return {"ok": False, "error":
-                        f"Video {vid} not found in index"}
+                        "The selected saved copy no longer matches this video. Refresh Browse and try again."}
             filepath, channel_name = row[0], row[1]
         except Exception as e:
             return {"ok": False, "error": f"Lookup failed: {e}"}

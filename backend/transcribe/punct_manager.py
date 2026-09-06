@@ -80,6 +80,7 @@ class PunctuationManager:
         # callers append "+TIMEOUT" to the source tag so the user can
         # see at-a-glance why the transcript is unpunctuated.
         self.last_was_timeout: bool = False
+        self.last_error: str = ""
 
     def is_available(self) -> bool:
         return self._worker_script.exists() and (self._python311 or find_python311()) is not None
@@ -109,9 +110,22 @@ class PunctuationManager:
             env = os.environ.copy()
             self._proc = subprocess.Popen(
                 [py, str(self._worker_script)],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, bufsize=1, startupinfo=_startupinfo, env=env,
             )
+            errors: list[str] = []
+            error_proc = self._proc
+
+            def _read_errors():
+                try:
+                    for error_line in error_proc.stderr:
+                        errors.append(error_line.strip())
+                        del errors[:-20]
+                except Exception:
+                    pass
+
+            error_reader = threading.Thread(target=_read_errors, daemon=True)
+            error_reader.start()
             try:
                 from ..process_runner import PROCESS_REGISTRY
                 PROCESS_REGISTRY.register(
@@ -135,6 +149,10 @@ class PunctuationManager:
                 return False
             line = ready[0]
             if not line:
+                error_reader.join(timeout=0.2)
+                self.last_error = "Punctuation worker did not start. " + " ".join(errors)
+                self._stream.emit_error(self.last_error.strip())
+                self._stop()
                 return False
             info = json.loads(line)
             if info.get("status") != "ready":
@@ -179,7 +197,19 @@ class PunctuationManager:
                         _log.debug("punctuation kill failed: %s", kill_exc)
                 self._proc = None
 
+    def punctuate_checked(self, text: str, timeout_sec: float = 60.0) -> str:
+        """Restoration must distinguish a failed worker from unchanged text."""
+        with self._lock:
+            result = self.punctuate(text, timeout_sec=timeout_sec)
+            if self.last_error:
+                raise RuntimeError(self.last_error)
+            return result
+
     def punctuate(self, text: str, timeout_sec: float = 60.0) -> str:
+        with self._lock:
+            return self._punctuate_locked(text, timeout_sec)
+
+    def _punctuate_locked(self, text: str, timeout_sec: float) -> str:
         """Run text through the punctuation model. Returns original text on failure.
 
         timeout_sec is now actually honored. The stdout
@@ -189,6 +219,7 @@ class PunctuationManager:
         blocking readline could hang forever, wedging every subsequent
         transcription because the lock was held the whole time.
         """
+        self.last_error = ""
         if not text or len(text.split()) < 3:
             return text
         # Bug [43]: reset timeout flag at the start of each call so the
@@ -199,8 +230,10 @@ class PunctuationManager:
             with self._lock:
                 if self._proc is None or self._proc.poll() is not None:
                     if not self._start():
+                        self.last_error = self.last_error or "Punctuation worker failed to start."
                         return text
                 if self._proc is None or self._proc.stdin is None:
+                    self.last_error = "Punctuation worker is unavailable."
                     return text
                 self._proc.stdin.write(req)
                 self._proc.stdin.flush()
@@ -221,17 +254,21 @@ class PunctuationManager:
                     # closes) and treat as failed pass.
                     self._stop()
                     self.last_was_timeout = True
+                    self.last_error = "Punctuation request timed out."
                     self._stream.emit_dim(
                         f" (punctuation timed out after {timeout_sec:.0f}s)")
                     return text
                 line = (_result.get("line") or "").strip()
             if not line:
+                self.last_error = "Punctuation worker exited without a result."
                 return text
             resp = json.loads(line)
             if resp.get("status") == "ok":
                 return resp.get("text", text) or text
+            self.last_error = str(resp.get("text") or "Punctuation request failed.")
             return text
         except Exception as e:
+            self.last_error = str(e)
             self._stream.emit_dim(f" (punctuation skipped: {e})")
             # Subprocess may be wedged — kill so next call restarts cleanly.
             # Safe to call _stop() now that self._lock is an RLock.

@@ -190,14 +190,14 @@ subscriber, or has multiple independent consumers.
 ### Showing a confirm dialog
 
 ```js
-const ok = await askConfirm({
-    title: "Delete this channel?",
-    message: "All metadata stays; only the subscription is removed.",
-    confirmLabel: "Delete",
-    danger: true,
-});
+const ok = await askConfirm(
+    "Remove this channel?",
+    "Remove the subscription and keep its archived files?",
+    { confirm: "Remove" });
 if (ok) {
-    await window.pywebview.api.subs_remove({ name: channelName });
+    const res = await window.YT.bridge.bridgeCall(
+        "subs_remove_channel", { name: channelName }, false);
+    if (!res?.ok) throw new Error(res?.error || "Channel removal failed.");
 }
 ```
 
@@ -205,10 +205,10 @@ if (ok) {
 
 ```js
 try {
-    const res = await window.pywebview.api.channel_list();
-    renderRows(res);
+    const channels = await window.YT.util.loadSubsChannels();
+    renderRows(channels);
 } catch (e) {
-    console.error("channel_list failed:", e);
+    console.error("Loading channels failed:", e);
 }
 ```
 
@@ -259,7 +259,9 @@ Python tests, privacy scanning, and a verified executable build. Manual UI
 testing remains useful for visual polish, but it is no longer the only
 frontend safety net.
 
-## Known accessibility gaps
+## Shared keyboard and accessibility behavior
 
-Custom dropdowns lack ARIA labels; modals don't have focus traps.
-Acceptable for a single-user desktop tool; not for public-web use.
+Use the shared dropdown and modal helpers: they provide keyboard navigation,
+accessible roles, focus trapping and focus restoration. Stacked dialogs route
+keyboard input to the top dialog. Cover new interactions in
+`tests/frontend/browser/` and check labels and focus order when adding controls.

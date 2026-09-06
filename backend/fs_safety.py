@@ -102,6 +102,26 @@ def is_within_managed_roots(path: str) -> bool:
     return False
 
 
+def files_equal(path_a: str, path_b: str) -> bool:
+    """Compare complete files; reject read failures or concurrent changes."""
+    try:
+        with open(path_a, "rb") as left, open(path_b, "rb") as right:
+            before = (os.fstat(left.fileno()), os.fstat(right.fileno()))
+            if before[0].st_size != before[1].st_size:
+                return False
+            while True:
+                chunk = left.read(1 << 20)
+                if chunk != right.read(1 << 20):
+                    return False
+                if not chunk:
+                    break
+            after = (os.fstat(left.fileno()), os.fstat(right.fileno()))
+            return all((a.st_size, a.st_mtime_ns) == (b.st_size, b.st_mtime_ns)
+                       for a, b in zip(before, after, strict=True))
+    except (OSError, ValueError):
+        return False
+
+
 def sampled_files_equal(path_a: str, path_b: str, sample: int = 1 << 20) -> bool:
     """Best-effort 'are these the same file' check: equal size + up to three
     1MB content windows (head, mid, tail). Used before treating one file as a
@@ -112,12 +132,16 @@ def sampled_files_equal(path_a: str, path_b: str, sample: int = 1 << 20) -> bool
     of truth shared by redownload (replace) and reorg (dedup-delete) so the
     delete path isn't weaker than the replace path (audit: sampled_files_equal).
     """
+    if sample <= 0:
+        return False
     try:
         sz = os.path.getsize(path_a)
         if sz != os.path.getsize(path_b):
             return False
     except OSError:
         return False
+    if sz <= sample * 3:
+        return files_equal(path_a, path_b)
     try:
         with open(path_a, "rb") as _a, open(path_b, "rb") as _b:
             if _a.read(sample) != _b.read(sample):

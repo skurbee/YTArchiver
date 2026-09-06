@@ -65,7 +65,7 @@ A tour of the UI is on the [**wiki**](https://github.com/skurbee/YTArchiver/wiki
 
 ### UI & Workflow
 
-* **Five-tab layout** — Download, Subs, Browse, Health, Settings
+* **Four visible tabs** — Download, Browse, Health, Settings; channel management lives in Browse
 * **Health tab** — library maintenance and status in one place: Metadata, Index, and Tools dashboards and actions
 * **Settings** — a single page of real preferences (General / Performance / Appearance sections)
 * **Simple / Verbose log modes** — toggle between a readable sync view and full yt-dlp output

@@ -104,18 +104,33 @@
       }
     });
 
+    let queueAllBusy = false;
     const queueAll = async () => {
+      if (queueAllBusy) return;
       if (!nativeBridgeUp()) {
         window._showToast?.("App still starting - try again in a moment.", "warn");
         return;
       }
+      queueAllBusy = true;
       try {
         const ok = await window.askConfirm?.(
           "Queue all channels",
           "Add all channels to the transcription queue? This may take a long time for large libraries.",
           { confirm: "Queue all" });
         if (!ok) return;
-        const res = await bridgeCall("subs_queue_all");
+        let res = await bridgeCall("subs_queue_all");
+        if (res?.ok && res?.needs_choice) {
+          const pick = await window.askChoice?.({
+            title: "Transcript layout",
+            message: "Some organized channels do not have a saved transcript layout. Choose where their transcripts should be written.",
+            choices: [
+              { label: "One combined transcript per channel", value: "combined" },
+              { label: "Separate transcripts by folder", value: "folders" },
+            ],
+          });
+          if (pick !== "combined" && pick !== "folders") return;
+          res = await bridgeCall("subs_queue_all", pick === "combined");
+        }
         if (res?.ok && res?.started) {
           window._showToast?.("Checking all channels for transcription work…");
         } else {
@@ -124,6 +139,8 @@
       } catch (error) {
         window._showToast?.(
           "Queue-all check failed: " + (error?.message || error), "error");
+      } finally {
+        queueAllBusy = false;
       }
     };
     qpBtn.addEventListener("contextmenu", (event) => {

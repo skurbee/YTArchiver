@@ -56,6 +56,30 @@
     loading: false,
   };
   let _searchOpenSeq = 0;
+  let _selectedSearchResult = null;
+
+  function _paintSearchPlay(result, query) {
+    _selectedSearchResult = result ? { ...result, _query: query || "" } : null;
+    const button = document.getElementById("search-viewer-play");
+    if (!button) return;
+    button.hidden = !result;
+    button.textContent = result?._match_kind === "title"
+      ? "Open in Watch" : `Play at ${_formatTs(Number(result?.start_time) || 0)}`;
+  }
+
+  function _paintSearchDateFilter() {
+    const range = window._searchExactDateRange;
+    const wrap = document.getElementById("search-date-filter");
+    const label = document.getElementById("search-date-filter-label");
+    if (wrap) wrap.hidden = !range;
+    if (!label || !range) return;
+    const raw = String(range.label || "Selected date range");
+    const match = /^(\d{4})-(\d{2})$/.exec(raw);
+    label.textContent = match
+      ? new Date(Number(match[1]), Number(match[2]) - 1, 1)
+        .toLocaleDateString(undefined, { month: "long", year: "numeric" }) : raw;
+  }
+  window._paintSearchDateFilter = _paintSearchDateFilter;
 
   function _setSearchViewerLoading(loading) {
     _searchViewerState.loading = !!loading;
@@ -66,6 +90,7 @@
   }
 
   function _resetSearchViewerPane() {
+    _paintSearchPlay(null);
     const body = document.getElementById("search-viewer-body");
     const title = document.getElementById("search-viewer-title");
     const meta = document.getElementById("search-viewer-meta");
@@ -85,6 +110,7 @@
     const bEarly = document.getElementById("search-viewer-earlier");
     const bLater = document.getElementById("search-viewer-later");
     if (!body || !titleEl) return;
+    _paintSearchPlay(resultRow, query);
     // A title-table hit identifies a video, not a transcript segment. Asking
     // browse_search_context for an absent segment_id produces the technically
     // accurate but misleading "Segment not found" message. Keep the useful
@@ -116,7 +142,7 @@
       const message = document.createElement("div");
       message.className = "browse-empty";
       message.textContent = "No transcript available for this title match. "
-        + "Double-click to open the video.";
+        + "Choose Open in Watch to play the video.";
       body.appendChild(message);
       return;
     }
@@ -302,6 +328,9 @@
         title: res.title || snapshot.title,
         channel: res.channel || snapshot.channel,
         video_id: res.video_id || snapshot.videoId,
+        uploaded: res.upload_ts ? window._formatBrowseUploadAge?.(res.upload_ts) : "",
+        duration: res.duration || "",
+        views: res.views || "",
         tracked: res.tracked !== false,
         _seek_to: snapshot.seekTo,
         _search_query: snapshot.query,
@@ -466,6 +495,10 @@
     const btn = document.getElementById("btn-search-run");
     const results = document.getElementById("search-results");
     const counter = document.getElementById("search-count");
+    document.getElementById("search-viewer-play")?.addEventListener("click", () => {
+      const hit = _selectedSearchResult;
+      if (hit) _openResolvedSearchHit(hit, hit.start_time, hit._query);
+    });
     // Stale-response guard: each doSearch invocation bumps _searchSeq.
     // If the user types more before the API call returns, the late
     // response sees `myId !== _searchSeq` and bails — the most-recent
@@ -482,6 +515,10 @@
       _setSearchViewerLoading(false);
       _resetSearchViewerPane();
       const q = (input?.value || "").trim();
+      if (window._searchExactDateRange && window._searchExactDateRange.query !== q) {
+        window._searchExactDateRange = null;
+      }
+      _paintSearchDateFilter();
       if (!q) {
         results.innerHTML = '<div class="browse-empty">Type a query and press Search or Enter.</div>';
         counter.textContent = "\u2014";
@@ -787,6 +824,7 @@
     });
     input?.addEventListener("input", () => {
       window._searchExactDateRange = null;
+      _paintSearchDateFilter();
     });
     // Re-run on sort change so the user doesn't have to re-click Search
     // every time they pick a different ordering. Only re-runs when the
@@ -803,8 +841,15 @@
     ["search-year-from", "search-year-to"].forEach((id) => {
       document.getElementById(id)?.addEventListener("change", () => {
         window._searchExactDateRange = null;
+        _paintSearchDateFilter();
         if ((input?.value || "").trim()) doSearch();
       });
+    });
+
+    document.getElementById("search-date-filter-clear")?.addEventListener("click", () => {
+      window._searchExactDateRange = null;
+      _paintSearchDateFilter();
+      if ((input?.value || "").trim()) doSearch();
     });
 
     // FTS5 operator buttons — click-to-insert at the current cursor position
@@ -1059,6 +1104,16 @@
 
     // Expose the read function for doSearch (returns [] when "all").
     window._searchSelectedChannels = () => Array.from(selected);
+    window._setSearchSelectedChannels = (channels) => {
+      selected.clear();
+      for (const name of (channels || [])) if (name) selected.add(name);
+      list.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+        cb.checked = selected.has(cb.value);
+      });
+      updateLabel();
+      refreshAllCheckbox();
+      if (scopeShim) scopeShim.value = selected.size === 1 ? "channel" : "all";
+    };
 
     updateLabel();
     refreshAllCheckbox();

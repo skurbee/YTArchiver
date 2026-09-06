@@ -581,6 +581,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     # would make "not in bulk" flag thousands of perfectly-live videos
     # as removed from YouTube.
     _catalog_complete = bool(getattr(bulk_all, "complete", False))
+    _availability_complete = False
     if not _catalog_complete:
         try:
             stream.emit_dim(
@@ -596,6 +597,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         # Read-only state lookup â€” reader path avoids queueing behind sweep.
         _conn_rm = _idx._reader_open()
         if _catalog_complete and _conn_rm is not None:
+            _availability_complete = not _scope_year and not _scope_days
             # Normalize the folder path to the SAME canonical form that
             # videos.filepath rows were inserted with (os.path.normpath
             # in register_video). Old _like_esc(str(folder)) used the
@@ -610,14 +612,19 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
             with _idx._reader_lock:
                 for _row in _conn_rm.execute(
                         "SELECT filepath, video_id, removed_from_yt_ts "
-                        "FROM videos WHERE filepath LIKE ? ESCAPE '\\'", (_pat,)):
-                    _db_state[os.path.normpath(_row[0])] = (
+                        "FROM videos WHERE filepath LIKE ? ESCAPE '\\' "
+                        "AND channel=?", (_pat, name)):
+                    _db_state[os.path.normcase(os.path.normpath(_row[0]))] = (
                         _row[1], _row[2])
             for (_v, _t, _y, _m, _fp) in on_disk:
                 if not _v:
+                    _availability_complete = False
                     continue
-                _key = os.path.normpath(_fp)
+                _key = os.path.normcase(os.path.normpath(_fp))
                 _db_vid, _db_removed_ts = _db_state.get(_key, (None, None))
+                if _db_vid != _v:
+                    _availability_complete = False
+                    continue
                 _is_in_catalog = (_v in bulk_all)
                 if not _is_in_catalog and _db_removed_ts is None:
                     _newly_removed.append(_fp)
@@ -631,6 +638,8 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 # busy-timeout discipline. Use _open() for writes and
                 # serialize via _db_lock.
                 _conn_wr = _idx._open()
+                if _conn_wr is None:
+                    raise RuntimeError("Availability index is not writable")
                 if _conn_wr is not None:
                     with _idx._db_lock:
                         try:
@@ -642,28 +651,27 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                             # the wrong channel's video as removed
                             # (audit: refresh_views.py C14).
                             for _fp in _newly_removed:
-                                try:
-                                    _conn_wr.execute(
+                                _cursor = _conn_wr.execute(
                                         "UPDATE videos SET removed_from_yt_ts=? "
                                         "WHERE filepath=? COLLATE NOCASE "
                                         "AND channel=?",
                                         (_now_rm, _fp, name))
-                                except Exception as e:
-                                    _log.debug("swallowed: %s", e)
+                                if _cursor.rowcount != 1:
+                                    raise RuntimeError("Availability row changed during refresh")
                             for _fp in _newly_restored:
-                                try:
-                                    _conn_wr.execute(
+                                _cursor = _conn_wr.execute(
                                         "UPDATE videos SET removed_from_yt_ts=NULL "
                                         "WHERE filepath=? COLLATE NOCASE "
                                         "AND channel=?",
                                         (_fp, name))
-                                except Exception as e:
-                                    _log.debug("swallowed: %s", e)
+                                if _cursor.rowcount != 1:
+                                    raise RuntimeError("Availability row changed during refresh")
                             _conn_wr.commit()
                         except Exception as _we:
                             try: _conn_wr.rollback()
                             except Exception as e: _log.debug("swallowed: %s", e)
                             _log.error("removed_from_yt UPDATE failed: %s", _we)
+                            raise
                 if _newly_removed:
                     stream.emit([
                         [" \u26a0 ", ["meta_bracket", "views_refresh_progress"]],
@@ -679,6 +687,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                          ["simpleline", "views_refresh_progress"]],
                     ])
     except Exception as _rm_e:
+        _availability_complete = False
         try:
             stream.emit_error(
                 f"removed-from-YT detection failed for {name}: {_rm_e}")
@@ -1003,6 +1012,10 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     cancelled = bool(cancel_event is not None and cancel_event.is_set())
     if not cookie_auth_required and not rate_limited and not cancelled:
         stamp_channel_refresh(channel, "last_views_refresh_ts")
+        if _availability_complete:
+            stamp_channel_refresh(
+                channel, "last_availability_check_ts",
+                details={"availability_checked_count": len(on_disk)})
 
     # Stop the heartbeat thread BEFORE the clear_line + summary so
     # the in-place line doesn't get re-painted on top of the summary.

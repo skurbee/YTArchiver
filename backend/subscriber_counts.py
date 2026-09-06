@@ -37,14 +37,21 @@ _TRANSIENT_MARKERS = (
     "connection aborted",
     "sign in",
     "cookies",
+    "does not have a videos tab",
+    "does not have a streams tab",
 )
 
 
-def _videos_url(url: str) -> str:
-    """Normalize a configured channel URL and target its Videos tab."""
+def _channel_url(url: str) -> str:
+    """Use the channel root, which also supports streams-only channels."""
     base = normalize_channel_url(url).strip().rstrip("/")
     base = _CHANNEL_TAB_RE.sub("", base).rstrip("/")
-    return f"{base}/videos" if base else ""
+    return base
+
+
+def _excluded_for_missing_tab(record: dict[str, Any]) -> bool:
+    error = str(record.get("subscriber_fetch_last_error") or "").lower()
+    return "does not have a videos tab" in error or "does not have a streams tab" in error
 
 
 def _parse_count(stdout: str) -> int | None:
@@ -70,14 +77,14 @@ def fetch_subscriber_count(url: str, *, runner: YtDlpRunner | None = None,
                            timeout: float = 45.0) -> dict[str, Any]:
     """Fetch one channel's follower count through its configured URL.
 
-    Read the channel-level field from yt-dlp's Videos-tab result first. Some
+    Read the channel-level field from yt-dlp's channel-root result first. Some
     individual videos omit ``channel_follower_count`` even though the channel
     page exposes it, so treating the newest video's ``NA`` as a channel-level
     miss produces false failures. Fall back to the newest video's metadata for
     extractors where the channel-level field is absent. Public probes run
     first; cookies are only used when a public request itself fails.
     """
-    target = _videos_url(url)
+    target = _channel_url(url)
     if not target:
         return {"ok": False, "transient": False, "error": "missing URL"}
     runner = runner or YtDlpRunner(cookie_provider=_find_cookie_source)
@@ -162,7 +169,8 @@ def backfill_missing_counts(
         if rec.get("subscriber_count") is not None:
             continue
         failures = int(rec.get("subscriber_fetch_failures") or 0)
-        if rec.get("subscriber_fetch_excluded") or failures >= max_failures:
+        if ((rec.get("subscriber_fetch_excluded") or failures >= max_failures)
+                and not _excluded_for_missing_tab(rec)):
             continue
         eligible.append((url, channel.get("name") or channel.get("folder") or ""))
 
@@ -174,9 +182,9 @@ def backfill_missing_counts(
         current = archive_scan.load_disk_cache().get(url) or {}
         if current.get("subscriber_count") is not None:
             continue
-        if (current.get("subscriber_fetch_excluded")
+        if ((current.get("subscriber_fetch_excluded")
                 or int(current.get("subscriber_fetch_failures") or 0)
-                >= max_failures):
+                >= max_failures) and not _excluded_for_missing_tab(current)):
             continue
 
         fetched = fetch_subscriber_count(url, runner=runner)

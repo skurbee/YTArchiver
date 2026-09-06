@@ -559,9 +559,11 @@
     window._watchRenderedToken = window._watchOpenToken;
     const bookmarkButton = document.getElementById("btn-bookmark-now");
     if (bookmarkButton) {
-      const canBookmark = !!video.video_id;
+      const canBookmark = !!video.video_id && !opts?.transcriptLoading;
       bookmarkButton.disabled = !canBookmark;
-      bookmarkButton.title = canBookmark
+      bookmarkButton.title = opts?.transcriptLoading
+        ? "Bookmark is available when the transcript check finishes"
+        : canBookmark
         ? "Bookmark current segment (B)"
         : "Bookmark unavailable: this file has no YouTube ID";
     }
@@ -573,11 +575,23 @@
     try { window._syncWatchRetranscribeButton?.(); } catch {}
 
     if (!skipVideoReload) {
-      _loadVideoSource(video, vEl, ph);
+      _loadVideoSource(video, vEl, ph, opts?.playbackIntent);
       _loadWatchMetadataDrawer(video);
     }
 
     tr.innerHTML = "";
+    if (opts?.transcriptLoading || opts?.transcriptError) {
+      _unbindKaraoke();
+      vEl?._capOverlay?.classList.remove("show");
+      const note = document.createElement("div");
+      note.className = "watch-transcript-note";
+      note.setAttribute("role", "status");
+      note.textContent = opts.transcriptLoading
+        ? "Loading transcript… You can play the video while it loads."
+        : `Couldn't load transcript: ${opts.transcriptError}`;
+      tr.appendChild(note);
+      return;
+    }
     if (!transcript || transcript.length === 0) {
       _renderEmptyTranscript(tr, video, vEl);
       return;
@@ -595,10 +609,9 @@
     frag.appendChild(body);
     tr.appendChild(frag);
 
-    _bindKaraoke(vEl, tr, segEls, allWordEls, wordIndex);
-    // The on-video overlay is a pinned DOM overlay (see _ensureCapOverlay)
-    // driven by the karaoke loop above — no WebVTT cue track needed.
+    // Apply the selected font before measuring the rolling overlay's lines.
     _applyCaptionPrefs(vEl);
+    _bindKaraoke(vEl, tr, segEls, allWordEls, wordIndex);
   };
 
   /** Build the source-banner div for the Watch view transcript panel.
@@ -787,6 +800,25 @@
       return;
     }
     const meta = res.meta;
+    // Fill the same header fields even when the entry point supplied only
+    // a Search hit. Reuse the existing saved-details request and identity
+    // guard; enrichment never changes the selected file or playback time.
+    if (!video.duration && Number(meta.duration) > 0) {
+      video.duration = window._formatTs?.(Number(meta.duration)) || "";
+    }
+    if (!video.views && Number.isFinite(Number(meta.view_count)) && meta.view_count != null) {
+      video.views = Number(meta.view_count).toLocaleString(undefined,
+        { notation: "compact", maximumFractionDigits: 1 });
+    }
+    if (!video.uploaded && /^\d{8}$/.test(String(meta.upload_date || ""))) {
+      const date = String(meta.upload_date);
+      const timestamp = Date.UTC(Number(date.slice(0, 4)), Number(date.slice(4, 6)) - 1,
+        Number(date.slice(6, 8))) / 1000;
+      video.uploaded = window._formatBrowseUploadAge?.(timestamp) || "";
+    }
+    const header = document.getElementById("watch-meta");
+    if (header) header.textContent = [displayText(video.channel || ""), video.uploaded,
+      video.duration, video.views ? `${video.views} views` : ""].filter(Boolean).join(" · ");
     // Stats line
     if (statsEl) {
       const bits = [];
@@ -897,31 +929,7 @@
           e.preventDefault();
           const vEl = document.getElementById("watch-video");
           if (!vEl) return;
-          try {
-            // Clamp to duration so a malformed description
-            // timestamp (e.g. "9:99:99" decoded as 35999s on a
-            // 2-minute video) doesn't throw on Safari / older
-            // Chromium (audit: watchView.js:480-485). Modern
-            // Chrome silently clamps; clamp explicitly for cross-
-            // browser consistency.
-            // If metadata hasn't loaded yet, vEl.duration is NaN and
-            // the fallback `secs` is a guess — clamping to itself is
-            // a no-op and an oversize seek would error/silent-fail.
-            // Defer the seek until loadedmetadata fires when possible
-            // (audit: watchView.js H156).
-            if (Number.isFinite(vEl.duration)) {
-              vEl.currentTime = Math.min(secs, vEl.duration);
-              vEl.play().catch(() => {});
-            } else {
-              const _onMeta = () => {
-                vEl.removeEventListener("loadedmetadata", _onMeta);
-                if (!Number.isFinite(vEl.duration)) return;
-                vEl.currentTime = Math.min(secs, vEl.duration);
-                vEl.play().catch(() => {});
-              };
-              vEl.addEventListener("loadedmetadata", _onMeta);
-            }
-          } catch {}
+          _seekTo(vEl, secs);
         });
         el.appendChild(span);
       }
@@ -956,8 +964,9 @@
   if (document.readyState !== "loading") _initWatchMetaDrawerToggle();
   else document.addEventListener("DOMContentLoaded", _initWatchMetaDrawerToggle);
 
-  async function _loadVideoSource(video, vEl, ph) {
+  async function _loadVideoSource(video, vEl, ph, requestedIntent) {
     if (!vEl) return;
+    const playbackIntent = requestedIntent ?? _playbackIntent;
     const fp = video.filepath || "";
     // Race-token check: capture _watchOpenToken at entry so we can
     // detect "user navigated away during URL fetch". Before this fix,
@@ -1009,16 +1018,7 @@
       !window._browseState
       || window._browseState.view === "watch");
     if (!_stillOnSameVideo || !_stillOnWatchView) {
-      // Make sure the element is fully torn down — without this, a
-      // stale src from a previous load might still be in the element
-      // and play when we navigate back. _stopWatchVideo already runs
-      // in showView leaving-watch but it can't catch an in-flight
-      // _loadVideoSource that resolves AFTER it ran.
-      try {
-        vEl.pause();
-        vEl.removeAttribute("src");
-        if (typeof vEl.load === "function") vEl.load();
-      } catch { /* noop */ }
+      // A stale request has no ownership of the shared player's current source.
       return;
     }
     if (url) {
@@ -1079,6 +1079,7 @@
         });
       }
       vEl.src = url;
+      vEl.dataset.watchToken = String(_entryToken);
       vEl.hidden = false;
       if (ph) {
         ph.style.display = "none";
@@ -1097,7 +1098,9 @@
       // Opening a video from the grid should start playback immediately.
       // The race-token checks above prevent stale loads from starting in
       // the background after the user navigates away.
-      vEl.play().catch(() => { /* user can click play if autoplay is blocked */ });
+      if (playbackIntent === _playbackIntent && _watchIsVisible()) {
+        vEl.play().catch(() => { /* user can click play if autoplay is blocked */ });
+      }
     } else {
       // No playback possible — show placeholder with actionable error.
       // reported clicking a "(1)" duplicate that had a stale DB
@@ -1153,22 +1156,45 @@
     }
   }
 
+  let _playbackIntent = 0;
+  Object.defineProperty(window, "_watchPlaybackIntent", {
+    get: () => _playbackIntent,
+    configurable: true,
+  });
+  let _pendingSeekCleanup = null;
+  function _watchIsVisible() {
+    return window.YT.util.isElementVisible(document.getElementById("view-watch"));
+  }
+  window._cancelWatchPlaybackIntent = () => {
+    ++_playbackIntent;
+    _pendingSeekCleanup?.();
+    _pendingSeekCleanup = null;
+  };
   function _seekTo(vEl, seconds) {
     if (!vEl) return;
+    _pendingSeekCleanup?.();
+    _pendingSeekCleanup = null;
+    const token = window._watchOpenToken;
+    const intent = _playbackIntent;
     const target = Math.max(0, Number(seconds) || 0);
     const doSeek = () => {
+      if (token !== window._watchOpenToken || intent !== _playbackIntent
+          || !_watchIsVisible() || vEl.dataset.watchToken !== String(token)
+          || vEl.readyState < 1) return false;
       const d = Number.isFinite(vEl.duration) ? vEl.duration : target;
       vEl.currentTime = Math.min(target, d);
       vEl.play().catch(() => {});
+      return true;
     };
     try {
-      if (Number.isFinite(vEl.duration)) {
-        doSeek();
-      } else {
+      if (!doSeek()) {
         const onMeta = () => {
           vEl.removeEventListener("loadedmetadata", onMeta);
+          if (_pendingSeekCleanup === cleanup) _pendingSeekCleanup = null;
           try { doSeek(); } catch {}
         };
+        const cleanup = () => vEl.removeEventListener("loadedmetadata", onMeta);
+        _pendingSeekCleanup = cleanup;
         vEl.addEventListener("loadedmetadata", onMeta);
       }
     } catch { /* noop */ }
@@ -1211,6 +1237,14 @@
   let _karaokeGen = 0;
   function _unbindKaraoke() {
     _karaokeGen += 1;
+    const video = document.getElementById("watch-video");
+    if (video) {
+      video._capCleanup?.();
+      video._capCleanup = null;
+      video._capForceRefresh = null;
+      video._capRollingCache = null;
+      video._capOverlay?.classList.remove("show");
+    }
     if (_karaokeRafId !== null) {
       try { cancelAnimationFrame(_karaokeRafId); } catch {}
       _karaokeRafId = null;
@@ -1223,20 +1257,18 @@
     const myGen = ++_karaokeGen;
     let lastSegIdx = -1;
     let lastWordEl = null;
-    let lastCapWordEl = null;
-    vEl._capDefaultCueCache = null;
-    // Repaint the pinned overlay immediately (e.g. when the user flips
-    // overlay size/mode while paused) without waiting for the next tick.
-    vEl._capForceRefresh = () => {
-      const mode = window._captionPrefs?.mode || "single";
-      _updateCapOverlay(vEl, mode === "default" ? lastCapWordEl : lastWordEl,
-                        allWordEls, wordIndex);
-    };
-
-    const _tick = () => {
+    vEl._capRollingCache = null;
+    vEl._capLayoutDirty = true;
+    const _refresh = (force = false) => {
       if (myGen !== _karaokeGen) return;
+      const layoutChanged = vEl._capLayoutDirty;
+      if (layoutChanged) {
+        _updateCaptionScale(vEl);
+        vEl._capLayoutDirty = false;
+        if (vEl._capRollingCache) vEl._capRollingCache.layoutDirty = true;
+      }
       const t = vEl.currentTime;
-      if (t == null) return;
+      if (!Number.isFinite(t)) return;
       // Binary-search segments for the one containing t
       const idx = _findSegIdx(segEls, t);
       if (idx !== lastSegIdx) {
@@ -1271,31 +1303,51 @@
           if (s > t) break;
         }
       }
-      if (newWordEl !== lastWordEl) {
+      const wordChanged = newWordEl !== lastWordEl;
+      if (wordChanged) {
         if (lastWordEl) lastWordEl.classList.remove("active");
         if (newWordEl) newWordEl.classList.add("active");
         lastWordEl = newWordEl;
       }
-      // YouTube-style cues stay visible through the tiny timing gaps between
-      // words. Keep a separate overlay anchor so the transcript's active-word
-      // highlight still remains exact and clears normally in those gaps.
-      let capWordEl = newWordEl;
-      if (!capWordEl && window._captionPrefs?.mode === "default"
-          && idx >= 0 && segEls[idx]) {
-        const segEnd = parseFloat(segEls[idx].dataset.e || "0");
-        if (!Number.isFinite(segEnd) || t <= segEnd + 0.7) {
-          const words = segEls[idx].querySelectorAll(".word");
-          for (const word of words) {
-            const start = parseFloat(word.dataset.s || "0");
-            if (start <= t) capWordEl = word;
-            else break;
-          }
-        }
+      // Rolling captions have their own timing lookup, including brief gaps
+      // across segment boundaries. Transcript highlighting remains exact.
+      if (force || layoutChanged || wordChanged || (window._captionPrefs?.mode || "default") === "default") {
+        _updateCapOverlay(vEl, newWordEl, allWordEls, wordIndex, force || layoutChanged);
       }
-      if (capWordEl !== lastCapWordEl) {
-        _updateCapOverlay(vEl, capWordEl, allWordEls, wordIndex);
-        lastCapWordEl = capWordEl;
-      }
+    };
+    // Read currentTime again on every explicit refresh: the cached active
+    // word can belong to the old position when seeking or changing a mode.
+    vEl._capForceRefresh = () => {
+      vEl._capLayoutDirty = true;
+      _refresh(true);
+    };
+    const refresh = () => _refresh(true);
+    const events = ["seeking", "seeked", "pause", "ended"];
+    events.forEach(name => vEl.addEventListener(name, refresh));
+    const progress = () => _refresh();
+    vEl.addEventListener("timeupdate", progress);
+    const resize = () => {
+      if (myGen !== _karaokeGen) return;
+      vEl._capLayoutDirty = true;
+      _refresh();
+    };
+    vEl.addEventListener("loadedmetadata", resize);
+    vEl.addEventListener("resize", resize);
+    const observer = typeof ResizeObserver === "function" ? new ResizeObserver(resize) : null;
+    observer?.observe(vEl);
+    document.fonts?.ready.then(() => {
+      if (myGen === _karaokeGen) vEl._capLayoutDirty = true;
+    });
+    vEl._capCleanup = () => {
+      observer?.disconnect();
+      events.forEach(name => vEl.removeEventListener(name, refresh));
+      vEl.removeEventListener("timeupdate", progress);
+      vEl.removeEventListener("loadedmetadata", resize);
+      vEl.removeEventListener("resize", resize);
+      vEl._capOverlay?.getAnimations({ subtree: true }).forEach(animation => animation.cancel());
+    };
+    const _tick = () => {
+      _refresh();
       // Schedule the next frame as long as the video is still loaded.
       // The unbind path cancels the in-flight rAF so this never leaks.
       // Stop the rAF loop when the Watch view is hidden — it
@@ -1307,6 +1359,7 @@
         _karaokeRafId = requestAnimationFrame(_tick);
       }
     };
+    _refresh(true);
     _karaokeRafId = requestAnimationFrame(_tick);
   }
 
@@ -1435,150 +1488,209 @@
     return ovl;
   }
 
-  // Copy the active word (+ neighbours in 3-word mode) into the overlay
-  // cells. `curEl` is the active `.word` span from the transcript pane,
-  // or null when playback is between words — in which case we hide the
-  // overlay. `allWordEls`/`wordIndex` give O(1) neighbour lookup.
-  function _defaultCaptionProfile(vEl) {
-    const size = window._captionPrefs?.size || "small";
-    const fontPx = { small: 18, medium: 26, large: 40 }[size] || 18;
-    const videoWidth = vEl?.getBoundingClientRect?.().width || 640;
-    // Estimate how much text fits at the selected size, then cap it near
-    // YouTube's familiar short-line length. Two lines are the hard maximum.
-    const lineChars = Math.max(18, Math.min(42,
-      Math.floor((videoWidth * 0.84) / (fontPx * 0.54))));
-    const maxChars = lineChars * 2;
-    const maxWords = Math.max(7, Math.min(15, Math.floor(maxChars / 5.5)));
-    return {
-      key: `${size}:${lineChars}`,
-      lineChars,
-      maxChars,
-      maxWords,
-      targetWords: Math.max(5, Math.floor(maxWords * 0.72)),
-    };
+  const _CAPTION_HOLD = 0.7;
+  let _captionMeasureContext;
+  window._seekWatchTo = seconds => _seekTo(document.getElementById("watch-video"), seconds);
+
+  function _updateCaptionScale(vEl) {
+    const rect = vEl.getBoundingClientRect();
+    // Size choices are proportions of a 640 x 360 player, independent of
+    // monitor size, UI font preferences, and the video's encoded resolution.
+    // Retain the last usable geometry while hidden or waiting for metadata.
+    if (Number.isFinite(rect.width) && Number.isFinite(rect.height)
+        && rect.width > 0 && rect.height > 0) {
+      vEl._capScale = Math.min(rect.width / 640, rect.height / 360);
+      vEl._capPlayerWidth = rect.width;
+    }
+    vEl._capOverlay?.style.setProperty("--cap-scale", String(vEl._capScale || 1));
   }
 
-  function _splitDefaultCaptionLines(words, lineChars) {
-    const full = words.join(" ");
-    if (words.length < 2 || full.length <= lineChars) return [full];
-    let bestAt = 1;
-    let bestScore = Infinity;
-    for (let i = 1; i < words.length; i++) {
-      const left = words.slice(0, i).join(" ");
-      const right = words.slice(i).join(" ");
-      const overflow = Math.max(0, left.length - lineChars)
-                     + Math.max(0, right.length - lineChars);
-      const score = overflow * 20 + Math.abs(left.length - right.length);
-      if (score < bestScore) {
-        bestScore = score;
-        bestAt = i;
+  function _rollingCaptionCache(vEl, allWordEls) {
+    let cache = vEl._capRollingCache;
+    if (!cache || cache.words !== allWordEls) {
+      // Sort a separate timing view so overlapping or out-of-order segments
+      // cannot reveal future words. Saved transcripts and their DOM stay intact.
+      const timeline = allWordEls.map(el => ({
+        text: el.textContent.trim(), start: Number(el.dataset.s),
+        end: Number.parseFloat(el.dataset.e),
+        segmentEnd: Number.parseFloat(el.parentElement?.dataset.e),
+      })).filter(word => word.text && Number.isFinite(word.start))
+        .sort((a, b) => a.start - b.start);
+      timeline.forEach((word, i) => {
+        if (!Number.isFinite(word.end) || word.end < word.start) {
+          const next = timeline[i + 1]?.start;
+          word.end = Math.min(next > word.start ? next : word.start + 0.5,
+            word.segmentEnd > word.start ? word.segmentEnd : word.start + 0.5,
+            word.start + 1);
+        }
+      });
+      cache = { words: allWordEls, timeline, layout: null, renderKey: null };
+      vEl._capRollingCache = cache;
+    }
+    if (!cache.layout || cache.layoutDirty) {
+      cache.layoutDirty = false;
+      const style = getComputedStyle(vEl._capOverlay.children[1]);
+      const fontPx = Number.parseFloat(style.fontSize) || 13;
+      const font = `${style.fontStyle} ${style.fontWeight} ${fontPx}px ${style.fontFamily}`;
+      const scale = vEl._capScale || 1;
+      const width = Math.max(1, Math.min(
+        (vEl._capPlayerWidth || 640) * 0.86 - 14 * scale, fontPx * 26));
+      const key = `${font}:${width}:${scale}`;
+      if (cache.layout?.key !== key) {
+        _captionMeasureContext ||= document.createElement("canvas").getContext("2d");
+        if (_captionMeasureContext) _captionMeasureContext.font = font;
+        const measure = text => _captionMeasureContext
+          ? _captionMeasureContext.measureText(text).width : text.length * fontPx * 0.6;
+        const lines = [];
+        let line = null;
+        let block = 0;
+        cache.timeline.forEach((word, i) => {
+          const previous = cache.timeline[i - 1];
+          const gap = previous && word.start - previous.end > _CAPTION_HOLD;
+          if (gap) { block += 1; line = null; }
+          const text = line ? `${line.text} ${word.text}` : word.text;
+          const measured = measure(text);
+          if (!line || measured > width) {
+            line = { first: i, last: i, block, text: word.text, width: measure(word.text) };
+            lines.push(line);
+          } else {
+            line.last = i;
+            line.text = text;
+            line.width = measured;
+          }
+          word.line = lines.length - 1;
+        });
+        cache.layout = { key, fontPx, width, scale, lines };
+        cache.renderKey = null;
+        cache.lineKey = null;
       }
     }
-    return [words.slice(0, bestAt).join(" "), words.slice(bestAt).join(" ")];
+    return cache;
   }
 
-  function _buildDefaultCaptionCues(allWordEls, profile) {
-    const byWord = new Array(allWordEls.length);
-    const textAt = (i) => allWordEls[i]?.textContent?.trim() || "";
-    const startAt = (i) => parseFloat(allWordEls[i]?.dataset.s || "0");
-    const endAt = (i) => {
-      const el = allWordEls[i];
-      const end = parseFloat(el?.dataset.e || "");
-      return Number.isFinite(end) ? end : startAt(i);
-    };
-    const sentenceEnd = (text) => _isNonSpeechToken(text)
-      || /[.!?\u2026](?:["'\u201d\u2019)\]]+)?$/.test(text);
-    const softEnd = (text) => /(?:[,;:]|[\u2013\u2014])(?:["'\u201d\u2019)\]]+)?$/.test(text);
-
-    let first = 0;
-    while (first < allWordEls.length) {
-      let chars = 0;
-      let lastSoft = -1;
-      let last = first;
-      for (let i = first; i < allWordEls.length; i++) {
-        const text = textAt(i);
-        const count = i - first + 1;
-        const nextChars = chars + (chars ? 1 : 0) + text.length;
-        const gap = i > first ? startAt(i) - endAt(i - 1) : 0;
-
-        if (i > first && count > 3 && gap > 0.85) {
-          last = i - 1;
-          break;
-        }
-        if (i > first && (nextChars > profile.maxChars
-                          || count > profile.maxWords)) {
-          last = lastSoft >= first ? lastSoft : i - 1;
-          break;
-        }
-
-        chars = nextChars;
-        last = i;
-        if (sentenceEnd(text)) break;
-        if (count >= 4 && softEnd(text)) lastSoft = i;
-        if (count >= profile.targetWords && lastSoft >= first) {
-          last = lastSoft;
-          break;
-        }
-        if (count >= 4 && endAt(i) - startAt(first) >= 5.5) break;
+  function _renderRollingCaption(vEl, allWordEls, force) {
+    const ovl = vEl._capOverlay;
+    const cache = _rollingCaptionCache(vEl, allWordEls);
+    const { timeline, layout } = cache;
+    const t = vEl.currentTime;
+    let lo = 0, hi = timeline.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (timeline[mid].start <= t) lo = mid + 1;
+      else hi = mid;
+    }
+    const index = lo - 1;
+    const word = timeline[index];
+    if (!word || vEl.ended || t > word.end + _CAPTION_HOLD) {
+      ovl.classList.remove("show");
+      cache.renderKey = null;
+      cache.lineKey = null;
+      return;
+    }
+    const cell = ovl.children[1];
+    const key = `${layout.key}:${index}`;
+    if (!force && cache.renderKey === key && ovl.classList.contains("show")) return;
+    if (force) {
+      cell.getAnimations({ subtree: true }).forEach(animation => animation.cancel());
+      cell.querySelector('[data-row="outgoing"]')?.remove();
+    }
+    if (cache.renderKey !== key) {
+      const current = layout.lines[word.line];
+      const candidate = layout.lines[word.line - 1];
+      const previous = candidate?.block === current.block ? candidate : null;
+      const oldCurrent = cell.querySelector('[data-row="current"]');
+      const lineKey = `${layout.key}:${current.first}`;
+      const spoken = timeline.slice(current.first, index + 1).map(item => item.text).join(" ");
+      if (cache.lineKey === lineKey && oldCurrent) {
+        // A fast speaker can add words during the scroll. Preserve the rows
+        // and their animations while extending the incoming line's text.
+        oldCurrent.firstChild.textContent = spoken;
+        cache.renderKey = key;
+        ovl.classList.add("show");
+        return;
       }
-
-      const words = [];
-      for (let i = first; i <= last; i++) words.push(textAt(i));
-      const cue = {
-        key: `${profile.key}:${first}:${last}`,
-        lines: _splitDefaultCaptionLines(words, profile.lineChars),
-      };
-      for (let i = first; i <= last; i++) byWord[i] = cue;
-      first = last + 1;
+      const canRoll = previous && cache.lineKey && !force && !vEl.paused && !vEl.seeking
+        && oldCurrent?.dataset.line === String(previous.first)
+        && !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const outgoing = canRoll ? cell.querySelector('[data-row="previous"]') : null;
+      cell.getAnimations({ subtree: true }).forEach(animation => animation.cancel());
+      cell.style.setProperty("--cap-row-height", `${layout.fontPx * 1.25 + 4 * layout.scale}px`);
+      const rows = [previous, current].map((line, row) => {
+        const span = row === 0 && canRoll ? oldCurrent : document.createElement("span");
+        span.className = "cap-ovl-line";
+        span.dataset.row = row === 0 ? "previous" : "current";
+        span.dataset.line = line ? String(line.first) : "";
+        // Reserve the complete line's measured width. Its spoken prefix grows
+        // from one fixed position; future words never enter the rendered DOM.
+        const scale = line ? Math.min(1, layout.width / Math.max(1, line.width)) : 1;
+        span.style.width = line ? `${Math.min(layout.width, line.width) + 14 * layout.scale}px` : "0px";
+        span.style.fontSize = `${layout.fontPx * scale}px`;
+        span.replaceChildren();
+        if (line) {
+          const text = document.createElement("span");
+          text.className = "cap-ovl-text";
+          text.textContent = row === 0 ? line.text : spoken;
+          span.appendChild(text);
+        }
+        return span;
+      });
+      cell.replaceChildren(...rows);
+      if (canRoll) {
+        const distance = layout.fontPx * 1.25 + 6 * layout.scale;
+        const nextLine = layout.lines[word.line + 1];
+        const nextStart = nextLine ? timeline[nextLine.first].start : Infinity;
+        const playbackRate = Math.max(0.1, Number(vEl.playbackRate) || 1);
+        // Finish before the next line arrives, including accelerated playback
+        // and a narrow player where one long word can occupy a whole row.
+        const duration = Math.max(1, Math.min(250, (nextStart - t) * 800 / playbackRate));
+        const slide = (element, from, to) => element.animate([
+          { transform: `translate(-50%, ${from}px)` },
+          { transform: `translate(-50%, ${to}px)` },
+        ], { duration, easing: "ease-out" });
+        rows.forEach(row => slide(row, distance, 0));
+        // A third row exists only while leaving the clipped two-row window.
+        // No animation is allowed to grow the viewport into a third line.
+        if (outgoing?.textContent) {
+          outgoing.dataset.row = "outgoing";
+          cell.appendChild(outgoing);
+          const animation = slide(outgoing, 0, -distance);
+          animation.finished.then(() => outgoing.remove(), () => outgoing.remove());
+        }
+      }
+      cache.renderKey = key;
+      cache.lineKey = lineKey;
     }
-    return byWord;
+    ovl.classList.add("show");
   }
 
-  function _defaultCaptionCue(vEl, allWordEls, index) {
-    const profile = _defaultCaptionProfile(vEl);
-    let cache = vEl._capDefaultCueCache;
-    if (!cache || cache.words !== allWordEls || cache.key !== profile.key) {
-      cache = {
-        key: profile.key,
-        words: allWordEls,
-        byWord: _buildDefaultCaptionCues(allWordEls, profile),
-      };
-      vEl._capDefaultCueCache = cache;
-    }
-    return cache.byWord[index] || null;
-  }
+  // `default` selects rolling captions. Explicit one/three-word choices
+  // keep their centered active word while the overlay remains enabled.
 
-  function _renderDefaultCaption(cell, cue) {
-    if (cell.dataset.cueKey === cue.key) return;
-    const lines = cue.lines.map((text) => {
-      const line = document.createElement("span");
-      line.className = "cap-ovl-line";
-      line.textContent = text;
-      return line;
-    });
-    cell.replaceChildren(...lines);
-    cell.dataset.cueKey = cue.key;
-  }
-
-  function _updateCapOverlay(vEl, curEl, allWordEls, wordIndex) {
+  function _updateCapOverlay(vEl, curEl, allWordEls, wordIndex, force = false) {
     const ovl = vEl && vEl._capOverlay;
     if (!ovl) return;
     const p = window._captionPrefs || {};
     const on = p.size && p.size !== "off";
-    if (!on || !curEl) { ovl.classList.remove("show"); return; }
-    const mode = p.mode || "single";
+    const mode = p.mode || "default";
+    if (!on || mode !== "default") {
+      ovl.getAnimations({ subtree: true }).forEach(animation => animation.cancel());
+      ovl.querySelector('[data-row="outgoing"]')?.remove();
+    }
+    if (!on) { ovl.classList.remove("show"); return; }
     const i = wordIndex ? wordIndex.get(curEl) : -1;
     const has = (j) => allWordEls && j >= 0 && j < allWordEls.length;
     ovl.dataset.capMode = mode;
     if (mode === "default") {
-      const cue = has(i) ? _defaultCaptionCue(vEl, allWordEls, i) : null;
-      if (!cue) { ovl.classList.remove("show"); return; }
-      ovl.children[0].textContent = "";
-      ovl.children[2].textContent = "";
-      _renderDefaultCaption(ovl.children[1], cue);
-      ovl.classList.add("show");
+      if (ovl.children[0].firstChild) ovl.children[0].textContent = "";
+      if (ovl.children[2].firstChild) ovl.children[2].textContent = "";
+      _renderRollingCaption(vEl, allWordEls, force);
       return;
     }
+    if (vEl._capRollingCache) {
+      vEl._capRollingCache.renderKey = null;
+      vEl._capRollingCache.lineKey = null;
+    }
+    if (!curEl) { ovl.classList.remove("show"); return; }
     const prevEl = (mode === "phrase3" && has(i - 1)) ? allWordEls[i - 1] : null;
     const nextEl = (mode === "phrase3" && has(i + 1)) ? allWordEls[i + 1] : null;
     ovl.children[0].textContent = prevEl ? prevEl.textContent.trim() : "";
@@ -1597,13 +1709,14 @@
     const p = window._captionPrefs || {};
     const size = p.size || "off";
     const bg = p.bg || "translucent";
-    const mode = p.mode || "single";
+    const mode = p.mode || "default";
     const ovl = vEl._capOverlay;
     if (ovl) {
       ovl.dataset.capSize = (size === "off") ? "" : size;
       ovl.dataset.capBg = bg;
       ovl.dataset.capMode = mode;
       if (size === "off") ovl.classList.remove("show");
+      vEl._capLayoutDirty = true;
     }
   }
 

@@ -4,10 +4,13 @@ const { loadApp } = require("./fixtures");
 test.beforeEach(async ({ page }) => { await loadApp(page); });
 
 test("subscription refresh retains filtering and keyboard selection updates bulk controls", async ({ page }) => {
-  await page.evaluate(() => {
+  await page.evaluate(async () => {
+    const settings = await window.pywebview.api.settings_load();
+    // Startup reloads settings after wiring controls. Keep the saved choice
+    // consistent so that reload cannot hide the tab while this test uses it.
+    window.__setBridgeHandler("settings_load", () => ({ ...settings, legacy_subs_tab: true }));
+    window._applyLegacySubsMode(true);
     const tab = document.querySelector('.tab[data-tab="subs"]');
-    tab.hidden = false;
-    tab.classList.remove("legacy-subs-tab");
     tab.click();
     window.fixtureSubs = [{ folder: "Apple" }, { folder: "Banana" }, { folder: "Apricot" }];
     window.renderSubsTable(window.fixtureSubs);

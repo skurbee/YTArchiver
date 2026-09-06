@@ -6,6 +6,16 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v84.4 - Release check correction
+
+09.05.26 11:59pm
+
+Includes the caption, browsing, download, and recovery improvements documented under v84.3.
+
+### Fixed
+
+- Corrected the automated check for the optional channel table. Its saved setting now stays consistent during startup, preventing a false test failure when settings finish loading.
+
 ## v84.3 - Smoother captions and everyday fixes
 
 09.05.26 11:25pm

@@ -6,6 +6,17 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v84.6 - Fix downloader plugin startup
+
+09.07.26 4:41pm
+
+### Fixed
+
+- Fixed a startup crash in the YouTube request-protection plugin when the external downloader uses Python 3.10. The plugin now uses a compatible UTC timestamp API, allowing channel syncs to start normally.
+- Kept hourly and daily request limits and existing usage unchanged.
+- Added a regression check for the older downloader runtime and a matching plugin-specific lint target to prevent this compatibility regression from returning.
+- Verified the fix with the actual frozen downloader executable and an offline fixture, including the plugin extracted from the packaged desktop application.
+
 ## v84.5 - More efficient syncing and clearer status
 
 09.07.26 2:10pm

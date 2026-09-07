@@ -11,7 +11,7 @@ import json
 import os
 import re
 import socket
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from yt_dlp.postprocessor.common import PostProcessor
@@ -307,7 +307,7 @@ class YTArchiverTrafficGuardPP(PostProcessor):
                         result = {**result, "ytarchiver_metadata_snapshot": {
                             "version": 1, "video_id": video_id, "comments_complete": True,
                             "comments_disabled": disabled,
-                            "fetched_at": datetime.now(UTC).isoformat(),
+                            "fetched_at": datetime.now(timezone.utc).isoformat(),
                         }}
                 return result
 

@@ -81,6 +81,11 @@ extend-exclude = [
     "GitHub Desktop",
 ]
 
+[tool.ruff.per-file-target-version]
+# The external downloader executable can embed Python 3.10 even though the
+# desktop application and its test interpreter use Python 3.13.
+"backend/yt_dlp_plugins/**/*.py" = "py310"
+
 [tool.ruff.lint]
 # Sensible default rules + a few hand-picked extras.
 # - E,W: pycodestyle errors + warnings

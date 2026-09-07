@@ -41,12 +41,12 @@
   const showContextMenu = window.showContextMenu || (() => {});
 
   function initMetadataTab() {
+    return window.YT.util.initialize("metadata-tab", scope => {
     // Re-init guard — multiple calls would stack duplicate global
     // listeners (mousedown/keydown/resize/scroll capture), each one
     // triggering on every event. After several re-inits the page
     // gets noticeably slower on scroll.
     if (window._metadataTabInited) return;
-    window._metadataTabInited = true;
     const tbody = document.getElementById("metadata-tbody");
     const table = document.getElementById("metadata-table");
     const bAllViews = document.getElementById("btn-md-refresh-all-views");
@@ -54,7 +54,7 @@
     const bAllBackfill = document.getElementById("btn-md-backfill-all-ids");
     const bAllThumbs = document.getElementById("btn-md-refetch-all-thumbs");
     const bReload = document.getElementById("btn-md-reload");
-    if (!tbody || !table) return;
+    if (!tbody || !table) throw new Error("Metadata table is not available.");
 
     // Current dataset + sort state. Sort state persists across reloads.
     let _rows = [];
@@ -72,7 +72,7 @@
     clearFilter.textContent = "Show all channels";
     filterNotice.append(filterText, clearFilter);
     table.before(filterNotice);
-    clearFilter.addEventListener("click", () => {
+    scope.listen(clearFilter, "click", () => {
       _missingIdsOnly = false;
       render();
       table.querySelector("thead th[data-sort]")?.focus?.();
@@ -137,8 +137,8 @@
       _saveCachedMeta(_rows);
     }
     const _scheduleMetadataRefresh = () => {
-      if (_pendingRefreshTimer) clearTimeout(_pendingRefreshTimer);
-      _pendingRefreshTimer = setTimeout(() => {
+      if (_pendingRefreshTimer) scope.clearTimeout(_pendingRefreshTimer);
+      _pendingRefreshTimer = scope.timeout(() => {
         _pendingRefreshTimer = null;
         try { window._refreshMetadataTab?.({ force: true }); } catch (e) {}
       }, 2000);
@@ -783,8 +783,8 @@
         _missingIdsFirst = false;
         render();
       };
-      th.addEventListener("click", activateSort);
-      th.addEventListener("keydown", (event) => {
+      scope.listen(th, "click", activateSort);
+      scope.listen(th, "keydown", (event) => {
         if (event.key !== "Enter" && event.key !== " ") return;
         event.preventDefault();
         activateSort();
@@ -1004,227 +1004,40 @@
     // the cursor, NOT a centered modal. Left + right click both open
     // the same dropdown at the click point. Active reference + close
     // helper — only one menu lives at a time.
-    let _activeMenu = null;
-    let _activeMenuTrigger = null;
-    const _closeRowMenu = (restoreFocus = false) => {
-      const trigger = _activeMenuTrigger;
-      if (_activeMenu) {
-        try { _activeMenu.remove(); } catch {}
-        _activeMenu = null;
-      }
-      _activeMenuTrigger = null;
-      if (restoreFocus && trigger?.isConnected) {
-        try { trigger.focus(); } catch {}
-      }
-    };
-    const _positionRowSubmenu = head => {
-      const sub = head?.nextElementSibling;
-      if (!sub?.classList.contains("md-cm-sub")) return;
-      const wasDisplay = sub.style.display;
-      sub.style.display = "block";
-      const rect = sub.getBoundingClientRect();
-      const parent = head.getBoundingClientRect();
-      const margin = 4;
-      const available = Math.max(0, window.innerHeight - margin * 2);
-      sub.style.maxHeight = `${available}px`;
-      sub.style.overflowY = "auto";
-      const left = parent.right + rect.width + margin <= window.innerWidth
-        ? parent.right : parent.left - rect.width;
-      sub.style.left = `${Math.max(margin, Math.min(left, window.innerWidth - rect.width - margin))}px`;
-      sub.style.top = `${Math.max(margin, Math.min(parent.top - 5, window.innerHeight - Math.min(rect.height, available) - margin))}px`;
-      sub.style.display = wasDisplay;
-    };
     const _openRowMenu = (tr, clientX, clientY) => {
-      _closeRowMenu();
-      _activeMenuTrigger = tr;
       let ident = {};
       try { ident = JSON.parse(tr.dataset.identity || "{}"); } catch {}
       const row = _rowForIdent(ident);
       const needsFix = tr.classList.contains("md-row-needs-fix");
-      const txTotal = row?.tx_total || 0;
-      const txWith = row?.tx_transcribed || 0;
-      const needsTranscribe = txTotal > 0 && txWith < txTotal;
-      // Reorder so the most-likely action is FIRST — askChoice focuses
-      // the first primary-kinded button for keyboard confirm. Since
-      // the default kind is now primary (all green), ordering alone
-      // picks the default without making the others visually secondary.
-      // Build the dropdown DOM. Compact list, positioned at the
-      // cursor \u2014 looks like a Windows right-click menu, NOT a
-      // centered askChoice modal.
-      const menu = document.createElement("div");
-      menu.className = "md-context-menu";
-      menu.setAttribute("role", "menu");
-      const mkItem = (label, act, opts) => {
-        opts = opts || {};
-        const b = document.createElement("button");
-        b.type = "button";
-        b.className = "md-cm-item" + (opts.warn ? " md-cm-warn" : "");
-        b.setAttribute("role", "menuitem");
-        b.dataset.act = act;
-        if (opts.days !== undefined) b.dataset.days = String(opts.days);
-        b.textContent = label;
-        return b;
-      };
-      const fixItem = mkItem("Fix missing video IDs", "backfill",
-                             { warn: needsFix });
-      const transcribeItem = mkItem("Transcribe missing", "transcribe",
-                                    { warn: needsTranscribe });
-      const thumbsItem = mkItem("Refetch missing thumbnails", "thumbs");
-      // Views/likes supports the same recent-upload scoping as the Browse
-      // channel menu. This keeps a large archive from defaulting to a full
-      // historical pass when only current counts matter.
-      const viewsWrap = document.createElement("div");
-      viewsWrap.className = "md-cm-sub-wrap";
-      const viewsHead = document.createElement("button");
-      viewsHead.type = "button";
-      viewsHead.className = "md-cm-item md-cm-has-sub";
-      viewsHead.setAttribute("role", "menuitem");
-      viewsHead.setAttribute("aria-haspopup", "menu");
-      viewsHead.setAttribute("aria-expanded", "false");
-      viewsHead.innerHTML = "Refresh views/likes<span class=\"md-cm-chev\">›</span>";
-      const viewsSub = document.createElement("div");
-      viewsSub.className = "md-cm-sub";
-      viewsSub.setAttribute("role", "menu");
-      viewsSub.setAttribute("aria-label", "Refresh views and likes range");
-      viewsSub.appendChild(mkItem("Last week", "views", { days: 7 }));
-      viewsSub.appendChild(mkItem("Last month", "views", { days: 30 }));
-      viewsSub.appendChild(mkItem("Last year", "views", { days: 365 }));
-      viewsSub.appendChild(mkItem("All videos", "views", { days: 0 }));
-      viewsWrap.appendChild(viewsHead);
-      viewsWrap.appendChild(viewsSub);
-      // "Refresh comments" carries a hover-submenu with day-scope picks.
-      const commentsWrap = document.createElement("div");
-      commentsWrap.className = "md-cm-sub-wrap";
-      const commentsHead = document.createElement("button");
-      commentsHead.type = "button";
-      commentsHead.className = "md-cm-item md-cm-has-sub";
-      commentsHead.setAttribute("role", "menuitem");
-      commentsHead.setAttribute("aria-haspopup", "menu");
-      commentsHead.setAttribute("aria-expanded", "false");
-      commentsHead.innerHTML = "Refresh comments<span class=\"md-cm-chev\">\u203a</span>";
-      const commentsSub = document.createElement("div");
-      commentsSub.className = "md-cm-sub";
-      commentsSub.setAttribute("role", "menu");
-      commentsSub.setAttribute("aria-label", "Refresh comments range");
-      commentsSub.appendChild(mkItem("Last 7 days", "comments", { days: 7 }));
-      commentsSub.appendChild(mkItem("Last 30 days", "comments", { days: 30 }));
-      commentsSub.appendChild(mkItem("Last 90 days", "comments", { days: 90 }));
-      commentsSub.appendChild(mkItem("All videos", "comments", { days: 0 }));
-      commentsWrap.appendChild(commentsHead);
-      commentsWrap.appendChild(commentsSub);
-      // Mark the first choice `primary: true` so Enter confirms it
-      // (askChoice uses this flag to pick the keyboard-focus target).
-      // All three still render green — the primary flag only affects
-      // auto-focus, not color, under the new default-to-primary kind.
-      if (needsFix) {
-        menu.appendChild(fixItem);
-        if (needsTranscribe) menu.appendChild(transcribeItem);
-        menu.appendChild(viewsWrap);
-      } else {
-        if (needsTranscribe) menu.appendChild(transcribeItem);
-        menu.appendChild(viewsWrap);
-        menu.appendChild(fixItem);
-      }
-      menu.appendChild(commentsWrap);
-      menu.appendChild(thumbsItem);
-
-      // Leaf-item click → close + dispatch. Clicking a submenu header
-      // opens it and moves focus to the first choice, matching keyboard use.
-      menu.addEventListener("click", async (ev) => {
-        const btn = ev.target.closest(".md-cm-item");
-        if (!btn) return;
-        if (btn.classList.contains("md-cm-has-sub")) {
-          const expanded = btn.getAttribute("aria-expanded") === "true";
-          menu.querySelectorAll(".md-cm-has-sub").forEach(head =>
-            head.setAttribute("aria-expanded", "false"));
-          btn.setAttribute("aria-expanded", String(!expanded));
-          if (!expanded) {
-            _positionRowSubmenu(btn);
-            btn.nextElementSibling?.querySelector(".md-cm-item")?.focus?.();
-          }
-          return;
-        }
-        const act = btn.dataset.act;
-        const days = btn.dataset.days; // string or undefined
-        _closeRowMenu();
-        await _runRowAct(act, ident, days);
-        // The refresh runs server-side (queued); re-pull the table shortly
-        // after so a quick views/likes refresh on a small channel shows up
-        // without the user manually hitting Reload. Harmless if the job is
-        // still running — the row just re-renders with the current backend
-        // state. (Full completion for big channels still needs a Reload.)
-        _scheduleMetadataRefresh();
+      const needsTranscribe = (row?.tx_total || 0) > (row?.tx_transcribed || 0);
+      const action = (label, act, days, warn = false) => ({
+        label, cls: warn ? "md-cm-warn" : "",
+        action: async () => {
+          await _runRowAct(act, ident, days === undefined ? undefined : String(days));
+          _scheduleMetadataRefresh();
+        },
       });
-
-      document.body.appendChild(menu);
-      _activeMenu = menu;
-
-      // Position at the click point, flipping if it would go off-screen.
-      const margin = 4;
-      const vw = window.innerWidth, vh = window.innerHeight;
-      let x = clientX, y = clientY;
-      const r = menu.getBoundingClientRect();
-      if (x + r.width + margin > vw) x = Math.max(margin, vw - r.width - margin);
-      if (y + r.height + margin > vh) y = Math.max(margin, vh - r.height - margin);
-      menu.style.left = x + "px";
-      menu.style.top = y + "px";
-      menu.querySelectorAll(".md-cm-has-sub").forEach(head => {
-        head.parentElement.addEventListener("mouseenter", () => _positionRowSubmenu(head));
-        head.addEventListener("focus", () => _positionRowSubmenu(head));
+      const fix = action("Fix missing video IDs", "backfill", undefined, needsFix);
+      const transcribe = action("Transcribe missing", "transcribe", undefined, needsTranscribe);
+      const views = { label: "Refresh views/likes", submenu: [
+        action("Last week", "views", 7), action("Last month", "views", 30),
+        action("Last year", "views", 365), action("All videos", "views", 0),
+      ] };
+      const items = [];
+      if (needsFix) items.push(fix);
+      if (needsTranscribe) items.push(transcribe);
+      items.push(views);
+      if (!needsFix) items.push(fix);
+      items.push({ label: "Refresh comments", submenu: [
+        action("Last 7 days", "comments", 7), action("Last 30 days", "comments", 30),
+        action("Last 90 days", "comments", 90), action("All videos", "comments", 0),
+      ] }, action("Refetch missing thumbnails", "thumbs"));
+      window.YT.ctx.show(clientX, clientY, items, {
+        className: "md-context-menu", returnFocus: tr,
       });
-
-      setTimeout(() => {
-        const first = menu.querySelector(
-          ":scope > .md-cm-item, :scope > .md-cm-sub-wrap > .md-cm-has-sub");
-        first?.focus?.();
-      }, 0);
     };
-    // Outside click / Escape / scroll / resize → close.
-    document.addEventListener("mousedown", (e) => {
-      if (!_activeMenu) return;
-      if (_activeMenu.contains(e.target)) return;
-      _closeRowMenu();
-    });
-    document.addEventListener("keydown", (e) => {
-      if (_activeMenu && e.key === "Escape") {
-        e.preventDefault();
-        _closeRowMenu(true);
-      } else if (_activeMenu && ["Enter", " ", "ArrowRight"].includes(e.key)
-                 && document.activeElement?.classList?.contains("md-cm-has-sub")) {
-        e.preventDefault();
-        const head = document.activeElement;
-        _activeMenu.querySelectorAll(".md-cm-has-sub").forEach(other =>
-          other.setAttribute("aria-expanded", String(other === head)));
-        _positionRowSubmenu(head);
-        head.nextElementSibling?.querySelector(".md-cm-item")?.focus?.();
-      } else if (_activeMenu && e.key === "ArrowLeft"
-                 && document.activeElement?.closest?.(".md-cm-sub")) {
-        e.preventDefault();
-        const sub = document.activeElement.closest(".md-cm-sub");
-        const head = sub?.previousElementSibling;
-        head?.setAttribute("aria-expanded", "false");
-        head?.focus?.();
-      } else if (_activeMenu && ["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
-        const activeSub = document.activeElement?.closest?.(".md-cm-sub");
-        const items = activeSub
-          ? Array.from(activeSub.querySelectorAll(":scope > .md-cm-item"))
-          : Array.from(_activeMenu.querySelectorAll(
-            ":scope > .md-cm-item, :scope > .md-cm-sub-wrap > .md-cm-has-sub"));
-        if (!items.length) return;
-        e.preventDefault();
-        const current = items.indexOf(document.activeElement);
-        let next = 0;
-        if (e.key === "End") next = items.length - 1;
-        else if (e.key === "Home") next = 0;
-        else if (e.key === "ArrowUp") next = current <= 0 ? items.length - 1 : current - 1;
-        else next = current < 0 || current >= items.length - 1 ? 0 : current + 1;
-        items[next].focus();
-      }
-    });
-    window.addEventListener("resize", _closeRowMenu);
-    window.addEventListener("scroll", _closeRowMenu, true);
     // Left click anywhere on a row → open menu at the click point.
-    tbody.addEventListener("click", (e) => {
+    scope.listen(tbody, "click", (e) => {
       const tr = e.target.closest("tr.md-row-clickable");
       if (!tr) return;
       try {
@@ -1240,13 +1053,13 @@
       _openRowMenu(tr, e.clientX, e.clientY);
     });
     // Right click anywhere on a row → open SAME menu at the click point.
-    tbody.addEventListener("contextmenu", (e) => {
+    scope.listen(tbody, "contextmenu", (e) => {
       const tr = e.target.closest("tr.md-row-clickable");
       if (!tr) return;
       e.preventDefault();
       _openRowMenu(tr, e.clientX, e.clientY);
     });
-    tbody.addEventListener("keydown", (e) => {
+    scope.listen(tbody, "keydown", (e) => {
       const tr = e.target.closest("tr.md-row-clickable");
       if (!tr) return;
       const openMenu = e.key === "Enter" || e.key === " "
@@ -1259,7 +1072,7 @@
 
     // Bulk buttons.
     if (bAllViews) {
-      bAllViews.addEventListener("click", async () => {
+      scope.listen(bAllViews, "click", async () => {
         if (!nativeBridgeUp()) {
           window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn"); return;
         }
@@ -1293,7 +1106,7 @@
       });
     }
     if (bAllComments) {
-      bAllComments.addEventListener("click", async () => {
+      scope.listen(bAllComments, "click", async () => {
         if (!nativeBridgeUp()) {
           window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn"); return;
         }
@@ -1325,7 +1138,7 @@
       });
     }
     if (bAllBackfill) {
-      bAllBackfill.addEventListener("click", async () => {
+      scope.listen(bAllBackfill, "click", async () => {
         if (!nativeBridgeUp()) {
           window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn"); return;
         }
@@ -1389,7 +1202,7 @@
     // count from the cached _rows so the confirmation dialog can
     // tell the user how big the job actually is.
     if (bAllThumbs) {
-      bAllThumbs.addEventListener("click", async () => {
+      scope.listen(bAllThumbs, "click", async () => {
         if (!nativeBridgeUp()) {
           window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn"); return;
         }
@@ -1441,7 +1254,7 @@
     }
 
     if (bReload) {
-      bReload.addEventListener("click", () => {
+      scope.listen(bReload, "click", () => {
         window._refreshMetadataTab?.({ force: true });
       });
     }
@@ -1452,7 +1265,7 @@
     const bRecheckThumbs = document.getElementById("btn-md-recheck-thumbs");
     const recheckProgress = document.getElementById("md-recheck-progress");
     if (bRecheckThumbs) {
-      bRecheckThumbs.addEventListener("click", async () => {
+      scope.listen(bRecheckThumbs, "click", async () => {
         if (bRecheckThumbs.disabled) return;
         if (!nativeBridgeUp()) {
           window._showToast?.("YTArchiver isn't ready yet. Try again in a moment.", "warn"); return;
@@ -1534,12 +1347,14 @@
       // away to another tab in the 400ms window, the fetch isn't
       // needed and would just spam the bridge (audit:
       // metadataTab.js:1077).
-      setTimeout(() => {
+      scope.timeout(() => {
         if (!metaView.hidden) {
           window._refreshMetadataTab?.();
         }
       }, 400);
     }
+    window._metadataTabInited = true;
+    });
   }
   window._initMetadataTab = initMetadataTab;
 

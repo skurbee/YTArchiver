@@ -87,7 +87,8 @@ def test_api_config_mutators_serialize_disjoint_concurrent_changes():
     from backend.api_mixins.info_mixin import InfoMixin
     from backend.api_mixins.onboarding_mixin import OnboardingMixin
     from backend.api_mixins.queue_mixin import QueueMixin
-    from backend.services.app_services import AppServices
+    from backend.services.composition import compose_application_services
+    from backend.services.config_repository import ConfigRepository
 
     seed = copy.deepcopy(config.DEFAULT_CONFIG)
     seed["url_history"] = ["existing-url"]
@@ -121,10 +122,11 @@ def test_api_config_mutators_serialize_disjoint_concurrent_changes():
             self._window = None
             self._reload_config = lambda: None
             self._on_queue_changed = lambda: None
-            self.services = AppServices(
-                load_config=config.load_config,
-                save_config=config.save_config,
-                update_config=controlled_update,
+            self.services = compose_application_services(
+                config=ConfigRepository(config.load_config, config.save_config,
+                                        controlled_update),
+                config_path=str(config.CONFIG_FILE),
+                can_write=config.config_is_writable,
                 queues=SimpleNamespace(),
                 log_stream=null_dependency,
                 transcribe=null_dependency,

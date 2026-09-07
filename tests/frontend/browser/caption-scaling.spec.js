@@ -1,4 +1,4 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 const { loadApp } = require("./fixtures");
 
 const BASE_FONT = { xsmall: 6, small: 13, medium: 20, large: 26 };
@@ -224,27 +224,9 @@ test("X-small remains a distinct persisted caption size after reload", async ({ 
   expect(await page.evaluate(() => localStorage.getItem("ytarchiver_caption_size"))).toBe("xsmall");
   await expect.poll(() => page.evaluate(() => window.__bridgeCallsFor("settings_save")
     .some(call => call.args[0]?.caption_overlay_size === "xsmall"))).toBe(true);
-  await page.addInitScript(() => {
-    // Confirm backend preferences can restore X-small independently of the
-    // local browser cache. Install when the fixture bridge becomes available,
-    // regardless of which addInitScript runs first.
-    localStorage.removeItem("ytarchiver_caption_size");
-    const configure = setHandler => setHandler("settings_load", () => Promise.resolve({
-      output_dir: "C:\\FixtureArchive", video_out_dir: "C:\\FixtureArchive",
-      default_resolution: "1080", caption_overlay_size: "xsmall",
-      caption_overlay_mode: "default", caption_overlay_bg: "translucent",
-    }));
-    if (typeof window.__setBridgeHandler === "function") configure(window.__setBridgeHandler);
-    else Object.defineProperty(window, "__setBridgeHandler", {
-      configurable: true,
-      set(handler) {
-        Object.defineProperty(window, "__setBridgeHandler", {
-          configurable: true, writable: true, value: handler,
-        });
-        configure(handler);
-      },
-    });
-  });
+  // The fixture persists acknowledged settings across reloads like the host.
+  // Removing only the browser caption cache proves backend restoration.
+  await page.evaluate(() => localStorage.removeItem("ytarchiver_caption_size"));
   await page.reload({ waitUntil: "load" });
   await page.waitForFunction(() => window._watchActionsInited === true);
   await renderFixture(page, { keepPreferences: true });

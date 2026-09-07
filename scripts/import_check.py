@@ -1,8 +1,7 @@
 """Import the backend in a disposable application-data environment.
 
-``main.py`` is compiled but deliberately not imported: importing it acquires
-the Windows single-instance mutex, which is an application action rather than
-an import-graph check.
+The desktop entry module is importable: native effects are confined to its
+explicit launch function. Import it here without invoking that function.
 """
 from __future__ import annotations
 
@@ -52,6 +51,10 @@ def import_backend() -> list[str]:
                     importlib.import_module(module.name)
                 except Exception as exc:  # noqa: BLE001 - import boundary
                     failures.append(f"{module.name}: {type(exc).__name__}")
+            try:
+                importlib.import_module("main")
+            except Exception as exc:
+                failures.append(f"main: {type(exc).__name__}")
         finally:
             for name, value in old_env.items():
                 if value is None:

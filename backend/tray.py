@@ -33,12 +33,13 @@ def activity_spin_color(*, sync_working: bool, gpu_working: bool,
                         traffic_waiting: bool) -> str | None:
     """Return the native activity-spinner color, or ``None`` when paused/idle.
 
-    A traffic-governor wait is still part of an active sync. Keep the blue
-    spinner moving through that wait; the caller's ``sync_working`` state is
-    what distinguishes active waiting from a genuinely paused queue.
+    A rolling-budget wait parks sync work. Independent local processing can
+    still animate; otherwise the caller displays the static pause indicator.
     """
     if gpu_working:
         return "red"
+    if traffic_waiting:
+        return None
     if sync_working:
         return "blue"
     return None
@@ -143,6 +144,7 @@ class TrayController:
         # visual priority over the ordinary new-download count until the user
         # clears that error list, while the spinner can remain visible.
         self._error_count: int = 0
+        self._traffic_waiting: bool = False
         # The notification-area icon and the taskbar button are distinct
         # Windows surfaces. pystray owns the former; ITaskbarList3 uses this
         # HWND for the small spinner/count overlay on the latter.
@@ -297,7 +299,7 @@ class TrayController:
     def _static_icon_image(self):
         if self._base_img is None:
             return None
-        if self._error_count or self._badge_count:
+        if self._traffic_waiting or self._error_count or self._badge_count:
             normalized = self._compose_tray_spin_frame(None)
             if normalized is not None:
                 return normalized
@@ -344,6 +346,7 @@ class TrayController:
         `color` = "blue" (sync) or "red" (gpu)."""
         if not self._started or not self._icon:
             return
+        self.set_traffic_waiting(False)
         new_color = (80, 160, 240, 255) if color == "blue" else (230, 80, 80, 255)
         # OLD uses 0.18s/frame for blue (sync), 0.12s/frame for red (GPU) — red
         # spins faster to signal GPU work is active. Mirrors YTArchiver.py:3481.
@@ -388,14 +391,20 @@ class TrayController:
         # the new loop also writes it. Previously the two threads
         # overlapped and the icon flickered between their frames,
         # sometimes getting stuck on an intermediate state.
-        self._spin_stop.set()
-        _old_thread = self._spin_thread
+        with self._icon_lock:
+            self._spin_stop.set()
+            self._spin_epoch += 1
+            stopped_epoch = self._spin_epoch
+            _old_thread = self._spin_thread
         if _old_thread is not None:
             try:
                 _old_thread.join(timeout=0.5)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-        self._spin_thread = None
+        with self._icon_lock:
+            if self._spin_epoch != stopped_epoch:
+                return  # a newer activity transition owns the icons now
+            self._spin_thread = None
         # Restore base icon (possibly with badge if a count is set)
         if self._icon and self._base_img:
             try:
@@ -404,6 +413,16 @@ class TrayController:
             except Exception as e:
                 _log.debug("swallowed: %s", e)
         self._refresh_taskbar_static()
+
+    def set_traffic_waiting(self, waiting: bool) -> None:
+        """Show a static yellow pause on both icons during a request-limit wait."""
+        waiting = bool(waiting)
+        if self._traffic_waiting == waiting:
+            return
+        self._traffic_waiting = waiting
+        # stop_spin invalidates any delayed animation frame before restoring
+        # the static icon. The caller starts animation again when work resumes.
+        self.stop_spin()
 
     def set_badge(self, count: int):
         """Overlay a small count badge on the tray icon (downloaded-this-session).
@@ -516,12 +535,26 @@ class TrayController:
         return img
 
     def _compose_taskbar_overlay(self, frame: int | None = None):
-        """Build a transparent spinner/badge for the taskbar button."""
+        """Build a transparent activity indicator and optional count/error badge."""
         if self._Image is None or self._ImageDraw is None:
             return None
         try:
             img = self._Image.new("RGBA", (32, 32), (0, 0, 0, 0))
             draw = self._ImageDraw.Draw(img)
+            waiting = self._traffic_waiting
+            if waiting:
+                frame = None
+                # Two high-contrast bars remain legible after the shell scales
+                # the overlay to 16px. Leave space for a smaller alert/count.
+                compact = bool(self._error_count or self._badge_count)
+                right = 23 if compact else 30
+                draw.rounded_rectangle(
+                    [1, 1, right, 30], radius=4,
+                    fill=(35, 30, 18, 245))
+                for left in ((5, 14) if compact else (8, 20)):
+                    draw.rounded_rectangle(
+                        [left, 7, left + 4, 24], radius=1,
+                        fill=(245, 180, 55, 255))
             if frame is not None:
                 import math
                 opacities = [255, 220, 180, 140, 100, 70, 40, 25]
@@ -535,12 +568,13 @@ class TrayController:
                         fill=(base[0], base[1], base[2], alpha),
                     )
             if self._error_count:
-                radius = 8 if frame is not None else 12
+                radius = 7 if waiting else (8 if frame is not None else 12)
                 self._draw_error_badge(
-                    draw, cx=16, cy=16, radius=radius)
+                    draw, cx=24 if waiting else 16,
+                    cy=24 if waiting else 16, radius=radius)
             elif self._badge_count:
-                radius = 8 if frame is not None else 12
-                cx = cy = 16
+                radius = 7 if waiting else (8 if frame is not None else 12)
+                cx = cy = 24 if waiting else 16
                 draw.ellipse(
                     [cx - radius, cy - radius, cx + radius, cy + radius],
                     fill=(220, 40, 40, 255),
@@ -550,7 +584,7 @@ class TrayController:
                     if self._badge_count < 10 else "9+")
                 try:
                     font = self._ImageDraw.ImageFont.truetype(
-                        "arial.ttf", 11 if frame is not None else 14)
+                        "arial.ttf", 10 if waiting else (11 if frame is not None else 14))
                 except Exception:
                     font = None
                 try:
@@ -594,13 +628,18 @@ class TrayController:
             return self._base_img.copy()
 
     def _refresh_taskbar_static(self) -> None:
-        """Show the unseen-download badge, or clear an idle overlay."""
+        """Show pause/error/count state, or clear an idle overlay."""
         if not self._taskbar_hwnd:
             return
         try:
             from .taskbar_overlay import WindowsTaskbarOverlay
-            with WindowsTaskbarOverlay(self._taskbar_hwnd) as overlay:
-                if self._error_count:
+            with self._icon_lock, WindowsTaskbarOverlay(self._taskbar_hwnd) as overlay:
+                if self._traffic_waiting:
+                    label = "YTArchiver is waiting for a YouTube request-limit slot"
+                    if self._error_count:
+                        label += "; errors also need attention"
+                    overlay.set_pil_image(self._compose_taskbar_overlay(), label)
+                elif self._error_count:
                     overlay.set_pil_image(
                         self._compose_taskbar_overlay(),
                         "YTArchiver errors need attention — open for details",
@@ -632,21 +671,27 @@ class TrayController:
                 break
             try:
                 img = self._compose_tray_spin_frame(frame)
-                if self._icon and img is not None:
-                    with self._icon_lock:
+                with self._icon_lock:
+                    # A timed-out join must not let an old frame overwrite a
+                    # newer static pause badge or another animation thread.
+                    if epoch != self._spin_epoch or self._spin_stop.is_set():
+                        break
+                    if self._icon and img is not None:
                         self._icon.icon = img
-                if taskbar is not None and taskbar.available:
-                    taskbar.set_pil_image(
-                        self._compose_taskbar_overlay(frame),
-                        "YTArchiver is working",
-                    )
+                    if taskbar is not None and taskbar.available:
+                        taskbar.set_pil_image(
+                            self._compose_taskbar_overlay(frame),
+                            "YTArchiver is working",
+                        )
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             frame += 1
             self._spin_stop.wait(self._spin_interval)
         if taskbar is not None:
             try:
-                taskbar.clear()
+                with self._icon_lock:
+                    if epoch == self._spin_epoch:
+                        taskbar.clear()
             except Exception:
                 pass
             taskbar.close()

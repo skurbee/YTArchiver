@@ -6,6 +6,32 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v84.5 - More efficient syncing and clearer status
+
+09.07.26 2:10pm
+
+### Downloads and YouTube traffic
+
+- YouTube page, API, caption, artwork, and thumbnail request attempts now share the rolling hourly and daily budgets throughout a download. Usage survives restarts, and requests stop if safety checks cannot be completed.
+- Separated the short 1–2 second pause between requests from the configured pause between jobs. Video downloads retain their 10–20 second pause without repeating a long delay for every small request.
+- Automatic metadata saves reuse the video's original extraction, including up to 50 top comments. Incomplete saved information falls back to a fresh lookup; explicit metadata refreshes still fetch current information.
+- Download one suitable English caption track, preferring human captions and falling back when a track is missing, empty, or fails. Original English auto-captions are recognized locally without an extra lookup.
+- Initial channel syncs fetch channel artwork before videos under the same task, so choosing Sync Now immediately after adding a channel no longer fails because artwork is busy.
+- Large channel syncs start downloading before every catalog page has been fetched. Discovery progress remains visible, and channel-level failures are no longer presented as failed videos.
+- Failed or cancelled first syncs no longer schedule a successful-batch cooldown. Completed downloads and transcriptions count once, and metadata completion replaces the queued log line.
+- Request-limit waits show a static yellow pause on the taskbar and tray icons, with the expected resume time in the tooltip. Activity animation returns when work resumes; independent processing keeps its activity indicator.
+- Thumbnail fallbacks also honor the shared budget and stop immediately on a YouTube rate-limit response.
+
+### Library, processing, and recovery
+
+- Backups include the full Search database by default, with an opt-out. Large database backups and restores use consistent SQLite snapshots and available staging space instead of the former fixed size limit.
+- Unreadable saved queues block writes and backups that could replace recoverable pending work. Queue commands target the current task and roll back reservations when saving fails.
+- Download and transcription work share a channel only when they belong to the same operation. Transcript text and timestamp updates share write locks and recovery tracking, and completion requires actual transcript content.
+- Processing events and prompts remain available until the interface acknowledges them; stale progress cannot overwrite newer completion state.
+- Watch, Browse, and metadata views discard results from earlier selections or page requests. Late playback actions cannot affect a different video.
+- Settings preserve edits made while preferences are loading and recover correctly when a save fails. Additional archive folders remain configured until their Search cleanup succeeds.
+- Watch controls use the existing bounded startup script recovery when their initial script load is unavailable.
+
 ## v84.4 - Release check correction
 
 09.05.26 11:59pm

@@ -557,7 +557,10 @@ class RetranscribeReceiptIndexTests(unittest.TestCase):
                 video_a, _video_b, aggregate, title_a, _title_b = self._seed(
                     root)
                 txt = aggregate.with_name("Fixture Channel 2026 Transcript.txt")
-                txt.write_text("existing readable transcript\n", encoding="utf-8")
+                txt.write_text(
+                    f"===({title_a}), (01.01.2026), (0:01), (WHISPER:small), "
+                    f"(youtu.be/{self.VIDEO_A})===\nexisting readable transcript\n",
+                    encoding="utf-8")
                 conn = index._open()
                 assert conn is not None
                 disk_before = (aggregate.read_bytes(), txt.read_bytes())

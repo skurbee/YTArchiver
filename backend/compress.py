@@ -466,61 +466,13 @@ def compress_video(input_path: str, stream: LogStreamer,
             stream.emit_error(f"Couldn't start video compression: {e}")
             return {"ok": False, "error": str(e)}
 
-        # Drain stderr on a side thread + read lines from a queue with a
-        # timeout. The previous `for line in proc.stderr:` blocked on
-        # readline forever when ffmpeg stopped producing output (NVENC
-        # driver wedge, paused pipeline, etc.) \u2014 cancel_event would not be
-        # checked again until a new line arrived. With a polling queue.get,
-        # cancel is reacted to within 250ms regardless of ffmpeg output.
-        import queue as _queue
-        _stderr_q: _queue.Queue = _queue.Queue()
-        _SENTINEL = object()
-
-        def _drain_stderr():
-            try:
-                for _l in proc.stderr:
-                    _stderr_q.put(_l)
-            except Exception as _de:
-                _log.debug("stderr drain failed: %s", _de)
-            finally:
-                _stderr_q.put(_SENTINEL)
-
-        _stderr_thread = threading.Thread(
-            target=_drain_stderr, daemon=True,
-            name=f"compress-stderr-drain-{os.getpid()}")
-        _stderr_thread.start()
+        from .process_runner import supervise_streaming_process
 
         last_pct = -1
         first_progress_emitted = False
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=3)
-                except Exception:
-                    proc.kill()
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
-                stream.emit_text(" \u26d4 Encode cancelled.", "red")
-                # Drop the reserved slot: a cancelled encode never emits a
-                # done line, so its half-drawn progress bar would otherwise
-                # stay parked under the video row.
-                clear_compress_marker(stream, input_path)
-                return {"ok": False, "reason": "cancelled"}
-            try:
-                line = _stderr_q.get(timeout=0.25)
-            except _queue.Empty:
-                # Check process is still alive \u2014 if ffmpeg died without
-                # writing more stderr, the drain thread will push SENTINEL
-                # soon. Loop continues so cancel_event still gets polled.
-                if proc.poll() is not None and _stderr_q.empty():
-                    break
-                continue
-            if line is _SENTINEL:
-                break
 
+        def _on_encode_line(line: str) -> None:
+            nonlocal last_pct, first_progress_emitted
             m = _FFMPEG_TIME_RE.search(line)
             if m and dur > 0:
                 sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
@@ -550,41 +502,32 @@ def compress_video(input_path: str, stream: LogStreamer,
                         except Exception as _cb_e:
                             stream.emit_dim(f" (progress_cb failed: {_cb_e})")
 
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            # Full terminate→wait→kill→wait so a hung ffmpeg (NVENC driver
-            # wedge) doesn't leave proc.returncode=None — which would let
-            # the "smaller than orig" safety below misinterpret a truncated
-            # stub as a successful encode.
+        run_result = supervise_streaming_process(
+            proc, on_stderr_line=_on_encode_line, cancel_event=cancel_event,
+            owner=process_owner, task_id=task_id, role="compression",
+        )
+        if run_result.cancelled:
             try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=2)
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-        # unregister from PROCESS_REGISTRY now that the
-        # encode has exited.
-        try:
-            from .process_runner import PROCESS_REGISTRY
-            PROCESS_REGISTRY.unregister(proc)
-        except Exception:
-            pass
+                os.remove(temp_path)
+            except OSError:
+                pass
+            stream.emit_text(" \u26d4 Encode cancelled.", "red")
+            clear_compress_marker(stream, input_path)
+            return {"ok": False, "reason": "cancelled"}
 
         # check ffmpeg returncode BEFORE accepting the output.
         # A mid-encode crash (NVENC driver reset, OOM, etc.) leaves a short
         # temp file that was smaller than the original — with no returncode
         # check, the "smaller than orig" safety below would PROMOTE the
         # truncated stub over the pristine source. Not recoverable.
-        if proc.returncode is not None and proc.returncode != 0:
-            stream.emit_error(
-                f"ffmpeg exited with code {proc.returncode}; leaving original intact.")
+        if run_result.returncode != 0 or not run_result.output_complete:
+            error = (f"ffmpeg exited with code {run_result.returncode}"
+                     if run_result.returncode != 0
+                     else "Compression output could not be read completely")
+            stream.emit_error(f"{error}; leaving original intact.")
             try: os.remove(temp_path)
             except OSError: pass
-            return {"ok": False, "error": f"ffmpeg rc={proc.returncode}",
+            return {"ok": False, "error": error,
                     "reason": "ffmpeg_error"}
 
         if not os.path.isfile(temp_path):

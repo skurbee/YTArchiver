@@ -158,7 +158,7 @@ def _probe_local(ffprobe: str, filepath: str) -> dict[str, Any]:
 def _ytsearch(yt: str, query: str, n: int,
               cancel_event: threading.Event | None = None) -> list[dict[str, Any]]:
     """yt-dlp `ytsearchN:<query>` -> candidate dicts (id/title/duration/channel)."""
-    from ..sync.ytdlp_proc import _find_cookie_source
+    from ..ytdlp_options import _find_cookie_source
     if not query.strip():
         return []
     cmd = [yt, f"ytsearch{n}:{query}", "--flat-playlist",

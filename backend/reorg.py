@@ -673,7 +673,8 @@ def _reorg_channel_impl(channel_folder: str, split_years: bool, split_months: bo
                 # Also sync the file's mtime so future non-recheck runs are correct
                 try:
                     ts_new = d.timestamp()
-                    os.utime(video, (ts_new, ts_new))
+                    if not dry_run:
+                        os.utime(video, (ts_new, ts_new))
                     redated += 1
                 except OSError as e:
                     stream.emit_text(

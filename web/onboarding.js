@@ -96,7 +96,7 @@
           + "still space out YouTube requests and pause if YouTube starts "
           + "rejecting them. Auto-sync cannot use “When budget allows” in this mode.";
       } else if (p?.sweep?.channels) {
-        text += ` One complete sweep is estimated at about ${p.sweep.units} operations.`;
+        text += ` Minimum sweep estimate: ${p.sweep.units} budget units. New videos and additional pages use more.`;
       }
       summary.textContent = text;
       summary.classList.toggle("is-warning", _trafficMode === "unlimited" || p?.fits_complete_sweep === false);

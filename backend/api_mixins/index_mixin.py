@@ -15,6 +15,7 @@ import uuid
 
 from backend import archive_scan
 from backend import index as index_backend
+from backend.services.archive_roots import ArchiveRootCommands
 from backend.services.job_supervisor import WorkAdmissionClosed
 from backend.services.managed_work import (
     admitted_operation,
@@ -29,18 +30,16 @@ from ._shared import _log
 _fts_state_init_lock = threading.Lock()
 
 
+from backend.services.config_snapshot import config_snapshot
+
+
 class IndexMixin:
     def _index_services(self):
         return getattr(self, "services", None)
 
     def _index_config(self):
-        services = self._index_services()
-        if services is not None:
-            return services.fresh_config()
-        cfg = getattr(self, "_config", None)
-        if cfg is not None:
-            return cfg
-        return load_config()
+        return config_snapshot(self, load_config)
+
 
     def _index_log_stream(self):
         services = self._index_services()
@@ -51,7 +50,7 @@ class IndexMixin:
 
     def get_index_summary(self):
         """Return Index tab data: cards + per-channel breakdown."""
-        if self._config is None:
+        if self._index_services() is None and getattr(self, "_config", None) is None:
             # never return None to JS — the caller at
             # app.js:2813 does `.then((idx) => ... idx.get(...))`
             # which blows up on null. Empty dict keeps the Index
@@ -60,7 +59,7 @@ class IndexMixin:
                 "cards": [], "per_channel": [],
                 "total_videos": 0, "total_size_bytes": 0,
             }
-        return archive_scan.index_summary()
+        return archive_scan.index_summary(cfg=self._index_config())
 
 
     def get_index_db_stats(self):
@@ -83,27 +82,15 @@ class IndexMixin:
 
 
     def index_remove_archive_root(self, folder):
-        """Forget one Additional archive folder without deleting its files."""
-        raw_root = str(folder or "").strip()
-        if not raw_root:
-            return {"ok": False, "error": "Archive folder is required."}
-        root = os.path.abspath(os.path.normpath(raw_root))
-        cfg = self._index_config()
-        primary_raw = str(cfg.get("output_dir") or "").strip()
-        primary = (os.path.abspath(os.path.normpath(primary_raw))
-                   if primary_raw else "")
-        overlaps_primary = False
-        if primary:
-            try:
-                root_key = os.path.normcase(root)
-                primary_key = os.path.normcase(primary)
-                common = os.path.commonpath([root_key, primary_key])
-                overlaps_primary = common in {root_key, primary_key}
-            except (OSError, ValueError):
-                overlaps_primary = False
-        if overlaps_primary:
-            return {"ok": False,
-                    "error": "This folder overlaps the primary archive."}
+        """Compatibility entry point for the complete root-removal command."""
+        return self.archive_root_remove(folder)
+
+    def archive_root_remove(self, folder):
+        """Remove one configured additional folder from Settings and Search."""
+        root = os.path.abspath(os.path.normpath(str(folder or "").strip())) if folder else ""
+        base_result = {"ok": False, "removed": False, "already_removed": False,
+                       "root": root, "videos": 0, "segments": 0,
+                       "config_restored": True, "retryable": True}
         task_id = f"remove-index-root-{uuid.uuid4().hex}"
         cancel = threading.Event()
         try:
@@ -121,13 +108,19 @@ class IndexMixin:
                     cancel=cancel,
                 )
                 if not admission.ok or admission.lease is None:
-                    return lease_busy_result(admission)
+                    return {**base_result, **lease_busy_result(admission)}
                 try:
-                    return index_backend.delete_catalog_under_root(root)
+                    command = ArchiveRootCommands(
+                        self.services.config_repository,
+                        index_backend.delete_catalog_under_root)
+                    result = command.remove(folder, cancelled=cancel.is_set)
+                    if result["ok"] and result["removed"]:
+                        self._reload_config()
+                    return result
                 finally:
                     admission.lease.release()
         except WorkAdmissionClosed as exc:
-            return {"ok": False, "error": str(exc)}
+            return {**base_result, "error": str(exc)}
 
 
     def index_count_transcripts(self, folder=None):

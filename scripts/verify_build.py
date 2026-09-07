@@ -12,13 +12,18 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 REQUIRED_ARCHIVE_ENTRIES = (
+    "backend\\yt_dlp_plugins\\ytarchiver\\yt_dlp_plugins\\postprocessor\\ytarchiver_traffic.py",
     "backend\\punct_worker.py",
     "backend\\whisper_worker.py",
+    "backend\\worker_protocol.py",
     "licenses\\README.md",
     "requirements\\worker-cpu.lock",
     "requirements\\worker-cuda.lock",
     "THIRD_PARTY_NOTICES.md",
     "web\\bridge.js",
+    "web\\eventState.js",
+    "web\\pagedCollection.js",
+    "web\\watchSession.js",
     "web\\index.html",
     "web\\punctRestoreDialog.js",
 )

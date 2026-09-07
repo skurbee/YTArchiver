@@ -1,4 +1,4 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 const { loadApp } = require("./fixtures");
 
 test("Manual bulk actions show feedback while their summary is being counted", async ({ page }) => {

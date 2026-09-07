@@ -91,6 +91,10 @@ class AutorunScheduler:
         self._clock_anchor_24 = self._validated_clock_anchor(
             _initial_config.get("autorun_clock_time_24"), 1440)
         self._lock = threading.RLock()
+        # Native lifecycle inspection never waits behind configuration I/O.
+        # Keep every still-running timer, including a cancelled predecessor.
+        self._lifecycle_lock = threading.Lock()
+        self._lifecycle_timers: set[threading.Timer] = set()
         # A preference change touches both live timer state and the config
         # file. Serialize that two-part transaction so two quick UI changes
         # cannot persist or roll back over one another.
@@ -594,7 +598,14 @@ class AutorunScheduler:
             self._next_fire_ts = time.time() + sec
         t = threading.Timer(sec, self._fire)
         t.daemon = True
-        t.start()
+        with self._lifecycle_lock:
+            self._lifecycle_timers = {old for old in self._lifecycle_timers if old.is_alive()}
+            self._lifecycle_timers.add(t)
+            try:
+                t.start()
+            except BaseException:
+                self._lifecycle_timers.discard(t)
+                raise
         self._timer = t
         if persist_deadline:
             self._persist_timer_deadline_locked()
@@ -884,16 +895,19 @@ class AutorunScheduler:
             self._timer_waiting_for_startup = False
 
     def is_alive(self) -> bool:
-        with self._lock:
-            timer = self._timer
-            return bool(timer is not None and timer.is_alive())
+        return bool(self._live_timers())
+
+    def _live_timers(self):
+        with self._lifecycle_lock:
+            self._lifecycle_timers = {t for t in self._lifecycle_timers if t.is_alive()}
+            return tuple(self._lifecycle_timers)
 
     def join(self, timeout: float = 1.0) -> bool:
-        with self._lock:
-            timer = self._timer
-        if timer is not None and timer.is_alive():
-            timer.join(timeout=max(0.0, float(timeout)))
-        return timer is None or not timer.is_alive()
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        for timer in self._live_timers():
+            if timer is not threading.current_thread():
+                timer.join(timeout=max(0.0, deadline - time.monotonic()))
+        return not self._live_timers()
 
 
 # ── Activity-log history append ────────────────────────────────────────

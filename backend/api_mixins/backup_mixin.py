@@ -291,18 +291,9 @@ class BackupMixin:
         """ZIP the user's config + queue state + cached ID list + seen-filters
         + disk cache + livestream journal into a user-picked file.
 
-        also include the FTS transcript index DB when it's
-        small enough to fit (< 2GB). Previously the DB was
-        unconditionally skipped, which meant "full backup" restore
-        returned a usable archive browser that then had EVERY
-        transcript search return empty until the user kicked off a
-        full re-transcribe. Now the authoritative search index rides
-        along in the ZIP too — the backup is actually full.
-
-        The 2GB cap is a pragmatic stop: ZIP deflate slows dramatically
-        past that size and the ZIP64 format has its own constraints.
-        For archives where the DB exceeds the cap, the UI surfaces a
-        size warning so users can decide to export manually.
+        Include a consistent SQLite snapshot of the Search database unless
+        the user has opted out in backup settings. The shared ZIP64 writer
+        streams databases of any size; bookmarks and notes are always saved.
         """
         try:
             import webview as _wv

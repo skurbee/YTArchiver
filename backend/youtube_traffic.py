@@ -1,13 +1,14 @@
 """Persistent YouTube traffic governor.
 
-YTArchiver deliberately treats a yt-dlp launch as an *operation*, not as an
-exact HTTP-request count.  One extractor launch can issue several
-webpage/player requests internally, while media fragments use a different
-traffic path.  The governor therefore combines:
+The required yt-dlp request plugin obtains shared permission before each
+YouTube page, API, caption, artwork, or manifest URL open. Existing launch
+charges remain as a conservative job-start allowance. Media chunks and
+redirects/retries internal to a transport are not individual units; this
+is a request-attempt budget, not a wire-level HTTP meter. The governor combines:
 
 * a rolling one-hour operation budget;
 * a rolling 24-hour operation budget;
-* randomized minimum spacing between launches; and
+* randomized minimum spacing between admitted requests and launches; and
 * a restart-safe event ledger under the app-data directory.
 
 The conservative defaults are intentionally far below yt-dlp's empirically
@@ -37,6 +38,15 @@ TRAFFIC_FILE = APP_DATA_DIR / "youtube_traffic.jsonl"
 CIRCUIT_FILE = APP_DATA_DIR / "youtube_rate_limit_state.json"
 HOUR_SECONDS = 3600
 DAY_SECONDS = 86400
+# Job launches retain the user's configured pause. Requests within those jobs
+# share a shorter clock so each page/player call does not restart that pause.
+REQUEST_MIN_GAP = 1.0
+REQUEST_MAX_GAP = 2.0
+_REQUEST_KINDS = frozenset({
+    "youtube_http", "youtube_page", "youtube_api", "youtube_caption",
+    "youtube_thumbnail", "youtube_manifest", "youtube_media_manifest",
+    "youtube_media", "channel_art_image",
+})
 
 TRAFFIC_PRESETS: dict[str, dict[str, int]] = {
     "conservative": {
@@ -67,12 +77,18 @@ _loaded = False
 _events: list[dict[str, Any]] = []
 _last_launch_ts = 0.0
 _next_gap_seconds = 0.0
+_last_request_ts = 0.0
+_next_request_gap_seconds = 0.0
 _reservations: dict[str, dict[str, Any]] = {}
 _scope = threading.local()
 _active_waits: dict[int, dict[str, Any]] = {}
 _wait_listeners: list[Any] = []
 _budget_override_active = False
 _override_wakeup = threading.Event()
+_circuit_memory: dict[str, Any] | None = None
+_circuit_memory_path = ""
+_circuit_dirty = False
+_circuit_error = ""
 
 
 def _notify_wait_listeners(state: dict[str, Any]) -> None:
@@ -158,42 +174,79 @@ def budget_override_active() -> bool:
 
 
 def _load_circuit_locked(now: float | None = None) -> dict[str, Any]:
+    """Read a snapshot without discarding a decision made by this process."""
+    global _circuit_memory, _circuit_memory_path, _circuit_dirty, _circuit_error
     now = time.time() if now is None else float(now)
-    incidents: list[float] = []
-    cooldown_until = 0.0
+    path_key = os.path.abspath(CIRCUIT_FILE)
+    if _circuit_memory_path != path_key:
+        _circuit_memory_path = path_key
+        _circuit_memory = None
+        _circuit_dirty = False
+        _circuit_error = ""
     try:
-        if CIRCUIT_FILE.is_file():
+        try:
             data = json.loads(CIRCUIT_FILE.read_text(encoding="utf-8"))
-            incidents = [
-                float(ts) for ts in (data.get("incidents") or [])
-                if float(ts) > now - 7 * DAY_SECONDS
-            ]
-            cooldown_until = float(data.get("cooldown_until") or 0)
+        except FileNotFoundError:
+            data = {"incidents": [], "cooldown_until": 0}
+        if not isinstance(data, dict) or not isinstance(data.get("incidents", []), list):
+            raise ValueError("invalid circuit state")
+        incidents = [float(ts) for ts in data.get("incidents", [])]
+        cooldown_until = float(data.get("cooldown_until") or 0)
+        if not all(math.isfinite(ts) and ts >= 0 for ts in [*incidents, cooldown_until]):
+            raise ValueError("invalid circuit timestamps")
+        disk = {"incidents": incidents, "cooldown_until": cooldown_until}
+        if _circuit_memory is not None:
+            # A failed write, deletion or stale external snapshot cannot undo
+            # an incident already observed here. Expiry still uses real time.
+            incidents = sorted(set(incidents + _circuit_memory["incidents"]))
+            cooldown_until = max(cooldown_until, _circuit_memory["cooldown_until"])
+        _circuit_memory = {"incidents": incidents, "cooldown_until": cooldown_until}
+        _circuit_dirty = disk != _circuit_memory
+        if not _circuit_dirty:
+            _circuit_error = ""
     except Exception as exc:
+        _circuit_error = "YouTube traffic safety state could not be read. Try again when storage is available."
         _log.warning("YouTube rate-limit state read failed: %s", exc)
+    state = _circuit_memory or {"incidents": [], "cooldown_until": 0.0}
+    incidents = [ts for ts in state["incidents"] if ts > now - 7 * DAY_SECONDS]
+    cooldown_until = state["cooldown_until"]
     return {
         "incidents": incidents,
         "cooldown_until": cooldown_until,
         "active": cooldown_until > now,
         "remaining_seconds": max(0, cooldown_until - now),
+        "state_known": _circuit_memory is not None,
+        "persisted": _circuit_memory is not None and not _circuit_dirty,
+        "error": _circuit_error,
     }
 
 
-def _save_circuit_locked(state: dict[str, Any]) -> None:
+def _save_circuit_locked(state: dict[str, Any]) -> bool:
+    """Persist the already-published decision; failure keeps it authoritative."""
+    global _circuit_memory, _circuit_dirty, _circuit_error
+    _circuit_memory = {"incidents": list(state["incidents"]),
+                       "cooldown_until": float(state["cooldown_until"])}
+    _circuit_dirty = True
+    temp = Path(str(CIRCUIT_FILE) + f".{os.getpid()}.tmp")
     try:
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        temp = Path(str(CIRCUIT_FILE) + f".{os.getpid()}.tmp")
-        temp.write_text(json.dumps(
-            {
-                "incidents": state.get("incidents") or [],
-                "cooldown_until": float(state.get("cooldown_until") or 0),
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ), encoding="utf-8")
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(_circuit_memory, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temp, CIRCUIT_FILE)
+        _circuit_dirty = False
+        _circuit_error = ""
+        return True
     except Exception as exc:
+        _circuit_error = "YouTube cooldown remains active, but could not be saved for the next launch."
         _log.warning("YouTube rate-limit state save failed: %s", exc)
+        return False
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def record_rate_limit(now: float | None = None) -> dict[str, Any]:
@@ -206,6 +259,9 @@ def record_rate_limit(now: float | None = None) -> dict[str, Any]:
         # the log safety net. Treat every signal during an already-active
         # cooldown as the same incident.
         if state["active"]:
+            if not state["persisted"]:
+                state["persisted"] = _save_circuit_locked(state)
+                state["error"] = _circuit_error
             return state
         incidents.append(now)
         count = len(incidents)
@@ -217,7 +273,9 @@ def record_rate_limit(now: float | None = None) -> dict[str, Any]:
             "remaining_seconds": cooldown_hours * HOUR_SECONDS,
             "cooldown_hours": cooldown_hours,
         }
-        _save_circuit_locked(state)
+        state["persisted"] = _save_circuit_locked(state)
+        state["state_known"] = True
+        state["error"] = _circuit_error
         return state
 
 
@@ -305,7 +363,7 @@ def estimate_channel_units(channel: dict[str, Any]) -> int:
 
 
 def estimate_sweep(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Estimate operation cost for one complete configured-channel sweep."""
+    """Estimate minimum sweep cost; pagination and downloads add request units."""
     if cfg is None:
         cfg = load_config()
     channels = [
@@ -403,7 +461,7 @@ def projection(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def _read_events_locked() -> None:
-    global _loaded, _events, _last_launch_ts
+    global _loaded, _events, _last_launch_ts, _last_request_ts
     if _loaded:
         return
     rows: list[dict[str, Any]] = []
@@ -465,11 +523,14 @@ def _read_events_locked() -> None:
 
     _events = sorted(rows, key=lambda item: item["ts"])
     positive = [
-        row["ts"] for row in _events
+        row for row in _events
         if row["hourly_units"] > 0
         and row.get("kind") != "autosync_sweep_reservation"
     ]
-    _last_launch_ts = max(positive, default=0.0)
+    _last_launch_ts = max((row["ts"] for row in positive
+                           if row["kind"] not in _REQUEST_KINDS), default=0.0)
+    _last_request_ts = max((row["ts"] for row in positive
+                            if row["kind"] in _REQUEST_KINDS), default=0.0)
     _loaded = True
     _prune_locked(time.time())
     if legacy_refunds:
@@ -546,8 +607,17 @@ def _expiry_for_units_locked(now: float, seconds: int, limit: int,
     return now + seconds
 
 
+def _gap_at_locked(settings: dict[str, Any], kind: str, now: float) -> float:
+    if kind in _REQUEST_KINDS:
+        return (_last_request_ts + max(REQUEST_MIN_GAP, _next_request_gap_seconds)
+                if _last_request_ts else now)
+    return (_last_launch_ts + max(float(settings["min_gap"]), _next_gap_seconds)
+            if _last_launch_ts else now)
+
+
 def eligibility(units: int = 1, cfg: dict[str, Any] | None = None,
                 *, include_gap: bool = True,
+                kind: str = "youtube",
                 ignore_limits: bool = False,
                 now: float | None = None) -> dict[str, Any]:
     """Return whether units can launch now and the earliest eligible time."""
@@ -565,10 +635,7 @@ def eligibility(units: int = 1, cfg: dict[str, Any] | None = None,
         hour_ts = now if ignore_limits else _expiry_for_units_locked(
             now, HOUR_SECONDS, int(settings["hourly"]), requested,
             "hourly_units")
-        gap_ts = now
-        if include_gap and _last_launch_ts > 0:
-            gap_ts = _last_launch_ts + max(
-                float(settings["min_gap"]), _next_gap_seconds)
+        gap_ts = _gap_at_locked(settings, kind, now) if include_gap else now
         next_ts = max(now, day_ts, hour_ts, gap_ts)
         daily_used = _window_units_locked(
             now, DAY_SECONDS, "daily_units")
@@ -577,6 +644,8 @@ def eligibility(units: int = 1, cfg: dict[str, Any] | None = None,
         circuit = _load_circuit_locked(now)
         if circuit["active"]:
             next_ts = max(next_ts, float(circuit["cooldown_until"]))
+        if not circuit["state_known"]:
+            next_ts = max(next_ts, now + 60)  # recheck storage, not an invented cooldown
     wait_candidates = [
         ("daily_limit", day_ts),
         ("hourly_limit", hour_ts),
@@ -588,6 +657,8 @@ def eligibility(units: int = 1, cfg: dict[str, Any] | None = None,
     wait_reason = None
     if next_ts > now + 0.05:
         wait_reason = max(wait_candidates, key=lambda item: item[1])[0]
+    if not circuit["state_known"]:
+        wait_reason = "circuit_unavailable"
     impossible = not ignore_limits and bool(
         (settings["daily"] > 0 and requested > settings["daily"])
         or (settings["hourly"] > 0 and requested > settings["hourly"])
@@ -656,6 +727,8 @@ def sweep_eligibility(cfg: dict[str, Any] | None = None,
         cadence_ts,
         float(circuit["cooldown_until"]) if circuit["active"] else now,
     )
+    if not circuit["state_known"]:
+        next_ts = max(next_ts, now + 60)
     impossible = bool(
         estimated_units <= 0
         or (settings["daily"] > 0 and requested > settings["daily"]))
@@ -682,6 +755,7 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
             pause_event=None, stream=None) -> dict[str, Any]:
     """Wait for and consume permission for one YouTube operation."""
     global _last_launch_ts, _next_gap_seconds
+    global _last_request_ts, _next_request_gap_seconds
     requested = max(1, int(units or 1))
     reservation_id = _current_reservation()
     announced = False
@@ -695,6 +769,8 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
             cfg = load_config()
             override = budget_override_active()
             circuit = circuit_state(now)
+            if not circuit["state_known"]:
+                return {"ok": False, "circuit_error": True, "error": circuit["error"]}
             if circuit["active"]:
                 resume = time.strftime(
                     "%I:%M%p", time.localtime(circuit["cooldown_until"])
@@ -709,7 +785,7 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
                 }
             check = eligibility(
                 requested, cfg, include_gap=True, ignore_limits=override,
-                now=now)
+                kind=kind, now=now)
             if check["impossible"]:
                 return {
                     "ok": False,
@@ -733,10 +809,7 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
                     hour_at = now if override else _expiry_for_units_locked(
                         now, HOUR_SECONDS, int(settings["hourly"]), requested,
                         "hourly_units")
-                    gap_at = (
-                        _last_launch_ts
-                        + max(float(settings["min_gap"]), _next_gap_seconds)
-                        if _last_launch_ts else now)
+                    gap_at = _gap_at_locked(settings, kind, now)
                     next_at = max(hour_at, gap_at)
                     allowed = next_at <= now + 0.05
                     wait_seconds = max(0.0, next_at - now)
@@ -750,7 +823,7 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
                     # workers cannot oversubscribe a window or the gap.
                     check = eligibility(
                         requested, cfg, include_gap=True,
-                        ignore_limits=override, now=now)
+                        ignore_limits=override, kind=kind, now=now)
                     allowed = bool(check["allowed"])
                     wait_seconds = float(check["wait_seconds"] or 0)
                     wait_reason = check.get("wait_reason")
@@ -784,11 +857,16 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
                     if reserved_available:
                         reservation["remaining"] = (
                             int(reservation["remaining"]) - requested)
-                    _last_launch_ts = now
-                    _next_gap_seconds = random.uniform(
-                        float(settings["min_gap"]),
-                        float(settings["max_gap"]),
-                    )
+                    if kind in _REQUEST_KINDS:
+                        _last_request_ts = now
+                        _next_request_gap_seconds = random.uniform(
+                            REQUEST_MIN_GAP, REQUEST_MAX_GAP)
+                    else:
+                        _last_launch_ts = now
+                        _next_gap_seconds = random.uniform(
+                            float(settings["min_gap"]),
+                            float(settings["max_gap"]),
+                        )
                     return {
                         "ok": True,
                         "units": requested,
@@ -1033,6 +1111,8 @@ def status(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
         "hourly_limit": settings["hourly"],
         "min_gap": settings["min_gap"],
         "max_gap": settings["max_gap"],
+        "request_min_gap": REQUEST_MIN_GAP,
+        "request_max_gap": REQUEST_MAX_GAP,
         "daily_used": daily_used,
         "hourly_used": hourly_used,
         "daily_remaining": (
@@ -1050,16 +1130,24 @@ def _reset_for_tests(path: Path | None = None,
                      circuit_path: Path | None = None) -> None:
     """Reset process-local state; intentionally private test helper."""
     global _loaded, _events, _last_launch_ts, _next_gap_seconds
+    global _last_request_ts, _next_request_gap_seconds
     global TRAFFIC_FILE, CIRCUIT_FILE, _budget_override_active
+    global _circuit_memory, _circuit_memory_path, _circuit_dirty, _circuit_error
     with _lock:
         if path is not None:
             TRAFFIC_FILE = path
         if circuit_path is not None:
             CIRCUIT_FILE = circuit_path
         _loaded = False
+        _circuit_memory = None
+        _circuit_memory_path = ""
+        _circuit_dirty = False
+        _circuit_error = ""
         _events = []
         _last_launch_ts = 0.0
         _next_gap_seconds = 0.0
+        _last_request_ts = 0.0
+        _next_request_gap_seconds = 0.0
         _reservations.clear()
         _active_waits.clear()
         _wait_listeners.clear()

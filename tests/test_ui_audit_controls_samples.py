@@ -1,7 +1,6 @@
 """Sample confirmations are exact, expire safely, and unblock cancellation."""
 from __future__ import annotations
 
-import json
 import os
 import queue
 import tempfile
@@ -19,8 +18,8 @@ class Stream:
     def __init__(self):
         self.events = queue.Queue()
 
-    def emit(self, segments):
-        self.events.put(json.loads(segments[0][0]))
+    def emit_control(self, payload):
+        self.events.put(payload)
 
     def flush(self):
         pass
@@ -104,7 +103,7 @@ def test_ambiguous_legacy_ack_cannot_answer_two_samples():
 def test_failed_sample_publish_cancels_instead_of_continuing():
     api = redownload_mixin.RedownloadMixin()
     stream = mock.Mock()
-    stream.emit.side_effect = RuntimeError("event bridge unavailable")
+    stream.emit_control.side_effect = RuntimeError("event bridge unavailable")
     assert api._wait_redownload_sample(20, "smaller", "720p", 10, threading.Event(), stream) == "cancel"
     assert api._redwnl_samples == {}
 
@@ -128,6 +127,8 @@ def test_cancel_before_worker_entry_does_not_start_download_and_clears_only_at_e
     api._redownload_log_stream = mock.Mock(return_value=mock.Mock())
     api._redwnl_cancel = threading.Event()
     api._redwnl_cancel.set()
+    api._redwnl_lock = threading.Lock()
+    api._redwnl_pending = []
     api._window = None
     api._on_queue_changed = mock.Mock()
     run = mock.Mock()

@@ -294,9 +294,21 @@
         <div class="settings-view" id="settings-view-backups" hidden>
           <label class="subs-section-label">Backups</label>
           <div class="health-view-intro">
-            Backups save YTArchiver's settings, subscriptions, queues, app history, bookmarks, and notes. They do not copy downloaded videos or transcript files. The Search index is included when it fits the backup size limit and can be rebuilt when omitted; bookmarks and notes are still included.
+            Backups save YTArchiver's settings, subscriptions, queues, app history, bookmarks, and notes. They do not copy downloaded videos or transcript files. The full Search database is included by default, with no size limit.
           </div>
           <div class="edit-grid health-backup-grid">
+            <label class="edit-gl">Backup contents</label>
+            <div class="edit-gv-stack settings-field-with-help">
+              <label class="edit-gv-inline settings-checkbox-row">
+                <input type="checkbox" id="settings-backup-include-search-db" checked disabled
+                       aria-describedby="backup-search-db-help" />
+                <span>Include Search database <span id="backup-search-db-size">(loading size&hellip;)</span></span>
+              </label>
+              <div class="settings-field-help" id="backup-search-db-help">
+                Applies to manual and automatic backups. Large databases need more time and disk space. Uncheck to leave out the Search database; bookmarks and notes are still included, but Search may need rebuilding after a restore.
+              </div>
+            </div>
+
             <label class="edit-gl" for="settings-auto-backup">Automatic backups</label>
             <div class="edit-gv-stack settings-field-with-help">
               <select class="ctl-select" id="settings-auto-backup"
@@ -316,7 +328,7 @@
             <div class="edit-gv-stack settings-field-with-help">
               <div class="edit-gv-inline edit-gap-6">
                 <button class="btn btn-ghost btn-thin" id="btn-export-backup"
-                        title="Save app settings, subscriptions, unfinished work, history, bookmarks, and notes to a ZIP file">Save backup&hellip;</button>
+                        title="Save app settings, subscriptions, unfinished work, history, bookmarks, and notes to a ZIP file, including the Search database when selected">Save backup&hellip;</button>
                 <button class="btn btn-ghost btn-thin" id="btn-import-backup"
                         title="Restore a backup zip after safely saving the current app settings">Restore&hellip;</button>
               </div>

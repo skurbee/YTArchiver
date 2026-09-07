@@ -582,11 +582,8 @@ def _write_transcript_entry_plain(txt_path: str, title: str, date_str: str,
             try:
                 with open(tmp, "w", encoding="utf-8") as fh:
                     fh.write(new_content)
-                    try:
-                        fh.flush()
-                        os.fsync(fh.fileno())
-                    except OSError as e:
-                        _log.debug("swallowed: %s", e)
+                    fh.flush()
+                    os.fsync(fh.fileno())
                 os.replace(tmp, txt_path)
             except OSError:
                 try: os.remove(tmp)

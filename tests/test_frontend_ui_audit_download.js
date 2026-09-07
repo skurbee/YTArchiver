@@ -2,10 +2,9 @@
 
 // Headless behavioral tests: no browser, native bridge, or live profile.
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
+const { frontendSource } = require("./frontend/source");
 
 class Element {
   constructor(tag = "div") {
@@ -94,7 +93,7 @@ function harness(ids, bridge = async () => ({ ok: true })) {
   return {
     window, document, elements, timers, observers, toasts,
     load(file) {
-      vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "web", file), "utf8"), context, { filename: file });
+      vm.runInContext(frontendSource(file), context, { filename: file });
     },
     async tick() {
       const item = timers.entries().next().value;

@@ -283,7 +283,12 @@ class InterruptibleProbeTests(unittest.TestCase):
                     return_value=False), \
                 mock.patch.object(
                     channel_identity.youtube_traffic, "circuit_state",
-                    return_value={"active": False}), \
+                    return_value={
+                        "incidents": [], "cooldown_until": 0.0,
+                        "active": False, "remaining_seconds": 0.0,
+                        "state_known": True, "persisted": True,
+                        "error": "", "incident_count_7d": 0, "cooldown_hours": 6,
+                    }), \
                 mock.patch.object(
                     channel_identity.youtube_traffic, "eligibility",
                     return_value=waiting), \

@@ -203,7 +203,7 @@
   // nothing changes in the program."
   window._onArchiveRescanComplete = async function () {
     try {
-      const _browseState = window._browseState || {};
+      const _browseState = window.YT.util.requireBrowseState();
       let refreshedGrid = false;
       // If we're viewing a channel's video grid right now, re-query it.
       const ch = (_browseState.currentChannel) || null;

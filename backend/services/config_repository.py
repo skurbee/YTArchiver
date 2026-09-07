@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -9,6 +10,10 @@ from typing import Any
 ConfigLoader = Callable[[], dict[str, Any]]
 ConfigSaver = Callable[[dict[str, Any]], bool]
 ConfigUpdater = Callable[[Callable[[dict[str, Any]], Any]], tuple[Any, dict[str, Any]]]
+
+# Application commands with both config and runtime/catalog effects share this
+# order. ConfigRepository still owns atomic field patches through its updater.
+CONFIG_COMMAND_LOCK = threading.RLock()
 
 
 @dataclass(slots=True)

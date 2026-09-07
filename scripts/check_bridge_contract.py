@@ -66,19 +66,110 @@ def frontend_methods(web_dir: Path = WEB) -> set[str]:
 
 
 def backend_methods(root: Path = ROOT) -> set[str]:
+    """Resolve Api's real source inheritance without importing application code."""
+    modules: dict[str, tuple[dict, dict]] = {}
+    classes: dict[tuple[str, str], ast.ClassDef] = {}
+    resolving: set[tuple[str, str]] = set()
+    linearizations: dict[tuple[str, str], list[tuple[str, str]]] = {}
+
+    def module_symbols(module: str) -> tuple[dict, dict]:
+        if module in modules:
+            return modules[module]
+        path = root.joinpath(*module.split("."))
+        source = path.with_suffix(".py")
+        package = module.rpartition(".")[0]
+        if not source.is_file():
+            source = path / "__init__.py"
+            package = module
+        if not source.is_file():
+            raise ValueError(f"Cannot resolve bridge base module: {module}")
+        names: dict[str, ast.ClassDef] = {}
+        aliases: dict[str, str] = {}
+        for node in ast.parse(source.read_text(encoding="utf-8-sig"), filename=str(source)).body:
+            if isinstance(node, ast.ClassDef):
+                names[node.name] = node
+            elif isinstance(node, ast.ImportFrom):
+                base = node.module or ""
+                if node.level:
+                    parts = package.split(".") if package else []
+                    if node.level > len(parts):
+                        raise ValueError(f"Invalid relative import in {module}")
+                    base = ".".join(parts[:len(parts)-node.level+1] + ([base] if base else []))
+                for alias in node.names:
+                    if alias.name != "*":
+                        aliases[alias.asname or alias.name] = f"{base}.{alias.name}"
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    aliases[alias.asname or alias.name.split(".")[0]] = (
+                        alias.name if alias.asname else alias.name.split(".")[0])
+            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        aliases[target.id] = f"{module}.{node.value.id}"
+        modules[module] = names, aliases
+        return names, aliases
+
+    def resolve(qualified: str, seen: frozenset[str] = frozenset()) -> tuple[str, str]:
+        if qualified in seen:
+            raise ValueError(f"Cyclic bridge base alias: {qualified}")
+        module, _, name = qualified.rpartition(".")
+        names, aliases = module_symbols(module)
+        if name in names:
+            key = module, name
+            classes[key] = names[name]
+            return key
+        if name in aliases:
+            return resolve(aliases[name], seen | {qualified})
+        raise ValueError(f"Cannot resolve bridge base class: {qualified}")
+
+    def base_class(module: str, expr: ast.expr) -> tuple[str, str] | None:
+        if isinstance(expr, ast.Name) and expr.id == "object":
+            return None
+        parts = []
+        while isinstance(expr, ast.Attribute):
+            parts.insert(0, expr.attr)
+            expr = expr.value
+        if not isinstance(expr, ast.Name):
+            raise ValueError(f"Unsupported dynamic Api base in {module}")
+        _, aliases = module_symbols(module)
+        head = aliases.get(expr.id, f"{module}.{expr.id}")
+        return resolve(".".join([head, *parts]))
+
+    def mro(key: tuple[str, str]) -> list[tuple[str, str]]:
+        if key in linearizations:
+            return linearizations[key]
+        if key in resolving:
+            raise ValueError(f"Cyclic bridge inheritance: {key}")
+        resolving.add(key)
+        bases = [base for expr in classes[key].bases
+                 if (base := base_class(key[0], expr)) is not None]
+        sequences = [list(mro(base)) for base in bases] + [list(bases)]
+        result = [key]
+        while any(sequences):
+            sequences = [sequence for sequence in sequences if sequence]
+            candidate = next((sequence[0] for sequence in sequences
+                              if not any(sequence[0] in other[1:] for other in sequences)), None)
+            if candidate is None:
+                raise ValueError(f"Inconsistent bridge inheritance: {key}")
+            result.append(candidate)
+            for sequence in sequences:
+                if sequence[0] == candidate:
+                    sequence.pop(0)
+        resolving.remove(key)
+        linearizations[key] = result
+        return result
+
     methods: set[str] = set()
-    paths = [root / "main.py", *sorted((root / "backend" / "api_mixins").glob("*.py"))]
-    for path in paths:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in tree.body:
-            if not isinstance(node, ast.ClassDef):
-                continue
-            if node.name != "Api" and not node.name.endswith("Mixin"):
-                continue
-            for member in node.body:
-                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if not member.name.startswith("_"):
-                        methods.add(member.name)
+    for key in reversed(mro(resolve("main.Api"))):
+        for member in classes[key].body:
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not member.name.startswith("_"):
+                    methods.add(member.name)
+            elif isinstance(member, (ast.Assign, ast.AnnAssign)):
+                targets = member.targets if isinstance(member, ast.Assign) else [member.target]
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        methods.discard(target.id)
     return methods
 
 

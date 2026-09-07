@@ -77,11 +77,14 @@ class _FakeIndex:
         self.calls = []
         self._reader_lock = threading.Lock()
 
+    def catalog_session(self):
+        return self
+
     def _reader_open(self):
         return self.connection
 
     @contextmanager
-    def _interactive_reader(self, _operation):
+    def read(self, _operation):
         yield self.connection
 
     def execute(self, sql, args):
@@ -200,7 +203,7 @@ def test_segment_resolver_uses_catalog_channel_above_year_folder(
 
 def test_bookmark_catalog_unavailable_raises_instead_of_looking_empty(
         monkeypatch):
-    monkeypatch.setattr(index_bookmarks._idx, "_reader_open", lambda: None)
+    monkeypatch.setattr(_backend_index, "_reader_open", lambda: None)
 
     try:
         index_bookmarks.bookmark_list()

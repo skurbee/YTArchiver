@@ -4,7 +4,6 @@ YTArchiver — pywebview shell.
 Run with Python 3.13 (pywebview ships; PATH's 3.11 doesn't).
 """
 
-import ctypes
 import os
 import sys
 import threading
@@ -35,124 +34,12 @@ def _boot_trace(label: str) -> None:
         pass
 
 
-_boot_trace("module start")
 
 
-def _ensure_webview2_browser_args() -> None:
-    """Disable WebView2's video overlay plane before the control is created."""
-    if os.name != "nt":
-        return
-    key = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"
-    switch = "--disable-direct-composition-video-overlays"
-    current = os.environ.get(key, "").strip()
-    if switch in current:
-        return
-    os.environ[key] = f"{current} {switch}".strip()
-
-
-_ensure_webview2_browser_args()
-
-# APP_VERSION + APP_VERSION_DATE live in backend/version.py — bump THERE
-# (+0.1, single-decimal rollover) on every push. Surfaced in the window
-# title, /cmd/ping, and the header bar.
-from backend.version import APP_VERSION
-
-# ── Single-instance mutex ──────────────────────────────────────────────
-_INSTANCE_MUTEX = None
-if os.name == "nt":
-    _INSTANCE_MUTEX = ctypes.windll.kernel32.CreateMutexW(
-        None, False, "Local\\YTArchiver_SingleInstance")
-    if ctypes.windll.kernel32.GetLastError() == 183: # ERROR_ALREADY_EXISTS
-        # Another instance is running — focus its window and exit.
-        import ctypes.wintypes as _wt
-        _WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, _wt.HWND, _wt.LPARAM)
-
-        def _window_belongs_to_this_exe(hwnd) -> bool:
-            pid = _wt.DWORD()
-            try:
-                ctypes.windll.user32.GetWindowThreadProcessId(
-                    hwnd, ctypes.byref(pid))
-                if not pid.value:
-                    return False
-                _k32 = ctypes.windll.kernel32
-                _k32.OpenProcess.restype = _wt.HANDLE
-                h_proc = _k32.OpenProcess(
-                    0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
-                if not h_proc:
-                    return False
-                try:
-                    size = _wt.DWORD(32768)
-                    buf = ctypes.create_unicode_buffer(size.value)
-                    ok = _k32.QueryFullProcessImageNameW(
-                        h_proc, 0, buf, ctypes.byref(size))
-                    if not ok:
-                        return False
-                    return (Path(buf.value).name.lower()
-                            == Path(sys.executable).name.lower())
-                finally:
-                    _k32.CloseHandle(h_proc)
-            except Exception:
-                return False
-
-        def _find_and_focus(hwnd, _):
-            _n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-            if _n > 0:
-                _buf = ctypes.create_unicode_buffer(_n + 1)
-                ctypes.windll.user32.GetWindowTextW(hwnd, _buf, _n + 1)
-                # Accept both historical title spellings when focusing an
-                # existing instance.
-                _tv = _buf.value
-                if _tv in {"YTArchiver", "YT Archiver"} \
-                        and _window_belongs_to_this_exe(hwnd):
-                    ctypes.windll.user32.ShowWindow(hwnd, 9) # SW_RESTORE
-                    ctypes.windll.user32.SetForegroundWindow(hwnd)
-                    return False
-            return True
-        _cb = _WNDENUMPROC(_find_and_focus)
-        ctypes.windll.user32.EnumWindows(_cb, 0)
-        print("[YTArchiver] Another instance is already running.")
-        sys.exit(0)
-
-try:
-    import webview
-    _boot_trace("webview imported")
-except ImportError:
-    try:
-        import ctypes
-        ctypes.windll.user32.MessageBoxW(
-            None,
-            "YTArchiver requires pywebview.\n\n"
-            "Install with Python 3.13:\n"
-            " Python313\\python.exe -m pip install pywebview",
-            "YTArchiver", 0x10,
-        )
-    except Exception as e:
-        # _log isn't defined yet at this stage (set below) — use print
-        # so a secondary ctypes failure doesn't mask the original
-        # ImportError with NameError.
-        print(f"[YTArchiver] pywebview ImportError MessageBox failed: {e}")
-    sys.exit(1)
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 INDEX = WEB / "index.html"
-_boot_trace("paths resolved")
-
-# Phase 0 demo-data shim (backend/sample_logs.py + web/sample.json) was
-# removed once real backends were wired up. No-config / DEMO_MODE paths
-# now just return empty results — the UI handles those cleanly.
-sys.path.insert(0, str(ROOT))
-
-# web/index.html is built from a template and partials. Assemble the output
-# file before pywebview opens the window so the UI sees a complete HTML
-# page. Idempotent: skipped if index.html is already up to date.
-try:
-    from backend.html_assembler import assemble_index_html
-    assemble_index_html(WEB)
-    _boot_trace("html assembled")
-except Exception as _e:  # pragma: no cover - boot-time best effort
-    print(f"[html_assembler] could not (re)build index.html: {_e}")
-    _boot_trace("html assemble failed")
 
 from backend import auto_backup as auto_backup_backend
 from backend import autorun as autorun_backend
@@ -161,29 +48,31 @@ from backend import net as net_backend
 from backend import sync as sync_backend
 from backend import trash_retention as trash_retention_backend
 from backend import window_state as winstate
-from backend.archive_capacity import archive_capacity_status
 from backend.log import get_logger as _get_logger
 from backend.log import install as _install_log_bridge
 from backend.log_stream import LogStreamer
 from backend.queues import QueueState
-from backend.services import AppServices, BridgeEventBus
+from backend.services import BridgeEventBus
+from backend.services.composition import compose_application_services
+from backend.services.config_repository import ConfigRepository
 from backend.services.job_supervisor import JobSupervisor, OwnerAdapter
 from backend.services.managed_work import (
     start_managed_task,
     try_global_archive_lease,
 )
+from backend.services.startup_sequence import StartupDependencies, StartupSequence
 from backend.transcribe import TranscribeManager
 from backend.tray import TrayController, activity_spin_color
+from backend.version import APP_VERSION
 from backend.ytarchiver_config import (
     CONFIG_FILE,
     backup_config_on_start,
     config_file_exists,
+    config_is_writable,
     load_config,
     save_config,
     update_config,
 )
-
-_boot_trace("backend imports complete")
 
 _log = _get_logger("main")
 
@@ -215,15 +104,13 @@ from backend.api_mixins import (
     WindowMixin,
 )
 
-_boot_trace("api mixins imported")
-
 
 class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, DiagnosticsMixin, IndexMixin, InfoMixin, LivestreamsMixin, MediaOpsMixin, MetadataMixin, OnboardingMixin, QueueMixin, RecentMixin, RedownloadMixin, SettingsMixin, StartupMixin, SubsMixin, SyncMixin, ThumbnailMixin, TrashMixin, TranscribeMixin, VideoMixin, WindowMixin):
     """
     Exposed to JS as window.pywebview.api.*
 
-    Phase 0: only enough to seed logs with test data.
-    Later phases: add every YTArchiver action here.
+    Composes long-lived services and delegates feature endpoints. Runtime
+    admission, native-window ownership, and shutdown are coordinated here.
     """
 
     def __init__(self):
@@ -326,47 +213,32 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # eventually fire callbacks that touch self._queues; building
         # the queue object first ensures `self._queues` exists if any
         # of those callbacks race init.
-        # wrap queue load in try/except so a corrupt queue file
-        # doesn't brick the entire app — log + start empty, and back
-        # up the corrupt file for debugging.
+        # Keep the hydration owner on failure: it preserves unreadable
+        # recovery files and blocks writes until the same owner loads safely.
         self._queues = QueueState()
         try:
             self._queues.load()
         except Exception as _qe:
-            try:
-                import shutil as _sh
-
-                from backend.ytarchiver_config import QUEUE_FILE as _QF
-                _bak = str(_QF) + ".corrupt"
-                _sh.copy2(str(_QF), _bak)
-                print(f"[queues] corrupt queue file backed up to {_bak}: {_qe}")
-            except Exception:
-                print(f"[queues] queue load failed: {_qe}")
-            # Disable atexit on the discarded instance so its atexit
-            # handler can't fire at process exit and clobber the
-            # corrupt-but-recoverable on-disk queue file with this
-            # orphan's empty state. The fresh replacement instance
-            # below registers its own atexit hook.
-            try:
-                self._queues.mark_orphan()
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-            # Reset to a fresh empty state so the app can still launch.
-            self._queues = QueueState()
+            _log.warning("Queue recovery could not finish: %s", _qe)
+        _queue_hydration = self._queues.hydration_status()
+        if not _queue_hydration["writable"]:
+            self._log_stream.emit_error(
+                "Saved queues could not be read. Queue changes are blocked "
+                "to preserve recovery data. Restart and try again. "
+                + str(_queue_hydration["error"]))
         # Pull whisper model from config so Settings changes actually take
         # effect on next launch. Without this the TranscribeManager defaults
         # to "large-v3" regardless of what the user picked in Settings.
         _init_model = (load_config() or {}).get("whisper_model") or "small"
         self._transcribe = TranscribeManager(self._log_stream, model=_init_model)
         self._event_bus = BridgeEventBus(lambda: self._window)
-        self.services = AppServices(
-            load_config=load_config,
-            save_config=save_config,
+        self.services = compose_application_services(
+            config=ConfigRepository(load_config, save_config, update_config),
+            config_path=str(CONFIG_FILE), can_write=config_is_writable,
             queues=self._queues,
             log_stream=self._log_stream,
             transcribe=self._transcribe,
             event_bus=self._event_bus,
-            update_config=update_config,
         )
 
         from backend.disk_watch import DiskErrorMonitor
@@ -667,6 +539,23 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 )
         except Exception as e:
             _log.debug("swallowed: %s", e)
+
+        self.services.startup = StartupSequence(StartupDependencies(
+            config=self.services.config_repository,
+            log_stream=self.services.log_stream, events=self.services.event_bus,
+            catalog=index_backend, window=lambda: self._window,
+            restore_pending=self._transcribe.load_pending,
+            publish_config=self._accept_config_snapshot,
+            queue_changed=self._on_queue_changed,
+            sync_running=self.sync_is_running,
+            manual_running=self.archive_single_is_running,
+            processing_busy=self._transcribe.has_current_job,
+            autorun_ready=self._autorun.notify_startup_ready,
+            trash_ready=self._trash_retention.notify_startup_ready,
+        ))
+
+    def _accept_config_snapshot(self, snapshot: dict) -> None:
+        self._config = snapshot
 
     @staticmethod
     def _thread_is_alive(thread_obj) -> bool:
@@ -989,9 +878,12 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             # (not spinning) while a pass is paused between channels.
             tray = getattr(self, "_tray", None)
             if tray is not None:
-                _traffic_waiting = bool(_traffic_wait.get("active"))
+                _sync_paused_now = bool(payload["sync_paused"] or _sync_pa)
+                _traffic_waiting = (bool(_traffic_wait.get("active"))
+                                    and sync_working and not _sync_paused_now)
+                tray.set_traffic_waiting(_traffic_waiting and not gpu_working)
                 _spin_color = activity_spin_color(
-                    sync_working=sync_working,
+                    sync_working=sync_working and not _sync_paused_now,
                     gpu_working=gpu_working,
                     traffic_waiting=_traffic_waiting,
                 )
@@ -1018,17 +910,27 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     tray.set_tooltip(tip)
                 else:
                     tray.stop_spin()
-                    if getattr(tray, "error_active", False) is True:
-                        tray.set_tooltip(
-                            "YTArchiver — Errors need attention — open for details")
-                    elif _traffic_waiting:
+                    if _traffic_waiting:
                         _wait_label = (
                             "24-hour" if _traffic_wait.get("reason")
                             == "daily_limit" else "hourly"
                         )
+                        tip = f"YTArchiver — Paused for YouTube {_wait_label} limit"
+                        try:
+                            _until = float(_traffic_wait.get("until") or 0)
+                            if _until > time.time():
+                                _resume_local = time.localtime(_until)
+                                _resume_time = time.strftime("%I:%M %p", _resume_local).lstrip("0")
+                                if _resume_local.tm_yday != time.localtime().tm_yday:
+                                    _resume_time = (f"{_resume_local.tm_mon}/{_resume_local.tm_mday} "
+                                                    f"at {_resume_time}")
+                                tip += f" — resumes {_resume_time}"
+                        except (TypeError, ValueError, OverflowError, OSError):
+                            pass
+                        tray.set_tooltip(tip)
+                    elif getattr(tray, "error_active", False) is True:
                         tray.set_tooltip(
-                            "YTArchiver \u2014 Waiting for YouTube "
-                            f"{_wait_label} slot")
+                            "YTArchiver — Errors need attention — open for details")
                     else:
                         tray.set_tooltip("YTArchiver \u2014 Idle")
         except Exception as e:
@@ -1071,522 +973,8 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             self._config = None
 
     def _run_startup_sequence(self, cancel_event=None):
-        """Three-stage startup log matching YTArchiver's OLD timing:
-
-            Stage 1 (< 2s) --- Startup checks complete, ready to download ---
-                              → Sync Subbed + related buttons enable here
-            Stage 2 (20-40s) --- Disk scan complete (N ch \u00b7 M vids \u00b7 X TB) ---
-                              → staleness-gated: if cache is newer than
-                                `disk_scan_staleness_hours`, skip the walk
-                                and just report from the cache (instant)
-            Stage 3 (background) --- newly-added files swept into the index
-
-        The stages run sequentially under one supervised startup owner and
-        emit each milestone as it finishes. A small joined indicator helper
-        animates the "Loading\u00b7" line in verbose mode; simple mode sees
-        only the three green milestones (the tick is VERBOSE_ONLY).
-        """
-        import time as _time
-        cancel_event = cancel_event or threading.Event()
-        s = self._log_stream
-
-        # App-started banner FIRST — must precede the "Startup checks
-        # complete" milestone below. (Moved here from set_window, whose log
-        # fired after this buffered output flushed, so "checks complete"
-        # appeared above "started" and made the checks look instantaneous.)
-        try:
-            s.emit_text(f"YTArchiver {APP_VERSION} started", None)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-
-        def _flush_now():
-            try: s.flush()
-            except Exception as e: _log.debug("swallowed: %s", e)
-
-        def _loading(msg):
-            # In-place status line (replace-in-place via `startup_loading`).
-            # Filtered from simple mode — user sees only the green milestones.
-            try:
-                s.emit([[f" {msg}\n", "startup_loading"]])
-                _flush_now()
-            except Exception as e: _log.debug("swallowed: %s", e)
-
-        _loading("Loading\u00b7 ")
-
-        # Pending-transcribe journal restore (fast, runs before any milestone).
-        try:
-            n = self._transcribe.load_pending()
-            if n > 0:
-                s.emit_text(
-                    f" \u2014 Restored {n} pending transcription job(s) from last session.",
-                    "simpleline_blue")
-                _flush_now()
-        except Exception as _pe:
-            s.emit_dim(f" (pending-journal restore skipped: {_pe})")
-            _flush_now()
-
-        cfg = self._config or load_config()
-        # Startup status for low-priority background indexing.
-        dots_state = {
-            "i": 0,
-            "sweep": {"phase": "Starting up", "detail": ""},
-        }
-        stage3_done = threading.Event()
-
-        def _push_indicator(slot, text):
-            """Push startup status text, or `None`/`""` to hide it.
-            Visible in Simple + Verbose.
-
-            Use json.dumps to encode the text argument. A manual replace-chain
-            escaped
-            `\\` and `'` only — a literal newline / carriage return
-            inside a channel folder name would produce broken JS
-            (unescaped newline inside a quoted string is a
-            SyntaxError) which evaluate_js then silently swallowed
-            into the outer except below, leaving the indicator
-            stuck on its last value for the affected tick.
-            """
-            import json as _json
-            try:
-                w = self._window
-                if w is None:
-                    return
-                if text:
-                    safe = _json.dumps(text)  # returns a fully-quoted JS string literal
-                    w.evaluate_js(
-                        f"window._setIndicator && "
-                        f"window._setIndicator({_json.dumps(slot)}, {safe})")
-                else:
-                    w.evaluate_js(
-                        f"window._setIndicator && "
-                        f"window._setIndicator({_json.dumps(slot)}, null)")
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-
-        def _animate_dots():
-            """Cycle dots on each active status slot. When a
-            slot's `phase` is empty, its UI indicator is hidden; when
-            populated, we emit `{phase}{dots} {detail}`."""
-            while not stage3_done.is_set() and not cancel_event.is_set():
-                dots_state["i"] = (dots_state["i"] + 1) % 3
-                d = ["\u00b7 ", "\u00b7\u00b7 ", "\u00b7\u00b7\u00b7"][dots_state["i"]]
-                log_parts = []
-                for slot in ("sweep",):
-                    state = dots_state[slot]
-                    phase = state.get("phase") or ""
-                    detail = state.get("detail") or ""
-                    if phase:
-                        line = (f"{phase}{d} {detail}" if detail
-                                else f"{phase}{d}")
-                        _push_indicator(slot, line.strip())
-                        log_parts.append(line.strip())
-                    else:
-                        _push_indicator(slot, None)
-                # Log mirror for the verbose startup "Loading" line.
-                if log_parts:
-                    _loading(" \u00b7 ".join(log_parts))
-                cancel_event.wait(0.4)
-            # NOTE: post-stage-3 indicator state is handled by the
-            # caller after stage3_done.set(). The animator deliberately
-            # doesn't touch the slot on exit so it can't race-overwrite
-            # cleanup.
-        animator = threading.Thread(
-            target=_animate_dots, daemon=True, name="startup-indicator")
-        animator.start()
-
-        def _clear_loading():
-            """Remove the in-place Loading line from the DOM."""
-            try:
-                w = self._window
-                if w is not None:
-                    w.evaluate_js("window.clearStartupLine && window.clearStartupLine()")
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-
-        def _fire_ready_js():
-            """Tell the UI to un-gray the Sync Subbed / Sync Tasks buttons."""
-            try:
-                w = self._window
-                if w is not None:
-                    w.evaluate_js("window._setReady && window._setReady(true)")
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-
-        # ── Stage 1: Startup checks (immediate — < 2s) ─────────────────
-        # No heavy I/O at this stage. Emit the green milestone right away
-        # so the user sees the app responded, and flip the Sync buttons
-        # active so they can kick off a sync without waiting for background
-        # indexing.
-        try:
-            s.emit_text("--- Startup checks complete, ready to download ---",
-                        "simpleline_green")
-            _flush_now()
-        except Exception as e: _log.debug("swallowed: %s", e)
-        _fire_ready_js()
-        # Paint the restored queue NOW. Items restored from last session
-        # in Api.__init__ were loaded before the window existed, so their
-        # listener pushes were silently dropped (self._window is None in
-        # _on_queue_changed). Without this explicit repaint, restored
-        # Sync/GPU tasks stayed invisible until the next incidental queue
-        # mutation — after a cold reboot that could be the end of the
-        # disk scan, ~45s later, which read as "my queue is gone."
-        try:
-            self._on_queue_changed()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-
-        # Every startup archive walk is lowest-priority work. This predicate
-        # stays true for an entire sync worker/pass, allowing a scan that
-        # began before the user pressed Sync/Resume to stop cooperatively
-        # instead of monopolizing pooled-storage metadata I/O underneath it.
-        def _startup_low_priority_busy():
-            try:
-                if index_backend.is_foreground_browse_busy():
-                    return True
-            except Exception:
-                pass
-            try:
-                if self.sync_is_running():
-                    return True
-            except Exception:
-                pass
-            try:
-                if self.archive_single_is_running():
-                    return True
-            except Exception:
-                pass
-            try:
-                mgr = self._transcribe
-                if mgr._current_job is not None:
-                    return True
-            except Exception:
-                pass
-            try:
-                from backend.sync.active_state import is_sync_work_active
-                return bool(is_sync_work_active())
-            except Exception:
-                return False
-
-        # ── Stage 2: Disk walk (staleness-gated) ───────────────────────
-        def _stage2_disk_walk():
-            """Refresh disk-scan cache after Stage 1 makes the UI usable."""
-            if cancel_event.is_set():
-                return
-            try:
-                from backend.archive_scan import (
-                    cache_coverage,
-                    heal_malformed_cache_entries,
-                    index_summary,
-                    publish_scan_stats,
-                    scan_all_channels,
-                )
-                # issue #134: drop any cache entries that only contain a
-                # `sweep_fingerprint` (no num_vids/size_bytes). Those can
-                # be left over from older code paths; if present, they
-                # show as "—" in Subs table + Index summary. Force a
-                # walk when any are found so the next pass fills them in.
-                dropped = heal_malformed_cache_entries()
-                coverage = cache_coverage(load_config().get("channels", []))
-                stale_hours = int(cfg.get("disk_scan_staleness_hours", 24) or 0)
-                last_ts = float(cfg.get("last_disk_scan_ts", 0) or 0)
-                age_hours = (_time.time() - last_ts) / 3600.0 if last_ts > 0 else 1e9
-                do_walk = ((stale_hours <= 0) or (age_hours >= stale_hours)
-                           or (last_ts == 0) or (dropped > 0)
-                           or not coverage["complete"])
-
-                if do_walk:
-                    dots_state["sweep"]["phase"] = "Scanning disk"
-                    dots_state["sweep"]["detail"] = ""
-                    def _on_walk(ch_name, idx, total):
-                        clean = (ch_name or "")[:32]
-                        dots_state["sweep"]["phase"] = "Scanning disk"
-                        dots_state["sweep"]["detail"] = f"{idx+1}/{total} \u2014 {clean}"
-                    walked = scan_all_channels(
-                        progress_cb=_on_walk,
-                        stop_if=lambda: (
-                            cancel_event.is_set()
-                            or _startup_low_priority_busy()
-                        ))
-                    if cancel_event.is_set():
-                        return
-                    if walked is None:
-                        dots_state["sweep"]["phase"] = ""
-                        dots_state["sweep"]["detail"] = ""
-                        s.emit_dim(
-                            " Disk scan deferred — sync or foreground work "
-                            "started; existing cache preserved.")
-                        _flush_now()
-                        return False
-                    if walked:
-                        # Merge counts into the current cache so concurrent
-                        # subscriber metadata and newer sync results survive.
-                        published = publish_scan_stats(walked)
-                        coverage = cache_coverage(
-                            load_config().get("channels", []), published)
-                        # Persist the timestamp so next boot can decide
-                        # staleness. Previously the exception handler
-                        # silently swallowed failures — reported
-                        # disk scan running every launch, which means
-                        # this save wasn't sticking. Now we surface
-                        # the outcome so a silent failure (write-gate
-                        # off, disk full, permissions, etc.) is visible
-                        # in the log instead of mysteriously rescanning
-                        # forever.
-                        if coverage["complete"]:
-                            try:
-                                _unused, c2 = update_config(
-                                    lambda live: live.__setitem__(
-                                        "last_disk_scan_ts", _time.time()))
-                                self._config = c2
-                            except Exception as _se:
-                                s.emit_error(
-                                    f"Disk scan timestamp save raised: {_se}")
-                                _flush_now()
-                else:
-                    # Explicit dim log line when we SKIP the scan so
-                    # the user can tell it's honoring the staleness
-                    # setting. Verbose-only.
-                    age_str = (f"{age_hours:.1f}h" if age_hours < 72
-                               else f"{age_hours/24:.1f}d")
-                    s.emit_dim(
-                        f" Disk scan skipped \u2014 last run was {age_str} ago, "
-                        f"staleness threshold is {stale_hours}h.")
-                    _flush_now()
-                # Emit the milestone from the freshly-walked (or still-cached) totals.
-                t = index_summary()["cards"]
-                if not t["scan_complete"]:
-                    s.emit_dim(
-                        " Saved disk scan is incomplete "
-                        f"({t['scanned_channels']}/{t['total_channels']} channels).")
-                elif t["videos"] > 0:
-                    s.emit_text(
-                        f"--- Disk scan complete ({t['channels']} channels \u00b7 "
-                        f"{t['videos']:,} videos \u00b7 "
-                        f"{t['size_gb']/1024:.1f} TB) ---",
-                        "simpleline_green")
-                else:
-                    s.emit_text("--- Disk scan complete ---", "simpleline_green")
-                _flush_now()
-                # issue #134: Subs table was rendered at boot using
-                # whatever was in the cache at that moment — which for
-                # healed/invalidated channels was an empty record that
-                # maps to "—". Now that Stage 2 has just written fresh
-                # stats, ask the UI to re-fetch. Without this push the
-                # user has to click Subs → some other tab → Subs to see
-                # the numbers fill in.
-                try:
-                    if self._window is not None:
-                        self._window.evaluate_js(
-                            "if (window.refreshSubsTable) "
-                            "window.refreshSubsTable();"
-                            "if (document.getElementById('panel-health')"
-                            "?.classList.contains('active')) {"
-                            "if (!document.getElementById('settings-view-library')"
-                            "?.hidden && window._refreshIndexStats) "
-                            "window._refreshIndexStats();"
-                            "if (!document.getElementById('settings-view-overview')"
-                            "?.hidden && window._refreshHealthOverview) "
-                            "window._refreshHealthOverview();}")
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-            except Exception as e:
-                s.emit_error(f"Disk scan error: {e}")
-                _flush_now()
-
-        def _start_subscriber_backfill():
-            """Recover missing card counts without delaying app readiness."""
-            def _run():
-                if cancel_event.is_set():
-                    return
-                try:
-                    from backend.subscriber_counts import (
-                        backfill_missing_counts,
-                    )
-                    current_cfg = self._config or load_config()
-                    result = backfill_missing_counts(
-                        list(current_cfg.get("channels", []) or []))
-                    updated = int(result.get("updated") or 0)
-                    failed = int(result.get("failed") or 0)
-                    excluded = int(result.get("excluded") or 0)
-                    deferred = int(result.get("deferred") or 0)
-                    if updated and self._window is not None:
-                        # refreshSubsTable fans into _primeBrowse, so visible
-                        # channel cards pick up the new counts immediately.
-                        self._window.evaluate_js(
-                            "window.refreshSubsTable && "
-                            "window.refreshSubsTable();")
-                    if updated or failed or excluded or deferred:
-                        summary = f" Subscriber counts: {updated} recovered"
-                        if failed:
-                            summary += f", {failed} still unavailable"
-                        if excluded:
-                            summary += f", {excluded} excluded after 3 attempts"
-                        if deferred:
-                            summary += f", {deferred} deferred"
-                        summary += "."
-                        s.emit_dim(summary)
-                        _flush_now()
-                except Exception as exc:
-                    _log.debug("subscriber-count launch backfill failed: %s",
-                               exc)
-
-            _run()
-
-        # Stage 3: low-priority background sweep.
-        def _stage3_sweep():
-            """Run the archive sweep after disk state is known."""
-            if cancel_event.is_set():
-                return
-            output_dir = (cfg.get("output_dir") or "").strip()
-            sweep_result = {"registered": 0, "ingested": 0}
-
-            def _run_sweep():
-                if not output_dir or cancel_event.is_set():
-                    return
-                sweep_progress = {"detail": ""}
-                def _on_sweep(idx, total, name):
-                    clean = (name or "")[:32]
-                    sweep_progress["detail"] = f"{idx}/{total} \u2014 {clean}"
-                    dots_state["sweep"]["phase"] = "Indexing new files"
-                    dots_state["sweep"]["detail"] = sweep_progress["detail"]
-
-                def _sweep_busy():
-                    busy = _startup_low_priority_busy()
-                    if busy:
-                        # The old label said "Indexing new files" for up to an
-                        # hour while the sweep was intentionally yielding to a
-                        # sync/GPU/Browse task. Tell the truth about the wait.
-                        dots_state["sweep"]["phase"] = (
-                            "Index scan waiting for active work")
-                        dots_state["sweep"]["detail"] = ""
-                    elif dots_state["sweep"].get("phase") == (
-                            "Index scan waiting for active work"):
-                        dots_state["sweep"]["phase"] = "Indexing new files"
-                        dots_state["sweep"]["detail"] = (
-                            sweep_progress["detail"])
-                    return busy
-
-                if not _sweep_busy():
-                    dots_state["sweep"]["phase"] = "Indexing new files"
-                    dots_state["sweep"]["detail"] = ""
-                try:
-                    # Pass the low-priority gate to sweep so it yields
-                    # between channels while sync/GPU work is active.
-                    r = index_backend.sweep_new_videos(
-                        output_dir, cfg.get("channels", []),
-                        progress_cb=_on_sweep,
-                        gpu_busy_fn=_sweep_busy,
-                        extra_roots=list(cfg.get("tp_archive_roots") or []))
-                    if cancel_event.is_set():
-                        return
-                    sweep_result["registered"] = int(r.get("registered") or 0)
-                    sweep_result["ingested"] = int(r.get("ingested") or 0)
-                    sweep_result["skipped_unchanged"] = int(
-                        r.get("skipped_unchanged") or 0)
-                    sweep_result["walked"] = int(r.get("walked") or 0)
-                except Exception as _se:
-                    s.emit_error(f"Sweep failed: {_se}")
-                    _flush_now()
-                finally:
-                    # Clear the sweep slot when indexing is done.
-                    dots_state["sweep"]["phase"] = ""
-                    dots_state["sweep"]["detail"] = ""
-
-            # This stage already runs on the supervised startup worker. Keep
-            # the sweep inline so shutdown/restore owns the real writer rather
-            # than a nested daemon that could outlive its parent.
-            _run_sweep()
-            if cancel_event.is_set():
-                return
-
-            sweep_reg = sweep_result["registered"]
-            sweep_ing = sweep_result["ingested"]
-            sweep_skip = sweep_result.get("skipped_unchanged", 0)
-            sweep_walked = sweep_result.get("walked", 0)
-            if sweep_reg > 0 or sweep_ing > 0:
-                s.emit_text(
-                    f" \u2014 Background sweep: +{sweep_reg} new videos registered, "
-                    f"+{sweep_ing} jsonl ingested.",
-                    "simpleline_blue")
-                _flush_now()
-            if sweep_skip:
-                s.emit_dim(
-                    f" Sweep: {sweep_skip} channel(s) skipped (folder "
-                    f"unchanged since last sweep), {sweep_walked} walked.")
-                _flush_now()
-
-            # Storage-pressure warning stays at the tail.
-            try:
-                cfg2 = self._config or load_config()
-                od = (cfg2.get("output_dir") or "").strip()
-                if od:
-                    probe = od if os.path.isdir(od) else os.path.dirname(od) or "."
-                    cap = archive_capacity_status(probe, cfg2)
-                    if cap.get("status") == "warning":
-                        detail = cap.get("detail") or "Archive drive is over its warning threshold"
-                        s.emit([
-                            ["\u26a0 ", "red"],
-                            [f"Archive drive warning: {detail}. New syncs may fail.\n", "red"]])
-                        _flush_now()
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-
-        # Sequential stages on one background thread — each milestone
-        # fires the moment its stage finishes.
-        def _run_stages():
-            """Run slow startup stages in order on the boot worker thread."""
-            try:
-                try:
-                    disk_scan_deferred = False
-                    if not cancel_event.is_set():
-                        disk_scan_deferred = _stage2_disk_walk() is False
-                    if not cancel_event.is_set():
-                        _stage3_sweep()
-                    # The sweep yields to active work. Retry a disk count that
-                    # was interrupted during launch once that work has settled,
-                    # rather than leaving partial counts until the next launch.
-                    if disk_scan_deferred and not cancel_event.is_set():
-                        _stage2_disk_walk()
-                finally:
-                    # Keep progress visible through a deferred count retry.
-                    stage3_done.set()
-                    # Let the animator observe completion before clearing it.
-                    cancel_event.wait(0.5)
-                    _clear_loading()
-                    try:
-                        _push_indicator("sweep", None)
-                    except Exception as e:
-                        _log.debug("swallowed: %s", e)
-                # Start only after the local sweep finishes: it guarantees
-                # normal cache rows exist and avoids racing the sweep's final
-                # disk-cache merge. This remains independent background work,
-                # so traffic spacing never delays app readiness.
-                if not cancel_event.is_set():
-                    _start_subscriber_backfill()
-            finally:
-                stage3_done.set()
-                # Budget-based auto-sync is restored from config before the
-                # window exists. Release its boot gate only after local
-                # startup work is finished, then let the scheduler apply its
-                # three-minute remote-sync grace period.
-                if not cancel_event.is_set():
-                    try:
-                        self._autorun.notify_startup_ready("indexing")
-                    except Exception as e:
-                        _log.debug(
-                            "autorun startup-ready notification failed: %s", e)
-                    try:
-                        self._trash_retention.notify_startup_ready("indexing")
-                    except Exception as e:
-                        _log.debug(
-                            "Trash retention startup-ready notification "
-                            "failed: %s", e)
-        _run_stages()
-        try:
-            if animator is not threading.current_thread():
-                animator.join(timeout=1.0)
-        except (RuntimeError, TypeError):
-            pass
+        assert self.services.startup is not None
+        return self.services.startup.run(cancel_event)
 
 
 def _configured_whisper_model_for_restore(valid_models):
@@ -1599,7 +987,11 @@ def _configured_whisper_model_for_restore(valid_models):
 
 
 def main():
+    from backend.desktop_startup import INSTANCE_LEASE, prepare_desktop
+
     _boot_trace("main start")
+    webview = prepare_desktop(WEB)
+    _boot_trace("desktop prerequisites ready")
     _start_minimized = "--start-minimized" in sys.argv
 
     # Put the app-managed bin dir (%APPDATA%/YTArchiver/bin) on PATH FIRST,
@@ -2281,6 +1673,7 @@ def main():
     # step. See backend audit #1 (2026-05-13).
     try:
         api._shutdown_cleanup_fn = _shutdown_cleanup
+        api._release_instance_lease = INSTANCE_LEASE.release
         api._prepare_restore_commit_fn = _prepare_restore_commit
     except Exception as e:
         _log.debug("swallowed: %s", e)

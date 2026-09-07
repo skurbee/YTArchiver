@@ -79,7 +79,7 @@
     document.getElementById(focusId)?.focus();
   }
 
-  window.addEventListener("yt-control", event => {
+  window.YT.eventState.onControl(["redownload_sample", "redownload_sample_closed"], event => {
     const data = event?.detail;
     if (data?.kind === "redownload_sample_closed") {
       close(data.sample_id);
@@ -89,7 +89,7 @@
     const deadline = Number(data.deadline_ts) * 1000;
     if (!data.sample_id || !Number.isFinite(deadline) || deadline <= Date.now()) return;
     const m = modal();
-    if (!m) return;
+    if (!m) return false;
     if (active) close(active.id);
     active = { id: data.sample_id, deadline, answering: false };
     const sub = document.getElementById("redwnl-sample-sub");

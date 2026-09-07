@@ -116,6 +116,15 @@ def load_channel_transaction(*, strict: bool = False) -> dict[str, Any] | None:
         if strict:
             raise ChannelTransactionJournalError(message)
         return None
+    from .format_versions import UnsupportedFormatError, require_version
+    try:
+        require_version(value.get("version", 0), {0, 1, 2, 3},
+                        "Channel recovery journal")
+    except UnsupportedFormatError as exc:
+        if strict:
+            raise ChannelTransactionJournalError(str(exc)) from exc
+        _log.warning("%s", exc)
+        return None
     return value
 
 

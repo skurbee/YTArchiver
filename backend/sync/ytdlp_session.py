@@ -11,7 +11,14 @@ from typing import Any
 from .. import utils as _utils
 from .. import youtube_traffic
 from ..log import get_logger, swallow
-from ..process_runner import PROCESS_REGISTRY, popen_ytdlp
+from ..process_runner import (
+    PROCESS_REGISTRY,
+    ProcessOutputReader,
+    finish_owned_process,
+    popen_ytdlp,
+    stop_owned_process,
+)
+from ..youtube_request_process import budget_wait_seconds
 
 _log = get_logger(__name__)
 
@@ -33,11 +40,15 @@ class DownloadWatchdog:
     last_output: list[float]
     stalled: dict[str, bool]
     thread: threading.Thread
+    output_reader: ProcessOutputReader | None = None
+    output_complete: bool = False
 
     def stop(self, timeout: float | None = None) -> None:
         self.stop_event.set()
         if self.thread.is_alive():
             self.thread.join(timeout=timeout)
+        if self.output_reader is not None:
+            self.output_reader.close()
 
 
 def popen_ytdlp_process(cmd: list[str], *, startupinfo: Any = None,
@@ -58,6 +69,8 @@ def popen_ytdlp_process(cmd: list[str], *, startupinfo: Any = None,
         bufsize=0,
         startupinfo=startupinfo,
         env=_utils.utf8_subprocess_env(),
+        request_cancel_event=cancel_event,
+        request_pause_event=pause_event,
     )
     return proc
 
@@ -77,13 +90,17 @@ def start_download_watchdog(
     stalled = {"hit": False}
 
     def _run() -> None:
+        accounted_wait = budget_wait_seconds(proc)
         while not stop_event.wait(poll_interval):
+            waited = budget_wait_seconds(proc)
+            last_output[0] += max(0.0, waited - accounted_wait)
+            accounted_wait = waited
             if proc.poll() is not None:
                 return
             if ((cancel_event is not None and cancel_event.is_set())
                     or (pause_event is not None and pause_event.is_set())):
                 try:
-                    proc.kill()
+                    stop_owned_process(proc, registry=PROCESS_REGISTRY, timeout=2.0)
                 except Exception as exc:
                     swallow("cancel kill", exc)
                 return
@@ -97,7 +114,7 @@ def start_download_watchdog(
                 except Exception as exc:
                     swallow("stall-warn stream flush", exc)
                 try:
-                    proc.kill()
+                    stop_owned_process(proc, registry=PROCESS_REGISTRY, timeout=2.0)
                 except Exception as exc:
                     swallow("stall kill", exc)
                 return
@@ -112,36 +129,52 @@ def start_download_watchdog(
     )
 
 
+def iter_download_output(proc: subprocess.Popen, watchdog: DownloadWatchdog):
+    """Yield raw stdout for the sync parser with bounded post-exit draining.
+
+    Sync retains its immediate pause/cancel watchdog and binary decoder.
+    Pipe mechanics are shared with all other streaming subprocesses, so an
+    inherited stdout handle cannot keep the parser blocked after child exit.
+    """
+    reader = ProcessOutputReader(proc).start()
+    watchdog.output_reader = reader
+    post_exit_deadline = None
+    try:
+        while not watchdog.stop_event.is_set():
+            item = reader.read(timeout=0.1)
+            if item is not None:
+                post_exit_deadline = None
+                channel, line = item
+                if channel == "stdout":
+                    yield line
+                continue
+            if reader.finished:
+                break
+            if proc.poll() is not None:
+                if post_exit_deadline is None:
+                    post_exit_deadline = time.monotonic() + 1.0
+                elif time.monotonic() >= post_exit_deadline:
+                    break
+    finally:
+        watchdog.output_complete = (reader.finished and not reader.failed.is_set()
+                                    and not watchdog.stop_event.is_set())
+        reader.close()
+
+
 def finish_ytdlp_process(
         proc: subprocess.Popen,
         *,
         wait_timeout: float = 10.0,
         terminate_timeout: float = 5.0,
         kill_timeout: float = 2.0,
+        watchdog: DownloadWatchdog | None = None,
 ) -> int | None:
-    """Wait for yt-dlp, escalate if hung, close stdout, and unregister."""
-    try:
-        proc.wait(timeout=wait_timeout)
-    except subprocess.TimeoutExpired:
-        proc.terminate()
-        try:
-            proc.wait(timeout=terminate_timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-                proc.wait(timeout=kill_timeout)
-            except Exception as exc:
-                swallow("force-kill wait", exc)
-    try:
-        if proc.stdout is not None:
-            proc.stdout.close()
-    except Exception as exc:
-        swallow("stdout close", exc)
-    try:
-        PROCESS_REGISTRY.unregister(proc)
-    except Exception as exc:
-        swallow("process-registry unregister", exc)
-    return proc.returncode
+    """Finish the owned child without closing a pipe held by a live reader."""
+    return finish_owned_process(
+        proc, registry=PROCESS_REGISTRY, wait_timeout=wait_timeout,
+        stop_timeout=terminate_timeout + kill_timeout,
+        output_reader=getattr(watchdog, "output_reader", None),
+    )
 
 
 def launch_ytdlp_process(

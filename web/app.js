@@ -55,14 +55,17 @@
     // Each line is wrapped in try/catch so one broken module doesn't
     // brick the rest of the UI.
     const _safe = (name, fn) => {
-      try {
-        fn();
-      } catch (e) {
+      const report = e => {
         if (typeof window._reportBootIssue === "function") {
           window._reportBootIssue(name, e, { level: "error" });
-        } else {
-          console.error(name + ":", e);
-        }
+        } else console.error(name + ":", e);
+      };
+      try {
+        const result = fn();
+        return Promise.resolve(result).catch(report);
+      } catch (e) {
+        report(e);
+        return Promise.resolve();
       }
     };
 
@@ -111,6 +114,12 @@
       "punctRestoreDialog.js?v=2",
       "punctuation repair",
       () => window.initPunctRestoreDialog(),
+    );
+    _retryBootModule(
+      "initWatchActions",
+      "watchActions.js?v=4",
+      "the Watch toolbar",
+      () => window.initWatchActions(),
     );
 
     const _expectedBootFns = [

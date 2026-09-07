@@ -51,26 +51,35 @@ _SCAN_CACHE_MAX = 256
 
 
 def _scan_channel_videos(folder: Path) -> list[tuple[str, str, int | None, int | None, str]]:
-    """Walk `folder` and yield (video_id, title, year, month, filepath)
-    for every video file.
+    """Overlay fresh catalog identity on a cached physical enumeration.
 
-    video_id lookup priority:
-      1. Trailing `[id]` bracket in filename (legacy naming and current
-         duplicate-title collision fallback).
-      2. Index DB's `videos` table via filepath (ordinary current + OLD
-         naming remains title-only, so the DB is the only mapping). users hit
-         this: the metadata recheck saw
-         all 642 playlist IDs as "not on disk" because this function
-         returned vid_id="" for every file (no bracket to parse), so
-         the `by_id` map was empty, the caller treated every ID as
-         new, and 642 blank-title log rows scrolled past.
-
-    Year/month come from the file's OWN folder (via `_year_month_from_path`)
-    so the metadata JSONL + thumbnail bucket co-locates with the mp4. The
-    download foldered it by `upload_date`; reading the folder back avoids
-    yt-dlp's `--mtime` drifting into a different month for premieres /
-    scheduled uploads. Falls back to UTC mtime for flat layouts.
+    Catalog-only repairs must become visible even when the folder fingerprint
+    stays unchanged. Only disk-derived values belong in the filesystem cache.
+    Exact catalog IDs outrank sidecar IDs and unambiguous filename candidates.
     """
+    physical = _scan_physical_videos(folder)
+    if not physical:
+        return []
+    fp_to_id: dict[str, str] = {}
+    try:
+        from ..index import catalog_session
+        with catalog_session().reader(writer_fallback=True) as conn:
+            if conn is not None:
+                prefix = os.path.join(str(folder), "")
+                rows = conn.execute(
+                    "SELECT filepath, video_id FROM videos "
+                    "WHERE filepath LIKE ? ESCAPE '\\'",
+                    (_like_esc(prefix) + "%",)).fetchall()
+                fp_to_id = {os.path.normpath(fp).lower(): vid
+                            for fp, vid in rows if fp and vid}
+    except Exception as exc:
+        _log.debug("catalog identities unavailable for metadata scan: %s", exc)
+    return [(fp_to_id.get(os.path.normpath(fp).lower(), vid), title, year, month, fp)
+            for vid, title, year, month, fp in physical]
+
+
+def _scan_physical_videos(folder: Path) -> list[tuple[str, str, int | None, int | None, str]]:
+    """Cache paths, titles, dates and file-derived identity by disk fingerprint."""
     out = []
     if not folder.is_dir():
         return out
@@ -91,32 +100,6 @@ def _scan_channel_videos(folder: Path) -> list[tuple[str, str, int | None, int |
     # IDs are valid; ambiguity with a user label must be resolved through the
     # filepath DB/sidecar evidence rather than rejecting a valid ID shape.
     bracket_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]\s*$")
-    # Pre-load videos-table rows for this channel folder so we can
-    # fill in missing video_ids without N queries.
-    # Use the read-only connection so this scan doesn't contend with
-    # sync's register_video writers on `_db_lock` — critical because
-    # this function is called from the parallel thumbnail walker.
-    #
-    # v68.7 ESCAPE-clause fix: `ESCAPE '\\'` (proper escape for the
-    # SQLite LIKE syntax). Earlier `'\'` parsed as `ESCAPE ''` (empty
-    # char) which SQLite rejected with `OperationalError: ESCAPE
-    # expression must be a single character` — exception swallowed,
-    # `fp_to_id` stayed empty, every OLD-naming file got vid_id="".
-    fp_to_id: dict[str, str] = {}
-    try:
-        from .. import index as _idx
-        conn = _idx._reader_open() or _idx._open()
-        if conn is not None:
-            with _idx._reader_lock:
-                rows = conn.execute(
-                    "SELECT filepath, video_id FROM videos "
-                    "WHERE filepath LIKE ? ESCAPE '\\'",
-                    (_like_esc(str(folder)) + "%",)).fetchall()
-            for fp, vid in rows:
-                if fp and vid:
-                    fp_to_id[os.path.normpath(fp).lower()] = vid
-    except Exception as e:
-        _log.debug("swallowed: %s", e)
     for dp, _dns, fns in os.walk(str(folder)):
         for fn in fns:
             low = fn.lower()
@@ -128,12 +111,9 @@ def _scan_channel_videos(folder: Path) -> list[tuple[str, str, int | None, int |
             stem, _ext = os.path.splitext(fn)
             m = bracket_re.search(stem)
             filename_candidate = m.group(1) if m else ""
-            # Exact catalog and yt-dlp sidecar identities outrank the filename
-            # bracket.  This keeps valid all-letter IDs while preventing an
-            # old 11-letter user label from overriding stronger evidence.
-            vid_id = fp_to_id.get(os.path.normpath(fp).lower(), "")
-            if not vid_id:
-                vid_id = _read_info_json_vid(fp)
+            # Sidecar identity is disk-derived. Catalog IDs are deliberately
+            # resolved by the outer function after every cache lookup.
+            vid_id = _read_info_json_vid(fp)
             if not vid_id and not filename_candidate.isalpha():
                 vid_id = filename_candidate
             # Strip the trailing `[...]` suffix from the title even

@@ -131,6 +131,10 @@ class QueueState:
         # `get_loaded_resuming()` after `load()` to decide how to
         # requeue them. Empty until load() runs.
         self._loaded_resuming: dict[str, Any] = {}
+        # Independent of config write admission: unreadable queue generations
+        # must not be replaced by this owner's initially empty memory.
+        self._hydration_state = "new"
+        self._hydration_error = ""
         # False only while a legacy queue has received in-memory IDs but the
         # schema migration has not yet committed to every authoritative file.
         # The UI disables item mutations in that narrow state so it never
@@ -203,6 +207,13 @@ class QueueState:
         copy; safe to consume."""
         with self._lock:
             return copy.deepcopy(self._loaded_resuming or {})
+
+    def hydration_status(self) -> dict[str, Any]:
+        """Expose whether both authoritative queue generations were readable."""
+        with self._lock:
+            return {"state": self._hydration_state,
+                    "error": self._hydration_error,
+                    "writable": self._hydration_state not in {"loading", "blocked"}}
 
     def clear_resuming_slots(self, *kinds: str,
                              clear_current: bool = False) -> bool:
@@ -514,6 +525,16 @@ class QueueState:
         return deduped, changed
 
     def load(self) -> bool:
+        """Hydrate both generations without racing an in-process save."""
+        with self._lock:
+            try:
+                return self._load_locked()
+            except Exception as exc:
+                self._hydration_state = "blocked"
+                self._hydration_error = str(exc)
+                raise
+
+    def _load_locked(self) -> bool:
         """Load queue state from ytarchiver_queue.json. Returns True on success.
 
         _load_queue_state: if the JSON is
@@ -524,17 +545,24 @@ class QueueState:
         # before the main queue so a first-run crash (sidecar committed before
         # the first debounced main save), a missing main file, or a corrupt main
         # file cannot discard the exact in-flight task.
-        sidecar_exists, sidecar_resuming = self._load_resuming_sidecar()
+        self._hydration_state = "loading"
+        self._hydration_error = ""
+        sidecar = self._queue_repository().load_resuming()
+        loaded = self._queue_repository().load_main()
+        for result in (sidecar, loaded):
+            if result.state == "blocked":
+                self._hydration_state = "blocked"
+                self._hydration_error = result.error
+                _log.warning("Queue hydration blocked: %s", result.error)
+                return False
+        self._hydration_state = "ready"
+        sidecar_exists, sidecar_resuming = sidecar.exists, sidecar.data
         data: dict[str, Any] = {}
         main_needs_rebuild = False
-        loaded = self._queue_repository().load_main()
         if loaded.state == "missing":
             if not sidecar_exists:
                 return False
             main_needs_rebuild = True
-        elif loaded.state == "blocked":
-            _log.warning("Queue file could not be loaded safely: %s", loaded.error)
-            return False
         elif loaded.state == "sidelined":
             if not sidecar_exists:
                 _log.warning(
@@ -680,15 +708,6 @@ class QueueState:
     def _resuming_file(self):
         return self._queue_repository().resuming_path
 
-    def _load_resuming_sidecar(self) -> tuple[bool, dict[str, Any]]:
-        loaded = self._queue_repository().load_resuming()
-        if loaded.state == "blocked":
-            _log.warning(
-                "Queue recovery sidecar could not be loaded safely: %s",
-                loaded.error,
-            )
-        return loaded.state == "ok", loaded.data
-
     def _build_save_payload_locked(self) -> dict[str, Any]:
         """Build the QUEUE_FILE payload from current state. CALLER MUST HOLD
         self._lock — building under a FRESH lock let a concurrent set_current_*
@@ -724,6 +743,8 @@ class QueueState:
         """Atomically replace QUEUE_FILE. Serialized via _save_io_lock so two
         writers can't interleave on the same .tmp."""
         with self._save_io_lock:
+            if self._hydration_state in {"loading", "blocked"}:
+                return False
             result = self._queue_repository().commit_main(payload)
             if result.ok:
                 self._save_failure_warned = False
@@ -763,6 +784,8 @@ class QueueState:
         loading ignores unknown fields.
         """
         with self._lock:
+            if self._hydration_state in {"loading", "blocked"}:
+                raise OSError("Queue recovery state is unreadable; backup is blocked.")
             main_payload = self._build_save_payload_locked()
             generation = f"backup-{uuid.uuid4().hex}"
             main_payload["_backup_generation"] = generation
@@ -787,6 +810,8 @@ class QueueState:
 
     def _write_resuming_payload(self, payload: dict[str, Any]) -> bool:
         with self._resuming_io_lock:
+            if self._hydration_state in {"loading", "blocked"}:
+                return False
             seq = int(payload.get("_seq") or 0)
             if seq and seq < self._resuming_last_written_seq:
                 return True
@@ -1699,6 +1724,39 @@ class QueueState:
         self._notify()
         self.save_debounced()
         return True
+
+    def command_sync_current(self, task_id: str, *, defer: bool = False,
+                             signal: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+        """Own the exact-row durable command and signal within one lock boundary.
+
+        A defer reservation precedes cancellation intent. A failed second commit
+        compensates the complete pending snapshot, including any replaced row.
+        The signal cannot race with a successor acquiring the current slot.
+        """
+        wanted = str(task_id or "").strip()
+        with self._lock:
+            current = copy.deepcopy(self.current_sync or {})
+            if not wanted or wanted != str(current.get("task_id") or "").strip():
+                return {"ok": False, "code": "stale_task",
+                        "error": "Queue changed; task is no longer running"}
+            original = copy.deepcopy(self.sync)
+            if defer:
+                pending = dict(current)
+                pending.pop("_pass_start_ts", None)
+                pending.pop("cancel_requested", None)
+                if not self.sync_defer_task(pending):
+                    return {"ok": False, "code": "save_failed",
+                            "error": "Deferred task could not be saved"}
+            current["cancel_requested"] = True
+            if not self.replace_current_task_durable("sync", current, expected_task_id=wanted):
+                if defer:
+                    self.sync[:] = original
+                    if not self.save_now():
+                        self._mark_identity_persistence_failed()
+                return {"ok": False, "code": "save_failed",
+                        "error": "Current sync task could not be saved as cancelled"}
+            signal(current)
+            return {"ok": True}
 
     def sync_defer_task(self, channel: dict[str, Any]) -> bool:
         """Durably place the exact current sync task at the pending tail."""

@@ -53,13 +53,15 @@ may be from an earlier build.
 10. verify the artifact is a Windows x64 PE with the expected version
     resources and required packaged files.
 
-The import check compiles but does not import `main.py`, because importing it
-acquires the application's single-instance mutex. The separate Whisper and
-punctuation worker entry points are excluded from desktop import checks; this
-gate does not execute transcription models or validate GPU performance.
+The import check includes `main.py`. Native preparation in `desktop_startup.py`
+is invoked only by `main()`: imports do not acquire the single-instance mutex,
+open a window, or regenerate HTML. Imports still use disposable application
+data. The separate Whisper and punctuation worker entry points are excluded;
+this gate does not execute transcription models or validate GPU performance.
 
-The gate compares working-tree fingerprints at the start and end using tracked
-diffs and the untracked-file list. Detected changes fail the gate. Review source
+The gate compares working-tree fingerprints at the start and end using paths
+and current bytes of tracked and non-ignored new files, including missing-file
+markers. Detected changes fail the gate. Review source
 before running it, and avoid concurrent edits or regeneration during the run.
 
 Use `-RequireCleanTree` for CI or a release checkout. Without it, reviewed local
@@ -97,7 +99,9 @@ The lock files have separate responsibilities:
 
 - `requirements/runtime.lock` — Python 3.13 desktop runtime
 - `requirements/build.lock` — PyInstaller and packaging tools
-- `requirements/dev.lock` — Ruff, pytest, coverage, and test helpers
+- `requirements/dev.lock` — Ruff, pytest, coverage, test helpers, and the pinned
+  yt-dlp baseline used by offline plugin integration tests. The desktop app
+  continues to use its separately managed yt-dlp executable.
 - `requirements/worker-cpu.lock` — Python 3.11 CPU transcription worker
 - `requirements/worker-cuda.lock` — Python 3.11 CUDA transcription worker
 
@@ -148,6 +152,12 @@ Never run aggregate `pytest`, including `pytest tests/`. Test modules can change
 process-wide environment variables and application singleton state.
 Every test file needs a fresh Python interpreter and new disposable `APPDATA`
 and `LOCALAPPDATA` directories, set **before any backend import**.
+
+The root `conftest.py` enforces this before collection: it accepts explicit
+selection from one Python file, rejects directory or multi-file collection,
+and creates a disposable profile even for an IDE-launched focused test. It
+also refuses a process that already imported application modules. This guard
+does not make aggregate execution supported; keep using the isolated runner.
 
 Use `scripts/check.ps1` directly for the complete gate. `scripts/check.sh` is a
 Git Bash compatibility wrapper that forwards its arguments to that PowerShell
@@ -214,8 +224,8 @@ imports and packages the frontend, icon, worker scripts, third-party notices,
 and license texts. A bare `pyinstaller --onefile main.py` command does not
 represent the supported artifact.
 
-The spec also includes the worker dependency locks and punctuation alignment
-helper. yt-dlp, ffmpeg, and ffprobe are bundled only when their executables are
+The spec also includes the worker dependency locks, punctuation alignment
+helper, and shared worker protocol module. yt-dlp, ffmpeg, and ffprobe are bundled only when their executables are
 present at the repository root; otherwise runtime tool discovery and setup are
 separate from the Python packaging step.
 

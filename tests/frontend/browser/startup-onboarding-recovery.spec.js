@@ -1,4 +1,4 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 const { loadApp } = require("./fixtures");
 
 const EXISTING_INSTALL = {
@@ -7,20 +7,7 @@ const EXISTING_INSTALL = {
 };
 
 async function bootWithRuntime(page, runtime) {
-  await page.addInitScript(runtime => {
-    const configure = setHandler => setHandler("get_runtime_info", () => Promise.resolve(runtime));
-    if (typeof window.__setBridgeHandler === "function") configure(window.__setBridgeHandler);
-    else Object.defineProperty(window, "__setBridgeHandler", {
-      configurable: true,
-      set(handler) {
-        Object.defineProperty(window, "__setBridgeHandler", {
-          configurable: true, writable: true, value: handler,
-        });
-        configure(handler);
-      },
-    });
-  }, runtime);
-  await loadApp(page);
+  await loadApp(page, { bridge: { responses: { get_runtime_info: runtime } } });
   await page.evaluate(() => window.seedLogs());
 }
 

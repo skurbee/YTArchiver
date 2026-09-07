@@ -20,6 +20,7 @@ def test_restart_quiesces_old_process_before_spawning_replacement(monkeypatch):
     api = window_mixin.WindowMixin()
     api._shutdown_cleanup_fn = lambda: (
         events.append("quiesced") or {"ok": True})
+    api._release_instance_lease = lambda: events.append("lease released")
     api._window = mock.Mock()
     api._window.destroy.side_effect = lambda: events.append("destroyed")
 
@@ -34,7 +35,7 @@ def test_restart_quiesces_old_process_before_spawning_replacement(monkeypatch):
         window_mixin.os, "_exit", lambda _code: events.append("exited"))
 
     assert api.app_restart() == {"ok": True}
-    assert events == ["quiesced", "spawned", "destroyed", "exited"]
+    assert events == ["quiesced", "lease released", "spawned", "destroyed", "exited"]
 
 
 def test_restart_fails_closed_when_old_writers_do_not_stop(monkeypatch):

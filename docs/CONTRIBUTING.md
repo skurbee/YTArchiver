@@ -93,7 +93,8 @@ YTArchiver/
 │   │   ├── normalize.py        # title canonicalization
 │   │   ├── scan.py             # per-channel video scan
 │   │   └── thumbnails_ops.py   # thumbnail housekeeping
-│   ├── services/           # AppServices + event bus + file ops
+│   ├── services/           # Explicit feature, persistence, and lifecycle owners
+│   ├── desktop_startup.py  # Native preparation, called only at launch
 │   ├── pause_helpers.py    # Shared pause/cancel guards
 │   ├── index.py            # SQLite index entry — schema + register + reads
 │   ├── index_search.py     # FTS5 + LIKE search
@@ -113,7 +114,10 @@ YTArchiver/
 │   ├── punct_restore.py    # Restore punctuation on old transcripts
 │   ├── thumbnails.py       # Thumbnail download + cache
 │   ├── channel_art.py      # Channel banner + avatar
-│   ├── ytarchiver_config.py # Config IO + view models
+│   ├── ytarchiver_config.py # Config IO + compatibility view exports
+│   ├── config_views.py     # UI projections of supplied config snapshots
+│   ├── media_identity.py   # Shared identity and preferred-copy policy
+│   ├── ytdlp_options.py    # Leaf tool/cookie options without sync imports
 │   ├── view_format.py      # UI formatters
 │   ├── text_utils.py       # Canonical normalize_title
 │   ├── fs_search.py        # Canonical VIDEO_EXTS + file walker
@@ -121,7 +125,7 @@ YTArchiver/
 │   ├── process_runner.py   # ProcessRegistry + YtDlpRunner
 │   ├── utils.py            # Misc helpers (legacy grab-bag)
 │   ├── log.py              # Logging bridge to LogStreamer
-│   ├── log_stream.py       # Batched log emit to JS
+│   ├── log_stream.py       # Display logs + independent acknowledged UI events
 │   ├── cmd_server.py       # Loopback HTTP API for companion viewers
 │   ├── local_fileserver.py # Local fileserver for video playback
 │   ├── tray.py             # System tray
@@ -143,6 +147,8 @@ YTArchiver/
     │   │   popovers.html, dialogs.html, modals.html
     ├── app.js              # Bootstrap + tab init orchestrator
     ├── logs.js             # Log rendering
+    ├── watchSession.js     # Video selection/render/request identity owner
+    ├── pagedCollection.js  # Shared library request/offset/refresh owner
     ├── watchView.js        # Watch view + karaoke + captions
     ├── browseGrids.js      # Channel grid + Video grid + card builder
     ├── tables.js           # Optional compact Subs table
@@ -255,6 +261,8 @@ do not infer permission for later steps from an earlier one.
   including `pytest tests/`. Test modules can change process-wide
   configuration and shutdown state. [BUILD.md](BUILD.md) has a safe focused
   test example, including `tests/test_backend_smoke.py`.
+- Root `conftest.py` rejects unsupported collection before test imports and
+  establishes disposable profile paths. It does not enable aggregate execution.
 - Prefer `scripts/check.ps1` directly. `scripts/check.sh` is the Git Bash
   compatibility entry point that forwards arguments to the same Windows
   PowerShell gate; it does not run a separate aggregate Python suite.
@@ -265,6 +273,9 @@ do not infer permission for later steps from an earlier one.
   `tests/frontend/browser` and run with `npm run test:browser` against the real
   HTML and a fixture bridge. They run headlessly; native WebView/media behavior
   still benefits from a separately approved manual check.
+- Browser fixtures reject unregistered bridge methods and validate readiness.
+  Add representative responses explicitly; do not mask new calls with a generic
+  success object. Load real module prerequisites in unit harnesses.
 - Edit the template or partials, regenerate HTML, and review that output before
   the gate. The gate verifies freshness without repairing the generated file.
 

@@ -75,8 +75,8 @@ class VideoMetadataRefreshModeTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     fetcher,
-                    "_fetch_video_metadata",
-                    return_value=copy.deepcopy(fetched_entry),
+                    "_fetch_video_metadata_result",
+                    return_value=fetcher.MetadataFetchResult.success(copy.deepcopy(fetched_entry)),
                 ) as fetch_metadata,
                 mock.patch.object(fetcher, "_download_thumbnail") as download_thumb,
                 mock.patch("backend.index.update_video_stats") as update_stats,

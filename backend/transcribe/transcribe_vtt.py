@@ -48,6 +48,7 @@ from .paths import (
 from .transcribe_files import (
     _write_jsonl_entry,
     _write_transcript_entry,
+    transcript_output_locks,
 )
 
 _log = get_logger(__name__)
@@ -128,7 +129,8 @@ def _extract_video_id(video_path: str, hint: str = "") -> str:
 
 
 def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
-                              fetched_paths_out: list[str]) -> str | None:
+                              fetched_paths_out: list[str], *,
+                              cancel_event=None) -> str | None:
     """Probe yt-dlp for captions and write a .vtt next to the video.
 
     Mirrors YTArchiver.py:11641 `_fetch_auto_captions`: tries without cookies
@@ -136,8 +138,8 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
     empty result. Adds any written file to `fetched_paths_out` so the caller
     can clean up after parsing.
 
-    Returns the path to the written .vtt (auto-caption preferred over manual
-    subs so we get <c>-tag word timing), or None if no captions exist or
+    Returns the path to a usable English .vtt (human captions preferred, with
+    automatic captions as fallback), or None if no captions exist or
     yt-dlp is unavailable.
     """
     yt = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
@@ -164,10 +166,12 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
             except OSError: pass
 
     def _run(use_cookies: bool) -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
         cmd = [
             yt, "--skip-download",
             "--write-sub", "--write-auto-sub",
-            "--sub-lang", "en", "--sub-format", "vtt",
+            "--sub-lang", "en,en-orig,en-US,en-GB", "--sub-format", "vtt",
             "-o", temp_base + ".%(ext)s",
             "--no-playlist",
             "--force-overwrites",
@@ -180,7 +184,7 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
                 cmd += ["--cookies-from-browser", "firefox"]
         cmd.append(video_url)
         permission = youtube_traffic.acquire(
-            "caption_fetch", stream=stream)
+            "caption_fetch", stream=stream, cancel_event=cancel_event)
         if not permission.get("ok"):
             stream.emit_dim(
                 " Auto-caption fetch deferred by YouTube traffic safety: "
@@ -198,7 +202,8 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
             r = run_ytdlp(cmd, stdin=subprocess.DEVNULL,
                                stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE,
-                               timeout=120, startupinfo=_startupinfo)
+                               timeout=120, startupinfo=_startupinfo,
+                               request_cancel_event=cancel_event)
             try:
                 err_text = (r.stderr or b"").decode(
                     "utf-8", errors="replace")
@@ -251,17 +256,24 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
 
     # Pass 1: cookieless
     _run(False)
+    if cancel_event is not None and cancel_event.is_set():
+        _cleanup()
+        return None
     vtts = _glob_vtts()
     if not vtts:
         _cleanup()
         # Pass 2: with cookies (some channels require auth for captions)
         _run(True)
+        if cancel_event is not None and cancel_event.is_set():
+            _cleanup()
+            return None
         vtts = _glob_vtts()
     if not vtts:
         _cleanup()
         return None
 
-    # Prefer auto-generated VTT — it has <c> tags with per-word timestamps.
+    # The guarded downloader normally writes one suitable English track.
+    # Prefer usable text if an unsuccessful alternate left an empty file.
     def _caption_pref(path: str) -> tuple[int, str]:
         name = os.path.basename(path).lower()
         if name.endswith(".en.vtt"):
@@ -270,8 +282,10 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
             rank = 1
         elif name.endswith(".en-gb.vtt"):
             rank = 2
-        else:
+        elif name.endswith(".en-orig.vtt"):
             rank = 3
+        else:
+            rank = 4
         return (rank, name)
 
     vtts = sorted(vtts, key=_caption_pref)
@@ -279,9 +293,7 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
     if len(vtts) > 1:
         for vf in vtts:
             try:
-                with open(vf, "r", encoding="utf-8") as fh:
-                    sample = fh.read(2000)
-                if "<c>" in sample or "<c " in sample:
+                if _parse_vtt(vf):
                     pick = vf
                     break
             except Exception as e:
@@ -340,10 +352,23 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     base = os.path.splitext(video_path)[0]
     candidates = [
         f"{base}.en.vtt", f"{base}.en-US.vtt", f"{base}.en-GB.vtt",
-        f"{base}.en-us.vtt", f"{base}.en-gb.vtt", f"{base}.vtt",
+        f"{base}.en-us.vtt", f"{base}.en-gb.vtt", f"{base}.en-orig.vtt", f"{base}.vtt",
         f"{base}.en.ttml", f"{base}.en.srt",
     ]
-    vtt = next((p for p in candidates if os.path.isfile(p)), None)
+    vtt = None
+    local_segments = None
+    for candidate in candidates:
+        if not os.path.isfile(candidate):
+            continue
+        if vtt is None:
+            vtt = candidate
+        try:
+            candidate_segments = _parse_vtt(candidate)
+        except Exception:
+            continue
+        if candidate_segments:
+            vtt, local_segments = candidate, candidate_segments
+            break
 
     # Fallback: if sync didn't get a .vtt (e.g. auto-transcribe was off at
     # sync time, or yt-dlp's caption fetch failed transiently), try yt-dlp
@@ -351,7 +376,15 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     # which runs a cookieless probe first, then retries with cookies on 403.
     _fetched_temp: list[str] = []
     if not vtt and allow_fetch:
-        vtt = _fetch_captions_via_ytdlp(video_path, stream, _fetched_temp)
+        vtt = _fetch_captions_via_ytdlp(
+            video_path, stream, _fetched_temp, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            for fetched_path in _fetched_temp:
+                try:
+                    os.remove(fetched_path)
+                except OSError:
+                    pass
+            return _CaptionOutcome.CANCELLED
         if vtt:
             candidates.append(vtt)
 
@@ -360,7 +393,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
 
     t0 = time.time()
     try:
-        segs = _parse_vtt(vtt)
+        segs = local_segments if local_segments is not None else _parse_vtt(vtt)
     except Exception as _ve:
         # surface the parse failure before bailing. Old code
         # silently returned False, causing the caller to emit "No
@@ -512,106 +545,107 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
         except Exception as _pe:
             stream.emit_dim(f" (punctuation skipped: {_pe})")
 
-    # Cancellation is accepted until this multi-store commit begins. Once TXT
-    # commits, finish JSONL/index coherently or retain the recovery marker.
-    if cancel_event is not None and cancel_event.is_set():
-        return _CaptionOutcome.CANCELLED
-    marker_path = reconciliation_marker_path(
-        Path(APP_DATA_DIR) / "reconciliation",
-        operation="auto-caption",
-        key=f"{os.path.normcase(os.path.abspath(video_path))}|{vid_id}",
-    )
-    txt_store = f"txt:{os.path.normcase(os.path.abspath(txt_path))}"
-    jsonl_store = f"jsonl:{os.path.normcase(os.path.abspath(jsonl_path))}"
-    index_store = f"index:{os.path.normcase(os.path.abspath(video_path))}"
-    try:
-        marker = begin_reconciliation(
-            marker_path,
-            operation="auto-caption TXT/JSONL/index commit",
-            stores=(txt_store, jsonl_store, index_store),
-            details={"video_id": vid_id, "video_path": video_path},
+    with transcript_output_locks(txt_path, jsonl_path):
+        # Cancellation is accepted until this multi-store commit begins. Once TXT
+        # commits, finish JSONL/index coherently or retain the recovery marker.
+        if cancel_event is not None and cancel_event.is_set():
+            return _CaptionOutcome.CANCELLED
+        marker_path = reconciliation_marker_path(
+            Path(APP_DATA_DIR) / "reconciliation",
+            operation="auto-caption",
+            key=f"{os.path.normcase(os.path.abspath(video_path))}|{vid_id}",
         )
-    except SidecarError as exc:
+        txt_store = f"txt:{os.path.normcase(os.path.abspath(txt_path))}"
+        jsonl_store = f"jsonl:{os.path.normcase(os.path.abspath(jsonl_path))}"
+        index_store = f"index:{os.path.normcase(os.path.abspath(video_path))}"
         try:
-            stream.emit_error(
-                f"Could not create transcript recovery marker: {exc}")
-        except Exception as emit_exc:
-            _log.debug("caption marker error emit failed: %s", emit_exc)
-        return _CaptionOutcome.FAILED
+            marker = begin_reconciliation(
+                marker_path,
+                operation="auto-caption TXT/JSONL/index commit",
+                stores=(txt_store, jsonl_store, index_store),
+                details={"video_id": vid_id, "video_path": video_path},
+            )
+        except SidecarError as exc:
+            try:
+                stream.emit_error(
+                    f"Could not create transcript recovery marker: {exc}")
+            except Exception as emit_exc:
+                _log.debug("caption marker error emit failed: %s", emit_exc)
+            return _CaptionOutcome.FAILED
 
-    def _record_partial(error: object) -> None:
-        try:
-            marker.record_failure(error)
-        except SidecarError as marker_exc:
-            _log.error("Could not update transcript recovery marker %s: %s",
-                       marker.path, marker_exc)
+        def _record_partial(error: object) -> None:
+            try:
+                marker.record_failure(error)
+            except SidecarError as marker_exc:
+                _log.error("Could not update transcript recovery marker %s: %s",
+                           marker.path, marker_exc)
 
-    if not _write_transcript_entry(txt_path, title, upload_date, duration,
-                                   src_tag, full_text, video_id=vid_id):
-        _record_partial(f"TXT write failed: {txt_path}")
+        if not _write_transcript_entry(txt_path, title, upload_date, duration,
+                                       src_tag, full_text, video_id=vid_id):
+            _record_partial(f"TXT write failed: {txt_path}")
+            try:
+                stream.emit_error(f"Could not write transcript to {txt_path}")
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+            return _CaptionOutcome.FAILED
         try:
-            stream.emit_error(f"Could not write transcript to {txt_path}")
+            marker.mark_committed(txt_store)
+        except SidecarError as exc:
+            _record_partial(exc)
+            return _CaptionOutcome.PARTIAL
+        _hide_per_video_transcript_txt_if_needed(video_path, txt_path)
+        if not _write_jsonl_entry(jsonl_path, vid_id, title, segs):
+            _record_partial(f"JSONL write failed: {jsonl_path}")
+            try:
+                stream.emit_error(
+                    f"Could not write transcript JSONL to {jsonl_path} "
+                    f"— not marking {os.path.basename(video_path)} transcribed")
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+            # TXT is already durable. This is not the ordinary "captions were
+            # unavailable" miss: retain the job and retry through replacement.
+            return _CaptionOutcome.PARTIAL
+        try:
+            marker.mark_committed(jsonl_store)
+        except SidecarError as exc:
+            _record_partial(exc)
+            return _CaptionOutcome.PARTIAL
+
+        # Clean up only .vtt sidecars fetched by this function. Pre-existing
+        # user-supplied caption sidecars must survive a successful parse.
+        for _p in list(_fetched_temp):
+            if os.path.isfile(_p):
+                try: os.remove(_p)
+                except OSError: pass
+
+        # FTS ingest — use the new aggregated .jsonl path. A committed sidecar
+        # with a failed index update is a recoverable partial result, never green
+        # success. ``ingest_jsonl`` owns the transaction that inserts segments and
+        # marks matching video rows; a second independent mark here could report
+        # false after that transaction committed and strand a completed job.
+        try:
+            from .. import index as _idx
+            if not _idx.ingest_jsonl(video_path, jsonl_path, title, channel):
+                raise RuntimeError("index ingest returned no transcript segments")
         except Exception as e:
-            _log.debug("swallowed: %s", e)
-        return _CaptionOutcome.FAILED
-    try:
-        marker.mark_committed(txt_store)
-    except SidecarError as exc:
-        _record_partial(exc)
-        return _CaptionOutcome.PARTIAL
-    _hide_per_video_transcript_txt_if_needed(video_path, txt_path)
-    if not _write_jsonl_entry(jsonl_path, vid_id, title, segs):
-        _record_partial(f"JSONL write failed: {jsonl_path}")
+            _record_partial(e)
+            _log.warning("auto-caption index finalization failed for %s: %s",
+                         os.path.basename(video_path), e)
+            try:
+                stream.emit_error(
+                    f"Auto-captions were written but indexing failed for "
+                    f"{os.path.basename(video_path)}: {e}. Task kept for retry.")
+            except Exception as emit_exc:
+                _log.debug("caption index failure emit failed: %s", emit_exc)
+            return _CaptionOutcome.PARTIAL
         try:
-            stream.emit_error(
-                f"Could not write transcript JSONL to {jsonl_path} "
-                f"— not marking {os.path.basename(video_path)} transcribed")
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        # TXT is already durable. This is not the ordinary "captions were
-        # unavailable" miss: retain the job and retry through replacement.
-        return _CaptionOutcome.PARTIAL
-    try:
-        marker.mark_committed(jsonl_store)
-    except SidecarError as exc:
-        _record_partial(exc)
-        return _CaptionOutcome.PARTIAL
-
-    # Clean up only .vtt sidecars fetched by this function. Pre-existing
-    # user-supplied caption sidecars must survive a successful parse.
-    for _p in list(_fetched_temp):
-        if os.path.isfile(_p):
-            try: os.remove(_p)
-            except OSError: pass
-
-    # FTS ingest — use the new aggregated .jsonl path. A committed sidecar
-    # with a failed index update is a recoverable partial result, never green
-    # success. ``ingest_jsonl`` owns the transaction that inserts segments and
-    # marks matching video rows; a second independent mark here could report
-    # false after that transaction committed and strand a completed job.
-    try:
-        from .. import index as _idx
-        if not _idx.ingest_jsonl(video_path, jsonl_path, title, channel):
-            raise RuntimeError("index ingest returned no transcript segments")
-    except Exception as e:
-        _record_partial(e)
-        _log.warning("auto-caption index finalization failed for %s: %s",
-                     os.path.basename(video_path), e)
-        try:
-            stream.emit_error(
-                f"Auto-captions were written but indexing failed for "
-                f"{os.path.basename(video_path)}: {e}. Task kept for retry.")
-        except Exception as emit_exc:
-            _log.debug("caption index failure emit failed: %s", emit_exc)
-        return _CaptionOutcome.PARTIAL
-    try:
-        marker.mark_committed(index_store)
-        marker.finish()
-    except SidecarError as exc:
-        _record_partial(exc)
-        _log.error("Auto-caption stores committed but marker update failed: %s",
-                   exc)
-        return _CaptionOutcome.PARTIAL
+            marker.mark_committed(index_store)
+            marker.finish()
+        except SidecarError as exc:
+            _record_partial(exc)
+            _log.error("Auto-caption stores committed but marker update failed: %s",
+                       exc)
+            return _CaptionOutcome.PARTIAL
     # Decrement transcription_pending / set transcription_complete on 0 only
     # when this ingest belongs to a queued Processing job. The synchronous
     # sync path never increments the counter in the first place.

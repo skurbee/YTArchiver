@@ -33,6 +33,7 @@ from .. import utils as _utils
 from ..log import get_logger, swallow
 from ..process_runner import PROCESS_REGISTRY, popen_ytdlp, run_ytdlp
 from ..subs import normalize_channel_url
+from ..youtube_request_process import budget_wait_seconds
 from ..ytarchiver_config import config_transaction
 from .ytdlp_proc import _find_cookie_source, find_yt_dlp
 
@@ -147,8 +148,26 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
         return {"ok": False, "error": str(e)}
     timer = None
     timeout_hit = {"hit": False}
+    timer_done = threading.Event()
+    probe_started = time.monotonic()
+    initial_budget_wait = budget_wait_seconds(proc)
+
+    def _remaining_probe_time():
+        return float(timeout_sec) - (time.monotonic() - probe_started) + (
+            budget_wait_seconds(proc) - initial_budget_wait)
+
     try:
         def _kill_on_timeout() -> None:
+            nonlocal timer
+            if timer_done.is_set():
+                return
+            if _remaining_probe_time() > 0:
+                # The request governor, not YouTube, can deliberately hold a
+                # probe for hours. Its wait must not trigger retry traffic.
+                timer = threading.Timer(0.5, _kill_on_timeout)
+                timer.daemon = True
+                timer.start()
+                return
             timeout_hit["hit"] = True
             try:
                 proc.kill()
@@ -158,7 +177,6 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
         timer = threading.Timer(float(timeout_sec), _kill_on_timeout)
         timer.daemon = True
         timer.start()
-        deadline = time.time() + float(timeout_sec)
         for line in proc.stdout:
             try:
                 from ..youtube_session import handle_youtube_failure_text
@@ -169,7 +187,7 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
                     break
             except Exception as e:
                 _log.debug("quick-check YouTube guard failed: %s", e)
-            if time.time() > deadline:
+            if _remaining_probe_time() <= 0:
                 # Drain stdout in a background thread before terminate
                 # so a full pipe doesn't deadlock the subsequent wait
                 # (audit: sync/quickcheck.py:87). yt-dlp can dump
@@ -200,6 +218,7 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
             elif status == "is_upcoming":
                 upcoming += 1
     finally:
+        timer_done.set()
         if timer is not None:
             try:
                 timer.cancel()
@@ -303,6 +322,7 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
     try:
         proc = run_ytdlp(
             cmd, capture_output=True, text=True, timeout=float(timeout_sec),
+            request_cancel_event=cancel_event, request_pause_event=pause_event,
             encoding="utf-8", errors="replace",
             # stdin=DEVNULL so a signal sent to the parent doesn't
             # propagate into yt-dlp via shared stdin and abort the

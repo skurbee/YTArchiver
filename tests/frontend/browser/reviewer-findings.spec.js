@@ -1,4 +1,4 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 const { loadApp } = require("./fixtures");
 
 test("Download URL validation uses the real hostname", async ({ page }) => {

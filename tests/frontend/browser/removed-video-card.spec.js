@@ -1,4 +1,4 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 const { loadApp } = require("./fixtures");
 
 test("removed videos keep only their badge and remain normal clickable cards", async ({ page }) => {

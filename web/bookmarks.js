@@ -4,7 +4,7 @@
 (function () {
   "use strict";
 
-  const _browseState = window._browseState || {};
+  const _browseState = window.YT.util.requireBrowseState();
   const showContextMenu = window.showContextMenu || (() => {});
   const askConfirm = window.askConfirm;
   const askDanger = window.askDanger;
@@ -434,6 +434,8 @@
         });
 
         const jump = async () => {
+          const session = window.YT.watchSession;
+          const request = session.reserveResolution();
           const openObj = {
             filepath: b.filepath || "",
             title,
@@ -446,7 +448,7 @@
           };
           try {
             if (openObj.filepath && typeof window._openVideoInWatch === "function") {
-              window._openVideoInWatch(openObj);
+              window._openVideoInWatch(openObj, { intentToken: request.intent });
               return;
             }
             if (openObj.video_id) {
@@ -454,6 +456,7 @@
               return;
             }
             const r = await bridgeCall("recent_resolve", title, channel);
+            if (!session.resolutionCurrent(request)) return;
             if (r?.ok && r.filepath && typeof window._openVideoInWatch === "function") {
               window._openVideoInWatch({
                 filepath: r.filepath,
@@ -463,11 +466,12 @@
                 _seek_to: start,
                 tracked: r.tracked !== undefined
                   ? !!r.tracked : _isTrackedChannel(channel),
-              });
+              }, { intentToken: request.intent });
               return;
             }
             window._showToast?.("Couldn't find the source video for this bookmark.", "warn");
           } catch (err) {
+            if (!session.resolutionCurrent(request)) return;
             window._showToast?.("Jump failed: " + err, "error");
           }
         };

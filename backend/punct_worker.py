@@ -16,7 +16,6 @@ Protocol:
 """
 
 import io
-import json
 import logging
 import os
 import re
@@ -29,6 +28,11 @@ else:
     from punct_alignment import joined_text_and_word_ends
 
 _out = sys.stdout
+if __package__:
+    from .worker_protocol import ProtocolWriter, iter_requests
+else:
+    from worker_protocol import ProtocolWriter, iter_requests
+_protocol = ProtocolWriter(_out)
 sys.stdout = io.StringIO()
 sys.stderr = io.StringIO()
 
@@ -50,38 +54,15 @@ try:
                        aggregation_strategy="none",
                        device=0 if device_str == "cuda" else -1)
 
-    _out.write(json.dumps({"status": "ready", "device": device_str}) + "\n")
-    _out.flush()
+    _protocol.send({"status": "ready", "device": device_str})
 except Exception as e:
-    _out.write(json.dumps({"status": "error", "text": str(e)}) + "\n")
-    _out.flush()
+    _protocol.send({"status": "error", "text": str(e)})
     sys.exit(1)
 
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        req = json.loads(line)
-        text = req.get("text", "")
-    except json.JSONDecodeError as _je:
-        # Emit an error response so the parent's readline call
-        # unblocks immediately. Old code silently continued the loop,
-        # leaving punctuate() blocked until its 60s timeout
-        # (audit: punct_worker.py:54-66).
-        try:
-            _out.write(json.dumps({
-                "status": "error",
-                "text": "",
-                "error": f"JSON decode failed: {_je}",
-            }) + "\n")
-            _out.flush()
-        except Exception:
-            pass
-        continue
+for req in iter_requests(sys.stdin, "punctuation", _protocol):
+    text = req["text"]
     if not text:
-        _out.write(json.dumps({"status": "ok", "text": ""}) + "\n")
-        _out.flush()
+        _protocol.send({"status": "ok", "text": ""})
         continue
 
     try:
@@ -105,8 +86,7 @@ for line in sys.stdin:
             "", text)
         words = cleaned.split()
         if not words:
-            _out.write(json.dumps({"status": "ok", "text": text}) + "\n")
-            _out.flush()
+            _protocol.send({"status": "ok", "text": text})
             continue
 
         # ── Step 2: split into overlapping chunks ──────────────────────
@@ -180,8 +160,6 @@ for line in sys.stdin:
         if out:
             out = out[0].upper() + out[1:]
 
-        _out.write(json.dumps({"status": "ok", "text": out}) + "\n")
-        _out.flush()
+        _protocol.send({"status": "ok", "text": out})
     except Exception as e:
-        _out.write(json.dumps({"status": "error", "text": str(e)}) + "\n")
-        _out.flush()
+        _protocol.send({"status": "error", "text": str(e)})

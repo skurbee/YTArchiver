@@ -22,7 +22,7 @@
 (function () {
   "use strict";
 
-  const _browseState = window._browseState || {};
+  const _browseState = window.YT.util.requireBrowseState();
   const showContextMenu = window.showContextMenu || (() => {});
   const askConfirm = window.askConfirm;
   const askDanger = window.askDanger;

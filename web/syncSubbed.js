@@ -6,7 +6,7 @@
 (function () {
   "use strict";
 
-  const _browseState = window._browseState || {};
+  const _browseState = window.YT.util.requireBrowseState();
   const showContextMenu = window.showContextMenu || (() => {});
   const askConfirm = window.askConfirm;
   const askDanger = window.askDanger;
@@ -523,7 +523,7 @@
   // navigated away from the Sync tab when the alert fires.
   (function wireCookieAlertListener() {
     let _pending = false;
-    window.addEventListener("yt-control", async (ev) => {
+    window.YT.eventState.onControl("cookie_alert", async (ev) => {
       if (!ev.detail || ev.detail.kind !== "cookie_alert") return;
       if (_pending) return; // dedupe: only one modal at a time
       _pending = true;
@@ -552,7 +552,7 @@
   (function wireChannelUrlChangedListener() {
     const seen = new Set();
     let dialogChain = Promise.resolve();
-    window.addEventListener("yt-control", (ev) => {
+    window.YT.eventState.onControl("channel_url_changed", (ev) => {
       const d = ev?.detail;
       if (!d || d.kind !== "channel_url_changed") return;
       const key = [d.channel_id || "", d.old_url || "", d.new_url || ""]
@@ -579,7 +579,7 @@
   // can compound the block while the dialog is open.
   (function wireYouTubeRateLimitListener() {
     let _pending = false;
-    window.addEventListener("yt-control", async (ev) => {
+    window.YT.eventState.onControl("youtube_rate_limit_alert", async (ev) => {
       if (!ev.detail || ev.detail.kind !== "youtube_rate_limit_alert") return;
       if (_pending) return;
       _pending = true;

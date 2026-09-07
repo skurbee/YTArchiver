@@ -13,14 +13,13 @@ lazily so this focused module can also be imported directly without racing
 """
 from __future__ import annotations
 
-import calendar
 import sqlite3
 import threading
 import time
 from collections import OrderedDict
-from datetime import UTC, datetime
 from typing import Any
 
+from .archive_calendar import calendar_sql, year_start_epoch
 from .catalog_repository import normalized_reads_enabled
 from .log import get_logger
 
@@ -40,7 +39,7 @@ def _index_module():
 
 
 def _year_start_ts(year: int) -> int:
-    return calendar.timegm(datetime(int(year), 1, 1, tzinfo=UTC).timetuple())
+    return year_start_epoch(year)
 
 
 def _dedupe_segment_hits(rows: list[Any]) -> list[Any]:
@@ -182,7 +181,7 @@ def search_video_titles(query: str,
     if not query or not query.strip():
         return []
     idx = _index_module()
-    with idx._interactive_reader("Searching video titles") as conn:
+    with idx.catalog_session().read("Searching video titles") as conn:
         return _search_video_titles(conn, query, channel, limit, sort, year_from, year_to,
                                      date_from_ts, date_to_ts)
 
@@ -424,7 +423,7 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
     if not query.strip():
         return []
     idx = _index_module()
-    with idx._interactive_reader("Searching transcripts") as conn:
+    with idx.catalog_session().read("Searching transcripts") as conn:
         return _search_fts(conn, query, channel, limit, year_from, year_to, sort,
                            date_from_ts, date_to_ts)
 
@@ -517,14 +516,15 @@ def _search_fts(conn, query: str, channel: Any | None = None, limit: int = 200,
     # when we have it, fall back to the folder-derived s.year when
     # upload_ts is missing, and stay lenient (include the row) only when
     # BOTH sources are unknown.
+    upload_year_sql = calendar_sql(_upload_expr, "year")
     if year_from is not None:
-        suffix += (f" AND (CAST(strftime('%Y', {_upload_expr}, 'unixepoch') AS INTEGER) >= ?"
+        suffix += (f" AND (CAST({upload_year_sql} AS INTEGER) >= ?"
                    f" OR ({_upload_expr} IS NULL AND s.year >= ?)"
                    f" OR ({_upload_expr} IS NULL AND s.year IS NULL))")
         args_suffix.append(int(year_from))
         args_suffix.append(int(year_from))
     if year_to is not None:
-        suffix += (f" AND (CAST(strftime('%Y', {_upload_expr}, 'unixepoch') AS INTEGER) <= ?"
+        suffix += (f" AND (CAST({upload_year_sql} AS INTEGER) <= ?"
                    f" OR ({_upload_expr} IS NULL AND s.year <= ?)"
                    f" OR ({_upload_expr} IS NULL AND s.year IS NULL))")
         args_suffix.append(int(year_to))

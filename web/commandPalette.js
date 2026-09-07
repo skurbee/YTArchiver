@@ -64,7 +64,7 @@
         card.click();
         return;
       }
-      const state = window._browseState || {};
+      const state = window.YT.util.requireBrowseState();
       const candidates = []
         .concat(Array.isArray(state.channels) ? state.channels : [])
         .concat(Array.isArray(state.pendingChannels)
@@ -111,7 +111,7 @@
         run: () => _clickTab("subs"),
       });
     }
-    const state = window._browseState || {};
+    const state = window.YT.util.requireBrowseState();
     const completeChannels = Array.isArray(state.channels)
       ? state.channels : [];
     const pendingChannels = Array.isArray(state.pendingChannels)

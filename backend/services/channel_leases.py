@@ -192,9 +192,10 @@ class LeaseOwner:
     label: str = ""
     task_id: str = ""
     kind: str = ""
+    parent_job_id: str = ""
 
     def __post_init__(self) -> None:
-        for field_name in ("owner", "job_id", "label", "task_id", "kind"):
+        for field_name in ("owner", "job_id", "label", "task_id", "kind", "parent_job_id"):
             value = str(getattr(self, field_name) or "").strip()
             object.__setattr__(self, field_name, value)
         if not self.owner:
@@ -361,18 +362,43 @@ class ChannelLeaseManager:
     def _blocking_states_locked(
         self,
         aliases: frozenset[str],
-        requester_key: tuple[str, str] | None,
+        requester: LeaseOwner | tuple[str, str] | None,
     ) -> list[_OwnerState]:
+        requester_key = self._requester_key(requester)
+        registered = self._owners.get(requester_key)
+        requester_owner = registered.owner if registered is not None else (
+            requester if isinstance(requester, LeaseOwner) else None
+        )
         wants_global = GLOBAL_ARCHIVE_ALIAS in aliases
         blockers: list[_OwnerState] = []
         for key, state in self._owners.items():
             if key == requester_key:
                 continue
             held = state.alias_counts.keys()
-            if wants_global or GLOBAL_ARCHIVE_ALIAS in held or not aliases.isdisjoint(held):
+            if wants_global or GLOBAL_ARCHIVE_ALIAS in held:
+                blockers.append(state)
+            elif not aliases.isdisjoint(held) and not self._download_processing_pair(
+                requester_owner, state.owner
+            ):
                 blockers.append(state)
         blockers.sort(key=lambda state: state.owner.key)
         return blockers
+
+    @staticmethod
+    def _download_processing_pair(first: LeaseOwner | None, second: LeaseOwner) -> bool:
+        """Share only a download and transcription spawned by that exact job."""
+        if first is None:
+            return False
+        if first.owner == "processing":
+            first, second = second, first
+        return (
+            first.owner == "sync"
+            and first.kind == "download"
+            and second.owner == "processing"
+            and second.kind == "transcribe"
+            and bool(second.parent_job_id)
+            and second.parent_job_id == first.job_id
+        )
 
     @staticmethod
     def _snapshot_state(state: _OwnerState, now: float) -> LeaseSnapshot:
@@ -392,12 +418,12 @@ class ChannelLeaseManager:
     def _blocker_snapshots_locked(
         self,
         aliases: frozenset[str],
-        requester_key: tuple[str, str] | None,
+        requester: LeaseOwner | tuple[str, str] | None,
     ) -> tuple[LeaseSnapshot, ...]:
         now = time.monotonic()
         return tuple(
             self._snapshot_state(state, now)
-            for state in self._blocking_states_locked(aliases, requester_key)
+            for state in self._blocking_states_locked(aliases, requester)
         )
 
     @staticmethod
@@ -455,7 +481,7 @@ class ChannelLeaseManager:
                 return LeaseAcquireResult(
                     False, "cancelled", None, (), "Lease request was cancelled."
                 )
-            blockers = self._blocker_snapshots_locked(requested, owner.key)
+            blockers = self._blocker_snapshots_locked(requested, owner)
             if blockers:
                 return LeaseAcquireResult(False, "busy", None, blockers, self._busy_text(blockers))
             return self._grant_locked(requested, owner)
@@ -482,7 +508,7 @@ class ChannelLeaseManager:
         with self._condition:
             while True:
                 if cancel_event is not None and cancel_event.is_set():
-                    blockers = self._blocker_snapshots_locked(requested, owner.key)
+                    blockers = self._blocker_snapshots_locked(requested, owner)
                     return LeaseAcquireResult(
                         False,
                         "cancelled",
@@ -490,7 +516,7 @@ class ChannelLeaseManager:
                         blockers,
                         "Lease request was cancelled.",
                     )
-                blockers = self._blocker_snapshots_locked(requested, owner.key)
+                blockers = self._blocker_snapshots_locked(requested, owner)
                 if not blockers:
                     return self._grant_locked(requested, owner)
                 remaining = deadline - time.monotonic()
@@ -540,7 +566,7 @@ class ChannelLeaseManager:
         """Return immutable details for jobs blocking the requested aliases."""
         requested = self._aliases(aliases)
         with self._condition:
-            return self._blocker_snapshots_locked(requested, self._requester_key(requester))
+            return self._blocker_snapshots_locked(requested, requester)
 
     def busy_explanation(
         self,

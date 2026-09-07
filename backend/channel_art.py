@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import time
+import urllib.error
 import urllib.request
 from typing import Any
 from urllib.parse import urlparse
@@ -68,7 +69,58 @@ def _looks_like_image(data: bytes) -> bool:
     return False
 
 
-def _http_get(url: str, dest: str, timeout: int = 30) -> bool:
+def _wait_for_controls(cancel_event=None, pause_event=None) -> bool:
+    """Wait out a manual pause without preventing cancellation."""
+    while pause_event is not None and pause_event.is_set():
+        if cancel_event is not None:
+            if cancel_event.wait(0.1):
+                return False
+        else:
+            time.sleep(0.1)
+    return cancel_event is None or not cancel_event.is_set()
+
+
+def _acquire_request(kind: str, *, cancel_event=None, pause_event=None) -> dict:
+    while _wait_for_controls(cancel_event, pause_event):
+        result = youtube_traffic.acquire(
+            kind, cancel_event=cancel_event, pause_event=pause_event)
+        if result.get("paused"):
+            continue
+        if result.get("ok") and not _wait_for_controls(cancel_event, pause_event):
+            return {"ok": False, "cancelled": True}
+        return result
+    return {"ok": False, "cancelled": True}
+
+
+def _youtube_failure(text: str, pause_event=None) -> dict:
+    from .youtube_session import (
+        handle_youtube_failure_text,
+        is_cookie_auth_error,
+        is_youtube_rate_limit_error,
+    )
+
+    # Preserve the classification if alert delivery fails: especially do not
+    # retry a public 429 with account cookies because a UI notification failed.
+    failure = ("rate_limit" if is_youtube_rate_limit_error(text)
+               else "cookie" if is_cookie_auth_error(text) else "")
+    try:
+        failure = handle_youtube_failure_text(
+            text, context="fetching channel artwork", pause_event=pause_event) or failure
+    except Exception as exc:
+        _log.debug("channel-art YouTube guard failed: %s", exc)
+    if not failure:
+        return {}
+    return {
+        "ok": False,
+        "error": ("Firefox YouTube sign-in expired" if failure == "cookie"
+                  else "YouTube rate limited"),
+        "cookie_auth_required": failure == "cookie",
+        "rate_limited": failure == "rate_limit",
+    }
+
+
+def _http_get(url: str, dest: str, timeout: int = 30, *, cancel_event=None,
+              pause_event=None, failure: dict | None = None) -> bool:
     """Atomically fetch `url` into `dest`. Tmp-then-replace + magic-byte
     validation + size cap so a crash, network reset, or 200-OK HTML
     error page can't leave a corrupt sidecar that the 30-day refresh
@@ -76,7 +128,14 @@ def _http_get(url: str, dest: str, timeout: int = 30) -> bool:
     """
     tmp = dest + ".tmp"
     try:
-        if urlparse(url).scheme.lower() not in ("http", "https"):
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+            return False
+        permission = _acquire_request(
+            "channel_art_image", cancel_event=cancel_event, pause_event=pause_event)
+        if not permission.get("ok"):
+            if failure is not None:
+                failure.update(permission)
             return False
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -91,6 +150,10 @@ def _http_get(url: str, dest: str, timeout: int = 30) -> bool:
             return False
         if not _looks_like_image(data):
             return False
+        if not _wait_for_controls(cancel_event, pause_event):
+            if failure is not None:
+                failure.update(ok=False, cancelled=True)
+            return False
         with open(tmp, "wb") as f:
             f.write(data)
             try:
@@ -98,20 +161,31 @@ def _http_get(url: str, dest: str, timeout: int = 30) -> bool:
                 os.fsync(f.fileno())
             except OSError:
                 pass
+        if not _wait_for_controls(cancel_event, pause_event):
+            if failure is not None:
+                failure.update(ok=False, cancelled=True)
+            return False
         os.replace(tmp, dest)
         try:
             hide_file_win(dest)
         except Exception:
             pass
         return True
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            result = _youtube_failure("HTTP Error 429: Too Many Requests", pause_event)
+            if failure is not None:
+                failure.update(result)
+        return False
     except Exception:
+        return False
+    finally:
         try: os.remove(tmp)
         except OSError: pass
-        return False
 
 
-def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
-                      ) -> dict[str, Any]:
+def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False, *,
+                      cancel_event=None, pause_event=None) -> dict[str, Any]:
     """Download channel avatar + banner via yt-dlp metadata dump.
 
     Files written:
@@ -120,10 +194,19 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
 
     Skips if both exist and are < 30 days old (unless force=True).
 
-    Returns {ok, avatar_path?, banner_path?, skipped?, error?}.
+    Returns {ok, avatar_path?, banner_path?, skipped?, error?}; cancellation
+    and traffic/session denials are returned without writing a success sentinel.
     """
     if not ch_url or not folder_path:
         return {"ok": False, "error": "ch_url + folder_path required"}
+    try:
+        parsed = urlparse(ch_url)
+    except ValueError:
+        return {"ok": False, "error": "invalid channel URL"}
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        return {"ok": False, "error": "invalid channel URL"}
+    if cancel_event is not None and cancel_event.is_set():
+        return {"ok": False, "cancelled": True}
 
     art_dir = os.path.join(folder_path, ".ChannelArt")
     avatar_path = os.path.join(art_dir, "avatar.jpg")
@@ -157,6 +240,8 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
         except OSError:
             pass
 
+    if not _wait_for_controls(cancel_event, pause_event):
+        return {"ok": False, "cancelled": True}
     try:
         os.makedirs(art_dir, exist_ok=True)
     except OSError as e:
@@ -181,49 +266,53 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
         "--dump-single-json", "--flat-playlist", "--playlist-items", "0",
     ]
 
-    def _run_probe(cookie_args: list[str]) -> subprocess.CompletedProcess:
+    def _run_probe(cookie_args: list[str]):
         cmd = [*base_cmd, *cookie_args, base_url]
-        permission = youtube_traffic.acquire("channel_art")
+        permission = _acquire_request(
+            "channel_art", cancel_event=cancel_event, pause_event=pause_event)
         if not permission.get("ok"):
-            raise RuntimeError(
-                permission.get("error") or "traffic governor cancelled")
+            return permission
         return run_ytdlp(
             cmd, capture_output=True, text=True, timeout=60,
             encoding="utf-8", errors="replace",
             creationflags=(0x08000000 if os.name == "nt" else 0),
+            request_cancel_event=cancel_event, request_pause_event=pause_event,
         )
 
     try:
         proc = _run_probe([])
+        if isinstance(proc, dict):
+            return proc
+        if cancel_event is not None and cancel_event.is_set():
+            return {"ok": False, "cancelled": True}
+        failure = _youtube_failure(proc.stderr or "", pause_event)
+        if failure:
+            return failure
         if proc.returncode != 0 or not (proc.stdout or "").strip():
             # Channel art is cosmetic. Do not attach YouTube cookies unless
             # the public metadata probe failed.
+            if not _wait_for_controls(cancel_event, pause_event):
+                return {"ok": False, "cancelled": True}
             cookie_args = _find_cookie_source() or []
             if cookie_args:
                 proc = _run_probe(cookie_args)
+                if isinstance(proc, dict):
+                    return proc
+                if cancel_event is not None and cancel_event.is_set():
+                    return {"ok": False, "cancelled": True}
+                failure = _youtube_failure(proc.stderr or "", pause_event)
+                if failure:
+                    return failure
     except subprocess.TimeoutExpired:
+        if cancel_event is not None and cancel_event.is_set():
+            return {"ok": False, "cancelled": True}
         return {"ok": False, "error": "yt-dlp timed out"}
     except FileNotFoundError:
         return {"ok": False, "error": "yt-dlp not found"}
     except Exception as e:
+        if cancel_event is not None and cancel_event.is_set():
+            return {"ok": False, "cancelled": True}
         return {"ok": False, "error": f"yt-dlp failed: {e}"}
-
-    try:
-        from .youtube_session import handle_youtube_failure_text
-        _yt_failure = handle_youtube_failure_text(
-            proc.stderr or "", context="fetching channel artwork")
-    except Exception as e:
-        _log.debug("channel-art YouTube guard failed: %s", e)
-        _yt_failure = ""
-    if _yt_failure:
-        return {
-            "ok": False,
-            "error": ("Firefox YouTube sign-in expired"
-                      if _yt_failure == "cookie"
-                      else "YouTube rate limited"),
-            "cookie_auth_required": _yt_failure == "cookie",
-            "rate_limited": _yt_failure == "rate_limit",
-        }
 
     if proc.returncode != 0 or not (proc.stdout or "").strip():
         # Patch C: include stderr excerpt so the user can see WHY
@@ -254,14 +343,25 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
            "partial": False, "failed_assets": []}
     avatar_attempted = bool(avatar and avatar.get("url"))
     banner_attempted = bool(banner and banner.get("url"))
-    if avatar_attempted and _http_get(avatar["url"], avatar_path):
+    failure = {}
+    controls = {"cancel_event": cancel_event, "pause_event": pause_event,
+                "failure": failure}
+    if avatar_attempted and _http_get(avatar["url"], avatar_path, **controls):
         got["avatar_path"] = avatar_path
     elif avatar_attempted:
         got["failed_assets"].append("avatar")
-    if banner_attempted and _http_get(banner["url"], banner_path):
+    if failure:
+        return failure
+    if not _wait_for_controls(cancel_event, pause_event):
+        return {"ok": False, "cancelled": True}
+    if banner_attempted and _http_get(banner["url"], banner_path, **controls):
         got["banner_path"] = banner_path
     elif banner_attempted:
         got["failed_assets"].append("banner")
+    if failure:
+        return failure
+    if not _wait_for_controls(cancel_event, pause_event):
+        return {"ok": False, "cancelled": True}
     if got["avatar_path"] is None and got["banner_path"] is None:
         return {"ok": False, "error": "avatar + banner downloads failed",
                 "failed_assets": got["failed_assets"]}

@@ -26,26 +26,13 @@ function Invoke-Step([string]$Name, [scriptblock]$Action) {
 }
 
 function Get-TreeFingerprint {
-    # Use the checkout's normal Git attributes and line-ending rules. Forcing
-    # core.autocrlf off here makes an unchanged Windows checkout look dirty as
-    # soon as Git has to re-read a CRLF file instead of trusting its stat cache.
-    $diff = (& git diff --binary --no-ext-diff -- . | Out-String)
-    if ($LASTEXITCODE -ne 0) { throw 'git diff failed.' }
-    $cached = (& git diff --cached --binary --no-ext-diff -- . | Out-String)
-    if ($LASTEXITCODE -ne 0) { throw 'git diff --cached failed.' }
-    $untracked = (& git ls-files --others --exclude-standard | Sort-Object | Out-String)
-    if ($LASTEXITCODE -ne 0) { throw 'git untracked-file query failed.' }
-    $sha = [Security.Cryptography.SHA256]::Create()
-    try {
-        $bytes = [Text.Encoding]::UTF8.GetBytes($diff + "`0" + $cached + "`0" + $untracked)
-        return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '')
-    }
-    finally {
-        $sha.Dispose()
-    }
+    # Current file bytes also cover edits to an already-listed new module.
+    # Do not override the checkout's normal Git line-ending configuration.
+    $fingerprint = (& $BasePython (Join-Path $Root 'scripts\source_fingerprint.py') | Select-Object -Last 1)
+    if ($LASTEXITCODE -ne 0) { throw 'Source fingerprint failed.' }
+    return $fingerprint
 }
 
-$InitialFingerprint = Get-TreeFingerprint
 if ($RequireCleanTree) {
     $porcelain = @(& git status --porcelain=v1 --untracked-files=all)
     if ($LASTEXITCODE -ne 0) { throw 'git status failed.' }
@@ -77,6 +64,7 @@ $ActualPython = (& $BasePython -c 'import platform; print(platform.python_versio
 if ($ActualPython -ne $ExpectedPython) {
     throw "Python $ExpectedPython is required; found $ActualPython."
 }
+$InitialFingerprint = Get-TreeFingerprint
 
 $TempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $CheckRoot = Join-Path $TempBase ("ytarchiver-quality-" + [Guid]::NewGuid().ToString('N'))

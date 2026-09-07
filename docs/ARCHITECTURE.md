@@ -53,8 +53,35 @@ Main thread (pywebview event loop)
 registry for long-lived background owners. New work is registered before its
 thread starts. Shutdown or restore closes admission, asks each owner to
 checkpoint, waits with a bounded deadline, and force-stops only the exact
-remaining owner. Child processes are tagged and tracked by
+remaining owner. The deadline covers diagnostics, activity probes, checkpoint,
+join, and stop calls; a blocked probe remains an explicit unknown owner rather
+than extending shutdown without a bound. Child processes are tagged and tracked by
 `ProcessRegistry` in `backend/process_runner.py`.
+
+`ProcessOutputReader` supplies bounded pipe queues and safe reader cleanup.
+`stop_owned_process` and `finish_owned_process` share exact-tree termination
+and reaping. `supervise_streaming_process` reports cancellation, timeout, and
+output completeness separately; incomplete output cannot establish a complete
+catalog or successful processing run. A busy post-exit backlog continues to
+drain, while silence from an inherited handle has a bounded allowance.
+
+The native single-instance lease owns the lifetime of a named handle without
+acquiring thread-specific mutex ownership. Restart closes that handle through
+the lease before spawning a replacement; failed release prevents launching a
+second instance.
+
+Tool policy remains at the caller:
+
+| Caller | Pause/cancellation and deadline policy |
+|---|---|
+| Channel sync | Binary output parser; pause/cancel stops the child; inactivity watchdog remains local. |
+| Metadata capture | Shared capture with existing bounded attempt deadlines and retry backoff. |
+| Metadata catalog | Pause suspends consumption and deadline accounting; cancellation still interrupts; incomplete output cannot prove absence. |
+| Title matching | Pause/cancel stops the walk; only complete output can establish an unambiguous match. |
+| Redownload catalog | Pause suspends consumption; cancellation remains responsive; retains a 300-second exit wait after pipe EOF. |
+| Individual redownload | Pause remains between videos; cancel/session abort stops the child; final wait after EOF is bounded. |
+| Compression | Progress parsing stays local; cancellation or unreadable output preserves the original file. |
+| Manual download | Shared supervision with a 15-minute inactivity limit; incomplete output is not successful completion. |
 
 Mutating jobs also use the process-wide leases in
 `backend/services/channel_leases.py`. A channel lease covers its stable URL
@@ -66,11 +93,18 @@ or roll back an interrupted multi-resource change.
 
 ## State and persistence owners
 
+`services/composition.py` wires repositories and the application-information
+service without starting runtime work. `main.Api` retains bridge compatibility
+and native lifecycle coordination. Extracted information and startup workflows
+receive their dependencies explicitly; they do not discover collaborators on
+an arbitrary Api object. Other feature mixins remain incremental migration
+targets, rather than moving all application behavior into `AppServices`.
+
 | State | Owner | Storage |
 |---|---|---|
 | Configuration | `ConfigRepository` via `AppServices` | `%APPDATA%\YTArchiver\ytarchiver_config.json` |
 | Sync/GPU queues | `QueueState` + `QueueRepository` | `ytarchiver_queue.json` and `ytarchiver_queue_resuming.json` |
-| Catalog and transcript index | `index.py` + `catalog_repository.py` | `transcription_index.db` (SQLite + FTS5) |
+| Catalog and transcript index | `index.py` + `CatalogSession` + `catalog_repository.py` | `transcription_index.db` (SQLite + FTS5) |
 | Saved channel counts and sizes | `archive_scan.py` | `ytarchiver_disk_cache.json` |
 | Bookmarks and notes | `index_bookmarks.py` | `bookmarks` table in the index database; separate resource in app-state backups |
 | Metadata sidecars | metadata services + `sidecar_store.py` | hidden per-channel JSONL |
@@ -80,10 +114,44 @@ or roll back an interrupted multi-resource change.
 | Window state | configuration repository | `window_state` inside configuration |
 
 `ConfigRepository` owns load, replace, and serialized read-modify-write
-operations. `QueueRepository` owns parsing, atomic main/resuming commits, and
+operations. Loading, normalization/migration, recovery, and cache publication
+share the same generation lock as saves. `QueueRepository` owns parsing, atomic main/resuming commits, and
 corruption preservation; malformed queue files are moved aside rather than
 silently overwritten. Domain code should ask those repositories for state
 instead of opening the persistence files itself.
+
+Queue hydration is a write-admission boundary: an unreadable main queue or
+resuming journal blocks ordinary writes, sidecar writes, and exit saves. Startup
+retains that owner and exposes its recovery status instead of replacing it with
+an apparently empty queue. Known legacy formats are admitted explicitly;
+unsupported database, sidecar, or recovery-journal versions are preserved.
+
+`config_views.py` projects supplied configuration snapshots for the UI without
+loading or saving configuration. `services/config_snapshot.py` gives migrated
+API operations one copied snapshot per operation; an injected repository failure
+is propagated rather than silently switching to global state.
+
+`CatalogSession` owns lock admission, bounded SQL scopes, reader/writer access,
+and transactions for bookmarks, search, Graph, and maintenance. Legacy schema
+and connection construction remain in `index.py`. `media_identity.py` owns the
+shared identity and preferred-copy policy used by SQL reads and Python projection.
+
+`ManagedRoots` derives root membership once from a supplied configuration and
+resolves containment at each check. `TrashStore` owns the persistent manifest,
+journal, and recovery-marker protocol used by file operations and TrashManager.
+Atomic JSON publication is a neutral primitive shared with other sidecar work.
+
+Trash restore records the moved file's identity before finalizing catalog work.
+An existing destination can satisfy an interrupted move only when the receipt
+identifies that same file. Root removal is one backend command: catalog cleanup
+must succeed before the additional root is removed from fresh configuration.
+Failure leaves the configured root visible and retryable; media stays in place.
+
+Filesystem scans report complete, partial, cancelled, or unavailable observations.
+Only complete observations replace known counts. SQL read-only connections to
+live databases and cookie stores include committed WAL data; immutable mode is
+reserved for actual offline snapshots. Search and Graph share UTC calendar
+adapters, while date-only upload metadata retains its calendar day.
 
 ### Queue recovery and completion
 
@@ -104,6 +172,18 @@ These transitions live in [`queues.py`](../backend/queues.py); the sync
 service and [`sync_mixin.py`](../backend/api_mixins/sync_mixin.py) consume
 their results.
 
+`transcribe/queue_commands.py` coordinates processing commands across runtime
+jobs, QueueState, and the recovery journal, including compensation after a
+failed write. `transcribe/recovery.py` defines the processing-record codec and
+recovery flags at persistence/queue boundaries. Persisted formats and task IDs
+remain compatible with existing records.
+
+`sync/queue_commands.py` keeps redownload's runtime companions aligned with
+durable pending rows and owns completion/defer acknowledgement. Bridge adapters
+call the processing command service directly; test collaborators implement the
+same interface. Processing admission returns an `EnqueueResult`, distinct from
+the outcome of the later job, so a rejected save cannot look like a duplicate.
+
 ## Startup and saved-count recovery
 
 The frontend validates the complete runtime installation status before opening
@@ -112,9 +192,12 @@ retry path. Failed seed steps can retry after `pywebviewready`, including when
 that event arrives during the failing attempt; successful recovery clears the
 startup-data and connection warnings while retaining unrelated boot issues.
 
-[`main.py`](../main.py) runs local startup stages sequentially under one
-supervised owner. Initial checks make the UI ready to accept work; slower
-archive scans continue in the background:
+[`main.py`](../main.py) assembles `services/startup_sequence.py` with explicit
+configuration, catalog, logging, and readiness callbacks. It runs stages through
+`startup_stages.py` and disk recovery through `startup_scan.py` under one
+supervised owner. These components can be tested without a desktop launch.
+Initial checks make the UI ready to accept work; slower archive scans continue
+in the background:
 
 1. Refresh saved channel counts when the scan is stale, has never completed,
    or has missing, malformed, or old-format records for current subscriptions.
@@ -205,7 +288,7 @@ copy is elsewhere. The shared selection helpers are
 ## Sidecar durability
 
 `backend/services/sidecar_store.py` is the common boundary for metadata,
-transcript, provenance, caption-repair, and reorganization sidecars. It:
+transcript, caption-repair, and reorganization sidecars. It:
 
 1. serializes writers per target path;
 2. reads existing content without treating unreadable data as empty;
@@ -214,6 +297,12 @@ transcript, provenance, caption-repair, and reorganization sidecars. It:
 5. reads them back and validates their format;
 6. installs them with `os.replace`; and
 7. preserves the old target on any pre-replace failure.
+
+Buffered flush and close failures abort publication. The provenance ledger has
+a separate append owner: it parses history once per pass, appends checksummed,
+flushed records, preserves evidence of a torn tail, and compacts during recovery.
+Preview paths inspect planned work without creating archive directories or
+repairing sidecars.
 
 Operations that must update more than one store first create a durable
 reconciliation marker. Each committed store is checked off independently;
@@ -230,12 +319,32 @@ registration both succeeded. Existing-file, ID-less, and normal download
 paths all use this contract, so a download is not announced as committed when
 the final media or catalog registration failed.
 
+`sync/completion.py` separates immutable completion observations, once-only
+registration/accounting, follow-up work, and activity-row rendering. Deferred
+callbacks retain their video's identity rather than borrowing changing parser
+state. `sync/results.py` names sync outcomes; metadata and processing admission
+also expose explicit results, with compatibility adapters at older call sites.
+
 `backend/transcribe/job_execution.py` gives each queued transcription/compression
 operation an explicit `WorkerOutcome`. The executor converts exceptions and
 invalid legacy return values into a known result; the owner then applies
 cancel, defer, and shutdown signals after file-changing work has stopped.
 Terminal removal and retry/pause decisions are made from that result rather
 than from a collection of implicit sentinels.
+
+`transcribe/inference.py` owns the request/response transaction and failure
+classification used by ordinary and chunked jobs. `transcribe/audio_extract.py` registers and supervises each FFmpeg chunk
+extractor with the job's pause, cancel, and shutdown state. `worker_protocol.py`
+is a Python 3.11-compatible wire boundary shared by parent and worker entrypoints;
+it validates messages, serializes worker output, and classifies EOF explicitly.
+Both default-model endpoints use `services/processing_defaults.py`: save first,
+then apply to runtime, with a deferred result when the runtime cannot switch yet.
+
+Metadata's filesystem cache stores physical enumeration only; catalog identity
+is projected from a fresh reader snapshot. Comment completion uses its own
+checkpoint rather than a general metadata-fetch timestamp. The YouTube cooldown
+keeps an in-memory failure circuit even when its durable save fails. The bounded
+executor retains only outstanding futures and yields completed values once.
 
 ## Sync pipeline (per video)
 
@@ -311,10 +420,25 @@ size changes, resizing, and video changes while enabled. Startup hydration does
 not save fallback preferences over the stored settings, and a late response is
 ignored after a user interacts with any caption control.
 
+`web/preferences.js` coalesces reads and serializes acknowledged writes. Per-key
+revisions prevent delayed reads from replacing newer edits, and failed writes
+roll back to the last acknowledged values. Hydration applies saved state without
+writing it back. Bridge adapters validate settings/channel reply shapes so an
+error cannot become an empty successful result.
+
+`YT.util.initialize` tracks initializing, ready, and failed states. Failed setup
+aborts owned listeners/timers and can retry. Browse consumers require its actual
+shared state. Metadata uses the shared context-menu lifecycle, including keyboard
+navigation, dismissal, positioning, and focus restoration.
+
 ## Metadata and authored state
 
 [`backend/metadata/`](../backend/metadata/) separates sidecar I/O, scans,
 remote fetches, views/likes and comment refreshes, and thumbnail operations.
+The catalog, duration, identity, and cancellation helpers are leaf modules;
+refresh workflows import these directly. `ytdlp_options.py` provides tool/cookie
+options without importing the sync workflow. `metadata/core.py` and the old
+proxy module retain compatibility exports rather than owning cyclic workflows.
 Reloading saved metadata status is different from contacting YouTube.
 `get_channel_metadata_status(force=True)` recounts channel files and catalog
 coverage, publishing refreshed disk counts; the UI's recount action also
@@ -393,6 +517,24 @@ and the status bar subscribe independently. A broken or removed subscriber
 cannot replace the bridge callback or prevent another subscriber from
 receiving the update. Log indicator state follows the same named-topic model.
 
+Prompts and processing state use `services/reliable_events.py` and
+`window._appEventBatch`, independently of disposable log batches. Stable keys,
+revisions, acknowledgements, and sample deadlines govern retries and coalescing.
+Processing snapshots retain request identity and lifecycle order; display text
+and Simple/Verbose filtering do not decide job state. External-output scanners
+receive original text before display filtering or truncation.
+
+`services/operation_results.py` owns bounded pending/result registries for
+short-lived bridge jobs. Completed polls return detached, repeatable snapshots;
+retention starts at completion, and admission failure releases the token.
+
+`web/watchSession.js` owns selected/rendered video identity and distinct open,
+transcript, metadata, playback, and navigation revisions. Immutable request tickets guard
+delayed resolutions, metadata, media loading, and seeks. Compatibility globals
+and Browse route state reference this owner. `web/pagedCollection.js` supplies
+shared request admission/completion and coalesced refresh for the three library
+pagers; their rendering, mapping, deduplication, and caching remain view-specific.
+
 Long-running bridge handlers must still offload work because pywebview invokes
 Python methods on bridge worker threads. See the threading rules in
 [`../backend/api_mixins/README.md`](../backend/api_mixins/README.md).
@@ -444,8 +586,11 @@ The gate runs, in order:
 8. a clean PyInstaller build plus x64 PE, version-resource, and packaged-data
    verification.
 
-The gate fingerprints the source tree before and after running and fails if a
-check unexpectedly changes it. See [`BUILD.md`](BUILD.md) for commands and
+The gate fingerprints paths and bytes of tracked and non-ignored new files
+before and after running, and fails if a check unexpectedly changes them.
+The bridge checker resolves the actual `Api` inheritance tree without importing
+the application; detached mixins cannot supply a missing endpoint.
+See [`BUILD.md`](BUILD.md) for commands and
 locked-environment bootstrap details.
 
 ## Notable design rules

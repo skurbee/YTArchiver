@@ -90,11 +90,11 @@ def test_failed_rollback_retains_original_and_next_start_recovers(state, tmp_pat
     assert not restore.RESTORE_JOURNAL.exists()
 
 
-def test_large_index_backup_round_trip_preserves_authored_state(state, tmp_path, monkeypatch):
+def test_excluded_index_backup_round_trip_preserves_authored_state(state, tmp_path, monkeypatch):
     _profile, _config, database, _queue = state
     seed_database(database)
     archive = tmp_path / "large-library.zip"
-    monkeypatch.setattr(auto_backup, "_FTS_ZIP_CAP", 1)
+    monkeypatch.setattr(auto_backup, "load_config", lambda: {"backup_include_search_db": False})
     exported = auto_backup.build_backup_zip(str(archive))
     assert not exported["fts_included"]
     assert exported["bookmarks_included"] and exported["bookmark_count"] == 1
@@ -178,7 +178,7 @@ def test_bookmark_seed_survives_normal_index_initialization(state, tmp_path, mon
     from backend import index
     _profile, _config, database, _queue = state
     seed_database(database)
-    monkeypatch.setattr(auto_backup, "_FTS_ZIP_CAP", 1)
+    monkeypatch.setattr(auto_backup, "load_config", lambda: {"backup_include_search_db": False})
     archive = tmp_path / "seed.zip"
     auto_backup.build_backup_zip(str(archive))
     assert restore.restore_backup(archive)["ok"]

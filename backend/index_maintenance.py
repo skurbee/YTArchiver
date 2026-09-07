@@ -19,7 +19,8 @@ Archive and index maintenance operations extracted from backend/index.py:
         — wipe the FTS5 table and rebuild it from scratch by re-ingesting
           every `.jsonl` on disk. Settings → Rebuild button drives this.
 
-Connection + lock primitives come from index.py via `_idx`.
+Connection admission and transaction lifetimes come from the explicit
+catalog session; this module owns archive traversal and maintenance SQL.
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ from typing import Any
 from . import index as _idx
 from .fs_search import MEDIA_EXTS_TUPLE, is_partial_artifact
 from .log import get_logger
+from .services.catalog_session import LibraryQueryTimeout
 
 _log = get_logger(__name__)
 
@@ -362,8 +364,8 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
 
     Returns {registered, ingested} counts.
 
-    The sweep uses its OWN sqlite3 connection (via _idx._open_independent)
-    so its many per-file writes don't go through the shared `_idx._db_lock`.
+    The sweep owns an independent session connection, so its many per-file
+    writes do not hold the shared writer admission lock.
     Without this, sync's DLTRACK register_video calls + transcribe's
     FTS-ingest calls all serialized behind the sweep's lock acquisition,
     causing visible "Downloading 100%" hangs of many minutes during
@@ -403,8 +405,8 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
     _wait_while_busy()
     # Make sure the shared connection's schema-init has run at least
     # once (creates tables, sets PRAGMAs at the file level).
-    _ = _idx._open()
-    sweep_conn = _idx._open_independent()
+    _idx.catalog_session().initialize()
+    sweep_conn = _idx.catalog_session().open_independent()
     if sweep_conn is None:
         return {"registered": 0, "ingested": 0}
 
@@ -640,7 +642,7 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
                         if _jsonl_needs_ingest(sweep_conn, jp):
                             title = _strip_id.sub("", _os.path.basename(base)) or _os.path.basename(base)
                             # Pass sweep_conn so this call doesn't compete
-                            # for _idx._db_lock — see _idx._open_independent docstring.
+                            # for shared writer admission — see CatalogSession.open_independent.
                             _wait_while_busy()
                             if _idx.ingest_jsonl(fp, jp, title, ch_name,
                                             _conn_override=sweep_conn):
@@ -913,8 +915,8 @@ def restore_channel_catalog(
             "error": "Restored channel folder is unavailable.",
         }
 
-    _ = _idx._open()
-    conn = _idx._open_independent()
+    _idx.catalog_session().initialize()
+    conn = _idx.catalog_session().open_independent()
     if conn is None:
         return {"ok": False, "registered": 0, "ingested": 0,
                 "error": "Index database is unavailable."}
@@ -1041,7 +1043,7 @@ def restore_channel_catalog(
     }
 
 
-def refresh_channel_file_sizes(channel: str, folder: str = "") -> dict[str, int]:
+def refresh_channel_file_sizes(channel: str, folder: str = "") -> dict[str, Any]:
     """Restat one channel's indexed files and persist their real byte sizes.
 
     Normal startup sweeps deliberately skip stat calls for known files.  This
@@ -1051,8 +1053,7 @@ def refresh_channel_file_sizes(channel: str, folder: str = "") -> dict[str, int]
     """
     import os as _os
 
-    conn = _idx._open()
-    if conn is None or not channel:
+    if not channel or not _idx.catalog_session().initialize():
         return {"checked": 0, "updated": 0, "bytes": 0,
                 "duplicate_markers_cleared": 0}
     root = _os.path.normcase(_os.path.abspath(folder)) if folder else ""
@@ -1066,7 +1067,10 @@ def refresh_channel_file_sizes(channel: str, folder: str = "") -> dict[str, int]
         except (OSError, ValueError):
             return False
 
-    with _idx._db_lock:
+    with _idx.catalog_session().reader(writer_fallback=True) as conn:
+        if conn is None:
+            return {"checked": 0, "updated": 0, "bytes": 0,
+                    "duplicate_markers_cleared": 0, "error": "DB unavailable"}
         rows = conn.execute(
             "SELECT filepath, COALESCE(size_bytes, 0) FROM videos "
             "WHERE channel=? COLLATE NOCASE", (channel,)).fetchall()
@@ -1088,25 +1092,27 @@ def refresh_channel_file_sizes(channel: str, folder: str = "") -> dict[str, int]
             updates.append((size, filepath))
 
     cleared = 0
-    with _idx._db_lock:
-        if updates:
-            conn.executemany(
-                "UPDATE videos SET size_bytes=? "
-                "WHERE filepath=? COLLATE NOCASE", updates)
-        # A repaired bad ID can leave its formerly paired row carrying an
-        # obsolete duplicate marker. Clear only IDs now represented by one
-        # row; genuine duplicate downloads remain flagged.
-        cur = conn.execute(
-            "UPDATE videos SET is_duplicate_of=NULL "
-            "WHERE channel=? COLLATE NOCASE "
-            "AND is_duplicate_of IS NOT NULL "
-            "AND video_id IS NOT NULL AND video_id != '' "
-            "AND (SELECT COUNT(*) FROM videos AS siblings "
-            "     WHERE siblings.video_id=videos.video_id)=1",
-            (channel,))
-        cleared = max(0, cur.rowcount or 0)
-        if updates or cleared:
-            conn.commit()
+    try:
+        with _idx.catalog_session().maintenance_transaction("Refreshing file sizes") as conn:
+            if updates:
+                conn.executemany(
+                    "UPDATE videos SET size_bytes=? "
+                    "WHERE filepath=? COLLATE NOCASE", updates)
+            # A repaired bad ID can leave its formerly paired row carrying an
+            # obsolete duplicate marker. Clear only IDs now represented by one
+            # row; genuine duplicate downloads remain flagged.
+            cur = conn.execute(
+                "UPDATE videos SET is_duplicate_of=NULL "
+                "WHERE channel=? COLLATE NOCASE "
+                "AND is_duplicate_of IS NOT NULL "
+                "AND video_id IS NOT NULL AND video_id != '' "
+                "AND (SELECT COUNT(*) FROM videos AS siblings "
+                "     WHERE siblings.video_id=videos.video_id)=1",
+                (channel,))
+            cleared = max(0, cur.rowcount or 0)
+    except (LibraryQueryTimeout, RuntimeError) as exc:
+        return {"checked": checked, "updated": 0, "bytes": total_bytes,
+                "duplicate_markers_cleared": 0, "error": str(exc)}
     if updates or cleared:
         _idx.invalidate_channel_videos(channel)
     return {"checked": checked, "updated": len(updates),
@@ -1132,8 +1138,7 @@ def prune_missing_videos() -> dict[str, int]:
     so ghost search hits don't linger. Returns per-category counts.
     """
     import os as _os
-    conn = _idx._open()
-    if conn is None:
+    if not _idx.catalog_session().initialize():
         return {"videos_removed": 0, "segments_removed": 0,
                 "missing": 0, "zero_byte": 0, "duplicate_id": 0,
                 "pending_missing": 0, "availability_restored": 0,
@@ -1148,10 +1153,9 @@ def prune_missing_videos() -> dict[str, int]:
         # holding the writer lock. On large Z: archives these stats can
         # take minutes; keeping _db_lock free lets sync/register/transcribe
         # writers continue to make progress while the disk walk runs.
-        reader = _idx._reader_open() or conn
-        reader_lock = (_idx._reader_lock if reader is not conn
-                       else _idx._db_lock)
-        with reader_lock:
+        with _idx.catalog_session().reader(writer_fallback=True) as reader:
+            if reader is None:
+                raise RuntimeError("DB unavailable")
             rows = reader.execute(
                 "SELECT id, filepath, availability, channel FROM videos"
             ).fetchall()
@@ -1213,7 +1217,7 @@ def prune_missing_videos() -> dict[str, int]:
                 "aborted_suspicious": suspicious_count,
             }
 
-        with _idx._db_lock:
+        with _idx.catalog_session().maintenance_transaction("Pruning missing catalog entries") as conn:
             for row_id in to_delete_row_ids:
                 result = _idx._delete_media_copy_row_locked(conn, row_id)
                 affected_channels.update(result["channels"])
@@ -1306,7 +1310,6 @@ def prune_missing_videos() -> dict[str, int]:
             repair = _idx._repair_all_video_copy_groups_locked(conn)
             n_dup += int(repair["repaired"] or 0)
             affected_channels.update(repair["channels"])
-            conn.commit()
         # Drop the Browse grid cache for every channel that had a
         # row removed or flagged — the cache is keyed by
         # (channel, sort, limit, include_thumbs) and lives inside
@@ -1320,7 +1323,6 @@ def prune_missing_videos() -> dict[str, int]:
                 _log.warning("Browse cache invalidation failed after prune "
                              "for %r: %s", _ch, e)
     except Exception as e:
-        _idx._rollback_quietly(conn, "prune_missing_videos error")
         _log.warning("prune_missing_videos failed: %s", e)
     return {"videos_removed": videos_removed,
             "segments_removed": segs_removed,
@@ -1342,7 +1344,7 @@ def fts_health_check() -> dict[str, Any]:
     points at that rowid.  FTS5's ``integrity-check`` with ``rank=1`` compares
     the actual shadow vocabulary to the content table and catches that case.
     """
-    conn = _idx._open_independent()
+    conn = _idx.catalog_session().open_independent()
     if conn is None:
         return {"ok": False, "error": "DB unavailable", "indexes": {}}
     checks: dict[str, dict[str, Any]] = {}
@@ -1381,29 +1383,9 @@ def rebuild_fts_index() -> dict[str, Any]:
     together.  ``rows_indexed`` remains the transcript count for API
     compatibility; ``video_rows_indexed`` reports the title-index count.
     """
-    conn: sqlite3.Connection | None = None
-    with _idx._db_lock:
-        try:
-            # The shared connection may belong to a caller's surrounding
-            # transaction.  Rebuilding on it used to commit that unrelated
-            # work on success and leave it open after a savepoint rollback on
-            # failure.  Initialize the schema through the shared handle, then
-            # own a fresh connection and its complete transaction lifecycle.
-            shared = _idx._open()
-            if shared is None:
-                return {"ok": False, "error": "DB unavailable"}
-            if shared.in_transaction:
-                return {
-                    "ok": False,
-                    "error": (
-                        "FTS rebuild deferred because the shared index "
-                        "connection has an active transaction"
-                    ),
-                }
-            conn = _idx._open_independent()
-            if conn is None:
-                return {"ok": False, "error": "DB unavailable"}
-            conn.execute("BEGIN IMMEDIATE")
+    try:
+        with _idx.catalog_session().maintenance_transaction(
+                "FTS rebuild", independent=True) as conn:
             _idx._install_fts_sync_triggers(conn)
             _idx._rebuild_all_fts(conn)
             rows = conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
@@ -1449,15 +1431,7 @@ def rebuild_fts_index() -> dict[str, Any]:
                     "INSERT OR REPLACE INTO indexed_files"
                     "(path, mtime, segment_count) VALUES(?, ?, ?)",
                     (_jp, _mt, int(n)))
-            conn.commit()
             return {"ok": True, "rows_indexed": int(rows),
                     "video_rows_indexed": int(video_rows)}
-        except Exception as exc:
-            _idx._rollback_quietly(conn, "rebuild_fts_index")
-            return {"ok": False, "error": str(exc)}
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except sqlite3.Error:
-                    pass
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}

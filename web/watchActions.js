@@ -74,44 +74,26 @@
   window._isWatchViewVisible = _isWatchViewVisible;
 
   function initWatchActions() {
+    return window.YT.util.initialize("watch-actions", scope => {
     // Re-init guard — multiple inits would stack duplicate window
     // mousemove/mouseup/keydown listeners plus duplicate
     // loadedmetadata listeners on vEl. After a few inits, Space
     // toggled play/pause TWICE per press and ArrowRight skipped
     // 2x/3x as far.
     if (window._watchActionsInited) return;
-    window._watchActionsInited = true;
     const _browseState = window._browseState;
     if (!_browseState) {
-      console.warn("[watchActions] window._browseState not published yet");
-      return;
+      throw new Error("Watch requires initialized Browse state.");
     }
 
-    function _sameWatchVideo(a, b) {
-      if (!a || !b) return false;
-      if (a.video_id && b.video_id) return a.video_id === b.video_id;
-      const norm = (s) => String(s || "").replace(/\\/g, "/").toLowerCase();
-      if (a.filepath && b.filepath) return norm(a.filepath) === norm(b.filepath);
-      return (a.title || "") === (b.title || "")
-        && (a.channel || "") === (b.channel || "");
-    }
+    const _sameWatchVideo = window.YT.watchSession.sameVideo;
 
     function _watchActionVideo(quiet = false) {
-      const rendered = window._watchCurrentVideo || null;
-      const pending = _browseState.currentVideo || null;
-      const openToken = window._watchOpenToken;
-      const renderedToken = window._watchRenderedToken;
-      if (rendered && pending && !_sameWatchVideo(rendered, pending)) {
+      const video = window.YT.watchSession.actionVideo();
+      if (!video && _browseState.currentVideo) {
         if (!quiet) window._showToast?.("Video is still loading - try again in a moment.", "warn");
-        return null;
       }
-      if (rendered && Number.isFinite(openToken)
-          && Number.isFinite(renderedToken)
-          && renderedToken !== openToken) {
-        if (!quiet) window._showToast?.("Video is still loading - try again in a moment.", "warn");
-        return null;
-      }
-      return rendered || pending;
+      return video;
     }
 
     // Playback speed
@@ -136,21 +118,21 @@
       if (vEl) vEl.playbackRate = saved;
     } catch {}
     // Apply persisted speed every time a new video source loads.
-    vEl?.addEventListener("loadedmetadata", () => {
+    scope.listen(vEl, "loadedmetadata", () => {
       try {
         const _vRaw = parseFloat(localStorage.getItem(_SPEED_KEY) || "1");
         const v = Number.isFinite(_vRaw) && _vRaw > 0 ? _vRaw : 1;
         vEl.playbackRate = v;
       } catch {}
     });
-    speedSel?.addEventListener("change", () => {
+    scope.listen(speedSel, "change", () => {
       const v = parseFloat(speedSel.value) || 1.0;
       if (vEl) vEl.playbackRate = v;
       try { localStorage.setItem(_SPEED_KEY, String(v)); } catch {}
     });
 
     // Video-scoped keyboard shortcuts (only active when the watch view is visible)
-    document.addEventListener("keydown", (e) => {
+    scope.listen(document, "keydown", (e) => {
       if (!_isWatchViewVisible() || !vEl || e.defaultPrevented) return;
       // Buttons, selects, links, sliders, and modal controls own their keys.
       // In particular, Space on a focused button must click that button, not
@@ -194,7 +176,7 @@
       }
     });
 
-    document.getElementById("btn-open-external")?.addEventListener("click", async () => {
+    scope.listen(document.getElementById("btn-open-external"), "click", async () => {
       const v = _watchActionVideo();
       if (!v?.filepath) { window._showToast?.("No file loaded.", "warn"); return; }
       try {
@@ -211,7 +193,7 @@
     });
 
     // Redownload current video — resolution picker, then video_redownload.
-    document.getElementById("btn-watch-redownload")?.addEventListener("click", async () => {
+    scope.listen(document.getElementById("btn-watch-redownload"), "click", async () => {
       let v = _watchActionVideo();
       if (!v?.video_id) {
         window._showToast?.("This video does not have a YouTube ID.", "warn");
@@ -280,7 +262,7 @@
     });
 
     // Per-video metadata refresh: synchronous yt-dlp fetch for THIS video.
-    document.getElementById("btn-watch-refresh-meta")?.addEventListener("click", async () => {
+    scope.listen(document.getElementById("btn-watch-refresh-meta"), "click", async () => {
       const v = _watchActionVideo();
       if (!v?.video_id) {
         window._showToast?.("This video does not have a YouTube ID.", "warn");
@@ -337,38 +319,42 @@
     // 206-217). LocalStorage update is immediate so the size
     // restores correctly if the user navigates away mid-debounce.
     let _txFontSaveTimer = null;
-    function _applyTxFontSize(px) {
+    let _txFontEdited = false;
+    function _saveWatchPreference(updates) {
+      return window.YT.preferences.save(updates).catch(error => {
+        window._showToast?.(`Could not save preference: ${error.message}`, "warn");
+      });
+    }
+    function _applyTxFontSize(px, { persist = true } = {}) {
+      if (persist) _txFontEdited = true;
       const v = Math.max(_TX_FONT_MIN,
         Math.min(_TX_FONT_MAX, parseFloat(px) || 12.5));
       document.documentElement.style.setProperty(
         "--watch-transcript-fz", v.toFixed(1) + "px");
       try { localStorage.setItem(_txFontKey, String(v)); } catch {}
-      if (_nativeBridgeUp()) {
-        if (_txFontSaveTimer) clearTimeout(_txFontSaveTimer);
-        _txFontSaveTimer = setTimeout(() => {
-          try { _bridgeCall("settings_save", { transcript_font_size: v }); }
-          catch {}
+      if (persist) {
+        if (_txFontSaveTimer) scope.clearTimeout(_txFontSaveTimer);
+        _txFontSaveTimer = scope.timeout(() => {
+          _saveWatchPreference({ transcript_font_size: v });
         }, 300);
       }
     }
     try {
       const _stored = parseFloat(localStorage.getItem(_txFontKey) || "");
-      if (Number.isFinite(_stored) && _stored > 0) _applyTxFontSize(_stored);
+      if (Number.isFinite(_stored) && _stored > 0) _applyTxFontSize(_stored, { persist: false });
     } catch {}
-    (async () => {
-      try {
-        if (!_nativeBridgeUp()) return;
-        const s = await _bridgeCall("settings_load");
-        const v = parseFloat(s?.transcript_font_size);
-        if (Number.isFinite(v) && v > 0) _applyTxFontSize(v);
-      } catch {}
-    })();
-    document.getElementById("btn-tx-font-down")?.addEventListener("click", () => {
+    window.YT.preferences.hydrate(s => {
+      const v = parseFloat(s.transcript_font_size);
+      if (!_txFontEdited && Number.isFinite(v) && v > 0) {
+        _applyTxFontSize(v, { persist: false });
+      }
+    }, ["transcript_font_size"], { signal: scope.signal }).catch(() => {});
+    scope.listen(document.getElementById("btn-tx-font-down"), "click", () => {
       const cur = parseFloat(getComputedStyle(document.documentElement)
         .getPropertyValue("--watch-transcript-fz")) || 12.5;
       _applyTxFontSize(cur - 1);
     });
-    document.getElementById("btn-tx-font-up")?.addEventListener("click", () => {
+    scope.listen(document.getElementById("btn-tx-font-up"), "click", () => {
       const cur = parseFloat(getComputedStyle(document.documentElement)
         .getPropertyValue("--watch-transcript-fz")) || 12.5;
       _applyTxFontSize(cur + 1);
@@ -395,9 +381,7 @@
       const extras = document.getElementById("watch-overlay-extras");
       if (extras) extras.classList.toggle("collapsed", v === "off");
       try { localStorage.setItem(_capSizeKey, v); } catch {}
-      if (persist && _nativeBridgeUp()) {
-        try { _bridgeCall("settings_save", { caption_overlay_size: v }); } catch {}
-      }
+      if (persist) _saveWatchPreference({ caption_overlay_size: v });
     }
     function _applyCapBg(bg, { persist = true } = {}) {
       const v = _CAP_BGS.has(bg) ? bg : "translucent";
@@ -405,9 +389,7 @@
       const sel = document.getElementById("watch-cap-bg");
       if (sel && sel.value !== v) sel.value = v;
       try { localStorage.setItem(_capBgKey, v); } catch {}
-      if (persist && _nativeBridgeUp()) {
-        try { _bridgeCall("settings_save", { caption_overlay_bg: v }); } catch {}
-      }
+      if (persist) _saveWatchPreference({ caption_overlay_bg: v });
     }
     function _applyCapMode(mode, { persist = true } = {}) {
       const v = _CAP_MODES.has(mode) ? mode : "default";
@@ -415,9 +397,7 @@
       const sel = document.getElementById("watch-cap-mode");
       if (sel && sel.value !== v) sel.value = v;
       try { localStorage.setItem(_capModeKey, v); } catch {}
-      if (persist && _nativeBridgeUp()) {
-        try { _bridgeCall("settings_save", { caption_overlay_mode: v }); } catch {}
-      }
+      if (persist) _saveWatchPreference({ caption_overlay_mode: v });
     }
     _applyCapMode("default", { persist: false });
     try {
@@ -426,10 +406,7 @@
       const _bg = localStorage.getItem(_capBgKey);
       if (_bg && _CAP_BGS.has(_bg)) _applyCapBg(_bg, { persist: false });
     } catch {}
-    (async () => {
-      try {
-        if (!_nativeBridgeUp()) return;
-        const s = await _bridgeCall("settings_load");
+    window.YT.preferences.hydrate(s => {
         // Slow startup hydration must not undo newer dropdown choices.
         if (_capPrefsEdited) return;
         if (s?.caption_overlay_size && _CAP_SIZES.has(s.caption_overlay_size)) {
@@ -438,17 +415,17 @@
         if (s?.caption_overlay_bg && _CAP_BGS.has(s.caption_overlay_bg)) {
           _applyCapBg(s.caption_overlay_bg, { persist: false });
         }
-      } catch {}
-    })();
-    document.getElementById("watch-cap-size")?.addEventListener("change", (ev) => {
+    }, ["caption_overlay_size", "caption_overlay_bg", "caption_overlay_mode"], { signal: scope.signal })
+      .catch(() => {});
+    scope.listen(document.getElementById("watch-cap-size"), "change", (ev) => {
       _capPrefsEdited = true;
       _applyCapSize(ev.target.value);
     });
-    document.getElementById("watch-cap-bg")?.addEventListener("change", (ev) => {
+    scope.listen(document.getElementById("watch-cap-bg"), "change", (ev) => {
       _capPrefsEdited = true;
       _applyCapBg(ev.target.value);
     });
-    document.getElementById("watch-cap-mode")?.addEventListener("change", (ev) => {
+    scope.listen(document.getElementById("watch-cap-mode"), "change", (ev) => {
       _capPrefsEdited = true;
       _applyCapMode(ev.target.value);
     });
@@ -472,7 +449,7 @@
     try {
       if (localStorage.getItem(_nonSpeechKey) === "1") _applyNonSpeech(true);
     } catch {}
-    document.getElementById("btn-tx-nonspeech")?.addEventListener("click", () => {
+    scope.listen(document.getElementById("btn-tx-nonspeech"), "click", () => {
       const tr = document.getElementById("watch-transcript");
       _applyNonSpeech(!(tr && tr.classList.contains("hide-nonspeech")));
     });
@@ -480,7 +457,7 @@
     // ⋮ More — overflow menu for less-used watch-view actions.
     // Reuses the hidden source buttons' click handlers so we don't have
     // to re-implement the redownload / re-transcribe / refresh flows.
-    document.getElementById("btn-watch-more")?.addEventListener("click", (e) => {
+    scope.listen(document.getElementById("btn-watch-more"), "click", (e) => {
       e.preventDefault();
       const showMenu = window.showContextMenu;
       if (!showMenu) return;
@@ -503,7 +480,9 @@
     const _txWidthKey = "ytarchiver_tx_pane_width";
     const _TX_WIDTH_MIN = 240;
     const _TX_WIDTH_MAX = 1400;
-    function _applyTxWidth(px) {
+    let _txWidthEdited = false;
+    function _applyTxWidth(px, { hydrate = false } = {}) {
+      if (!hydrate) _txWidthEdited = true;
       const v = Math.max(_TX_WIDTH_MIN,
         Math.min(_TX_WIDTH_MAX, parseInt(px, 10) || 420));
       document.documentElement.style.setProperty(
@@ -517,27 +496,16 @@
       return v;
     }
     function _persistTxWidth(px) {
-      if (_nativeBridgeUp()) {
-        try {
-          _bridgeCall("settings_save", {
-            transcript_pane_width: parseInt(px, 10),
-          });
-        }
-        catch {}
-      }
+      _saveWatchPreference({ transcript_pane_width: parseInt(px, 10) });
     }
     try {
       const _stored = parseInt(localStorage.getItem(_txWidthKey) || "", 10);
-      if (Number.isFinite(_stored) && _stored > 0) _applyTxWidth(_stored);
+      if (Number.isFinite(_stored) && _stored > 0) _applyTxWidth(_stored, { hydrate: true });
     } catch {}
-    (async () => {
-      try {
-        if (!_nativeBridgeUp()) return;
-        const s = await _bridgeCall("settings_load");
-        const v = parseInt(s?.transcript_pane_width, 10);
-        if (Number.isFinite(v) && v > 0) _applyTxWidth(v);
-      } catch {}
-    })();
+    window.YT.preferences.hydrate(s => {
+      const v = parseInt(s.transcript_pane_width, 10);
+      if (!_txWidthEdited && Number.isFinite(v) && v > 0) _applyTxWidth(v, { hydrate: true });
+    }, ["transcript_pane_width"], { signal: scope.signal }).catch(() => {});
     const _splitter = document.getElementById("watch-splitter");
     if (_splitter) {
       let _dragStart = null;
@@ -563,7 +531,7 @@
         window.removeEventListener("mousemove", _onMove);
         window.removeEventListener("mouseup", _onUp);
       };
-      _splitter.addEventListener("mousedown", (e) => {
+      scope.listen(_splitter, "mousedown", (e) => {
         e.preventDefault();
         const layout = _splitter.parentElement;
         if (!layout) return;
@@ -572,10 +540,10 @@
         _dragStart = { x: e.clientX, startWidth: cur, layout };
         _splitter.classList.add("dragging");
         document.body.style.cursor = "col-resize";
-        window.addEventListener("mousemove", _onMove);
-        window.addEventListener("mouseup", _onUp);
+        scope.listen(window, "mousemove", _onMove);
+        scope.listen(window, "mouseup", _onUp);
       });
-      _splitter.addEventListener("keydown", (e) => {
+      scope.listen(_splitter, "keydown", (e) => {
         const current = parseInt(getComputedStyle(document.documentElement)
           .getPropertyValue("--watch-tx-width"), 10) || 420;
         const step = e.shiftKey ? 60 : 20;
@@ -638,6 +606,9 @@
           phase_started_at: phaseStartedAt,
           filepath: String(raw.filepath || ""),
           message: String(raw.message || ""),
+          request_id: String(raw.request_id || ""),
+          task_id: String(raw.task_id || ""),
+          phase_revision: Number.isSafeInteger(raw.phase_revision) ? raw.phase_revision : 0,
         };
       }
       const pct = _clampRetranscribePct(raw);
@@ -722,7 +693,7 @@
 
     function _stopFinalizingUiTimerIfIdle() {
       if (_finalizingUiTimer && !_hasFinalizingRetranscribe()) {
-        clearInterval(_finalizingUiTimer);
+        scope.clearInterval(_finalizingUiTimer);
         _finalizingUiTimer = 0;
       }
     }
@@ -731,7 +702,7 @@
       if (_finalizingUiTimer || !_hasFinalizingRetranscribe()) return;
       // The bar itself animates continuously. Repaint once per second so the
       // elapsed label proves the UI is alive without inventing percent work.
-      _finalizingUiTimer = setInterval(() => {
+      _finalizingUiTimer = scope.interval(() => {
         if (!_hasFinalizingRetranscribe()) {
           _stopFinalizingUiTimerIfIdle();
           return;
@@ -768,7 +739,7 @@
       window._syncWatchRetranscribeBanner?.();
     };
 
-    document.getElementById("btn-watch-retranscribe")?.addEventListener("click", async () => {
+    scope.listen(document.getElementById("btn-watch-retranscribe"), "click", async () => {
       let v = _watchActionVideo();
       if (!v?.filepath) {
         window._showToast?.("No file loaded.", "warn");
@@ -804,7 +775,9 @@
       }
       v = _watchActionVideo();
       if (!v?.filepath) return;
-      // Mark inflight BEFORE the bridge call so a whisper_pct event
+      const requestId = window.crypto?.randomUUID?.()
+        || `watch-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      // Mark inflight BEFORE the bridge call so a typed progress event
       // racing between the bridge return and the post-await success
       // branch finds the entry and updates it. Roll back on failure
       // (audit: watchActions.js C27).
@@ -817,13 +790,16 @@
           phase_started_at: now,
           filepath: v.filepath,
           message: "",
+          request_id: requestId,
         });
         window._syncWatchRetranscribeButton();
       }
       let res;
       try {
-        res = await _bridgeCall("transcribe_retranscribe",
-          v.filepath, v.title || "", vid);
+        res = await _bridgeCall("transcribe_request_retranscription", {
+          path: v.filepath, title: v.title || "", video_id: vid,
+          model, request_id: requestId,
+        });
       } catch (e) {
         if (vid) window._inflightRetranscribes.delete(vid);
         window._syncWatchRetranscribeButton?.();
@@ -845,7 +821,7 @@
             _btn.disabled = true;
             _btn.textContent = "Re-transcribing…";
             // Auto-clear after 30s as a last-resort fallback.
-            setTimeout(() => {
+            scope.timeout(() => {
               if (_btn.textContent === "Re-transcribing…") {
                 _btn.disabled = false;
                 _btn.textContent = "Re-transcribe…";
@@ -860,7 +836,7 @@
       }
     });
 
-    // Called from logs.js when a whisper_pct line goes by.
+    // Percentage updates are typed job telemetry, separate from display logs.
     window._retranscribeWatchUpdateProgress = function (pct, video_id) {
       if (!video_id) return;
       const p = _clampRetranscribePct(pct);
@@ -868,14 +844,16 @@
         const now = Date.now();
         const previous = _normalizeRetranscribeState(
           window._inflightRetranscribes.get(video_id), now);
+        const held = ["paused", "finalizing", "needs_attention"].includes(previous.phase);
         window._inflightRetranscribes.set(video_id, {
+          ...previous,
           pct: p,
-          phase: "transcribing",
+          phase: held ? previous.phase : "transcribing",
           started_at: previous.started_at,
-          phase_started_at: previous.phase === "transcribing"
+          phase_started_at: held || previous.phase === "transcribing"
             ? previous.phase_started_at : now,
           filepath: previous.filepath,
-          message: "",
+          message: held ? previous.message : "",
         });
       }
       const cur = window._watchCurrentVideo;
@@ -884,7 +862,7 @@
       }
     };
 
-    // Called from logs.js when the backend reports that Whisper recognition
+    // Called when the backend reports that Whisper recognition
     // has completed and the transcript is being prepared for durable storage.
     window._retranscribeWatchMarkFinalizing = function (video_id) {
       if (!video_id || !window._inflightRetranscribes.has(video_id)) return;
@@ -892,6 +870,7 @@
       const previous = _normalizeRetranscribeState(
         window._inflightRetranscribes.get(video_id), now);
       window._inflightRetranscribes.set(video_id, {
+        ...previous,
         pct: previous.pct,
         phase: "finalizing",
         started_at: previous.started_at,
@@ -956,7 +935,7 @@
         window._retranscribeWatchClear(videoId);
         return;
       }
-      if (!["paused", "resuming", "queued", "finalizing",
+      if (!["paused", "resuming", "queued", "finalizing", "transcribing",
             "needs_attention"].includes(phase)) {
         return;
       }
@@ -967,20 +946,43 @@
             window._inflightRetranscribes.get(videoId), now)
         : _normalizeRetranscribeState(0, now);
       window._inflightRetranscribes.set(videoId, {
-        pct: previous.pct,
+        ...previous,
+        pct: payload.pct == null ? previous.pct : _clampRetranscribePct(payload.pct),
         phase,
         started_at: previous.started_at,
         phase_started_at: previous.phase === phase
           ? previous.phase_started_at : now,
         filepath: filepath || previous.filepath,
         message: String(payload.message || ""),
+        request_id: String(payload.request_id || previous.request_id || ""),
+        task_id: String(payload.task_id || previous.task_id || ""),
+        phase_revision: Number.isSafeInteger(payload.phase_revision)
+          ? payload.phase_revision : previous.phase_revision || 0,
       });
       _stopFinalizingUiTimerIfIdle();
       if (phase === "finalizing") _ensureFinalizingUiTimer();
       window._syncWatchRetranscribeButton();
     };
 
-    document.getElementById("btn-bookmark-now")?.addEventListener("click", async () => {
+    window._onProcessingEvent = function (payload) {
+      if (!payload || typeof payload !== "object") return true;
+      const current = window._inflightRetranscribes.get(String(payload.video_id || ""));
+      if (current?.request_id && current.request_id !== payload.request_id) return true;
+      const phaseRevision = Number.isSafeInteger(payload.phase_revision) ? payload.phase_revision : 0;
+      if (phaseRevision && phaseRevision < (current?.phase_revision || 0)) return true;
+      if (payload.kind === "complete") {
+        if (typeof window._onRetranscribeComplete !== "function") return false;
+        window._onRetranscribeComplete(payload)?.catch?.(
+          error => console.error("Transcript refresh failed", error));
+      } else if (payload.state === "transcribing") {
+        if (phaseRevision > (current?.phase_revision || 0)) {
+          window._onRetranscribeState(payload);
+        } else window._retranscribeWatchUpdateProgress(payload.pct, payload.video_id);
+      } else window._onRetranscribeState(payload);
+      return true;
+    };
+
+    scope.listen(document.getElementById("btn-bookmark-now"), "click", async () => {
       const _vEl = document.getElementById("watch-video");
       let v = _watchActionVideo(true);
       if (!v) {
@@ -1115,11 +1117,11 @@
     // (audit: watchActions.js H157). 120ms keeps the find feel
     // responsive while collapsing rapid typing into one scan.
     let _findDebounce = null;
-    watchFind?.addEventListener("input", () => {
-      if (_findDebounce) clearTimeout(_findDebounce);
-      _findDebounce = setTimeout(_rebuildFindMatches, 120);
+    scope.listen(watchFind, "input", () => {
+      if (_findDebounce) scope.clearTimeout(_findDebounce);
+      _findDebounce = scope.timeout(_rebuildFindMatches, 120);
     });
-    watchFind?.addEventListener("keydown", (e) => {
+    scope.listen(watchFind, "keydown", (e) => {
       if (e.key === "Enter") {
         e.preventDefault();
         if (!findState.matches.length) {
@@ -1141,13 +1143,15 @@
         watchFind.blur();
       }
     });
-    watchFindNext?.addEventListener("click", () => {
+    scope.listen(watchFindNext, "click", () => {
       findState.primed = false;
       _findGoTo(findState.idx + 1);
     });
-    watchFindPrev?.addEventListener("click", () => {
+    scope.listen(watchFindPrev, "click", () => {
       findState.primed = false;
       _findGoTo(findState.idx - 1);
+    });
+    window._watchActionsInited = true;
     });
   }
 

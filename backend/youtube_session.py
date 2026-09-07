@@ -17,7 +17,6 @@ as long as it surfaces its error.
 """
 from __future__ import annotations
 
-import json
 import threading
 import time
 from typing import Any
@@ -131,7 +130,7 @@ def _emit_control(stream, kind: str, **extra: Any) -> None:
     payload = {"kind": kind}
     payload.update(extra)
     try:
-        stream.emit([[json.dumps(payload), "__control__"]])
+        stream.emit_control(payload)
     except Exception as exc:
         _log.debug("YouTube guard control emit failed: %s", exc)
 
@@ -290,6 +289,10 @@ def check_cookie_source(cookie_args: list[str] | tuple[str, ...] | None,
         _log.debug("Firefox cookie validation failed: %s", exc)
         return True
 
+    if status.get("check_available") is False:
+        # An unreadable live cookie DB is unknown, not proof of sign-out.
+        # Let the actual yt-dlp request establish authentication status.
+        return True
     if status.get("signed_in"):
         return True
 

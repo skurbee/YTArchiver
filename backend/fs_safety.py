@@ -11,6 +11,7 @@ from typing import Any
 
 from .fs_attrs import _file_has_hidden_attribute
 from .log import get_logger
+from .services.managed_roots import ManagedRoots
 
 _log = get_logger(__name__)
 
@@ -52,54 +53,12 @@ def check_disk_space(path: str, required_bytes: int) -> bool:
 
 
 def is_within_managed_roots(path: str) -> bool:
-    """True if `path` resolves to a location under one of the archive roots
-    this app manages: the global output_dir, the single-video video_out_dir,
-    and the tp_archive_roots (index-only roots). Used to gate destructive
-    os.remove calls that originate from the JS bridge (the trust boundary),
-    so a crafted/compromised filepath can't drive a delete outside the
-    archive. Fail-closed: returns False when no roots are configured or the
-    path can't be resolved. realpath is used on both sides so a symlink
-    can't tunnel out of an allowed root.
-    """
+    """Fail-closed containment against the shared configured-root policy."""
     try:
         from .ytarchiver_config import load_config
-        cfg = load_config() or {}
+        return ManagedRoots.from_config(load_config() or {}).contains(path)
     except Exception:
         return False
-    roots: list[str] = []
-    _g = (cfg.get("output_dir") or "").strip()
-    if _g:
-        roots.append(_g)
-    # Single-video ("manual") downloads land in video_out_dir, which sits
-    # OUTSIDE the channel archive tree. Without it here, the Browse > Manual
-    # view couldn't play any of them ("Refusing to operate on a file outside
-    # the archive"). It's an app-managed download location, so include it.
-    _v = (cfg.get("video_out_dir") or "").strip()
-    if _v:
-        roots.append(_v)
-    # (Channels don't store their own output_dir — their folders nest under
-    # the global output_dir added above, so no per-channel root is needed.)
-    for _r in (cfg.get("tp_archive_roots") or []):
-        if _r:
-            roots.append(str(_r))
-    if not roots:
-        return False
-    try:
-        target = os.path.normcase(os.path.realpath(path)).rstrip("/\\")
-    except (ValueError, OSError):
-        return False
-    if not target:
-        return False
-    for _root in roots:
-        try:
-            nr = os.path.normcase(os.path.realpath(_root)).rstrip("/\\")
-        except (ValueError, OSError):
-            continue
-        if not nr:
-            continue
-        if target == nr or target.startswith((nr + os.sep, nr + "/")):
-            return True
-    return False
 
 
 def files_equal(path_a: str, path_b: str) -> bool:
@@ -267,37 +226,25 @@ def atomic_write(path, mode: str = "w", encoding: str = "utf-8"):
     _dir = os.path.dirname(path) or "."
     _stem = os.path.basename(path) + "."
     fd, tmp = _tempfile.mkstemp(prefix=_stem, suffix=".tmp", dir=_dir)
-    try:
-        os.close(fd)
-    except OSError:
-        pass
     open_kwargs: dict[str, Any] = {"mode": mode}
     if "b" not in mode:
         open_kwargs["encoding"] = encoding
-    f = open(tmp, **open_kwargs)
-    success = False
     try:
-        yield f
-        try:
+        # Own the mkstemp descriptor through close. Flush, fsync and close are
+        # all admission conditions for publishing the staged bytes.
+        handle = os.fdopen(fd, **open_kwargs)
+        fd = -1
+        with handle as f:
+            yield f
             f.flush()
             os.fsync(f.fileno())
-        except OSError:
-            pass
-        success = True
+        os.replace(tmp, path)
     finally:
+        if fd >= 0:
+            os.close(fd)
         try:
-            f.close()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        if success:
-            try:
-                os.replace(tmp, path)
-            except Exception:
-                try: os.unlink(tmp)
-                except OSError: pass
-                raise
-        else:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _log.debug("staged write cleanup failed: %s", exc)

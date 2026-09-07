@@ -22,6 +22,22 @@ from backend import index as index_backend
 from backend import index_maintenance, subs
 from backend.log import get_logger
 from backend.services import file_ops
+from backend.services.managed_roots import ManagedRoots
+from backend.services.trash_store import (
+    MANIFEST_NAME as _MANIFEST_NAME,
+)
+from backend.services.trash_store import (
+    PURGE_PREFIX as _PURGE_PREFIX,
+)
+from backend.services.trash_store import (
+    PURGE_RECOVERY_DIR as _PURGE_RECOVERY_DIR,
+)
+from backend.services.trash_store import (
+    RESTORE_RECOVERY_DIR,
+)
+from backend.services.trash_store import (
+    TRASH_STORE as _trash_store,
+)
 from backend.ytarchiver_config import (
     TRASH_RETENTION_MAX_DAYS,
     load_config,
@@ -29,9 +45,6 @@ from backend.ytarchiver_config import (
 )
 
 _log = get_logger(__name__)
-_MANIFEST_NAME = ".ytarchiver-trash.json"
-_PURGE_PREFIX = ".ytarchiver-purge-"
-_PURGE_RECOVERY_DIR = ".ytarchiver-purge-recovery"
 _ENTRY_ID_RE = re.compile(r"^[a-fA-F0-9]{32,64}$")
 
 
@@ -91,7 +104,7 @@ def _purge_recovery_dir_is_safe(path: str, archive_root: str) -> bool:
             not os.path.islink(path)
             and not is_junction(path)
             and _trash_root_is_safe(archive_root)
-            and file_ops._is_within_trash_root(path, archive_root)
+            and _trash_store.contains_entry(path, archive_root)
         )
     except (OSError, TypeError, ValueError):
         return False
@@ -175,26 +188,9 @@ def _strict_retention_policy(config: dict[str, Any]) -> tuple[int, float]:
 
 
 def configured_archive_roots(cfg: dict[str, Any] | None = None) -> list[str]:
-    """Return canonical, deduplicated roots that may own an app Trash."""
+    """Return deduplicated configured roots through the shared root policy."""
     value = cfg if isinstance(cfg, dict) else (load_config() or {})
-    candidates = [
-        value.get("output_dir"),
-        value.get("video_out_dir"),
-        *(value.get("tp_archive_roots") or []),
-    ]
-    roots: list[str] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        text = str(candidate or "").strip()
-        if not text:
-            continue
-        absolute = os.path.abspath(text)
-        key = _path_key(absolute)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        roots.append(absolute)
-    return roots
+    return list(ManagedRoots.from_config(value).paths)
 
 
 def _manifest_epoch(manifest: dict[str, Any], entry_path: str) -> int:
@@ -377,7 +373,7 @@ class TrashManager:
                 continue
             for child in children:
                 if child.name in {
-                        file_ops._RESTORE_RECOVERY_DIR,
+                        RESTORE_RECOVERY_DIR,
                         _PURGE_RECOVERY_DIR}:
                     continue
                 entry_path = child.path
@@ -421,7 +417,7 @@ class TrashManager:
 
             # A video restore publishes a marker outside the entry before its
             # final rmdir.  Enumerate marker-only residue as well as folders.
-            recovery_dir = os.path.join(trash_root, file_ops._RESTORE_RECOVERY_DIR)
+            recovery_dir = os.path.join(trash_root, RESTORE_RECOVERY_DIR)
             if (os.path.isdir(recovery_dir)
                     and _purge_recovery_dir_is_safe(recovery_dir, root)):
                 try:
@@ -459,7 +455,7 @@ class TrashManager:
                         os.path.dirname(candidate), root)
                         and os.path.isfile(candidate)):
                     marker_path = candidate
-        manifest, manifest_path = file_ops._read_trash_manifest(
+        manifest, manifest_path = _trash_store.read_manifest(
             entry_path, archive_root=root)
         warnings: list[str] = []
         if not isinstance(manifest, dict) and marker_path:
@@ -588,6 +584,7 @@ class TrashManager:
             "restore_scope": restore_scope,
             "can_restore": bool(
                 (complete or resumable_video)
+                and not (complete and missing)
                 and os.path.isdir(entry_path)
                 and not staged),
             "can_purge": bool(complete and os.path.isdir(entry_path)
@@ -918,7 +915,7 @@ class TrashManager:
                         "error": "Incomplete Trash entries cannot be permanently deleted."}
             source = entry["_entry_path"]
             if (not _trash_root_is_safe(entry["_root_path"])
-                    or not file_ops._is_within_trash_root(
+                    or not _trash_store.contains_entry(
                         source, entry["_root_path"])):
                 return {
                     "ok": False,
@@ -993,7 +990,7 @@ class TrashManager:
                         raise OSError(
                             "Trash recovery folder is a link, junction, or "
                             "outside the archive.")
-                    file_ops._write_json_atomic(purge_marker, {
+                    _trash_store.publish_object(purge_marker, {
                         "version": 1,
                         "entry_id": entry["entry_id"],
                         "source_path": os.path.normpath(source),

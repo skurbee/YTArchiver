@@ -148,10 +148,6 @@ def write_bookmark_database(path, payload) -> None:
     finally:
         connection.close()
 
-# FTS index DB rides along only when small enough for ZIP deflate to
-# stay reasonable (see backup_mixin's original rationale).
-_FTS_ZIP_CAP = 2 * 1024 * 1024 * 1024
-
 _INTERVAL_SECS = {
     "daily": 24 * 3600,
     "weekly": 7 * 24 * 3600,
@@ -280,19 +276,22 @@ def build_backup_zip(out_path: str, *, queue_state=None,
         raise RuntimeError(
             "live queue state is required for a coherent full backup")
 
+    # Manual and scheduled exports share this opt-out. Older configurations
+    # include the database by default; malformed values must not drop it.
+    include_search_db = load_config().get("backup_include_search_db", True) is not False
     fts_skipped_reason = ""
     fts_size = 0
     include_fts = False
     try:
         if TRANSCRIPTION_DB.exists():
             fts_size = int(TRANSCRIPTION_DB.stat().st_size)
-            if fts_size < _FTS_ZIP_CAP:
-                include_fts = True
-            else:
+            include_fts = include_search_db
+            if not include_fts:
                 fts_skipped_reason = (
-                    f"The search index was not included because it is larger "
-                    f"than 2 GB ({fts_size / (1024**3):.1f} GB). It can be "
-                    f"rebuilt from saved transcripts after a restore.")
+                    "The Search database was excluded because Include Search "
+                    "database is turned off in backup settings. Bookmarks and "
+                    "notes are still included. Search can be rebuilt from saved "
+                    "transcripts after a restore.")
     except OSError as exc:
         raise RuntimeError("Could not inspect the database for bookmark backup") from exc
 
@@ -318,13 +317,22 @@ def build_backup_zip(out_path: str, *, queue_state=None,
                 # copy can tear mid-checkpoint.
                 import sqlite3 as _sq3
                 import tempfile as _tf
-                _fd, _snap = _tf.mkstemp(suffix=".db")
+                # Large snapshots belong on the chosen backup drive, rather
+                # than unexpectedly filling the system temporary directory.
+                _fd, _snap = _tf.mkstemp(
+                    prefix=".ytarchiver-backup-", suffix=".db",
+                    dir=str(Path(out_path).resolve().parent))
                 os.close(_fd)
                 try:
                     _src = _sq3.connect(
-                        f"file:{TRANSCRIPTION_DB}?mode=ro",
+                        TRANSCRIPTION_DB.resolve().as_uri() + "?mode=ro",
                         uri=True, timeout=60)
                     try:
+                        # Pin one read snapshot. Without it, writes through
+                        # other connections can restart incremental backups,
+                        # indefinitely delaying large, actively used indexes.
+                        _src.execute("BEGIN")
+                        _src.execute("SELECT rootpage FROM sqlite_schema LIMIT 1").fetchone()
                         _dst = _sq3.connect(_snap)
                         try:
                             def _backup_progress(_status, _remaining, _total):
@@ -337,6 +345,9 @@ def build_backup_zip(out_path: str, *, queue_state=None,
                                 progress=_backup_progress,
                                 sleep=0.05,
                             )
+                            # The copy can inherit WAL mode. Make the private
+                            # snapshot self-contained before adding it to ZIP.
+                            _dst.execute("PRAGMA journal_mode=DELETE").fetchone()
                         finally:
                             _dst.close()
                     finally:
@@ -349,11 +360,15 @@ def build_backup_zip(out_path: str, *, queue_state=None,
                             cancel_event,
                         )
                     )
+                    # The snapshot includes committed WAL pages that may not
+                    # have reached the main database at the initial stat.
+                    fts_size = int(resources[TRANSCRIPTION_DB.name]["size"])
                     n += 1
                     bookmark_payload = read_bookmark_backup(_snap)
                 finally:
-                    try: os.remove(_snap)
-                    except OSError: pass
+                    for _suffix in ("", "-wal", "-shm", "-journal"):
+                        try: os.remove(_snap + _suffix)
+                        except OSError: pass
             if bookmark_payload is None:
                 bookmark_payload = read_bookmark_backup(TRANSCRIPTION_DB)
             resources[BOOKMARK_BACKUP_NAME] = _write_zip_bytes_resource(
@@ -482,6 +497,9 @@ THIS FOLDER ("{INFO_DIR_NAME}")
   {BACKUP_PREFIX}*.zip — snapshots of the app's state:
                              settings, channel subscriptions, the
                              downloaded-video-ID list, filters, queue.
+                             Bookmarks and notes are always included.
+                             The Search database is included unless
+                             disabled in Health > Backups settings.
                              To restore: run the app, Health tab >
                              Backups > Restore. The newest
                              {KEEP_BACKUPS} are kept; older scheduled backups

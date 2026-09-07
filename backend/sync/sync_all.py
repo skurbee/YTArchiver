@@ -236,11 +236,9 @@ def _channel_folder_media_confirmed(cfg: dict[str, Any],
 
 def _task_result_failure_state(result: dict[str, Any]) -> tuple[int, bool]:
     """Return a truthful numeric error count and cancellation flag."""
-    cancelled = bool(result.get("cancelled"))
-    errors = int(result.get("errors", 0) or 0)
-    if not bool(result.get("ok", True)) and not cancelled and errors == 0:
-        errors = 1
-    return errors, cancelled
+    from .results import SyncOutcome, SyncStatus
+    outcome = SyncOutcome.from_payload(result)
+    return outcome.errors, outcome.status is SyncStatus.CANCELLED
 
 
 def _sync_all_impl(stream: LogStreamer,
@@ -1720,10 +1718,17 @@ def _sync_all_impl(stream: LogStreamer,
         # values until the user clicks away and back.
         try: fire_channel_synced_hook()
         except Exception as e: swallow("channel-synced hook", e)
-        # If this was a batch-limited bootstrap run, apply the next cooldown.
-        # We only set cooldown when the channel hadn't finished initializing
-        # and this pass hit the BATCH_LIMIT threshold.
-        if _should_batch_limit(ch, res.get("total", 0)):
+        # A bootstrap cooldown requires a successful, uninterrupted walk with
+        # a known count above the large-channel threshold. Unknown totals are
+        # conservative when planning work, but a failed/empty first attempt
+        # must not turn that fallback into a 72-hour wait before retrying.
+        _walked_total = int(res.get("total", 0) or 0)
+        if (_owned_download_success
+                and not res.get("cancelled")
+                and not _task_cancel.is_set()
+                and not (pause_event is not None and pause_event.is_set())
+                and _walked_total > 0
+                and _should_batch_limit(ch, _walked_total)):
             set_batch_cooldown(ch.get("url", ""))
 
     final_channel_lease = _lease_guard.pop("lease", None)

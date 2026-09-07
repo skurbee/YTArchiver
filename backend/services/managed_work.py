@@ -54,6 +54,7 @@ def start_managed_task(
     task_id: str = "",
     cancel: threading.Event | None = None,
     force: Callable[[], Any] | None = None,
+    on_cancelled_before_start: Callable[[], Any] | None = None,
     name: str | None = None,
     thread_factory: Callable[..., threading.Thread] = threading.Thread,
 ) -> threading.Thread:
@@ -63,6 +64,10 @@ def start_managed_task(
     stable_id = str(task_id or "").strip() or uuid.uuid4().hex
 
     def _owned_target() -> Any:
+        if cancel is not None and cancel.is_set():
+            if on_cancelled_before_start is not None:
+                on_cancelled_before_start()
+            return None
         with process_owner_scope(owner, stable_id):
             return target()
 
@@ -75,6 +80,7 @@ def start_managed_task(
             task_id=stable_id,
             cancel=cancel,
             force=force,
+            on_cancelled_before_start=on_cancelled_before_start,
             name=name,
             daemon=True,
         )

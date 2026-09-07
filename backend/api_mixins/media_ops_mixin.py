@@ -19,6 +19,7 @@ from backend import index as index_backend
 from backend import reorg as reorg_backend
 from backend import subs as subs_backend
 from backend.log import swallow
+from backend.services.config_snapshot import config_snapshot
 from backend.services.job_supervisor import WorkAdmissionClosed
 from backend.services.managed_work import (
     admitted_operation,
@@ -26,6 +27,7 @@ from backend.services.managed_work import (
     start_managed_task,
     try_global_archive_lease,
 )
+from backend.services.operation_results import OperationLimitError, operation_results
 from backend.ytarchiver_config import load_config
 
 
@@ -37,6 +39,9 @@ def _channel_archive_path(output_dir, channel):
 
 
 class MediaOpsMixin:
+
+    def _media_config(self):
+        return config_snapshot(self, load_config)
 
     def _ensure_archive_rescan_state(self):
         """Initialize rescan state for narrow mixin-only test doubles."""
@@ -209,7 +214,7 @@ class MediaOpsMixin:
                     _was_cancelled = True
                     _failure = "Archive rescan cancelled."
                     return
-                cfg = self._config or load_config()
+                cfg = self._media_config()
                 output_dir = (cfg.get("output_dir") or "").strip()
                 if not output_dir:
                     _failure = "No archive folder is configured."
@@ -479,7 +484,7 @@ class MediaOpsMixin:
         def _run():
             try:
                 from .. import utils as _u
-                cfg = self._config or load_config()
+                cfg = self._media_config()
                 output_dir = (cfg.get("output_dir") or "").strip()
                 if not output_dir or not os.path.isdir(output_dir):
                     self._log_stream.emit_error(
@@ -719,17 +724,14 @@ class MediaOpsMixin:
         aggregated .txt, hidden .jsonl, and FTS index.
 
         Spawns a background worker so the js_api thread doesn't freeze
-        the UI while we walk three sources for a large channel (audit:
-        media_ops_mixin.py:93). Returns a token immediately; caller
-        polls drift_scan_channel_poll. The synchronous behavior
-        (return the scan result directly) is preserved when called
-        from worker context — detect via thread name.
+        the UI while we walk three sources for a large channel. Returns a
+        token immediately; caller polls drift_scan_channel_poll.
         """
         from backend import drift_scan as _ds
         ch = subs_backend.get_channel(identity or {})
         if not ch:
             return {"ok": False, "error": "Channel not found"}
-        cfg = self._config or load_config()
+        cfg = self._media_config()
         output_dir = (cfg.get("output_dir") or "").strip()
         if not output_dir:
             return {"ok": False, "error": "No archive folder is configured."}
@@ -738,37 +740,20 @@ class MediaOpsMixin:
         import uuid as _uuid
         token = _uuid.uuid4().hex
         cancel = threading.Event()
-        if not hasattr(self, "_drift_scan_results"):
-            self._drift_scan_results = {}
-        if not hasattr(self, "_drift_scan_lock"):
-            self._drift_scan_lock = threading.Lock()
-        # Sweep abandoned entries (>10 min) so the dict can't grow
-        # unbounded if user navigates away mid-scan (audit:
-        # media_ops_mixin H10).
-        import time as _t_mod
-        _now_ts = _t_mod.time()
-        with self._drift_scan_lock:
-            _stale = [k for k, v in self._drift_scan_results.items()
-                      if isinstance(v, dict)
-                      and (_now_ts - (v.get("_ts") or _now_ts)) > 600]
-            for k in _stale:
-                self._drift_scan_results.pop(k, None)
-            self._drift_scan_results[token] = {
-                "ok": True, "pending": True, "_ts": _now_ts}
+        results = operation_results(self)
+        try:
+            results.begin("drift-scan", token)
+        except OperationLimitError as exc:
+            return {"ok": False, "error": str(exc)}
         def _run():
             try:
-                res = _ds.scan_channel(ch, output_dir)
-                if isinstance(res, dict):
-                    res["_ts"] = _t_mod.time()
-                with self._drift_scan_lock:
-                    self._drift_scan_results[token] = res
-            except Exception as e:
-                with self._drift_scan_lock:
-                    self._drift_scan_results[token] = {
-                        "ok": False, "error": str(e),
-                        "_ts": _t_mod.time()}
+                return _ds.scan_channel(ch, output_dir)
             finally:
                 lease.release()
+
+        def _cancelled_before_start():
+            lease.release()
+            results.cancelled_before_start(token)
         try:
             with admitted_operation(
                 self,
@@ -784,8 +769,7 @@ class MediaOpsMixin:
                     cancel=cancel,
                 )
                 if not admission.ok or admission.lease is None:
-                    with self._drift_scan_lock:
-                        self._drift_scan_results.pop(token, None)
+                    results.discard(token)
                     return lease_busy_result(admission)
                 lease = admission.lease
                 try:
@@ -795,39 +779,26 @@ class MediaOpsMixin:
                         label="Scan transcript drift",
                         task_id=token,
                         cancel=cancel,
-                        target=_run,
+                        target=lambda: results.run(token, _run),
                         name="drift-scan-channel",
+                        on_cancelled_before_start=_cancelled_before_start,
                         thread_factory=threading.Thread,
                     )
                 except Exception:
                     lease.release()
                     raise
         except WorkAdmissionClosed as exc:
-            with self._drift_scan_lock:
-                self._drift_scan_results.pop(token, None)
+            results.discard(token)
             return {"ok": False, "started": False, "error": str(exc)}
         except Exception as exc:
-            with self._drift_scan_lock:
-                self._drift_scan_results.pop(token, None)
+            results.discard(token)
             return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "pending": True, "token": token}
 
     def drift_scan_channel_poll(self, token):
         """Poll the drift_scan_channel worker by token. Returns
         {ok, pending} while running, the full scan result once done."""
-        lock = getattr(self, "_drift_scan_lock", None)
-        results = getattr(self, "_drift_scan_results", {})
-        if lock is None:
-            return {"ok": False, "error": "unknown token"}
-        with lock:
-            res = results.get(token)
-            if res is None:
-                return {"ok": False, "error": "unknown token"}
-            if res.get("pending"):
-                return {"ok": True, "pending": True}
-            try: del results[token]
-            except KeyError: pass
-            return res
+        return operation_results(self).poll("drift-scan", token)
 
 
     def drift_apply_channel(self, identity):
@@ -845,7 +816,7 @@ class MediaOpsMixin:
         ch = subs_backend.get_channel(identity or {})
         if not ch:
             return {"ok": False, "error": "Channel not found"}
-        cfg = self._config or load_config()
+        cfg = self._media_config()
         output_dir = (cfg.get("output_dir") or "").strip()
         if not output_dir:
             return {"ok": False, "error": "No archive folder is configured."}
@@ -866,21 +837,15 @@ class MediaOpsMixin:
         import uuid as _uuid
         token = _uuid.uuid4().hex
         cancel = threading.Event()
-        if not hasattr(self, "_drift_apply_results"):
-            self._drift_apply_results = {}
-        if not hasattr(self, "_drift_apply_lock"):
-            self._drift_apply_lock = threading.Lock()
-        # TTL sweep (audit: media_ops_mixin H10).
-        import time as _t_mod
-        _now_ts = _t_mod.time()
-        with self._drift_apply_lock:
-            _stale = [k for k, v in self._drift_apply_results.items()
-                      if isinstance(v, dict)
-                      and (_now_ts - (v.get("_ts") or _now_ts)) > 600]
-            for k in _stale:
-                self._drift_apply_results.pop(k, None)
-            self._drift_apply_results[token] = {
-                "ok": True, "pending": True, "_ts": _now_ts}
+        results = operation_results(self)
+        try:
+            results.begin("drift-apply", token)
+        except OperationLimitError as exc:
+            return {"ok": False, "error": str(exc)}
+        def _cancelled_before_start():
+            lease.release()
+            results.cancelled_before_start(token)
+
         def _run():
             try:
                 result = _ds.apply_channel(
@@ -928,11 +893,7 @@ class MediaOpsMixin:
                                     "start is already in flight)")
                             except Exception:
                                 pass
-                with self._drift_apply_lock:
-                    self._drift_apply_results[token] = result
-            except Exception as e:
-                with self._drift_apply_lock:
-                    self._drift_apply_results[token] = {"ok": False, "error": str(e)}
+                return result
             finally:
                 lease.release()
         try:
@@ -950,8 +911,7 @@ class MediaOpsMixin:
                     cancel=cancel,
                 )
                 if not admission.ok or admission.lease is None:
-                    with self._drift_apply_lock:
-                        self._drift_apply_results.pop(token, None)
+                    results.discard(token)
                     return lease_busy_result(admission)
                 lease = admission.lease
                 try:
@@ -961,20 +921,19 @@ class MediaOpsMixin:
                         label="Repair transcript drift",
                         task_id=token,
                         cancel=cancel,
-                        target=_run,
+                        target=lambda: results.run(token, _run),
                         name="drift-apply-channel",
+                        on_cancelled_before_start=_cancelled_before_start,
                         thread_factory=threading.Thread,
                     )
                 except Exception:
                     lease.release()
                     raise
         except WorkAdmissionClosed as exc:
-            with self._drift_apply_lock:
-                self._drift_apply_results.pop(token, None)
+            results.discard(token)
             return {"ok": False, "started": False, "error": str(exc)}
         except Exception as exc:
-            with self._drift_apply_lock:
-                self._drift_apply_results.pop(token, None)
+            results.discard(token)
             return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "pending": True, "token": token}
 
@@ -982,19 +941,7 @@ class MediaOpsMixin:
     def drift_apply_channel_poll(self, token):
         """Poll the drift_apply_channel worker by token. Returns
         {ok, pending} while running, the full apply result once done."""
-        lock = getattr(self, "_drift_apply_lock", None)
-        results = getattr(self, "_drift_apply_results", {})
-        if lock is None:
-            return {"ok": False, "error": "unknown token"}
-        with lock:
-            res = results.get(token)
-            if res is None:
-                return {"ok": False, "error": "unknown token"}
-            if res.get("pending"):
-                return {"ok": True, "pending": True}
-            try: del results[token]
-            except KeyError: pass
-            return res
+        return operation_results(self).poll("drift-apply", token)
 
 
     # ─── Repair YT auto-captions (v64.7 parser fix) ────────────────────
@@ -1019,7 +966,7 @@ class MediaOpsMixin:
         (re-parsing would strip the restored punctuation across the
         whole transcript — worse than the bug we're fixing).
         """
-        cfg = self._config or load_config()
+        cfg = self._media_config()
         output_dir = (cfg.get("output_dir") or "").strip()
         if not output_dir:
             return {"ok": False, "error": "No archive folder is configured."}
@@ -1085,7 +1032,7 @@ class MediaOpsMixin:
           video_id: single video to punctuate (overrides channel)
           dry_run: bool — load the model + parse but don't write
         """
-        cfg = self._config or load_config()
+        cfg = self._media_config()
         output_dir = (cfg.get("output_dir") or "").strip()
         if not output_dir:
             return {"ok": False, "error": "No archive folder is configured."}
@@ -1149,7 +1096,7 @@ class MediaOpsMixin:
           do_mp4: bool — run the MP4 tag phase (default on)
           dry_run: bool — count what would change but write nothing
         """
-        cfg = self._config or load_config()
+        cfg = self._media_config()
         output_dir = (cfg.get("output_dir") or "").strip()
         if not output_dir:
             return {"ok": False, "error": "No archive folder is configured."}

@@ -4,7 +4,7 @@
 (function () {
   "use strict";
 
-  const _browseState = window._browseState || {};
+  const _browseState = window.YT.util.requireBrowseState();
   const showContextMenu = window.showContextMenu || (() => {});
   const askConfirm = window.askConfirm;
   const askDanger = window.askDanger;
@@ -27,14 +27,17 @@
   }
 
   const CHANNEL_VIDEO_PAGE_SIZE = 120;
+  const _channelPages = window.YT.pagedCollection.create({
+    scope: "channel-videos", label: "channel videos",
+  });
   const _channelPage = {
     active: false,
     channel: "",
     sort: "newest",
     query: "",
-    offset: 0,
-    hasMore: false,
-    loading: false,
+    get offset() { return _channelPages.offset; },
+    get hasMore() { return _channelPages.hasMore; },
+    get loading() { return _channelPages.loading; },
   };
 
   function _channelGroupingEnabled() {
@@ -189,35 +192,17 @@
   // eventual response would render in the background — even if the
   // user had navigated away and the next video had been picked. Track
   // a monotonic token per open call and bail when it changes.
-  let _watchOpenToken = 0;
-  let _watchOpenIntentToken = 0;
-  // Some entry paths must resolve a media file before they can invoke the
-  // canonical opener. Reserving an intent immediately makes "last click
-  // wins" apply across that pre-open await as well as transcript loading.
-  window._reserveWatchOpenIntent = () => ++_watchOpenIntentToken;
-  window._isWatchOpenIntentCurrent = (token) =>
-    token === _watchOpenIntentToken;
-  // _browseState publication moved to web/browseState.js — that module
-  // loads early enough to be the canonical owner. We just expose the
-  // _watchOpenToken getter for logs.js _loadVideoSource (which checks
-  // it after its own awaits and bails if the user navigated away).
-  Object.defineProperty(window, "_watchOpenToken", {
-    get() { return _watchOpenToken; },
-    configurable: true,
-  });
+  const watchSession = window.YT.watchSession;
   window._openVideoInWatch = async function (video, options = {}) {
     if (!video) return;
     const reservedIntent = Number(options.intentToken);
-    if (Number.isFinite(reservedIntent)) {
-      if (reservedIntent !== _watchOpenIntentToken) return;
-    } else {
-      ++_watchOpenIntentToken;
-    }
+    if (Number.isFinite(reservedIntent) && !watchSession.intentCurrent(reservedIntent)) return;
     window._cancelWatchPlaybackIntent?.();
     const playbackIntent = window._watchPlaybackIntent;
-    const myToken = ++_watchOpenToken;
     // Ensure we're on the Browse tab and in Watch view.
     document.querySelector('.tab[data-tab="browse"]')?.click();
+    const request = watchSession.begin(video, reservedIntent);
+    if (!request) return;
     // Record where Watch was entered FROM so Back returns there. Prefer
     // the SUBMODE (recent / search / bookmarks / graph) — `view` only
     // tracks the within-Channels view (channels|videos|watch), so for a
@@ -265,6 +250,9 @@
     let transcriptError = "";
     let transcript = null;
     let sourceInfo = null;
+    // Completion can refresh this transcript while the initial read is still
+    // pending. Only the newest read for this rendered video owns the result.
+    const transcriptRequest = watchSession.beginTranscript(video);
     if (nativeBridgeUp()) {
       try {
         const res = await bridgeCall("browse_get_transcript", {
@@ -276,7 +264,7 @@
         // If the user navigated away (different video, different tab)
         // while we were waiting, drop the result on the floor so the
         // late response doesn't start playing the wrong video.
-        if (myToken !== _watchOpenToken) return;
+        if (!watchSession.transcriptCurrent(transcriptRequest)) return;
         if (Array.isArray(res)) {
           transcript = res;
         } else if (res?.ok === false || res?.error) {
@@ -295,7 +283,7 @@
         // Surface bridge errors so the user knows the transcript
         // couldn't load (was: silent swallow → empty "No transcript
         // available" with no clue why; audit: browseContent H149).
-        if (myToken !== _watchOpenToken) return;
+        if (!watchSession.transcriptCurrent(transcriptRequest)) return;
         transcriptError = e?.message || String(e);
         console.warn("browse_get_transcript failed:", e);
         try {
@@ -304,7 +292,7 @@
         } catch {}
       }
     }
-    if (myToken !== _watchOpenToken) return;
+    if (!watchSession.transcriptCurrent(transcriptRequest)) return;
     // Bug fix: if user navigated away from Watch view entirely (back
     // button, Browse sub-mode switch, etc.) abort rather than render
     // into a hidden Watch view and accidentally autoplay audio.
@@ -320,7 +308,7 @@
         ts: _formatTs(seg.s), text: seg.t, words: seg.w, s: seg.s, e: seg.e,
       }));
     }
-    if (myToken !== _watchOpenToken) return;
+    if (!watchSession.transcriptCurrent(transcriptRequest)) return;
     if (_browseState.view !== "watch") return;
     window.renderWatchView(video, transcript, sourceInfo,
       { playbackIntent, skipVideoReload: true, transcriptError });
@@ -485,6 +473,7 @@
 
     // Clear the previous channel's grid + update the breadcrumb title
     // IMMEDIATELY so switching channels never shows stale content.
+    _channelPages.invalidate();
     _channelPage.active = false;
     _browseState.videos = [];
     const grid = document.getElementById("video-grid");
@@ -544,26 +533,22 @@
   async function _loadChannelPage(channel, reset, seq) {
     const name = channel?.folder || channel?.name || "";
     if (!name || !nativeBridgeUp()) return false;
-    if (!reset && (_channelPage.loading || !_channelPage.hasMore)) return true;
+    const request = _channelPages.start(reset);
+    if (!request) return true;
 
     const sort = document.getElementById("browse-sort")?.value || "newest";
     const query = _currentVideoFilter();
-    const offset = reset ? 0 : _channelPage.offset;
+    const offset = request.offset;
     if (reset) {
       _browseState.videos = [];
       _channelPage.active = true;
       _channelPage.channel = name;
       _channelPage.sort = sort;
       _channelPage.query = query;
-      _channelPage.offset = 0;
-      _channelPage.hasMore = true;
     }
-    _channelPage.loading = true;
     _renderChannelPageSentinel();
-    let stale = false;
     try {
-      const outcome = await window.YT.bridge.catalogRead(
-        "channel-videos",
+      const res = await _channelPages.read(request,
         () => bridgeCall(
           "browse_list_videos_page",
           name, sort, CHANNEL_VIDEO_PAGE_SIZE, offset, query),
@@ -571,24 +556,8 @@
           label: "channel videos",
           onStatus: _paintChannelVideoCatalogStatus,
         });
-      if (outcome.stale) {
-        stale = true;
-        return true;
-      }
-      const res = outcome.value;
+      if (!res) return true;
       if (seq && seq !== loadVideosFor._seq) {
-        stale = true;
-        return true;
-      }
-      if (res?.error) {
-        _channelPage.active = false;
-        _paintChannelVideoError(res.error);
-        window._showToast?.(res.error, "error");
-        return true;
-      }
-      if (!res || !Array.isArray(res.rows)) {
-        _channelPage.active = false;
-        _paintChannelVideoError("Couldn’t load this channel’s videos.");
         return true;
       }
       const rows = res.rows;
@@ -606,25 +575,25 @@
           }
         }
       }
-      const nextOffset = Number(res?.next_offset);
       _channelPage.active = true;
       _channelPage.channel = name;
       _channelPage.sort = sort;
       _channelPage.query = query;
-      _channelPage.offset = Number.isFinite(nextOffset)
-        ? nextOffset : offset + mapped.length;
-      _channelPage.hasMore = !!res?.has_more;
-      _channelPage.loading = false;
+      _channelPages.commit(request, res);
+      _channelPages.finish(request);
       _reconcileCompleteChannelCount(channel);
       sortCurrentVideos(sort);
       return true;
     } catch (e) {
       console.warn("browse_list_videos_page failed:", e);
-      if (reset) _channelPage.active = false;
-      return false;
+      if (!_channelPages.current(request)) return true;
+      if (reset) {
+        _channelPage.active = false;
+        _paintChannelVideoError(e?.message || "Couldn’t load this channel’s videos.");
+      }
+      return true;
     } finally {
-      if (!stale) {
-        _channelPage.loading = false;
+      if (_channelPages.finish(request)) {
         _renderChannelPageSentinel();
       }
     }
@@ -1330,8 +1299,6 @@
   // loadVideosFor() while Channels / Videos / Search / etc. is visible would
   // also repaint the shared title and channel-action chrome for a page the
   // user has already left.
-  let _chanRefreshBusy = false;
-  let _chanRefreshPendingName = null;
   window._refreshChannelVideosIfLoaded = async function (channelName) {
     const cur = _browseState.currentChannel;
     if (!cur || !nativeBridgeUp()) return;
@@ -1346,95 +1313,74 @@
       // doesn't trigger a full channel re-fetch.
       return;
     }
-    if (_chanRefreshBusy) {
-      // A sync can land several videos while the first catalog refresh is
-      // still reading. Remember the newest notification instead of dropping
-      // it; the first query's SQLite snapshot may predate that later commit.
-      _chanRefreshPendingName = channelName || "";
-      return;
-    }
-    _chanRefreshBusy = true;
-    try {
-      const sort = document.getElementById("browse-sort")?.value || "newest";
-      const loadSeq = loadVideosFor._seq || 0;
-      const channelViewIsVisible = () => {
-        const active = _browseState.currentChannel;
-        const activeName = active ? (active.folder || active.name || "") : "";
-        return _browseState.view === "videos" && activeName === shown;
-      };
-      if (_channelPage.active && !_channelGroupingEnabled()) {
-        const depth = _channelPage.offset;
-        const query = _channelPage.query;
-        if (_channelPage.loading) return;
-        const mapped = [];
-        let offset = 0;
-        let hasMore = true;
-        while (hasMore && offset < Math.max(depth, CHANNEL_VIDEO_PAGE_SIZE)) {
-          const count = Math.min(500, Math.max(depth, CHANNEL_VIDEO_PAGE_SIZE) - offset);
-          const outcome = await window.YT.bridge.catalogRead(
-            "channel-videos-refresh",
-            () => bridgeCall("browse_list_videos_page", shown, sort, count, offset, query),
-            { label: "channel videos" });
-          if (outcome.stale) return;
-          const result = outcome.value;
-          if (result?.error || !Array.isArray(result?.rows)) return;
-          if ((loadVideosFor._seq || 0) !== loadSeq || _channelPage.offset !== depth
-              || _channelPage.query !== query || _channelPage.loading) return;
-          mapped.push(...result.rows.map(row => _mapVideoRow(row, shown)));
-          const next = Number(result.next_offset ?? offset + result.rows.length);
-          hasMore = !!result.has_more;
-          if (next <= offset) break;
-          offset = next;
+    return _channelPages.refresh(async (request) => {
+      const activeName = _browseState.currentChannel?.folder || _browseState.currentChannel?.name;
+      if (activeName !== shown) return;
+      try {
+        const sort = document.getElementById("browse-sort")?.value || "newest";
+        const loadSeq = loadVideosFor._seq || 0;
+        const channelViewIsVisible = () => {
+          const active = _browseState.currentChannel;
+          const activeName = active ? (active.folder || active.name || "") : "";
+          return _browseState.view === "videos" && activeName === shown;
+        };
+        if (_channelPage.active && !_channelGroupingEnabled()) {
+          const depth = _channelPage.offset;
+          const query = _channelPage.query;
+          const mapped = [];
+          let offset = 0;
+          let hasMore = true;
+          while (hasMore && offset < Math.max(depth, CHANNEL_VIDEO_PAGE_SIZE)) {
+            const count = Math.min(500, Math.max(depth, CHANNEL_VIDEO_PAGE_SIZE) - offset);
+            const result = await _channelPages.read(request,
+              () => bridgeCall("browse_list_videos_page", shown, sort, count, offset, query),
+              { label: "channel videos" });
+            if (!result || (loadVideosFor._seq || 0) !== loadSeq) return;
+            mapped.push(...result.rows.map(row => _mapVideoRow(row, shown)));
+            const next = Number(result.next_offset ?? offset + result.rows.length);
+            hasMore = !!result.has_more && Number.isFinite(next) && next > offset;
+            if (!Number.isFinite(next) || next <= offset) break;
+            offset = next;
+          }
+          const currentName = _browseState.currentChannel?.folder || _browseState.currentChannel?.name;
+          if (currentName !== shown) return;
+          const same = mapped.map(_videoRowSig).join("|")
+            === (_browseState.videos || []).map(_videoRowSig).join("|");
+          _channelPages.position(request, offset, hasMore);
+          _channelPages.finish(request);
+          if (!same) {
+            const scrolls = [document.getElementById("view-videos"), document.scrollingElement]
+              .filter(Boolean).map(el => [el, el.scrollTop]);
+            _browseState.videos = mapped;
+            sortCurrentVideos(sort);
+            for (const [el, top] of scrolls) el.scrollTop = top;
+            if (channelViewIsVisible()) _updateChannelHeader(cur);
+          }
+          return;
         }
-        const currentName = _browseState.currentChannel?.folder || _browseState.currentChannel?.name;
-        if (currentName !== shown) return;
-        const same = mapped.map(_videoRowSig).join("|")
-          === (_browseState.videos || []).map(_videoRowSig).join("|");
-        _channelPage.offset = offset;
-        _channelPage.hasMore = hasMore;
-        if (!same) {
-          const scrolls = [document.getElementById("view-videos"), document.scrollingElement]
-            .filter(Boolean).map(el => [el, el.scrollTop]);
-          _browseState.videos = mapped;
-          sortCurrentVideos(sort);
-          for (const [el, top] of scrolls) el.scrollTop = top;
-          if (channelViewIsVisible()) _updateChannelHeader(cur);
-        }
-        return;
-      }
-      const outcome = await window.YT.bridge.catalogRead(
-        "channel-videos",
-        () => bridgeCall("browse_list_videos", shown, sort, 50000),
-        { label: "channel videos" });
-      if (outcome.stale) return;
-      const rows = outcome.value;
-      // Discard if the user opened/reloaded a channel while this background
-      // read was pending. That newer load is authoritative. Merely leaving
-      // the channel page is safe: the refreshed grid is hidden and ready if
-      // the user returns.
-      if ((loadVideosFor._seq || 0) !== loadSeq) return;
-      const curNow = _browseState.currentChannel;
-      const shownNow = curNow ? (curNow.folder || curNow.name || "") : "";
-      if (shownNow !== shown || !Array.isArray(rows)) return;
-      const mappedRows = rows.map(r => _mapVideoRow(r, shown));
-      const newSig = mappedRows.map(r => _videoRowSig(r)).join("|");
-      const oldSig = (_browseState.videos || [])
-        .map(v => _videoRowSig(v)).join("|");
-      if (newSig === oldSig) return;   // nothing new — leave the grid as-is
-      _browseState.videos = mappedRows;
-      sortCurrentVideos(sort);
-    } catch (_e) { /* non-fatal — leave the current grid as-is */ }
-    finally {
-      _chanRefreshBusy = false;
-      const pendingName = _chanRefreshPendingName;
-      _chanRefreshPendingName = null;
-      if (pendingName !== null) {
-        setTimeout(() => {
-          window._refreshChannelVideosIfLoaded(
-            pendingName || undefined);
-        }, 0);
-      }
-    }
+        const outcome = await window.YT.bridge.catalogRead(
+          "channel-videos",
+          () => bridgeCall("browse_list_videos", shown, sort, 50000),
+          { label: "channel videos" });
+        if (outcome.stale || !_channelPages.current(request)) return;
+        const rows = outcome.value;
+        // Discard if the user opened/reloaded a channel while this background
+        // read was pending. That newer load is authoritative. Merely leaving
+        // the channel page is safe: the refreshed grid is hidden and ready if
+        // the user returns.
+        if ((loadVideosFor._seq || 0) !== loadSeq) return;
+        const curNow = _browseState.currentChannel;
+        const shownNow = curNow ? (curNow.folder || curNow.name || "") : "";
+        if (shownNow !== shown || !Array.isArray(rows)) return;
+        const mappedRows = rows.map(r => _mapVideoRow(r, shown));
+        const newSig = mappedRows.map(r => _videoRowSig(r)).join("|");
+        const oldSig = (_browseState.videos || [])
+          .map(v => _videoRowSig(v)).join("|");
+        if (newSig === oldSig) return;   // nothing new — leave the grid as-is
+        _browseState.videos = mappedRows;
+        sortCurrentVideos(sort);
+      } catch (_e) { /* non-fatal — leave the current grid as-is */ }
+    });
   };
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", _wireChannelPagingScroll,

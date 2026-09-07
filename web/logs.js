@@ -801,14 +801,8 @@
               // an invalid selector and querySelectorAll throws —
               // killing the entire log batch and breaking in-place
               // replacements downstream. CSS.escape is browser-native.
-              // Dispatch the yt-control event FIRST so listeners
-               // observe the removal as a clean transition. Old order
-               // was remove → dispatch, which let a listener that
-               // also handled clear_line attempt a second removal on
-               // an already-detached node (audit: logs.js:746).
-              window.dispatchEvent(new CustomEvent("yt-control", {
-                detail: data,
-              }));
+              // Only display-line commands belong in disposable log batches.
+              // Prompts and processing state use the acknowledged event channel.
               if (data.kind === "clear_line" && data.marker) {
                 // Remove matching `data-inplace` elements from BOTH
                 // the committed DOM AND the in-progress fragment —
@@ -833,49 +827,6 @@
             continue;
           }
           const line = buildLine(segs);
-          // Surface Whisper progress onto the watch-view Re-transcribe
-          // control — but only for the video this line
-          // belongs to. The `tx_done_<vid>` marker tag rides every
-          // transcribe progress/finalizing emit, so we read the video_id
-          // out of it and let
-          // the update function decide whether THAT video is on screen.
-          // Without the video_id gate, Video A's progress used to paint
-          // Video B's button when the user navigated away mid-transcribe.
-          try {
-            if (window._inflightRetranscribes
-                && window._inflightRetranscribes.size > 0) {
-              let _lineVid = "";
-              let _pctStr = "";
-              let _phase = "";
-              for (const _sg of segs) {
-                if (!Array.isArray(_sg) || _sg.length < 2) continue;
-                const _tag = _sg[1];
-                const tags = Array.isArray(_tag) ? _tag : [_tag];
-                if (!_lineVid) {
-                  for (const t of tags) {
-                    if (typeof t === "string" && t.startsWith("tx_done_")) {
-                      _lineVid = t.slice("tx_done_".length);
-                      break;
-                    }
-                  }
-                }
-                if (!_pctStr && tags.includes("whisper_pct")) {
-                  const _m = String(_sg[0] || "").match(/(\d+)\s*%/);
-                  if (_m) _pctStr = _m[1];
-                }
-                if (!_phase && tags.includes("whisper_finalizing")) {
-                  _phase = "finalizing";
-                }
-              }
-              if (_lineVid && _phase === "finalizing"
-                  && window._retranscribeWatchMarkFinalizing) {
-                window._retranscribeWatchMarkFinalizing(_lineVid);
-              } else if (_lineVid && _pctStr
-                  && window._retranscribeWatchUpdateProgress) {
-                window._retranscribeWatchUpdateProgress(_pctStr, _lineVid);
-              }
-            }
-          } catch (_pe) { /* non-fatal */ }
           // Mark transcribe progress lines so they pin at the bottom of
           // the log (see post-append pin-move below). The browse-tab
           // mini-log mirrors the last N main-log lines — without

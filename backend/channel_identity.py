@@ -9,7 +9,6 @@ before any config is changed.
 """
 from __future__ import annotations
 
-import json
 import re
 import subprocess
 import time
@@ -734,6 +733,6 @@ def emit_url_changed(stream, result: dict[str, Any]) -> None:
         "channel_id": str(result.get("channel_id") or ""),
     }
     try:
-        stream.emit([[json.dumps(payload, ensure_ascii=False), "__control__"]])
+        stream.emit_control(payload)
     except Exception as exc:
         _log.debug("channel URL change notification failed: %s", exc)

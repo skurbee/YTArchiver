@@ -19,6 +19,14 @@ class WorkerOutcome(StrEnum):
     CLEANUP_FAILED = "cleanup_failed"
 
 
+class OutputCancelled(RuntimeError):
+    """A writer stopped at its cancellation checkpoint before committing."""
+
+
+class EmptyTranscript(RuntimeError):
+    """An output adapter has definitively found no speech to persist."""
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionDecision:
     outcome: WorkerOutcome
@@ -38,14 +46,10 @@ class TranscriptionJobExecutor:
     ) -> WorkerOutcome:
         try:
             returned = operation()
-        except RuntimeError as exc:
-            message = str(exc).lower()
-            if "cancelled before write" in message:
-                return WorkerOutcome.CANCELLED
-            if "empty transcript" in message:
-                return WorkerOutcome.NO_SPEECH
-            on_error(exc)
-            return WorkerOutcome.FAILED
+        except OutputCancelled:
+            return WorkerOutcome.CANCELLED
+        except EmptyTranscript:
+            return WorkerOutcome.NO_SPEECH
         except Exception as exc:
             on_error(exc)
             return WorkerOutcome.FAILED
@@ -94,7 +98,9 @@ def execution_decision(outcome: WorkerOutcome) -> ExecutionDecision:
 
 
 __all__ = [
+    "EmptyTranscript",
     "ExecutionDecision",
+    "OutputCancelled",
     "TranscriptionJobExecutor",
     "WorkerOutcome",
     "apply_control_signals",

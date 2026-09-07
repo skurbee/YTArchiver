@@ -175,7 +175,10 @@ class TranscribeProgressStateTests(unittest.TestCase):
             outcomes.append(manager._transcribe_chunked(job, 60.0))
 
         with (
-            mock.patch.object(transcribe_core.subprocess, "run"),
+            mock.patch.object(
+                transcribe_core, "extract_audio_chunk",
+                return_value=mock.Mock(outcome=transcribe_core._WorkerOutcome.SUCCESS),
+            ),
             mock.patch.object(
                 manager, "_transcribe_single_file",
                 return_value=(transcribe_core._WorkerOutcome.SUCCESS,
@@ -686,15 +689,14 @@ class RetranscribeApiStateCallbackTests(unittest.TestCase):
         self.assertFalse(cleanup_payload["ok"])
         self.assertEqual(cleanup_payload["state"], "rejected")
         self.assertTrue(cleanup_payload["error"])
-        scripts = [call.args[0] for call in api._window.evaluate_js.call_args_list]
-        self.assertFalse(any("_onRetranscribeComplete" in script
-                             for script in scripts), scripts)
-        rejected = [script for script in scripts
-                    if "_onRetranscribeState" in script]
-        self.assertEqual(len(rejected), 1, scripts)
-        self.assertIn("rejected", rejected[0])
+        events = [call.args[0] for call in api._log_stream.emit_processing.call_args_list]
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]["state"], "rejected")
+        self.assertEqual(events[0]["request_id"], result["request_id"])
+        self.assertNotEqual(events[0].get("kind"), "complete")
+        api._window.evaluate_js.assert_not_called()
 
-    def test_runtime_state_and_success_use_separate_browser_hooks(self) -> None:
+    def test_runtime_state_and_success_share_one_request_identity(self) -> None:
         manager = mock.Mock()
         manager.enqueue.return_value = True
         api = self._api(manager)
@@ -717,21 +719,18 @@ class RetranscribeApiStateCallbackTests(unittest.TestCase):
                 "filepath": os.path.normpath(video),
                 "message": "Paused — resume from Processing",
             })
-            scripts_after_state = [
-                call.args[0] for call in api._window.evaluate_js.call_args_list
-            ]
-            self.assertTrue(any("_onRetranscribeState" in script
-                                for script in scripts_after_state))
-            self.assertFalse(any("_onRetranscribeComplete" in script
-                                 for script in scripts_after_state))
+            paused = api._log_stream.emit_processing.call_args.args[0]
+            self.assertEqual(paused["state"], "paused")
+            self.assertEqual(paused["request_id"], result["request_id"])
+            self.assertNotEqual(paused.get("kind"), "complete")
 
             complete_cb({"ok": True})
 
-        scripts = [call.args[0] for call in api._window.evaluate_js.call_args_list]
-        self.assertEqual(sum("_onRetranscribeState" in script
-                             for script in scripts), 1)
-        self.assertEqual(sum("_onRetranscribeComplete" in script
-                             for script in scripts), 1)
+        events = [call.args[0] for call in api._log_stream.emit_processing.call_args_list]
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[1]["kind"], "complete")
+        self.assertEqual(events[1]["request_id"], paused["request_id"])
+        api._window.evaluate_js.assert_not_called()
 
     def test_completion_hook_distinguishes_kept_existing_transcript(
             self) -> None:
@@ -750,14 +749,10 @@ class RetranscribeApiStateCallbackTests(unittest.TestCase):
                 self.assertTrue(queued["ok"])
                 manager.enqueue.call_args.kwargs["on_complete"](result)
 
-            scripts = [
-                call.args[0] for call in api._window.evaluate_js.call_args_list
-                if "_onRetranscribeComplete" in call.args[0]
-            ]
-            self.assertEqual(len(scripts), 1, scripts)
-            marker = "window._onRetranscribeComplete("
-            encoded = scripts[0].partition(marker)[2].rsplit(");", 1)[0]
-            return json.loads(encoded)
+            events = [call.args[0] for call in api._log_stream.emit_processing.call_args_list]
+            self.assertEqual(len(events), 1, events)
+            self.assertEqual(events[0]["kind"], "complete")
+            return events[0]
 
         kept = completion_payload({
             "ok": True,

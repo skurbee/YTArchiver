@@ -38,7 +38,9 @@ def test_bridge_contract_reports_only_real_source_calls(tmp_path: Path) -> None:
     (tmp_path / "web").mkdir()
     mixins = tmp_path / "backend" / "api_mixins"
     mixins.mkdir(parents=True)
-    (tmp_path / "main.py").write_text("class Api:\n    pass\n", encoding="utf-8")
+    (tmp_path / "main.py").write_text(
+        "from backend.api_mixins.demo_mixin import DemoMixin\n"
+        "class Api(DemoMixin):\n    pass\n", encoding="utf-8")
     (mixins / "demo_mixin.py").write_text(
         "class DemoMixin:\n    def present(self):\n        pass\n",
         encoding="utf-8",

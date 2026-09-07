@@ -1,10 +1,4 @@
-"""Source-level regression checks for Patch 1 frontend async ownership.
-
-The frontend is framework-free browser JavaScript and has no DOM unit-test
-runner.  These checks protect the small ownership invariants that prevent a
-late A response from repainting, closing, or opening over a newer B action;
-``node --check`` remains the executable syntax check.
-"""
+"""Static wiring checks; asynchronous behavior is exercised by browser tests."""
 
 from pathlib import Path
 
@@ -56,13 +50,9 @@ def test_search_distinguishes_failed_legs_and_keeps_title_text_raw() -> None:
     assert 'snippet: escapeHtml(r.title || "")' not in source
 
 
-def test_watch_and_graph_drop_stale_async_responses() -> None:
-    watch = _source("watchView.js")
+def test_static_graph_declares_request_identity_guards() -> None:
     graph = _source("graphTab.js")
 
-    assert "if (!stillShowingRefreshTarget()) return;" in watch
-    assert "requestSeq === _watchMetadataSeq" in watch
-    assert "_watchVideoIdentity(window._watchCurrentVideo) === requestKey" in watch
     assert "let _graphRequestSeq = 0;" in graph
     assert "const requestType = _graphType;" in graph
     assert "if (!requestIsCurrent()) return;" in graph

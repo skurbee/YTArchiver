@@ -807,6 +807,14 @@ class TrashPersistenceTests(unittest.TestCase):
                 trashed = file_ops.safe_trash_video_file(str(video))
 
             trash_folder = Path(trashed["trashed_folder_path"])
+            # Only an interrupted restore may reconcile an already-original
+            # destination. A complete Trash entry with a missing source is
+            # rejected before that replay branch.
+            manifest_path = trash_folder / ".ytarchiver-trash.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["state"] = "restoring"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            manifest_before = manifest_path.read_bytes()
             (trash_folder / "Video.mp4").unlink()
             destination_key = os.path.normcase(os.path.normpath(str(video)))
             real_lexists = file_ops.os.path.lexists
@@ -836,12 +844,13 @@ class TrashPersistenceTests(unittest.TestCase):
                         side_effect=lambda path: (
                             True if is_destination(path)
                             else real_islink(path))), \
-                    mock.patch.object(file_ops.shutil, "move") as move_mock:
+                    mock.patch.object(file_ops, "_move_no_replace") as move_mock:
                 restored = file_ops.restore_trash_entry(str(trash_folder))
 
             self.assertFalse(restored["ok"])
             self.assertIn("not a regular file", restored["error"])
             move_mock.assert_not_called()
+            self.assertEqual(manifest_path.read_bytes(), manifest_before)
 
     def test_interrupted_multifile_restore_resumes_from_manifest(self) -> None:
         class SimulatedPowerLoss(BaseException):

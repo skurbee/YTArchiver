@@ -24,6 +24,7 @@ import json
 import os
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,31 @@ _SUBSCRIBER_CACHE_FIELDS = (
     "subscriber_fetch_last_error",
 )
 _COUNT_SEMANTICS_VERSION = 2
+
+
+@dataclass(frozen=True)
+class ChannelScanResult:
+    n_vids: int = 0
+    size_bytes: int = 0
+    physical_copies: int = 0
+    status: str = "complete"
+    errors: tuple[str, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return self.status == "complete"
+
+    def cache_record(self, previous=None, *, now=None) -> dict[str, Any]:
+        record = dict(previous) if isinstance(previous, dict) else {}
+        if self.complete:
+            record.update(num_vids=self.n_vids, size_bytes=self.size_bytes,
+                          physical_copies=self.physical_copies,
+                          last_updated=now if now is not None else time.time(),
+                          count_semantics_version=_COUNT_SEMANTICS_VERSION)
+        record.update(scan_complete=self.complete, scan_status=self.status,
+                      scan_errors=list(self.errors),
+                      scan_attempted_at=now if now is not None else time.time())
+        return record
 
 
 def _cache_int(value: Any, default: int = 0) -> int:
@@ -353,8 +379,15 @@ def update_disk_cache_for_channel(channel: dict[str, Any],
         n_vids = total_bytes = None
     if n_vids is None:
         from pathlib import Path as _P
-        n_vids, total_bytes, physical_copies = scan_channel_folder(
-            _P(base), channel, include_physical=True)
+        scanned = scan_channel_folder(_P(base), channel, with_status=True)
+        if not scanned.complete:
+            url = str(channel.get("url") or "").strip()
+            cache = load_disk_cache()
+            if url:
+                cache = publish_scan_stats({url: scanned.cache_record(cache.get(url))})
+            return stats_for_channel(channel, cache)
+        n_vids, total_bytes, physical_copies = (
+            scanned.n_vids, scanned.size_bytes, scanned.physical_copies)
     url = channel.get("url", "").strip()
     subscriber_count = None
     subscriber_checked = False
@@ -381,6 +414,9 @@ def update_disk_cache_for_channel(channel: dict[str, Any],
                 "size_bytes": int(total_bytes),
                 "last_updated": time.time(),
                 "count_semantics_version": _COUNT_SEMANTICS_VERSION,
+                "scan_complete": True,
+                "scan_status": "complete",
+                "scan_errors": [],
             }
             # Preserve the sweep fingerprint across stat refreshes —
             # replacing the whole record dropped it and forced a full
@@ -499,21 +535,31 @@ def stats_for_channel(channel: dict[str, Any], cache: dict[str, Any] | None = No
         "physical_copies": physical_copies,
         "size_bytes": size_bytes,
         "size_gb": size_bytes / (1024 ** 3),
-        "cached": True,
+        "cached": "num_vids" in rec and "size_bytes" in rec,
         "stale_secs": stale,
+        "scan_complete": rec.get("scan_complete", True),
+        "scan_status": rec.get("scan_status", "complete"),
+        "scan_errors": rec.get("scan_errors", []),
     }
 
 
 def publish_scan_stats(scanned: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Publish fresh counts without overwriting concurrent subscriber metadata."""
     fields = ("num_vids", "physical_copies", "size_bytes", "last_updated",
-              "count_semantics_version")
+              "count_semantics_version", "scan_complete", "scan_status",
+              "scan_errors", "scan_attempted_at")
     with _CACHE_LOCK:
         cache = load_disk_cache()
         for url, fresh in scanned.items():
             current = cache.get(url)
             if not isinstance(current, dict):
                 current = cache[url] = {}
+            if fresh.get("scan_complete") is False:
+                if float(current.get("last_updated") or 0) <= float(fresh.get("scan_attempted_at") or 0):
+                    current.update({key: fresh[key] for key in (
+                        "scan_complete", "scan_status", "scan_errors", "scan_attempted_at")
+                        if key in fresh})
+                continue
             if float(current.get("last_updated") or 0) > float(fresh.get("last_updated") or 0):
                 continue
             current.update({key: fresh[key] for key in fields if key in fresh})
@@ -587,9 +633,11 @@ import threading as _threading
 _CACHE_LOCK = _threading.Lock()
 
 
-def _cache_record_complete(record: Any) -> bool:
+def _cache_record_complete(record: Any, *, allow_stale: bool = False) -> bool:
     """Recognize usable current count records, including genuine zero counts."""
     if not isinstance(record, dict):
+        return False
+    if not allow_stale and record.get("scan_complete") is False:
         return False
     if _cache_int(record.get("count_semantics_version"), 0) < _COUNT_SEMANTICS_VERSION:
         return False
@@ -661,7 +709,7 @@ def heal_malformed_cache_entries() -> int:
         cache = load_disk_cache()
         dropped = []
         for url, rec in list(cache.items()):
-            if not _cache_record_complete(rec):
+            if not _cache_record_complete(rec, allow_stale=True):
                 dropped.append(url)
         if not dropped:
             return 0
@@ -711,8 +759,9 @@ def _channel_folder_name(ch: dict[str, Any]) -> str:
 
 
 def scan_channel_folder(base_dir: Path, channel: dict[str, Any],
-                        stop_if=None, *, include_physical: bool = False
-                        ) -> tuple[int, int] | tuple[int, int, int] | None:
+                        stop_if=None, *, include_physical: bool = False,
+                        with_status: bool = False
+                        ) -> ChannelScanResult | tuple[int, int] | tuple[int, int, int] | None:
     """Walk a channel's folder, return (num_vids, total_bytes).
 
     Mirrors YTArchiver.py:3012 _scan_channel_disk_info for the two counts we need.
@@ -723,24 +772,33 @@ def scan_channel_folder(base_dir: Path, channel: dict[str, Any],
         except Exception:
             return False
 
+    def finish(count=0, size=0, copies=0, status="complete", errors=()):
+        result = ChannelScanResult(count, size, copies, status, tuple(errors))
+        if with_status:
+            return result
+        if status == "cancelled":
+            return None
+        return (count, size, copies) if include_physical else (count, size)
+
     if _should_stop():
-        return None
+        return finish(status="cancelled")
     folder_name = _channel_folder_name(channel)
     if not folder_name:
-        return (0, 0, 0) if include_physical else (0, 0)
+        return finish(status="unavailable", errors=("Channel folder is unspecified.",))
     ch_folder = base_dir / folder_name
     if not ch_folder.is_dir():
-        return (0, 0, 0) if include_physical else (0, 0)
+        return finish(status="unavailable", errors=(f"Channel folder is unavailable: {ch_folder}",))
     n_vids = 0
     total = 0
     media_paths: list[str] = []
     zero_byte = 0
-    for dp, _dns, fns in os.walk(ch_folder):
+    scan_errors = []
+    for dp, _dns, fns in os.walk(ch_folder, onerror=lambda exc: scan_errors.append(str(exc))):
         if _should_stop():
-            return None
+            return finish(n_vids, total, n_vids, "cancelled", scan_errors)
         for fn in fns:
             if _should_stop():
-                return None
+                return finish(n_vids, total, n_vids, "cancelled", scan_errors)
             if not fn.lower().endswith(_CHANNEL_VIDEO_EXTS):
                 continue
             if is_partial_artifact(fn, dp):
@@ -748,7 +806,8 @@ def scan_channel_folder(base_dir: Path, channel: dict[str, Any],
             fp = os.path.join(dp, fn)
             try:
                 size = os.path.getsize(fp)
-            except OSError:
+            except OSError as exc:
+                scan_errors.append(f"{fp}: {exc}")
                 # File vanished between os.walk and the stat — typically
                 # caught mid-replace (compress finalize, sync atomic
                 # rename). Brief retry catches the case where the new
@@ -813,18 +872,18 @@ def scan_channel_folder(base_dir: Path, channel: dict[str, Any],
             "archive duplicate-count DB query failed for %r: %s",
             channel.get("name") or channel.get("folder") or channel.get("url"),
             e)
-    if include_physical:
-        return (n_vids, total, physical_copies)
-    return (n_vids, total)
+    return finish(n_vids, total, physical_copies,
+                  "partial" if scan_errors else "complete", scan_errors)
 
 
 def scan_all_channels(progress_cb=None,
-                      stop_if=None) -> dict[str, dict[str, Any]] | None:
+                      stop_if=None, *,
+                      cfg: dict[str, Any] | None = None) -> dict[str, dict[str, Any]] | None:
     """Walk the entire archive. Slow — use only when cache is missing/stale.
 
     progress_cb(current_ch_name: str, done: int, total: int) — optional.
     """
-    cfg = load_config()
+    cfg = load_config() if cfg is None else cfg
     base_str = (cfg.get("output_dir") or "").strip()
     if not base_str:
         return {}
@@ -846,19 +905,12 @@ def scan_all_channels(progress_cb=None,
             except Exception as e:
                 _log.debug("swallowed: %s", e)
         scanned = scan_channel_folder(
-            base_dir, ch, stop_if=stop_if, include_physical=True)
-        if scanned is None:
+            base_dir, ch, stop_if=stop_if, with_status=True)
+        if scanned.status == "cancelled":
             return None
-        n_vids, size_bytes, physical_copies = scanned
         url = ch.get("url", "").strip()
         if url:
-            rec = {
-                "num_vids": n_vids,
-                "physical_copies": physical_copies,
-                "size_bytes": size_bytes,
-                "last_updated": now,
-                "count_semantics_version": _COUNT_SEMANTICS_VERSION,
-            }
+            rec = scanned.cache_record(previous.get(url), now=now)
             old = previous.get(url)
             if isinstance(old, dict):
                 for key in ("sweep_fingerprint", *_SUBSCRIBER_CACHE_FIELDS):
@@ -870,7 +922,7 @@ def scan_all_channels(progress_cb=None,
 
 # ── Index tab summary ──────────────────────────────────────────────────
 
-def index_summary() -> dict[str, Any]:
+def index_summary(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return stats for the Browse > Index sub-mode.
 
     Provides per-card counters plus a per-channel table.
@@ -880,7 +932,7 @@ def index_summary() -> dict[str, Any]:
     the boot sequence with multi-second SQL on large archives. The
     Settings panel fetches that one async after the basics render.
     """
-    cfg = load_config()
+    cfg = load_config() if cfg is None else cfg
     cache = load_disk_cache()
     channels = cfg.get("channels", [])
 

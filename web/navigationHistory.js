@@ -42,7 +42,7 @@
     } else if (tab === "health") {
       route.subview = _activeSubview("panel-health");
     } else if (tab === "browse") {
-      const state = window._browseState || {};
+      const state = window.YT.util.requireBrowseState();
       route.browseSubmode = document.querySelector(
         "#panel-browse .submode-btn.active[data-submode]",
       )?.dataset.submode || state.submode || "channels";
@@ -161,6 +161,7 @@
 
   function _applyRoute(route) {
     if (!route) return;
+    window.YT.watchSession.navigationChanged();
     restoring = true;
     try {
       const tab = route.tab || "download";
@@ -189,6 +190,7 @@
       return false;
     }
 
+    window.YT.watchSession.navigationChanged();
     entries = entries.slice(0, position + 1);
     entries.push(route);
     position = entries.length - 1;

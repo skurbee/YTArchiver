@@ -25,10 +25,9 @@
   const PAGE = 60;
   let _sort = "newest";
   let _query = "";
-  let _offset = 0;
-  let _loading = false;
-  let _hasMore = true;
-  let _seq = 0;
+  const _pages = window.YT.pagedCollection.create({
+    scope: "manual", label: "manual downloads",
+  });
   let _wired = false;
   let _firstPageSig = "";
   // Background metadata can finish before the bridge promise that started it
@@ -287,7 +286,7 @@
         thumbnail_url: url,
         thumbnail_source: item?.thumbnail_source || "",
       };
-      if (_loading) _pendingThumbPatches.set(fp, patch);
+      if (_pages.loading) _pendingThumbPatches.set(fp, patch);
       _patchCachedPage1(fp, patch);
       for (const card of cards) {
         if ((card.dataset.filepath || "") !== fp) continue;
@@ -324,7 +323,7 @@
       const fp = item?.filepath || "";
       const duration = item?.duration || "";
       if (!fp || !duration) continue;
-      if (_loading) _pendingDurationPatches.set(fp, { duration });
+      if (_pages.loading) _pendingDurationPatches.set(fp, { duration });
       _patchCachedPage1(fp, { duration });
       for (const card of cards) {
         if ((card.dataset.filepath || "") !== fp) continue;
@@ -508,9 +507,8 @@
 
   async function loadPage(reset) {
     if (!nativeBridgeUp()) return;
-    _loading = true;
-    const myId = ++_seq;
-    if (reset) { _offset = 0; _hasMore = true; }
+    const request = _pages.start(reset);
+    if (!request) return false;
     const sortAtCall = _sort;
     const queryAtCall = _query;
     const g = grid();
@@ -523,19 +521,16 @@
       if (cached && cached.length) { _paintRows(g, cached); g.classList.add("is-refreshing"); }
       else { g.innerHTML = _skeletonHtml(8); }
     } else if (moreEl) { moreEl.hidden = false; }
-    const pageOffset = _offset;
+    const pageOffset = request.offset;
     try {
-      const outcome = await window.YT.bridge.catalogRead(
-        "manual",
+      const res = await _pages.read(request,
         () => bridgeCall("list_manual_videos", sortAtCall, PAGE, pageOffset, queryAtCall),
         {
           label: "manual downloads",
           onStatus: (status) => _paintManualCatalogStatus(status, reset),
         });
-      if (outcome.stale || myId !== _seq) return false;
-      const res = outcome.value;
-      if (res?.error) throw new Error(res.error);
-      const rows = (res && res.rows) || [];
+      if (!res) return false;
+      const rows = res.rows;
       _mergeEarlyBackgroundPatches(rows);
       if (reset) {
         _firstPageSig = _pageSig(rows);
@@ -546,8 +541,7 @@
       const frag = document.createDocumentFragment();
       for (const r of rows) { const c = _cardFor(r); if (c) frag.appendChild(c); }
       if (g) g.appendChild(frag);
-      _offset += rows.length;
-      _hasMore = !!(res && res.has_more);
+      _pages.commit(request, res);
 
       // Update folder label
       const lbl = $("manual-folder-label");
@@ -557,7 +551,7 @@
         lbl.textContent = `Manual downloads${n} — ${res.folder}`;
       }
 
-      if (reset && g && _offset === 0) {
+      if (reset && g && _pages.offset === 0) {
         const folder = res?.folder || "";
         g.innerHTML = folder
           ? `<div class="browse-empty">No video files found in<br><code>${
@@ -577,7 +571,7 @@
       return true;
     } catch (e) {
       console.error("[manual] load failed", e);
-      if (myId === _seq && reset && g) {
+      if (_pages.current(request) && reset && g) {
         g.classList.remove("is-refreshing");
         g.innerHTML = "";
         const error = document.createElement("div");
@@ -587,8 +581,7 @@
       }
       return false;
     } finally {
-      if (myId === _seq) {
-        _loading = false;
+      if (_pages.finish(request)) {
         if (moreEl) moreEl.hidden = true;
       }
     }
@@ -603,7 +596,7 @@
     if (_scrollRaf) return;
     _scrollRaf = requestAnimationFrame(() => {
       _scrollRaf = null;
-      if (!isActive() || !_hasMore || _loading) return;
+      if (!isActive() || !_pages.hasMore || _pages.loading) return;
       // Like Videos, Manual can scroll on either the inner frame or the
       // outer .browse-view depending on the current layout. Listen/check both
       // so reaching the bottom always requests the next page.
@@ -621,7 +614,7 @@
     let filterTimer = null;
     $("manual-filter")?.addEventListener("input", (event) => {
       _query = event.target.value.trim();
-      ++_seq;
+      _pages.invalidate();
       clearTimeout(filterTimer);
       filterTimer = setTimeout(() => loadPage(true), 200);
     });
@@ -843,51 +836,50 @@
   };
 
   window._refreshManualViewIfActive = async function () {
-    if (!isActive() || _loading) return;
+    if (!isActive()) return;
     if (!nativeBridgeUp()) return;
-    const sortAtCall = _sort;
-    const queryAtCall = _query;
-    try {
-      const outcome = await window.YT.bridge.catalogRead(
-        "manual",
-        () => bridgeCall("list_manual_videos", sortAtCall, PAGE, 0, queryAtCall),
-        { label: "manual downloads" });
-      if (outcome.stale) return;
-      const res = outcome.value;
-      if (res?.error) throw new Error(res.error);
-      if (sortAtCall !== _sort || queryAtCall !== _query || _loading) return;
-      const rows = (res && res.rows) || [];
-      const newSig = _pageSig(rows);
-      if (newSig === _firstPageSig) return;
-      if (sortAtCall === "newest" && _firstPageSig) {
-        const oldFirst = _firstPageSig.split("|")[0].split("~")[0];
-        const splitIdx = rows.findIndex(r => (r.filepath || "") === oldFirst);
-        if (splitIdx > 0) {
-          const g = grid();
-          if (g) {
-            const frag = document.createDocumentFragment();
-            const existing = new Map([...g.querySelectorAll(".video-card")]
-              .map(card => [card.dataset.filepath, card]));
-            let added = 0;
-            for (let i = 0; i < splitIdx; i++) {
-              const c = _cardFor(rows[i]);
-              if (c) {
-                const previous = existing.get(rows[i].filepath);
-                if (previous) previous.remove();
-                else added++;
-                existing.set(rows[i].filepath, c);
-                frag.appendChild(c);
+    return _pages.refresh(async (request) => {
+      const sortAtCall = _sort;
+      const queryAtCall = _query;
+      try {
+        const res = await _pages.read(request,
+          () => bridgeCall("list_manual_videos", sortAtCall, PAGE, 0, queryAtCall),
+          { label: "manual downloads" });
+        if (!res) return;
+        const rows = res.rows;
+        _mergeEarlyBackgroundPatches(rows);
+        const newSig = _pageSig(rows);
+        if (newSig === _firstPageSig) return;
+        if (sortAtCall === "newest" && _firstPageSig) {
+          const oldFirst = _firstPageSig.split("|")[0].split("~")[0];
+          const splitIdx = rows.findIndex(r => (r.filepath || "") === oldFirst);
+          if (splitIdx > 0) {
+            const g = grid();
+            if (g) {
+              const frag = document.createDocumentFragment();
+              const existing = new Map([...g.querySelectorAll(".video-card")]
+                .map(card => [card.dataset.filepath, card]));
+              let added = 0;
+              for (let i = 0; i < splitIdx; i++) {
+                const c = _cardFor(rows[i]);
+                if (c) {
+                  const previous = existing.get(rows[i].filepath);
+                  if (previous) previous.remove();
+                  else added++;
+                  existing.set(rows[i].filepath, c);
+                  frag.appendChild(c);
+                }
               }
+              g.insertBefore(frag, g.firstChild);
+              _pages.position(request, _pages.offset + added, _pages.hasMore);
+              _firstPageSig = newSig;
+              return;
             }
-            g.insertBefore(frag, g.firstChild);
-            _offset += added;
-            _firstPageSig = newSig;
-            return;
           }
         }
-      }
-      loadPage(true);
-    } catch (_e) { /* non-fatal */ }
+        loadPage(true);
+      } catch (_e) { /* non-fatal */ }
+    });
   };
 
   if (document.readyState === "loading") {

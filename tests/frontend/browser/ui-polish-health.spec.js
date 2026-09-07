@@ -1,4 +1,4 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 const { loadApp } = require("./fixtures");
 
 async function health(page, view = "overview") {
@@ -57,17 +57,17 @@ test("metadata flyout stays inside a small window and keeps keyboard navigation"
   await page.locator("#metadata-tbody .md-row-clickable").first().evaluate(row => {
     row.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: 630, clientY: 465 }));
   });
-  const head = page.locator(".md-context-menu .md-cm-has-sub").first();
+  const head = page.locator(".md-context-menu .ctx-submenu-wrap").first();
   await head.focus();
   await page.keyboard.press("ArrowRight");
-  const sub = head.locator("xpath=following-sibling::*[1]");
+  const sub = head.locator(":scope > .ctx-submenu");
   await expect(sub).toBeVisible();
   const bounds = await sub.boundingBox();
   expect(bounds.x).toBeGreaterThanOrEqual(0);
   expect(bounds.y).toBeGreaterThanOrEqual(0);
   expect(bounds.x + bounds.width).toBeLessThanOrEqual(641);
   expect(bounds.y + bounds.height).toBeLessThanOrEqual(481);
-  await expect(sub.locator(".md-cm-item").first()).toBeFocused();
+  await expect(sub.locator(".ctx-menu-item").first()).toBeFocused();
   await page.keyboard.press("ArrowLeft");
   await expect(head).toBeFocused();
   await expect(sub).toBeHidden();

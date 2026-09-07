@@ -36,9 +36,9 @@ import time
 
 from .log import get_logger, swallow
 from .pause_helpers import wait_while_paused
+from .services.provenance_ledger import ProvenanceLedger
 from .services.sidecar_store import (
     SidecarError,
-    append_jsonl_object,
     atomic_write_text,
     read_jsonl,
     read_text,
@@ -78,30 +78,12 @@ def _startupinfo():
 
 def _load_ledger() -> dict[str, tuple[int, int]]:
     """{normcase(path): (size, int(mtime))} for files already tagged."""
-    done: dict[str, tuple[int, int]] = {}
-    try:
-        snapshot = read_jsonl(LEDGER_FILE, invalid="skip")
-        for rec in snapshot.records:
-            try:
-                done[os.path.normcase(rec["path"])] = (
-                    int(rec.get("size", -1)),
-                    int(rec.get("mtime", -1)),
-                )
-            except (KeyError, TypeError, ValueError):
-                continue
-    except SidecarError as e:
-        swallow("provenance ledger read", e)
-    return done
+    return ProvenanceLedger(LEDGER_FILE).load()
 
 
-def _ledger_append(path: str, size: int, mtime: float) -> None:
-    try:
-        append_jsonl_object(
-            LEDGER_FILE,
-            {"path": path, "size": int(size), "mtime": int(mtime), "ts": round(time.time(), 1)},
-        )
-    except SidecarError as e:
-        swallow("provenance ledger append", e)
+def _ledger_append(path: str, size: int, mtime: float, *, ledger=None) -> None:
+    (ledger or ProvenanceLedger(LEDGER_FILE)).append(
+        {"path": path, "size": int(size), "mtime": int(mtime), "ts": round(time.time(), 1)})
 
 
 # ─── Phase A — Transcript.txt header upgrade ───────────────────────────
@@ -582,10 +564,12 @@ def embed_provenance_archive(
         ffmpeg = find_ffmpeg()
         if not ffmpeg:
             raise RuntimeError("ffmpeg not found — cannot embed MP4 tags")
-        for ch_dir in _channel_dirs(output_dir, channel_folder):
-            _sweep_stale_tmp(ch_dir)
+        if not dry_run:
+            for ch_dir in _channel_dirs(output_dir, channel_folder):
+                _sweep_stale_tmp(ch_dir)
         work = _mp4_worklist(output_dir, channel_folder, db_path=db_path)
-        ledger = _load_ledger()
+        ledger_store = ProvenanceLedger(LEDGER_FILE)
+        ledger = ledger_store.load(recover=not dry_run)
         _emit(
             [
                 ["  — ", ["simpleline_pink"]],
@@ -627,9 +611,9 @@ def embed_provenance_archive(
                 res["succeeded"] += 1
                 try:
                     st2 = os.stat(fp)
-                    _ledger_append(fp, st2.st_size, st2.st_mtime)
+                    _ledger_append(fp, st2.st_size, st2.st_mtime, ledger=ledger_store)
                 except OSError as e:
-                    swallow("provenance ledger stat", e)
+                    swallow("provenance checkpoint save", e)
             else:
                 res["failed"] += 1
                 _log.error("provenance embed failed for %s: %s", fp, err)

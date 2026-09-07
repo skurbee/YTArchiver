@@ -1,37 +1,25 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 const { loadApp } = require("./fixtures");
 
 async function bootWithPreferences(page, { local = {}, saved = {}, delayed = false } = {}) {
-  await page.addInitScript(({ local, saved, delayed }) => {
-    for (const [key, value] of Object.entries(local)) {
-      localStorage.setItem(`ytarchiver_caption_${key}`, value);
-    }
-    const settings = {
-      output_dir: "C:\\FixtureArchive", video_out_dir: "C:\\FixtureArchive",
-      default_resolution: "1080", ...saved,
-    };
-    window.__captionSettingsCalls = 0;
-    const pending = delayed ? new Promise(resolve => {
-      window.__releaseCaptionSettings = () => resolve(settings);
-    }) : null;
-    const configure = setHandler => setHandler("settings_load", () => {
-      window.__captionSettingsCalls++;
-      return pending || Promise.resolve(settings);
-    });
-    // Fixture init scripts may execute in either order. Attach the handler
-    // before application boot without relying on a runtime-private helper.
-    if (typeof window.__setBridgeHandler === "function") configure(window.__setBridgeHandler);
-    else Object.defineProperty(window, "__setBridgeHandler", {
-      configurable: true,
-      set(handler) {
-        Object.defineProperty(window, "__setBridgeHandler", {
-          configurable: true, writable: true, value: handler,
-        });
-        configure(handler);
-      },
-    });
-  }, { local, saved, delayed });
-  await loadApp(page);
+  await loadApp(page, {
+    waitFor: delayed ? "handlers" : "settled",
+    args: { local, saved, delayed },
+    configure: ({ local, saved, delayed }) => {
+      for (const [key, value] of Object.entries(local)) {
+        localStorage.setItem(`ytarchiver_caption_${key}`, value);
+      }
+      const settings = { ...window.__fixtureDefaultResult("settings_load"), ...saved };
+      window.__captionSettingsCalls = 0;
+      const pending = delayed ? new Promise(resolve => {
+        window.__releaseCaptionSettings = () => resolve(settings);
+      }) : null;
+      window.__setBridgeHandler("settings_load", () => {
+        window.__captionSettingsCalls++;
+        return pending || Promise.resolve(settings);
+      });
+    },
+  });
 }
 
 async function settleFrames(page) {

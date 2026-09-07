@@ -904,9 +904,13 @@ class ArchiveMixin:
                     task_id=task_id,
                     role="download",
                 )
-                _returncode = stream_result.returncode
+                _output_complete = stream_result.output_complete
+                _returncode = stream_result.returncode if _output_complete else -1
                 _killed = bool(
                     stream_result.timed_out or stream_result.cancelled)
+                if not _output_complete and not _killed:
+                    _stderr_errors.insert(
+                        0, "download tool output was incomplete; any saved file was kept")
                 if stream_result.timed_out:
                     try:
                         self._log_stream.emit([
@@ -935,7 +939,7 @@ class ArchiveMixin:
                         swallow("url-history write", e)
                 # Post-download bookkeeping — emulate the channel-sync
                 # path's register_video + _record_recent_download hooks.
-                if _dltrack and not _killed:
+                if _dltrack and not _killed and _output_complete:
                     try:
                         # audit DT-8: guard against yt-dlp output format
                         # changes / missing fields. parse_dltrack returns

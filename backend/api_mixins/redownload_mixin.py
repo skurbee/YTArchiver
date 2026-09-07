@@ -7,7 +7,6 @@ private Api attributes kept as fallback state.
 """
 from __future__ import annotations
 
-import json
 import threading
 import time
 import uuid
@@ -198,52 +197,19 @@ class RedownloadMixin:
         except Exception as e:
             log_stream.emit_error(f"Redownload crashed: {e}")
         finally:
-            cleared = False
             try:
-                current = queues.current_sync
-                if current is None:
-                    # An exact per-channel cancel durably clears the recovery
-                    # slot before signalling this worker.
-                    cleared = True
-                else:
-                    cleared = queues.replace_current_task_durable(
-                        "sync", None,
-                        expected_task_id=str(
-                            _rd_task.get("task_id") or "").strip(),
-                    )
-                if not cleared:
-                    _log.warning(
-                        "redownload completion could not durably clear its "
-                        "recovery slot; task remains recoverable")
-            except Exception as e:
-                _log.warning(
-                    "redownload finally: durable current clear failed: %s", e)
-            if cleared and cancel_event.is_set():
-                # Defer persists the same task at the durable queue's tail.
-                # Reattach its execution companion only after this worker has
-                # stopped and acknowledged its current slot. A normal Cancel
-                # has no matching pending row, and Stop must not restart work.
-                try:
-                    with self._redwnl_lock:
-                        stopped = getattr(self, "_sync_cancel", None)
-                        task_id = str(_rd_task.get("task_id") or "").strip()
-                        deferred = None
-                        if task_id and not (stopped and stopped.is_set()):
-                            deferred = next((dict(task) for task in queues.sync_snapshot()
-                                             if str(task.get("task_id") or "").strip() == task_id
-                                             and task.get("kind") == "redownload"), None)
-                        if deferred is not None and not any(
-                                str((item.get("rd_task") or {}).get("task_id") or "").strip() == task_id
-                                for item in self._redwnl_pending):
-                            deferred.pop("cancel_requested", None)
-                            self._redwnl_pending.append({
-                                "ch": dict(ch), "folder": folder,
-                                "new_res": deferred.get("redownload_res") or new_res,
-                                "scope_label": scope_label, "scope": deferred.get("scope"),
-                                "only_video": dict(only_video), "rd_task": deferred,
-                            })
-                except Exception as exc:
-                    _log.warning("deferred redownload runtime restoration failed: %s", exc)
+                from backend.sync.queue_commands import RedownloadQueueCommands
+                stopped = getattr(self, "_sync_cancel", None)
+                RedownloadQueueCommands(
+                    queues, self._redwnl_lock, self._redwnl_pending).acknowledge(
+                        str(_rd_task.get("task_id") or "").strip(),
+                        cancelled=cancel_event.is_set(),
+                        stopped=bool(stopped and stopped.is_set()),
+                        companion={"ch": dict(ch), "folder": folder, "new_res": new_res,
+                                   "scope_label": scope_label, "scope": _rd_task.get("scope"),
+                                   "only_video": dict(only_video), "rd_task": _rd_task})
+            except Exception as exc:
+                _log.warning("Redownload completion acknowledgement failed: %s", exc)
             log_stream.flush()
             try:
                 from backend import archive_scan as _as
@@ -287,9 +253,7 @@ class RedownloadMixin:
             self._redwnl_sample = pending
 
         def emit(kind, **fields):
-            stream.emit([[json.dumps({"kind": kind, "sample_id": sample_id,
-                                     **fields}), "__control__"]])
-            stream.flush()
+            stream.emit_control({"kind": kind, "sample_id": sample_id, **fields})
 
         reason = "timeout"
         try:

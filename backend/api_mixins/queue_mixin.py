@@ -205,83 +205,21 @@ class QueueMixin:
             return 0
 
     def _remove_pending_redownload_exact(self, task_id, queues):
-        """Commit one redownload removal in both runtime and durable queues."""
-        lock = getattr(self, "_redwnl_lock", None)
-        pending = getattr(self, "_redwnl_pending", None)
-        if lock is None or not isinstance(pending, list):
-            return queues.sync_remove_task(task_id, durable=True)
-        with lock:
-            index = next(
-                (i for i, item in enumerate(pending)
-                 if str(((item or {}).get("rd_task") or {}).get("task_id")
-                        or "").strip() == task_id),
-                -1,
-            )
-            if not queues.sync_remove_task(task_id, durable=True):
-                return False
-            if index >= 0:
-                pending.pop(index)
-            return True
+        from backend.sync.queue_commands import RedownloadQueueCommands
+        return RedownloadQueueCommands(
+            queues, self._redwnl_lock, self._redwnl_pending).remove(task_id)
 
-    def _reorder_pending_redownload_exact(
-            self, task_id, new_index, queues) -> bool:
-        """Keep the redownload chain's relative order equal to QueueState."""
-        lock = getattr(self, "_redwnl_lock", None)
-        pending = getattr(self, "_redwnl_pending", None)
-        if lock is None or not isinstance(pending, list):
-            return queues.sync_reorder(task_id, new_index, durable=True)
-        with lock:
-            queue_order = queues.sync_snapshot()
-            source_index = next(
-                (i for i, item in enumerate(queue_order)
-                 if str(item.get("task_id") or "").strip() == task_id),
-                -1,
-            )
-            if (source_index < 0 or new_index < 0
-                    or new_index >= len(queue_order)):
-                return False
-            moved = queue_order.pop(source_index)
-            queue_order.insert(new_index, moved)
-            if not queues.sync_reorder(task_id, new_index, durable=True):
-                return False
-            by_id = {
-                str(((item or {}).get("rd_task") or {}).get("task_id")
-                    or "").strip(): item
-                for item in pending
-                if str(((item or {}).get("rd_task") or {}).get("task_id")
-                       or "").strip()
-            }
-            ordered_ids = [
-                str(item.get("task_id") or "").strip()
-                for item in queue_order
-                if (item.get("kind") or "").lower() == "redownload"
-                and str(item.get("task_id") or "").strip() in by_id
-            ]
-            reordered = [by_id[ident] for ident in ordered_ids]
-            reordered.extend(
-                item for item in pending if item not in reordered)
-            pending[:] = reordered
-            return True
-
+    def _reorder_pending_redownload_exact(self, task_id, new_index, queues) -> bool:
+        from backend.sync.queue_commands import RedownloadQueueCommands
+        return RedownloadQueueCommands(
+            queues, self._redwnl_lock, self._redwnl_pending).reorder(task_id, new_index)
 
     def queues_gpu_remove(self, task_id):
         """Remove one pending Processing job by opaque task ID only."""
         ident = str(task_id or "").strip()
         if not ident:
             return {"ok": False, "error": "task_id required"}
-        queues = self._queue_state()
-        entries = queues.gpu_items_for_ids({ident})
-        manager = self._queue_transcribe()
-        coordinate = getattr(
-            manager, "remove_pending_task_ids_coordinated", None)
-        if not callable(coordinate):
-            return {"ok": False,
-                    "error": "Processing queue coordinator unavailable"}
-        ok = coordinate(
-            {ident},
-            lambda: queues.gpu_remove(ident, durable=True),
-            lambda: queues.gpu_restore_items(entries, durable=True),
-        )
+        ok = self._queue_transcribe().queue_commands().remove({ident})
         self._on_queue_changed()
         return ({"ok": True} if ok else
                 {"ok": False, "error": "Task removal could not be saved"})
@@ -307,32 +245,11 @@ class QueueMixin:
         wanted = [task_id for task_id in wanted if task_id]
         if not wanted or len(set(wanted)) != len(wanted):
             return {"ok": False, "error": "unique task_ids required"}
-        queues = self._queue_state()
-        wanted_set = set(wanted)
-        entries = queues.gpu_items_for_ids(wanted_set)
-        manager = self._queue_transcribe()
-        coordinate = getattr(
-            manager, "remove_pending_task_ids_coordinated", None)
-        if not callable(coordinate):
-            return {"ok": False,
-                    "error": "Processing queue coordinator unavailable"}
-        removed: list[str] = []
-
-        def _remove_exact() -> bool:
-            nonlocal removed
-            removed = queues.gpu_remove_tasks(
-                wanted, durable=True, require_all=True)
-            return set(removed) == wanted_set
-
-        ok = coordinate(
-            wanted_set, _remove_exact,
-            lambda: queues.gpu_restore_items(entries, durable=True),
-        )
+        ok = self._queue_transcribe().queue_commands().remove(set(wanted))
         self._on_queue_changed()
-        return {"ok": ok, "dropped": len(removed) if ok else 0,
-                "task_ids": removed if ok else [],
-                **({} if ok else
-                   {"error": "Grouped task removal could not be saved"})}
+        return {"ok": ok, "dropped": len(wanted) if ok else 0,
+                "task_ids": wanted if ok else [],
+                **({} if ok else {"error": "Grouped task removal could not be saved"})}
 
 
     def queues_sync_reorder(self, task_id, new_index):
@@ -373,26 +290,7 @@ class QueueMixin:
         ident = str(task_id or "").strip()
         if not ident:
             return {"ok": False, "error": "task_id required"}
-        queues = self._queue_state()
-        snapshot = queues.gpu_snapshot()
-        old_index = next(
-            (i for i, item in enumerate(snapshot)
-             if str(item.get("task_id") or "").strip() == ident),
-            -1,
-        )
-        if old_index < 0:
-            return {"ok": False, "error": "Queue changed; task not found"}
-        manager = self._queue_transcribe()
-        coordinate = getattr(
-            manager, "reorder_pending_task_coordinated", None)
-        if not callable(coordinate):
-            return {"ok": False,
-                    "error": "Processing queue coordinator unavailable"}
-        ok = coordinate(
-            ident, _idx,
-            lambda: queues.gpu_reorder(ident, _idx, durable=True),
-            lambda: queues.gpu_reorder(ident, old_index, durable=True),
-        )
+        ok = self._queue_transcribe().queue_commands().reorder(ident, _idx)
         self._on_queue_changed()
         return ({"ok": True} if ok else
                 {"ok": False, "error": "Task order could not be saved"})

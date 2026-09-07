@@ -18,13 +18,15 @@ from typing import Any
 
 from ..log import get_logger
 from ..log_stream import LogStreamer
-from ..sync import find_yt_dlp
 from ..text_utils import normalize_title as _canon_norm_title
 from ..utils import sqlite_like_escape as _like_esc
-from ._refresh_proxies import (
+from ..ytdlp_options import find_yt_dlp
+from .catalog import (
+    _flat_playlist_bulk_stats,
+)
+from .control import (
     _enter_pause_wait,
     _exit_pause_wait,
-    _flat_playlist_bulk_stats,
 )
 from .fetcher import (
     fetch_single_video_metadata,

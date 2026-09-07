@@ -33,12 +33,7 @@
   const PAGE = 60;
   let _sort = "recent";
   let _filter = "";      // title/channel substring filter (server-side)
-  let _offset = 0;
-  let _loading = false;
-  let _refreshing = false;
-  let _refreshPending = false;
-  let _hasMore = true;
-  let _seq = 0;          // stale-load guard: a newer sort/reset wins
+  const _pages = window.YT.pagedCollection.create({ scope: "videos", label: "videos" });
   let _wired = false;
   // Signature (joined ids/paths) of the page-1 rows currently rendered.
   // Used by _refreshVideosViewIfActive to decide whether a return-to-tab
@@ -162,9 +157,8 @@
 
   async function loadPage(reset) {
     if (!nativeBridgeUp()) return;
-    _loading = true;
-    const myId = ++_seq;
-    if (reset) { _offset = 0; _hasMore = true; }
+    const request = _pages.start(reset);
+    if (!request) return;
     const sortAtCall = _sort;
     const filterAtCall = _filter;
     const g = grid();
@@ -173,20 +167,17 @@
       g.innerHTML = '<div class="grid-loading"><div class="grid-spinner"></div>'
         + '<span class="grid-loading-label">Loading videos…</span></div>';
     } else if (moreEl) { moreEl.hidden = false; }
-    const pageOffset = _offset;
+    const pageOffset = request.offset;
     try {
-      const outcome = await window.YT.bridge.catalogRead(
-        "videos",
+      const res = await _pages.read(request,
         () => bridgeCall(
           "list_all_videos", sortAtCall, PAGE, pageOffset, filterAtCall),
         {
           label: "videos",
           onStatus: _paintVideosCatalogStatus,
         });
-      if (outcome.stale || myId !== _seq) return;
-      const res = outcome.value;
-      if (res?.error) throw new Error(res.error);
-      const rows = (res && res.rows) || [];
+      if (!res) return;
+      const rows = res.rows;
       if (reset) {
         _firstPageSig = _pageSig(rows);
       }
@@ -194,10 +185,9 @@
       const frag = document.createDocumentFragment();
       for (const r of rows) { const c = _cardFor(r); if (c) frag.appendChild(c); }
       if (g) g.appendChild(frag);
-      _offset += rows.length;
-      _hasMore = !!(res && res.has_more);
+      _pages.commit(request, res);
       _queueThumbnailPage(sortAtCall, pageOffset, filterAtCall, rows.length);
-      if (g && _offset === 0) {
+      if (g && _pages.offset === 0) {
         g.innerHTML = filterAtCall
           ? `<div class="browse-empty">No videos match “${filterAtCall
               .replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}”.</div>`
@@ -205,7 +195,7 @@
       }
     } catch (e) {
       console.error("[videos] load failed", e);
-      if (myId === _seq && reset && g) {
+      if (_pages.current(request) && reset && g) {
         g.innerHTML = "";
         const error = document.createElement("div");
         error.className = "browse-empty";
@@ -213,8 +203,7 @@
         g.appendChild(error);
       }
     } finally {
-      if (myId === _seq) {
-        _loading = false;
+      if (_pages.finish(request)) {
         if (moreEl) moreEl.hidden = true;
       }
     }
@@ -231,7 +220,7 @@
     if (_scrollRaf) return;
     _scrollRaf = requestAnimationFrame(() => {
       _scrollRaf = null;
-      if (!isActive() || !_hasMore || _loading) return;
+      if (!isActive() || !_pages.hasMore || _pages.loading) return;
       // The Videos grid's scroll can live on EITHER the inner frame
       // (#recent-grid-frame) or the outer .browse-view (#view-recent) — the
       // latter is a block-level overflow-y:auto container, so the inner
@@ -283,11 +272,6 @@
   // hit. _firstPageSig is keyed implicitly to the current sort because
   // loadPage() always rebuilds it for whatever sort is active.
   window._refreshVideosViewIfActive = async function () {
-    if (_loading) return;
-    if (_refreshing) {
-      _refreshPending = true;
-      return;
-    }
     if (!nativeBridgeUp()) return;
     // Background-capable: refresh when the view is visible OR when it was
     // already loaded once (`_firstPageSig` set). Updating the hidden grid
@@ -296,68 +280,58 @@
     // (it'll load fresh on first open). DOM prepends on a hidden grid are
     // cheap and safe.
     if (!isActive() && !_firstPageSig) return;
-    _refreshing = true;
-    const sortAtCall = _sort;
-    const filterAtCall = _filter;
-    try {
-      const outcome = await window.YT.bridge.catalogRead(
-        "videos",
-        () => bridgeCall(
-          "list_all_videos", sortAtCall, PAGE, 0, filterAtCall),
-        { label: "videos" });
-      if (outcome.stale) return;
-      const res = outcome.value;
-      if (res?.error) throw new Error(res.error);
-      if (sortAtCall !== _sort || filterAtCall !== _filter || _loading) return;
-      const rows = (res && res.rows) || [];
-      const newSig = _pageSig(rows);
-      if (newSig === _firstPageSig) return; // nothing changed
+    return _pages.refresh(async (request) => {
+      const sortAtCall = _sort;
+      const filterAtCall = _filter;
+      try {
+        const res = await _pages.read(request,
+          () => bridgeCall(
+            "list_all_videos", sortAtCall, PAGE, 0, filterAtCall),
+          { label: "videos" });
+        if (!res) return;
+        const rows = res.rows;
+        const newSig = _pageSig(rows);
+        if (newSig === _firstPageSig) return; // nothing changed
 
-      // For "recent" sort: try a no-flash prepend — find how many NEW
-      // items are at the top (before the old first item) and insert only
-      // those, avoiding the blank-grid flash that loadPage(true) causes.
-      if (sortAtCall === "recent" && _firstPageSig) {
-        const oldFirstId = _firstPageSig.split("|")[0].split("~")[0];
-        const splitIdx = rows.findIndex(
-          r => (r.video_id || r.filepath || "") === oldFirstId
-        );
-        if (splitIdx > 0) {
-          const g = grid();
-          if (g) {
-            const frag = document.createDocumentFragment();
-            const existing = new Map([...g.querySelectorAll(".video-card")]
-              .map(card => [card.dataset.filepath, card]));
-            let added = 0;
-            for (let i = 0; i < splitIdx; i++) {
-              const c = _cardFor(rows[i]);
-              if (c) {
-                const previous = existing.get(rows[i].filepath);
-                if (previous) previous.remove();
-                else added++;
-                existing.set(rows[i].filepath, c);
-                frag.appendChild(c);
+        // For "recent" sort: try a no-flash prepend — find how many NEW
+        // items are at the top (before the old first item) and insert only
+        // those, avoiding the blank-grid flash that loadPage(true) causes.
+        if (sortAtCall === "recent" && _firstPageSig) {
+          const oldFirstId = _firstPageSig.split("|")[0].split("~")[0];
+          const splitIdx = rows.findIndex(
+            r => (r.video_id || r.filepath || "") === oldFirstId
+          );
+          if (splitIdx > 0) {
+            const g = grid();
+            if (g) {
+              const frag = document.createDocumentFragment();
+              const existing = new Map([...g.querySelectorAll(".video-card")]
+                .map(card => [card.dataset.filepath, card]));
+              let added = 0;
+              for (let i = 0; i < splitIdx; i++) {
+                const c = _cardFor(rows[i]);
+                if (c) {
+                  const previous = existing.get(rows[i].filepath);
+                  if (previous) previous.remove();
+                  else added++;
+                  existing.set(rows[i].filepath, c);
+                  frag.appendChild(c);
+                }
               }
+              g.insertBefore(frag, g.firstChild);
+              _pages.position(request, _pages.offset + added, _pages.hasMore);
+              _firstPageSig = newSig;
+              _queueThumbnailPage(sortAtCall, 0, filterAtCall, rows.length);
+              return; // done — no blank flash, scroll position preserved
             }
-            g.insertBefore(frag, g.firstChild);
-            _offset += added;
-            _firstPageSig = newSig;
-            _queueThumbnailPage(sortAtCall, 0, filterAtCall, rows.length);
-            return; // done — no blank flash, scroll position preserved
           }
         }
-      }
 
-      // Fallback: full reload (other sorts, filtered view, or old first
-      // item no longer in the new page because many videos were added).
-      loadPage(true);
-    } catch (_e) { /* non-fatal — leave the current grid as-is */ }
-    finally {
-      _refreshing = false;
-      if (_refreshPending) {
-        _refreshPending = false;
-        setTimeout(() => window._refreshVideosViewIfActive(), 0);
-      }
-    }
+        // Fallback: full reload (other sorts, filtered view, or old first
+        // item no longer in the new page because many videos were added).
+        loadPage(true);
+      } catch (_e) { /* non-fatal — leave the current grid as-is */ }
+    });
   };
 
   if (document.readyState === "loading") {

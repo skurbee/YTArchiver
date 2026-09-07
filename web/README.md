@@ -41,7 +41,7 @@ startup and only rewrites `index.html` when generated content changes.
 |------|---------|
 | `app.js`         | Tiny boot orchestrator — calls every module's `init*`. Owns the MutationObserver-cleanup pool. |
 | `logs.js`        | Log infrastructure (`_logBatch`, scroll state, in-place row replace, mini-log mirror). |
-| `watchView.js`   | Watch view + karaoke transcript + WebVTT captions + metadata drawer. |
+| `watchView.js`   | Watch view + karaoke transcript + timed DOM caption overlay + metadata drawer. |
 | `browseGrids.js` | Channel grid + Video grid + `_buildVideoCard` (shared by Videos/Manual cards). |
 | `tables.js`      | Subs channel table. |
 | `queueRender.js` | Sync / GPU task popover row renderer (drag-reorder, right-click). |
@@ -53,8 +53,10 @@ startup and only rewrites `index.html` when generated content changes.
 |------|---------|
 | `util.js`        | Tiny shared utilities (`escapeHtml`, `escapeAttr`, `_formatTs`, `onceIdempotent`). |
 | `bridge.js`      | `pywebview.api` readiness helper + `bridgeCall` plumbing. |
-| `eventState.js`  | Stable named-topic state/event owner (`publish`, `subscribe`, `snapshot`) for bridge-pushed values with more than one consumer. |
+| `eventState.js`  | Named-topic state plus acknowledged, revisioned control/processing events independent of display logs. |
 | `browseState.js` | Canonical `window._browseState` (loaded early so every extracted module captures the same object reference). |
+| `watchSession.js` | Video selection/render ownership and separate request revisions for navigation, transcripts, metadata, and playback. Loads after Browse state. |
+| `pagedCollection.js` | Shared page admission/completion, offsets, and coalesced refresh; loads after the bridge. View rendering and caching remain local. |
 | `toasts.js`      | Toast notifications + error-message sanitizer. |
 | `modals.js`      | `askQuestion / askConfirm / askChoice / askDanger / askTextInput`. |
 | `contextMenu.js` | Generic right-click menu builder. |

@@ -162,6 +162,7 @@ from .ytdlp_proc import (  # noqa: F401  (re-exports for backend.sync surface)
 )
 from .ytdlp_session import (
     finish_ytdlp_process,
+    iter_download_output,
     popen_ytdlp_process,
     start_download_watchdog,
 )
@@ -902,8 +903,12 @@ def _clear_timeout_strike(vid: str) -> None:
 # plain-English sentence. Ordered most-specific-first. The generic fallback
 # is accurate because any error reaching here also re-queues the failed
 # video for the next sync pass.
-def _humanize_ytdlp_error(low: str) -> str:
+def _humanize_ytdlp_error(low: str, *, channel_scope: bool = False) -> str:
     """Map a raw yt-dlp ERROR line (already lowercased) to a plain reason."""
+    if channel_scope:
+        if "http error 404" in low or "404: not found" in low:
+            return "Couldn't load this channel page (HTTP 404)."
+        return "The download tool hit an error while checking this channel."
     # Disk / filesystem
     if ("no space left" in low or "not enough space" in low
             or "errno 28" in low or "disk full" in low):
@@ -1099,8 +1104,14 @@ _startupinfo = _make_startupinfo()
 
 # ── Sync one channel ───────────────────────────────────────────────────
 
-class SyncResult(dict):
-    """Result dict with ok/reason/counts."""
+from .completion import (
+    CompletedMedia,
+    CompletionLedger,
+    CompletionLog,
+    DownloadFollowups,
+    DownloadObservation,
+)
+from .results import SyncResult
 
 
 def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
@@ -1258,6 +1269,51 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     if not ch_dir_exists:
         ch_dir.mkdir(parents=True, exist_ok=True)
 
+    # A new channel's artwork is a sequential phase of its first sync. The
+    # sync already owns the channel lease, so an immediate Sync now cannot
+    # collide with a separate add-channel artwork worker.
+    _art_before_downloads = not bool(
+        channel.get("initialized") or channel.get("init_complete"))
+    if _art_before_downloads:
+        from .. import channel_art as _ca
+        from ..process_runner import CancellationSignals
+        _art_cancel = LinkedCancelEvent(
+            CancellationSignals(cancel_event, kill_current))
+        if _art_cancel.is_set():
+            return SyncResult(ok=False, reason="cancelled", cancelled=True)
+        if pause_event is not None and pause_event.is_set():
+            return SyncResult(ok=False, reason="paused")
+        stream.emit_text(" Fetching channel avatar and banner...\n", "simpleline")
+        try:
+            _art_result = _ca.fetch_channel_art(
+                url or "", str(ch_dir), force=False,
+                cancel_event=_art_cancel, pause_event=pause_event)
+        except Exception as exc:
+            _log.debug("Initial channel-art fetch failed: %s", exc)
+            _art_result = {"ok": False}
+        if not isinstance(_art_result, dict):
+            _art_result = {"ok": False}
+        if _art_cancel.is_set() or _art_result.get("cancelled"):
+            return SyncResult(ok=False, reason="cancelled", cancelled=True)
+        if pause_event is not None and pause_event.is_set():
+            return SyncResult(ok=False, reason="paused")
+        if (_art_result.get("rate_limited")
+                or _art_result.get("cookie_auth_required")):
+            return SyncResult(
+                ok=False, errors=1,
+                reason=("rate_limited" if _art_result.get("rate_limited")
+                        else "cookie_auth_required"),
+                rate_limited=bool(_art_result.get("rate_limited")),
+                cookie_auth_required=bool(_art_result.get("cookie_auth_required")))
+        if _art_result.get("partial"):
+            stream.emit_text(
+                " Some channel artwork is unavailable; starting videos.\n", "yellow")
+        elif _art_result.get("ok"):
+            stream.emit_text(" Channel artwork ready; starting videos.\n", "simpleline")
+        else:
+            stream.emit_text(
+                " Channel artwork unavailable; continuing with videos.\n", "yellow")
+
     fmt = build_format_string(resolution)
     # Files live under the channel folder, optionally split into
     # <year>/[<month>/] subfolders. yt-dlp first writes an ID-suffixed bundle
@@ -1271,6 +1327,11 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     cmd = [
         yt,
         "--newline", "--no-quiet",
+        # Process each discovered video before requesting later channel pages.
+        # Eager enumeration can consume the request budget before the first
+        # download on a large channel. Lazy iteration preserves YouTube order
+        # and lets archive hits stop an incremental pass without that walk.
+        "--lazy-playlist",
         # Bound the connection retries/timeout. yt-dlp's defaults (10
         # retries × ~20s connect timeout, ×each stream) mean an
         # UNREACHABLE CDN host silently burns 3+ minutes before giving up
@@ -1336,6 +1397,13 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
         # internally below and adds no separate YouTube request.
         "--print", _channel_identity.CHANNEL_TRACK_PRINT,
     ]
+    if channel.get("auto_metadata"):
+        # Capture comments with the video extraction so the completed info
+        # sidecar can populate archive metadata without another player fetch.
+        cmd += [
+            "--write-comments", "--extractor-args",
+            "youtube:comment_sort=top;max_comments=50,50,0,0",
+        ]
     # Write VTT captions ONLY when auto-transcribe is enabled for this
     # channel. The transcribe fast-path (_try_auto_captions) parses the VTT
     # into the aggregated Transcript.txt and then deletes the .vtt files.
@@ -1630,6 +1698,18 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     # the Destination line that triggers the dlrow creation, so it's the
     # correct id to associate with the new dlrow.
     current_vid_id: str = ""
+    # The existing sync_row_ family coalesces these page updates in both logs.
+    # Give discovery its own identity so it never replaces a channel summary.
+    _discovery_marker = f"sync_row_discovery_{_new_pass_id()}"
+    _discovery_active = False
+
+    def _clear_discovery_row() -> None:
+        nonlocal _discovery_active
+        if _discovery_active:
+            import json
+            stream.emit([[json.dumps({"kind": "clear_line", "marker": _discovery_marker}),
+                          "__control__"]])
+            _discovery_active = False
     # dlrow_N values that have already been CLOSED by a DLTRACK ✓ done
     # emit. yt-dlp sometimes dribbles a final "[download] 100% of X in
     # Y" progress line AFTER the DLTRACK has fired — if we let it
@@ -1691,8 +1771,8 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     # triple-count the `downloaded` tally. Keyed by merged .mp4 path.
     _title_announced: dict[str, bool] = {}
     _announced_vids: set[str] = set()
-    _counted_vids: set[str] = set()  # committed/count guard
-    _registration_failed_vids: set[str] = set()
+    _completion_ledger = CompletionLedger(committed_ids)
+    _registration_failed_vids = _completion_ledger.failed_ids
 
     # ── Inline metadata pipeline ──────────────────────────────────────
     # Design intent: "when a sync download kicks out a metadata
@@ -1806,6 +1886,8 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
             _ch_snapshot = dict(channel) if isinstance(channel, dict) else {}
 
         def _task():
+            from ..metadata.fetcher import emit_inline_metadata_outcome
+            res = {"ok": False, "cancelled": True}
             try:
                 if _meta_cancel.is_set():
                     return
@@ -1827,21 +1909,23 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                 from .. import metadata as _meta
                 res = _meta.fetch_single_video_metadata(
                     _ch_snapshot, vid_id, final_path, title, stream,
+                    emit_terminal_log=False,
                     cancel_event=_meta_cancel,
                     process_owner="sync",
                     process_task_id=_ch_snapshot.get("task_id") or "",
                 )
-                if _meta_cancel.is_set():
-                    return
                 if res.get("ok") and res.get("fetched"):
                     _bump_meta_counts("fetched")
                 elif res.get("ok") and res.get("skipped"):
                     _bump_meta_counts("skipped")
-                else:
+                elif not res.get("cancelled"):
                     _bump_meta_counts("errors")
             except Exception:
                 if not _meta_cancel.is_set():
+                    res = {"ok": False, "error": "metadata worker failed"}
                     _bump_meta_counts("errors")
+            finally:
+                emit_inline_metadata_outcome(stream, vid_id, res)
             if _meta_cancel.is_set():
                 return
             # Now that metadata + thumbnail are on disk, re-push the
@@ -1863,12 +1947,21 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                 if len(_meta_futures) < _MAX_INLINE_METADATA_IN_FLIGHT:
                     break
                 if _meta_cancel.is_set():
+                    from ..metadata.fetcher import emit_inline_metadata_outcome
+                    emit_inline_metadata_outcome(
+                        stream, vid_id, {"ok": False, "cancelled": True})
                     return
                 wait(
                     tuple(_meta_futures), timeout=0.05,
                     return_when=FIRST_COMPLETED,
                 )
             _fut = _meta_exec.submit(_task)
+            def _cancelled_metadata(done_future):
+                if done_future.cancelled():
+                    from ..metadata.fetcher import emit_inline_metadata_outcome
+                    emit_inline_metadata_outcome(
+                        stream, vid_id, {"ok": False, "cancelled": True})
+            _fut.add_done_callback(_cancelled_metadata)
             try:
                 _meta_futures.append(_fut)
                 _track_inline_metadata_worker(
@@ -1876,6 +1969,12 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
             except Exception: pass
         except Exception as e:
             swallow("metadata executor submit", e)
+            from ..metadata.fetcher import emit_inline_metadata_outcome
+            cancelled = _meta_cancel.is_set()
+            if not cancelled:
+                _bump_meta_counts("errors")
+            emit_inline_metadata_outcome(
+                stream, vid_id, {"ok": False, "cancelled": cancelled})
 
     # track returncode per pass instead of relying on
     # `proc.returncode` after the loop (which reads the LAST proc only;
@@ -1991,6 +2090,8 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
         if proc is None:
             continue # streams pass launch failed — skip, main pass completed
 
+        current_vid_id = ""
+
         # No-output watchdog. readline() below BLOCKS while yt-dlp silently
         # grinds through connection retries, so one unreachable video can
         # freeze the whole pass — and pause/cancel (checked per-line) stop
@@ -2013,7 +2114,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
         _wd_stalled = _watchdog.stalled
         # Manual line iteration on the bytes stream so we can apply our
         # UTF-8-first-cp1252-fallback decoder (`_utils.decode_subprocess_line`).
-        for _line_bytes in iter(proc.stdout.readline, b""):
+        for _line_bytes in iter_download_output(proc, _watchdog):
             _last_out[0] = time.time()   # watchdog heartbeat
             line = _utils.decode_subprocess_line(_line_bytes)
             if cancel_event is not None and cancel_event.is_set():
@@ -2052,6 +2153,25 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
             s = line.rstrip()
             if not s:
                 continue
+
+            # Channel enumeration can take minutes under the request budget.
+            # Keep its current page visible, including when lazy enumeration
+            # resumes between videos, without leaving a scanning row behind.
+            if re.match(r"(?:ERROR:\s*)?\[youtube:tab\]", s):
+                current_vid_id = ""
+                current_title = ""
+                if s.startswith("[youtube:tab]") and "Downloading" in s:
+                    _page_match = re.search(r"\bpage (\d+):", s)
+                    _discovery_message = (
+                        f"Finding channel videos — page {_page_match.group(1)}..."
+                        if _page_match else "Checking channel for videos...")
+                    stream.emit([[f" {_discovery_message}\n",
+                                  ["simpleline", _discovery_marker]]])
+                    _discovery_active = True
+            elif (extract_video_id_from_line(s)
+                  or s.startswith(("[download] Destination:", "DLTRACK:::",
+                                   "[download] Finished downloading playlist:"))):
+                _clear_discovery_row()
 
             _channel_track = _channel_identity.parse_channel_track_line(s)
             if _channel_track is not None:
@@ -2218,37 +2338,17 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
 
             if s.startswith("DLTRACK:::"):
                 try:
-                    # Patch A: validate field count before unpacking.
-                    # yt-dlp's DLTRACK template emits exactly 7 ::: -
-                    # separated fields. A malformed line (yt-dlp format
-                    # drift, unusual metadata, etc.) previously raised
-                    # ValueError straight into the swallowing except
-                    # below — the download silently failed to register.
-                    # Now: warn + continue so the rest of the for-loop
-                    # processes other lines normally.
-                    # Split with NO limit so titles containing literal
-                    # `:::` don't shift the trailing fields. The other
-                    # 5 fields (uploader/date/size/duration/id) are
-                    # well-formed yt-dlp metadata that can't contain
-                    # `:::`, so we treat them as fixed anchors and
-                    # rejoin everything between them into the title
-                    # (audit: sync/core.py H29). The previous code
-                    # used `split(":::", 6)` which silently corrupted
-                    # the id field on `:::` titles even though the
-                    # `len==7` check passed.
-                    _parts = s.split(":::")
-                    if len(_parts) < 7:
-                        _log.warning(
-                            "DLTRACK malformed (%d parts, expected ≥7): %s",
-                            len(_parts), s[:200])
+                    observation = DownloadObservation.parse(s)
+                    if observation is None:
+                        _log.warning("DLTRACK malformed: %s", s[:200])
                         continue
-                    # Anchor on the trailing 5 + leading DLTRACK; the
-                    # middle parts (parts[1:-5]) belong to the title.
-                    _ = _parts[0]
-                    upl, ud, sz, dur, vid = _parts[-5:]
-                    t = ":::".join(_parts[1:-5])
-                    t = (t or "").strip()
-                    vid = (vid or "").strip()
+                    t, upl, ud, sz, dur, vid = (
+                        observation.title, observation.uploader, observation.upload_date,
+                        observation.size, observation.duration, observation.video_id)
+                    if vid and _completion_ledger.has_completed(vid):
+                        # Replayed after_video events must not reset completed
+                        # metadata rows or ingest the same captions again.
+                        continue
                     _existing_final = _existing_file_dltrack.consume(
                         vid or current_vid_id)
                     if _existing_final:
@@ -2652,23 +2752,18 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                             if _dur_str:
                                 stream.emit([[" Duration: ", "dim"],
                                              [f"{_dur_str}\n", "dim"]])
-                        _download_commit = commit_download(
-                            final_path,
-                            name,
-                            t,
-                            video_id=vid,
-                            auto_transcribe=auto_tx,
-                            duration=dur,
-                            upload_date=ud,
-                            filename_id_is_provenance=(
-                                _filename_id_is_provenance),
-                        )
+                        completed_media = CompletedMedia(
+                            final_path, name, t, vid, ud or "", dur,
+                            size_bytes=_size_bytes or None,
+                            filename_id_is_provenance=_filename_id_is_provenance)
+                        completion = _completion_ledger.register(
+                            completed_media, auto_transcribe=auto_tx, commit=commit_download)
+                        _download_commit = completion.result
                         _registered = _download_commit.ok
                         _register_error = _download_commit.error
                         _dur_val = _download_commit.duration_seconds
                         if not _registered:
-                            if vid not in _registration_failed_vids:
-                                _registration_failed_vids.add(vid)
+                            if completion.count_error:
                                 errors += 1
                                 _why = (_register_error
                                         or "index rejected the final media")
@@ -2678,7 +2773,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                                      f"download history until it is registered "
                                      f"successfully — {_why}\n", "yellow"],
                                 ])
-                        elif vid not in _counted_vids:
+                        elif completion.count_download:
                             if _completion_kind:
                                 stream.emit([
                                     [" ", ["dim", _completion_kind]],
@@ -2692,9 +2787,6 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                                     [f"{_completion_size_tag}\n", [
                                         "dim", _completion_kind]],
                                 ])
-                            _counted_vids.add(vid)
-                            if vid not in committed_ids:
-                                committed_ids.append(vid)
                             downloaded += 1
                             # Periodic disk-space re-check every 10 committed
                             # downloads. Observed/no-file DLTRACK events must
@@ -2723,221 +2815,27 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                                     downloaded=1, skipped=0, errors=0)
                             except Exception as e:
                                 swallow("sync-progress dltrack", e)
-                        try:
-                            # Pass size + duration through so the function
-                            # doesn't need to spawn ffprobe / re-stat the
-                            # video file. DLTRACK already gave us both
-                            # (`_size_bytes` was just computed above for
-                            # the ✓ line, `_dur_val` is `dur` from the
-                            # DLTRACK record). Skipping ffprobe matters
-                            # when Z: is contended by the boot sweep —
-                            # the subprocess can otherwise stall 5+
-                            # seconds per download.
-                            _rec_size = _size_bytes if _size_bytes else None
-                            _record_recent_download(final_path, name, t, vid,
-                                                    upload_date=(ud or "").strip(),
-                                                    size_bytes=_rec_size,
-                                                    duration_secs=_dur_val)
-                        except Exception as _re2:
-                            # Recent tab goes stale silently
-                            # on any cache write failure without this.
-                            stream.emit_dim(
-                                f" (recent downloads write failed: {_re2})")
-                        # if this vid was previously deferred
-                        # as a livestream/premiere, drop it from the
-                        # deferred journal now that we've successfully
-                        # grabbed the recording. Without this, the
-                        # Deferred Livestreams drawer accumulates stale
-                        # entries forever; only the manual Ignore button
-                        # ever removed them.
-                        try:
-                            from .. import livestreams as _ls
-                            _ls.drop(vid)
-                        except Exception as e:
-                            swallow("deferred-livestream drop", e)
-                        # Issues #139/#144/#148: emit a meta_done_<vid>
-                        # placeholder BEFORE the metadata fetch fires
-                        # async. The done line tags the same marker so
-                        # it lands AT the placeholder's position rather
-                        # than scrolling in below later channels'
-                        # rows. Mirrors the tx_done_<vid> pattern.
-                        _meta_marker = f"meta_done_{vid}" if vid else ""
-                        # Only emit the placeholder when a metadata
-                        # task will actually run — with auto_metadata
-                        # off, _meta_exec is None and _submit_inline_
-                        # metadata no-ops, so the "Metadata queued…"
-                        # line sat stuck forever (nothing resolves it;
-                        # the orphan sweep clears only dlrow_ markers).
-                        if _meta_marker and _meta_exec is not None:
-                            # Indent to match the eventual " — ✓ Metadata
-                            # downloaded" / " — ✓ Transcription (...)" lines
-                            # nested under the parent video row (6 leading
-                            # spaces). Mirrors the same indent already applied
-                            # to the "Transcription queued…" placeholder ~80
-                            # lines below — without it, the queued line
-                            # appeared one level shallower than the done line
-                            # that replaces it.
-                            stream.emit([
-                                ["      — ⏳ ",
-                                 ["meta_bracket", _meta_marker]],
-                                ["Metadata queued…\n",
-                                 ["simpleline", _meta_marker]],
-                            ])
-                        # Inline metadata fetch — no channel walk.
-                        _submit_inline_metadata(vid, t, final_path)
-                        # If auto_transcribe is OFF, remember the video ID on
-                        # the channel so Queue Pending can later snipe the
-                        # exact file without folder-scanning. Spec: the
-                        # Queue Pending ticker counts up when a channel
-                        # without auto transcription enabled downloads a
-                        # video.
-                        if not auto_tx:
-                            try:
-                                from .. import ytarchiver_config as _cfg
-                                _cfg.append_pending_tx_id(name, vid)
-                            except Exception as _re3:
-                                # pending transcribe list
-                                # silently loses the ID otherwise —
-                                # user would later see "Queue Pending"
-                                # miss this video without knowing why.
-                                stream.emit_dim(
-                                    f" (pending-transcribe list write failed: {_re3})")
-                        # Auto-transcribe: ingest already-punctuated YouTube
-                        # captions here in the sync queue. Only captions that
-                        # need the punctuation model (or videos that need
-                        # Whisper) are handed to Processing.
-                        if auto_tx and transcribe_mgr is not None:
-                            _compress_after = None
-                            if channel.get("compress_enabled"):
-                                _comp_lvl = channel.get("compress_level") or "Average"
-                                _comp_res = str(channel.get("compress_output_res") or "720")
-                                _compress_after = {
-                                    "quality": _comp_lvl,
-                                    "output_res": _comp_res,
-                                }
-                            # Reserve a slot in the log for the transcription
-                            # completion line so it renders under THIS channel's
-                            # block when the async GPU job finishes — not
-                            # interleaved with later channels' "no new videos"
-                            # rows or orphaned at the bottom of the log.
-                            # `_inplaceKind` prioritizes `tx_done_` so when the
-                            # done line emits with `["dim", whisper_job_N,
-                            # f"tx_done_{vid}"]` it finds this placeholder and
-                            # replaces it in place.
-                            _tx_marker = f"tx_done_{vid}"
-                            # Placeholder MUST include a non-verbose-only
-                            # segment so it survives Simple mode's
-                            # `_line_is_verbose_only` filter and actually
-                            # lands in DOM. Otherwise the subsequent
-                            # transcribe-done emit (with same tx_done_
-                            # marker) can't find the placeholder to
-                            # replace and appends at log bottom — under
-                            # whichever channel the sync pass is
-                            # currently processing, not under this
-                            # video's section. Using `whisper_bracket`
-                            # for the em-dash + hourglass so the line
-                            # visually matches the eventual ✓ done
-                            # emit's em-dash color.
-                            # Indent to match the eventual " \u2014 \u2713 Metadata
-                            # downloaded" / " \u2014 \u2713 Transcription (\u2026)" lines
-                            # below the parent video row (6 leading spaces).
-                            # Previously this used 1 space so the queued
-                            # placeholder didn't align with its own
-                            # finished line.
-                            stream.emit([
-                                ["      \u2014 \u23F3 ", ["whisper_bracket", _tx_marker]],
-                                ["Checking YouTube captions\u2026\n",
-                                 ["simpleline", _tx_marker]],
-                            ])
-                            # Fall back to the filename stem if the
-                            # yt-dlp title field came back empty (rare
-                            # but happens for region-locked / partially-
-                            # extracted videos that still successfully
-                            # downloaded). Empty `t` made the
-                            # transcribe row land in the log + DB
-                            # without a usable name (audit:
-                            # sync/core.py H35).
-                            _title_for_tx = (
-                                t or os.path.splitext(
-                                    os.path.basename(final_path))[0])
-                            def _emit_processing_queued(_m=_tx_marker):
-                                stream.emit([
-                                    ["      \u2014 \u23F3 ",
-                                     ["whisper_bracket", _m]],
-                                    ["Transcription queued in Processing\u2026\n",
-                                     ["simpleline", _m]],
-                                ])
-
-                            # The compress follow-up runs from the GPU
-                            # queue minutes later, long after this
-                            # channel block has scrolled away. Reserve
-                            # its slot now (same trick as meta_done_ /
-                            # tx_done_) so "Encoding ...", the progress
-                            # bar and the "\u2713 Compressed" done line all
-                            # render under THIS video rather than under
-                            # whichever channel is printing when the
-                            # encode finally starts. Same 6-space indent
-                            # as the Metadata / Transcription rows.
-                            if _compress_after:
-                                _emit_compress_placeholder(
-                                    stream, final_path)
-
-                            _tx_route = transcribe_mgr.route_download_transcription(
-                                final_path, _title_for_tx,
-                                channel=name,
-                                video_id=vid,
-                                compress_after=_compress_after,
-                                on_processing_queued=_emit_processing_queued,
-                            )
-                            if _tx_route == "duplicate":
-                                stream.emit([
-                                    ["      \u2014 ", ["dim", _tx_marker]],
-                                    ["Transcription already queued.\n",
-                                     ["dim", _tx_marker]],
-                                ])
-                        # If auto_transcribe is off but compress_enabled is on,
-                        # route the compress task through the SHARED GPU queue
-                        # (rule: "every compress is a GPU task").
-                        # Falls back to inline direct-fire if the transcribe
-                        # manager isn't attached (e.g. tests).
-                        elif channel.get("compress_enabled"):
-                            _comp_lvl = channel.get("compress_level") or "Average"
-                            _comp_res = str(channel.get("compress_output_res") or "720")
-                            if transcribe_mgr is not None:
-                                # Same reserved slot as the auto-transcribe
-                                # path above — this is the only line this
-                                # video gets, so it has to sit under the
-                                # video row, not at the log bottom.
-                                _emit_compress_placeholder(stream, final_path)
-                                try:
-                                    _queued = transcribe_mgr.compress_enqueue(
-                                        final_path,
-                                        title=os.path.splitext(
-                                            os.path.basename(final_path))[0],
-                                        channel=name,
-                                        quality=_comp_lvl,
-                                        output_res=_comp_res,
-                                        from_download=True)
-                                except Exception as _e:
-                                    _queued = False
-                                    stream.emit_error(f"Couldn't queue video compression: {_e}")
-                                if not _queued:
-                                    # Rejected (shutdown, duplicate,
-                                    # containment) — nothing will ever
-                                    # replace the placeholder, so drop it.
-                                    _clear_compress_placeholder(
-                                        stream, final_path)
-                            else:
-                                # A detached fallback thread has no durable
-                                # queue owner and can overwrite media after a
-                                # restore or shutdown checkpoint. Production
-                                # always supplies TranscribeManager; if that
-                                # owner is unavailable, preserve the original
-                                # and report the skipped follow-up explicitly.
-                                stream.emit_error(
-                                    "Video compression was not queued because "
-                                    "the processing owner is unavailable. The "
-                                    "downloaded original was left unchanged.")
+                        if not completion.count_download:
+                            # Registration failures remain retryable; only the
+                            # first successful commit dispatches follow-ups.
+                            continue
+                        from .. import livestreams as _ls
+                        from .. import ytarchiver_config as _cfg
+                        followups = DownloadFollowups(
+                            log=CompletionLog(stream, _emit_compress_placeholder,
+                                              _clear_compress_placeholder),
+                            record_recent=_record_recent_download,
+                            submit_metadata=_submit_inline_metadata,
+                            append_pending_transcription=_cfg.append_pending_tx_id,
+                            drop_livestream=_ls.drop, processing=transcribe_mgr)
+                        compression = ({
+                            "quality": channel.get("compress_level") or "Average",
+                            "output_res": str(channel.get("compress_output_res") or "720"),
+                        } if channel.get("compress_enabled") else None)
+                        followups.dispatch(
+                            completed_media, duration_seconds=_dur_val,
+                            metadata_enabled=(_meta_exec is not None),
+                            auto_transcribe=auto_tx, compression=compression)
                     elif final_path and os.path.isfile(final_path) and not vid:
                         _register_idless_download(
                             final_path, name, t,
@@ -3369,6 +3267,12 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                              "sync.\n", ["red", "error_detail"]],
                             [s, "error_raw"],
                         ])
+                    elif not current_vid_id and "error" in low and low.strip() not in ("error:", "error"):
+                        stream.emit([
+                            [" ⚠ Couldn't reach YouTube while checking this channel.\n",
+                             ["red", "error_detail"]],
+                            [s, "error_raw"],
+                        ])
                 elif ("error" in low
                       and low.strip() not in ("error:", "error")
                       and not _is_channel_page_unavailable_line):
@@ -3380,8 +3284,9 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                     if not (current_vid_id and current_vid_id in _simple_err_shown):
                         if current_vid_id:
                             _simple_err_shown.add(current_vid_id)
-                        _reason = _humanize_ytdlp_error(low)
-                        _who = _clean_display_title(current_title)
+                        _reason = _humanize_ytdlp_error(
+                            low, channel_scope=not bool(current_vid_id))
+                        _who = _clean_display_title(current_title) if current_vid_id else ""
                         if _who:
                             stream.emit([
                                 [f" ⚠ {_who} — {_reason}\n",
@@ -3449,6 +3354,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
             # Default: dim
             stream.emit([[f" {s}\n", "dim"]])
 
+        _clear_discovery_row()
         # Stop the watchdog. If it killed a stalled download, count the
         # in-flight video as failed so the 3-strike give-up advances toward
         # permanently skipping it.
@@ -3460,13 +3366,13 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
             _failed_this_run.add(current_vid_id)
 
         try:
-            finish_ytdlp_process(proc)
+            finish_ytdlp_process(proc, watchdog=_watchdog)
         except Exception as e:
             swallow("ytdlp proc finish", e)
         # record this pass's returncode for the final
         # _ok check. None = terminated mid-flight without wait (treated
         # below as not-a-failure if any other pass succeeded).
-        _pass_returncodes.append(proc.returncode)
+        _pass_returncodes.append(proc.returncode if _watchdog.output_complete else -1)
         if (_target_url == url and _channel_page_unavailable
                 and not _main_channel_tracks):
             # A failed main channel cannot make later gap or /streams probes
@@ -3726,6 +3632,10 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
         except Exception as e:
             swallow("meta-executor shutdown", e)
 
+    # Metadata workers have drained, so their failures now belong in the pass
+    # and activity summaries rather than being hidden behind "0 errors".
+    errors += _read_meta_count("errors")
+
     # Do not clear ``current_sync`` here. The queue orchestrator owns the
     # pending -> running -> completed transaction and acknowledges completion
     # with ``replace_current_task_durable`` only after this entire function
@@ -3970,18 +3880,19 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
         except Exception as _hve:
             _log.debug("hide sweep spawn skipped: %s", _hve)
 
-    # Also refresh the channel's avatar/banner art. Internal 30-day
-    # threshold on channel_art.fetch_channel_art means this is near-free
-    # when art is already current. Matches OLD auto-fetch behavior.
+    # Established channels retain the normal artwork refresh. A first sync
+    # already attempted it before downloading; do not spend another request
+    # retrying missing artwork at the end of the same pass.
     # Gate behind _post_sync_cancelled for consistency with the other
     # post-sync passes above — the freshness check + network probe
     # still adds noticeable cancel-latency if it fires (audit:
     # sync/core.py H39).
-    if not _post_sync_cancelled:
+    if not _post_sync_cancelled and not _art_before_downloads:
         try:
             from .. import channel_art as _ca
             _ca.fetch_channel_art(
-                url or "", str(ch_dir), force=False)
+                url or "", str(ch_dir), force=False,
+                cancel_event=cancel_event, pause_event=pause_event)
         except Exception as _ae:
             stream.emit_dim(f" (channel-art refresh skipped: {_ae})")
 

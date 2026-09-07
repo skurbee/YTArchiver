@@ -44,11 +44,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
+from . import youtube_traffic
+from .executor_utils import LinkedCancelEvent
 from .log import get_logger
 from .subprocess_util import make_startupinfo, subprocess_creationflags
 from .utils import hide_file_win as _hide_file_win
@@ -341,6 +345,33 @@ def _thumbnail_url_candidates(url: str, video_id: str) -> list[str]:
     return candidates
 
 
+def _is_youtube_thumbnail_url(url: str) -> bool:
+    """Identify YouTube image requests by hostname, never a path substring."""
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").encode("idna").decode("ascii").lower().rstrip(".")
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return False
+    except (ValueError, UnicodeError):
+        return False
+    return any(host == domain or host.endswith("." + domain) for domain in (
+        "youtube.com", "youtu.be", "youtube-nocookie.com", "ytimg.com",
+        "ggpht.com", "googleusercontent.com", "googlevideo.com",
+        "youtubei.googleapis.com", "youtube.googleapis.com",
+    ))
+
+
+class _ThumbnailRequestCancel(LinkedCancelEvent):
+    """Make the existing commit predicate interrupt a governor wait too."""
+
+    def __init__(self, may_commit: Callable[[], bool]) -> None:
+        super().__init__()
+        self._may_commit = may_commit
+
+    def is_set(self) -> bool:
+        return super().is_set() or not self._may_commit()
+
+
 def _download_thumbnail(url: str, thumb_dir: str,
                         title: str, video_id: str,
                         stream=None,
@@ -447,17 +478,28 @@ def _download_thumbnail(url: str, thumb_dir: str,
         _MAX_BYTES = 20 * 1024 * 1024
         img_data = None
         _last_error: Exception | None = None
+        request_cancel = _ThumbnailRequestCancel(_may_commit)
         for candidate_url in _thumbnail_url_candidates(url, video_id):
             if not _may_commit():
                 return False
+            youtube_request = _is_youtube_thumbnail_url(candidate_url)
             try:
                 req = urllib.request.Request(
                     candidate_url, headers={"User-Agent": "Mozilla/5.0"})
+                if youtube_request:
+                    permission = youtube_traffic.acquire(
+                        "youtube_thumbnail", cancel_event=request_cancel,
+                        stream=stream)
+                    if not permission.get("ok") or not _may_commit():
+                        return False
                 # Pre-check Content-Length: YouTube thumbs are typically <200KB,
                 # and we cap at 20MB. A misbehaving server reporting 100MB+
                 # gets refused without burning a slow read (audit:
                 # thumbnails.py:130-141).
                 with urllib.request.urlopen(req, timeout=30) as resp:
+                    if youtube_request and getattr(resp, "status", None) == 429:
+                        raise urllib.error.HTTPError(
+                            candidate_url, 429, "Too Many Requests", resp.headers, None)
                     try:
                         _cl = resp.headers.get("Content-Length")
                         if _cl and int(_cl) > _MAX_BYTES:
@@ -481,6 +523,16 @@ def _download_thumbnail(url: str, thumb_dir: str,
                 break
             except Exception as _candidate_error:
                 _last_error = _candidate_error
+                if (youtube_request
+                        and isinstance(_candidate_error, urllib.error.HTTPError)
+                        and _candidate_error.code == 429):
+                    # A thumbnail throttle applies to the shared session;
+                    # trying lower-resolution URLs must not continue it.
+                    try:
+                        youtube_traffic.record_rate_limit()
+                    finally:
+                        _candidate_error.close()
+                    raise
                 if not _may_commit():
                     return False
         if img_data is None:

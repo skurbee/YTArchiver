@@ -1,6 +1,6 @@
 const fs = require("node:fs");
 const path = require("node:path");
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 const WEB_ROOT = path.join(REPO_ROOT, "web");

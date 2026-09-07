@@ -365,15 +365,8 @@ class WindowMixin:
                     # Release the single-instance mutex only after old writers
                     # and local servers are stopped, then launch exactly one
                     # detached replacement.
-                    try:
-                        import ctypes as _ct
-                        _main_mod = sys.modules.get("__main__")
-                        _mx = getattr(_main_mod, "_INSTANCE_MUTEX", None)
-                        if _mx:
-                            _ct.windll.kernel32.CloseHandle(_mx)
-                            _main_mod._INSTANCE_MUTEX = None
-                    except Exception as exc:
-                        _log.debug("restart mutex release failed: %s", exc)
+                    release_lease = self._release_instance_lease
+                    release_lease()
 
                     argv = ([sys.executable] if getattr(sys, "frozen", False)
                             else [sys.executable, *sys.argv])

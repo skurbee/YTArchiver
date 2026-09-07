@@ -18,6 +18,7 @@ Path(_TEST_APPDATA.name, "YTArchiver").mkdir(parents=True, exist_ok=True)
 
 from backend import drift_scan, index, index_maintenance
 from backend.api_mixins import media_ops_mixin
+from backend.services.catalog_session import CatalogSession
 
 
 def _reset_index() -> None:
@@ -269,8 +270,14 @@ class Patch3FtsDriftTests(unittest.TestCase):
             writer = threading.Thread(target=_writer, name="fts-race-writer")
             writer.start()
             try:
-                with mock.patch.object(index, "_db_lock", gate), \
-                        mock.patch.object(index, "_open", return_value=conn):
+                session = CatalogSession(
+                    writer_factory=lambda: conn,
+                    reader_factory=index._reader_open,
+                    independent_factory=index._open_independent,
+                    writer_lock=gate, reader_lock=threading.RLock(),
+                    lock_seconds=lambda: 2.0, query_seconds=lambda: 8.0,
+                )
+                with mock.patch.object(index, "catalog_session", return_value=session):
                     result = index_maintenance.rebuild_fts_index()
             finally:
                 gate.writer_may_commit.set()

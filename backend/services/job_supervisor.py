@@ -17,6 +17,12 @@ class WorkAdmissionClosed(RuntimeError):
 
 @dataclass(slots=True)
 class OwnerAdapter:
+    """Lifecycle queries must be cheap; joins budget their complete call.
+
+    The supervisor additionally bounds foreign callbacks during quiescence.
+    A callback that misses its deadline remains owned and prevents a safe
+    restore result until it actually returns.
+    """
     owner: str
     label: str
     active: Callable[[], bool]
@@ -41,6 +47,14 @@ class ManagedTask:
     started: threading.Event = field(default_factory=threading.Event)
 
 
+@dataclass(slots=True)
+class _LifecycleCall:
+    owner: str
+    thread: threading.Thread
+    done: threading.Event = field(default_factory=threading.Event)
+    outcome: tuple[bool, Any] | None = None
+
+
 class JobSupervisor:
     """Coordinates admission, checkpoint, bounded join, and exact force-stop.
 
@@ -55,6 +69,7 @@ class JobSupervisor:
         self._close_reason = ""
         self._owners: dict[str, OwnerAdapter] = {}
         self._tasks: dict[str, ManagedTask] = {}
+        self._lifecycle_calls: dict[tuple[str, str], _LifecycleCall] = {}
 
     def register_owner(self, adapter: OwnerAdapter) -> None:
         owner = str(adapter.owner or "").strip()
@@ -98,6 +113,7 @@ class JobSupervisor:
         task_id: str = "",
         cancel: threading.Event | None = None,
         force: Callable[[], Any] | None = None,
+        on_cancelled_before_start: Callable[[], Any] | None = None,
         name: str | None = None,
         daemon: bool = True,
     ) -> threading.Thread:
@@ -123,6 +139,8 @@ class JobSupervisor:
                 # without ever entering user code.
                 if not task.cancel.is_set():
                     target()
+                elif on_cancelled_before_start is not None:
+                    on_cancelled_before_start()
             finally:
                 with self._lock:
                     self._tasks.pop(key, None)
@@ -265,42 +283,49 @@ class JobSupervisor:
     def _remaining(deadline: float) -> float:
         return max(0.0, deadline - time.monotonic())
 
-    @staticmethod
     def _bounded_callbacks(
+        self,
         callbacks: list[tuple[str, Callable[[], Any]]],
         deadline: float,
+        *, phase: str = "callback",
     ) -> list[dict[str, Any]]:
-        """Run independent lifecycle callbacks inside one absolute deadline."""
-        lock = threading.Lock()
-        outcomes: dict[str, tuple[bool, Any]] = {}
+        """Bound the whole callback, reusing an unfinished owner/phase call."""
+        calls: list[tuple[str, _LifecycleCall | None]] = []
+        for name, callback in callbacks:
+            key = (phase, name)
+            with self._lock:
+                call = self._lifecycle_calls.get(key)
+                if call is None or call.done.is_set():
+                    if self._remaining(deadline) <= 0:
+                        calls.append((name, None))
+                        continue
 
-        def _call(name: str, callback: Callable[[], Any]) -> None:
-            try:
-                value = callback()
-                result = (True, value)
-            except BaseException as exc:
-                result = (False, exc)
-            with lock:
-                outcomes[name] = result
+                    def run(fn=callback, callback_key=key):
+                        try:
+                            outcome = (True, fn())
+                        except BaseException as exc:
+                            outcome = (False, exc)
+                        with self._lock:
+                            owned = self._lifecycle_calls[callback_key]
+                            owned.outcome = outcome
+                            owned.done.set()
 
-        threads: list[tuple[str, threading.Thread]] = []
-        for index, (name, callback) in enumerate(callbacks):
-            thread = threading.Thread(
-                target=_call,
-                args=(name, callback),
-                name=f"yta-lifecycle-{index}",
-                daemon=True,
-            )
-            threads.append((name, thread))
-            thread.start()
-        for _name, thread in threads:
-            thread.join(JobSupervisor._remaining(deadline))
-
+                    thread = threading.Thread(
+                        target=run, name=f"yta-lifecycle-{phase}-{name}", daemon=True)
+                    call = _LifecycleCall(name, thread)
+                    self._lifecycle_calls[key] = call
+                    try:
+                        thread.start()
+                    except BaseException as exc:
+                        call.outcome = (False, exc)
+                        call.done.set()
+                calls.append((name, call))
+        for _name, call in calls:
+            if call is not None:
+                call.done.wait(self._remaining(deadline))
         rows: list[dict[str, Any]] = []
-        with lock:
-            snapshot = dict(outcomes)
-        for name, _thread in threads:
-            outcome = snapshot.get(name)
+        for name, call in calls:
+            outcome = call.outcome if call is not None and call.done.is_set() else None
             if outcome is None:
                 rows.append({"owner": name, "ok": False, "error": "deadline exceeded"})
             elif outcome[0]:
@@ -309,6 +334,20 @@ class JobSupervisor:
                 rows.append({"owner": name, "ok": False, "error": str(outcome[1])})
         return rows
 
+    def _unfinished_lifecycle_owners(self) -> list[str]:
+        with self._lock:
+            return sorted({f"lifecycle:{phase}:{name}"
+                           for (phase, name), call in self._lifecycle_calls.items()
+                           if not call.done.is_set()})
+
+    def _snapshot_until(self, deadline: float) -> dict[str, Any]:
+        row = self._bounded_callbacks(
+            [("diagnostics", self.snapshot)], deadline, phase="snapshot")[0]
+        if row["ok"]:
+            return row["result"]
+        return {"accepting": self.accepting_work(), "owners": [], "processes": [],
+                "error": "Lifecycle inspection did not finish within its deadline"}
+
     def prepare_all(self, deadline: float | None = None) -> list[dict[str, Any]]:
         for task in self._managed_tasks():
             task.cancel.set()
@@ -316,7 +355,8 @@ class JobSupervisor:
         if deadline is None:
             deadline = time.monotonic() + 30.0
         raw = self._bounded_callbacks(
-            [(adapter.owner, adapter.prepare) for adapter in adapters], deadline
+            [(adapter.owner, adapter.prepare) for adapter in adapters], deadline,
+            phase="prepare",
         )
         return [
             {
@@ -333,14 +373,14 @@ class JobSupervisor:
         return self._join_until_deadline(deadline)
 
     def _join_until_deadline(self, deadline: float) -> list[str]:
-        for adapter in self._adapters():
-            if not self._safe_active(adapter):
-                continue
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                adapter.join(remaining)
-            except Exception:
-                pass
+        def join_owner(adapter):
+            if self._safe_active(adapter):
+                adapter.join(self._remaining(deadline))
+            return self._safe_active(adapter)
+
+        results = self._bounded_callbacks(
+            [(adapter.owner, lambda a=adapter: join_owner(a))
+             for adapter in self._adapters()], deadline, phase="join")
         for task in self._managed_tasks():
             if task.thread is threading.current_thread():
                 continue
@@ -351,10 +391,8 @@ class JobSupervisor:
                     task.thread.join(self._remaining(deadline))
             except (RuntimeError, TypeError):
                 pass
-        remaining = [
-            adapter.owner for adapter in self._adapters()
-            if self._safe_active(adapter)
-        ]
+        remaining = [row["owner"] for row in results
+                     if not row["ok"] or row.get("result")]
         remaining.extend(
             f"{task.owner}:{task.task_id}"
             for task in self._managed_tasks()
@@ -363,13 +401,13 @@ class JobSupervisor:
 
     def force_remaining(self, deadline: float | None = None) -> list[dict[str, Any]]:
         """Force only adapters still active; never scan by process name."""
-        callbacks = [
-            (adapter.owner, adapter.force)
-            for adapter in self._adapters()
-            if self._safe_active(adapter)
-        ]
+        def force_owner(adapter):
+            return (True, adapter.force()) if self._safe_active(adapter) else (False, None)
+
+        callbacks = [(adapter.owner, lambda a=adapter: force_owner(a))
+                     for adapter in self._adapters()]
         callbacks.extend(
-            (f"{task.owner}:{task.task_id}", task.force)
+            (f"{task.owner}:{task.task_id}", lambda t=task: (True, t.force()))
             for task in self._managed_tasks()
             if task.force is not None
         )
@@ -379,10 +417,11 @@ class JobSupervisor:
             {
                 "owner": row["owner"],
                 "forced": row["ok"],
-                **({"result": row.get("result")} if row["ok"] else
+                **({"result": row["result"][1]} if row["ok"] else
                    {"error": row["error"]}),
             }
-            for row in self._bounded_callbacks(callbacks, deadline)
+            for row in self._bounded_callbacks(callbacks, deadline, phase="force")
+            if not row["ok"] or row["result"][0]
         ]
 
     def quiesce(self, *, reason: str, timeout: float = 8.0) -> dict[str, Any]:
@@ -393,13 +432,14 @@ class JobSupervisor:
         prepare_deadline = min(deadline, started + budget * 0.20)
         join_deadline = min(deadline, started + budget * 0.75)
         self.close_admission(reason)
-        before = self.snapshot()
+        before = self._snapshot_until(started + budget * 0.10)
         prepared = self.prepare_all(prepare_deadline)
         remaining = self._join_until_deadline(join_deadline)
         forced = self.force_remaining(deadline) if remaining else []
         if remaining:
             remaining = self._join_until_deadline(deadline)
-        after = self.snapshot()
+        after = self._snapshot_until(deadline)
+        remaining = sorted(set(remaining + self._unfinished_lifecycle_owners()))
         failed_prepares = [row for row in prepared if not row["prepared"]]
         return {
             "ok": not remaining and not failed_prepares,

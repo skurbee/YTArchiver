@@ -23,7 +23,7 @@
     },
   };
 
-  const _browseState = window._browseState || {};
+  const _browseState = window.YT.util.requireBrowseState();
   const askConfirm = window.askConfirm;
   const askDanger = window.askDanger;
   const askQuestion = window.askQuestion;
@@ -56,9 +56,28 @@
     const impBtn = document.getElementById("btn-import-channels");
     const bkExpBtn = document.getElementById("btn-export-backup");
     const bkImpBtn = document.getElementById("btn-import-backup");
+    const backupSearchDbEl = document.getElementById("settings-backup-include-search-db");
+    const backupExportLabel = bkExpBtn?.textContent || "Save backup\u2026";
     if (!panel) return;
+    let _loadGeneration = 0;
+    let _formRevision = 0;
+    const _drafts = new Set();
+    const trackEdit = event => {
+      if (!event.target?.closest?.(".settings-view")) return;
+      _formRevision++;
+      if (event.type === "input") _drafts.add(event.target);
+      else _drafts.delete(event.target);
+    };
+    document.addEventListener("input", trackEdit, true);
+    document.addEventListener("change", trackEdit, true);
+    // Editing back to the original value produces no change event on blur.
+    // A finished interaction must not leave all later refreshes blocked.
+    document.addEventListener("focusout", event => _drafts.delete(event.target), true);
     let _lastAutomaticBackupTs = 0;
     let _lastAutomaticBackupPath = "";
+    let _backupSettingsLoaded = false;
+    let _backupPreferenceSaving = false;
+    let _backupSaving = false;
     if (autorunModeSel) {
       autorunModeSel.dataset.savedValue = autorunModeSel.value || "clock";
     }
@@ -257,12 +276,12 @@
               "We\u2019ll estimate a safe auto-sync schedule from your archive.";
           } else if (!fits) {
             detail.textContent =
-              `A complete sync needs about ${units.toLocaleString()} operations, ` +
-              `more than the current ${Number(t.daily_limit).toLocaleString()}-operation daily budget.`;
+              `The minimum sync estimate is ${units.toLocaleString()} budget units, ` +
+              `more than the current ${Number(t.daily_limit).toLocaleString()}-unit daily budget.`;
           } else {
             detail.textContent =
-              `Calculated from ${channels.toLocaleString()} channels and about ` +
-              `${units.toLocaleString()} operations per complete sync.`;
+              `Minimum estimate for ${channels.toLocaleString()} channels: ` +
+              `${units.toLocaleString()} budget units. New videos and additional pages use more.`;
           }
         }
         if (note) {
@@ -374,6 +393,40 @@
       }
     }
 
+    function _renderBackupControls() {
+      if (backupSearchDbEl) {
+        backupSearchDbEl.disabled = !_backupSettingsLoaded
+          || _backupPreferenceSaving || _backupSaving;
+      }
+      if (bkExpBtn) {
+        bkExpBtn.disabled = _backupPreferenceSaving || _backupSaving;
+        bkExpBtn.textContent = _backupSaving ? "Saving backup\u2026" : backupExportLabel;
+        bkExpBtn.setAttribute("aria-busy", String(_backupSaving));
+      }
+      if (bkImpBtn) bkImpBtn.disabled = _backupSaving;
+    }
+
+    function _renderBackupSearchSize(settings) {
+      const el = document.getElementById("backup-search-db-size");
+      if (!el) return;
+      let label = settings.backup_search_db_size_label;
+      if (typeof label !== "string" || !label.trim()) {
+        const bytes = settings.backup_search_db_size_bytes;
+        if (bytes === 0) {
+          label = "not created yet";
+        } else if (Number.isSafeInteger(bytes) && bytes > 0) {
+          const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+          const unit = Math.min(units.length - 1,
+            Math.floor(Math.log(bytes) / Math.log(1024)));
+          label = `${(bytes / (1024 ** unit)).toLocaleString(undefined,
+            { maximumFractionDigits: unit ? 1 : 0 })} ${units[unit]}`;
+        } else {
+          label = "size unavailable";
+        }
+      }
+      el.textContent = `(${label})`;
+    }
+
     function _fmtYtdlpCheckAge(ts) {
       if (!ts) return "never checked";
       const wholeDays = Math.max(0,
@@ -402,8 +455,16 @@
 
     async function load() {
       if (!nativeBridgeUp()) return;
+      const generation = ++_loadGeneration;
+      const formRevision = _formRevision;
+      const writeRevision = window.YT.preferences.writeRevision();
+      const current = () => generation === _loadGeneration
+        && formRevision === _formRevision && _drafts.size === 0
+        && writeRevision === window.YT.preferences.writeRevision()
+        && !window.YT.preferences.isSaving();
       try {
         const s = await bridgeCall("settings_load");
+        if (!current()) return;
         const outputEl = document.getElementById("settings-output-dir");
         const videoDirEl = document.getElementById("settings-video-dir");
         const whisperEl = document.getElementById("settings-whisper-model");
@@ -494,6 +555,13 @@
           _lastAutomaticBackupPath = s.last_auto_backup_path || "";
           _renderAutomaticBackupAge(abEl.value);
         }
+        if (backupSearchDbEl) {
+          backupSearchDbEl.checked = s.backup_include_search_db !== false;
+          rememberControl(backupSearchDbEl, backupSearchDbEl.checked);
+        }
+        _backupSettingsLoaded = true;
+        _renderBackupSearchSize(s);
+        _renderBackupControls();
         const trashRetentionEl = document.getElementById(
           "settings-trash-retention-days");
         if (trashRetentionEl) {
@@ -519,6 +587,7 @@
         // settings_save, so use its authoritative state when Settings opens.
         try {
           const state = await bridgeCall("autorun_state");
+          if (!current()) return;
           if (autorunModeSel) {
             const mode = state?.mode === "clock" ? "clock" : "timer";
             autorunModeSel.value = mode;
@@ -530,6 +599,7 @@
         // Launch at boot — read Registry state, not config.
         try {
           const bootState = await bridgeCall("launch_at_boot_get");
+          if (!current()) return;
           const labEl = document.getElementById("settings-launch-at-boot");
           const lbmEl = document.getElementById("settings-boot-minimized");
           const lbmWrap = document.getElementById("settings-boot-minimized-wrap");
@@ -569,7 +639,13 @@
           _ytdlpAutoUpdatable = v?.ok ? v.auto_updatable !== false : true;
           _renderYtdlpUpdateControls();
         } catch { if (vEl) vEl.textContent = "check failed"; }
-      } catch (e) { console.warn("settings load:", e); }
+      } catch (e) {
+        console.warn("settings load:", e);
+        if (current()) {
+          _renderBackupSearchSize({});
+          flashSaved(false, "Settings unavailable — reopen this tab to retry");
+        }
+      }
     }
 
     // ── Per-field auto-save wiring ──────────────────────────────────
@@ -601,6 +677,17 @@
     document.getElementById("settings-close-behavior")
       ?.addEventListener("change", (e) =>
         persistControl(e.target, "close_behavior", e.target.value));
+    backupSearchDbEl?.addEventListener("change", async (e) => {
+      _backupPreferenceSaving = true;
+      _renderBackupControls();
+      try {
+        await persistControl(e.target, "backup_include_search_db", e.target.checked,
+          { checked: true });
+      } finally {
+        _backupPreferenceSaving = false;
+        _renderBackupControls();
+      }
+    });
     document.getElementById("settings-auto-backup")
       ?.addEventListener("change", async (e) => {
         const previous = e.target.dataset.savedValue || "off";
@@ -900,9 +987,8 @@
       ?.addEventListener("click", () => { setTimeout(load, 50); });
     document.querySelector('.tab[data-tab="health"]')
       ?.addEventListener("click", () => { setTimeout(load, 50); });
-    window.YT?.bridge?.ready?.then(load).catch(() => {});
-    // Also load once on boot so values are ready if the user switches fast.
-    setTimeout(load, 200);
+    window.YT.settingsReady = window.YT.bridge.ready.then(load);
+    window.addEventListener("pywebviewready", load);
     const _trafficRefreshIv = setInterval(() => {
       if (document.visibilityState === "visible"
           && panel.classList.contains("active")) {
@@ -1555,26 +1641,38 @@
     });
 
     bkExpBtn?.addEventListener("click", async () => {
-      const res = await bridgeCall("export_full_backup");
-      if (res?.ok) {
-        if (res.fts_skipped) {
-          window._showToast?.(
-            `Backup saved (${res.files} files), but the Search index was ` +
-              "too large to include. Search can be rebuilt after a restore. " +
-              (res.bookmarks_included
-                ? "Your bookmarks and notes are included."
-                : "This backup does not separately preserve bookmarks or notes."),
-            "warn",
-            { ttlMs: 12000 }
-          );
-        } else {
-          window._showToast?.(`Backup saved (${res.files} files).` +
-            (res.bookmarks_included ? " Your bookmarks and notes are included." : ""), "ok");
+      if (_backupSaving || _backupPreferenceSaving) return;
+      _backupSaving = true;
+      _renderBackupControls();
+      try {
+        const res = await bridgeCall("export_full_backup");
+        if (res?.ok) {
+          if (res.fts_skipped) {
+            const reason = typeof res.fts_skipped === "string"
+              ? res.fts_skipped : "The Search database was not included.";
+            window._showToast?.(
+              `Backup saved (${res.files} files). ${reason} ` +
+                "Search may need rebuilding after a restore. " +
+                (res.bookmarks_included
+                  ? "Your bookmarks and notes are included."
+                  : "This backup does not separately preserve bookmarks or notes."),
+              "warn",
+              { ttlMs: 12000 }
+            );
+          } else {
+            window._showToast?.(`Backup saved (${res.files} files).` +
+              (res.bookmarks_included ? " Your bookmarks and notes are included." : ""), "ok");
+          }
+          const bkAgeEl = document.getElementById("backup-age-display");
+          if (bkAgeEl) bkAgeEl.textContent = _fmtBackupAge(res.last_backup_ts || Date.now() / 1000, res.path);
+        } else if (!res?.cancelled) {
+          window._showToast?.(res?.error || "Backup failed.", "error");
         }
-        const bkAgeEl = document.getElementById("backup-age-display");
-        if (bkAgeEl) bkAgeEl.textContent = _fmtBackupAge(res.last_backup_ts || Date.now() / 1000, res.path);
-      } else if (!res?.cancelled) {
-        window._showToast?.(res?.error || "Backup failed.", "error");
+      } catch (e) {
+        window._showToast?.("Backup failed: " + e, "error");
+      } finally {
+        _backupSaving = false;
+        _renderBackupControls();
       }
     });
     bkImpBtn?.addEventListener("click", async () => {

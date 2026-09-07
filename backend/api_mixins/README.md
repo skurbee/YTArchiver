@@ -1,92 +1,100 @@
-# api_mixins/ — JS-Callable API Surface
+# JS-callable API adapters
 
-This package contains the methods that the pywebview JS frontend can call via
-`pywebview.api.<method>(...)`. They're split across 22 mixin classes that
-`main.py`'s `Api` class composes via multiple inheritance:
+`main.Api` exposes the methods in 24 feature mixins to
+`window.pywebview.api`. These classes preserve the existing bridge method names
+while behavior moves into explicit services. A feature file is an adapter
+boundary; adding a mixin does not by itself separate state ownership.
 
-```python
-class Api(InfoMixin, StartupMixin, WindowMixin, SettingsMixin, ..., BookmarkMixin):
-    def __init__(self): ...
-```
+## Dependency ownership
 
-## Why mixins (and the caveat)
+New behavior belongs in a named service with constructor dependencies. Assemble
+it through `AppServices` before the window admits calls. Keep the container a
+dependency holder. For concrete examples:
 
-Originally one giant `Api` class in `main.py`. Mixins were extracted per-feature
-so individual files stay browsable. The split is along **feature boundaries**,
-not strict layers — every mixin is part of the same logical god-object that's
-glued together by `main.py`.
+- `ApplicationInformation` owns information projection and URL-history updates;
+  `InfoMixin` delegates those endpoints through `services.information`.
+- `StartupSequence` receives `StartupDependencies`; disk scanning and stage
+  ordering are normal importable components with separate contracts. It does
+  not receive the whole `Api` object.
+- The catalog session owns read/transaction admission. Queue coordinators own
+  exact-ID lifecycle commands. Call these owners instead of reassembling their
+  locks and persistence steps in bridge methods.
 
-That means mixins **read and write `self.<attr>` attributes that other mixins
-own**. The contracts are implicit and listed below for reference. A clean
-refactor would replace this with explicit service injection, but for now the
-pattern is: write a method, attach to a mixin, document any new `self.<attr>`
-dependencies here.
+Legacy feature adapters still use attributes initialized by `Api`:
 
-## Shared `self` attributes (the implicit contract)
+| Attribute | Owner and purpose |
+|---|---|
+| `services` | Composed repositories, runtime dependencies and feature services |
+| `_config` | Current UI snapshot; fresh reads go through the config repository |
+| `_window` | Native window, absent before attachment; prefer the event bus |
+| `_log_stream` | Application logging dependency, also in `services` |
+| `_queues`, `_transcribe` | Existing aliases of composed worker dependencies |
+| `_sync_thread`, `_sync_cancel`, `_sync_pause`, `_sync_skip` | Sync-lane lifecycle |
+| `_redwnl_pending`, `_redwnl_lock` | Legacy runtime companion state; use lane commands |
+| `_job_supervisor` | Admission, cancellation and shutdown ownership |
+| `_autorun`, `_trash_retention`, `_auto_backup` | Long-lived schedulers |
+| `_tray` | Optional native tray integration |
 
-Set by `main.py` `Api.__init__`. Every mixin can rely on these existing.
+Do not create new cross-feature attributes on first use. Declare dependencies
+where the component is assembled. Compatibility support for isolated legacy
+adapters is not a template for new application code.
 
-| Attribute              | Owner       | Read by                                 | Notes |
-|------------------------|-------------|-----------------------------------------|-------|
-| `self._config`         | main        | almost every mixin                      | Cached config dict; use `config_transaction` for atomic read-modify-write operations |
-| `self._window`         | main        | every mixin that emits JS events        | pywebview window; `None` before `set_window` |
-| `self._log_stream`     | main        | most mixins                             | `LogStreamer` for tagged log emit |
-| `self._queues`         | main        | sync_mixin, queue_mixin, channel_mixin  | `QueueState` (in `backend/queues.py`) |
-| `self._transcribe`     | main        | transcribe_mixin, channel_mixin, sync_mixin | `TranscribeManager` (in `backend/transcribe/core.py`, re-exported via `backend.transcribe`) |
-| `self.services`        | main        | new code                                | `AppServices` container for explicit dependency access; prefer this for new service-boundary work |
-| `self._sync_thread`    | main        | sync_mixin, channel_mixin               | Currently-running sync worker thread or None |
-| `self._sync_cancel`    | main        | sync_mixin                              | `threading.Event` to cancel sync |
-| `self._sync_pause`     | main        | sync_mixin                              | `threading.Event` |
-| `self._sync_skip`      | main        | sync_mixin                              | `threading.Event` |
-| `self._redwnl_pending` | main        | channel_mixin, sync_mixin               | List of pending redownload tasks |
-| `self._redwnl_lock`    | main        | channel_mixin, sync_mixin               | Lock protecting `_redwnl_pending` |
-| `self._autorun`        | main        | settings_mixin                          | `AutorunScheduler` |
-| `self._disk_mon`       | main        | settings_mixin                          | `DiskErrorMonitor` |
-| `self._tray`           | main        | tray-aware mixins                       | `TrayController` |
+## Imports and results
 
-## `_shared.py` and the star import
+Use explicit imports. `_shared.py` contains only bridge errors, dialog-result
+normalization, common resolutions and the logger; it is not a union of backend
+and standard-library imports. Do not import `main` from a backend module.
 
-Every mixin starts with `from ._shared import *`. That gives it access to
-stdlib aliases (`os`, `json`, `threading`, etc.) and backend module aliases
-(`sync_backend`, `metadata_backend`, etc.) without each file having to repeat
-those imports.
+Use typed internal outcomes and stable error codes. Adapt them to the existing
+bridge response at the endpoint. Distinguish failure or unavailability from a
+successful empty result, and keep user-facing text separate from control codes.
 
-The star import is a code smell — explicit imports per mixin would be cleaner.
-That's a future refactor. For now, treat `_shared.py` as "the global namespace
-this package operates in". Avoid adding new aliases there for one-off work;
-prefer explicit imports or `self.services.<dependency>` for new code.
+## Background work
 
-## Adding a new method
-
-1. Pick the mixin whose feature area matches your method (e.g. channel-related
-   → `channel_mixin.py`; metadata-related → `metadata_mixin.py`).
-2. Add the method to that class. It must be named consistently with the
-   existing methods in the file.
-3. If you need a new `self.<attr>` from `main.py`, add it to `Api.__init__`
-   in `main.py` AND document it in the table above.
-4. If your method blocks (`subprocess.run`, file I/O on a slow disk), offload
-   to a background thread before returning — the JS bridge thread is shared
-   across all calls and blocking it freezes the UI.
-5. Add the method to the JS caller (`web/app.js`, etc.) so it actually gets used.
-
-## Threading: when to background a method
-
-The pywebview JS bridge invokes Python on the JS-result-waiting thread. Long
-operations on that thread freeze the UI. Rule of thumb:
-
-- **Synchronous OK** (< 100ms): config reads, queue inspections, simple DB
-  lookups.
-- **Background required**: any `subprocess.Popen`, any file walk, any
-  network call, any ffprobe/yt-dlp invocation, anything that holds a DB
-  writer lock.
-
-For background work, use:
+Bridge calls can overlap. Keep foreground queries bounded and use the existing
+owners for long work. New background tasks must register before their thread
+starts so shutdown and restoration can close admission and wait for the writer.
 
 ```python
-def my_long_method(self, payload):
-    def _worker():
-        # do the work
-        # push results back via self._window.evaluate_js(...)
-    threading.Thread(target=_worker, daemon=True, name="yta-my-feature").start()
-    return {"ok": True, "queued": True}  # tell the UI we started
+import threading
+
+from backend.services.job_supervisor import WorkAdmissionClosed
+from backend.services.managed_work import start_managed_task
+
+from ._shared import _api_err
+
+
+def start_feature(self, payload):
+    cancel = threading.Event()
+    # Resolve and validate dependencies and input before admission.
+    worker = self.services.feature  # A service assembled by the application.
+    try:
+        start_managed_task(
+            self,
+            owner="feature",
+            label="Feature operation",
+            cancel=cancel,
+            target=lambda: worker.run(payload, cancel=cancel),
+            name="feature-operation",
+        )
+    except WorkAdmissionClosed as exc:
+        return _api_err("WORK_ADMISSION_CLOSED", str(exc), retryable=True)
+    return {"ok": True, "queued": True}
 ```
+
+`feature` is an illustrative new service, not an existing AppServices field.
+For an existing workflow, use its coordinator rather than adding a second task
+owner. Native window creation and single-instance handling belong exclusively
+to the explicit desktop launch function.
+
+## Verification
+
+Use `scripts/check.ps1` for the full gate. Python test files require separate
+processes. The root collection guard rejects directory/multi-file selection and
+establishes a disposable profile before test imports. Test services through
+their actual interfaces with supplied repositories and callbacks; avoid parsing
+production source to extract a nested function for execution.
+
+When changing an endpoint, update the browser fixture registry and verify its
+response contract, delayed completion, and error handling. Edit HTML templates
+or partials and regenerate `web/index.html` when markup or script order changes.

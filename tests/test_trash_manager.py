@@ -23,6 +23,7 @@ from backend.services.channel_leases import (  # noqa: E402
     global_archive_aliases,
 )
 from backend.services.job_supervisor import JobSupervisor  # noqa: E402
+from backend.services.trash_store import TRASH_STORE  # noqa: E402
 from backend.trash_manager import TrashManager, purge_expired  # noqa: E402
 
 
@@ -196,7 +197,7 @@ class TrashManagerTests(unittest.TestCase):
         trash_path = Path(trashed["trashed_folder_path"])
         entry = self.manager.list_entries(self.cfg)["entries"][0]
         cancel = threading.Event()
-        real_write = file_ops._write_json_atomic
+        real_write = TRASH_STORE.publish_object
 
         def cancel_after_marker(path, value):
             result = real_write(path, value)
@@ -204,7 +205,7 @@ class TrashManagerTests(unittest.TestCase):
             return result
 
         with mock.patch.object(
-            file_ops, "_write_json_atomic", side_effect=cancel_after_marker,
+            TRASH_STORE, "publish_object", side_effect=cancel_after_marker,
         ):
             result = self.manager.purge(
                 entry["entry_id"], cancel_event=cancel)
@@ -256,7 +257,7 @@ class TrashManagerTests(unittest.TestCase):
             "backend.trash_manager.os.path.isjunction",
             side_effect=is_junction,
         ), mock.patch("backend.trash_manager.os.rename") as rename, mock.patch(
-            "backend.trash_manager.file_ops._write_json_atomic",
+            "backend.services.trash_store.TRASH_STORE.publish_object",
         ) as write_marker:
             listing = self.manager.list_entries(self.cfg)
             result = self.manager.purge(entry["entry_id"])
@@ -285,7 +286,7 @@ class TrashManagerTests(unittest.TestCase):
             "backend.trash_manager.os.path.isjunction",
             side_effect=is_junction,
         ), mock.patch("backend.trash_manager.os.rename") as rename, mock.patch(
-            "backend.trash_manager.file_ops._write_json_atomic",
+            "backend.services.trash_store.TRASH_STORE.publish_object",
         ) as write_marker:
             result = self.manager.purge(entry["entry_id"])
 

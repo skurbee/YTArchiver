@@ -72,7 +72,7 @@ $Build = @(
 $Dev = @(
     'colorama==0.4.6', 'coverage==7.16.0', 'iniconfig==2.3.0',
     'packaging==25.0', 'pluggy==1.6.0', 'Pygments==2.19.1',
-    'pytest==9.0.3', 'ruff==0.15.13'
+    'pytest==9.0.3', 'ruff==0.15.13', 'yt-dlp==2026.2.21'
 )
 # Keep Transformers on the application's previously supported 4.x contract;
 # 5.x changed the worker-facing pipeline stack even though a bare import can

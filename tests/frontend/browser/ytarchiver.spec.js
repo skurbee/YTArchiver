@@ -1,4 +1,4 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 const { installDelayedBridge, loadApp } = require("./fixtures");
 
 test.describe("YTArchiver real frontend behavior", () => {
@@ -506,6 +506,7 @@ test.describe("YTArchiver real frontend behavior", () => {
       await page.locator("#edit-url")
         .fill(`https://www.youtube.com/@fixture_add_${index}`);
       await page.locator("#edit-folder").fill(`Fixture Add ${index}`);
+      await page.locator("#edit-min-dur").fill("");
       await expect(page.locator("#edit-min-dur")).toHaveValue("");
       await page.locator("#btn-edit-update").click();
 

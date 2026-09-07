@@ -24,7 +24,7 @@
 (function () {
   "use strict";
 
-  const _browseState = window._browseState || {};
+  const _browseState = window.YT.util.requireBrowseState();
   const _formatTs = (sec) => (window._formatTs ? window._formatTs(sec) : String(sec));
   const escapeHtml = window.YT?.util?.escapeHtml || ((s) => String(s ?? "")
     .replace(/[&<>"']/g, (ch) => ({

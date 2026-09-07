@@ -1,9 +1,8 @@
 """Application service container.
 
-This is the first small step away from `main.Api` as the implicit owner of
-every backend dependency. Existing mixins can keep using `self._queues`,
-`self._log_stream`, etc. while new work moves toward explicit
-`self.services.<dependency>` access.
+The composition root injects repositories and feature services. Existing
+adapters still expose legacy attributes, but extracted workflows receive
+their collaborators explicitly rather than discovering them on Api.
 """
 
 from __future__ import annotations
@@ -21,7 +20,9 @@ from backend.services.config_repository import (
 if TYPE_CHECKING:
     from backend.log_stream import LogStreamer
     from backend.queues import QueueState
+    from backend.services.application_information import ApplicationInformation
     from backend.services.event_bus import BridgeEventBus
+    from backend.services.startup_sequence import StartupSequence
     from backend.transcribe import TranscribeManager
 
 
@@ -41,6 +42,8 @@ class AppServices:
     event_bus: BridgeEventBus
     update_config: ConfigUpdater | None = None
     config_repository: ConfigRepository | None = None
+    startup: StartupSequence | None = None
+    information: ApplicationInformation | None = None
 
     def __post_init__(self) -> None:
         if self.config_repository is None:

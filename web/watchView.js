@@ -43,14 +43,7 @@
     return !!window.YT?.bridge?.isUp?.();
   }
 
-  function _watchVideoIdentity(video) {
-    if (!video) return "";
-    if (video.video_id) return `id:${video.video_id}`;
-    if (video.filepath) {
-      return `file:${String(video.filepath).replace(/\\/g, "/").toLowerCase()}`;
-    }
-    return `fallback:${video.channel || ""}\u0000${video.title || ""}`;
-  }
+  const watchSession = window.YT.watchSession;
 
   /** Retranscribe completion hook — called by Python via evaluate_js
    * when a `transcribe_retranscribe` job finishes. If the completed
@@ -59,8 +52,7 @@
    * "auto-captions — approximate" to "Whisper transcription"). Mirrors
    * the companion viewer's post-finish progress refresh. */
   window._onRetranscribeComplete = async function (payload) {
-    let refreshToken = null;
-    let refreshKey = "";
+    let refreshRequest = null;
     const existingTranscriptKept = payload?.existing_transcript_kept === true;
     const keptTranscriptMessage =
       "Whisper found no speech — the existing transcript was kept.";
@@ -76,17 +68,8 @@
       if (!wv || wv.hidden) return;
       const cur = window._watchCurrentVideo || null;
       if (!cur) return;
-      refreshToken = (typeof window._watchOpenToken === "number")
-        ? window._watchOpenToken : null;
-      refreshKey = _watchVideoIdentity(cur);
-      const stillShowingRefreshTarget = () => {
-        const active = window._watchCurrentVideo || null;
-        const tokenMatches = refreshToken === null
-          || window._watchOpenToken === refreshToken;
-        return tokenMatches
-          && _watchVideoIdentity(active) === refreshKey
-          && (!window._browseState || window._browseState.view === "watch");
-      };
+      const stillShowingRefreshTarget = () => watchSession.transcriptCurrent(refreshRequest)
+        && window._browseState.view === "watch";
       // Normalize filepaths — Python sends os.path.normpath() output which
       // uses backslashes on Windows, the video obj's `filepath` field may
       // carry whatever separator the source set. reported the Watch
@@ -99,6 +82,7 @@
                      _norm(filepath) === _norm(cur.filepath));
       if (!match) return;
       if (!nativeBridgeUp()) return;
+      refreshRequest = watchSession.beginTranscript(cur);
       const res = await bridgeCall("browse_get_transcript", {
         video_id: cur.video_id || undefined,
         title: cur.title || "",
@@ -169,10 +153,8 @@
                              { skipVideoReload: true });
       window._showToast?.("Re-transcription complete — transcript updated.", "ok");
     } catch (e) {
-      if (refreshToken !== null
-          && (window._watchOpenToken !== refreshToken
-              || _watchVideoIdentity(window._watchCurrentVideo) !== refreshKey
-              || (window._browseState && window._browseState.view !== "watch"))) {
+      if (refreshRequest && (!watchSession.transcriptCurrent(refreshRequest)
+          || window._browseState.view !== "watch")) {
         return;
       }
       if (existingTranscriptKept) {
@@ -555,8 +537,7 @@
     // Stash for `_onRetranscribeComplete` — when Python finishes a
     // retranscribe, the handler checks this ref to decide whether the
     // completed job matches what's on screen.
-    window._watchCurrentVideo = video;
-    window._watchRenderedToken = window._watchOpenToken;
+    watchSession.render(video);
     const bookmarkButton = document.getElementById("btn-bookmark-now");
     if (bookmarkButton) {
       const canBookmark = !!video.video_id && !opts?.transcriptLoading;
@@ -747,7 +728,6 @@
   // Exposed via window.loadWatchMetadataDrawer so the Refresh-metadata
   // button (wired in app.js) can re-render the drawer in place after a
   // per-video re-fetch, instead of forcing a Back-and-reopen.
-  let _watchMetadataSeq = 0;
   window.loadWatchMetadataDrawer = (video) => _loadWatchMetadataDrawer(video);
   async function _loadWatchMetadataDrawer(video) {
     const drawer = document.getElementById("watch-meta-drawer");
@@ -756,17 +736,8 @@
     const descEl = document.getElementById("watch-meta-description");
     const commentsEl = document.getElementById("watch-meta-comments");
     const countEl = document.getElementById("watch-meta-comments-count");
-    const requestSeq = ++_watchMetadataSeq;
-    const requestToken = (typeof window._watchOpenToken === "number")
-      ? window._watchOpenToken : null;
-    const requestKey = _watchVideoIdentity(video);
-    const requestIsCurrent = () => {
-      const tokenMatches = requestToken === null
-        || window._watchOpenToken === requestToken;
-      return requestSeq === _watchMetadataSeq
-        && tokenMatches
-        && _watchVideoIdentity(window._watchCurrentVideo) === requestKey;
-    };
+    const request = watchSession.beginMetadata(video);
+    const requestIsCurrent = () => watchSession.metadataCurrent(request);
     // Reset state immediately so a slow fetch doesn't bleed previous video's data
     if (statsEl) statsEl.textContent = "";
     if (descEl) descEl.textContent = "Loading…";
@@ -966,7 +937,7 @@
 
   async function _loadVideoSource(video, vEl, ph, requestedIntent) {
     if (!vEl) return;
-    const playbackIntent = requestedIntent ?? _playbackIntent;
+    const playbackIntent = requestedIntent ?? watchSession.playback;
     const fp = video.filepath || "";
     // Race-token check: capture _watchOpenToken at entry so we can
     // detect "user navigated away during URL fetch". Before this fix,
@@ -975,8 +946,8 @@
     // response would still set vEl.src + call play(), starting playback
     // in a hidden Watch view with no way to stop it short of returning
     // to the same video and pausing manually.
-    const _entryToken = (typeof window._watchOpenToken === "number")
-      ? window._watchOpenToken : 0;
+    const request = watchSession.ticket(video);
+    const _entryToken = request.open;
     // Show a "Loading…" state on the placeholder while we await
     // browse_video_url. Without this the user sees a blank box
     // (or the previous video's stale state) between clicking the
@@ -1011,9 +982,7 @@
     // in the background, no UI affordance to stop it. Two checks:
     //   1. Token mismatch = user opened a different video.
     //   2. View no longer "watch" = user backed out / changed sub-view.
-    const _stillOnSameVideo = (
-      typeof window._watchOpenToken !== "number"
-      || window._watchOpenToken === _entryToken);
+    const _stillOnSameVideo = watchSession.isRendered(request);
     const _stillOnWatchView = (
       !window._browseState
       || window._browseState.view === "watch");
@@ -1039,9 +1008,7 @@
       // gap can run _stopWatchVideo before this assignment lands —
       // restarting playback in a hidden Watch view (audit:
       // watchView.js C25).
-      const _stillOnSameVideo2 = (
-        typeof window._watchOpenToken !== "number"
-        || window._watchOpenToken === _entryToken);
+      const _stillOnSameVideo2 = watchSession.isRendered(request);
       const _stillOnWatchView2 = (
         !window._browseState
         || window._browseState.view === "watch");
@@ -1098,7 +1065,7 @@
       // Opening a video from the grid should start playback immediately.
       // The race-token checks above prevent stale loads from starting in
       // the background after the user navigates away.
-      if (playbackIntent === _playbackIntent && _watchIsVisible()) {
+      if (playbackIntent === watchSession.playback && _watchIsVisible()) {
         vEl.play().catch(() => { /* user can click play if autoplay is blocked */ });
       }
     } else {
@@ -1156,17 +1123,12 @@
     }
   }
 
-  let _playbackIntent = 0;
-  Object.defineProperty(window, "_watchPlaybackIntent", {
-    get: () => _playbackIntent,
-    configurable: true,
-  });
   let _pendingSeekCleanup = null;
   function _watchIsVisible() {
     return window.YT.util.isElementVisible(document.getElementById("view-watch"));
   }
   window._cancelWatchPlaybackIntent = () => {
-    ++_playbackIntent;
+    watchSession.cancelPlayback();
     _pendingSeekCleanup?.();
     _pendingSeekCleanup = null;
   };
@@ -1174,11 +1136,11 @@
     if (!vEl) return;
     _pendingSeekCleanup?.();
     _pendingSeekCleanup = null;
-    const token = window._watchOpenToken;
-    const intent = _playbackIntent;
+    const request = watchSession.ticket();
+    const token = request.open;
     const target = Math.max(0, Number(seconds) || 0);
     const doSeek = () => {
-      if (token !== window._watchOpenToken || intent !== _playbackIntent
+      if (!watchSession.playbackCurrent(request)
           || !_watchIsVisible() || vEl.dataset.watchToken !== String(token)
           || vEl.readyState < 1) return false;
       const d = Number.isFinite(vEl.duration) ? vEl.duration : target;

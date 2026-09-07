@@ -128,15 +128,93 @@
     if (!target || !key) return;
     const flag = `_once_${key}`;
     if (target.dataset && target.dataset[flag] === "1") return;
-    if (target.dataset) target.dataset[flag] = "1";
-    try { fn(target); } catch (e) { console.error("[once " + key + "]", e); }
+    return initialize(`element:${key}`, () => fn(target), target).then(result => {
+      if (target.dataset) target.dataset[flag] = "1";
+      return result;
+    });
+  }
+
+  const initialization = new WeakMap();
+  function initialize(name, setup, owner = window) {
+    let states = initialization.get(owner);
+    if (!states) { states = new Map(); initialization.set(owner, states); }
+    const existing = states.get(name);
+    if (existing && existing.status !== "failed") return existing.promise;
+    const controller = new AbortController();
+    const timeouts = new Set();
+    const intervals = new Set();
+    let resolveSetup;
+    let rejectSetup;
+    const state = { status: "initializing", promise: new Promise((resolve, reject) => {
+      resolveSetup = resolve;
+      rejectSetup = reject;
+    }) };
+    states.set(name, state);
+    const scope = {
+      signal: controller.signal,
+      listen(target, type, listener, options) {
+        target?.addEventListener(type, listener, {
+          ...(typeof options === "boolean" ? { capture: options } : options),
+          signal: controller.signal,
+        });
+      },
+      timeout(fn, delay) {
+        if (controller.signal.aborted) return null;
+        const id = setTimeout(() => { timeouts.delete(id); fn(); }, delay);
+        timeouts.add(id);
+        return id;
+      },
+      interval(fn, delay) {
+        if (controller.signal.aborted) return null;
+        const id = setInterval(fn, delay);
+        intervals.add(id);
+        return id;
+      },
+      clearTimeout(id) { clearTimeout(id); timeouts.delete(id); },
+      clearInterval(id) { clearInterval(id); intervals.delete(id); },
+    };
+    const dispose = () => {
+      controller.abort();
+      timeouts.forEach(id => clearTimeout(id));
+      intervals.forEach(id => clearInterval(id));
+      timeouts.clear();
+      intervals.clear();
+    };
+    window.addEventListener("beforeunload", dispose, { once: true, signal: controller.signal });
+    const fail = error => {
+      state.status = "failed";
+      dispose();
+      rejectSetup(error);
+    };
+    try {
+      const result = setup(scope);
+      if (result === state.promise) throw new Error(`Initializer ${name} cannot await itself.`);
+      Promise.resolve(result).then(value => {
+        state.status = "ready";
+        resolveSetup(value);
+      }, fail);
+    } catch (error) {
+      fail(error);
+    }
+    return state.promise;
+  }
+  function initializationState(name, owner = window) {
+    return initialization.get(owner)?.get(name)?.status || "idle";
+  }
+  function requireBrowseState() {
+    if (!window._browseState) throw new Error("Browse state has not initialized.");
+    return window._browseState;
   }
 
   function normalizeSubsChannels(resp) {
+    if (!resp || resp.ok === false || resp.error) {
+      throw new Error(resp?.error || "Channels could not be loaded.");
+    }
     let rows = [];
     if (Array.isArray(resp) && Array.isArray(resp[0])) rows = resp[0];
     else if (Array.isArray(resp)) rows = resp;
     else if (resp && Array.isArray(resp.channels)) rows = resp.channels;
+    else throw new Error("Channels returned an invalid response.");
     return rows
       .map((ch) => {
         const folder = String(ch?.folder || ch?.folder_override || ch?.name || "").trim();
@@ -155,7 +233,9 @@
 
   async function loadSubsChannels() {
     const bridge = window.YT?.bridge;
-    if (!bridge?.isUp?.() || !bridge?.bridgeCall) return [];
+    if (!bridge?.isUp?.() || !bridge?.bridgeCall) {
+      throw new Error("YTArchiver is still starting. Try again in a moment.");
+    }
     const resp = await bridge.bridgeCall("get_subs_channels");
     return normalizeSubsChannels(resp);
   }
@@ -196,6 +276,9 @@
     parseDateValue,
     formatRelativeTime,
     onceIdempotent,
+    initialize,
+    initializationState,
+    requireBrowseState,
     normalizeSubsChannels,
     loadSubsChannels,
     isElementVisible,

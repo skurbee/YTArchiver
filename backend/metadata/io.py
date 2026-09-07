@@ -59,8 +59,8 @@ def _folder_for_channel(ch: dict[str, Any]) -> Path | None:
     common case (config unchanged during a bulk pass) while still
     seeing edits made mid-pass.
     """
-    # Late import to avoid circular dep (sync.py imports metadata.py).
-    from ..sync import sanitize_folder
+    # Shared folder rules do not depend on the sync orchestrator.
+    from ..ytdlp_options import sanitize_folder
     base = _cached_output_dir()
     if not base:
         return None
@@ -225,7 +225,11 @@ def _read_metadata_jsonl(jsonl_path: str, *, strict: bool = False
 
 
 def _fetched_at_epoch(value: Any) -> float | None:
-    """Parse old/new fetched_at strings into comparable epoch seconds."""
+    """Parse metadata timestamps; legacy naive strings represent local time.
+
+    New writes include a UTC offset. Keeping the old local-time interpretation
+    here gives freshness and operation checkpoints one compatibility policy.
+    """
     text = str(value or "").strip()
     if not text:
         return None

@@ -21,6 +21,7 @@ from typing import Any
 from ..log import get_logger
 from ..log_stream import LogStreamer
 from ..subprocess_util import make_startupinfo as _make_startupinfo
+from ..worker_protocol import decode_request, decode_response
 from .helpers import find_python311
 
 _log = get_logger(__name__)
@@ -154,7 +155,7 @@ class PunctuationManager:
                 self._stream.emit_error(self.last_error.strip())
                 self._stop()
                 return False
-            info = json.loads(line)
+            info = decode_response(line)
             if info.get("status") != "ready":
                 self._stream.emit_error(f"Punct start: {info}")
                 self._stop()
@@ -220,13 +221,13 @@ class PunctuationManager:
         transcription because the lock was held the whole time.
         """
         self.last_error = ""
+        # Reset even when this input is too short to require the worker.
+        self.last_was_timeout = False
         if not text or len(text.split()) < 3:
             return text
-        # Bug [43]: reset timeout flag at the start of each call so the
-        # caller can read it after this call returns.
-        self.last_was_timeout = False
         try:
             req = json.dumps({"text": text}) + "\n"
+            decode_request(req, "punctuation")
             with self._lock:
                 if self._proc is None or self._proc.poll() is not None:
                     if not self._start():
@@ -262,7 +263,7 @@ class PunctuationManager:
             if not line:
                 self.last_error = "Punctuation worker exited without a result."
                 return text
-            resp = json.loads(line)
+            resp = decode_response(line)
             if resp.get("status") == "ok":
                 return resp.get("text", text) or text
             self.last_error = str(resp.get("text") or "Punctuation request failed.")

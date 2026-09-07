@@ -15,10 +15,7 @@ Public surface (re-exported through the metadata package):
         Group-by-(year, month) bulk fetch with parallel pre-fetch
         (3 workers, jittered submission) + sticky active line.
 
-The pause helpers (_enter_pause_wait / _exit_pause_wait) used by
-fetch_metadata_for_videos are defined locally here as thin wrappers
-around pause_helpers.emit_paused / emit_resumed — they're also
-defined in legacy.py for the other call sites still living there.
+Pause feedback is shared with other metadata operations through control.py.
 """
 from __future__ import annotations
 
@@ -34,10 +31,12 @@ from typing import Any
 from ..executor_utils import WorkResult, run_bounded
 from ..log import get_logger, swallow
 from ..log_stream import LogStreamer
-from ..process_runner import popen_ytdlp
-from ..sync import _find_cookie_source, _startupinfo, find_yt_dlp
+from ..process_runner import PROCESS_REGISTRY, popen_ytdlp, supervise_streaming_process
+from ..subprocess_util import make_startupinfo
 from ..thumbnails import _download_thumbnail, _ensure_thumbnails_dir
 from ..utils import utf8_subprocess_env as _utf8_env
+from ..ytdlp_options import _find_cookie_source, find_yt_dlp
+from .control import _enter_pause_wait, _exit_pause_wait
 from .io import (
     _folder_for_channel,
     _get_metadata_jsonl_path,
@@ -46,6 +45,7 @@ from .io import (
     _write_metadata_jsonl,
     _year_month_from_path,
 )
+from .results import FetchStatus, MetadataFetchResult
 from .scan import _group_by_metadata_path, _scan_channel_videos
 
 # Module-scoped tracking for in-flight metadata-fetch subprocesses.
@@ -56,8 +56,6 @@ from .scan import _group_by_metadata_path, _scan_channel_videos
 _inflight_procs: set[subprocess.Popen] = set()
 _inflight_procs_lock = threading.Lock()
 _fail_count_column_ready = False
-
-
 
 def _ensure_fail_count_column(conn) -> None:
     global _fail_count_column_ready
@@ -72,6 +70,7 @@ def _ensure_fail_count_column(conn) -> None:
     _fail_count_column_ready = True
 
 _log = get_logger(__name__)
+_startupinfo = make_startupinfo()
 
 
 def _invalidate_browse_thumbnail_cache(channel_name: str) -> None:
@@ -82,39 +81,19 @@ def _invalidate_browse_thumbnail_cache(channel_name: str) -> None:
     except Exception as e:
         swallow("browse thumbnail cache invalidation", e)
 
-
-def _enter_pause_wait(stream: LogStreamer, label: str, queues) -> None:
-    """Worker hit a pause-wait. Routes through pause_helpers.emit_paused."""
-    from ..pause_helpers import emit_paused
-    emit_paused(stream, label=label, queues=queues)
-
-
-def _exit_pause_wait(stream: LogStreamer, label: str, queues) -> None:
-    """Worker exiting pause-wait. Routes through pause_helpers.emit_resumed."""
-    from ..pause_helpers import emit_resumed
-    emit_resumed(stream, label=label, queues=queues)
-
-
-def _fetch_video_metadata(yt: str, video_id: str,
+def _fetch_video_metadata_result(yt: str, video_id: str,
                           title_hint: str = "",
                           proc_registry: set[subprocess.Popen] | None = None,
-                          error_out: list[str] | None = None,
                           stream: LogStreamer | None = None,
                           cancel_event: threading.Event | None = None,
                           process_owner: str | None = None,
                           process_task_id: str = "",
                           include_comments: bool = True,
-                          ) -> dict[str, Any] | None:
-    """Fetch metadata for a single video via yt-dlp --dump-json.
-    Returns the OLD-schema dict, or None on failure.
-    Matches YTArchiver.py:26719.
+                          ) -> MetadataFetchResult:
+    """Fetch one video; status and diagnostic never occupy payload keys.
 
-    proc_registry: if supplied, this proc's Popen is registered there instead
-    of the module-global _inflight_procs — so a bulk-cancel only kills procs
-    from its own operation, leaving DLTRACK per-video fetches untouched.
-
-    error_out: optional one-item sink for a concise yt-dlp stderr reason.
-    The legacy return type remains metadata-or-None for existing callers.
+    A supplied process registry scopes bulk cancellation to its own operation.
+    Network retry policy remains local to this fetch operation.
     """
     _reg = proc_registry if proc_registry is not None else _inflight_procs
     cmd = [
@@ -143,17 +122,18 @@ def _fetch_video_metadata(yt: str, video_id: str,
     _attempts = (60, 60, 90)
     for _attempt_idx, _attempt_timeout in enumerate(_attempts):
         if cancel_event is not None and cancel_event.is_set():
-            return None
+            return MetadataFetchResult(FetchStatus.CANCELLED)
         from .. import youtube_traffic
         permission = youtube_traffic.acquire(
             "video_metadata", cancel_event=cancel_event, stream=stream)
         if not permission.get("ok"):
-            if error_out is not None:
-                error_out.append(
-                    permission.get("error") or "traffic governor cancelled")
-            return None
+            return MetadataFetchResult(
+                FetchStatus.CANCELLED if permission.get("cancelled") or (
+                    cancel_event is not None and cancel_event.is_set())
+                else FetchStatus.FAILED,
+                detail=permission.get("error") or "traffic governor cancelled")
         if cancel_event is not None and cancel_event.is_set():
-            return None
+            return MetadataFetchResult(FetchStatus.CANCELLED)
         try:
             # CREATE_NEW_PROCESS_GROUP so taskkill /T /F on cancel/timeout
             # also reaps spawned ffmpeg/curl children. Without it,
@@ -177,9 +157,8 @@ def _fetch_video_metadata(yt: str, video_id: str,
                 role="metadata",
             )
         except OSError as e:
-            if error_out is not None:
-                error_out.append(f"could not start yt-dlp: {e}")
-            return None
+            return MetadataFetchResult(
+                FetchStatus.FAILED, detail=f"could not start yt-dlp: {e}")
         # Register this yt-dlp Popen in a module-scoped set so a
         # cancel-during-bulk-fetch can forcibly kill in-flight metadata
         # fetches without disturbing sync's downloads. Each call can
@@ -189,55 +168,29 @@ def _fetch_video_metadata(yt: str, video_id: str,
         with _inflight_procs_lock:
             _reg.add(proc)
         try:
-            # Close the launch/register race: cancellation may arrive after
-            # the pre-launch check but before this process becomes visible in
-            # the operation registry.
-            if cancel_event is not None and cancel_event.is_set():
-                try:
-                    proc.kill()
-                except Exception as e:
-                    swallow("metadata post-launch cancel kill", e)
-                try:
-                    proc.communicate(timeout=5)
-                except Exception as e:
-                    swallow("metadata post-launch cancel drain", e)
-                return None
-            try:
-                stdout, stderr = proc.communicate(timeout=_attempt_timeout)
-                _rc = proc.returncode
+            stdout_lines: list[str] = []
+            stderr_lines: list[str] = []
+            captured = supervise_streaming_process(
+                proc, on_stdout_line=stdout_lines.append, on_stderr_line=stderr_lines.append,
+                cancel_event=cancel_event, timeout=_attempt_timeout,
+                owner=process_owner or "unowned", task_id=process_task_id, role="metadata")
+            if captured.cancelled:
+                return MetadataFetchResult(FetchStatus.CANCELLED)
+            if not captured.timed_out:
+                if not captured.output_complete:
+                    return MetadataFetchResult(
+                        FetchStatus.FAILED, detail="yt-dlp metadata output was incomplete")
+                stdout, stderr = "\n".join(stdout_lines), "\n".join(stderr_lines)
+                _rc = captured.returncode
                 break
-            except subprocess.TimeoutExpired:
-                # Use taskkill /T /F on Windows so the entire process
-                # tree (yt-dlp + any ffmpeg/curl children it spawned)
-                # gets reaped, not just the top-level yt-dlp (audit:
-                # metadata/fetcher.py:99-111).
-                _reaped = False
-                if os.name == "nt":
-                    try:
-                        subprocess.run(
-                            ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                            capture_output=True, timeout=5,
-                            creationflags=0x08000000,  # CREATE_NO_WINDOW
-                        )
-                        _reaped = True
-                    except Exception as _tk:
-                        _log.debug("taskkill /T failed: %s", _tk)
-                if not _reaped:
-                    try: proc.kill()
-                    except Exception: pass
-                try: proc.communicate(timeout=5)
-                except Exception as e: swallow("yt-dlp communicate after timeout-kill", e)
-                if _attempt_idx == len(_attempts) - 1:
-                    # All attempts exhausted — still a transient signal,
-                    # not a permanent failure. audit E-11 sentinel.
-                    return {"_timeout": True}
-                # Short backoff before retry
-                backoff = 2 ** _attempt_idx  # 1s, 2s
-                if cancel_event is not None:
-                    if cancel_event.wait(backoff):
-                        return None
-                else:
-                    time.sleep(backoff)
+            if _attempt_idx == len(_attempts) - 1:
+                return MetadataFetchResult(FetchStatus.TIMEOUT, detail="timeout")
+            backoff = 2 ** _attempt_idx
+            if cancel_event is not None:
+                if cancel_event.wait(backoff):
+                    return MetadataFetchResult(FetchStatus.CANCELLED)
+            else:
+                time.sleep(backoff)
         finally:
             with _inflight_procs_lock:
                 _reg.discard(proc)
@@ -250,22 +203,23 @@ def _fetch_video_metadata(yt: str, video_id: str,
         except Exception as e:
             _log.debug("metadata YouTube-failure classification failed: %s", e)
     if _youtube_failure:
-        return {"_youtube_failure": _youtube_failure}
+        return MetadataFetchResult(
+            FetchStatus.COOKIE if _youtube_failure == "cookie" else FetchStatus.RATE_LIMIT,
+            detail=("Firefox YouTube sign-in expired" if _youtube_failure == "cookie"
+                    else "YouTube rate limited"))
     if _rc is None or _rc != 0:
-        if error_out is not None:
-            lines = [
-                line.strip() for line in (stderr or "").splitlines()
-                if line.strip()
-            ]
-            detail = next(
-                (line for line in reversed(lines)
-                 if line.lower().startswith("error:")),
-                lines[-1] if lines else f"yt-dlp exited with code {_rc}",
-            )
-            if detail.lower().startswith("error:"):
-                detail = detail[6:].strip()
-            error_out.append(detail[:500])
-        return None
+        lines = [
+            line.strip() for line in (stderr or "").splitlines()
+            if line.strip()
+        ]
+        detail = next(
+            (line for line in reversed(lines)
+             if line.lower().startswith("error:")),
+            lines[-1] if lines else f"yt-dlp exited with code {_rc}",
+        )
+        if detail.lower().startswith("error:"):
+            detail = detail[6:].strip()
+        return MetadataFetchResult(FetchStatus.FAILED, detail=detail[:500])
 
     # yt-dlp --dump-json writes exactly one JSON object on stdout.
     # Try the WHOLE stdout first — that's the canonical case and
@@ -300,10 +254,17 @@ def _fetch_video_metadata(yt: str, video_id: str,
         # `{` — kept for back-compat but the whole-stdout path above
         # should win in normal operation.
         # Disabled: fail closed instead of risking a wrong sliced object.
-        if error_out is not None:
-            error_out.append("yt-dlp returned unreadable metadata")
-        return None
+        return MetadataFetchResult(
+            FetchStatus.FAILED, detail="yt-dlp returned unreadable metadata")
 
+    return MetadataFetchResult.success(_metadata_from_ytdlp(
+        data, video_id, title_hint, include_comments=include_comments))
+
+
+def _metadata_from_ytdlp(data: dict[str, Any], video_id: str, title_hint: str,
+                        *, include_comments: bool,
+                        fetched_at: str | None = None) -> dict[str, Any]:
+    """Normalize the same fields for network results and completed downloads."""
     comments = []
     for c in (data.get("comments") or [])[:50]:
         comments.append({
@@ -313,6 +274,7 @@ def _fetch_video_metadata(yt: str, video_id: str,
             "time": c.get("timestamp") or c.get("time_text", ""),
         })
 
+    fetched_at = fetched_at or datetime.now(UTC).isoformat()
     return {
         "video_id": video_id,
         "title": data.get("title", title_hint),
@@ -324,15 +286,114 @@ def _fetch_video_metadata(yt: str, video_id: str,
         "duration": data.get("duration", 0),
         "thumbnail_url": data.get("thumbnail", ""),
         "comments": comments,
-        # UTC, offset-aware: refresh_comments' resume-skip parses this
-        # as UTC (H75). The old naive LOCAL string parsed 5-6h in the
-        # past for Central Time, so 'already done this pass' never
-        # matched and every resumed comment refresh restarted from
-        # video 1. metadata.io's duplicate resolution parses these into
-        # epoch seconds so mixed old naive-local and new offset-aware
-        # entries compare by actual time rather than string order.
-        "fetched_at": datetime.now(UTC).isoformat(),
+        "fetched_at": fetched_at,
+        # Only a request that actually fetched comments can complete comment
+        # work. Stats refreshes leave this independent checkpoint unchanged.
+        **({"comments_fetched_at": fetched_at} if include_comments else {}),
     }
+
+
+def _read_download_metadata(file_path: str, video_id: str,
+                            title_hint: str) -> MetadataFetchResult | None:
+    """Reuse an exact sibling only after its comment extraction completed.
+
+    Ordinary legacy info JSON contains useful video fields but no proof that
+    comments were requested. The downloader's completion marker distinguishes
+    an empty/disabled comment section from a missing or interrupted fetch.
+    """
+    stem = os.path.splitext(file_path)[0]
+    for sidecar in (stem + ".info.json", file_path + ".info.json"):
+        try:
+            # Bound reads of malformed or unrelated sidecars; a rejected
+            # snapshot uses the existing governed fetch path.
+            with open(sidecar, "r", encoding="utf-8") as handle:
+                payload = handle.read(16 * 1024 * 1024 + 1)
+            if len(payload) > 16 * 1024 * 1024:
+                continue
+            data = json.loads(payload)
+            if (not isinstance(data, dict) or data.get("id") != video_id
+                    or data.get("_type", "video") != "video"):
+                continue
+            snapshot = data.get("ytarchiver_metadata_snapshot")
+            if (not isinstance(snapshot, dict)
+                    or type(snapshot.get("version")) is not int
+                    or snapshot["version"] != 1
+                    or snapshot.get("video_id") != video_id
+                    or snapshot.get("comments_complete") is not True):
+                continue
+            fetched_at = snapshot.get("fetched_at")
+            if not isinstance(fetched_at, str):
+                continue
+            captured_at = datetime.fromisoformat(fetched_at)
+            if captured_at.tzinfo is None:
+                continue
+            # Reject truncated/flat entries. Counts and thumbnails can be
+            # unavailable on YouTube, so those optional fields remain optional.
+            if (not isinstance(data.get("title"), str) or not data["title"].strip()
+                    or not isinstance(data.get("description"), str)
+                    or not isinstance(data.get("upload_date"), str)
+                    or len(data["upload_date"]) != 8
+                    or not data["upload_date"].isascii()
+                    or not data["upload_date"].isdigit()
+                    or type(data.get("duration")) not in (int, float)
+                    or data["duration"] <= 0):
+                continue
+            comments = data.get("comments")
+            if snapshot.get("comments_disabled") is True:
+                if comments is not None and comments != []:
+                    continue
+            elif (not isinstance(comments, list)
+                    or not all(isinstance(comment, dict) for comment in comments)
+                    or type(data.get("comment_count")) is not int
+                    or data["comment_count"] < len(comments)):
+                continue
+            return MetadataFetchResult.success(_metadata_from_ytdlp(
+                data, video_id, title_hint, include_comments=True,
+                fetched_at=captured_at.astimezone(UTC).isoformat()))
+        except (OSError, ValueError, TypeError, RecursionError):
+            continue
+    return None
+
+
+def _fetch_video_metadata(yt: str, video_id: str, title_hint: str = "",
+                          proc_registry=None, error_out=None, stream=None,
+                          cancel_event=None, process_owner=None,
+                          process_task_id="", include_comments=True):
+    """Legacy adapter; production orchestration consumes the typed result."""
+    result = _fetch_video_metadata_result(
+        yt, video_id, title_hint, proc_registry=proc_registry, stream=stream,
+        cancel_event=cancel_event, process_owner=process_owner,
+        process_task_id=process_task_id, include_comments=include_comments)
+    if error_out is not None and result.detail:
+        error_out.append(result.detail)
+    return result.legacy_value()
+
+
+
+def emit_inline_metadata_outcome(stream: LogStreamer, video_id: str,
+                                 result: dict[str, Any]) -> None:
+    """Replace a video's queued line with its actual terminal outcome."""
+    if result.get("ok"):
+        message = "already saved" if result.get("skipped") else "downloaded"
+        prefix, color = "— ✓ ", "meta_bracket"
+    elif result.get("cancelled"):
+        message, prefix, color = "cancelled", "— ", "yellow"
+    elif result.get("rate_limited"):
+        message, prefix, color = "deferred by YouTube cooldown", "— ", "yellow"
+    elif result.get("cookie_auth_required"):
+        message, prefix, color = "needs YouTube sign-in", "— ", "yellow"
+    elif result.get("code") == "timeout" or result.get("transient"):
+        message, prefix, color = "timed out; retry needed", "— ⚠ ", "yellow"
+    else:
+        message, prefix, color = "failed; retry needed", "— ⚠ ", "red"
+    marker = f"meta_done_{video_id}" if video_id else ""
+    tags = lambda tag: [value for value in (marker, tag) if value]
+    stream.emit([
+        ["      ", tags("dim")],
+        [prefix, tags(color)],
+        ["Metadata ", tags("simpleline_pink")],
+        [message + "\n", tags("simpleline")],
+    ])
 
 
 def fetch_single_video_metadata(channel: dict[str, Any],
@@ -348,6 +409,7 @@ def fetch_single_video_metadata(channel: dict[str, Any],
                                 process_task_id: str = "",
                                 refresh_scope: str = "all",
                                 refresh_thumbnail: bool = True,
+                                emit_terminal_log: bool = True,
                                 ) -> dict[str, Any]:
     """Fetch metadata for ONE just-downloaded video, inline per-video.
 
@@ -368,11 +430,18 @@ def fetch_single_video_metadata(channel: dict[str, Any],
 
     Returns {ok, fetched|skipped|error}.
     """
+    def finish(result):
+        if emit_inline_log and emit_terminal_log:
+            emit_inline_metadata_outcome(stream, video_id, result)
+        return result
+
     scope = str(refresh_scope or "all").strip().lower()
     if scope not in {"all", "stats", "comments"}:
-        return {"ok": False, "error": "invalid metadata refresh scope"}
+        return finish({"ok": False, "error": "invalid metadata refresh scope"})
     if not video_id or not file_path:
-        return {"ok": False, "error": "missing id or path"}
+        return finish({"ok": False, "error": "missing id or path"})
+    if cancel_event is not None and cancel_event.is_set():
+        return finish({"ok": False, "cancelled": True})
 
     # `dest_folder` (manual/loose single-video refresh) writes the metadata
     # JSONL straight into the video's OWN folder instead of a subscription
@@ -380,11 +449,7 @@ def fetch_single_video_metadata(channel: dict[str, Any],
     # looks, so a loose download outside the channel tree still gets metadata.
     folder = dest_folder or _folder_for_channel(channel)
     if folder is None:
-        return {"ok": False, "error": "no output_dir"}
-
-    yt = find_yt_dlp()
-    if not yt:
-        return {"ok": False, "error": "yt-dlp missing"}
+        return finish({"ok": False, "error": "no output_dir"})
 
     name = channel.get("name") or channel.get("folder") or "?"
     split_years = bool(channel.get("split_years"))
@@ -404,57 +469,32 @@ def fetch_single_video_metadata(channel: dict[str, Any],
 
     existing = _read_metadata_jsonl(jp)
     if video_id in existing and not refresh:
-        # Already have metadata for this id — nothing to do. No log.
+        # Saved metadata avoids another fetch but must still close the queued
+        # log line reserved by the download-completion pipeline.
         # `refresh=True` (comments refresh) bypasses this so the entry
         # gets re-fetched with current comments/views/likes.
-        return {"ok": True, "skipped": True}
+        return finish({"ok": True, "skipped": True})
 
-    _fetch_errors: list[str] = []
-    entry = _fetch_video_metadata(
-        yt, video_id, title_hint, error_out=_fetch_errors,
-        stream=stream, cancel_event=cancel_event,
-        process_owner=process_owner, process_task_id=process_task_id,
-        include_comments=(scope != "stats"))
+    fetched = (_read_download_metadata(file_path, video_id, title_hint)
+               if not refresh and scope == "all" else None)
+    if fetched is None:
+        yt = find_yt_dlp()
+        if not yt:
+            return finish({"ok": False, "error": "yt-dlp missing"})
+        fetched = _fetch_video_metadata_result(
+            yt, video_id, title_hint, stream=stream, cancel_event=cancel_event,
+            process_owner=process_owner, process_task_id=process_task_id,
+            include_comments=(scope != "stats"))
     if cancel_event is not None and cancel_event.is_set():
-        return {"ok": False, "cancelled": True}
-    if isinstance(entry, dict) and entry.get("_youtube_failure"):
-        kind = str(entry["_youtube_failure"])
-        return {
-            "ok": False,
-            "error": ("Firefox YouTube sign-in expired"
-                      if kind == "cookie" else "YouTube rate limited"),
-            "cookie_auth_required": kind == "cookie",
-            "rate_limited": kind == "rate_limit",
-        }
-    # `{"_timeout": True}` sentinel signals a transient
-    # 120s fetch timeout (slow network) rather than a true failure.
-    # Return without marking anything; caller can retry later.
-    if isinstance(entry, dict) and entry.get("_timeout"):
-        if emit_inline_log:
-            # Indent — this line nests under the parent " — ✓ Title …"
-            # video row from sync.py, matching the metadata/transcription
-            # done lines below.
-            stream.emit([
-                ["      — ", "dim"],
-                ["Metadata fetch timed out (will retry next pass)\n", "dim"],
-            ])
-        return {"ok": False, "error": "timeout", "transient": True}
-    if entry is None:
-        if emit_inline_log:
-            stream.emit([
-                ["      — ", "dim"],
-                ["Metadata fetch failed\n", "red"],
-            ])
-        return {
-            "ok": False,
-            "error": (_fetch_errors[-1] if _fetch_errors
-                      else "yt-dlp dump-json failed"),
-        }
+        fetched = MetadataFetchResult(FetchStatus.CANCELLED)
+    if fetched.status is not FetchStatus.SUCCESS:
+        return finish(fetched.api_failure())
+    entry = fetched.metadata
 
     _jsonl_write_failed = False
     try:
         if cancel_event is not None and cancel_event.is_set():
-            return {"ok": False, "cancelled": True}
+            return finish({"ok": False, "cancelled": True})
         # Hold the per-path lock across read+merge+write so a concurrent
         # metadata writer's just-landed entry isn't clobbered by our stale
         # read above. The network fetch ran outside the lock; re-read fresh
@@ -462,10 +502,10 @@ def fetch_single_video_metadata(channel: dict[str, Any],
         # _write_metadata_jsonl re-acquires on this thread safely.
         with _lock_for(jp):
             if cancel_event is not None and cancel_event.is_set():
-                return {"ok": False, "cancelled": True}
+                return finish({"ok": False, "cancelled": True})
             existing = _read_metadata_jsonl(jp, strict=True)
             if cancel_event is not None and cancel_event.is_set():
-                return {"ok": False, "cancelled": True}
+                return finish({"ok": False, "cancelled": True})
             current = existing.get(video_id)
             if refresh and isinstance(current, dict) and scope != "all":
                 # A scoped refresh must not erase fields the user did not ask
@@ -476,7 +516,7 @@ def fetch_single_video_metadata(channel: dict[str, Any],
                 fields = (
                     ("view_count", "like_count", "comment_count", "fetched_at")
                     if scope == "stats"
-                    else ("comments", "comment_count", "fetched_at")
+                    else ("comments", "comment_count", "fetched_at", "comments_fetched_at")
                 )
                 for field in fields:
                     if field in entry:
@@ -496,7 +536,7 @@ def fetch_single_video_metadata(channel: dict[str, Any],
     # surface as verbose-only dim log lines instead of disappearing.
     thumb_saved = False
     if cancel_event is not None and cancel_event.is_set():
-        return {"ok": False, "cancelled": True}
+        return finish({"ok": False, "cancelled": True})
     if scope == "all" and refresh_thumbnail and entry.get("thumbnail_url"):
         thumb_dir = _ensure_thumbnails_dir(subfolder)
         thumb_saved = _download_thumbnail(
@@ -515,7 +555,7 @@ def fetch_single_video_metadata(channel: dict[str, Any],
     # metadata refreshes too. Bulk refreshes already write these columns, but
     # this per-video path is what Manual Downloads uses.
     if cancel_event is not None and cancel_event.is_set():
-        return {"ok": False, "cancelled": True}
+        return finish({"ok": False, "cancelled": True})
     try:
         from .. import index as _idx_db
         if scope in {"all", "stats"}:
@@ -534,48 +574,20 @@ def fetch_single_video_metadata(channel: dict[str, Any],
     except Exception as e:
         swallow("single metadata stats update", e)
 
-    if emit_inline_log:
-        # Per-video metadata done line. Matches the three-line simple-mode
-        # summary spec locked in:
-        # — ✓ <title> — <channel> (size) [download done, green]
-        # — ✓ Transcription (details) [transcription done, blue]
-        # — ✓ Metadata downloaded [metadata done, pink + white]
-        # Pink em-dash + checkmark + pink "Metadata", then white
-        # "downloaded". user spec: color the subject, not the
-        # verb — "(pink)— (pink)Metadata (white)downloaded".
-        # Issues #139/#144/#148: tag with meta_done_<vid> so the
-        # emit REPLACES the placeholder sync.py reserved under this
-        # video's block rather than landing at log bottom after later
-        # channels' rows have scrolled in.
-        _md_marker = f"meta_done_{video_id}" if video_id else ""
-        _md_tag = lambda *extra: [t for t in (_md_marker, *extra) if t]
-        # Indent — this line nests visually under the parent " — ✓ Title
-        # … (size)" video row that sync.py emits for this same video.
-        # 6 leading spaces gives a clean two-level outline:
-        #   [N/M] Channel
-        #    — ✓ Title (12 MB)
-        #         — ✓ Metadata downloaded
-        #         — ✓ Transcription (...)
-        stream.emit([
-            ["      ", _md_tag("dim")],
-            ["— ✓ ", _md_tag("meta_bracket")],
-            ["Metadata ", _md_tag("simpleline_pink")],
-            ["downloaded\n", _md_tag("simpleline")],
-        ])
     # Return the entry so callers (refresh_channel_comments) can
     # diff old-vs-new to count "unchanged" videos. If the jsonl write
     # failed we still attempted the thumbnail, but the contract
     # demands ok=False in that case (audit: fetcher H93).
     if _jsonl_write_failed:
-        return {"ok": False, "error": f"jsonl write failed: {_jsonl_err}",
-                "entry": entry}
-    return {
+        return finish({"ok": False, "error": f"jsonl write failed: {_jsonl_err}",
+                       "entry": entry})
+    return finish({
         "ok": True,
         "fetched": True,
         "entry": entry,
         "refresh_scope": scope,
         "thumbnail_saved": thumb_saved,
-    }
+    })
 
 
 def fetch_metadata_for_videos(channel: dict[str, Any],
@@ -770,7 +782,7 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                 continue
             _to_prefetch.append((_v_id, _v_title))
 
-        _prefetched: dict[str, dict[str, Any] | None] = {}
+        _prefetched: dict[str, MetadataFetchResult] = {}
         if _to_prefetch:
             import random as _random
             _pf_done = 0
@@ -787,10 +799,10 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
             def _prefetch_one(
                 item: tuple[str, str],
                 _proc_registry=_local_procs,
-            ) -> dict[str, Any] | None:
+            ) -> MetadataFetchResult:
                 _pf_vid, _pf_title = item
                 if _prefetch_cancelled():
-                    return None
+                    return MetadataFetchResult(FetchStatus.CANCELLED)
                 # Keep network and pause gates in the worker.  Submission is
                 # then bounded to the three actual workers instead of eagerly
                 # queueing the entire channel before cancellation is checked.
@@ -804,17 +816,17 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                     _log.debug("meta net-block check failed: %s", _nce)
                 while pause_event is not None and pause_event.is_set():
                     if _prefetch_cancelled():
-                        return None
+                        return MetadataFetchResult(FetchStatus.CANCELLED)
                     time.sleep(0.05)
                 if _prefetch_cancelled():
-                    return None
+                    return MetadataFetchResult(FetchStatus.CANCELLED)
                 jitter = _random.uniform(0, 0.2)
                 if cancel_event is not None:
                     if cancel_event.wait(jitter):
-                        return None
+                        return MetadataFetchResult(FetchStatus.CANCELLED)
                 else:
                     time.sleep(jitter)
-                return _fetch_video_metadata(
+                return _fetch_video_metadata_result(
                     yt,
                     _pf_vid,
                     _pf_title,
@@ -825,13 +837,14 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
 
             def _record_prefetch(
                     result: WorkResult[
-                        tuple[str, str], dict[str, Any] | None],
+                        tuple[str, str], MetadataFetchResult],
                     _result_store=_prefetched,
                     _total=_pf_total) -> None:
                 nonlocal _pf_done, _pf_last_tick
                 _pf_vid, _ = result.item
                 _result_store[_pf_vid] = (
-                    None if result.error is not None else result.value)
+                    MetadataFetchResult(FetchStatus.FAILED, detail=str(result.error))
+                    if result.error is not None else result.value)
                 _pf_done += 1
                 _now = time.time()
                 if _now - _pf_last_tick > 1.0 or _pf_done == _total:
@@ -860,14 +873,11 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                     # different registry.
                     with _inflight_procs_lock:
                         _snap = list(_local_procs)
-                    _killed = 0
-                    for _proc in _snap:
-                        try:
-                            if _proc.poll() is None:
-                                _proc.kill()
-                                _killed += 1
-                        except Exception as _pe:
-                            swallow("bulk-cancel proc kill", _pe)
+                    try:
+                        _killed = PROCESS_REGISTRY.terminate_processes(_snap, timeout=2.0)
+                    except Exception as _pe:
+                        _killed = 0
+                        swallow("bulk-cancel owned process cleanup", _pe)
                     if _killed:
                         _log.info(
                             "metadata cancel killed %d in-flight yt-dlp procs",
@@ -884,10 +894,8 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
         # pause-wait/merge loop; otherwise the remaining prefetched failures
         # would be counted (and potentially persisted) one video at a time.
         _pf_youtube_failure = next(
-            (str(_entry.get("_youtube_failure"))
-             for _entry in _prefetched.values()
-             if isinstance(_entry, dict)
-             and _entry.get("_youtube_failure")),
+            (_entry.status.value for _entry in _prefetched.values()
+             if _entry.session_failure),
             "",
         )
         if _pf_youtube_failure:
@@ -967,15 +975,17 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
             # error, or (b) this vid_id wasn't in the prefetch set
             # (shouldn't happen with the same skip-logic, but defensive).
             if needs_thumb_only:
-                entry = existing.get(vid_id) or {}
+                fetched_result = MetadataFetchResult.success(existing.get(vid_id) or {})
             elif vid_id in _prefetched:
-                entry = _prefetched[vid_id]
+                fetched_result = _prefetched[vid_id]
             else:
-                entry = _fetch_video_metadata(
-                    yt, vid_id, title, stream=stream,
-                    cancel_event=cancel_event)
-            if isinstance(entry, dict) and entry.get("_youtube_failure"):
-                kind = str(entry["_youtube_failure"])
+                fetched_result = _fetch_video_metadata_result(
+                    yt, vid_id, title, stream=stream, cancel_event=cancel_event)
+            if fetched_result.status is FetchStatus.CANCELLED:
+                break
+            entry = fetched_result.metadata
+            if fetched_result.session_failure:
+                kind = fetched_result.status.value
                 _clear_active()
                 return {
                     "ok": False,
@@ -989,7 +999,7 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
             # transient timeout sentinel — count as "will
             # retry" rather than a permanent failure so future rechecks
             # still try this video. No persistent flag set.
-            if isinstance(entry, dict) and entry.get("_timeout"):
+            if fetched_result.status is FetchStatus.TIMEOUT:
                 errors += 1
                 stream.emit([
                     [" — ", "dim"],
@@ -1069,6 +1079,8 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                 old["comments"] = entry.get("comments", old.get("comments", []))
                 old["fetched_at"] = entry.get(
                     "fetched_at", old.get("fetched_at", ""))
+                if "comments_fetched_at" in entry:
+                    old["comments_fetched_at"] = entry["comments_fetched_at"]
                 if entry.get("upload_date"):
                     old["upload_date"] = entry["upload_date"]
                 if entry.get("duration"):

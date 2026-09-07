@@ -214,6 +214,9 @@ def test_owner_stop_kills_exact_registered_tree_but_not_sibling(tmp_path):
 
 
 def test_streaming_timeout_stops_a_silent_child(monkeypatch):
+    # This fixture runs Python, not yt-dlp; exercise lifecycle supervision
+    # without injecting downloader-specific command-line options.
+    monkeypatch.setattr(process_runner, "prepare_command", lambda cmd, env: (cmd, env, None))
     monkeypatch.setattr(
         process_runner.youtube_traffic, "acquire",
         lambda *_args, **_kwargs: {"ok": True},
@@ -239,6 +242,7 @@ def test_streaming_timeout_stops_a_silent_child(monkeypatch):
 
 def test_streaming_cancel_stops_a_silent_child_without_waiting_for_output(
         monkeypatch):
+    monkeypatch.setattr(process_runner, "prepare_command", lambda cmd, env: (cmd, env, None))
     monkeypatch.setattr(
         process_runner.youtube_traffic, "acquire",
         lambda *_args, **_kwargs: {"ok": True},
@@ -270,6 +274,7 @@ def test_streaming_cancel_stops_a_silent_child_without_waiting_for_output(
 
 
 def test_streaming_bounded_reader_drains_heavy_output(monkeypatch):
+    monkeypatch.setattr(process_runner, "prepare_command", lambda cmd, env: (cmd, env, None))
     monkeypatch.setattr(
         process_runner.youtube_traffic, "acquire",
         lambda *_args, **_kwargs: {"ok": True},

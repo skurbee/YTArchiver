@@ -1,4 +1,4 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 const { loadApp } = require("./fixtures");
 
 async function openEditor(page, name = "Control Fixture") {
@@ -67,6 +67,9 @@ test("late save cannot close or disable a newer channel editor", async ({ page }
 test("blank duration fields explicitly clear both existing limits", async ({ page }) => {
   await loadApp(page);
   await openEditor(page);
+  await page.evaluate(() => window.__setBridgeHandler("subs_update_channel", async (_identity, updates) => ({
+    ok: true, channel: { name: "Control Fixture", ...updates },
+  })));
   await page.locator("#edit-min-dur").fill("");
   await page.locator("#edit-max-dur").fill("");
   await page.locator("#btn-edit-update").click();

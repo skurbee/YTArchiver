@@ -34,6 +34,13 @@ from .subprocess_util import (
     subprocess_creationflags,
     utf8_env,
 )
+from .youtube_request_process import (
+    attach_session,
+    budget_wait_seconds,
+    prepare_command,
+    request_session,
+    set_request_signals,
+)
 
 _log = get_logger(__name__)
 
@@ -67,14 +74,16 @@ def process_owner_scope(owner: str, task_id: str = ""):
 class StreamingRunResult:
     """Backward-compatible result for YtDlpRunner.run_streaming."""
 
-    __slots__ = ("returncode", "stderr_tail", "cancelled", "timed_out")
+    __slots__ = ("returncode", "stderr_tail", "cancelled", "timed_out", "output_complete")
 
     def __init__(self, returncode: int, stderr_tail: list[str],
-                 cancelled: bool = False, timed_out: bool = False):
+                 cancelled: bool = False, timed_out: bool = False,
+                 output_complete: bool = True):
         self.returncode = returncode
         self.stderr_tail = stderr_tail
         self.cancelled = cancelled
         self.timed_out = timed_out
+        self.output_complete = output_complete
 
     def __iter__(self):
         yield self.returncode
@@ -489,14 +498,178 @@ class ProcessRegistry:
 PROCESS_REGISTRY = ProcessRegistry()
 
 
+def stop_owned_process(proc, *, registry=None, timeout: float = 4.0) -> None:
+    """Stop this exact child tree and reap it within one cleanup budget."""
+    target_registry = registry or PROCESS_REGISTRY
+    deadline = time.monotonic() + max(0.0, timeout)
+    try:
+        target_registry.terminate_process(proc, timeout=max(0.0, timeout / 2))
+    except Exception as exc:
+        _log.debug("owned process termination failed: %s", exc)
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        pass
+    try:
+        proc.terminate()
+    except Exception as exc:
+        _log.debug("process terminate fallback failed: %s", exc)
+    try:
+        proc.wait(timeout=max(0.0, (deadline - time.monotonic()) * 0.7))
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception as exc:
+        _log.debug("process kill fallback failed: %s", exc)
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except Exception as exc:
+        _log.debug("process reap fallback failed: %s", exc)
+
+
+def finish_owned_process(proc, *, registry=None, wait_timeout: float = 10.0,
+                         stop_timeout: float = 7.0,
+                         output_reader: ProcessOutputReader | None = None) -> int | None:
+    """Finalize a child after its output reader has stopped.
+
+    A surviving child remains registered for application shutdown. Callers
+    with active readers must close those readers first; closing an inherited
+    pipe while another thread is blocked in readline can itself block.
+    """
+    target_registry = registry or PROCESS_REGISTRY
+    try:
+        proc.wait(timeout=wait_timeout)
+    except Exception:
+        stop_owned_process(proc, registry=target_registry, timeout=stop_timeout)
+    returncode = getattr(proc, "returncode", None)
+    if output_reader is not None:
+        output_reader.close()
+    if returncode is not None:
+        pipes = () if output_reader is not None else (
+            getattr(proc, "stdout", None), getattr(proc, "stderr", None))
+        for pipe in pipes:
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except Exception as exc:
+                _log.debug("process pipe close failed: %s", exc)
+        target_registry.unregister(proc)
+    return returncode
+
+
+class ProcessOutputReader:
+    """Bounded pipe draining shared by supervisors and binary parser adapters.
+
+    Values retain their original str/bytes form. One consumer owns callbacks
+    or parsing; readers only transfer lines. close() never waits on a held
+    pipe's I/O lock and has one total join deadline for both readers.
+    """
+
+    def __init__(self, proc, *, task_id: str = ""):
+        self._proc = proc
+        self._queue: Queue = Queue(maxsize=512)
+        self._stop = threading.Event()
+        self._closed = False
+        self.failed = threading.Event()
+        self._done = {name: threading.Event() for name in ("stdout", "stderr")}
+        self._threads = [threading.Thread(
+            target=self._drain, args=(getattr(proc, name, None), name),
+            daemon=True, name=f"process-{name}-{task_id or 'unknown'}",
+        ) for name in self._done]
+
+    def start(self):
+        for thread in self._threads:
+            thread.start()
+        return self
+
+    def _drain(self, pipe, channel: str) -> None:
+        try:
+            if pipe is None:
+                return
+            readline = getattr(pipe, "readline", None)
+            iterator = None if callable(readline) else iter(pipe)
+            while not self._stop.is_set():
+                if callable(readline):
+                    line = readline()
+                    if not line:
+                        break
+                else:
+                    try:
+                        line = next(iterator)
+                    except StopIteration:
+                        break
+                while not self._stop.is_set():
+                    try:
+                        self._queue.put((channel, line), timeout=0.05)
+                        break
+                    except Full:
+                        continue
+        except Exception as exc:
+            self.failed.set()
+            _log.debug("stream reader stopped: %s", exc)
+        finally:
+            self._done[channel].set()
+
+    def read(self, timeout: float = 0.1):
+        try:
+            return self._queue.get(timeout=timeout)
+        except Empty:
+            return None
+
+    @property
+    def finished(self) -> bool:
+        return all(event.is_set() for event in self._done.values()) and self._queue.empty()
+
+    def pending(self):
+        while True:
+            try:
+                yield self._queue.get_nowait()
+            except Empty:
+                return
+
+    def close(self, timeout: float = 1.0) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        deadline = time.monotonic() + max(0.0, timeout)
+        for thread in self._threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        for channel, done in self._done.items():
+            if not done.is_set():
+                continue
+            try:
+                pipe = getattr(self._proc, channel, None)
+                if pipe is not None:
+                    pipe.close()
+            except Exception as exc:
+                _log.debug("stream pipe close failed: %s", exc)
+
+
+class CancellationSignals:
+    """Read-only union of caller cancellation and operation-local stop signals."""
+
+    def __init__(self, *events):
+        self._events = tuple(event for event in events if event is not None)
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self._events)
+
+
 def supervise_streaming_process(
         proc: subprocess.Popen, *,
         registry: ProcessRegistry | None = None,
         on_stdout_line: Callable[[str], None] | None = None,
         on_stderr_line: Callable[[str], None] | None = None,
         cancel_event: threading.Event | None = None,
+        pause_event: threading.Event | None = None,
+        on_pause_change: Callable[[bool], None] | None = None,
         timeout: float | None = None,
         idle_timeout: float | None = None,
+        exit_timeout: float = 10.0,
         owner: str = "unowned",
         task_id: str = "",
         role: str = "streaming",
@@ -517,55 +690,15 @@ def supervise_streaming_process(
         # one-argument registry protocol.
         target_registry.register(proc)
 
+    set_request_signals(proc, cancel_event, pause_event)
+    budget_accounted = budget_wait_seconds(proc)
     stderr_tail: deque = deque(maxlen=200)
     cancelled = False
     timed_out = False
-    output_queue: Queue = Queue(maxsize=512)
-    reader_stop = threading.Event()
-    stdout_done = threading.Event()
-    stderr_done = threading.Event()
-
-    def _drain_pipe(pipe, channel: str, done: threading.Event) -> None:
-        try:
-            if pipe is None:
-                return
-            readline = getattr(pipe, "readline", None)
-            iterator = None if callable(readline) else iter(pipe)
-            while not reader_stop.is_set():
-                if callable(readline):
-                    line = readline()
-                    if not line:
-                        break
-                else:
-                    try:
-                        line = next(iterator)
-                    except StopIteration:
-                        break
-                while not reader_stop.is_set():
-                    try:
-                        output_queue.put((channel, line), timeout=0.05)
-                        break
-                    except Full:
-                        continue
-        except Exception as exc:
-            _log.debug("stream reader stopped: %s", exc)
-        finally:
-            done.set()
-
-    stdout_thread = threading.Thread(
-        target=_drain_pipe,
-        args=(getattr(proc, "stdout", None), "stdout", stdout_done),
-        daemon=True,
-        name=f"process-stdout-{task_id or 'unknown'}",
-    )
-    stderr_thread = threading.Thread(
-        target=_drain_pipe,
-        args=(getattr(proc, "stderr", None), "stderr", stderr_done),
-        daemon=True,
-        name=f"process-stderr-{task_id or 'unknown'}",
-    )
-    stdout_thread.start()
-    stderr_thread.start()
+    output_reader = ProcessOutputReader(proc, task_id=task_id).start()
+    output_complete = False
+    callback_failed = False
+    paused_at: float | None = None
 
     started = time.monotonic()
     last_activity = started
@@ -577,54 +710,35 @@ def supervise_streaming_process(
     closed_pipes_deadline: float | None = None
 
     def _call_line(callback, line: str) -> None:
+        nonlocal callback_failed
         if callback is None:
             return
         try:
             callback(line.rstrip("\n"))
         except Exception as exc:
+            callback_failed = True
             _log.debug("stream callback failed: %s", exc)
 
     def _consume(channel: str, line: str, *, callbacks: bool = True) -> None:
-        nonlocal last_activity
+        nonlocal last_activity, post_exit_deadline
         last_activity = time.monotonic()
         if channel == "stderr":
             stderr_tail.append(line.rstrip())
             if callbacks:
                 _call_line(on_stderr_line, line)
-            return
-        if callbacks:
+        elif callbacks:
             _call_line(on_stdout_line, line)
+        if post_exit_deadline is not None:
+            # A busy final backlog is still useful output. Bound silence
+            # from inherited pipe handles, rather than callback/drain time.
+            post_exit_deadline = time.monotonic() + 1.0
 
-    def _terminate_owned() -> None:
-        try:
-            target_registry.terminate_process(proc, timeout=2.0)
-        except Exception as exc:
-            _log.debug("owned process termination failed: %s", exc)
-        try:
-            if proc.poll() is not None:
-                return
-        except Exception:
-            pass
-        cleanup_deadline = time.monotonic() + 2.0
-        try:
-            proc.terminate()
-        except Exception as exc:
-            _log.debug("process terminate fallback failed: %s", exc)
-        try:
-            proc.wait(timeout=max(
-                0.0, min(1.4, cleanup_deadline - time.monotonic())))
-            return
-        except Exception:
-            pass
-        try:
-            proc.kill()
-        except Exception as exc:
-            _log.debug("process kill fallback failed: %s", exc)
-        try:
-            proc.wait(timeout=max(
-                0.0, cleanup_deadline - time.monotonic()))
-        except Exception as exc:
-            _log.debug("process reap fallback failed: %s", exc)
+    def _pause_changed(paused: bool) -> None:
+        if on_pause_change is not None:
+            try:
+                on_pause_change(paused)
+            except Exception as exc:
+                _log.debug("process pause callback failed: %s", exc)
 
     def _poll_process():
         try:
@@ -638,33 +752,56 @@ def supervise_streaming_process(
     try:
         while True:
             now = time.monotonic()
+            budget_now = budget_wait_seconds(proc)
+            budget_elapsed = max(0.0, budget_now - budget_accounted)
+            budget_accounted = budget_now
+            # Manual pause below already excludes its entire duration. Avoid
+            # counting the overlapping request wait twice on resume.
+            if paused_at is None:
+                last_activity += budget_elapsed
+                if operation_deadline is not None:
+                    operation_deadline += budget_elapsed
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
-                _terminate_owned()
+                stop_owned_process(proc, registry=target_registry)
                 break
+            if pause_event is not None and pause_event.is_set():
+                if paused_at is None:
+                    paused_at = now
+                    _pause_changed(True)
+                time.sleep(0.1)
+                continue
+            if paused_at is not None:
+                pause_duration = now - paused_at
+                last_activity += pause_duration
+                if operation_deadline is not None:
+                    operation_deadline += pause_duration
+                if post_exit_deadline is not None:
+                    post_exit_deadline += pause_duration
+                if closed_pipes_deadline is not None:
+                    closed_pipes_deadline += pause_duration
+                paused_at = None
+                _pause_changed(False)
             returncode = _poll_process()
-            if (returncode is None and (
-                    (operation_deadline is not None and now >= operation_deadline)
-                    or (idle_timeout is not None
-                        and now - last_activity >= idle_timeout))):
+            if ((operation_deadline is not None and now >= operation_deadline)
+                    or (returncode is None and idle_timeout is not None
+                        and now - last_activity >= idle_timeout)):
                 timed_out = True
-                _terminate_owned()
+                stop_owned_process(proc, registry=target_registry)
                 break
             if returncode is not None:
                 if post_exit_deadline is None:
                     post_exit_deadline = now + 1.0
-                if (stdout_done.is_set() and stderr_done.is_set()
-                        and output_queue.empty()):
+                if output_reader.finished:
                     break
                 if now >= post_exit_deadline:
                     break
-            elif (stdout_done.is_set() and stderr_done.is_set()
-                  and output_queue.empty()):
+            elif output_reader.finished:
                 if closed_pipes_deadline is None:
-                    closed_pipes_deadline = now + 10.0
+                    closed_pipes_deadline = now + max(0.0, exit_timeout)
                 elif now >= closed_pipes_deadline:
                     timed_out = True
-                    _terminate_owned()
+                    stop_owned_process(proc, registry=target_registry)
                     break
 
             poll_slice = 0.1
@@ -676,36 +813,19 @@ def supervise_streaming_process(
                     poll_slice,
                     max(0.001, min(deadlines) - time.monotonic()),
                 )
-            try:
-                channel, line = output_queue.get(timeout=poll_slice)
-            except Empty:
-                continue
-            _consume(channel, line)
+            item = output_reader.read(timeout=poll_slice)
+            if item is not None:
+                _consume(*item)
     finally:
-        reader_stop.set()
-        reader_deadline = time.monotonic() + 1.0
-        for thread in (stdout_thread, stderr_thread):
-            thread.join(timeout=max(
-                0.0, reader_deadline - time.monotonic()))
-        for pipe, done in (
-                (getattr(proc, "stdout", None), stdout_done),
-                (getattr(proc, "stderr", None), stderr_done)):
-            if not done.is_set():
-                continue
-            try:
-                if pipe is not None:
-                    pipe.close()
-            except Exception as exc:
-                _log.debug("stream pipe close failed: %s", exc)
-        while True:
-            try:
-                channel, line = output_queue.get_nowait()
-            except Empty:
-                break
-            _consume(
-                channel, line,
-                callbacks=not (cancelled or timed_out),
-            )
+        output_complete = (output_reader.finished and not output_reader.failed.is_set()
+                           and not callback_failed
+                           and not (cancelled or timed_out))
+        output_reader.close()
+        if paused_at is not None:
+            _pause_changed(False)
+        for channel, line in output_reader.pending():
+            _consume(channel, line, callbacks=not (cancelled or timed_out))
+        output_complete = output_complete and not callback_failed
         still_alive = _poll_process() is None
         if still_alive:
             try:
@@ -724,6 +844,7 @@ def supervise_streaming_process(
         list(stderr_tail),
         cancelled=cancelled,
         timed_out=timed_out,
+        output_complete=output_complete,
     )
 
 
@@ -789,7 +910,8 @@ YTDLP_UPDATE_GATE = YtDlpUpdateGate()
 
 def popen_ytdlp(*args, registry: ProcessRegistry | None = None,
                 owner: str | None = None, task_id: str = "",
-                role: str = "yt-dlp", **kwargs):
+                role: str = "yt-dlp", request_cancel_event=None,
+                request_pause_event=None, **kwargs):
     """Launch and register yt-dlp as one update-gate transaction.
 
     Ownership keywords are consumed here and never forwarded to ``Popen``.
@@ -801,17 +923,60 @@ def popen_ytdlp(*args, registry: ProcessRegistry | None = None,
         _PROCESS_OWNER_CONTEXT, "value", ("yt-dlp", ""))
     effective_owner = str(owner) if owner is not None else scoped_owner
     effective_task_id = str(task_id or scoped_task_id)
-    with YTDLP_UPDATE_GATE.launch_slot():
-        proc = subprocess.Popen(*args, **kwargs)
-        target_registry.register(
-            proc, owner=effective_owner, task_id=effective_task_id, role=role)
+    command = args[0] if args else kwargs.pop("args")
+    session = None
+    proc = None
+    try:
+        with YTDLP_UPDATE_GATE.launch_slot():
+            # Create authorization after any updater wait, so the unbound
+            # session cannot expire while another process updates yt-dlp.
+            command, child_env, session = prepare_command(command, kwargs.get("env"))
+            if session is not None:
+                kwargs["env"] = child_env
+                session.set_signals(cancel_event=request_cancel_event,
+                                    pause_event=request_pause_event)
+            proc = subprocess.Popen(command, *args[1:], **kwargs)
+            attach_session(proc, session)
+            target_registry.register(
+                proc, owner=effective_owner, task_id=effective_task_id, role=role)
+    except BaseException:
+        if session is not None:
+            session.close()
+        if proc is not None:
+            stop_owned_process(proc, registry=target_registry)
+        raise
     return proc
 
 
-def run_ytdlp(*args, **kwargs):
-    """Run a synchronous yt-dlp probe without racing self-update."""
-    with YTDLP_UPDATE_GATE.launch_slot():
-        return subprocess.run(*args, **kwargs)
+def run_ytdlp(*args, input=None, capture_output=False, timeout=None,
+              check=False, **kwargs):
+    """Capture a registered probe with request-budget-aware timeout handling."""
+    if input is not None:
+        if kwargs.get("stdin") is not None:
+            raise ValueError("stdin and input arguments may not both be used")
+        kwargs["stdin"] = subprocess.PIPE
+    if capture_output:
+        if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
+            raise ValueError("stdout/stderr cannot be used with capture_output")
+        kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = popen_ytdlp(*args, **kwargs)
+    try:
+        stdout, stderr = proc.communicate(input=input, timeout=timeout)
+        returncode = proc.poll()
+        if check and returncode:
+            raise subprocess.CalledProcessError(returncode, proc.args, stdout, stderr)
+        return subprocess.CompletedProcess(proc.args, returncode, stdout, stderr)
+    except BaseException:
+        stop_owned_process(proc)
+        raise
+    finally:
+        session = request_session(proc)
+        if session is not None:
+            session.close()
+        PROCESS_REGISTRY.unregister(proc)
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                pipe.close()
 
 
 # ── yt-dlp locator (re-exports the legacy one for now) ───────────────

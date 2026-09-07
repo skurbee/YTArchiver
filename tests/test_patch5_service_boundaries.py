@@ -7,6 +7,7 @@ import pytest
 from backend.services.config_repository import ConfigRepository
 from backend.sync.download_commit import commit_download
 from backend.transcribe.job_execution import (
+    EmptyTranscript,
     TranscriptionJobExecutor,
     WorkerOutcome,
     apply_control_signals,
@@ -114,9 +115,9 @@ def test_transcription_executor_never_treats_missing_result_as_success():
     assert execution_decision(outcome).pause_for_retry
 
 
-def test_transcription_executor_maps_legacy_terminal_sentinels():
+def test_transcription_executor_maps_explicit_terminal_signal():
     def no_speech():
-        raise RuntimeError("empty transcript")
+        raise EmptyTranscript("No recognized speech")
 
     outcome = TranscriptionJobExecutor().run(
         no_speech,

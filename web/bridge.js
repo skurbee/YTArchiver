@@ -215,6 +215,33 @@
   // now holds, which matters for removeEventListener-style call sites
   // (audit: bridge.js:97-110).
   const API_FN_CACHE_LIMIT = 200;
+  // These reads have legacy wire formats (plain settings and a channel tuple).
+  // Validate them here so every consumer distinguishes failure from empty data.
+  function requireReply(reply, label) {
+    if (!reply || reply.ok === false || reply.error) {
+      const error = new Error(reply?.error || `${label} could not be loaded.`);
+      error.code = reply?.code || "INVALID_BRIDGE_RESPONSE";
+      throw error;
+    }
+    return reply;
+  }
+  function validateRead(method, reply) {
+    if (method === "settings_load") {
+      requireReply(reply, "Settings");
+      if (Array.isArray(reply) || typeof reply.output_dir !== "string") {
+        throw new Error("Settings returned an invalid response.");
+      }
+    } else if (method === "get_subs_channels") {
+      requireReply(reply, "Channels");
+      const rows = Array.isArray(reply) && Array.isArray(reply[0])
+        ? reply[0] : Array.isArray(reply) ? reply : reply.channels;
+      if (!Array.isArray(rows) || rows.some(row => !row || typeof row !== "object"
+          || Array.isArray(row))) {
+        throw new Error("Channels returned an invalid response.");
+      }
+    }
+    return reply;
+  }
   const _apiFnCache = new Map();
   const _apiProxy = new Proxy({}, {
     get(_target, prop) {
@@ -228,14 +255,15 @@
       const _fn = function (...args) {
         const api = window.pywebview && window.pywebview.api;
         if (api && typeof api[prop] === "function") {
-          return api[prop].apply(api, args);
+          return Promise.resolve(api[prop].apply(api, args))
+            .then(reply => validateRead(prop, reply));
         }
         _toastNativeRequired();
         return Promise.resolve({
           ok: false,
           error: "YTArchiver isn't ready yet. Try again in a moment.",
           code: "NATIVE_BRIDGE_UNAVAILABLE",
-        });
+        }).then(reply => validateRead(prop, reply));
       };
       if (_apiFnCache.size >= API_FN_CACHE_LIMIT) {
         const oldest = _apiFnCache.keys().next().value;
@@ -596,6 +624,12 @@
   // Bare-bones bridgeCall — the legacy app.js name. Kept for back-compat
   // until the migration completes; new code should use YT.api.* directly.
   function bridgeCall(method, ...args) {
+    if (YT.preferences && method === "settings_load") {
+      return YT.preferences.load({ refresh: true });
+    }
+    if (YT.preferences && method === "settings_save") {
+      return YT.preferences.save(args[0]);
+    }
     // Defensive: if `method` resolves to undefined (e.g. someone
     // called `bridgeCall("then", ...)` while we serve "then" as
     // not-a-thenable), don't invoke undefined as a function (audit:
@@ -615,6 +649,7 @@
     catalogReadBusy,
     setReady,
     bridgeCall,
+    requireReply,
     _toastNativeRequired,
   };
 

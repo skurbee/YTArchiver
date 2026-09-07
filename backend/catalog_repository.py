@@ -24,6 +24,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .media_identity import (
+    canonical_sort_key as _canonical_sort_key,
+)
+from .media_identity import (
+    identity_key_for_row,
+    normalize_media_path,
+)
+from .services.format_versions import require_version
+
 CATALOG_SCHEMA_VERSION = 1
 CATALOG_PHASES = (
     "legacy",
@@ -34,10 +43,6 @@ CATALOG_PHASES = (
     "v2_writes",
 )
 _READ_PHASES = frozenset({"v2_reads", "v2_writes"})
-_SQLITE_ASCII_LOWER = str.maketrans(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-    "abcdefghijklmnopqrstuvwxyz",
-)
 
 
 class CatalogMigrationError(RuntimeError):
@@ -64,21 +69,10 @@ class CatalogStatus:
         return self.phase in _READ_PHASES and not self.legacy_dirty
 
 
-def normalize_media_path(path: Any) -> str:
-    """Return the rollback-compatible SQLite identity form for a filepath."""
-    value = str(path or "").strip(" ").replace("/", "\\")
-    return value.translate(_SQLITE_ASCII_LOWER)
 
 
-def identity_key_for_row(row: dict[str, Any]) -> tuple[str, str]:
-    """Return ``(identity_key, identity_kind)`` without title guessing."""
-    video_id = str(row.get("video_id") or "").strip()
-    if video_id:
-        return f"id:{video_id}", "youtube"
-    filepath = normalize_media_path(row.get("filepath"))
-    if filepath:
-        return f"path:{filepath}", "path"
-    return f"legacy-row:{int(row['id'])}", "legacy"
+
+
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -236,6 +230,7 @@ def create_verified_legacy_catalog_backup(
 
 def install_catalog_schema(conn: sqlite3.Connection) -> None:
     """Install the additive v2 schema and rollback-compatible dirty triggers."""
+    validate_catalog_version(conn)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS catalog_state (
                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -533,14 +528,7 @@ def _positive_number(value: Any) -> float | None:
     return number if number > 0 else None
 
 
-def _canonical_sort_key(row: dict[str, Any]) -> tuple[int, int, int]:
-    filepath = str(row.get("filepath") or "").strip()
-    available = (
-        str(row.get("availability") or "available") == "available"
-        and bool(filepath)
-    )
-    primary_hint = row.get("is_duplicate_of") is None
-    return (0 if available else 1, 0 if primary_hint else 1, int(row["id"]))
+
 
 
 def _stable_digest(value: Any) -> str:
@@ -1069,6 +1057,7 @@ def reconcile_dirty_catalog(
     max_incremental_keys: int = 512,
 ) -> None:
     """Reconcile identity groups touched by ordinary writes in safe batches."""
+    validate_catalog_version(conn)
     state = conn.execute(
         "SELECT phase, legacy_dirty FROM catalog_state WHERE singleton=1"
     ).fetchone()
@@ -1186,7 +1175,17 @@ def reconcile_dirty_catalog(
         raise
 
 
+def validate_catalog_version(conn: sqlite3.Connection) -> None:
+    """Reject future projections before schema writes or normalized reads."""
+    if _table_exists(conn, "catalog_state"):
+        row = conn.execute(
+            "SELECT schema_version FROM catalog_state WHERE singleton=1").fetchone()
+        if row:
+            require_version(row[0], {CATALOG_SCHEMA_VERSION}, "Library catalog")
+
+
 def catalog_status(conn: sqlite3.Connection) -> CatalogStatus:
+    validate_catalog_version(conn)
     if not catalog_schema_installed(conn):
         return CatalogStatus("legacy", 0, True, "", None, "", 0, 0)
     row = conn.execute(

@@ -69,6 +69,9 @@ datas = [
     # it through static analysis. Bundle it explicitly.
     (str(PROJECT_ROOT / 'backend' / 'punct_worker.py'), 'backend'),
     (str(PROJECT_ROOT / 'backend' / 'punct_alignment.py'), 'backend'),
+    (str(PROJECT_ROOT / 'backend' / 'worker_protocol.py'), 'backend'),
+    # Imported by the external yt-dlp process, not by the application itself.
+    (str(PROJECT_ROOT / 'backend' / 'yt_dlp_plugins'), 'backend/yt_dlp_plugins'),
     # Reproducible optional-worker installation and distributed notices.
     (str(PROJECT_ROOT / 'requirements'), 'requirements'),
     (str(PROJECT_ROOT / 'licenses'), 'licenses'),
@@ -110,6 +113,9 @@ a = Analysis(
         'tkinter.ttk',
         'tkinter.messagebox',
         'tkinter.filedialog',
+        # Installed for offline integration tests; downloads use the external
+        # executable and the plugin source bundled above.
+        'yt_dlp',
         # Transcription runs this stack in a separate Python 3.11 process.
         'faster_whisper',
         'ctranslate2',

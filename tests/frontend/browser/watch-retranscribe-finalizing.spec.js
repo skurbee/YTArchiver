@@ -1,4 +1,4 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 const { loadApp } = require("./fixtures");
 
 
@@ -78,21 +78,11 @@ test("Watch changes a completed 99% pass into a truthful finalizing state", asyn
   expect(percent.fillClass).not.toContain("is-indeterminate");
 
   await page.evaluate((videoId) => {
-    window._logBatch({
-      main: [[
-        [" — ", ["tx_done_" + videoId, "whisper_bracket"]],
-        ["Finalizing transcript", [
-          "tx_done_" + videoId,
-          "whisper_job_fixture",
-          "whisper_finalizing",
-        ]],
-        [" \"Fixture finalization\"...\n", [
-          "tx_done_" + videoId,
-          "whisper_job_fixture",
-        ]],
-      ]],
-      activity: [],
-    });
+    window._appEventBatch([{
+      channel: "fixture", key: "processing:finalizing", revision: 1,
+      topic: "processing",
+      payload: { state: "finalizing", video_id: videoId, pct: 99 },
+    }]);
   }, VIDEO_ID);
 
   await expect.poll(() => page.evaluate((videoId) =>

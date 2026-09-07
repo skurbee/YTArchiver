@@ -11,7 +11,7 @@ atexit.register(_PROFILE.cleanup)
 os.environ["APPDATA"] = str(Path(_PROFILE.name) / "roaming")
 os.environ["LOCALAPPDATA"] = str(Path(_PROFILE.name) / "local")
 
-from backend import index, index_bookmarks
+from backend import index
 from backend.api_mixins.backup_mixin import _clean_import_channel
 from backend.fs_safety import files_equal, sampled_files_equal
 
@@ -48,10 +48,10 @@ def segment(connection, path, identity, text="spoken words", title="Shared title
 def test_bookmark_known_id_never_uses_another_video(database, tmp_path):
     video(database, tmp_path / "other.mp4", "bbbbbbbbbb2")
     item = {"video_id": "aaaaaaaaaa1", "title": "Shared title", "channel": "Fixture"}
-    index_bookmarks._enrich_video_fields(database, item)
+    index.bookmark_repository().enrich_video_fields(database, item)
     assert not item.get("filepath")
     item["channel"] = "Different channel"
-    index_bookmarks._enrich_video_fields(database, item)
+    index.bookmark_repository().enrich_video_fields(database, item)
     assert not item.get("filepath")
 
 
@@ -61,7 +61,7 @@ def test_bookmark_prefers_available_primary_of_same_id(database, tmp_path):
     video(database, tmp_path / "duplicate.mp4", "aaaaaaaaaa1", duplicate=str(primary), added=99)
     video(database, tmp_path / "missing.mp4", "aaaaaaaaaa1", availability="missing", added=100)
     item = {"video_id": "aaaaaaaaaa1", "title": "Shared title", "channel": "Fixture"}
-    index_bookmarks._enrich_video_fields(database, item)
+    index.bookmark_repository().enrich_video_fields(database, item)
     assert item["filepath"] == str(primary)
 
 
@@ -69,7 +69,7 @@ def test_idless_bookmark_requires_unambiguous_channel_title(database, tmp_path):
     video(database, tmp_path / "first.mp4", "aaaaaaaaaa1")
     video(database, tmp_path / "second.mp4", "bbbbbbbbbb2")
     item = {"video_id": "", "title": "Shared title", "channel": "Fixture"}
-    index_bookmarks._enrich_video_fields(database, item)
+    index.bookmark_repository().enrich_video_fields(database, item)
     assert not item.get("filepath")
 
 

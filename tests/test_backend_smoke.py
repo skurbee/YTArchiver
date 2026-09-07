@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import queue
@@ -95,7 +96,7 @@ from backend.api_mixins.thumbnail_mixin import ThumbnailMixin
 from backend.api_mixins.transcribe_mixin import TranscribeMixin
 from backend.api_mixins.video_mixin import VideoMixin
 from backend.api_mixins.window_mixin import WindowMixin
-from backend.metadata import core as metadata_core
+from backend.metadata import catalog as metadata_core
 from backend.metadata import fetcher as metadata_fetcher
 from backend.metadata import io as metadata_io
 from backend.metadata import (
@@ -106,6 +107,9 @@ from backend.metadata import (
     thumbnails_ops,
 )
 from backend.services import AppServices, BridgeEventBus, file_ops
+from backend.services.catalog_session import CatalogSession
+from backend.services.composition import compose_application_services
+from backend.services.config_repository import ConfigRepository
 from backend.sync import (
     active_state,
     log_rows,
@@ -130,6 +134,7 @@ from backend.sync.ytdlp_events import (
 from backend.transcribe import core as transcribe_core
 from backend.transcribe import helpers as transcribe_helpers
 from backend.transcribe import transcribe_files, transcribe_vtt
+from backend.transcribe.acceptance import EnqueueResult, EnqueueStatus
 from backend.transcribe.punct_manager import PunctuationManager
 
 _TEST_TRAFFIC_TMP = None
@@ -942,10 +947,9 @@ class TrayControllerTests(unittest.TestCase):
         def copy(self):
             return TrayControllerTests.FakeImage(self.name + "-copy")
 
-    def test_traffic_wait_keeps_active_sync_spinner_running(self) -> None:
-        self.assertEqual(tray_backend.activity_spin_color(
-            sync_working=True, gpu_working=False, traffic_waiting=True),
-            "blue")
+    def test_traffic_wait_stops_sync_spinner_but_keeps_gpu_activity(self) -> None:
+        self.assertIsNone(tray_backend.activity_spin_color(
+            sync_working=True, gpu_working=False, traffic_waiting=True))
         self.assertEqual(tray_backend.activity_spin_color(
             sync_working=True, gpu_working=False, traffic_waiting=False),
             "blue")
@@ -1372,7 +1376,7 @@ class CosmeticProbeCookieTests(unittest.TestCase):
                                   return_value="yt-dlp"), \
                 mock.patch.object(channel_art, "_find_cookie_source",
                                   return_value=["--cookies", "cookies.txt"]) as cookies, \
-                mock.patch.object(channel_art.subprocess, "run",
+                mock.patch.object(channel_art, "run_ytdlp",
                                   side_effect=fake_run):
             result = channel_art.fetch_channel_art(
                 "https://youtube.com/@example",
@@ -1398,7 +1402,7 @@ class CosmeticProbeCookieTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.object(channel_art, "find_yt_dlp",
                                   return_value="yt-dlp"), \
-                mock.patch.object(channel_art.subprocess, "run",
+                mock.patch.object(channel_art, "run_ytdlp",
                                   return_value=mock.Mock(
                                       returncode=0, stdout=metadata, stderr="")), \
                 mock.patch.object(channel_art, "_http_get",
@@ -1847,11 +1851,7 @@ class YouTubeSessionGuardTests(unittest.TestCase):
         self.assertEqual(kind, "cookie")
         self.assertTrue(pause_event.is_set())
         queue_state.set_sync_paused.assert_called_with(True)
-        controls = [
-            json.loads(call.args[0][0][0])
-            for call in stream.emit.call_args_list
-            if call.args[0][0][1] == "__control__"
-        ]
+        controls = [call.args[0] for call in stream.emit_control.call_args_list]
         self.assertIn({"kind": "cookie_alert",
                        "context": "refreshing metadata"}, controls)
 
@@ -2386,9 +2386,14 @@ class MetadataFetcherTests(unittest.TestCase):
     def test_fetch_video_metadata_returns_ytdlp_stderr_detail(self) -> None:
         class FakeProc:
             returncode = 1
+            pid = None
 
-            def communicate(self, timeout=None):
-                return ("", "ERROR: [youtube] abc: Video unavailable")
+            def __init__(self):
+                self.stdout = io.StringIO("")
+                self.stderr = io.StringIO("ERROR: [youtube] abc: Video unavailable")
+
+            def poll(self):
+                return self.returncode
 
         errors = []
         with mock.patch.object(metadata_fetcher, "_find_cookie_source",
@@ -2404,12 +2409,15 @@ class MetadataFetcherTests(unittest.TestCase):
     def test_fetch_video_metadata_does_not_brace_slice_warning_text(self) -> None:
         class FakeProc:
             returncode = 0
+            pid = None
 
-            def communicate(self, timeout=None):
-                return (
-                    'warning before json {"id":"wrong","title":"Wrong"} tail',
-                    "",
-                )
+            def __init__(self):
+                self.stdout = io.StringIO(
+                    'warning before json {"id":"wrong","title":"Wrong"} tail')
+                self.stderr = io.StringIO("")
+
+            def poll(self):
+                return self.returncode
 
         with mock.patch.object(metadata_fetcher, "_find_cookie_source",
                                return_value=[]), \
@@ -2459,8 +2467,8 @@ class MetadataFetcherTests(unittest.TestCase):
                     mock.patch.object(metadata_fetcher,
                                       "_write_metadata_jsonl"), \
                     mock.patch.object(metadata_fetcher,
-                                      "_fetch_video_metadata",
-                                      return_value=entry) as fetch, \
+                                      "_fetch_video_metadata_result",
+                                      return_value=metadata_fetcher.MetadataFetchResult.success(entry)) as fetch, \
                     mock.patch.object(metadata_fetcher,
                                       "_ensure_thumbnails_dir",
                                       return_value=str(root / ".Thumbnails")), \
@@ -5610,9 +5618,10 @@ class InfoMixinServicesTests(unittest.TestCase):
                     "last_sync": "",
                 }
                 self._log_stream = mock.Mock()
-                self.services = AppServices(
-                    load_config=fresh_config,
-                    save_config=lambda cfg: saved.append(dict(cfg)) or True,
+                self.services = compose_application_services(
+                    config=ConfigRepository(
+                        fresh_config, lambda cfg: saved.append(dict(cfg)) or True),
+                    config_path="fixture-config", can_write=lambda: True,
                     queues=mock.Mock(),
                     log_stream=service_log,
                     transcribe=mock.Mock(),
@@ -5623,12 +5632,10 @@ class InfoMixinServicesTests(unittest.TestCase):
                 return {"ok": True, "version": "2026.01.01"}
 
         api = Api()
-        with mock.patch("backend.api_mixins.info_mixin.load_config",
+        with mock.patch("backend.ytarchiver_config.load_config",
                         side_effect=AssertionError("use services")), \
-                mock.patch("backend.api_mixins.info_mixin.save_config",
-                           side_effect=AssertionError("use services")), \
-                mock.patch("backend.api_mixins.info_mixin.config_is_writable",
-                           return_value=True):
+                mock.patch("backend.ytarchiver_config.save_config",
+                           side_effect=AssertionError("use services")):
             about = api.about_info()
             history = api.url_history()
             api._push_url_history("new-url")
@@ -6654,7 +6661,7 @@ class TranscribeMixinTests(unittest.TestCase):
             def __init__(self):
                 self._transcribe = mock.Mock()
                 self._transcribe.swap_model.return_value = True
-                self._transcribe.enqueue.return_value = True
+                self._transcribe.enqueue_result.return_value = EnqueueResult(EnqueueStatus.ACCEPTED)
 
         api = Api()
         with mock.patch("backend.index._reader_open", return_value=None):
@@ -6663,7 +6670,7 @@ class TranscribeMixinTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         api._transcribe.swap_model.assert_not_called()
-        api._transcribe.enqueue.assert_called_once_with(
+        api._transcribe.enqueue_result.assert_called_once_with(
             r"C:\video.mp4", "Video", channel="", requested_model="medium")
 
     def test_transcribe_enqueue_rejects_bad_runtime_model(self) -> None:
@@ -6677,7 +6684,7 @@ class TranscribeMixinTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "Unsupported model")
-        api._transcribe.enqueue.assert_not_called()
+        api._transcribe.enqueue_result.assert_not_called()
 
     def test_transcribe_folder_aborts_when_candidate_cap_exceeded(self) -> None:
         class ImmediateThread:
@@ -7217,7 +7224,7 @@ class TranscribeManagerQueueTests(unittest.TestCase):
                                   "_bump_transcription_pending"), \
                 mock.patch.object(
                     mgr, "_transcribe_one",
-                    side_effect=RuntimeError(
+                    side_effect=transcribe_core.EmptyTranscript(
                         "Whisper returned an empty transcript")):
             mgr._worker_loop()
 
@@ -7537,7 +7544,7 @@ class TranscribeVttTests(unittest.TestCase):
 
             with mock.patch.object(transcribe_vtt.shutil, "which",
                                    return_value="yt-dlp"), \
-                    mock.patch.object(transcribe_vtt.subprocess, "run"):
+                    mock.patch.object(transcribe_vtt, "run_ytdlp"):
                 picked = transcribe_vtt._fetch_captions_via_ytdlp(
                     str(video), mock.Mock(), [])
 
@@ -7878,7 +7885,13 @@ class RedownloadTests(unittest.TestCase):
                 (str(video), 999, "Channel", "old-primary.mp4",
                  "abc123_def4"))
             conn.commit()
-            with mock.patch.object(index, "_open", return_value=conn), \
+            session = CatalogSession(
+                writer_factory=lambda: conn, reader_factory=lambda: conn,
+                independent_factory=lambda: None, writer_lock=threading.RLock(),
+                reader_lock=threading.RLock(), lock_seconds=lambda: 1.0,
+                query_seconds=lambda: 1.0,
+            )
+            with mock.patch.object(index, "catalog_session", return_value=session), \
                     mock.patch.object(index, "invalidate_channel_videos"):
                 result = index_maintenance.refresh_channel_file_sizes(
                     "Channel", str(root))
@@ -8195,6 +8208,8 @@ class RedownloadMixinTests(unittest.TestCase):
                 self._queues.sync = []
                 self._log_stream = mock.Mock()
                 self._redwnl_cancel = threading.Event()
+                self._redwnl_lock = threading.Lock()
+                self._redwnl_pending = []
                 self._sync_pause = threading.Event()
                 self._window = None
                 self._on_queue_changed = mock.Mock()
@@ -9091,7 +9106,7 @@ class QuickcheckTests(unittest.TestCase):
                                return_value="yt-dlp"), \
                 mock.patch.object(quickcheck, "_find_cookie_source",
                                   return_value=[]), \
-                mock.patch.object(quickcheck.subprocess, "run",
+                mock.patch.object(quickcheck, "run_ytdlp",
                                   side_effect=quickcheck.subprocess
                                   .TimeoutExpired("yt-dlp", 1)) as run:
             first = quickcheck.quick_check_new_uploads(
@@ -9118,7 +9133,7 @@ class QuickcheckTests(unittest.TestCase):
                                return_value="yt-dlp"), \
                 mock.patch.object(quickcheck, "_find_cookie_source",
                                   return_value=[]), \
-                mock.patch.object(quickcheck.subprocess, "run",
+                mock.patch.object(quickcheck, "run_ytdlp",
                                   return_value=proc):
             result = quickcheck.quick_check_new_uploads(
                 url, {"KNOWNVIDEO1"}, min_duration=180)
@@ -9309,24 +9324,32 @@ class YtDlpSessionTests(unittest.TestCase):
         self.assertTrue(result.cancelled)
         popen.assert_not_called()
 
-    def test_download_watchdog_kills_stalled_process(self) -> None:
+    def test_download_watchdog_stops_stalled_process_through_its_owner(self) -> None:
         proc = mock.Mock()
+        proc.returncode = None
         proc.poll.return_value = None
         stream = mock.Mock()
+        stopped = threading.Event()
 
-        handle = ytdlp_session.start_download_watchdog(
-            proc, stream, kill_sec=-1, poll_interval=0.01)
-        try:
-            for _ in range(50):
-                if proc.kill.called:
-                    break
-                ytdlp_session.time.sleep(0.01)
-            self.assertTrue(proc.kill.called)
-            self.assertTrue(handle.stalled["hit"])
-            stream.emit.assert_called()
-            stream.flush.assert_called()
-        finally:
-            handle.stop(timeout=1)
+        def stop_tree(child, timeout):
+            self.assertIs(child, proc)
+            proc.returncode = -1
+            proc.poll.return_value = -1
+            stopped.set()
+
+        with mock.patch.object(ytdlp_session.PROCESS_REGISTRY,
+                               "terminate_process", side_effect=stop_tree) as stop:
+            handle = ytdlp_session.start_download_watchdog(
+                proc, stream, kill_sec=-1, poll_interval=0.01)
+            try:
+                self.assertTrue(stopped.wait(1))
+                self.assertIsNotNone(proc.poll())
+                stop.assert_called_once_with(proc, timeout=1.0)
+                self.assertTrue(handle.stalled["hit"])
+                stream.emit.assert_called()
+                stream.flush.assert_called()
+            finally:
+                handle.stop(timeout=1)
 
     def test_download_watchdog_handle_can_join_thread(self) -> None:
         proc = mock.Mock()
@@ -9355,18 +9378,22 @@ class YtDlpSessionTests(unittest.TestCase):
     def test_finish_ytdlp_process_escalates_after_timeout(self) -> None:
         proc = mock.Mock()
         proc.returncode = None
+        proc.poll.return_value = None
         proc.wait.side_effect = [
             ytdlp_session.subprocess.TimeoutExpired("yt-dlp", 10),
             ytdlp_session.subprocess.TimeoutExpired("yt-dlp", 5),
             None,
         ]
 
-        ytdlp_session.finish_ytdlp_process(proc)
+        with mock.patch.object(ytdlp_session.PROCESS_REGISTRY,
+                               "terminate_process", side_effect=OSError("tree stop failed")):
+            ytdlp_session.finish_ytdlp_process(proc)
 
         proc.terminate.assert_called_once()
         proc.kill.assert_called_once()
-        self.assertEqual(proc.wait.call_args_list[-1],
-                         mock.call(timeout=2.0))
+        cleanup_waits = [call.kwargs["timeout"] for call in proc.wait.call_args_list[1:]]
+        self.assertEqual(len(cleanup_waits), 2)
+        self.assertTrue(all(0 <= timeout <= 7 for timeout in cleanup_waits))
 
 
 class ConfigTests(unittest.TestCase):
@@ -9824,130 +9851,10 @@ class FrontendShortcutSourceTests(unittest.TestCase):
             self.assertIn(f'key === "{letter}"', shortcuts)
 
 
-class FrontendBrowseSourceTests(unittest.TestCase):
-    def test_ytdlp_updates_are_interval_based_and_idle_automatic(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        health = (root / "web" / "partials" / "tab-health.html").read_text(
-            encoding="utf-8")
-        preferences = (
-            root / "web" / "partials" / "tab-settings.html"
-        ).read_text(encoding="utf-8")
-        settings = (root / "web" / "settingsTab.js").read_text(
-            encoding="utf-8")
+class FrontendMarkupStructureTests(unittest.TestCase):
+    """Static product-copy contract; interaction behavior lives in browser tests."""
 
-        self.assertNotIn('id="settings-ytdlp-update-mode"', health)
-        self.assertIn('id="settings-ytdlp-update-mode"', preferences)
-        self.assertIn('value="automatic"', preferences)
-        self.assertIn('value="notify"', preferences)
-        self.assertIn('value="off"', preferences)
-        self.assertIn('id="settings-ytdlp-check-days"', preferences)
-        self.assertIn("Installs when YouTube work is idle", preferences)
-        self.assertNotIn("At launch every", preferences)
-        self.assertIn(
-            'persistControl(e.target, "ytdlp_update_mode"', settings)
-        self.assertIn('_ytdlpUpdateMode === "off"', settings)
-        self.assertIn("Update interval must be 1–365 days", settings)
-        self.assertIn("no restart required", settings)
-        self.assertIn("window._onYtdlpUpdateStatus", settings)
-
-    def test_detailed_index_stats_populate_sidebar_only_when_requested(
-            self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        browse = (root / "web" / "browseContent.js").read_text(
-            encoding="utf-8")
-        controls = (root / "web" / "indexControls.js").read_text(
-            encoding="utf-8")
-
-        self.assertNotIn('bridgeCall("get_index_db_stats"', browse)
-        self.assertIn('bridgeCall("get_index_db_stats"', controls)
-        self.assertIn('window._applyIndexDbStats = applyIndexDbStats', controls)
-        self.assertIn('"search-stat-segments"', controls)
-
-    def test_channel_menu_promotes_edit_groups_metadata_and_exposes_resume(
-            self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        menu = (root / "web" / "browseContextMenus.js").read_text(
-            encoding="utf-8")
-
-        sync_pos = menu.index('{ label: "Sync now"')
-        edit_pos = menu.index('{ label: "Edit settings"', sync_pos)
-        metadata_pos = menu.index('{ label: "Metadata"', edit_pos)
-        repair_pos = menu.index('{ label: "Repair missing thumbnails"',
-                                metadata_pos)
-        self.assertLess(sync_pos, edit_pos)
-        self.assertLess(edit_pos, metadata_pos)
-        self.assertLess(metadata_pos, repair_pos)
-        self.assertIn('{ label: "Refresh views & likes"', menu)
-        self.assertIn('{ label: "Refresh comments"', menu)
-        self.assertIn("Continue redownload at ${_redownloadResLabel}", menu)
-        self.assertIn('api?.chan_redownload?.(', menu)
-
-    def test_add_channel_still_offers_immediate_sync(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        editor = (root / "web" / "editChannel.js").read_text(
-            encoding="utf-8")
-
-        self.assertIn("if (wasAdd && addedChannelName)", editor)
-        self.assertIn('window.askConfirm("Channel added", syncSummary', editor)
-        self.assertIn('bridgeCall("sync_one_channel"', editor)
-        refresh = editor[editor.index("async function refreshSubsTable"):]
-        self.assertIn("window._primeBrowse(data[0]);", refresh)
-        self.assertNotIn("await window._primeBrowse(data[0]);", refresh)
-
-    def test_dense_view_context_toggle_persists_and_is_shared(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        browse_view = (root / "web" / "browseView.js").read_text(
-            encoding="utf-8")
-        editor = (root / "web" / "editChannel.js").read_text(
-            encoding="utf-8")
-
-        self.assertIn('addEventListener("contextmenu"', browse_view)
-        self.assertIn("window._denseSubsContextMenuItem?.()", browse_view)
-        self.assertIn('label: "View Dense Subs List"', editor)
-        self.assertIn("checked: !!window._legacySubsTabEnabled", editor)
-        self.assertIn('bridgeCall("settings_save"', editor)
-        self.assertIn("legacy_subs_tab: useDense", editor)
-        self.assertIn('mainSubsTab?.addEventListener("contextmenu"', editor)
-
-    def test_browse_edit_forces_modern_channel_dialog(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        editor = (root / "web" / "editChannel.js").read_text(
-            encoding="utf-8")
-        menu = (root / "web" / "browseContextMenus.js").read_text(
-            encoding="utf-8")
-        content = (root / "web" / "browseContent.js").read_text(
-            encoding="utf-8")
-
-        self.assertIn("window._editChannelFromBrowse =", editor)
-        self.assertIn("{ forceModern: true }", editor)
-        self.assertIn("window._editChannelFromBrowse?.(name)", menu)
-        self.assertIn("window._editChannelFromBrowse?.(name)", content)
-
-    def test_channel_menu_visually_groups_primary_actions(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        menu = (root / "web" / "browseContextMenus.js").read_text(
-            encoding="utf-8")
-        context_menu = (root / "web" / "contextMenu.js").read_text(
-            encoding="utf-8")
-
-        self.assertIn('{ header: "Open & manage" }', menu)
-        self.assertIn('{ header: "Maintenance" }', menu)
-        self.assertIn('label: "Open videos", cls: "primary"', menu)
-        self.assertIn('label: "Sync now", cls: "primary"', menu)
-        self.assertIn("typeof it.checked === \"boolean\"", context_menu)
-        self.assertIn('row.setAttribute("role", "menuitemcheckbox")',
-                      context_menu)
-
-    def test_empty_channel_grid_has_first_channel_call_to_action(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        grids = (root / "web" / "browseGrids.js").read_text(
-            encoding="utf-8")
-
-        self.assertIn('welcome.className = "browse-first-channel"', grids)
-        self.assertIn('title.textContent = "Add your first channel"', grids)
-        self.assertIn("window._openAddChannelEditor?.(\"\")", grids)
-
-    def test_compact_subs_setting_uses_current_product_copy(self) -> None:
+    def test_static_compact_subs_setting_uses_current_product_copy(self) -> None:
         root = Path(__file__).resolve().parents[1]
         settings = (root / "web" / "partials" / "tab-settings.html").read_text(
             encoding="utf-8")
@@ -10116,54 +10023,7 @@ class OnboardingMixinServicesTests(unittest.TestCase):
 
 
 class QueueMixinServicesTests(unittest.TestCase):
-    def test_session_error_clear_drives_native_error_indicator(self) -> None:
-        source = (
-            Path(__file__).resolve().parents[1] / "web" / "statusBar.js"
-        ).read_text(encoding="utf-8")
-        clear_block = source[
-            source.index('getElementById("gsb-errors-clear")'):
-            source.index('getElementById("gsb-errors-open-log")')
-        ]
-
-        self.assertIn('"app_session_errors_changed"', source)
-        self.assertIn("_syncNativeErrorIndicator();", clear_block)
-        self.assertIn("_errorCount = 0;", clear_block)
-
-    def test_footer_traffic_counter_refreshes_on_queue_edges(self) -> None:
-        source = (
-            Path(__file__).resolve().parents[1] / "web" / "statusBar.js"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn("_requestTrafficRefresh(0);", source)
-        self.assertIn("setInterval(_refreshTraffic, 5000)", source)
-        self.assertIn("_trafficRefreshPending = true", source)
-        self.assertNotIn("setInterval(refreshTraffic, 15000)", source)
-
-    def test_sync_task_blink_parks_for_both_youtube_limit_holds(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        blink_source = (root / "web" / "queueBlink.js").read_text(
-            encoding="utf-8")
-        main_source = (root / "main.py").read_text(encoding="utf-8")
-
-        self.assertIn(
-            "s.trafficWaiting || s.sessionLimited", blink_source)
-        self.assertIn(
-            "!_isYouTubeLimitHold(_blinkState.sync)", blink_source)
-        self.assertIn(
-            "if (_isYouTubeLimitHold(s) && (s.running || s.count > 0))",
-            blink_source)
-        self.assertIn('"sessionLimited": _session_limited', main_source)
-
-    def test_popover_pause_button_uses_only_custom_tooltip(self) -> None:
-        source = (
-            Path(__file__).resolve().parents[1] / "web" / "queueBlink.js"
-        ).read_text(encoding="utf-8")
-        helper = source[source.index("function _paintPopoverPauseBtn"):
-                        source.index("// Publish the public surface")]
-
-        self.assertIn('btn.setAttribute("data-tooltip", tip)', helper)
-        self.assertIn('btn.removeAttribute("title")', helper)
-        self.assertNotIn("btn.title =", helper)
+    # Queue/footer interactions are exercised in deep-behavior-contracts.spec.js.
 
     def test_queue_mixin_prefers_app_services_dependencies(self) -> None:
         saved: list[dict] = []
@@ -10531,7 +10391,7 @@ class TranscribeMixinServicesTests(unittest.TestCase):
         saved: list[dict] = []
         service_transcribe = mock.Mock()
         service_transcribe.swap_model.return_value = True
-        service_transcribe.enqueue.return_value = True
+        service_transcribe.enqueue_result.return_value = EnqueueResult(EnqueueStatus.ACCEPTED)
         service_transcribe.queue_size.return_value = 7
         service_transcribe.current_model.return_value = "small"
         service_transcribe.is_available.return_value = True
@@ -10569,7 +10429,7 @@ class TranscribeMixinServicesTests(unittest.TestCase):
             r"C:\missing.mp4", "Missing")
 
         self.assertTrue(enqueue_result["ok"])
-        service_transcribe.enqueue.assert_called_once_with(
+        service_transcribe.enqueue_result.assert_called_once_with(
             r"C:\video.mp4", "Video", channel="",
             requested_model="medium")
         api._on_queue_changed.assert_called_once()
@@ -11205,12 +11065,6 @@ class SyncMixinQueueTests(unittest.TestCase):
 
 class IndexGraphShapeTests(unittest.TestCase):
     def test_graph_multi_hoists_week_backfill_pending_count(self) -> None:
-        fake_conn = object()
-
-        class FakeIndex:
-            def _reader_open(self):
-                return fake_conn
-
         calls = []
 
         def _fake_graph(word: str, channel=None, bucket: str = "month",
@@ -11218,9 +11072,7 @@ class IndexGraphShapeTests(unittest.TestCase):
             calls.append(_backfill_pending)
             return {"labels": ["2026-W01"], "values": [1]}
 
-        with mock.patch.object(index_graph, "_index",
-                               return_value=FakeIndex()), \
-                mock.patch.object(index_graph, "_week_backfill_pending",
+        with mock.patch.object(index_graph, "_week_backfill_pending",
                                   return_value=42) as pending, \
                 mock.patch.object(index_graph, "graph_word_frequency",
                                   side_effect=_fake_graph):
@@ -11229,7 +11081,7 @@ class IndexGraphShapeTests(unittest.TestCase):
 
         self.assertEqual(out["labels"], ["2026-W01"])
         self.assertEqual(calls, [42, 42])
-        pending.assert_called_once_with(fake_conn)
+        pending.assert_called_once_with()
 
     def test_top_words_cache_reuses_result_until_invalidated(self) -> None:
         class FakeConn:
@@ -11246,7 +11098,10 @@ class IndexGraphShapeTests(unittest.TestCase):
         conn = FakeConn()
 
         class FakeIndex:
-            def _open_independent(self):
+            def catalog_session(self):
+                return self
+
+            def open_independent(self):
                 return conn
 
         index_graph.invalidate_top_words_cache()
@@ -11276,7 +11131,10 @@ class IndexGraphShapeTests(unittest.TestCase):
         conn = FakeConn()
 
         class FakeIndex:
-            def _open_independent(self):
+            def catalog_session(self):
+                return self
+
+            def open_independent(self):
                 return conn
 
         index_graph.invalidate_top_words_cache()

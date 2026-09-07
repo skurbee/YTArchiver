@@ -69,7 +69,9 @@ def test_silent_download_still_times_out():
     "https://www.youtube.com/watch?v=abcDEF12345&feature=share",
 ])
 @pytest.mark.parametrize("date_file", [True, False])
-def test_manual_download_normalization_date_and_idle_timeout(tmp_path, monkeypatch, url, date_file):
+@pytest.mark.parametrize("output_complete", [True, False])
+def test_manual_download_normalization_date_and_idle_timeout(
+        tmp_path, monkeypatch, url, date_file, output_complete):
     api = archive_mixin.ArchiveMixin()
     api._log_stream = mock.Mock()
     api._window = None
@@ -82,9 +84,11 @@ def test_manual_download_normalization_date_and_idle_timeout(tmp_path, monkeypat
     monkeypatch.setattr(archive_mixin.sync_backend, "find_yt_dlp", lambda: "yt-dlp")
     monkeypatch.setattr(archive_mixin.sync_backend, "build_format_string", lambda _r: "best")
     monkeypatch.setattr(archive_mixin.sync_backend, "_find_cookie_source", list)
-    monkeypatch.setattr(archive_mixin.sync_backend, "_record_recent_download", lambda *a, **k: True)
+    record_recent = mock.Mock(return_value=True)
+    monkeypatch.setattr(archive_mixin.sync_backend, "_record_recent_download", record_recent)
     monkeypatch.setattr(archive_mixin.youtube_traffic, "acquire", lambda *a, **k: {"ok": True})
-    monkeypatch.setattr(archive_mixin, "commit_download", lambda *a, **k: SimpleNamespace(ok=True))
+    commit = mock.Mock(return_value=SimpleNamespace(ok=True))
+    monkeypatch.setattr(archive_mixin, "commit_download", commit)
     monkeypatch.setattr(archive_mixin, "popen_ytdlp", lambda cmd, **k: commands.append(cmd) or mock.Mock())
 
     def supervise(_proc, **kwargs):
@@ -98,7 +102,7 @@ def test_manual_download_normalization_date_and_idle_timeout(tmp_path, monkeypat
         for line in [f"[download] Destination: {media}",
                      "DLTRACK:::Manual:::Channel:::20200102:::5:::60:::abcDEF12345"]:
             kwargs["on_stdout_line"](line)
-        return StreamingRunResult(0, [])
+        return StreamingRunResult(0, [], output_complete=output_complete)
 
     monkeypatch.setattr(archive_mixin, "supervise_streaming_process", supervise)
     monkeypatch.setattr(archive_mixin, "start_managed_task", lambda _api, **k: k["target"]())
@@ -109,6 +113,19 @@ def test_manual_download_normalization_date_and_idle_timeout(tmp_path, monkeypat
     assert seen_status[0]["task_id"] == result["task_id"]
     assert api.archive_single_status()["tasks"] == []
     final_path = tmp_path / "Manual.mp4"
+    if not output_complete:
+        # A truncated pipe can deliver a valid completion line before failing.
+        # Zero exit status must not authorize promotion, history, or follow-ups.
+        retained = tmp_path / "Manual [abcDEF12345].mp4"
+        assert retained.read_bytes() == b"video"
+        assert retained.with_suffix(".info.json").exists()
+        assert not final_path.exists()
+        commit.assert_not_called()
+        record_recent.assert_not_called()
+        api._push_url_history.assert_not_called()
+        assert "failed (download tool output was incomplete" in str(api._log_stream.emit.call_args_list)
+        assert not api.archive_single_is_running()
+        return
     if date_file:
         assert time.strftime("%Y%m%d", time.localtime(final_path.stat().st_mtime)) == "20200102"
     else:

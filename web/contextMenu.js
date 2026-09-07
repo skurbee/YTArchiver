@@ -28,6 +28,7 @@
 
   window.YT = window.YT || {};
   const YT = window.YT;
+  let active = null;
 
   function invokeAction(action) {
     if (typeof action !== "function") return;
@@ -170,7 +171,7 @@
         row.addEventListener("click", (event) => {
           event.stopPropagation();
           if (it.disabled) return;
-          closeContextMenu();
+          closeContextMenu(true);
           invokeAction(it.action);
         });
       }
@@ -179,7 +180,7 @@
     }
   }
 
-  function showContextMenu(x, y, items) {
+  function showContextMenu(x, y, items, options = {}) {
     closeContextMenu();
     const root = document.getElementById("ctx-menu-root");
     if (!root) {
@@ -187,20 +188,23 @@
       return;
     }
     const menu = document.createElement("div");
-    menu.className = "ctx-menu";
+    menu.className = "ctx-menu" + (options.className ? ` ${options.className}` : "");
     menu.setAttribute("role", "menu");
     menu.tabIndex = -1;
     menu.style.left = x + "px";
     menu.style.top = y + "px";
     appendMenuItems(menu, items);
     root.appendChild(menu);
+    const session = { menu, controller: new AbortController(), timer: null,
+      returnFocus: options.returnFocus || null };
+    active = session;
     // Clamp to viewport
     const r = menu.getBoundingClientRect();
     if (r.right > window.innerWidth) {
-      menu.style.left = (window.innerWidth - r.width - 4) + "px";
+      menu.style.left = Math.max(4, window.innerWidth - r.width - 4) + "px";
     }
     if (r.bottom > window.innerHeight) {
-      menu.style.top = (window.innerHeight - r.height - 4) + "px";
+      menu.style.top = Math.max(4, window.innerHeight - r.height - 4) + "px";
     }
     // Keep the root menu anchored near the click/button; flip flyout
     // submenus left only when a right-opening submenu would leave the
@@ -208,17 +212,37 @@
     menu.querySelectorAll(".ctx-submenu-wrap")
       .forEach((wrap) => positionSubmenu(wrap));
     const first = menu.querySelector(".ctx-menu-item:not(.disabled)");
-    if (first) setTimeout(() => first.focus(), 0);
-    setTimeout(() => {
-      document.addEventListener("click", closeContextMenu, { once: true });
-      document.addEventListener("keydown", onCtxKey);
+    session.timer = setTimeout(() => {
+      if (active !== session) return;
+      first?.focus();
+      const signal = session.controller.signal;
+      document.addEventListener("pointerdown", event => {
+        if (!menu.contains(event.target)) closeContextMenu();
+      }, { signal });
+      document.addEventListener("click", event => {
+        if (!menu.contains(event.target)) closeContextMenu();
+      }, { signal });
+      document.addEventListener("keydown", onCtxKey, { capture: true, signal });
+      window.addEventListener("resize", () => closeContextMenu(), { signal });
+      window.addEventListener("scroll", event => {
+        if (!menu.contains(event.target)) closeContextMenu();
+      }, { capture: true, signal });
     }, 0);
   }
 
-  function closeContextMenu() {
+  function closeContextMenu(restoreFocus = false) {
+    const previous = active;
+    active = null;
+    if (previous) {
+      clearTimeout(previous.timer);
+      previous.controller.abort();
+    }
     const root = document.getElementById("ctx-menu-root");
     if (root) root.innerHTML = "";
     document.removeEventListener("keydown", onCtxKey);
+    if (restoreFocus === true && previous?.returnFocus?.isConnected) {
+      previous.returnFocus.focus();
+    }
   }
 
   function onCtxKey(e) {
@@ -227,14 +251,15 @@
     // open underneath the context menu.
     if (e.key === "Escape") {
       e.stopPropagation();
-      closeContextMenu();
+      e.preventDefault();
+      closeContextMenu(true);
       return;
     }
     if (e.key === "Tab") {
       closeContextMenu();
       return;
     }
-    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
       const root = document.getElementById("ctx-menu-root");
       const cur = document.activeElement;
       const currentMenu = cur?.closest?.(".ctx-submenu")
@@ -250,7 +275,7 @@
       e.preventDefault();
       const idx = items.indexOf(cur);
       const dir = e.key === "ArrowDown" ? 1 : -1;
-      const next = idx === -1
+      const next = e.key === "Home" ? 0 : e.key === "End" ? items.length - 1 : idx === -1
         ? 0
         : (idx + dir + items.length) % items.length;
       items[next].focus();

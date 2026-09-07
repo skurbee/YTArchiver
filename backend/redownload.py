@@ -25,7 +25,7 @@ from . import youtube_traffic
 from .log import get_logger
 from .log_stream import LogStreamer
 from .net import block_if_down
-from .process_runner import popen_ytdlp
+from .process_runner import CancellationSignals, popen_ytdlp, supervise_streaming_process
 from .services.channel_leases import (
     LeaseOwner,
     canonical_path,
@@ -449,90 +449,64 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
         return {}
     result: dict[str, str] = {}
     last_page = 0
-    try:
-        for raw in proc.stdout:
-            if cancel_ev.is_set():
-                proc.terminate()
-                break
-            # honor pause_ev during the catalog walk. Without
-            # this, a paused user has to wait until the full playlist
-            # enumeration completes (minutes on a 10k-video channel)
-            # before the pause actually acts. Mirrors the pause-wait
-            # pattern used in the download loop at lines ~651-666.
-            if pause_ev is not None and pause_ev.is_set():
-                if queues is not None:
-                    try: queues.set_sync_paused_active(True)
-                    except Exception as e: _log.debug("swallowed: %s", e)
-                while (pause_ev.is_set() and not cancel_ev.is_set()):
-                    time.sleep(0.25)
-                if queues is not None:
-                    try: queues.set_sync_paused_active(False)
-                    except Exception as e: _log.debug("swallowed: %s", e)
-            if cancel_ev.is_set():
-                # Close stdout BEFORE terminate so a full pipe doesn't
-                # leave the child blocked on write while we wait for
-                # it to die (audit: redownload.py:152-188). Without
-                # this, terminate() on Windows could hang for the
-                # full 300s wait-timeout.
-                try:
-                    if proc.stdout is not None:
-                        proc.stdout.close()
-                except Exception: pass
-                try: proc.terminate()
-                except Exception: pass
-                break
-            line = raw.strip()
-            try:
-                from .youtube_session import handle_youtube_failure_text
-                _yt_failure = handle_youtube_failure_text(
-                    line,
-                    context="fetching a redownload catalog",
-                    stream=stream,
-                    pause_event=pause_ev,
-                    queues=queues,
-                )
-            except Exception as _guard_error:
-                _log.debug("redownload catalog guard failed: %s", _guard_error)
-                _yt_failure = ""
-            if _yt_failure:
-                try: proc.terminate()
-                except Exception: pass
-                break
-            if "|||" in line:
-                vid_id, title = line.split("|||", 1)
-                vid_id = vid_id.strip()
-                title = title.strip()
-                if re.fullmatch(r'[A-Za-z0-9_-]{11}', vid_id):
-                    _prev = result.get(title)
-                    if _prev is not None and _prev != vid_id:
-                        # Duplicate title with a DIFFERENT id (weekly
-                        # shows, reuploads, 'Q&A'): last-wins used to
-                        # silently bind title-matched files to whichever
-                        # id enumerated last — the wrong-content-replace
-                        # class. Empty string = ambiguous sentinel; the
-                        # matcher refuses exact-title binding for these.
-                        result[title] = ""
-                    elif _prev is None:
-                        result[title] = vid_id
-            else:
-                pm = _PAGE_RE.search(line)
-                if pm:
-                    pg = int(pm.group(1))
-                    if pg >= last_page + 10:
-                        last_page = pg
-                        stream.emit([["  \u2014", "simpleline_redwnl"],
-                                     [f" Scanning catalog (page {pg})\u2026\n",
-                                      "simpleline"]])
-    finally:
+    abort = threading.Event()
+
+    def _on_catalog_line(raw: str) -> None:
+        nonlocal last_page
+        line = raw.strip()
         try:
-            proc.wait(timeout=300)
-        except Exception:
-            try: proc.kill()
-            except Exception as e: _log.debug("swallowed: %s", e)
-            # Second wait after kill so Windows releases the handle
-            # immediately rather than leaking it until GC.
-            try: proc.wait(timeout=5)
-            except Exception as e: _log.debug("swallowed: %s", e)
+            from .youtube_session import handle_youtube_failure_text
+            _yt_failure = handle_youtube_failure_text(
+                line,
+                context="fetching a redownload catalog",
+                stream=stream,
+                pause_event=pause_ev,
+                queues=queues,
+            )
+        except Exception as _guard_error:
+            _log.debug("redownload catalog guard failed: %s", _guard_error)
+            _yt_failure = ""
+        if _yt_failure:
+            abort.set()
+            return
+        if "|||" in line:
+            vid_id, title = line.split("|||", 1)
+            vid_id = vid_id.strip()
+            title = title.strip()
+            if re.fullmatch(r'[A-Za-z0-9_-]{11}', vid_id):
+                _prev = result.get(title)
+                if _prev is not None and _prev != vid_id:
+                    # Duplicate title with a DIFFERENT id (weekly
+                    # shows, reuploads, 'Q&A'): last-wins used to
+                    # silently bind title-matched files to whichever
+                    # id enumerated last — the wrong-content-replace
+                    # class. Empty string = ambiguous sentinel; the
+                    # matcher refuses exact-title binding for these.
+                    result[title] = ""
+                elif _prev is None:
+                    result[title] = vid_id
+        else:
+            pm = _PAGE_RE.search(line)
+            if pm:
+                pg = int(pm.group(1))
+                if pg >= last_page + 10:
+                    last_page = pg
+                    stream.emit([["  \u2014", "simpleline_redwnl"],
+                                 [f" Scanning catalog (page {pg})\u2026\n",
+                                  "simpleline"]])
+
+    def _pause_changed(paused: bool) -> None:
+        if queues is not None:
+            queues.set_sync_paused_active(paused)
+
+    run_result = supervise_streaming_process(
+        proc, on_stdout_line=_on_catalog_line,
+        cancel_event=CancellationSignals(cancel_ev, abort),
+        pause_event=pause_ev, on_pause_change=_pause_changed,
+        exit_timeout=300.0, role="redownload-catalog",
+    )
+    if run_result.returncode != 0 or not run_result.output_complete:
+        return {}
     return result
 
 
@@ -1243,14 +1217,11 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
                       "red"]])
         return None
     dest: str | None = None
-    _cancelled = False
     _raw_output: list[str] = []
-    for raw in proc.stdout:
-        if cancel_ev.is_set():
-            try: proc.terminate()
-            except Exception as e: _log.debug("swallowed: %s", e)
-            _cancelled = True
-            break
+    abort = threading.Event()
+
+    def _on_download_line(raw: str) -> None:
+        nonlocal dest, _raw_output
         line = raw.rstrip()
         if line:
             _raw_output.append(line)
@@ -1268,24 +1239,20 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
             _log.debug("redownload guard failed: %s", _guard_error)
             _yt_failure = ""
         if _yt_failure:
-            try: proc.terminate()
-            except Exception: pass
-            break
+            abort.set()
+            return
         if "[Merger]" in line and "Merging formats into" in line:
             m = re.search(r'"([^"]+)"', line)
             if m: dest = m.group(1)
         elif line.startswith("[download] Destination:"):
             dest = line.split("Destination:", 1)[1].strip()
-    try: proc.wait(timeout=10)
-    except Exception:
-        try: proc.kill()
-        except Exception as e: _log.debug("swallowed: %s", e)
-        # Second wait after kill so Windows releases the proc handle
-        # promptly. Repeated download failures without this leaked
-        # one handle per failure until GC (audit: redownload.py:
-        # 605-608).
-        try: proc.wait(timeout=5)
-        except Exception as e: _log.debug("swallowed: %s", e)
+
+    run_result = supervise_streaming_process(
+        proc, on_stdout_line=_on_download_line,
+        cancel_event=CancellationSignals(cancel_ev, abort),
+        role="redownload-video",
+    )
+    _cancelled = cancel_ev.is_set()
     # Patch C: surface non-zero returncode so silent failures are
     # visible. yt-dlp emits its actual error message on stderr, which
     # was being merged into stdout via STDOUT redirection above (line
@@ -1330,8 +1297,9 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
         except OSError:
             pass
         return None
-    if proc.returncode != 0:
+    if run_result.returncode != 0 or not run_result.output_complete:
         return None
+
     # If yt-dlp produced a different extension after merge (e.g. .mkv),
     # locate the real file. OLD's scan pattern (YTArchiver.py:10035).
     if not os.path.isfile(dl_path):

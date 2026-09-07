@@ -133,7 +133,8 @@
       row?.classList.add("selected");
       row?.setAttribute("aria-selected", "true");
       _selectedRoot = path || null;
-      if (bRemove) bRemove.disabled = !path || row?.classList.contains("auto");
+      if (bRemove) bRemove.disabled = bRemove.dataset.pending === "true"
+        || !path || row?.classList.contains("auto");
     };
 
     const saveSettingsChecked = async (payload, label) => {
@@ -318,41 +319,18 @@
     });
 
     bRemove?.addEventListener("click", async () => {
-      if (!_selectedRoot) {
+      const removing = _selectedRoot;
+      if (!removing) {
         window._showToast?.("Select an additional archive folder first.", "warn");
         return;
       }
       if (!nativeBridgeUp()) return;
+      if (bRemove.dataset.pending === "true") return;
+      bRemove.dataset.pending = "true";
+      bRemove.disabled = true;
       try {
-        const s = await bridgeCall("settings_load");
-        if (!s || !Array.isArray(s.tp_archive_roots)) {
-          throw new Error("Archive folder settings could not be loaded.");
-        }
-        const outDir = (s?.output_dir || "").trim();
-        if (_pathKey(_selectedRoot) === _pathKey(outDir)) {
-          window._showToast?.(
-            "The primary archive folder can't be removed here. " +
-            "Change it under Archive folder in Settings.", "warn");
-          return;
-        }
-        const originalExtras = [...(s?.tp_archive_roots || [])];
-        if (!originalExtras.some(
-            path => _pathKey(path) === _pathKey(_selectedRoot))) {
-          _selectedRoot = null;
-          await renderRoots();
-          throw new Error("That folder is no longer in Settings.");
-        }
-        const extras = originalExtras.filter(
-          r => _pathKey(r) !== _pathKey(_selectedRoot));
-        const removing = _selectedRoot;
-        await saveSettingsChecked(
-          { tp_archive_roots: extras }, "Archive folders");
-        const removed = await bridgeCall("index_remove_archive_root", removing);
+        const removed = await bridgeCall("archive_root_remove", removing);
         if (!removed?.ok) {
-          // Keep Settings and Search consistent if catalog cleanup could not
-          // obtain its writer lease or failed for any other reason.
-          await saveSettingsChecked(
-            { tp_archive_roots: originalExtras }, "Archive folders");
           throw new Error(removed?.error || "Search cleanup failed.");
         }
         _selectedRoot = null;
@@ -363,6 +341,10 @@
         window._refreshMetadataTab?.({ force: true });
       } catch (e) {
         window._showToast?.("Could not remove the archive folder: " + e, "error");
+      } finally {
+        delete bRemove.dataset.pending;
+        const selected = rootsList?.querySelector(".root-entry.selected");
+        bRemove.disabled = !_selectedRoot || !!selected?.classList.contains("auto");
       }
     });
 

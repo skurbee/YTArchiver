@@ -13,6 +13,7 @@ import uuid
 
 from backend.services.job_supervisor import WorkAdmissionClosed
 from backend.services.managed_work import start_managed_task
+from backend.services.processing_defaults import WHISPER_MODELS, change_default_model
 from backend.ytarchiver_config import load_config
 
 from ._shared import _api_err, _log
@@ -63,7 +64,7 @@ class TranscribeMixin:
 
     # ─── Transcribe ─────────────────────────────────────────────────────
 
-    _WHISPER_MODELS = {"tiny", "small", "medium", "large-v3"}
+    _WHISPER_MODELS = WHISPER_MODELS
 
     def _apply_runtime_whisper_model(self, model):
         """Validate and snapshot a model for jobs about to be queued.
@@ -108,9 +109,9 @@ class TranscribeMixin:
         if not model_result.get("ok"):
             return model_result
         try:
-            ok = self._transcribe_manager().enqueue(
+            response = self._transcribe_manager().enqueue_result(
                 path, title, channel=_channel,
-                requested_model=model_result.get("model", ""))
+                requested_model=model_result.get("model", "")).api_payload()
         except Exception as _e:
             # surface the error instead of the silent
             # {ok: False} that the old code returned. Caller can
@@ -124,7 +125,7 @@ class TranscribeMixin:
             self._on_queue_changed()
         except Exception as e:
             _log.debug("swallowed: %s", e)
-        return {"ok": ok}
+        return response
 
 
     def transcribe_folder(self, model=""):
@@ -303,9 +304,25 @@ class TranscribeMixin:
         return {"ok": True, "started": True}
 
 
+    def transcribe_request_retranscription(self, request):
+        """Accept one immutable UI request with explicit model and identity."""
+        if not isinstance(request, dict):
+            return {"ok": False, "error": "Invalid transcription request"}
+        request_id = request.get("request_id")
+        model = request.get("model")
+        if (not isinstance(request_id, str) or not request_id
+                or len(request_id) > 128 or model not in self._WHISPER_MODELS):
+            return {"ok": False, "error": "Invalid transcription model or request ID"}
+        for name in ("path", "title", "video_id"):
+            if not isinstance(request.get(name, ""), str):
+                return {"ok": False, "error": "Invalid transcription request"}
+        return self.transcribe_retranscribe(
+            request.get("path", ""), request.get("title", ""),
+            request.get("video_id", ""), model=model, request_id=request_id)
+
     def transcribe_retranscribe(self, path, title="", video_id="",
                                  _on_complete_extra=None, *,
-                                 _log_queued=True, model=""):
+                                 _log_queued=True, model="", request_id=""):
         """Queue a re-transcription of a video with the current Whisper model.
         Mirrors YTArchiver.py:16369 `_run_retranscribe_job`.
 
@@ -407,13 +424,11 @@ class TranscribeMixin:
         _self = self
         _vid = vid_id
         _path = os.path.normpath(path)
+        _request_id = request_id or uuid.uuid4().hex
 
         def _push_runtime_state(value):
             """Publish a non-success processing state to the Watch view."""
             try:
-                if _self._window is None:
-                    return
-                import json as _json
                 state_payload = dict(value) if isinstance(value, dict) else {
                     "state": str(value or ""),
                 }
@@ -421,10 +436,8 @@ class TranscribeMixin:
                     state_payload["video_id"] = _vid
                 if not state_payload.get("filepath"):
                     state_payload["filepath"] = _path
-                payload = _json.dumps(state_payload)
-                _self._window.evaluate_js(
-                    f"if (window._onRetranscribeState) "
-                    f"window._onRetranscribeState({payload});")
+                state_payload["request_id"] = _request_id
+                _self._transcribe_log_stream().emit_processing(state_payload)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
 
@@ -446,21 +459,13 @@ class TranscribeMixin:
                 })
             else:
                 try:
-                    if _self._window is not None:
-                        import json as _json
-                        complete_payload = {
-                            "video_id": _vid,
-                            "filepath": _path,
-                        }
-                        if (isinstance(_result, dict)
-                                and _result.get(
-                                    "_existing_transcript_kept")):
-                            complete_payload[
-                                "existing_transcript_kept"] = True
-                        payload = _json.dumps(complete_payload)
-                        _self._window.evaluate_js(
-                            f"if (window._onRetranscribeComplete) "
-                            f"window._onRetranscribeComplete({payload});")
+                    complete_payload = {
+                        "kind": "complete", "request_id": _request_id,
+                        "video_id": _vid, "filepath": _path,
+                    }
+                    if isinstance(_result, dict) and _result.get("_existing_transcript_kept"):
+                        complete_payload["existing_transcript_kept"] = True
+                    _self._transcribe_log_stream().emit_processing(complete_payload)
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
             # Extra hook for callers (e.g. _handle_retranscribe model
@@ -506,7 +511,8 @@ class TranscribeMixin:
                     "simpleline_blue")
             except Exception:
                 pass
-        return {"ok": ok, "video_id": vid_id}
+        return {"ok": ok, "video_id": vid_id, "request_id": _request_id,
+                "task_id": getattr(ok, "task_id", "")}
 
 
     def transcribe_queue_size(self):
@@ -555,35 +561,23 @@ class TranscribeMixin:
         to do with that [settings default] and should have no influence
         on that setting."
         """
-        if not new_model or new_model not in ("tiny", "small", "medium", "large-v3"):
-            return {"ok": False, "error": "Unsupported model"}
-        ok = self._transcribe_manager().swap_model(new_model)
-        persisted = False
-        if ok and persist:
-            # Acquire the same settings_save lock so a parallel
-            # settings_save can't load_config, see the OLD whisper
-            # model, mutate, and clobber our write (audit:
-            # transcribe_mixin.py:212-239).
-            try:
-                from backend.api_mixins.settings_mixin import SettingsMixin
-                _lock = SettingsMixin._settings_save_lock
-            except Exception:
-                _lock = None
-            try:
-                if _lock is not None:
-                    with _lock:
-                        self._transcribe_update_config(
-                            lambda cfg: cfg.__setitem__(
-                                "whisper_model", new_model))
-                else:
-                    self._transcribe_update_config(
-                        lambda cfg: cfg.__setitem__(
-                            "whisper_model", new_model))
-                self._reload_config()
-                persisted = True
-            except Exception as e:
-                _log.warning("whisper default save failed: %s", e)
-        return {"ok": ok, "model": new_model, "persisted": persisted}
+        admission = getattr(self, "_work_admission_error", None)
+        if callable(admission):
+            blocked = admission("a processing model change")
+            if blocked is not None:
+                return blocked
+
+        def commit_model():
+            _result, snapshot = self._transcribe_update_config(
+                lambda cfg: cfg.__setitem__("whisper_model", new_model))
+            return snapshot
+
+        result = change_default_model(
+            new_model, apply_model=self._transcribe_manager().swap_model,
+            persist=commit_model if persist else None)
+        if result.persisted:
+            self._reload_config()
+        return result.as_dict()
 
 
     def transcribe_current_model(self):

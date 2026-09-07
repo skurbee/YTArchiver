@@ -385,7 +385,8 @@ def firefox_cookie_status() -> dict:
     Returns {installed, has_yt_cookies, signed_in, profile, detail}.
     """
     res = {"installed": False, "has_yt_cookies": False, "signed_in": False,
-           "expired_auth_cookies": False, "profile": "", "detail": ""}
+           "expired_auth_cookies": False, "profile": "", "detail": "",
+           "check_available": True}
     try:
         appdata = os.environ.get("APPDATA") or ""
         prof_dir = Path(appdata) / "Mozilla" / "Firefox" / "Profiles"
@@ -397,17 +398,15 @@ def firefox_cookie_status() -> dict:
         if not cookie_dbs:
             res["detail"] = "Firefox found, but no profile cookies yet"
             return res
-        import sqlite3 as _sql
+        from backend.services.sqlite_reads import open_readonly
+        read_failed = False
         # Cookie names that indicate an actual signed-in YouTube/Google
         # session (vs. just having visited youtube.com).
         AUTH = ("__Secure-3PSID", "__Secure-1PSID", "SID", "SAPISID",
                 "SSID", "LOGIN_INFO")
         for db in cookie_dbs:
             try:
-                # immutable=1 → read even while Firefox holds the DB open,
-                # without taking locks (it won't change under us).
-                uri = db.as_uri() + "?mode=ro&immutable=1"
-                con = _sql.connect(uri, uri=True, timeout=2.0)
+                con = open_readonly(db, timeout=2.0)
                 try:
                     schema_version = con.execute(
                         "PRAGMA user_version").fetchone()[0]
@@ -445,10 +444,14 @@ def firefox_cookie_status() -> dict:
                     res["profile"] = db.parent.name
                     break  # a signed-in profile is the best answer
             except Exception as e:
+                read_failed = True
                 _log.debug("firefox cookie db read failed (%s): %s", db, e)
                 continue
         if res["signed_in"]:
             res["detail"] = "signed into YouTube in Firefox"
+        elif read_failed:
+            res["check_available"] = False
+            res["detail"] = "could not check Firefox cookies"
         elif res["expired_auth_cookies"]:
             res["detail"] = (
                 "Firefox YouTube sign-in cookies expired - sign in again")
@@ -459,6 +462,7 @@ def firefox_cookie_status() -> dict:
         return res
     except Exception as e:
         _log.debug("firefox_cookie_status failed: %s", e)
+        res["check_available"] = False
         res["detail"] = "could not check Firefox cookies"
         return res
 

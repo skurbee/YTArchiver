@@ -433,10 +433,11 @@ def test_gpu_channel_lease_timeout_is_a_wait_not_a_processing_failure(
     assert acquire.call_count == 2
     callback.assert_called_once_with(job)
     stream.emit_error.assert_not_called()
-    stream.emit_text.assert_called_once_with(
-        "Processing is waiting for another task on this channel to finish.\n",
-        "simpleline_blue",
-    )
+    stream.emit_text.assert_not_called()
+    stream.emit.assert_called_once()
+    segments = stream.emit.call_args.args[0]
+    assert "Transcription waiting for another task on this channel" in segments[0][0]
+    assert "whisper_job_gpu-waits-after-timeout" in segments[0][1]
 
 
 def test_gpu_channel_lease_wait_still_honors_cancellation(tmp_path, monkeypatch):

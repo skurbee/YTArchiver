@@ -470,7 +470,7 @@ class QueueIdentityTests(unittest.TestCase):
             def __init__(self, state):
                 self._queues = state
                 self._log_stream = mock.Mock()
-                self.sync_skip_current = mock.Mock(return_value={"ok": True})
+                self._signal_sync_current = mock.Mock()
 
         current = {
             "task_id": "sync-current", "kind": "download",
@@ -483,7 +483,7 @@ class QueueIdentityTests(unittest.TestCase):
             failed = failed_api.sync_defer_current("sync-current")
         self.assertFalse(failed["ok"])
         self.assertEqual(failed_state.sync_snapshot(), [])
-        failed_api.sync_skip_current.assert_not_called()
+        failed_api._signal_sync_current.assert_not_called()
 
         state = queues.QueueState()
         state.current_sync = dict(current)
@@ -493,7 +493,9 @@ class QueueIdentityTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         self.assertEqual(state.sync_snapshot()[0]["task_id"], "sync-current")
         self.assertNotIn("_pass_start_ts", state.sync_snapshot()[0])
-        api.sync_skip_current.assert_called_once_with("sync-current")
+        api._signal_sync_current.assert_called_once()
+        self.assertEqual(api._signal_sync_current.call_args.args[0]["task_id"], "sync-current")
+        self.assertTrue(api._signal_sync_current.call_args.args[0]["cancel_requested"])
 
     def test_gpu_defer_requires_both_queue_and_journal_before_cancel(self):
         def manager_with_current():

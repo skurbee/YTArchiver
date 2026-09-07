@@ -16,13 +16,15 @@ and calls appendMainLog for each entry.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Any
 
 from .log import get_logger
+from .services.reliable_events import ReliableEventChannel
 
 _log = get_logger(__name__)
 
@@ -119,6 +121,9 @@ class LogStreamer:
     def __init__(self, window=None):
         self._window = window
         self._ready = False
+        self.events = ReliableEventChannel(self._deliver_events)
+        self._processing_event_lock = threading.Lock()
+        self._processing_events: OrderedDict[str, dict] = OrderedDict()
         self._buffer: list[SegmentList] = []
         self._buffer_activity: list[dict] = []
         # staging buffers populated by _flush_now_locked
@@ -167,6 +172,7 @@ class LogStreamer:
     def mark_ready(self):
         """Mark the JS bridge ready and flush buffered startup messages."""
         self._ready = True
+        self.events.wake()
         try:
             self.flush()
         except Exception as e:
@@ -240,13 +246,23 @@ class LogStreamer:
         """Append one line of segments to the main log."""
         if not segments:
             return
+        # Compatibility for existing producers. Only a display-row removal
+        # belongs in ordered log rendering; prompts use acknowledged delivery.
+        if (len(segments) == 1 and len(segments[0]) >= 2
+                and segments[0][1] == "__control__"):
+            data = json.loads(segments[0][0])
+            if data.get("kind") != "clear_line":
+                self.emit_control(data)
+                return
+        # External-output classification must see the original text, regardless
+        # of display mode, truncation or whether a bridge batch can be rendered.
+        self._run_line_scanners(segments)
         segments = self._clamp_segments(segments)
         # Simple-mode filter — drop pure-verbose lines
         if self.simple_mode and _line_is_verbose_only(segments):
             return
         # Feed the disk-error watchdog (and any other scanners) before we
         # buffer — scanners may need to react before the line renders.
-        self._run_line_scanners(segments)
         _fire_now = False
         with self._lock:
             self._buffer.append(segments)
@@ -269,6 +285,56 @@ class LogStreamer:
             self._do_flush(_main, _act)
             return
         self._schedule_flush()
+
+    def _deliver_events(self, events):
+        if not self._ready or self._window is None:
+            return []
+        payload = json.dumps(events, ensure_ascii=False).replace("</", "<\\/")
+        return self._window.evaluate_js(
+            f"window._appEventBatch ? window._appEventBatch({payload}) : []")
+
+    def emit_control(self, payload: dict) -> int:
+        """Publish an application prompt; ordinary log retention cannot evict it."""
+        kind = str(payload.get("kind") or "")
+        if not kind or kind == "clear_line":
+            raise ValueError("Application control events require a non-display kind")
+        sample = str(payload.get("sample_id") or "")
+        identity = ("sample:" + sample if sample else hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest())
+        deadline = payload.get("deadline_ts") if kind == "redownload_sample" else None
+        return self.events.publish("control", "control:" + identity, payload,
+                                   expires_at=float(deadline) if deadline is not None else None)
+
+    def emit_processing(self, payload: dict) -> int:
+        """Publish typed job state with a stable UI request identity."""
+        key = str(payload.get("request_id") or payload.get("task_id") or "")
+        if not key:
+            raise ValueError("Processing state requires a request or task identity")
+        with self._processing_event_lock:
+            previous = self._processing_events.get(key, {})
+            if previous.get("kind") == "complete" or previous.get("state") in {"cancelled", "rejected"}:
+                return 0
+            current = {**previous, **payload}
+            # Percentage telemetry cannot resume a paused task or undo its
+            # finalization. Only an explicit lifecycle transition can do that.
+            if (payload.get("state") == "transcribing"
+                    and previous.get("state") in {"paused", "finalizing", "needs_attention"}):
+                current["state"] = previous["state"]
+                current["message"] = previous.get("message", "")
+            # Coalescing may replace resuming with the next progress update.
+            # Retain the lifecycle epoch so the receiver can adopt that newer
+            # state without allowing ordinary late telemetry to resume a job.
+            current["phase_revision"] = int(previous.get("phase_revision", 0)) + int(
+                current.get("state") != previous.get("state"))
+            self._processing_events[key] = current
+            self._processing_events.move_to_end(key)
+            if len(self._processing_events) > 2048:
+                for old_key, old in list(self._processing_events.items()):
+                    if old.get("kind") == "complete" or old.get("state") in {"cancelled", "rejected"}:
+                        del self._processing_events[old_key]
+                        if len(self._processing_events) <= 2048:
+                            break
+            return self.events.publish("processing", "processing:" + key, current)
 
     def emit_text(self, text: str, tag: str | None = None):
         """Convenience: emit one plain-text line with optional tag."""
@@ -552,6 +618,7 @@ class LogStreamer:
         best-effort — losing the very last batch on close is acceptable;
         hanging the app on close is not.
         """
+        self.events.wake()
         if not self._lock.acquire(timeout=5.0):
             return
         delivery = None

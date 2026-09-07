@@ -1,12 +1,9 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
-
-const WEB = path.join(__dirname, "..", "web");
+const { frontendSource } = require("./frontend/source");
 
 function runScript(name, window, document) {
   const context = {
@@ -28,7 +25,7 @@ function runScript(name, window, document) {
     queueMicrotask,
   };
   vm.runInNewContext(
-    fs.readFileSync(path.join(WEB, name), "utf8"),
+    frontendSource(name),
     context,
     { filename: name },
   );

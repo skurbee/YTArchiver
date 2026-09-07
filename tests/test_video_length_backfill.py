@@ -6,7 +6,7 @@ import sqlite3
 import threading
 
 from backend import index
-from backend.metadata import core
+from backend.metadata import durations as core
 
 
 class _Stream:

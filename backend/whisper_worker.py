@@ -25,10 +25,14 @@ Protocol:
 
 import faulthandler
 import io
-import json
 import os
 import sys
 import traceback
+
+if __package__:
+    from .worker_protocol import ProtocolWriter, iter_requests
+else:
+    from worker_protocol import ProtocolWriter, iter_requests
 
 # Save real stdout for our JSON protocol, redirect stdout/stderr to suppress
 # prints from huggingface_hub downloads, tqdm bars, or import warnings.
@@ -40,6 +44,7 @@ import traceback
 # (see transcribe.py start_subprocess) for the captured stderr to be
 # readable on abnormal exit.
 _out = sys.stdout
+_protocol = ProtocolWriter(_out)
 _real_err = sys.stderr
 try:
     faulthandler.enable(file=_real_err, all_threads=True)
@@ -73,14 +78,13 @@ except Exception as _cuda_err:
         # so worker stderr during model load goes to the buffer).
         try:
             sys.stderr = sys.__stderr__
-            _out.write(json.dumps({
+            _protocol.send({
                 "status": "error",
                 "text": (f"Whisper model load failed on BOTH cuda "
                          f"and cpu. cuda: {_cuda_fallback_reason!r}; "
                          f"cpu: {_cpu_err!r}"),
                 "fatal": True,
-            }) + "\n")
-            _out.flush()
+            })
         except Exception:
             pass
         sys.exit(1)
@@ -89,6 +93,7 @@ except Exception as _cuda_err:
 sys.stderr = sys.__stderr__
 
 _actual_model_name = str(_model_name).strip()
+_protocol = ProtocolWriter(_out, model=_actual_model_name)
 
 
 def _worker_response(status, **fields):
@@ -99,8 +104,7 @@ def _worker_response(status, **fields):
 _ready_msg = _worker_response("ready", device=_device)
 if _cuda_fallback_reason:
     _ready_msg["cuda_fallback_reason"] = _cuda_fallback_reason
-_out.write(json.dumps(_ready_msg) + "\n")
-_out.flush()
+_protocol.send(_ready_msg)
 
 # Shared cancel flag — set by a separate stdin-reader thread when the
 # parent sends `{"command": "cancel"}`. The transcription segments
@@ -116,39 +120,19 @@ _request_lock = _threading.Lock()
 _stdin_done = _threading.Event()
 
 def _stdin_reader():
-    """Continuously read stdin lines; route cancel commands to the
-    cancel flag, route everything else as new requests."""
-    while True:
-        line = sys.stdin.readline()
-        if not line:
-            _stdin_done.set()
-            return
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            # A torn/partial write from the parent or a UTF-8 BOM at
-            # pipe start would land here. Previously the bytes were
-            # interpreted as a filepath and enqueued as a transcribe
-            # job — risk of treating garbage as a path and stalling
-            # the request/response stream (audit: whisper_worker H49).
-            # Emit an error response and drop the line.
-            try:
-                sys.stdout.write(json.dumps(_worker_response(
-                    "error",
-                    text="malformed request (not valid JSON)",
-                )) + "\n")
-                sys.stdout.flush()
-            except Exception:
-                pass
-            continue
-        if obj.get("command") == "cancel":
-            _cancel_flag.set()
-            continue
-        with _request_lock:
-            _request_queue.append(obj)
+    """Keep control traffic responsive and signal every dispatcher exit."""
+    try:
+        for obj in iter_requests(sys.stdin, "whisper", _protocol):
+            if obj.get("command") == "cancel":
+                _cancel_flag.set()
+                continue
+            with _request_lock:
+                _request_queue.append(obj)
+    except Exception as exc:
+        _cancel_flag.set()
+        _protocol.send(_worker_response("error", text=f"Worker input closed: {exc}"))
+    finally:
+        _stdin_done.set()
 
 _threading.Thread(target=_stdin_reader, daemon=True,
                   name="whisper-stdin-reader").start()
@@ -185,8 +169,7 @@ while True:
         continue
 
     try:
-        _out.write(json.dumps(_worker_response("starting")) + "\n")
-        _out.flush()
+        _protocol.send(_worker_response("starting"))
 
         segments_gen, info = model.transcribe(
             path,
@@ -221,12 +204,10 @@ while True:
                 pct = min(99, int(seg.end / total_dur * 100))
                 if pct > last_pct:
                     last_pct = pct
-                    _out.write(json.dumps(_worker_response(
-                        "progress", pct=pct)) + "\n")
-                    _out.flush()
+                    _protocol.send(_worker_response(
+                        "progress", pct=pct))
         if _cancelled:
-            _out.write(json.dumps(_worker_response("cancelled")) + "\n")
-            _out.flush()
+            _protocol.send(_worker_response("cancelled"))
             continue
 
         text = " ".join(seg.text.strip() for seg in all_segments if seg.text.strip())
@@ -329,9 +310,8 @@ while True:
                     ce = round(min(seg.end, seg.start + (ci + 1) * chunk_dur), 2)
                     seg_data.append({"s": cs, "e": ce, "t": chunk_text, "w": []})
 
-        _out.write(json.dumps(_worker_response(
-            "ok", text=text, segments=seg_data)) + "\n")
-        _out.flush()
+        _protocol.send(_worker_response(
+            "ok", text=text, segments=seg_data))
     except Exception as e:
         _trace = traceback.format_exc()[:2000]
         _text = f"{type(e).__name__}: {e}"
@@ -340,9 +320,8 @@ while True:
             _real_err.flush()
         except Exception:
             pass
-        _out.write(json.dumps(_worker_response(
+        _protocol.send(_worker_response(
             "error",
             text=_text,
             traceback=_trace,
-        )) + "\n")
-        _out.flush()
+        ))

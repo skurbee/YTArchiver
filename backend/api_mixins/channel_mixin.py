@@ -26,6 +26,7 @@ from backend.services.managed_work import (
     lease_busy_result,
     start_managed_task,
 )
+from backend.services.operation_results import operation_results
 from backend.ytarchiver_config import load_config, update_config
 
 from ._shared import ALLOWED_REDOWNLOAD_RESOLUTIONS, _log
@@ -870,9 +871,8 @@ class ChannelMixin:
 
             token = _uuid.uuid4().hex
             cancel = threading.Event()
-            if not hasattr(self, "_pending_res_scans"):
-                self._pending_res_scans = {}
-                self._pending_res_scans_lock = threading.Lock()
+            results = operation_results(self)
+            results.begin("resolution-scan", token)
 
             def _scan_worker():
                 total = 0
@@ -901,32 +901,10 @@ class ChannelMixin:
                                 mismatch += 1
                         except Exception:
                             unknown += 1
-                import time as _t_mod
-                with self._pending_res_scans_lock:
-                    self._pending_res_scans[token] = {
-                        "done": True,
-                        "_ts": _t_mod.time(),
-                        "result": {"ok": not cancel.is_set(),
-                                    "cancelled": cancel.is_set(),
-                                    "complete": not cancel.is_set(),
-                                    "unknown": unknown,
-                                   "mismatch": mismatch,
-                                   "total": total, "scanned": scanned,
-                                   "target": target_h},
-                    }
-
-            # Sweep abandoned entries (>10 min old) on every new submit
-            # so the dict can't grow unbounded if the user navigates
-            # away mid-scan (audit: channel_mixin H10).
-            import time as _t_mod
-            _now_ts = _t_mod.time()
-            with self._pending_res_scans_lock:
-                _stale = [k for k, v in self._pending_res_scans.items()
-                          if isinstance(v, dict)
-                          and (_now_ts - (v.get("_ts") or _now_ts)) > 600]
-                for k in _stale:
-                    self._pending_res_scans.pop(k, None)
-                self._pending_res_scans[token] = {"done": False, "_ts": _now_ts}
+                return {"ok": not cancel.is_set(), "cancelled": cancel.is_set(),
+                        "complete": not cancel.is_set(), "unknown": unknown,
+                        "mismatch": mismatch, "total": total, "scanned": scanned,
+                        "target": target_h}
             try:
                 start_managed_task(
                     self,
@@ -934,13 +912,13 @@ class ChannelMixin:
                     label=f"Scan video resolution for {name}",
                     task_id=f"resolution-scan-{token}",
                     cancel=cancel,
-                    target=_scan_worker,
+                    target=lambda: results.run(token, _scan_worker),
                     name="chan_scan_resolution",
+                    on_cancelled_before_start=lambda: results.cancelled_before_start(token),
                     thread_factory=threading.Thread,
                 )
-            except WorkAdmissionClosed as exc:
-                with self._pending_res_scans_lock:
-                    self._pending_res_scans.pop(token, None)
+            except Exception as exc:
+                results.discard(token)
                 return {"ok": False, "started": False, "error": str(exc)}
             return {"ok": True, "started": True, "token": token}
         except Exception as e:
@@ -950,17 +928,9 @@ class ChannelMixin:
     def chan_scan_resolution_mismatch_poll(self, token):
         """Poll a token returned by chan_scan_resolution_mismatch. Returns
         {pending: True} while running, or the final {ok, mismatch, total,
-        ...} payload when done. Once returned, the token is forgotten."""
-        if not hasattr(self, "_pending_res_scans"):
-            return {"ok": False, "error": "unknown token"}
-        with self._pending_res_scans_lock:
-            entry = self._pending_res_scans.get(token)
-            if entry is None:
-                return {"ok": False, "error": "unknown token"}
-            if not entry.get("done"):
-                return {"pending": True}
-            del self._pending_res_scans[token]
-        return entry.get("result") or {"ok": False, "error": "no result"}
+        ...} payload when done. Completed results remain available briefly."""
+        result = operation_results(self).poll("resolution-scan", token)
+        return {"pending": True} if result.get("pending") else result
 
 
 

@@ -54,6 +54,7 @@ from .services.sidecar_store import (
 from .sync import _find_cookie_source, _startupinfo, find_yt_dlp
 from .transcribe import _parse_vtt, _replace_jsonl_entry
 from .transcribe.transcribe_files import parse_transcript_header
+from .youtube_request_process import budget_wait_seconds
 from .ytarchiver_config import TRANSCRIPTION_DB
 
 _log = get_logger(__name__)
@@ -299,11 +300,13 @@ def _fetch_vtt(yt_dlp: str, video_id: str,
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True,
             startupinfo=_startupinfo, creationflags=_CREATE_NO_WINDOW,
+            request_cancel_event=cancel_event,
         )
     except FileNotFoundError:
         return None, f"yt-dlp not found: {yt_dlp}"
     # Poll loop — checks cancel_event every 250ms.
-    deadline = time.time() + 120.0
+    started = time.monotonic()
+    initial_budget_wait = budget_wait_seconds(proc)
     while True:
         if cancel_event is not None and cancel_event.is_set():
             try:
@@ -317,7 +320,9 @@ def _fetch_vtt(yt_dlp: str, video_id: str,
             r_code = proc.wait(timeout=0.25)
             break
         except subprocess.TimeoutExpired:
-            if time.time() >= deadline:
+            active_seconds = time.monotonic() - started - max(
+                0.0, budget_wait_seconds(proc) - initial_budget_wait)
+            if active_seconds >= 120.0:
                 try: proc.kill()
                 except Exception: pass
                 return None, "yt-dlp timeout"

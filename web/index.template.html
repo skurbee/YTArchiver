@@ -125,7 +125,7 @@
       <span id="gsb-errors-label">errors</span>
     </button>
     <span class="gsb-traffic" id="gsb-traffic" hidden
-          title="YouTube request limits. If either limit is reached, YTArchiver waits and continues automatically.">
+          title="Budget for YouTube page, API, caption, and artwork requests, including a job-start allowance. Video/audio chunks are excluded. At either limit, requests wait and continue automatically.">
       <span class="gsb-traffic-label">YT Request Limits</span>
       <span class="gsb-traffic-reading" id="gsb-traffic-hourly"></span>
       <span class="gsb-traffic-sep">·</span>
@@ -147,8 +147,11 @@
   <!-- UI helper modules load before logs.js + app.js so their exports are ready. -->
   <script src="util.js?v=1"></script>
   <script src="bridge.js?v=3"></script>
+  <script src="pagedCollection.js?v=1"></script>
+  <script src="preferences.js?v=1"></script>
   <script src="eventState.js?v=1"></script>
   <script src="browseState.js?v=1"></script>
+  <script src="watchSession.js?v=1"></script>
   <script src="toasts.js?v=1"></script>
   <script src="modals.js?v=1"></script>
   <script src="contextMenu.js?v=3"></script>

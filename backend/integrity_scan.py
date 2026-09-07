@@ -4,7 +4,7 @@ The scanner deliberately does not import YTArchiver's configured paths.  A
 caller must supply the archive root, config file, index database, and queue
 file it wants inspected.  Companion files may also be supplied explicitly;
 otherwise their names are resolved relative to the explicit config/queue
-paths.  SQLite is opened with ``mode=ro&immutable=1`` and every other input is
+paths. SQLite uses a WAL-aware read transaction and every other input is
 opened for reading only.
 
 Results are proposals, not commands.  This module contains no repair path.
@@ -23,6 +23,8 @@ from collections.abc import Iterable
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
+
+from backend.services.sqlite_reads import open_readonly
 
 
 class IntegrityScanCancelled(Exception):
@@ -160,9 +162,8 @@ def _read_jsonl(path: Path) -> tuple[list[Any], list[str]]:
 
 
 def _open_database_read_only(path: Path) -> sqlite3.Connection:
-    """Open one immutable snapshot without journal/WAL side effects."""
-    uri = f"{path.as_uri()}?mode=ro&immutable=1"
-    connection = sqlite3.connect(uri, uri=True)
+    """Pin one live catalog snapshot until this scan closes or is cancelled."""
+    connection = open_readonly(path)
     if control := _CONTROL.get():
         control.watch_connection(connection)
     return connection
@@ -198,7 +199,7 @@ def _fts_token_signatures(
     """Return exact, order-independent token-instance signatures.
 
     FTS5's official integrity command is expressed as an INSERT and cannot be
-    used on an immutable connection.  ``fts5vocab`` is instead attached in
+    used on a read-only input connection. ``fts5vocab`` is instead attached in
     TEMP (never the source file), and a bounded in-memory FTS table tokenizes
     source rows in batches.  The count plus a 128-bit modular checksum covers
     term, source rowid, and token offset, including the stale-token/rowid-reuse

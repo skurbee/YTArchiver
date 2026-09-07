@@ -47,7 +47,7 @@ _COPY_CHUNK = 1024 * 1024
 
 @dataclass(frozen=True, slots=True)
 class RestoreLimits:
-    """Hard resource limits applied before extraction."""
+    """Limits for ordinary resources; the streamed database is disk-bounded."""
 
     max_files: int = 512
     max_entry_bytes: int = 3 * 1024 * 1024 * 1024
@@ -248,6 +248,7 @@ def stage_backup(
     digests: dict[str, str] = {}
     manifest: dict[str, Any] = {}
     total_bytes = 0
+    ordinary_bytes = 0
     try:
         with zipfile.ZipFile(archive, "r") as zipped:
             infos = [info for info in zipped.infolist() if not info.is_dir()]
@@ -268,15 +269,24 @@ def stage_backup(
                 seen_names.add(name)
                 if info.flag_bits & 0x1:
                     raise RestoreError(f"Encrypted ZIP member rejected: {name}")
-                if info.file_size < 0 or info.file_size > limits.max_entry_bytes:
+                is_search_database = name == TRANSCRIPTION_DB.name
+                if info.file_size < 0 or (
+                    not is_search_database and info.file_size > limits.max_entry_bytes
+                ):
                     raise RestoreError(f"Backup member is too large: {name}")
                 total_bytes += int(info.file_size)
-                if total_bytes > limits.max_total_bytes:
+                if not is_search_database:
+                    ordinary_bytes += int(info.file_size)
+                if ordinary_bytes > limits.max_total_bytes:
                     raise RestoreError("Backup expands beyond the total-size limit")
                 if info.file_size and info.compress_size == 0:
                     raise RestoreError(f"Backup member has an invalid compressed size: {name}")
                 ratio = info.file_size / max(1, info.compress_size)
-                if ratio > limits.max_compression_ratio:
+                # A valid SQLite database can contain many empty pages. Its
+                # size and ratio are bounded by available staging space instead
+                # of metadata limits; streaming hashes and quick_check still
+                # validate it before any live state is replaced.
+                if not is_search_database and ratio > limits.max_compression_ratio:
                     raise RestoreError(
                         f"Backup member compression ratio is unsafe: {name}"
                     )
@@ -513,6 +523,11 @@ def recover_interrupted_restore() -> dict[str, Any]:
             "recovery_required": True,
             "error": "Restore recovery journal is malformed",
         }
+    from .format_versions import UnsupportedFormatError, require_version
+    try:
+        require_version(record.get("version"), {1}, "Backup restore journal")
+    except UnsupportedFormatError as exc:
+        return {"ok": False, "recovery_required": True, "error": str(exc)}
     if record.get("state") == "committed":
         _cleanup_transaction(record)
         return {"ok": True, "recovered": True, "action": "commit-kept"}

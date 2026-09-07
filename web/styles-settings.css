@@ -1046,48 +1046,19 @@
   from { opacity: 0; }
   to   { opacity: 1; }
 }
-.md-cm-item {
-  display: block;
-  width: 100%;
-  text-align: left;
-  background: transparent;
-  border: 0;
-  color: var(--c-text);
+.md-context-menu .ctx-menu-item {
   padding: 6px 14px;
   font: inherit;
-  cursor: pointer;
-  white-space: nowrap;
+  color: var(--c-text);
 }
-.md-cm-item:hover,
-.md-cm-item:focus {
+.md-context-menu .ctx-menu-item:hover,
+.md-context-menu .ctx-menu-item:focus {
   background: var(--c-menu-hover);
   color: #fff;
   outline: 0;
 }
-.md-cm-warn { color: var(--c-warn-fg); }
-.md-cm-warn:hover, .md-cm-warn:focus { color: var(--c-log-sum); }
-/* Flyouts are positioned within the viewport by the row-menu controller.
-   Hover opens them for a mouse; aria-expanded controls keyboard opening. */
-.md-cm-sub-wrap { position: relative; }
-.md-cm-has-sub { display: flex; align-items: center; }
-.md-cm-chev {
-  margin-left: auto;
-  padding-left: 14px;
-  opacity: 0.55;
-  font-weight: 600;
-}
-.md-cm-sub {
-  position: fixed;
-  left: 100%;
-  top: -5px;
-  min-width: 150px;
-  background: var(--c-menu-bg);
-  border: 1px solid rgba(255, 255, 255, 0.10);
-  border-radius: 4px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.35);
-  padding: 4px 0;
-  display: none;
-}
+.md-context-menu .md-cm-warn { color: var(--c-warn-fg); }
+.md-context-menu .ctx-submenu { min-width: 150px; }
 
 .integrity-background-status {
   position: fixed;
@@ -1108,15 +1079,6 @@
 .backup-preview-identity p { margin: 5px 0; }
 .metadata-filter-notice { display: flex; gap: 12px; align-items: center; margin: 8px 0; }
 .metadata-filter-notice[hidden] { display: none; }
-.md-cm-sub-wrap:hover > .md-cm-sub,
-.md-cm-has-sub[aria-expanded="true"] + .md-cm-sub {
-  display: block;
-}
-.md-cm-sub-wrap:hover > .md-cm-has-sub {
-  background: var(--c-menu-hover);
-  color: #fff;
-}
-
 /* Spinning loader for the Thumbnails column while the bulk disk walk
    is in flight. Replaces the old "—" which was indistinguishable from
    a genuinely-empty channel. */

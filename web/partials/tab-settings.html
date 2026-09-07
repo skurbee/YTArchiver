@@ -168,13 +168,13 @@
                 <div class="settings-traffic-custom" id="settings-traffic-custom" hidden>
                   <label>24-hour limit <input type="number" class="ctl-input" id="settings-traffic-daily" min="1" max="100000" /></label>
                   <label>Hourly limit <input type="number" class="ctl-input" id="settings-traffic-hourly" min="1" max="10000" /></label>
-                  <label>Min gap <input type="number" class="ctl-input" id="settings-traffic-min-gap" min="0" max="3600" /><span>sec</span></label>
-                  <label>Max gap <input type="number" class="ctl-input" id="settings-traffic-max-gap" min="0" max="3600" /><span>sec</span></label>
+                  <label>Min job gap <input type="number" class="ctl-input" id="settings-traffic-min-gap" min="0" max="3600" /><span>sec</span></label>
+                  <label>Max job gap <input type="number" class="ctl-input" id="settings-traffic-max-gap" min="0" max="3600" /><span>sec</span></label>
                 </div>
                 <div class="settings-traffic-meter" id="settings-traffic-meter">
                   <span class="settings-traffic-usage">
                     <strong id="settings-traffic-hourly-usage">&mdash;</strong>
-                    <small>This hour</small>
+                    <small>Last 60 minutes</small>
                   </span>
                   <span class="settings-traffic-usage">
                     <strong id="settings-traffic-daily-usage">&mdash;</strong>
@@ -183,6 +183,7 @@
                   <span class="settings-traffic-cooldown"
                         id="settings-traffic-cooldown" hidden></span>
                 </div>
+                <div class="settings-field-help">Counts YouTube page, API, caption, and artwork request attempts, plus a small allowance for starting each job. Video/audio chunks and internal redirects are not counted individually. Limits apply throughout channel downloads. The job gap spaces new operations; requests within them share a 1–2 second gap, and videos retain a 10–20 second download pause.</div>
                 <div class="settings-traffic-insight" id="settings-traffic-recommendation">
                   <span class="settings-traffic-insight-icon" aria-hidden="true">&#10003;</span>
                   <div class="settings-traffic-insight-copy">

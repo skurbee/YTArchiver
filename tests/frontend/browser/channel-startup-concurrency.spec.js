@@ -1,4 +1,4 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 const { installBridgeStub, loadApp } = require("./fixtures");
 
 test.describe("Channels startup concurrency", () => {

@@ -20,8 +20,8 @@ from typing import Any
 
 from ..log import get_logger
 from ..log_stream import LogStreamer
-from ..sync import find_yt_dlp
-from ._refresh_proxies import (
+from ..ytdlp_options import find_yt_dlp
+from .catalog import (
     _resolve_ids_by_title,
 )
 from .fetcher import fetch_metadata_for_videos

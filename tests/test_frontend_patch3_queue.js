@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
+const { frontendSource } = require("./frontend/source");
 
 class FakeClassList {
   add() {}
@@ -91,7 +92,7 @@ function loadSyncControlHarness(askConfirm) {
     },
   };
   vm.runInNewContext(
-    fs.readFileSync(path.join(__dirname, "..", "web", "syncSubbed.js"), "utf8"),
+    frontendSource("syncSubbed.js"),
     { window, document, console, Promise, Set, confirm: () => true },
     { filename: "syncSubbed.js" },
   );
@@ -288,7 +289,7 @@ test("cold Resume routes a restored redownload to its worker", async () => {
     addEventListener() {},
   };
   vm.runInNewContext(
-    fs.readFileSync(path.join(__dirname, "..", "web", "syncSubbed.js"), "utf8"),
+    frontendSource("syncSubbed.js"),
     { window, document, console, Promise, confirm: () => true },
     { filename: "syncSubbed.js" },
   );
@@ -331,7 +332,7 @@ test("global cold Resume routes a redownload without starting regular sync", asy
     addEventListener() {},
   };
   vm.runInNewContext(
-    fs.readFileSync(path.join(__dirname, "..", "web", "syncSubbed.js"), "utf8"),
+    frontendSource("syncSubbed.js"),
     { window, document, console, Promise, confirm: () => true },
     { filename: "syncSubbed.js" },
   );
@@ -379,7 +380,7 @@ test("cold mixed Resume stages redownload then starts ordinary sync", async () =
     addEventListener() {},
   };
   vm.runInNewContext(
-    fs.readFileSync(path.join(__dirname, "..", "web", "syncSubbed.js"), "utf8"),
+    frontendSource("syncSubbed.js"),
     { window, document, console, Promise, confirm: () => true },
     { filename: "syncSubbed.js" },
   );
@@ -440,7 +441,7 @@ test("popover queue controls toast rejected bridge promises", async () => {
     addEventListener() {},
   };
   vm.runInNewContext(
-    fs.readFileSync(path.join(__dirname, "..", "web", "syncSubbed.js"), "utf8"),
+    frontendSource("syncSubbed.js"),
     { window, document, console, Promise, confirm: () => true },
     { filename: "syncSubbed.js" },
   );

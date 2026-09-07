@@ -19,6 +19,7 @@ from backend import sync as sync_backend
 from backend.process_runner import run_ytdlp
 from backend.services.job_supervisor import WorkAdmissionClosed
 from backend.services.managed_work import start_managed_task
+from backend.services.operation_results import OperationLimitError, operation_results
 from backend.ytarchiver_config import (
     channels_for_subs_ui,
     config_is_writable,
@@ -155,7 +156,7 @@ class SubsMixin:
         YTArchiver.py:17162 do_preview_folder → _probe.
 
         Runs on a background thread; returns {ok, channel, folder} when
-        done via the persisted `_pending_preview` slot, polled via
+        done via the in-memory operation registry, polled via
         `subs_preview_folder_poll`.
         """
         url, url_error = _normalize_probe_channel_url(url)
@@ -170,70 +171,40 @@ class SubsMixin:
         # subs_mixin.py:97). uuid4 is collision-free in practice.
         import uuid as _uuid
         token = _uuid.uuid4().hex
-        # Lock-protected pending-preview dict. js_api and worker
-        # threads both mutate it (set→pending, set→result, pop on
-        # poll), so a bare dict could drop entries on concurrent set+
-        # pop (audit: subs_mixin.py:98).
-        if not hasattr(self, "_pending_previews"):
-            self._pending_previews = {}
-        if not hasattr(self, "_pending_previews_lock"):
-            self._pending_previews_lock = threading.Lock()
-        # Sweep entries older than 10 minutes on every new submit so
-        # the dict can't grow unbounded when users abandon previews
-        # (modal dismissed, navigated away, race with another preview)
-        # without ever polling. Same TTL pattern applies to
-        # _pending_res_scans / _drift_scan_results / _drift_apply_results
-        # (audit: subs_mixin H10).
-        import time as _t_mod
-        _now_ts = _t_mod.time()
-        with self._pending_previews_lock:
-            _stale = [k for k, v in self._pending_previews.items()
-                      if isinstance(v, dict)
-                      and (_now_ts - (v.get("_ts") or _now_ts)) > 600]
-            for k in _stale:
-                self._pending_previews.pop(k, None)
-            self._pending_previews[token] = {
-                "ok": False, "pending": True, "_ts": _now_ts}
         cancel = threading.Event()
+        results = operation_results(self)
+        try:
+            results.begin("folder-preview", token)
+        except OperationLimitError as exc:
+            return {"ok": False, "error": str(exc)}
         def _run():
-            try:
-                if cancel.is_set():
-                    return
-                cmd = [
+            if cancel.is_set():
+                return {"ok": False, "cancelled": True}
+            cmd = [
                     yt, "--flat-playlist", "--print", "channel",
                     "--print", "uploader",
                     *sync_backend._find_cookie_source(),
                     "--playlist-end", "1", url,
                 ]
-                permission = youtube_traffic.acquire(
-                    "channel_preview")
-                if not permission.get("ok"):
-                    raise RuntimeError(
+            permission = youtube_traffic.acquire(
+                    "channel_preview", cancel_event=cancel)
+            if not permission.get("ok"):
+                raise RuntimeError(
                         permission.get("error")
                         or "YouTube traffic governor cancelled")
-                r = run_ytdlp(cmd, capture_output=True, text=True,
+            r = run_ytdlp(cmd, capture_output=True, text=True,
+                            request_cancel_event=cancel,
                             timeout=_SUBS_PROBE_TIMEOUT_SEC,
                             startupinfo=sync_backend._startupinfo,
                             creationflags=(0x08000000 if os.name == "nt" else 0))
-                if cancel.is_set():
-                    return
-                out = (r.stdout or "").strip().splitlines()
-                name = (out[0] if out else "").strip() or (out[1] if len(out) > 1 else "").strip()
-                if not name:
-                    with self._pending_previews_lock:
-                        self._pending_previews[token] = {
-                            "ok": False, "error": "yt-dlp returned nothing",
-                            "_ts": _t_mod.time()}
-                    return
-                folder = sync_backend.sanitize_folder(name)
-                with self._pending_previews_lock:
-                    self._pending_previews[token] = {
-                        "ok": True, "channel": name, "folder": folder,
-                        "_ts": _t_mod.time()}
-            except Exception as e:
-                with self._pending_previews_lock:
-                    self._pending_previews[token] = {
-                        "ok": False, "error": str(e), "_ts": _t_mod.time()}
+            if cancel.is_set():
+                return {"ok": False, "cancelled": True}
+            out = (r.stdout or "").strip().splitlines()
+            name = (out[0] if out else "").strip() or (out[1] if len(out) > 1 else "").strip()
+            if not name:
+                return {"ok": False, "error": "yt-dlp returned nothing"}
+            return {"ok": True, "channel": name,
+                    "folder": sync_backend.sanitize_folder(name)}
         try:
             start_managed_task(
                 self,
@@ -241,13 +212,13 @@ class SubsMixin:
                 label="Preview a subscription folder name",
                 task_id=f"channel-preview-{token}",
                 cancel=cancel,
-                target=_run,
+                target=lambda: results.run(token, _run),
                 name="channel-folder-preview",
+                on_cancelled_before_start=lambda: results.cancelled_before_start(token),
                 thread_factory=threading.Thread,
             )
-        except WorkAdmissionClosed as exc:
-            with self._pending_previews_lock:
-                self._pending_previews.pop(token, None)
+        except Exception as exc:
+            results.discard(token)
             return {"ok": False, "started": False, "error": str(exc)}
         return {"ok": True, "token": token}
 
@@ -257,54 +228,18 @@ class SubsMixin:
         {ok, pending} while running, or the final {ok, channel, folder}
         once `_run` sets it.
         """
-        lock = getattr(self, "_pending_previews_lock", None)
-        pend = getattr(self, "_pending_previews", {})
-        if lock is not None:
-            with lock:
-                res = pend.get(token)
-                if res is None:
-                    return {"ok": False, "error": "unknown token"}
-                if res.get("pending"):
-                    return {"ok": True, "pending": True}
-                # One-shot: pop the result inside the lock so a second
-                # poll racing with this one can't double-deliver.
-                try: del pend[token]
-                except KeyError: pass
-                return res
-        # Defensive fallback if lock somehow isn't initialized yet.
-        res = pend.get(token)
-        if res is None:
-            return {"ok": False, "error": "unknown token"}
-        if res.get("pending"):
-            return {"ok": True, "pending": True}
-        try: del pend[token]
-        except KeyError: pass
-        return res
+        return operation_results(self).poll("folder-preview", token)
 
 
     def subs_add_channel(self, payload):
         """Add a new channel. Returns {ok, channel?, error?}.
 
-        Also kicks off a one-time channel-art fetch in the background so the
-        Browse grid shows the avatar/banner immediately — matches OLD
-        YTArchiver behavior where adding a channel triggers
-        `_fetch_channel_art`.
+        The first sync fetches artwork before videos under its own channel
+        lease. Starting another worker here would race the Sync now action.
         """
         try:
             ch = subs_backend.add_channel(payload or {})
             self._reload_config()
-            # Fire-and-forget channel-art fetch — but only when the
-            # channel record actually committed to disk. If the config
-            # write was gated (`_write_blocked`), skip the art fetch
-            # so we don't leave .ChannelArt/ files for a channel
-            # whose subs entry will revert on next reload (audit:
-            # subs_mixin.py:144).
-            try:
-                name = ch.get("name") or ch.get("folder", "")
-                if name and not ch.get("_write_blocked"):
-                    self.chan_fetch_art(name, False)
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
             if ch.get("_write_blocked"):
                 return {
                     "ok": False,

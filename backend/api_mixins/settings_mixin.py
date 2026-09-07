@@ -19,8 +19,13 @@ import uuid
 from backend import sync as sync_backend
 from backend import youtube_traffic
 from backend.archive_capacity import normalize_archive_capacity_warning
+from backend.services.config_repository import CONFIG_COMMAND_LOCK
 from backend.services.job_supervisor import WorkAdmissionClosed
 from backend.services.managed_work import start_managed_task
+from backend.services.processing_defaults import (
+    change_default_model,
+    validate_model,
+)
 from backend.ytarchiver_config import (
     TRASH_RETENTION_CHANGE_GRACE_SECONDS,
     TRASH_RETENTION_DEFAULT_DAYS,
@@ -67,6 +72,18 @@ def _stored_trash_retention_grace(value):
     if grace != grace or grace in (float("inf"), float("-inf")):
         return 0.0
     return max(0.0, grace)
+
+
+def _backup_search_db_size_bytes():
+    """Report the database file size without opening SQLite or scanning it."""
+    from backend.ytarchiver_config import TRANSCRIPTION_DB
+
+    try:
+        return TRANSCRIPTION_DB.stat().st_size
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
 
 
 class SettingsMixin:
@@ -317,6 +334,9 @@ class SettingsMixin:
             # Automatic full-backup cadence shown beside manual backup tools.
             "auto_backup_interval": (cfg.get("auto_backup_interval")
                                      or "off"),
+            "backup_include_search_db": (
+                cfg.get("backup_include_search_db", True) is not False),
+            "backup_search_db_size_bytes": _backup_search_db_size_bytes(),
             "trash_retention_days": _stored_trash_retention_days(
                 cfg.get("trash_retention_days")),
             # Read-only policy metadata. settings_save always computes this
@@ -360,7 +380,7 @@ class SettingsMixin:
     # window_state.save firing while the user clicked Save in Settings)
     # could both load_config, mutate independent copies, and the loser
     # silently overwrote the winner (audit: settings_mixin.py:99-196).
-    _settings_save_lock = threading.RLock()
+    _settings_save_lock = CONFIG_COMMAND_LOCK
 
     def settings_save(self, data):
         admission = getattr(self, "_work_admission_error", None)
@@ -378,6 +398,17 @@ class SettingsMixin:
             return self._settings_save_inner(data)
 
     def _settings_save_inner(self, data):
+        if ("backup_include_search_db" in data
+                and not isinstance(data["backup_include_search_db"], bool)):
+            return {
+                "ok": False,
+                "error": "Include Search database must be true or false.",
+            }
+        if "whisper_model" in data:
+            try:
+                validate_model(data["whisper_model"])
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "Unsupported model"}
         cfg = self._settings_fresh_config()
         original_cfg = copy.deepcopy(cfg)
         _old_ytdlp_channel = str(
@@ -386,12 +417,6 @@ class SettingsMixin:
         _old_trash_retention_days = _stored_trash_retention_days(
             cfg.get("trash_retention_days"), fallback=0)
         _trash_retention_changed = False
-        # Track the OLD whisper model so we can hot-apply a change to
-        # the running TranscribeManager (audit U-7). Settings_save was
-        # persisting the new model + reloading config, but the
-        # TranscribeManager's loaded subprocess kept using the OLD
-        # model — only a full app restart picked up the change.
-        _old_whisper = (cfg.get("whisper_model") or "").strip()
         if data.get("output_dir"): cfg["output_dir"] = os.path.normpath(data["output_dir"])
         if data.get("video_out_dir"): cfg["video_out_dir"] = os.path.normpath(data["video_out_dir"])
         if data.get("whisper_model"): cfg["whisper_model"] = data["whisper_model"]
@@ -485,6 +510,8 @@ class SettingsMixin:
         if data.get("auto_backup_interval") in ("off", "daily", "weekly",
                                                 "monthly"):
             cfg["auto_backup_interval"] = data["auto_backup_interval"]
+        if "backup_include_search_db" in data:
+            cfg["backup_include_search_db"] = data["backup_include_search_db"]
         if "trash_retention_days" in data:
             try:
                 _new_trash_retention_days = _parse_trash_retention_days(
@@ -586,11 +613,25 @@ class SettingsMixin:
                 < cfg.get("youtube_traffic_custom_min_gap", 10)):
             cfg["youtube_traffic_custom_max_gap"] = int(
                 cfg.get("youtube_traffic_custom_min_gap", 10))
-        saved, committed_cfg = self._settings_commit_candidate(
-            original_cfg, cfg)
-        if not saved:
-            return {"ok": False, "error": "Save failed"}
-        cfg = committed_cfg
+        model_result = None
+        if "whisper_model" in data:
+            def commit_settings():
+                saved, snapshot = self._settings_commit_candidate(original_cfg, cfg)
+                if not saved:
+                    raise OSError("Settings could not be saved")
+                return snapshot
+
+            model_result = change_default_model(
+                data["whisper_model"], persist=commit_settings,
+                apply_model=lambda model: self._settings_transcribe().swap_model(model))
+            if not model_result.persisted:
+                return model_result.as_dict()
+            cfg = model_result.snapshot
+        else:
+            saved, committed_cfg = self._settings_commit_candidate(original_cfg, cfg)
+            if not saved:
+                return {"ok": False, "error": "Save failed"}
+            cfg = committed_cfg
         self._reload_config()
         _new_ytdlp_channel = str(
             cfg.get("ytdlp_channel") or "stable").strip().lower()
@@ -611,24 +652,8 @@ class SettingsMixin:
                     self._ytdlp_update_pending = None
         # Push log mode into LogStreamer
         self._settings_log_stream().simple_mode = (cfg["log_mode"] == "Simple")
-        # Audit U-7: hot-apply Whisper model change so the next job
-        # uses the new model without requiring a full app restart.
-        # The GPU popover already exposes per-job swap via
-        # transcribe_swap_model — route through the same path.
-        _new_whisper = (cfg.get("whisper_model") or "").strip()
-        if _new_whisper and _new_whisper != _old_whisper:
-            try:
-                transcribe = self._settings_transcribe()
-                if hasattr(transcribe, "swap_model"):
-                    transcribe.swap_model(_new_whisper)
-            except Exception as _e:
-                # Log + continue — settings still saved successfully,
-                # the user just needs to restart for the change to bite.
-                try:
-                    self._settings_log_stream().emit_dim(
-                        f" (whisper model swap deferred until restart: {_e})")
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
+        if model_result is not None and not model_result.runtime_applied:
+            self._settings_log_stream().emit_dim(model_result.error)
         if any(key in data for key in (
                 "ytdlp_channel", "ytdlp_update_mode",
                 "ytdlp_update_check_days")):
@@ -655,6 +680,7 @@ class SettingsMixin:
         return {
             "ok": True,
             "budget_autosync_disabled": _budget_autosync_disabled,
+            **(model_result.as_dict() if model_result is not None else {}),
         }
 
     def youtube_traffic_status(self):

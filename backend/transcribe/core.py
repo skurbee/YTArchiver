@@ -44,6 +44,7 @@ from ..queues import make_task_id
 # startupinfo now comes from subprocess_util (one
 # source of truth shared with compress.py and sync.py).
 from ..subprocess_util import make_startupinfo as _make_startupinfo
+from ..worker_protocol import ProtocolError, decode_response
 
 __all__ = [
     "ytarchiver_config_output_dir",
@@ -75,6 +76,9 @@ _log = get_logger(__name__)
 # punct_manager.py. Re-imported here so this module's
 # namespace + the package __init__ surface keep the previously-public
 # names visible.
+from ..process_runner import CancellationSignals
+from .acceptance import EnqueueResult, EnqueueStatus
+from .audio_extract import extract_audio_chunk
 from .helpers import (  # noqa: F401
     _CHUNK_DURATION_SECS,
     _CHUNK_MIN_DURATION,
@@ -89,6 +93,8 @@ from .helpers import (  # noqa: F401
     find_python311,
     ytarchiver_config_output_dir,
 )
+from .inference import apply_punctuation, is_gpu_memory_error, run_inference
+from .job_execution import EmptyTranscript as EmptyTranscript
 from .job_execution import (
     TranscriptionJobExecutor,
     apply_control_signals,
@@ -101,6 +107,7 @@ from .paths import (  # noqa: F401
     _hide_per_video_transcript_txt_if_needed,
 )
 from .punct_manager import PunctuationManager  # noqa: F401
+from .recovery import ProcessingRecord, RecoveryState
 
 # ── Aggregated transcript writers ─────────────────────────────────────
 # Internal callers (_transcribe_one, _write_outputs, retranscribe flows)
@@ -112,6 +119,7 @@ from .transcribe_files import (
     _replace_txt_entry,
     _write_jsonl_entry,
     _write_transcript_entry,
+    transcript_output_locks,
 )
 
 # ── VTT caption path ──────────────────────────────────────────────────
@@ -381,9 +389,9 @@ class TranscribeManager:
             if line is None:
                 return False
             try:
-                msg = json.loads(line.strip())
-            except json.JSONDecodeError:
-                continue
+                msg = decode_response(line.strip())
+            except ProtocolError:
+                return False
             status = msg.get("status")
             if status in {"cancelled", "ok", "error"}:
                 return True
@@ -475,15 +483,13 @@ class TranscribeManager:
         transcript writers or the callback.
         """
         followup = dict(job.get("compress_after") or {})
-        job["_output_complete"] = True
-        job["_completed_outcome"] = terminal_outcome.value
+        RecoveryState.decode(job, runtime=True).output_finished(
+            terminal_outcome.value, has_followup=bool(followup)).apply(job)
         if result is not None:
             # Runtime-only: if the completion checkpoint itself transiently
             # fails, a same-process retry can still deliver the original
             # callback payload. It is deliberately excluded from the journal.
             job["_completion_result"] = result
-        if followup and not job.get("_followup_enqueued"):
-            job["_followup_pending"] = True
 
         with self._jobs_lock:
             tracked = (self._current_job is job
@@ -520,8 +526,7 @@ class TranscribeManager:
         # own atomic journal snapshot then contains BOTH this completion marker
         # and the new compression job. A crash immediately after replace sees
         # `_followup_enqueued` and cannot enqueue a duplicate on recovery.
-        job["_followup_enqueued"] = True
-        job.pop("_followup_pending", None)
+        RecoveryState.decode(job, runtime=True).followup_reserved().apply(job)
         try:
             queued = self.compress_enqueue(
                 job.get("path", ""),
@@ -540,8 +545,7 @@ class TranscribeManager:
         if queued:
             return True
 
-        job.pop("_followup_enqueued", None)
-        job["_followup_pending"] = True
+        RecoveryState.decode(job, runtime=True).followup_failed().apply(job)
         self._stream.emit_error(
             "Transcription finished, but video compression could not be saved "
             "in Processing. The completion task was kept for retry.")
@@ -672,6 +676,9 @@ class TranscribeManager:
             # increment nor later decrement that cosmetic counter.
             "_skip_pending_counter": True,
         }
+        from .processing_admission import download_parent_job_id
+        marker["_download_sync_job_id"] = download_parent_job_id(
+            self._channel_aliases_for_job(marker))
         staged, duplicate = self._stage_inline_caption_recovery(marker)
         if duplicate:
             return "duplicate"
@@ -884,8 +891,8 @@ class TranscribeManager:
                 self._stop_subprocess()
                 return False
             try:
-                info = json.loads(line)
-            except json.JSONDecodeError:
+                info = decode_response(line)
+            except ProtocolError:
                 # Keep raw `line` content but verbose-tag it so only
                 # Verbose-mode users see the gibberish. Simple-mode
                 # users get a cleaner one-liner.
@@ -1132,6 +1139,48 @@ class TranscribeManager:
                 _completed_outcome: str = "",
                 _task_id: str = "",
                 _restoring: bool = False) -> bool:
+        """Boolean compatibility surface with the original explicit signature."""
+        return self.enqueue_result(
+            path=path, title=title, channel=channel,
+            combined=combined, on_complete=on_complete, retranscribe=retranscribe,
+            video_id=video_id, bulk_id=bulk_id, bulk_total=bulk_total,
+            bulk_index=bulk_index, from_download=from_download, compress_after=compress_after,
+            requested_model=requested_model, on_state=on_state, _retry_required=_retry_required,
+            _retry_as_replace=_retry_as_replace, _write_intent=_write_intent, _caption_recovery=_caption_recovery,
+            _skip_pending_counter=_skip_pending_counter, _cleanup_only=_cleanup_only, _no_speech_pending=_no_speech_pending,
+            _stats_tallied=_stats_tallied, _output_complete=_output_complete, _callback_done=_callback_done,
+            _followup_pending=_followup_pending, _followup_enqueued=_followup_enqueued, _completed_outcome=_completed_outcome,
+            _task_id=_task_id, _restoring=_restoring,
+        ).accepted
+
+    def enqueue_result(self, path: str, title: str = "",
+                channel: str = "",
+                combined: bool | None = None,
+                on_complete: Callable | None = None,
+                retranscribe: bool = False,
+                video_id: str = "",
+                bulk_id: str = "",
+                bulk_total: int = 0,
+                bulk_index: int = 0,
+                from_download: bool = False,
+                compress_after: dict[str, str] | None = None,
+                requested_model: str = "",
+                on_state: Callable | None = None,
+                _retry_required: bool = False,
+                _retry_as_replace: bool = False,
+                _write_intent: bool = False,
+                _caption_recovery: bool = False,
+                _skip_pending_counter: bool = False,
+                _cleanup_only: bool = False,
+                _no_speech_pending: bool = False,
+                _stats_tallied: bool = False,
+                _output_complete: bool = False,
+                _callback_done: bool = False,
+                _followup_pending: bool = False,
+                _followup_enqueued: bool = False,
+                _completed_outcome: str = "",
+                _task_id: str = "",
+                _restoring: bool = False) -> EnqueueResult:
         """Queue a video for transcription.
 
         `channel` is optional; if provided it's stored on the job so the
@@ -1157,11 +1206,11 @@ class TranscribeManager:
         if self._shutdown_requested.is_set():
             self._stream.emit_error(
                 "Processing is shutting down; the new task was not accepted.")
-            return False
+            return EnqueueResult(EnqueueStatus.SHUTDOWN, error='Processing is shutting down; the task was not accepted.')
         path = str(path)
         if not os.path.isfile(path):
             self._stream.emit_error(f"Transcribe: file not found: {path}")
-            return False
+            return EnqueueResult(EnqueueStatus.MISSING_FILE, error='The video file was not found.')
         _job_title = title or os.path.basename(path)
         _path_key = os.path.normcase(os.path.normpath(os.path.abspath(path)))
         promotion = self._active_inline_promotion
@@ -1245,6 +1294,10 @@ class TranscribeManager:
             "_followup_enqueued": bool(_followup_enqueued),
             "_completed_outcome": str(_completed_outcome or ""),
         }
+        # The permission belongs to this completed download and its current
+        # Sync task only. Never persist it into restart/recovery journals.
+        job["_download_sync_job_id"] = str(
+            (promotion or {}).get("_download_sync_job_id") or "")
         # Reserve one durable visible identity before the job may start.  A
         # stale QueueState row for this logical path is adopted instead of
         # creating a second hidden ID.  If the journal's second commit fails,
@@ -1257,7 +1310,7 @@ class TranscribeManager:
                                for j in self._inline_caption_jobs
                                if j is not promotion)
                         or _same_transcribe_path(self._current_job)):
-                    return False
+                    return EnqueueResult(EnqueueStatus.DUPLICATE, error='This video is already queued or being processed.')
                 reserved_ids = {
                     str(existing.get("task_id") or "").strip()
                     for existing in [
@@ -1282,11 +1335,11 @@ class TranscribeManager:
                     self._stream.emit_error(
                         "Could not save the visible Processing queue; task was "
                         "not started.")
-                    return False
+                    return EnqueueResult(EnqueueStatus.SAVE_FAILED, error='The visible Processing queue could not be saved.')
                 job["task_id"] = str(
                     reservation.get("task_id") or "").strip()
                 if not job["task_id"]:
-                    return False
+                    return EnqueueResult(EnqueueStatus.SAVE_FAILED, error='The Processing task identity could not be saved.')
             with self._jobs_lock:
                 self._jobs.append(job)
                 if promotion is not None:
@@ -1311,7 +1364,7 @@ class TranscribeManager:
                 self._stream.emit_error(
                     "Could not save the transcription queue; task was not "
                     "started. Check that the app data folder is writable.")
-                return False
+                return EnqueueResult(EnqueueStatus.SAVE_FAILED, error='The processing recovery journal could not be saved.')
         # Bump `transcription_pending` for the channel so the Subs-tab
         # auto-indicator stays in sync with OLD's behavior (YTArchiver.py:
         # 14629 and friends set this counter during sync → transcribe flow).
@@ -1346,7 +1399,7 @@ class TranscribeManager:
         except Exception as e:
             _log.debug("swallowed: %s", e)
         self._ensure_worker()
-        return True
+        return EnqueueResult(EnqueueStatus.ACCEPTED, task_id=job["task_id"])
 
     def compress_enqueue(self, path: str, title: str = "",
                          channel: str = "", quality: str = "Average",
@@ -1460,40 +1513,8 @@ class TranscribeManager:
 
     @staticmethod
     def _snapshot_pending_job(j: dict[str, Any]) -> dict[str, Any]:
-        """Return the restart-safe, JSON-serializable portion of one job."""
-        return {
-            "task_id": j.get("task_id", ""),
-            "path": j.get("path", ""),
-            "title": j.get("title", ""),
-            "channel": j.get("channel", ""),
-            "video_id": j.get("video_id", ""),
-            "retranscribe": bool(j.get("retranscribe")),
-            "combined_override": j.get("combined_override"),
-            "bulk_id": j.get("bulk_id", ""),
-            "bulk_total": int(j.get("bulk_total", 0) or 0),
-            "bulk_index": int(j.get("bulk_index", 0) or 0),
-            "kind": j.get("kind", "transcribe"),
-            "from_download": bool(j.get("from_download")),
-            "quality": j.get("quality", "Average"),
-            "output_res": str(j.get("output_res", "720")),
-            "compress_after": dict(j.get("compress_after") or {}),
-            "requested_model": str(j.get("requested_model") or ""),
-            "actual_model": str(j.get("actual_model") or ""),
-            "retry_required": bool(j.get("_retry_required")),
-            "retry_as_replace": bool(j.get("_retry_as_replace")),
-            "write_intent": bool(j.get("_write_intent")),
-            "caption_recovery": bool(j.get("_caption_recovery")),
-            "skip_pending_counter": bool(j.get("_skip_pending_counter")),
-            "cleanup_only": bool(j.get("_cleanup_only")),
-            "no_speech_pending": bool(j.get("_no_speech_pending")),
-            "stats_tallied": bool(j.get("_stats_tallied")),
-            "output_complete": bool(j.get("_output_complete")),
-            "callback_done": bool(j.get("_callback_done")),
-            "followup_pending": bool(j.get("_followup_pending")),
-            "followup_enqueued": bool(j.get("_followup_enqueued")),
-            "completed_outcome": str(j.get("_completed_outcome") or ""),
-            "defer_requested": bool(j.get("_defer_requested")),
-        }
+        """Encode through the shared processing recovery schema."""
+        return ProcessingRecord.decode(j, runtime=True).journal_payload()
 
     def _pending_snapshot(self, *, include_current: bool = True) -> list[dict]:
         """Snapshot every durable job while the journal boundary is held."""
@@ -1776,77 +1797,11 @@ class TranscribeManager:
                                 "compress recovery containment check failed "
                                 "for %s: %s", path, exc)
                             continue
-                        runtime_job: dict[str, Any] = {
-                            "task_id": task_id,
-                            "kind": "compress",
-                            "path": os.path.normpath(path),
-                            "title": title,
-                            "channel": saved.get("channel", ""),
-                            "quality": saved.get("quality", "Average"),
-                            "output_res": str(saved.get("output_res", "720")),
-                            "cb": None,
-                            "cancel": threading.Event(),
-                        }
-                    else:
-                        caption_recovery = bool(
-                            saved.get("caption_recovery"))
-                        write_intent = bool(saved.get("write_intent"))
-                        runtime_job = {
-                            "task_id": task_id,
-                            "kind": "transcribe",
-                            "path": path,
-                            "title": title,
-                            "channel": saved.get("channel", ""),
-                            "combined_override": saved.get(
-                                "combined_override"),
-                            "cb": None,
-                            "cancel": threading.Event(),
-                            "retranscribe": bool(saved.get("retranscribe")),
-                            "video_id": (
-                                saved.get("video_id") or "").strip(),
-                            "bulk_id": saved.get("bulk_id", "") or "",
-                            "bulk_total": int(
-                                saved.get("bulk_total", 0) or 0),
-                            "bulk_index": int(
-                                saved.get("bulk_index", 0) or 0),
-                            "from_download": bool(
-                                saved.get("from_download")),
-                            "compress_after": dict(
-                                saved.get("compress_after") or {}),
-                            "requested_model": str(
-                                saved.get("requested_model")
-                                or self._model or ""),
-                            "actual_model": str(
-                                saved.get("actual_model") or ""),
-                            "_retry_required": bool(
-                                saved.get("retry_required")
-                                or write_intent
-                                or saved.get("cleanup_only")
-                                or saved.get("no_speech_pending")),
-                            "_retry_as_replace": bool(
-                                saved.get("retry_as_replace")
-                                or (write_intent and not caption_recovery)),
-                            "_write_intent": write_intent,
-                            "_caption_recovery": caption_recovery,
-                            "_skip_pending_counter": bool(
-                                saved.get("skip_pending_counter")),
-                            "_cleanup_only": bool(
-                                saved.get("cleanup_only")),
-                            "_no_speech_pending": bool(
-                                saved.get("no_speech_pending")),
-                            "_stats_tallied": bool(
-                                saved.get("stats_tallied")),
-                            "_output_complete": bool(
-                                saved.get("output_complete")),
-                            "_callback_done": bool(
-                                saved.get("callback_done")),
-                            "_followup_pending": bool(
-                                saved.get("followup_pending")),
-                            "_followup_enqueued": bool(
-                                saved.get("followup_enqueued")),
-                            "_completed_outcome": str(
-                                saved.get("completed_outcome") or ""),
-                        }
+                    record = ProcessingRecord.decode(
+                        saved, interrupted=(kind != "compress"), default_model=self._model)
+                    runtime_job = record.runtime_payload(cancel_event=threading.Event())
+                    runtime_job.update(task_id=task_id, kind="compress" if kind == "compress" else "transcribe", title=title,
+                                       path=os.path.normpath(path) if kind == "compress" else path)
 
                     candidates.append(runtime_job)
                     known_jobs.add(job_key)
@@ -1953,127 +1908,29 @@ class TranscribeManager:
             n += 1
         return n
 
+    def queue_commands(self):
+        """Bind the command service to this owner's live state and lock boundary."""
+        from .queue_commands import ProcessingQueueCommands
+        return ProcessingQueueCommands(
+            journal_lock=self._journal_lock, jobs_lock=self._jobs_lock,
+            pending_jobs=lambda: self._jobs, current_job=lambda: self._current_job,
+            inline_jobs=lambda: self._inline_caption_jobs, queue_state=lambda: self._queues,
+            persist_pending=self._persist_pending, write_pending_snapshot=self._write_pending_snapshot,
+            pending_snapshot=self._pending_snapshot, queue_payload=self._queue_payload_for_job,
+            send_cancel=self._send_cancel_command, stream=self._stream,
+            release_compress_slots=self._release_compress_slots,
+            notify_cancelled=self._notify_jobs_cancelled, bump_pending=_bump_transcription_pending)
+
     def remove_pending_task_ids_coordinated(
             self, task_ids: set[str], mirror_remove: Callable[[], bool],
             mirror_restore: Callable[[], bool]) -> bool:
-        """Remove exact pending jobs only if both durable stores commit.
-
-        QueueState commits while the candidate jobs are absent in memory, then
-        the transcription journal commits the same state.  If the journal
-        replacement fails, QueueState is restored and the in-memory jobs were
-        never allowed to escape the journal boundary.
-        """
-        wanted = {
-            str(task_id or "").strip() for task_id in task_ids
-            if str(task_id or "").strip()
-        }
-        if not wanted or not callable(mirror_remove):
-            return False
-        removed_jobs: list[dict[str, Any]] = []
-        with self._journal_lock:
-            with self._jobs_lock:
-                original = list(self._jobs)
-                keep = []
-                for job in self._jobs:
-                    if str(job.get("task_id") or "").strip() in wanted:
-                        removed_jobs.append(job)
-                    else:
-                        keep.append(job)
-                self._jobs[:] = keep
-            try:
-                mirror_saved = bool(mirror_remove())
-            except Exception as exc:
-                _log.warning("Processing queue removal mirror failed: %s", exc)
-                mirror_saved = False
-            if not mirror_saved:
-                with self._jobs_lock:
-                    self._jobs[:] = original
-                return False
-            if removed_jobs and not self._persist_pending():
-                with self._jobs_lock:
-                    self._jobs[:] = original
-                try:
-                    restored = bool(mirror_restore())
-                except Exception as exc:
-                    _log.warning(
-                        "Processing queue removal rollback failed: %s", exc)
-                    restored = False
-                if not restored:
-                    self._stream.emit_error(
-                        "Could not restore the visible Processing queue after "
-                        "a journal failure. Work remains in recovery and queue "
-                        "actions are disabled until saving succeeds.")
-                self._stream.emit_error(
-                    "Could not save task removal; Processing work was kept "
-                    "for recovery.")
-                return False
-        for job in removed_jobs:
-            try:
-                if (not job.get("retranscribe")
-                        and not job.get("_pending_decremented")
-                        and not job.get("_skip_pending_counter")):
-                    _bump_transcription_pending(
-                        job.get("channel") or "", -1)
-                    job["_pending_decremented"] = True
-            except Exception as exc:
-                _log.debug("pending counter cleanup failed: %s", exc)
-        self._release_compress_slots(removed_jobs)
-        self._notify_jobs_cancelled(removed_jobs)
-        return True
+        return self.queue_commands().remove_pending_task_ids_coordinated(task_ids, mirror_remove, mirror_restore)
 
     def reorder_pending_task_coordinated(
             self, task_id: str, new_index: int,
             mirror_reorder: Callable[[], bool],
             mirror_restore: Callable[[], bool]) -> bool:
-        """Reorder one exact job only if QueueState and journal agree."""
-        ident = str(task_id or "").strip()
-        if not ident or not callable(mirror_reorder):
-            return False
-        try:
-            target_index = int(new_index)
-        except (TypeError, ValueError):
-            return False
-        with self._journal_lock:
-            with self._jobs_lock:
-                original = list(self._jobs)
-                idx = next(
-                    (i for i, job in enumerate(self._jobs)
-                     if str(job.get("task_id") or "").strip() == ident),
-                    -1,
-                )
-                if idx >= 0:
-                    if target_index < 0 or target_index >= len(self._jobs):
-                        return False
-                    job = self._jobs.pop(idx)
-                    self._jobs.insert(target_index, job)
-            try:
-                mirror_saved = bool(mirror_reorder())
-            except Exception as exc:
-                _log.warning("Processing queue reorder mirror failed: %s", exc)
-                mirror_saved = False
-            if not mirror_saved:
-                with self._jobs_lock:
-                    self._jobs[:] = original
-                return False
-            if idx >= 0 and not self._persist_pending():
-                with self._jobs_lock:
-                    self._jobs[:] = original
-                try:
-                    restored = bool(mirror_restore())
-                except Exception as exc:
-                    _log.warning(
-                        "Processing queue reorder rollback failed: %s", exc)
-                    restored = False
-                if not restored:
-                    self._stream.emit_error(
-                        "Could not restore the visible Processing order after "
-                        "a journal failure. Queue actions are disabled until "
-                        "saving succeeds.")
-                self._stream.emit_error(
-                    "Could not save Processing order; the previous order was "
-                    "kept.")
-                return False
-        return True
+        return self.queue_commands().reorder_pending_task_coordinated(task_id, new_index, mirror_reorder, mirror_restore)
 
     @staticmethod
     def _pending_path_within(path: str, root: str) -> bool:
@@ -2536,6 +2393,7 @@ class TranscribeManager:
             return
         payload = {
             "state": str(state or ""),
+            "task_id": str(job.get("task_id") or ""),
             "video_id": str(job.get("video_id") or ""),
             "filepath": os.path.normpath(str(job.get("path") or "")),
             **details,
@@ -2633,50 +2491,8 @@ class TranscribeManager:
 
     @staticmethod
     def _queue_payload_for_job(job: dict[str, Any]) -> dict[str, Any]:
-        """Return the persisted/UI queue representation of a runtime job."""
-        payload = {
-            "task_id": job.get("task_id", ""),
-            "kind": (job.get("kind") or "transcribe").lower(),
-            "title": job.get("title", ""),
-            "path": job.get("path", ""),
-            "channel": job.get("channel", ""),
-            "bulk_id": job.get("bulk_id", ""),
-            "bulk_total": int(job.get("bulk_total", 0) or 0),
-            "bulk_index": int(job.get("bulk_index", 0) or 0),
-            "retry_required": bool(job.get("_retry_required")),
-            "retry_as_replace": bool(job.get("_retry_as_replace")),
-            "write_intent": bool(job.get("_write_intent")),
-            "caption_recovery": bool(job.get("_caption_recovery")),
-            "skip_pending_counter": bool(
-                job.get("_skip_pending_counter")),
-            "cleanup_only": bool(job.get("_cleanup_only")),
-            "no_speech_pending": bool(job.get("_no_speech_pending")),
-            "stats_tallied": bool(job.get("_stats_tallied")),
-            "output_complete": bool(job.get("_output_complete")),
-            "callback_done": bool(job.get("_callback_done")),
-            "followup_pending": bool(job.get("_followup_pending")),
-            "followup_enqueued": bool(job.get("_followup_enqueued")),
-            "completed_outcome": str(
-                job.get("_completed_outcome") or ""),
-        }
-        if payload["kind"] == "compress":
-            payload.update({
-                "quality": job.get("quality", "Average"),
-                "output_res": str(job.get("output_res", "720")),
-                "from_download": bool(job.get("from_download")),
-            })
-        else:
-            payload.update({
-                "combined_override": job.get("combined_override"),
-                "retranscribe": bool(job.get("retranscribe")),
-                "video_id": (job.get("video_id") or "").strip(),
-                "from_download": bool(job.get("from_download")),
-                "compress_after": dict(job.get("compress_after") or {}),
-                "requested_model": str(
-                    job.get("requested_model") or ""),
-                "actual_model": str(job.get("actual_model") or ""),
-            })
-        return payload
+        """Encode through the shared processing recovery schema."""
+        return ProcessingRecord.decode(job, runtime=True).queue_payload()
 
     def _restore_runtime_jobs_from_queue(self) -> int:
         """Merge persisted GPU tasks into the worker's runtime queue.
@@ -2712,65 +2528,11 @@ class TranscribeManager:
                     key = (kind, self._job_path_key(path))
                     if not key[1] or key in known or not os.path.isfile(path):
                         continue
-                    job: dict[str, Any] = {
-                        "task_id": (str(item.get("task_id") or "").strip()
-                                    or make_task_id("gpu")),
-                        "kind": kind,
-                        "path": path,
-                        "title": item.get("title") or os.path.basename(path),
-                        "channel": item.get("channel", ""),
-                        "cb": None,
-                        "cancel": threading.Event(),
-                    }
-                    if kind == "compress":
-                        job.update({
-                            "quality": item.get("quality", "Average"),
-                            "output_res": str(item.get("output_res", "720")),
-                            "from_download": bool(
-                                item.get("from_download")),
-                        })
-                    else:
-                        job.update({
-                            "kind": "transcribe",
-                            "combined_override": item.get("combined_override"),
-                            "retranscribe": bool(item.get("retranscribe")),
-                            "video_id": (item.get("video_id") or "").strip(),
-                            "bulk_id": item.get("bulk_id", "") or "",
-                            "bulk_total": int(item.get("bulk_total", 0) or 0),
-                            "bulk_index": int(item.get("bulk_index", 0) or 0),
-                            "from_download": bool(item.get("from_download")),
-                            "compress_after": dict(
-                                item.get("compress_after") or {}),
-                            "requested_model": str(
-                                item.get("requested_model")
-                                or self._model or ""),
-                            "actual_model": str(
-                                item.get("actual_model") or ""),
-                            "_retry_required": bool(
-                                item.get("retry_required")),
-                            "_retry_as_replace": bool(
-                                item.get("retry_as_replace")),
-                            "_write_intent": bool(item.get("write_intent")),
-                            "_caption_recovery": bool(
-                                item.get("caption_recovery")),
-                            "_skip_pending_counter": bool(
-                                item.get("skip_pending_counter")),
-                            "_cleanup_only": bool(item.get("cleanup_only")),
-                            "_no_speech_pending": bool(
-                                item.get("no_speech_pending")),
-                            "_stats_tallied": bool(
-                                item.get("stats_tallied")),
-                            "_output_complete": bool(
-                                item.get("output_complete")),
-                            "_callback_done": bool(
-                                item.get("callback_done")),
-                            "_followup_pending": bool(
-                                item.get("followup_pending")),
-                            "_followup_enqueued": bool(
-                                item.get("followup_enqueued")),
-                            "_completed_outcome": str(
-                                item.get("completed_outcome") or ""),
-                        })
+                    record = ProcessingRecord.decode(item, default_model=self._model)
+                    job = record.runtime_payload(cancel_event=threading.Event())
+                    job.update(task_id=(record.task_id.strip() or make_task_id("gpu")),
+                               kind="compress" if kind == "compress" else "transcribe",
+                               title=record.title or os.path.basename(path))
                     self._jobs.append(job)
                     known.add(key)
                     restored += 1
@@ -2824,6 +2586,11 @@ class TranscribeManager:
         self._ensure_worker()
         return True
 
+    def has_current_job(self) -> bool:
+        """Whether an operation owns the processing lane, excluding its tail."""
+        with self._jobs_lock:
+            return self._current_job is not None
+
     def is_active(self) -> bool:
         """True if a GPU job is currently running OR jobs remain queued.
 
@@ -2867,96 +2634,10 @@ class TranscribeManager:
     def cancel_current_durable(
             self, task_id: str,
             clear_visible: Callable[[], bool]) -> bool:
-        """Cancel one exact running job after both recovery stores commit."""
-        wanted = str(task_id or "").strip()
-        if not wanted or not callable(clear_visible):
-            return False
-        with self._journal_lock:
-            with self._jobs_lock:
-                job = self._current_job
-                if (not job
-                        or str(job.get("task_id") or "").strip() != wanted
-                        or "cancel" not in job):
-                    return False
-
-            # Commit the journal removal first.  The job is still running and
-            # its QueueState current slot remains recoverable until the peer
-            # store commits below.
-            if not self._write_pending_snapshot(
-                    self._pending_snapshot(include_current=False)):
-                return False
-            try:
-                visible_saved = bool(clear_visible())
-            except Exception as exc:
-                _log.warning(
-                    "Processing current-slot cancellation failed: %s", exc)
-                visible_saved = False
-            if not visible_saved:
-                # Restore the first durable store before returning failure.
-                # If this compensation itself cannot be saved, QueueState's
-                # still-present current slot remains sufficient for recovery.
-                self._write_pending_snapshot(
-                    self._pending_snapshot(include_current=True))
-                return False
-
-            # The worker's outcome must remain a deliberate terminal drop even
-            # if cancellation races with an unrelated failure.
-            job["_cancel_drop_requested"] = True
-            job["cancel"].set()
-            try:
-                self._send_cancel_command()
-            except Exception as exc:
-                _log.debug("cooperative Processing cancel failed: %s", exc)
-            return True
+        return self.queue_commands().cancel_current_durable(task_id, clear_visible)
 
     def defer_current(self, task_id: str) -> bool:
-        """Cancel the exact running task and place that same ID at the tail."""
-        wanted = str(task_id or "").strip()
-        if not wanted:
-            return False
-        reservation = None
-        with self._journal_lock:
-            with self._jobs_lock:
-                job = self._current_job
-                if (not job
-                        or str(job.get("task_id") or "").strip() != wanted
-                        or "cancel" not in job):
-                    return False
-                reserved_ids = {
-                    str(existing.get("task_id") or "").strip()
-                    for existing in [*self._jobs, *self._inline_caption_jobs]
-                    if str(existing.get("task_id") or "").strip()
-                }
-            if self._queues is None:
-                return False
-            try:
-                reservation = self._queues.gpu_reserve_task(
-                    self._queue_payload_for_job(job),
-                    reserved_task_ids=reserved_ids,
-                    required_task_id=wanted,
-                )
-            except Exception as exc:
-                _log.warning("GPU defer queue reservation failed: %s", exc)
-                reservation = None
-            if not isinstance(reservation, dict):
-                return False
-            job["_defer_requested"] = True
-            if not self._persist_pending():
-                job.pop("_defer_requested", None)
-                try:
-                    self._queues.gpu_rollback_reservation(reservation)
-                except Exception as exc:
-                    _log.warning("GPU defer reservation rollback failed: %s", exc)
-                self._stream.emit_error(
-                    "Could not save the deferred Processing task; the running "
-                    "task was not cancelled.")
-                return False
-            job["cancel"].set()
-            try:
-                self._send_cancel_command()
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
-        return True
+        return self.queue_commands().defer_current(task_id)
 
     def _ensure_worker(self):
         if self._shutdown_requested.is_set():
@@ -3007,14 +2688,9 @@ class TranscribeManager:
         if deferred:
             job["cancel"] = threading.Event()
         elif outcome is _WorkerOutcome.FAILED:
-            job["_retry_required"] = True
-            if (job.get("_write_intent")
-                    and not job.get("_caption_recovery")
-                    and not job.get("_no_speech_pending")
-                    and not job.get("_cleanup_only")):
-                job["_retry_as_replace"] = True
+            RecoveryState.decode(job, runtime=True).operation_failed().apply(job)
         elif outcome is _WorkerOutcome.CLEANUP_FAILED:
-            job["_cleanup_only"] = True
+            RecoveryState.decode(job, runtime=True).cleanup_failed().apply(job)
             # A cancelled work item may still need its durable pending-ID
             # cleanup retried; give that cleanup-only item a fresh event.
             job["cancel"] = threading.Event()
@@ -3110,12 +2786,24 @@ class TranscribeManager:
         return _WorkerOutcome.NO_SPEECH
 
     def _worker_loop(self):
+        lease_guard = {}
+        try:
+            return self._worker_loop_with_admission(lease_guard)
+        finally:
+            lease = lease_guard.pop("lease", None)
+            if lease is not None:
+                lease.release()
+
+    def _worker_loop_with_admission(self, lease_guard):
         # Whisper availability is checked only after native captions miss in
         # `_transcribe_one`. Cleanup-only recovery, durable no-speech retries,
         # compression, and local caption ingest do not need the 3.11 worker and
         # must remain able to drain when that optional environment is missing.
         while (not self._cancel_all.is_set()
                and not self._shutdown_requested.is_set()):
+            previous = lease_guard.pop("lease", None)
+            if previous is not None:
+                previous.release()
             # Two gates at the top of the loop before popping a job:
             # 1. `_paused` — set by queue_pause("gpu") or disk-watchdog.
             # Parks the worker thread without draining the queue,
@@ -3166,16 +2854,29 @@ class TranscribeManager:
                     self._stop_subprocess()
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
+            from .processing_admission import reserve_ready_job
+            with self._jobs_lock:
+                candidates = list(self._jobs)
+                if not candidates:
+                    self._manual_drain.clear()
+                    break
+            job, lease = reserve_ready_job(
+                candidates, self._channel_aliases_for_job, self._emit_processing_wait)
+            if job is None:
+                # Keep all blocked work Pending. A newly queued job on another
+                # channel can run on the next pass, without losing FIFO order
+                # among jobs that can currently execute.
+                self._cancel_all.wait(0.1)
+                continue
+            lease_guard["lease"] = lease
             pop_persisted = False
             with self._journal_lock:
                 with self._jobs_lock:
-                    if not self._jobs:
-                        # Queue drained. If this was a one-shot manual "Start"
-                        # (Auto still off), disarm it now so future arrivals
-                        # queue again instead of auto-draining.
-                        self._manual_drain.clear()
-                        break
-                    job = self._jobs.pop(0)
+                    selected = next((i for i, candidate in enumerate(self._jobs)
+                                     if candidate is job), None)
+                    if selected is None:
+                        continue
+                    self._jobs.pop(selected)
                     self._current_job = job
                 # A worker may not execute a job until the queued->current
                 # transition is durable. On failure, restore the exact runtime
@@ -3185,7 +2886,7 @@ class TranscribeManager:
                     with self._jobs_lock:
                         if self._current_job is job:
                             self._current_job = None
-                        self._jobs.insert(0, job)
+                        self._jobs.insert(selected, job)
             if not pop_persisted:
                 self._manual_drain.clear()
                 self._paused.set()
@@ -3559,6 +3260,9 @@ class TranscribeManager:
             if stop_after_job:
                 break
 
+        remaining_lease = lease_guard.pop("lease", None)
+        if remaining_lease is not None:
+            remaining_lease.release()
         # Flush per-channel batch stats to autorun_history + activity log.
         # One row per channel processed in this worker session.
         try:
@@ -3612,15 +3316,43 @@ class TranscribeManager:
             root = os.path.dirname(path) or path
         return channel_aliases(matched, paths=[root])
 
-    def _run_under_channel_lease(self, job: dict[str, Any], callback):
-        from backend.services.channel_leases import LeaseOwner, channel_leases
+    def _emit_processing_wait(self, job, blockers=()):
+        kind = "Compression" if job.get("kind") == "compress" else "Transcription"
+        if not isinstance(blockers, (tuple, list)):
+            blockers = ()
+        blocking = next(iter(blockers), None)
+        label = getattr(blocking, "label", "") or "another task on this channel"
+        self._emit_job_status(job, f"{kind} waiting for {label} to finish.")
 
-        task_id = str(job.get("task_id") or make_task_id("gpu"))
+    def _emit_job_status(self, job, message, *, warning=False):
+        if job.get("kind") == "compress":
+            from ..compress import compress_marker_tag
+            marker = compress_marker_tag(job.get("path", ""))
+        else:
+            video_id = str(job.get("video_id") or "").strip()
+            marker = f"tx_done_{video_id}" if video_id else ""
+        tag = job.get("job_tag") or f"whisper_job_{job.get('task_id', 'pending')}"
+        tags = [value for value in (marker, tag, "yellow" if warning else "simpleline_blue")
+                if value]
+        lead = "      " if job.get("from_download") else " "
+        identity = ""
+        if not job.get("from_download"):
+            identity = f" {job.get('title') or 'Video'}"
+            if job.get("channel"):
+                identity += f" ({job['channel']})"
+            identity += " —"
+        icon = "⚠" if warning else "⏳"
+        self._stream.emit([[f"{lead}— {icon}{identity} {message}\n", tags]])
+
+    def _run_under_channel_lease(self, job: dict[str, Any], callback):
+        from backend.services.channel_leases import channel_leases
+
+        from .processing_admission import processing_owner
+
+        if not job.get("task_id"):
+            job["task_id"] = make_task_id("gpu")
         aliases = self._channel_aliases_for_job(job)
-        owner = LeaseOwner(
-            "processing", task_id,
-            label="GPU processing", task_id=task_id,
-            kind=str(job.get("kind") or "transcribe"))
+        owner = processing_owner(job)
         waiting_reported = False
         while True:
             result = channel_leases.acquire(
@@ -3642,11 +3374,7 @@ class TranscribeManager:
                 return _WorkerOutcome.CANCELLED
             if result.status == "timeout":
                 if not waiting_reported:
-                    self._stream.emit_text(
-                        "Processing is waiting for another task on this "
-                        "channel to finish.\n",
-                        "simpleline_blue",
-                    )
+                    self._emit_processing_wait(job, getattr(result, "blockers", ()))
                     waiting_reported = True
                 continue
             self._stream.emit_error(
@@ -3939,10 +3667,7 @@ class TranscribeManager:
         # final "— ✓ Transcription" done line replaces this too.
         if (not job.get("retranscribe")
                 and caption_outcome is _CaptionOutcome.UNAVAILABLE):
-            self._stream.emit([[
-                " No auto-captions available \u2014 using Whisper\u2026\n",
-                ["transcribe_using", job_tag],
-            ]])
+            self._emit_job_status(job, "No auto-captions available — using Whisper…")
 
         if not self.is_available():
             self._stream.emit_error(
@@ -4032,6 +3757,7 @@ class TranscribeManager:
         # doesn't visibly jump from 1-space to 6-space leading whitespace.
         _prog_lead = "      " if job.get("from_download") else " "
         def _emit_progress(pct, suffix=""):
+            self._notify_job_runtime_state(job, "transcribing", pct=pct)
             # Em-dash + space in the whisper_bracket color matches the
             # other inline per-video lines (download ✓, metadata ✓,
             # etc.) so the block reads as one visual unit.
@@ -4045,170 +3771,18 @@ class TranscribeManager:
             ])
         _emit_progress(0)
 
-        # Request. Pass the parent's ffprobe duration as a fallback so
-        # the worker's progress emitter still has a denominator even
-        # when faster-whisper's info.duration comes back None/0 (audit:
-        # transcribe/core.py:1303 / 1729). vad_filter occasionally
-        # rejects everything on silent-intro videos and reports 0,
-        # which silently disabled all "[%]" progress emits before this.
-        req = json.dumps({
-            "path": path,
-            "duration": 0,
-            "duration_fallback": float(duration) if duration else 0.0,
-        }) + "\n"
-        proc, q = self._snapshot_worker_io()
-        if proc is None or q is None:
-            if job["cancel"].is_set() or self._cancel_all.is_set():
-                return _WorkerOutcome.CANCELLED
-            return _WorkerOutcome.FAILED
-        try:
-            proc.stdin.write(req)
-            proc.stdin.flush()
-        except Exception as e:
-            # Suppress the error toast when cancel was already
-            # requested — BrokenPipeError on cancel is normal cleanup,
-            # not a real failure (audit: transcribe/core.py:1303-1310).
-            if not (job["cancel"].is_set() or self._cancel_all.is_set()):
-                self._stream.emit_error(f"Write to whisper failed: {e}")
-            self._stop_subprocess()
-            if job["cancel"].is_set() or self._cancel_all.is_set():
-                return _WorkerOutcome.CANCELLED
-            return _WorkerOutcome.FAILED
-
-        # Read responses until we get "ok" or "error"
-        last_pct = -1
-        result = None
-        while True:
-            if job["cancel"].is_set() or self._cancel_all.is_set():
-                # tag the cancel line with this job's
-                # inplace family so it REPLACES the last progress
-                # tick in place. Old behavior emitted an untagged
-                # red line that landed at the log tail while the
-                # "25%..." tick stayed visible above it, confusing
-                # the user into thinking both were still active.
-                _job_tag_c = job.get("job_tag", "") or ""
-                _tag_list = ["red"]
-                if _job_tag_c:
-                    _tag_list.append(_job_tag_c)
-                self._stream.emit([
-                    [" \u26d4 Transcription cancelled.\n", _tag_list]
-                ])
-                if self._cancel_all.is_set():
-                    self._stop_subprocess(force=True)
-                elif not self._graceful_cancel_current():
-                    self._stop_subprocess(force=True)
-                return _WorkerOutcome.CANCELLED
-            try:
-                _proc_snapshot, q = self._snapshot_worker_io()
-                if q is None:
-                    if job["cancel"].is_set() or self._cancel_all.is_set():
-                        return _WorkerOutcome.CANCELLED
-                    self._stream.emit_error("Transcription stopped unexpectedly. Try again.")
-                    return _WorkerOutcome.FAILED
-                line = q.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if line is None:
-                self._stream.emit_error("Transcription stopped unexpectedly. Try again.")
-                self._emit_whisper_stderr_tail()
-                return _WorkerOutcome.FAILED
-            try:
-                msg = json.loads(line.strip())
-            except json.JSONDecodeError:
-                continue
-            status = msg.get("status")
-            if status == "progress":
-                pct = int(msg.get("pct", 0))
-                if pct != last_pct:
-                    last_pct = pct
-                    _emit_progress(pct)
-                continue
-            if status == "starting":
-                continue
-            if status == "cancelled":
-                return _WorkerOutcome.CANCELLED
-            if status == "ok":
-                if not self._accept_worker_model_report(
-                    msg,
-                    job,
-                    phase="result",
-                ):
-                    return _WorkerOutcome.FAILED
-                result = msg
-                # Recognition is complete, but punctuation, transcript writes,
-                # and FTS indexing still remain. Do not leave the last 99% tick
-                # on screen during that work -- it makes a healthy finalization
-                # phase look like Whisper itself has hung.
-                # Machine-readable phase tag lets the Watch progress control
-                # leave its last 99% value behind while punctuation,
-                # transcript writes, and indexing run.
-                self._stream.emit(_build_transcription_finalizing_segments(
-                    job, _disp_title, lead=_prog_lead))
-                break
-            if status == "error":
-                err = msg.get('text', 'unknown')
-                # CUDA OOM recovery: kill the subprocess, fall back to CPU,
-                # and requeue this job at the front.
-                low = err.lower()
-                if ("cuda" in low and ("out of memory" in low or "oom" in low)) or "cublas" in low:
-                    self._stream.emit_error(f"Transcription ran out of GPU memory: {err}")
-                    self._stream.emit_text(
-                        " \u21A9 Falling back to CPU mode for this job.",
-                        "simpleline_blue")
-                    self._stop_subprocess(force=True)
-                    # Flag-only: the next _start_subprocess reads
-                    # `self._cpu_fallback_active` and builds its env
-                    # accordingly. No more os.environ mutation (audit:
-                    # H51) — global mutation would leak into any
-                    # sibling subprocess spawned in between.
-                    self._cpu_fallback_active = True
-                    # Retry once on CPU. The worker owns the requeue so pending
-                    # counters/journal/UI state all stay in one place.
-                    if not job.get("_retried_cpu"):
-                        job["_retried_cpu"] = True
-                        return _WorkerOutcome.RETRY
-                    return _WorkerOutcome.FAILED
-                self._stream.emit_error(f"Transcription error: {err}")
-                self._emit_whisper_traceback(msg)
-                return _WorkerOutcome.FAILED
+        inference_outcome, result = self._transcribe_single_file(
+            path, job, duration_fallback=float(duration or 0), on_progress=_emit_progress)
+        if inference_outcome is not _WorkerOutcome.SUCCESS:
+            return inference_outcome
+        self._notify_job_runtime_state(job, "finalizing")
+        self._stream.emit(_build_transcription_finalizing_segments(
+            job, _disp_title, lead=_prog_lead))
 
         # Write output files + ingest into FTS index
         if result:
             channel = job.get("channel") or ""
-            # Run punctuation pass over the raw text (and each segment's t)
-            if self._punctuate_enabled:
-                # track whether punct succeeded so the source
-                # tag can reflect reality. Previously a failed punct
-                # pass left the tag as "(WHISPER:model)" even though
-                # the text was unpunctuated — users assumed punctuation
-                # was present in the Watch banner.
-                # Only mark `_punct_attempted = True` when we ACTUALLY
-                # call punctuate(). For silent videos with empty text
-                # the prior code set attempted=True but never made the
-                # call, so the source tag wrongly read "+NO-PUNCT".
-                result["_punct_success"] = False
-                result["_punct_timeout"] = False  # bug [43]
-                result.setdefault("_punct_attempted", False)
-                try:
-                    raw_text = result.get("text", "") or ""
-                    if raw_text:
-                        result["_punct_attempted"] = True
-                        punct_text = self._punct.punctuate(raw_text)
-                        # Bug [43]: surface a timeout-specific signal so
-                        # downstream code (source tag, summary log) can
-                        # distinguish "model wedged" from other failures.
-                        if getattr(self._punct, "last_was_timeout", False):
-                            result["_punct_timeout"] = True
-                        if punct_text and punct_text != raw_text:
-                            result["text"] = punct_text
-                            # Align punctuated whole-text back to segments by
-                            # word offset — no per-segment subprocess calls
-                            # (T150). Pure Python, completes in microseconds.
-                            _punct_align_segments(
-                                punct_text, result.get("segments", []))
-                            result["_punct_success"] = True
-                except Exception as _pe:
-                    self._stream.emit_dim(f" (punctuation pass skipped: {_pe})")
+            self._punctuate_result(result)
             replace_existing = bool(
                 job.get("retranscribe") or job.get("_retry_as_replace"))
             output_outcome = self._write_outputs(
@@ -4225,6 +3799,12 @@ class TranscribeManager:
                 return output_outcome
             if output_outcome is not _WorkerOutcome.SUCCESS:
                 return output_outcome
+            if result.get("_existing_transcript_kept"):
+                self._emit_job_status(
+                    job, "No speech detected; existing transcript kept.", warning=True)
+                if not self._finish_successful_job(job, result):
+                    return _WorkerOutcome.CLEANUP_FAILED
+                return _WorkerOutcome.SUCCESS
             # Done line — in-place replaces the sync.py-reserved
             # `tx_done_<vid>` placeholder under the channel's block
             # (`_inplaceKind` prioritizes `tx_done_` over `whisper_job_`),
@@ -4313,12 +3893,7 @@ class TranscribeManager:
                        (1 if total_duration % _CHUNK_DURATION_SECS > 0 else 0))
         _disp_title_chunked = title[:40].rstrip()
         _t_start_chunked = time.time()
-        self._stream.emit([
-            ["Transcribing ", "transcribe_using"],
-            [f'"{title}"', "transcribe_title"],
-            [" \u2014 ", "dim"],
-            [f"{hours:.1f}h, {n_chunks} sections\n", "simpleline"],
-        ])
+        self._emit_job_status(job, f'Transcribing "{title}" — {hours:.1f}h, {n_chunks} sections')
 
         all_text_parts: list[str] = []
         all_segments: list[dict[str, Any]] = []
@@ -4353,39 +3928,16 @@ class TranscribeManager:
                     break
 
                 chunk_path = os.path.join(chunk_dir, f"chunk_{ci:03d}.wav")
-                ff_cmd = [
-                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                    "-ss", str(start_sec), "-t", str(chunk_dur),
-                    "-i", path, "-vn", "-ac", "1", "-ar", "16000",
-                    "-acodec", "pcm_s16le", chunk_path,
-                ]
-                # Scale the ffmpeg-split timeout with chunk_dur — old
-                # hard-coded 600s could expire mid-split on slow disks
-                # (pooled archive + antivirus) for a long chunk, dropping that
-                # whole section from the merged transcript (audit:
-                # transcribe/core.py:1564-1581). Allow at least 3x
-                # realtime per second of chunk audio, with a 1200s
-                # floor for short chunks. If a section STILL times
-                # out, fail the whole chunked transcribe rather than
-                # silently continuing with a 2-hour hole.
-                _ff_timeout = max(1200.0, chunk_dur * 3.0)
-                try:
-                    subprocess.run(
-                        ff_cmd, check=True, capture_output=True,
-                        timeout=_ff_timeout,
-                        creationflags=(0x08000000 if os.name == "nt" else 0),
-                    )
-                except subprocess.TimeoutExpired as _toe:
+                extraction = extract_audio_chunk(
+                    path, chunk_path, start=start_sec, duration=chunk_dur,
+                    cancel_event=CancellationSignals(job["cancel"], self._cancel_all),
+                    task_id=str(job.get("task_id") or job.get("job_tag") or ""))
+                if extraction.outcome is _WorkerOutcome.CANCELLED:
+                    return _WorkerOutcome.CANCELLED
+                if extraction.outcome is not _WorkerOutcome.SUCCESS:
                     self._stream.emit_error(
-                        f"Section {ci+1}/{n_chunks} split timed out after "
-                        f"{int(_ff_timeout)}s — aborting chunked transcribe "
-                        f"to avoid silent gaps in the merged transcript.")
-                    return _WorkerOutcome.FAILED
-                except Exception as e:
-                    self._stream.emit_error(
-                        f"Section {ci+1}/{n_chunks} split failed: {e} "
-                        f"— aborting chunked transcribe to avoid silent gaps "
-                        f"in the merged transcript.")
+                        f"Section {ci+1}/{n_chunks} split failed: {extraction.error} "
+                        "— aborting chunked transcribe to avoid silent gaps in the merged transcript.")
                     return _WorkerOutcome.FAILED
 
                 # Hand the chunk to Whisper via the persistent subprocess.
@@ -4400,15 +3952,13 @@ class TranscribeManager:
                 if chunk_outcome is _WorkerOutcome.CANCELLED:
                     return _WorkerOutcome.CANCELLED
                 if chunk_outcome is not _WorkerOutcome.SUCCESS:
-                    return _WorkerOutcome.FAILED
+                    return chunk_outcome
                 if not result or not (
                         (result.get("text") or "").strip()
                         or any((seg.get("t") or seg.get("text") or "").strip()
                                for seg in (result.get("segments") or [])
                                if isinstance(seg, dict))):
-                    self._stream.emit([
-                        [f" Section {ci+1}/{n_chunks} \u2014 no speech\n", "simpleline"],
-                    ])
+                    self._emit_job_status(job, f"Section {ci+1}/{n_chunks} — no speech")
                     continue
 
                 # Log per-section summary
@@ -4416,10 +3966,8 @@ class TranscribeManager:
                 te_m, te_s = divmod(int(t_elapsed), 60)
                 te_str = f"{te_m}min {te_s:02d}sec" if te_m else f"{te_s}sec"
                 rt = f"{chunk_dur / t_elapsed:.1f}x realtime" if t_elapsed > 0 else ""
-                self._stream.emit([
-                    [f" Section {ci+1}/{n_chunks} done "
-                     f"({cd_m}m{cd_s:02d}s, {te_str}, {rt})\n", "simpleline_blue"],
-                ])
+                self._emit_job_status(job, f"Section {ci+1}/{n_chunks} done "
+                                      f"({cd_m}m{cd_s:02d}s, {te_str}, {rt})")
 
                 txt = result.get("text") or ""
                 if txt:
@@ -4469,29 +4017,10 @@ class TranscribeManager:
             # sidecar writes, and search indexing still remain. Match the
             # short-video Watch state instead of leaving the last section's
             # percentage on screen throughout that work.
+            self._notify_job_runtime_state(job, "finalizing")
             self._stream.emit(_build_transcription_finalizing_segments(
                 job, _disp_title_chunked))
-            # Optional punctuation pass on the merged text (same as single-pass).
-            # also iterate each segment and punctuate its text
-            # so the .jsonl (source of Watch-view karaoke + FTS search)
-            # reads consistently punctuated. Previously only the merged
-            # concatenated text got punctuated, leaving .jsonl segments
-            # as raw lowercase Whisper output — Watch view and search
-            # results looked different from the .txt.
-            merged["_punct_attempted"] = False
-            merged["_punct_success"] = False
-            if self._punctuate_enabled and merged["text"]:
-                merged["_punct_attempted"] = True
-                try:
-                    punct = self._punct.punctuate(merged["text"])
-                    if punct and punct != merged["text"]:
-                        merged["text"] = punct
-                        merged["_punct_success"] = True
-                        # Align punctuated whole-text back to segments by
-                        # word offset — no per-segment subprocess calls (T150).
-                        _punct_align_segments(punct, merged["segments"])
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
+            self._punctuate_result(merged)
             replace_existing = bool(
                 job.get("retranscribe") or job.get("_retry_as_replace"))
             output_outcome = self._write_outputs(
@@ -4508,6 +4037,12 @@ class TranscribeManager:
                 return output_outcome
             if output_outcome is not _WorkerOutcome.SUCCESS:
                 return output_outcome
+            if merged.get("_existing_transcript_kept"):
+                self._emit_job_status(
+                    job, "No speech detected; existing transcript kept.", warning=True)
+                if not self._finish_successful_job(job, merged):
+                    return _WorkerOutcome.CLEANUP_FAILED
+                return _WorkerOutcome.SUCCESS
             # Done line — REPLACES the last whisper_progress chunk line
             # in place via `whisper_progress` inplace kind. Matches OLD
             # YTArchiver.py:16495 format with (chunked) suffix to
@@ -4546,119 +4081,72 @@ class TranscribeManager:
             try: shutil.rmtree(chunk_dir, ignore_errors=True)
             except Exception as e: _log.debug("swallowed: %s", e)
 
-    def _transcribe_single_file(self, path: str, job: dict[str, Any],
-                                 _log_prefix: str = "") -> tuple[
-                                     _WorkerOutcome, dict[str, Any] | None]:
-        """Send one file to the persistent whisper subprocess and collect the
-        result. Used by the chunked path to do each section. Returns the
-        explicit outcome plus the parsed worker JSON when successful.
+    def _punctuate_result(self, result: dict[str, Any]) -> None:
+        apply_punctuation(
+            result, enabled=self._punctuate_enabled, punctuate=self._punct.punctuate,
+            timed_out=lambda: getattr(self._punct, "last_was_timeout", False),
+            align=_punct_align_segments,
+            report_error=lambda error: self._stream.emit_dim(f" (punctuation pass skipped: {error})"))
 
-        emits in-place progress ticks tagged with the
-        current job's `job_tag` + the section prefix. Before this,
-        chunked transcription looked frozen: a 6-hour video would
-        show 3 "Section N/M done" lines over 2 hours of wall time
-        with zero feedback in between. Now each chunk displays its
-        own progress bar. also honors pause INSIDE
-        the read loop so a 2-hour chunk can be paused mid-run.
-        """
+    def _transcribe_single_file(self, path: str, job: dict[str, Any],
+                                 _log_prefix: str = "", *,
+                                 duration_fallback: float | None = None,
+                                 on_progress: Callable[[int], None] | None = None) -> tuple[
+                                     _WorkerOutcome, dict[str, Any] | None]:
+        """One shared request transaction and recovery policy for any input file."""
+        def cancelled() -> bool:
+            return job["cancel"].is_set() or self._cancel_all.is_set()
+
+        if cancelled():
+            return _WorkerOutcome.CANCELLED, None
         proc, _line_q = self._snapshot_worker_io()
         if proc is None or proc.poll() is not None:
-            if not self.start_subprocess(
-                    model=str(job.get("requested_model") or self._model)):
+            if not self.start_subprocess(model=str(job.get("requested_model") or self._model)):
                 return _WorkerOutcome.FAILED, None
-            proc, _line_q = self._snapshot_worker_io()
-        if proc is None:
-            return _WorkerOutcome.FAILED, None
-        try:
-            # Pass ffprobe duration as fallback so the worker can still
-            # render progress on chunks where info.duration is 0
-            # (audit: transcribe/core.py:1303 / 1729).
-            _chunk_dur = _ffprobe_duration(path) or 0.0
-            req = json.dumps({
-                "path": path, "duration": 0,
-                "duration_fallback": float(_chunk_dur),
-            }) + "\n"
-            proc.stdin.write(req)
-            proc.stdin.flush()
-        except Exception as e:
-            self._stream.emit_error(f"Write to whisper failed: {e}")
-            if job["cancel"].is_set() or self._cancel_all.is_set():
-                return _WorkerOutcome.CANCELLED, None
-            return _WorkerOutcome.FAILED, None
-        _last_pct = -1
-        _job_tag_p = (job.get("job_tag") or "") if isinstance(job, dict) else ""
-        _prefix_str = (_log_prefix or "").strip()
-        while True:
-            if job["cancel"].is_set() or self._cancel_all.is_set():
-                if self._cancel_all.is_set():
-                    self._stop_subprocess(force=True)
-                elif not self._graceful_cancel_current():
-                    self._stop_subprocess(force=True)
-                return _WorkerOutcome.CANCELLED, None
-            # Whisper cannot pause inference in flight. Continue draining its
-            # result and keep the UI in "finishing current task" until the next
-            # chunk/job boundary, where the worker can actually become idle.
-            if job["cancel"].is_set() or self._cancel_all.is_set():
-                if self._cancel_all.is_set():
-                    self._stop_subprocess(force=True)
-                elif not self._graceful_cancel_current():
-                    self._stop_subprocess(force=True)
-                return _WorkerOutcome.CANCELLED, None
-            try:
-                _proc_snapshot, q = self._snapshot_worker_io()
-                if q is None:
-                    if job["cancel"].is_set() or self._cancel_all.is_set():
-                        return _WorkerOutcome.CANCELLED, None
-                    self._stream.emit_error("Transcription stopped unexpectedly. Try again.")
-                    return _WorkerOutcome.FAILED, None
-                line = q.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if line is None:
-                self._stream.emit_error("Transcription stopped unexpectedly. Try again.")
+
+        def cancel_request() -> None:
+            if not _log_prefix:
+                tags = [tag for tag in ("red", job.get("job_tag")) if tag]
+                self._stream.emit([[" ⛔ Transcription cancelled.\n", tags]])
+            if self._cancel_all.is_set() or not self._graceful_cancel_current():
+                self._stop_subprocess(force=True)
+
+        def progress(pct: int) -> None:
+            if on_progress is not None:
+                on_progress(pct)
+                return
+            self._notify_job_runtime_state(job, "transcribing", pct=pct, section=_log_prefix.strip())
+            video_id = str(job.get("video_id") or "").strip()
+            marker = f"tx_done_{video_id}" if video_id else ""
+            tags = [tag for tag in (marker, "whisper_progress", job.get("job_tag")) if tag]
+            prefix = _log_prefix.strip()
+            label = f"{prefix} {pct}%..." if prefix else f"{pct}%..."
+            self._stream.emit([[label + "\n", tags]])
+
+        result = run_inference(
+            path=path, duration=(float(duration_fallback) if duration_fallback is not None
+                                 else float(_ffprobe_duration(path) or 0)),
+            snapshot_io=self._snapshot_worker_io, is_cancelled=cancelled,
+            cancel=cancel_request, progress=progress,
+            accept_model=lambda msg: self._accept_worker_model_report(msg, job, phase="result"))
+        if result.transport_failed:
+            if result.outcome is not _WorkerOutcome.CANCELLED:
+                self._stream.emit_error(result.error)
                 self._emit_whisper_stderr_tail()
-                return _WorkerOutcome.FAILED, None
-            try:
-                msg = json.loads(line.strip())
-            except json.JSONDecodeError:
-                continue
-            status = msg.get("status")
-            if status == "progress":
-                # audit D-20 + SR-3: emit an in-place progress bar
-                # tagged with the per-job inplace family AND the
-                # tx_done_<vid> marker so each tick replaces the
-                # sync.py-reserved placeholder under the channel's
-                # block (not the log tail, which drifts as sync
-                # moves on to later channels). `tx_done_` wins in
-                # `_inplaceKind` so the line stays glued to the
-                # reserved slot.
-                pct = int(msg.get("pct", 0))
-                if pct != _last_pct:
-                    _last_pct = pct
-                    _vid_p = (job.get("video_id") or "").strip() if isinstance(job, dict) else ""
-                    _marker_p = f"tx_done_{_vid_p}" if _vid_p else ""
-                    _tag_list = [t for t in (_marker_p, "whisper_progress", _job_tag_p) if t]
-                    _label = f"{_prefix_str} {pct}%..." if _prefix_str else f"{pct}%..."
-                    self._stream.emit([[_label + "\n", _tag_list]])
-                continue
-            if status == "starting":
-                continue
-            if status == "cancelled":
-                return _WorkerOutcome.CANCELLED, None
-            if status == "ok":
-                if not self._accept_worker_model_report(
-                    msg,
-                    job,
-                    phase="result",
-                ):
-                    return _WorkerOutcome.FAILED, None
-                return _WorkerOutcome.SUCCESS, msg
-            if status == "error":
-                self._stream.emit_error(
-                    f"Whisper error{(' (' + _log_prefix.strip() + ')') if _log_prefix else ''}: "
-                    f"{msg.get('text', 'unknown')}")
-                self._emit_whisper_traceback(msg)
-                return _WorkerOutcome.FAILED, None
+            self._stop_subprocess(force=True)
+        elif result.response is not None and result.outcome is _WorkerOutcome.FAILED:
+            if is_gpu_memory_error(result.error):
+                self._stream.emit_error(f"Transcription ran out of GPU memory: {result.error}")
+                self._stream.emit_text(" ↩ Falling back to CPU mode for this job.", "simpleline_blue")
+                self._stop_subprocess(force=True)
+                self._cpu_fallback_active = True
+                if not job.get("_retried_cpu"):
+                    job["_retried_cpu"] = True
+                    return _WorkerOutcome.RETRY, None
+            else:
+                self._stream.emit_error(f"Transcription error: {result.error}")
+                self._emit_whisper_traceback(result.response)
+        return result.outcome, result.response
 
     def _write_outputs(self, video_path: str, result: dict[str, Any],
                        title: str = "", channel: str = "",
@@ -4760,12 +4248,30 @@ class TranscribeManager:
             # already has. If the new Whisper run hears nothing, keep that
             # known-good transcript and its searchable/indexed state instead
             # of relabeling the video no-speech while stale words remain.
+            existing = False
             if retranscribe:
+                from .transcript_presence import has_existing_transcript
+                try:
+                    with transcript_output_locks(txt_path, jsonl_path):
+                        if _output_cancelled():
+                            return _WorkerOutcome.CANCELLED
+                        existing = has_existing_transcript(
+                            txt_path, jsonl_path, title, video_id_hint)
+                except (OSError, ValueError) as exc:
+                    message = ("No speech detected; could not verify the existing "
+                               f"transcript. Files kept for retry: {exc}")
+                    if job is not None:
+                        self._emit_job_status(job, message, warning=True)
+                    else:
+                        self._stream.emit_text(message, "yellow")
+                    return _WorkerOutcome.FAILED
+            if existing:
                 result["_existing_transcript_kept"] = True
-                self._stream.emit_text(
-                    f" \u26a0 No speech was detected in "
-                    f"{os.path.basename(video_path)}; existing transcript kept.",
-                    "yellow")
+                if job is None:
+                    self._stream.emit_text(
+                        f" \u26a0 No speech was detected in "
+                        f"{os.path.basename(video_path)}; existing transcript kept.",
+                        "yellow")
                 return _WorkerOutcome.SUCCESS
             # Persist a TERMINAL 'no_speech' status so this silent / music-
             # only video is not re-attempted by auto + bulk transcribe passes,
@@ -4833,210 +4339,213 @@ class TranscribeManager:
         duration = segs[-1].get("end", segs[-1].get("e", 0)) if segs else 0
         if _output_cancelled():
             return _WorkerOutcome.CANCELLED
-        if not self._arm_output_write_intent(job):
-            return _WorkerOutcome.FAILED
-
-        _jsonl_replacement_receipt: dict[str, Any] = {}
-        if retranscribe:
-            # Surgically swap the old entries in both aggregated files.
-            # Mirrors YTArchiver.py:16462-16474: jsonl FIRST so its
-            # video_id-based purge can report back any title-drifted
-            # stale entries for the txt pass to also clean up.
-            # two-step replace was non-atomic — if .jsonl
-            # succeeded but .txt failed (lock, permission) the video
-            # ended up with new segments + old text, permanently
-            # inconsistent. Mitigation: try .jsonl first; if it
-            # fails, abort before touching .txt so the old content
-            # remains intact on BOTH files. If .jsonl succeeds but
-            # .txt fails, surface a prominent error and attempt a
-            # roll-back by re-reading the backup we captured first.
-            _jsonl_backup: bytes | None = None
-            try:
-                with open(jsonl_path, "rb") as _jb:
-                    _jsonl_backup = _jb.read()
-            except FileNotFoundError:
-                # First-ever retranscribe on a fresh .jsonl — no
-                # backup needed because there's no prior state to
-                # roll back to.
-                _jsonl_backup = None
-            except OSError as _bke:
-                _jsonl_backup = None
-                # Fail FAST before touching the .jsonl when we can't
-                # capture a backup — otherwise a .txt failure later
-                # would leave new .jsonl + old .txt with no way to
-                # recover (audit: transcribe/core.py H52).
-                self._stream.emit_error(
-                    f"Refusing retranscribe of "
-                    f"{os.path.basename(jsonl_path)}: backup capture "
-                    f"failed ({_bke}). Files left untouched.")
-                return _WorkerOutcome.FAILED
-            # Backup capture and journal writes can take time. Accept Cancel
-            # until the first output changes, then finish the paired commit.
+        with transcript_output_locks(txt_path, jsonl_path):
             if _output_cancelled():
                 return _WorkerOutcome.CANCELLED
-            try:
-                extra_titles = _replace_jsonl_entry(
-                    jsonl_path, title, vid_id, segs,
-                    receipt_out=_jsonl_replacement_receipt) or set()
-            except Exception as _je:
-                self._stream.emit_error(
-                    f"Could not update {os.path.basename(jsonl_path)}: {_je}"
-                    f" — .txt left unchanged to avoid split-state.")
-                return _WorkerOutcome.FAILED
-            try:
-                _old_txt_candidates = _jsonl_text_candidates_from_bytes(
-                    _jsonl_backup, title, vid_id)
-                _replace_txt_entry(txt_path, title, text, source_tag,
-                                   extra_titles_to_remove=extra_titles,
-                                   old_text_candidates=_old_txt_candidates,
-                                   video_id=vid_id,
-                                   upload_date=upload_date,
-                                   duration_secs=duration)
-            except Exception as _te:
-                self._stream.emit_error(
-                    f"Could not update {os.path.basename(txt_path)}: {_te}"
-                    f" — attempting .jsonl roll-back to prevent split-state.")
-                # Best-effort .jsonl roll-back so the two files stay
-                # consistent. If the roll-back itself fails the user
-                # is notified with a clear message.
-                if _jsonl_backup is not None:
-                    _rb_tmp = ""
-                    try:
-                        # Atomic, hidden-aware roll-back. The old
-                        # in-place open('wb') NEVER worked here:
-                        # _replace_jsonl_entry re-hides the file in its
-                        # finally block, and on Windows CreateFileW
-                        # refuses to truncate a FILE_ATTRIBUTE_HIDDEN
-                        # file (PermissionError) — so the roll-back was
-                        # dead code for every hidden transcript .jsonl.
-                        import tempfile as _tf
-
-                        from .paths import _hide_file_win as _rb_hide
-                        _fd, _rb_tmp = _tf.mkstemp(
-                            suffix=".jsonl.tmp",
-                            dir=os.path.dirname(jsonl_path) or ".")
-                        with os.fdopen(_fd, "wb") as _jw:
-                            _jw.write(_jsonl_backup)
-                            _jw.flush()
-                            os.fsync(_jw.fileno())
-                        try: _rb_hide(_rb_tmp)
-                        except Exception: pass
-                        os.replace(_rb_tmp, jsonl_path)
-                        try: _rb_hide(jsonl_path)
-                        except Exception: pass
-                        self._stream.emit_error(
-                            f"Rolled {os.path.basename(jsonl_path)} back "
-                            f"— files consistent; retry retranscribe "
-                            f"when {os.path.basename(txt_path)} is "
-                            f"writable.")
-                    except OSError as _re:
-                        if _rb_tmp:
-                            try: os.remove(_rb_tmp)
-                            except OSError: pass
-                        self._stream.emit_error(
-                            f"Roll-back of {os.path.basename(jsonl_path)} "
-                            f"FAILED: {_re}. Files may be out of sync; "
-                            f"retry retranscribe when writable.")
-                else:
-                    # The replacement created a brand-new JSONL. Restoring the
-                    # prior "missing" state means deleting it when the paired
-                    # TXT replacement fails.
-                    try:
-                        from ..utils import unhide_file_win as _rb_unhide
-                        _rb_unhide(os.path.normpath(jsonl_path))
-                        os.remove(jsonl_path)
-                        self._stream.emit_error(
-                            f"Removed newly-created "
-                            f"{os.path.basename(jsonl_path)} during roll-back "
-                            "— files consistent; retry when TXT is writable.")
-                    except FileNotFoundError:
-                        pass
-                    except OSError as _re:
-                        self._stream.emit_error(
-                            f"Roll-back delete of "
-                            f"{os.path.basename(jsonl_path)} FAILED: {_re}. "
-                            "Files may be out of sync; retry when writable.")
-                # Either way, do NOT fall through to the FTS ingest —
-                # the txt update failed, so indexing the new segments
-                # (or re-marking the video transcribed) would certify
-                # a state the visible transcript doesn't match.
-                return _WorkerOutcome.FAILED
-            _hide_per_video_transcript_txt_if_needed(video_path, txt_path)
-        else:
-            if _output_cancelled():
-                return _WorkerOutcome.CANCELLED
-            if not _write_transcript_entry(txt_path, title, upload_date,
-                                           duration, source_tag, text,
-                                           video_id=vid_id):
-                self._stream.emit_error(f"Could not write transcript to {txt_path}")
-                return _WorkerOutcome.FAILED
-            if isinstance(job, dict) and not job.get("retranscribe"):
-                # From this point a retry must replace, not append. Persisting
-                # this stage makes a JSONL/index failure restart-safe without
-                # duplicating the already-written TXT entry.
-                job["_retry_as_replace"] = True
-                job["_retry_required"] = True
-                self._persist_pending()
-            _hide_per_video_transcript_txt_if_needed(video_path, txt_path)
-            if not _write_jsonl_entry(jsonl_path, vid_id, title, segs):
-                self._stream.emit_error(
-                    f"Could not write transcript JSONL to {jsonl_path} "
-                    f"— not marking {os.path.basename(video_path)} transcribed")
+            if not self._arm_output_write_intent(job):
                 return _WorkerOutcome.FAILED
 
-        # Ingest into the search index. A verified re-transcribe receipt lets
-        # us replace only this video's rows. If its identity, file generation,
-        # or prior index tracker cannot be proven, fall back to the established
-        # full validated ingest of the current aggregate.
-        try:
-            from .. import index as _idx
-            # Use a dedicated writer connection. The shared ingest path first
-            # waits for the process-wide `_db_lock`; a long maintenance query
-            # can hold that Python lock indefinitely even when SQLite itself is
-            # ready to accept this tiny per-video ingest. That left completed
-            # transcript files on disk while the queue stayed at 99% forever.
-            # The independent connection bypasses unrelated Python lock holders;
-            # WAL/busy_timeout still serializes actual SQLite writers safely.
-            _ingest_conn = _idx._open_independent()
-            if _ingest_conn is None:
-                raise RuntimeError("could not open an independent index connection")
+            _jsonl_replacement_receipt: dict[str, Any] = {}
+            if retranscribe:
+                # Surgically swap the old entries in both aggregated files.
+                # Mirrors YTArchiver.py:16462-16474: jsonl FIRST so its
+                # video_id-based purge can report back any title-drifted
+                # stale entries for the txt pass to also clean up.
+                # two-step replace was non-atomic — if .jsonl
+                # succeeded but .txt failed (lock, permission) the video
+                # ended up with new segments + old text, permanently
+                # inconsistent. Mitigation: try .jsonl first; if it
+                # fails, abort before touching .txt so the old content
+                # remains intact on BOTH files. If .jsonl succeeds but
+                # .txt fails, surface a prominent error and attempt a
+                # roll-back by re-reading the backup we captured first.
+                _jsonl_backup: bytes | None = None
+                try:
+                    with open(jsonl_path, "rb") as _jb:
+                        _jsonl_backup = _jb.read()
+                except FileNotFoundError:
+                    # First-ever retranscribe on a fresh .jsonl — no
+                    # backup needed because there's no prior state to
+                    # roll back to.
+                    _jsonl_backup = None
+                except OSError as _bke:
+                    _jsonl_backup = None
+                    # Fail FAST before touching the .jsonl when we can't
+                    # capture a backup — otherwise a .txt failure later
+                    # would leave new .jsonl + old .txt with no way to
+                    # recover (audit: transcribe/core.py H52).
+                    self._stream.emit_error(
+                        f"Refusing retranscribe of "
+                        f"{os.path.basename(jsonl_path)}: backup capture "
+                        f"failed ({_bke}). Files left untouched.")
+                    return _WorkerOutcome.FAILED
+                # Backup capture and journal writes can take time. Accept Cancel
+                # until the first output changes, then finish the paired commit.
+                if _output_cancelled():
+                    return _WorkerOutcome.CANCELLED
+                try:
+                    extra_titles = _replace_jsonl_entry(
+                        jsonl_path, title, vid_id, segs,
+                        receipt_out=_jsonl_replacement_receipt) or set()
+                except Exception as _je:
+                    self._stream.emit_error(
+                        f"Could not update {os.path.basename(jsonl_path)}: {_je}"
+                        f" — .txt left unchanged to avoid split-state.")
+                    return _WorkerOutcome.FAILED
+                try:
+                    _old_txt_candidates = _jsonl_text_candidates_from_bytes(
+                        _jsonl_backup, title, vid_id)
+                    _replace_txt_entry(txt_path, title, text, source_tag,
+                                       extra_titles_to_remove=extra_titles,
+                                       old_text_candidates=_old_txt_candidates,
+                                       video_id=vid_id,
+                                       upload_date=upload_date,
+                                       duration_secs=duration)
+                except Exception as _te:
+                    self._stream.emit_error(
+                        f"Could not update {os.path.basename(txt_path)}: {_te}"
+                        f" — attempting .jsonl roll-back to prevent split-state.")
+                    # Best-effort .jsonl roll-back so the two files stay
+                    # consistent. If the roll-back itself fails the user
+                    # is notified with a clear message.
+                    if _jsonl_backup is not None:
+                        _rb_tmp = ""
+                        try:
+                            # Atomic, hidden-aware roll-back. The old
+                            # in-place open('wb') NEVER worked here:
+                            # _replace_jsonl_entry re-hides the file in its
+                            # finally block, and on Windows CreateFileW
+                            # refuses to truncate a FILE_ATTRIBUTE_HIDDEN
+                            # file (PermissionError) — so the roll-back was
+                            # dead code for every hidden transcript .jsonl.
+                            import tempfile as _tf
+
+                            from .paths import _hide_file_win as _rb_hide
+                            _fd, _rb_tmp = _tf.mkstemp(
+                                suffix=".jsonl.tmp",
+                                dir=os.path.dirname(jsonl_path) or ".")
+                            with os.fdopen(_fd, "wb") as _jw:
+                                _jw.write(_jsonl_backup)
+                                _jw.flush()
+                                os.fsync(_jw.fileno())
+                            try: _rb_hide(_rb_tmp)
+                            except Exception: pass
+                            os.replace(_rb_tmp, jsonl_path)
+                            try: _rb_hide(jsonl_path)
+                            except Exception: pass
+                            self._stream.emit_error(
+                                f"Rolled {os.path.basename(jsonl_path)} back "
+                                f"— files consistent; retry retranscribe "
+                                f"when {os.path.basename(txt_path)} is "
+                                f"writable.")
+                        except OSError as _re:
+                            if _rb_tmp:
+                                try: os.remove(_rb_tmp)
+                                except OSError: pass
+                            self._stream.emit_error(
+                                f"Roll-back of {os.path.basename(jsonl_path)} "
+                                f"FAILED: {_re}. Files may be out of sync; "
+                                f"retry retranscribe when writable.")
+                    else:
+                        # The replacement created a brand-new JSONL. Restoring the
+                        # prior "missing" state means deleting it when the paired
+                        # TXT replacement fails.
+                        try:
+                            from ..utils import unhide_file_win as _rb_unhide
+                            _rb_unhide(os.path.normpath(jsonl_path))
+                            os.remove(jsonl_path)
+                            self._stream.emit_error(
+                                f"Removed newly-created "
+                                f"{os.path.basename(jsonl_path)} during roll-back "
+                                "— files consistent; retry when TXT is writable.")
+                        except FileNotFoundError:
+                            pass
+                        except OSError as _re:
+                            self._stream.emit_error(
+                                f"Roll-back delete of "
+                                f"{os.path.basename(jsonl_path)} FAILED: {_re}. "
+                                "Files may be out of sync; retry when writable.")
+                    # Either way, do NOT fall through to the FTS ingest —
+                    # the txt update failed, so indexing the new segments
+                    # (or re-marking the video transcribed) would certify
+                    # a state the visible transcript doesn't match.
+                    return _WorkerOutcome.FAILED
+                _hide_per_video_transcript_txt_if_needed(video_path, txt_path)
+            else:
+                if _output_cancelled():
+                    return _WorkerOutcome.CANCELLED
+                if not _write_transcript_entry(txt_path, title, upload_date,
+                                               duration, source_tag, text,
+                                               video_id=vid_id):
+                    self._stream.emit_error(f"Could not write transcript to {txt_path}")
+                    return _WorkerOutcome.FAILED
+                if isinstance(job, dict) and not job.get("retranscribe"):
+                    # From this point a retry must replace, not append. Persisting
+                    # this stage makes a JSONL/index failure restart-safe without
+                    # duplicating the already-written TXT entry.
+                    job["_retry_as_replace"] = True
+                    job["_retry_required"] = True
+                    self._persist_pending()
+                _hide_per_video_transcript_txt_if_needed(video_path, txt_path)
+                if not _write_jsonl_entry(jsonl_path, vid_id, title, segs):
+                    self._stream.emit_error(
+                        f"Could not write transcript JSONL to {jsonl_path} "
+                        f"— not marking {os.path.basename(video_path)} transcribed")
+                    return _WorkerOutcome.FAILED
+
+            # Ingest into the search index. A verified re-transcribe receipt lets
+            # us replace only this video's rows. If its identity, file generation,
+            # or prior index tracker cannot be proven, fall back to the established
+            # full validated ingest of the current aggregate.
             try:
-                _ingested = 0
-                if (retranscribe and vid_id
-                        and _jsonl_replacement_receipt):
-                    _delta = _idx.replace_video_segments(
-                        video_path, channel, _jsonl_replacement_receipt,
-                        _conn_override=_ingest_conn)
-                    if _delta.get("ok"):
-                        _ingested = int(_delta.get("count") or 0)
-                    elif _delta.get("can_fallback", True):
-                        self._stream.emit_dim(
-                            " (using full transcript index refresh: "
-                            f"{_delta.get('reason') or 'verification unavailable'})")
+                from .. import index as _idx
+                # Use a dedicated writer connection. The shared ingest path first
+                # waits for the process-wide `_db_lock`; a long maintenance query
+                # can hold that Python lock indefinitely even when SQLite itself is
+                # ready to accept this tiny per-video ingest. That left completed
+                # transcript files on disk while the queue stayed at 99% forever.
+                # The independent connection bypasses unrelated Python lock holders;
+                # WAL/busy_timeout still serializes actual SQLite writers safely.
+                _ingest_conn = _idx._open_independent()
+                if _ingest_conn is None:
+                    raise RuntimeError("could not open an independent index connection")
+                try:
+                    _ingested = 0
+                    if (retranscribe and vid_id
+                            and _jsonl_replacement_receipt):
+                        _delta = _idx.replace_video_segments(
+                            video_path, channel, _jsonl_replacement_receipt,
+                            _conn_override=_ingest_conn)
+                        if _delta.get("ok"):
+                            _ingested = int(_delta.get("count") or 0)
+                        elif _delta.get("can_fallback", True):
+                            self._stream.emit_dim(
+                                " (using full transcript index refresh: "
+                                f"{_delta.get('reason') or 'verification unavailable'})")
+                            _ingested = _idx.ingest_jsonl(
+                                video_path, jsonl_path, title, channel,
+                                _conn_override=_ingest_conn, force=True)
+                        else:
+                            raise RuntimeError(
+                                "per-video index update failed: "
+                                f"{_delta.get('reason') or 'database write failed'}")
+                    else:
                         _ingested = _idx.ingest_jsonl(
                             video_path, jsonl_path, title, channel,
-                            _conn_override=_ingest_conn, force=True)
-                    else:
-                        raise RuntimeError(
-                            "per-video index update failed: "
-                            f"{_delta.get('reason') or 'database write failed'}")
-                else:
-                    _ingested = _idx.ingest_jsonl(
-                        video_path, jsonl_path, title, channel,
-                        _conn_override=_ingest_conn)
-            finally:
-                _ingest_conn.close()
-            if not _ingested:
-                raise RuntimeError("index ingest returned no transcript segments")
-        except Exception as e:
-            # Bug [101]: was emit_dim — invisible in Simple log mode. The
-            # transcript file IS on disk but FTS is out of sync (search
-            # won't find this video). User-actionable, so use the red
-            # convention used elsewhere for warnings/failures so it shows
-            # in Simple mode too.
-            self._stream.emit_text(
-                f" \u26a0 FTS index sync failed for {os.path.basename(video_path)}: {e}",
-                "red")
-            return _WorkerOutcome.FAILED
+                            _conn_override=_ingest_conn)
+                finally:
+                    _ingest_conn.close()
+                if not _ingested:
+                    raise RuntimeError("index ingest returned no transcript segments")
+            except Exception as e:
+                # Bug [101]: was emit_dim — invisible in Simple log mode. The
+                # transcript file IS on disk but FTS is out of sync (search
+                # won't find this video). User-actionable, so use the red
+                # convention used elsewhere for warnings/failures so it shows
+                # in Simple mode too.
+                self._stream.emit_text(
+                    f" \u26a0 FTS index sync failed for {os.path.basename(video_path)}: {e}",
+                    "red")
+                return _WorkerOutcome.FAILED
 
-        return _WorkerOutcome.SUCCESS
+            return _WorkerOutcome.SUCCESS

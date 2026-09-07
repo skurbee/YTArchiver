@@ -29,7 +29,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +39,9 @@ from .catalog_repository import (
     install_catalog_schema,
 )
 from .log import get_logger
+from .media_identity import available_copy_sql, canonical_order_sql, logical_key_sql
+from .services.catalog_session import CatalogSession
+from .services.catalog_session import LibraryQueryTimeout as LibraryQueryTimeout
 from .ytarchiver_config import TRANSCRIPTION_DB
 
 _log = get_logger(__name__)
@@ -50,47 +53,17 @@ _INTERACTIVE_LOCK_SECONDS = 2.0
 _INTERACTIVE_QUERY_SECONDS = 8.0
 
 
-class LibraryQueryTimeout(TimeoutError):
-    """An interactive library operation ended without a complete result."""
 
 
-@contextmanager
+
 def _bounded_sql(conn, operation: str, seconds: float, *, check_complete: bool = True):
-    """Limit SQL work while the caller exclusively owns this connection."""
-    deadline = time.monotonic() + seconds
-    old_busy = conn.execute("PRAGMA busy_timeout").fetchone()[0]
-    conn.execute(f"PRAGMA busy_timeout={max(1, min(500, int(seconds * 1000)))}")
-    conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
-    try:
-        yield conn
-        if check_complete and time.monotonic() >= deadline:
-            raise LibraryQueryTimeout(f"{operation} took too long. Please try again with a narrower selection.")
-    except sqlite3.OperationalError as exc:
-        if getattr(exc, "sqlite_errorcode", None) in (
-                sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
-            _log.warning("%s stopped during SQL work: %s", operation, exc)
-            raise LibraryQueryTimeout(
-                f"{operation} could not finish while the library was busy. Please try again.") from exc
-        raise
-    finally:
-        conn.set_progress_handler(None, 0)
-        conn.execute(f"PRAGMA busy_timeout={int(old_busy)}")
+    """Compatibility wrapper for the catalog session's SQL deadline policy."""
+    return catalog_session().bounded_sql(conn, operation, seconds, check_complete=check_complete)
 
 
-@contextmanager
 def _interactive_reader(operation: str):
-    """Bound reader contention and SQL work for foreground library requests."""
-    conn = _reader_open()
-    if conn is None:
-        raise RuntimeError("The library index is unavailable. Please try again shortly.")
-    if not _reader_lock.acquire(timeout=_INTERACTIVE_LOCK_SECONDS):
-        _log.warning("%s timed out waiting for the library reader", operation)
-        raise LibraryQueryTimeout(f"{operation} is waiting for another library operation. Please try again.")
-    try:
-        with _bounded_sql(conn, operation, _INTERACTIVE_QUERY_SECONDS):
-            yield conn
-    finally:
-        _reader_lock.release()
+    """Compatibility wrapper for the owned foreground reader operation."""
+    return catalog_session().read(operation)
 
 # Pending tx_status='transcribed' retries — coalesces the burst that
 # arrives when ingest races sync_write_video INSERTs (audit: index.py
@@ -139,16 +112,8 @@ def _upload_date_to_epoch(value: Any) -> float:
     keeps that date stable when the UI formats it in local time while avoiding
     the previous-day rollover that midnight UTC causes in western timezones.
     """
-    raw = str(value or "").strip()
-    if len(raw) != 8 or not raw.isdigit():
-        return 0.0
-    try:
-        return datetime(
-            int(raw[0:4]), int(raw[4:6]), int(raw[6:8]), 12,
-            tzinfo=UTC,
-        ).timestamp()
-    except (ValueError, OSError):
-        return 0.0
+    from .archive_calendar import upload_date_epoch
+    return upload_date_epoch(value)
 
 
 def _sqlite_is_busy(exc: BaseException) -> bool:
@@ -249,6 +214,23 @@ _reader_lock = threading.RLock()
 _schema_inited: bool = False
 
 
+_catalog_session = CatalogSession(
+    writer_factory=lambda: _open(),
+    reader_factory=lambda: _reader_open(),
+    independent_factory=lambda: _open_independent(),
+    writer_lock=_db_lock,
+    reader_lock=_reader_lock,
+    lock_seconds=lambda: _INTERACTIVE_LOCK_SECONDS,
+    query_seconds=lambda: _INTERACTIVE_QUERY_SECONDS,
+    logger=_log,
+)
+
+
+def catalog_session() -> CatalogSession:
+    """Explicit connection admission owner shared by all catalog consumers."""
+    return _catalog_session
+
+
 def canonical_videos_cte_sql() -> str:
     """Return the shared SQL CTE for one logical row per archived video.
 
@@ -272,32 +254,18 @@ def canonical_videos_cte_sql() -> str:
     that require playable media must additionally filter
     ``is_available_copy = 1``.
     """
-    logical_key = (
-        "CASE "
-        "WHEN trim(COALESCE(v.video_id, '')) <> '' "
-        "THEN 'id:' || trim(v.video_id) "
-        "WHEN trim(COALESCE(v.filepath, '')) <> '' "
-        "THEN 'path:' || lower(replace(trim(v.filepath), '/', char(92))) "
-        "ELSE 'row:' || CAST(v.id AS TEXT) END"
-    )
+    logical_key = logical_key_sql()
     return f"""
 _ranked_video_copies AS (
     SELECT
         v.*,
         {logical_key} AS logical_video_key,
-        CASE WHEN COALESCE(v.availability, 'available') = 'available'
-                  AND trim(COALESCE(v.filepath, '')) <> ''
-             THEN 1 ELSE 0 END AS is_available_copy,
+        CASE WHEN {available_copy_sql()} THEN 1 ELSE 0 END AS is_available_copy,
         CASE WHEN v.is_duplicate_of IS NULL THEN 1 ELSE 0 END
              AS is_primary_copy,
         ROW_NUMBER() OVER (
             PARTITION BY {logical_key}
-            ORDER BY
-                CASE WHEN COALESCE(v.availability, 'available') = 'available'
-                          AND trim(COALESCE(v.filepath, '')) <> ''
-                     THEN 0 ELSE 1 END,
-                CASE WHEN v.is_duplicate_of IS NULL THEN 0 ELSE 1 END,
-                v.id
+            ORDER BY {canonical_order_sql()}
         ) AS canonical_rank,
         SUM(CASE WHEN trim(COALESCE(v.filepath, '')) <> '' THEN 1 ELSE 0 END)
             OVER (PARTITION BY {logical_key}) AS physical_copy_count,
@@ -335,14 +303,7 @@ def channel_videos_cte_sql() -> str:
     The returned CTE has one ``channel = ?`` parameter and exposes the chosen
     rows as ``channel_videos``.
     """
-    logical_key = (
-        "CASE "
-        "WHEN trim(COALESCE(v.video_id, '')) <> '' "
-        "THEN 'id:' || trim(v.video_id) "
-        "WHEN trim(COALESCE(v.filepath, '')) <> '' "
-        "THEN 'path:' || lower(replace(trim(v.filepath), '/', char(92))) "
-        "ELSE 'row:' || CAST(v.id AS TEXT) END"
-    )
+    logical_key = logical_key_sql()
     return f"""
 _ranked_channel_copies AS (
     SELECT
@@ -350,14 +311,11 @@ _ranked_channel_copies AS (
         {logical_key} AS logical_video_key,
         ROW_NUMBER() OVER (
             PARTITION BY {logical_key}
-            ORDER BY
-                CASE WHEN v.is_duplicate_of IS NULL THEN 0 ELSE 1 END,
-                v.id
+            ORDER BY {canonical_order_sql(available_only=True)}
         ) AS channel_copy_rank
     FROM videos AS v
     WHERE v.channel = ? COLLATE NOCASE
-      AND COALESCE(v.availability, 'available') = 'available'
-      AND trim(COALESCE(v.filepath, '')) <> ''
+      AND {available_copy_sql()}
 ),
 channel_videos AS (
     SELECT *
@@ -590,6 +548,14 @@ def _open() -> sqlite3.Connection | None:
                 timeout=30.0,
                 factory=CatalogConnection,
             )
+            # Read admission precedes even journal-mode changes and additive
+            # repairs. An older binary must never relabel a newer database.
+            from .catalog_repository import validate_catalog_version
+            from .services.format_versions import require_version
+            _pre_schema_version = require_version(
+                _conn.execute("PRAGMA user_version").fetchone()[0],
+                range(6), "Library database")
+            validate_catalog_version(_conn)
             # Check the PRAGMA result — on some filesystems (network
             # shares without shared-memory support and some pooled-filesystem
             # configs) WAL silently falls back to "delete" mode, and
@@ -611,12 +577,6 @@ def _open() -> sqlite3.Connection | None:
             # independent connections and punct_restore/repair_captions on the
             # same DB (audit: index.py busy_timeout).
             _conn.execute("PRAGMA busy_timeout=30000")
-            try:
-                _pre_schema_version = int(
-                    _conn.execute("PRAGMA user_version").fetchone()[0]
-                )
-            except Exception:
-                _pre_schema_version = 0
             _catalog_upgrade_needed = False
             _legacy_table = _conn.execute(
                 "SELECT 1 FROM sqlite_master "
@@ -933,7 +893,7 @@ def _open() -> sqlite3.Connection | None:
                 for _v in sorted(_MIGRATIONS):
                     if _v > _current_v:
                         _MIGRATIONS[_v](_conn)
-                if _current_v != _SCHEMA_VERSION:
+                if _current_v < _SCHEMA_VERSION:
                     _conn.execute(f"PRAGMA user_version = {int(_SCHEMA_VERSION)}")
                 # Repair headless/cyclic/singleton duplicate markers on every
                 # startup so direct Browse filters and canonical consumers
@@ -6190,7 +6150,10 @@ def summary(report_errors: bool = False) -> dict[str, Any]:
 
 # Bookmark and maintenance operations live in focused submodules and remain
 # available through the established backend.index API.
+# Compose the bookmark leaf once; callbacks resolve legacy presentation helpers
+# lazily while connection ownership is explicit and independently testable.
 from .index_bookmarks import (  # noqa: F401
+    BookmarkRepository,  # noqa: E402
     bookmark_add,
     bookmark_list,
     bookmark_remove,
@@ -6204,3 +6167,14 @@ from .index_maintenance import (  # noqa: F401
     refresh_channel_file_sizes,
     sweep_new_videos,
 )
+
+_bookmark_repository = BookmarkRepository(
+    catalog_session(),
+    video_row=lambda *args, **kwargs: _build_browse_video_row(*args, **kwargs),
+    find_thumbnail=lambda *args: find_thumbnail(*args),
+    file_url=lambda path: _file_url(path),
+)
+
+
+def bookmark_repository() -> BookmarkRepository:
+    return _bookmark_repository

@@ -18,8 +18,8 @@ Graph queries extracted from backend/index.py. Powers Browse > Graph:
     list_all_channels_in_db()
         — distinct channels present in the segments table
 
-Connection + lock primitives live in index.py; this module reaches
-for them via `from . import index as _idx`.
+Connection admission and write transactions are provided by the catalog
+session; graph code owns query shape and cache policy.
 """
 from __future__ import annotations
 
@@ -29,7 +29,9 @@ import threading
 from collections import OrderedDict
 from typing import Any
 
+from .archive_calendar import calendar_bucket, calendar_sql
 from .log import get_logger, swallow
+from .services.catalog_session import LibraryQueryTimeout
 
 _log = get_logger(__name__)
 _TOP_WORDS_CACHE_MAX = 24
@@ -54,13 +56,13 @@ def _calendar_bucket_expr(bucket: str) -> str:
     if bucket == "year":
         return (
             "COALESCE("
-            "strftime('%Y', v.logical_upload_ts, 'unixepoch', 'localtime'), "
+            f"{calendar_sql('v.logical_upload_ts', 'year')}, "
             "CASE WHEN s.year IS NOT NULL THEN CAST(s.year AS TEXT) "
             "ELSE NULL END)"
         )
     return (
         "COALESCE("
-        "strftime('%Y-%m', v.logical_upload_ts, 'unixepoch', 'localtime'), "
+        f"{calendar_sql('v.logical_upload_ts', 'month')}, "
         "CASE WHEN s.year IS NOT NULL AND s.month IS NOT NULL "
         "THEN CAST(s.year AS TEXT) || '-' || printf('%02d', s.month) "
         "ELSE NULL END)"
@@ -85,7 +87,7 @@ def _index():
 
 
 def _bucket_cache_revision(conn: sqlite3.Connection) -> tuple[int, int, int]:
-    """Return a cheap connection/database revision for bucket-total caching.
+    """Read a borrowed connection while the caller owns its session scope.
 
     Segment ingestion already bumps the module revision below, but bucket
     labels also depend on ``videos.upload_ts`` and canonical-copy metadata.
@@ -97,8 +99,7 @@ def _bucket_cache_revision(conn: sqlite3.Connection) -> tuple[int, int, int]:
     from inheriting an old result.
     """
     try:
-        with _index()._reader_lock:
-            row = conn.execute("PRAGMA data_version").fetchone()
+        row = conn.execute("PRAGMA data_version").fetchone()
         data_version = int(row[0] or 0) if row else 0
     except (sqlite3.Error, TypeError, ValueError):
         data_version = 0
@@ -110,11 +111,15 @@ def _bucket_cache_revision(conn: sqlite3.Connection) -> tuple[int, int, int]:
 
 
 def _bucket_cache_lookup(
-    conn: sqlite3.Connection,
     bucket: str,
     channel: str | None,
+    *,
+    revision: tuple[int, int, int] | None = None,
 ) -> tuple[tuple[int, int, int, int, str, str], dict[str, int] | None]:
-    connection_id, data_version, total_changes = _bucket_cache_revision(conn)
+    if revision is None:
+        with _index().catalog_session().reader() as conn:
+            revision = _bucket_cache_revision(conn) if conn is not None else (0, 0, 0)
+    connection_id, data_version, total_changes = revision
     with _TOP_WORDS_CACHE_LOCK:
         cache_key = (
             _TOP_WORDS_CACHE_REVISION,
@@ -140,10 +145,9 @@ def bucket_totals(bucket: str = "month",
     """
     bucket = bucket if bucket in {"year", "month", "week"} else "month"
     channel = channel if isinstance(channel, str) and channel else None
-    conn = _index()._reader_open()
-    if conn is None:
+    cache_key, cached = _bucket_cache_lookup(bucket, channel)
+    if cache_key[1] == 0:
         return {}
-    cache_key, cached = _bucket_cache_lookup(conn, bucket, channel)
     if cached is not None:
         return cached
     canonical_ctes = _index().canonical_videos_cte_sql()
@@ -205,28 +209,27 @@ def bucket_totals(bucket: str = "month",
             "GROUP BY v.logical_upload_ts"
         )
         try:
-            with _index()._reader_lock:
+            with _index().catalog_session().reader() as conn:
+                if conn is None:
+                    return {}
                 # Another caller may have completed the same expensive scan
                 # while this one waited for the shared reader. Re-read both
                 # the SQLite revision and cache under that serialization lock
                 # before doing any aggregate work.
                 cache_key, cached = _bucket_cache_lookup(
-                    conn, bucket, channel)
+                    bucket, channel, revision=_bucket_cache_revision(conn))
                 if cached is not None:
                     return cached
                 rows = conn.execute(sql, count_args).fetchall()
         except sqlite3.Error as exc:
             _log.warning("bucket_totals week query failed: %s", exc)
             return {}
-        import datetime as _dt_w
         totals: dict[str, int] = {}
         for ts, cnt in rows:
             if ts is None:
                 continue
             try:
-                _dtobj = _dt_w.datetime.fromtimestamp(float(ts))
-                iso = _dtobj.isocalendar()
-                key = f"{iso.year:04d}-W{iso.week:02d}"
+                key = calendar_bucket(ts, "week")
             except Exception:
                 continue
             totals[key] = totals.get(key, 0) + int(cnt or 0)
@@ -277,8 +280,11 @@ def bucket_totals(bucket: str = "month",
         "WHERE bucket IS NOT NULL GROUP BY bucket"
     )
     try:
-        with _index()._reader_lock:
-            cache_key, cached = _bucket_cache_lookup(conn, bucket, channel)
+        with _index().catalog_session().reader() as conn:
+            if conn is None:
+                return {}
+            cache_key, cached = _bucket_cache_lookup(
+                bucket, channel, revision=_bucket_cache_revision(conn))
             if cached is not None:
                 return cached
             rows = conn.execute(sql, args).fetchall()
@@ -344,7 +350,7 @@ def top_words(channel: str | None = None, top_n: int = 120,
     # other reader (Browse / Search / Watch) for the whole duration of a
     # Word-Cloud open on a huge archive (audit r2). WAL handles concurrent
     # reads at the DB layer; we close the connection in finally.
-    conn = _index()._open_independent()
+    conn = _index().catalog_session().open_independent()
     if conn is None:
         return []
     sql = "SELECT text FROM segments"
@@ -387,7 +393,7 @@ def top_words(channel: str | None = None, top_n: int = 120,
     return result
 
 
-def backfill_upload_ts(limit: int = 0) -> dict[str, int]:
+def backfill_upload_ts(limit: int = 0) -> dict[str, Any]:
     """Populate `videos.upload_ts` from file mtime for any row where it's
     currently NULL. Called lazily the first time a Week-bucket graph is
     requested so we don't force a full-archive stat walk at startup.
@@ -403,12 +409,11 @@ def backfill_upload_ts(limit: int = 0) -> dict[str, int]:
     # on a live sweep / ingest. The UPDATE phase needs the writer
     # connection — they have to be separate handles because the reader
     # has PRAGMA query_only=ON.
-    reader = _index()._reader_open()
-    writer = _index()._open()
-    if reader is None or writer is None:
+    if not _index().catalog_session().initialize():
         return {"filled": 0, "skipped": 0}
     filled = 0
     skipped = 0
+    error = ""
     batch: list[tuple[float, int]] = []
     batch_size = 500
 
@@ -416,16 +421,17 @@ def backfill_upload_ts(limit: int = 0) -> dict[str, int]:
         nonlocal filled, batch
         if not batch:
             return
-        with _index()._db_lock:
+        with _index().catalog_session().maintenance_transaction("Backfilling upload dates") as writer:
             writer.executemany(
                 "UPDATE videos SET upload_ts=? WHERE rowid=?",
                 batch)
-            writer.commit()
         filled += len(batch)
         batch = []
 
     try:
-        with _index()._reader_lock:
+        with _index().catalog_session().reader() as reader:
+            if reader is None:
+                return {"filled": 0, "skipped": 0}
             sql = "SELECT rowid, filepath FROM videos WHERE upload_ts IS NULL"
             if limit > 0:
                 sql += f" LIMIT {int(limit)}"
@@ -442,23 +448,21 @@ def backfill_upload_ts(limit: int = 0) -> dict[str, int]:
             except OSError:
                 skipped += 1
         _flush_batch()
-    except sqlite3.Error as exc:
-        try:
-            with _index()._db_lock:
-                writer.rollback()
-        except sqlite3.Error as rollback_exc:
-            swallow("roll back graph upload-time backfill", rollback_exc)
+    except (sqlite3.Error, LibraryQueryTimeout, RuntimeError) as exc:
+        error = str(exc)
         _log.warning("backfill_upload_ts failed after %d filled/%d skipped: %s",
                      filled, skipped, exc)
     if filled:
         invalidate_top_words_cache()
-    return {"filled": filled, "skipped": skipped}
+    return {"filled": filled, "skipped": skipped, **({"error": error} if error else {})}
 
 
-def _week_backfill_pending(conn) -> int:
+def _week_backfill_pending() -> int:
     try:
         canonical_ctes = _index().canonical_videos_cte_sql()
-        with _index()._reader_lock:
+        with _index().catalog_session().reader() as conn:
+            if conn is None:
+                return 0
             row = conn.execute(
                 f"WITH {canonical_ctes} "
                 "SELECT COUNT(*) FROM canonical_videos "
@@ -486,9 +490,9 @@ def graph_word_frequency(word: str, channel: str | None = None,
                 upload_ts is NULL are skipped from the week plot; the
                 caller can trigger `backfill_upload_ts()` to populate.
     """
-    conn = _index()._reader_open()
-    if conn is None or not word.strip():
-        return {"labels": [], "values": []}
+    with _index().catalog_session().reader() as conn:
+        if conn is None or not word.strip():
+            return {"labels": [], "values": []}
     word = word.strip()
     canonical_ctes = _index().canonical_videos_cte_sql()
     # Normalize the same way Search does so hyphenated / punctuated terms
@@ -550,7 +554,9 @@ def graph_word_frequency(word: str, channel: str | None = None,
             args.append(channel)
         sql += " GROUP BY bucket ORDER BY bucket"
     try:
-        with _index()._reader_lock:
+        with _index().catalog_session().reader() as conn:
+            if conn is None:
+                return {"labels": [], "values": [], "error": "DB unavailable"}
             rows = conn.execute(sql, args).fetchall()
     except sqlite3.Error as e:
         return {"labels": [], "values": [], "error": str(e)}
@@ -558,15 +564,12 @@ def graph_word_frequency(word: str, channel: str | None = None,
     # isocalendar() so year-boundary weeks (e.g. 2024-12-30 is in
     # ISO week 2025-W01) don't split into two half-sized bars.
     if bucket == "week":
-        import datetime as _dt_w
         counts_by_iso: dict[str, int] = {}
         for ts, cnt in rows:
             if ts is None:
                 continue
             try:
-                _dtobj = _dt_w.datetime.fromtimestamp(float(ts))
-                iso = _dtobj.isocalendar()
-                key = f"{iso.year:04d}-W{iso.week:02d}"
+                key = calendar_bucket(ts, "week")
             except Exception:
                 continue
             counts_by_iso[key] = counts_by_iso.get(key, 0) + int(cnt)
@@ -584,7 +587,7 @@ def graph_word_frequency(word: str, channel: str | None = None,
     backfill_pending = 0
     if bucket == "week":
         backfill_pending = (_backfill_pending if _backfill_pending is not None
-                            else _week_backfill_pending(conn))
+                            else _week_backfill_pending())
     return {"labels": labels, "values": values,
             "backfill_pending": backfill_pending}
 
@@ -603,9 +606,7 @@ def graph_multi(words: list[str], channel: str | None = None,
     label_set = set()
     backfill_pending = None
     if bucket == "week":
-        conn = _index()._reader_open()
-        if conn is not None:
-            backfill_pending = _week_backfill_pending(conn)
+        backfill_pending = _week_backfill_pending()
     for w in words:
         if bucket == "week":
             r = graph_word_frequency(
@@ -636,9 +637,7 @@ def graph_channel_overlay(word: str, channels: list[str],
     label_set = set()
     backfill_pending = None
     if bucket == "week":
-        conn = _index()._reader_open()
-        if conn is not None:
-            backfill_pending = _week_backfill_pending(conn)
+        backfill_pending = _week_backfill_pending()
     for ch in channels:
         if bucket == "week":
             r = graph_word_frequency(
@@ -657,9 +656,8 @@ def graph_channel_overlay(word: str, channels: list[str],
 
 def list_all_channels_in_db() -> list[str]:
     """Return the distinct set of channels that appear in the segments table."""
-    conn = _index()._reader_open()
-    if conn is None:
-        return []
-    with _index()._reader_lock:
+    with _index().catalog_session().reader() as conn:
+        if conn is None:
+            return []
         cur = conn.execute("SELECT DISTINCT channel FROM segments ORDER BY channel COLLATE NOCASE")
         return [r[0] for r in cur.fetchall() if r[0]]

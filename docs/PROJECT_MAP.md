@@ -52,9 +52,10 @@ channel, starting a sync, loading transcripts, and deleting bookmarks are
 methods on this class. Playback seeking and other local UI interactions
 remain in JavaScript.
 
-Also handles app startup: single-instance mutex, config loading, tray
-icon, log streamer setup, autorun scheduler, transcription manager,
-window state restore, and signal handling for clean shutdown.
+Also assembles config, tray, log, scheduler, transcription, and startup services,
+restores window state, and handles clean shutdown. `desktop_startup.py` prepares
+the native mutex/browser only when `main()` is called. Importing `main.py` does
+not launch native components or assemble HTML.
 
 **Key things to find inside:**
 - `class Api` — the JS bridge, composed from `backend/api_mixins/`.
@@ -112,8 +113,9 @@ ownership boundaries are described below.
 
 ### `api_mixins/`  ·  feature endpoints on `main.Api`
 
-`__init__.py` exports the mixin classes; `_shared.py` holds shared imports and
-compatibility helpers. Endpoint ownership is divided as follows:
+`__init__.py` exports the mixin classes; `_shared.py` holds common error, dialog,
+and resolution helpers. Import concrete dependencies explicitly rather than
+using a shared import hub. Endpoint ownership is divided as follows:
 
 - `archive_mixin.py`, `index_mixin.py` — archive discovery/rescans and index operations.
 - `subs_mixin.py`, `channel_mixin.py` — subscriptions, defaults, and channel actions.
@@ -251,8 +253,10 @@ all read from this DB.
 Also stores transcript SEGMENTS (one row per Whisper segment per
 video) so full-text search can pinpoint matches inside transcripts.
 
-This file owns the connection management (`_open` / `_reader_open`),
-schema, and the most-called read/write functions. Specialized query
+This file owns legacy connection construction, schema, and the most-called
+read/write functions. `catalog_session()` exposes a `CatalogSession` that owns
+connection scopes, lock admission, and transactions for migrated consumers.
+Specialized query
 families live in sibling modules (`index_search.py`, `index_graph.py`,
 `index_bookmarks.py`, `index_maintenance.py`) which `index.py`
 re-exports for back-compat.
@@ -355,6 +359,10 @@ the `LogStreamer`, which batches them and pushes them
 into JS via `window._logBatch(payload)`. This is the bus that the
 Sync Log, mini-logs, and activity rows ride on.
 
+Application prompts and processing snapshots use `emit_control` and
+`emit_processing` through the independent acknowledged event channel. Display
+filtering/truncation happens after external-output scanners run.
+
 **Key classes/functions:** `class LogStreamer` (the bus),
 `emit`, `emit_text`, `emit_simple`, `emit_dim`, `emit_error`,
 `emit_header`, `emit_activity`, `_line_is_verbose_only` (the
@@ -367,14 +375,17 @@ catalog. Health > Library owns the channel-information table and bulk tools;
 individual video actions also use this package.
 
 Package layout (`metadata/__init__.py` preserves the public compatibility surface):
-- `core.py` — title-match strategies + bulk-stats pipeline
+- `core.py` — compatibility facade for metadata workflows and helpers
+- `catalog.py`, `durations.py`, `identity.py`, `control.py` — flat catalog fetch,
+  duration backfill, identity matching, and cancellation helpers
+- `results.py` — explicit metadata fetch outcomes and details
 - `fetcher.py` — per-video / per-batch yt-dlp metadata fetch
 - `refresh.py` — re-export shim
 - `refresh_views.py` — `bulk_refresh_views_likes`
 - `refresh_comments.py` — `refresh_channel_comments`
 - `refresh_fetch.py` — `fetch_channel_metadata`
-- `_refresh_proxies.py` — lazy proxies into core.py for the three
-  refresh modules above
+- `_refresh_proxies.py` — legacy compatibility exports; refresh modules use
+  leaf helpers directly
 - `normalize.py`, `scan.py`, `thumbnails_ops.py` — text utils,
   metadata-row scanning, thumbnail housekeeping
 - `io.py` — metadata JSONL paths and validated sidecar reads/writes
@@ -396,13 +407,31 @@ dependency holder.
 
 Package layout:
 - `app_services.py` — `AppServices`, the long-lived dependency container
+- `composition.py` — explicit service wiring without runtime admission
+- `application_information.py` — runtime/About information and URL history
+- `ports.py` — small collaborator protocols used by extracted services
+- `startup_sequence.py`, `startup_scan.py`, `startup_stages.py` — startup
+  orchestration, saved-count recovery, and cancellation/readiness ordering
 - `config_repository.py` — config load/replace/serialized mutation contract
+- `config_snapshot.py` — copied configuration snapshot for one API operation
+- `catalog_session.py` — reader/writer admission, SQL deadlines, and transactions
 - `queue_repository.py` — atomic queue/resuming commits and corruption
   preservation (used by `QueueState`)
 - `sidecar_store.py` — locked, validated, staged sidecar reads/writes and
   durable multi-store reconciliation markers
 - `event_bus.py` — `BridgeEventBus`, safely serialized Python-to-JS dispatch
 - `file_ops.py` — managed-root containment and recoverable destructive actions
+- `managed_roots.py` — shared managed-root categories and containment policy
+- `trash_store.py` — public manifest/journal protocol and recovery markers
+- `atomic_json.py` — shared atomic JSON publication primitive
+- `format_versions.py` — explicit admission of known persisted versions
+- `archive_roots.py` — catalog-first additional-root removal with retryable failures
+- `sqlite_reads.py` — WAL-aware read-only connections to live SQLite stores
+- `provenance_ledger.py` — append, checksum, torn-tail recovery, and compaction
+- `instance_lease.py` — native single-instance handle lifetime and checked release
+- `processing_defaults.py` — save/apply sequencing shared by default-model commands
+- `operation_results.py` — bounded operation admission and repeatable completed polls
+- `reliable_events.py` — retained UI events, revisions, acknowledgements, and expiry
 - `job_supervisor.py` — register-before-start background ownership,
   admission, checkpoint, bounded join, and exact force-stop
 - `managed_work.py` — small adapters for supervised API/startup work
@@ -518,6 +547,10 @@ Package layout (`sync/__init__.py` preserves the public compatibility surface):
 - `sync_all.py` — `sync_all`, the multi-channel batch coordinator
 - `download_commit.py` — validates durable final media and performs the one
   catalog-registration commit for completed downloads
+- `completion.py` — completion observations, once-only accounting, follow-up
+  effects, and activity-row rendering with stable callback identity
+- `results.py` — named sync outcomes
+- `queue_commands.py` — durable redownload commands and runtime companion order
 - `sync_helpers.py` — small file/format helpers (`_hide_sidecar_win`,
   `_sweep_orphan_vtts`, `_scan_recent_video`, `_resolve_final_mp4`,
   `_fmt_duration`, `_fmt_size`)
@@ -581,6 +614,11 @@ Package layout (`transcribe/__init__.py` preserves the public compatibility surf
 - `core.py` — `TranscribeManager` + worker loop
 - `job_execution.py` — explicit worker outcomes and cancel/defer/shutdown
   policy after file-changing work stops
+- `recovery.py` — typed processing records and the durable recovery codec
+- `queue_commands.py` — runtime/queue/journal command coordination and compensation
+- `acceptance.py` — accepted/duplicate/unavailable/save-failed enqueue results
+- `audio_extract.py` — owned FFmpeg chunk extraction and interruption cleanup
+- `inference.py` — shared ordinary/chunked inference transaction and failure policy
 - `helpers.py` — pure helpers (path/title resolution, `find_python311`,
   `_extract_video_id`, `_bump_transcription_pending`,
   `_resolve_transcript_paths`, `_ffprobe_duration`, chunk constants)
@@ -653,8 +691,9 @@ holds every user setting: archive root, subscribed channels, autosync
 interval, log mode, recent downloads, etc. The single source of truth
 for "what does this user have configured".
 
-Also formats the data for UI consumption (channels-for-Subs-table,
-recent-download history, autorun-history-for-Activity-log).
+Re-exports compatibility formatters from `config_views.py`. That module projects
+supplied snapshots for subscription rows and recent/activity history without
+loading or saving configuration.
 
 **Key functions:** `load_config`, `save_config`, `config_file_exists`,
 `config_is_writable`, `backup_config_on_start`,
@@ -668,12 +707,18 @@ recent-download history, autorun-history-for-Activity-log).
 |---|---|
 | `activity_history.py` | Stable-ID activity history in its own durable store; reads legacy formats during migration. |
 | `archive_capacity.py` | Archive-drive free-space warnings. |
+| `archive_calendar.py` | UTC Search/Graph buckets and date-only upload conversion. |
 | `channel_identity.py` | Learn permanent `UC…` channel IDs and verify handle recovery before changing saved URLs. |
+| `media_identity.py` | Shared Python and SQL identity/availability/preferred-copy policy. |
+| `desktop_startup.py` | Explicit native browser/mutex preparation and HTML assembly at launch. |
+| `config_views.py` | UI projection of supplied configuration snapshots. |
+| `ytdlp_options.py` | Shared tool/cookie options without workflow imports. |
 | `subscriber_counts.py` | Background recovery and caching of channel subscriber counts. |
 | `youtube_session.py` | Shared authentication/rate-limit failure handling and visible pause state. |
 | `youtube_traffic.py` | Persistent operation budgets, spacing, admission reservations, and traffic projections; a yt-dlp launch is an operation rather than an exact HTTP-request count. |
 | `deps_installer.py` | Optional external-tool and worker-environment installation helpers. |
-| `process_runner.py` | Child-process registry and supervised yt-dlp/ffmpeg execution. |
+| `process_runner.py` | Child-process registry, shared pipe readers, exact stop/reap, and supervised execution with explicit output completeness. |
+| `worker_protocol.py` | Python 3.11-compatible message validation, serialized worker output, and explicit EOF handling. |
 | `proc_utils.py`, `subprocess_util.py` | Subprocess environment, decoding, Windows launch flags, and process helpers. |
 | `executor_utils.py`, `pause_helpers.py` | Bounded thread-pool submission and shared pause/cancel coordination. |
 | `fs_search.py` | Canonical media-extension sets, partial-file detection, and channel file walkers. |
@@ -764,6 +809,16 @@ renderQueues, renderWatchView, renderChannelGrid,
 renderVideoGrid, _onRetranscribeComplete, etc.) now live in the
 extracted modules.
 
+### `preferences.js` and initialization utilities
+
+`preferences.js` owns shared settings reads, acknowledged write ordering,
+per-key revisions, failed-write rollback, and write-free hydration. Feature
+modules use this owner instead of issuing independent initial settings loads.
+`util.js` supplies retryable scoped initialization; failed setup removes its
+listeners and timers. `bridge.js` validates settings/channel response shapes.
+The browser fixture rejects unregistered bridge calls and distinguishes handler
+installation from completion of asynchronous settings hydration.
+
 ### `logs.js`
 After extraction, focused entirely on log rendering — the Python →
 JS log pipe. Owns:
@@ -838,6 +893,10 @@ later modules read earlier modules' globals.
   including paused playback and window fullscreen; hidden geometry retains
   the last usable scale. YT Style is the startup and Off-to-on default;
   explicitly selected word modes remain active while the overlay stays on.
+- `watchSession.js` — selected/rendered media identity and immutable tickets for
+  open, transcript, metadata, playback, and pre-open navigation checks.
+- `pagedCollection.js` — shared request/offset/refresh ownership used by channel,
+  archive-wide Videos, and Manual collections; leaves rendering and caching local.
 
 **Per-feature controllers (one file per UI feature):**
 - `downloadUrl.js`, `downloadDragDrop.js` — download URL bar +
@@ -928,11 +987,13 @@ ownership, CI stages, x64 PE parsing, and packaged notices.
 
 - `check.ps1` — authoritative Windows gate and clean verified build
 - `lock_dependencies.ps1` — validates or intentionally refreshes lock files
-- `import_check.py` — compiles backend code and `main.py`, then imports backend
-  modules and runtime dependencies in disposable app-data directories;
-  `main.py` and the Whisper/punctuation worker entry points are not imported
+- `import_check.py` — compiles and imports backend code and `main.py` plus
+  runtime dependencies in disposable app-data directories; separate
+  Whisper/punctuation worker entry points are not imported
 - `check_generated_html.py` — fails when generated `index.html` is stale
-- `check_bridge_contract.py` — reports frontend bridge calls with no Python API
+- `check_bridge_contract.py` — resolves actual `Api` inheritance and reports
+  frontend bridge calls with no exposed Python method, without importing the app
+- `source_fingerprint.py` — hashes current tracked/new source paths and bytes
 - `repository_scan.py` — blocks known secret and publication-privacy patterns
 - `verify_build.py` — verifies x64 PE structure, version resources, and required
   files inside the PyInstaller executable

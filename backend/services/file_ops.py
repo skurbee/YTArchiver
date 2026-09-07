@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import time
 import uuid
@@ -21,6 +22,17 @@ from typing import Any
 
 from backend.fs_safety import _file_has_hidden_attribute
 from backend.fs_search import MEDIA_EXTS_TUPLE
+from backend.services.atomic_json import publish_json
+from backend.services.managed_roots import ManagedRoots
+from backend.services.trash_store import (
+    MANIFEST_VERSION as _TRASH_MANIFEST_VERSION,
+)
+from backend.services.trash_store import (
+    RESTORE_RECOVERY_DIR as _RESTORE_RECOVERY_DIR,
+)
+from backend.services.trash_store import (
+    TRASH_STORE as _trash_store,
+)
 from backend.utils import (
     delete_video_sidecars,
     hide_file_win,
@@ -28,9 +40,6 @@ from backend.utils import (
     unhide_file_win,
 )
 from backend.ytarchiver_config import config_is_writable
-
-_RESTORE_RECOVERY_DIR = ".ytarchiver-restore-recovery"
-_TRASH_MANIFEST_VERSION = 2
 
 
 def _result(ok: bool, **extra: Any) -> dict[str, Any]:
@@ -50,37 +59,12 @@ def assert_within_managed_roots(path: str) -> dict[str, Any]:
 
 
 def _managed_root_for(path: str) -> str:
-    """Return the configured managed root containing path, or empty string."""
+    """Return the owning root through the common configuration policy."""
     try:
         from backend.ytarchiver_config import load_config
-        cfg = load_config() or {}
+        return ManagedRoots.from_config(load_config() or {}).owner_for(path)
     except Exception:
         return ""
-    roots: list[str] = []
-    output_dir = (cfg.get("output_dir") or "").strip()
-    if output_dir:
-        roots.append(output_dir)
-    # Single-video downloads live here, outside the channel tree (mirrors
-    # is_within_managed_roots so containment stays consistent).
-    video_out_dir = (cfg.get("video_out_dir") or "").strip()
-    if video_out_dir:
-        roots.append(video_out_dir)
-    roots.extend(str(r) for r in (cfg.get("tp_archive_roots") or []) if r)
-    try:
-        target = os.path.normcase(os.path.realpath(path))
-    except (ValueError, OSError):
-        return ""
-    matches: list[tuple[int, str]] = []
-    for root in roots:
-        try:
-            real_root = os.path.normcase(os.path.realpath(root))
-            if os.path.commonpath([target, real_root]) == real_root:
-                matches.append((len(real_root), os.path.realpath(root)))
-        except (ValueError, OSError):
-            continue
-    if not matches:
-        return ""
-    return max(matches)[1]
 
 
 def _trash_path_for(folder_path: str, archive_root: str) -> str:
@@ -867,26 +851,13 @@ def _unique_child_path(parent: str, basename: str) -> str:
 
 
 def _write_json_atomic(path: str, value: dict[str, Any]) -> str:
-    """Atomically publish and flush one JSON object at *path*."""
-    tmp_path = f"{path}.tmp-{uuid.uuid4().hex}"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(value, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-    return path
+    """Shared durable publication for sidecar handoff recovery records."""
+    return publish_json(path, value)
 
 
 def _write_trash_manifest(folder: str, manifest: dict[str, Any]) -> str:
-    """Atomically publish a trash manifest inside *folder*."""
-    manifest_path = os.path.join(folder, ".ytarchiver-trash.json")
-    return _write_json_atomic(manifest_path, manifest)
+    """Compatibility entry point; the Trash store owns the protocol."""
+    return _trash_store.write_manifest(folder, manifest)
 
 
 def _restore_original_hidden_state(path: str, original_hidden: Any) -> None:
@@ -901,36 +872,30 @@ def _restore_original_hidden_state(path: str, original_hidden: Any) -> None:
         unhide_file_win(path)
 
 
+def _restore_file_identity(path: str) -> dict[str, int]:
+    """Receipt for the same regular file across an atomic same-volume move.
+
+    No media reread is needed. Filesystems without stable file IDs cannot
+    establish interrupted replay from destination existence alone.
+    """
+    value = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(value.st_mode) or not value.st_ino:
+        raise OSError("File identity is unavailable for recoverable restore.")
+    return {"device": value.st_dev, "file_id": value.st_ino,
+            "size": value.st_size, "mtime_ns": value.st_mtime_ns}
+
+
 def _restore_cleanup_marker_path(trashed_folder_path: str) -> str:
-    """Return the outside-the-entry marker used during final cleanup."""
-    folder = os.path.normpath(trashed_folder_path)
-    trash_root = os.path.dirname(folder)
-    return os.path.join(
-        trash_root,
-        _RESTORE_RECOVERY_DIR,
-        f"{os.path.basename(folder)}.json",
-    )
+    """Compatibility entry point; the Trash store owns the protocol."""
+    return _trash_store.restore_marker_path(trashed_folder_path)
 
 
 def _write_restore_cleanup_marker(
-    trashed_folder_path: str,
-    manifest: dict[str, Any],
-    *,
-    archive_root: str = "",
+    trashed_folder_path: str, manifest: dict[str, Any], *, archive_root: str = "",
 ) -> str:
-    """Publish recovery metadata outside a folder before its manifest moves."""
-    marker_path = _restore_cleanup_marker_path(trashed_folder_path)
-    recovery_dir = os.path.dirname(marker_path)
-    if not _restore_recovery_dir_is_safe(
-            trashed_folder_path, archive_root=archive_root):
-        raise OSError("Trash restore recovery folder is not safely contained.")
-    os.makedirs(recovery_dir, exist_ok=True)
-    if not _restore_recovery_dir_is_safe(
-            trashed_folder_path, archive_root=archive_root):
-        raise OSError(
-            "Trash restore recovery folder is a link, junction, or outside "
-            "the archive.")
-    return _write_json_atomic(marker_path, manifest)
+    """Compatibility entry point; the Trash store owns the protocol."""
+    return _trash_store.write_restore_marker(
+        trashed_folder_path, manifest, archive_root=archive_root)
 
 
 def _is_strictly_within(path: str, root: str) -> bool:
@@ -1114,6 +1079,8 @@ def safe_trash_video_file(
             # This is deliberately a compact catalog identity, not a database
             # dump.  It is enough to recreate the physical row after restore.
             manifest["catalog_context"] = dict(catalog_context)
+        for entry in planned_files:
+            entry["restore_identity"] = _restore_file_identity(entry["original_path"])
         # Publish recovery intent before the first source is moved. A process
         # interruption can now always be discovered and reversed.
         _write_trash_manifest(trash_folder, manifest)
@@ -1189,67 +1156,23 @@ def safe_trash_video_file(
 
 
 def _is_within_trash_root(trashed_folder_path: str, archive_root: str) -> bool:
-    try:
-        archive_root = os.path.realpath(archive_root)
-        trash_path = os.path.join(archive_root, ".YTArchiver Trash")
-        is_junction = getattr(os.path, "isjunction", lambda _path: False)
-        if os.path.islink(trash_path) or is_junction(trash_path):
-            return False
-        trash_root = os.path.realpath(trash_path)
-        if (trash_root == archive_root
-                or os.path.commonpath([trash_root, archive_root])
-                != archive_root):
-            return False
-        target = os.path.realpath(trashed_folder_path)
-        return (target != trash_root
-                and os.path.commonpath([target, trash_root]) == trash_root)
-    except (ValueError, OSError):
-        return False
+    """Compatibility entry point; the Trash store owns the protocol."""
+    return _trash_store.contains_entry(trashed_folder_path, archive_root)
 
 
 def _restore_recovery_dir_is_safe(
-    trashed_folder_path: str,
-    *,
-    archive_root: str = "",
+    trashed_folder_path: str, *, archive_root: str = "",
 ) -> bool:
-    folder = os.path.normpath(trashed_folder_path)
-    root = os.path.normpath(
-        archive_root or os.path.dirname(os.path.dirname(folder)))
-    recovery_dir = os.path.dirname(_restore_cleanup_marker_path(folder))
-    is_junction = getattr(os.path, "isjunction", lambda _path: False)
-    try:
-        return (
-            bool(root)
-            and _is_within_trash_root(folder, root)
-            and not os.path.islink(recovery_dir)
-            and not is_junction(recovery_dir)
-            and _is_within_trash_root(recovery_dir, root)
-        )
-    except (OSError, TypeError, ValueError):
-        return False
+    """Compatibility entry point; the Trash store owns the protocol."""
+    return _trash_store.restore_recovery_is_safe(
+        trashed_folder_path, archive_root=archive_root)
 
 
 def _read_trash_manifest(
-    trashed_folder_path: str,
-    *,
-    archive_root: str = "",
-):
-    inside_path = os.path.join(
-        trashed_folder_path, ".ytarchiver-trash.json")
-    recovery_path = _restore_cleanup_marker_path(trashed_folder_path)
-    manifest_paths = [inside_path]
-    if _restore_recovery_dir_is_safe(
-            trashed_folder_path, archive_root=archive_root):
-        manifest_paths.append(recovery_path)
-    for manifest_path in manifest_paths:
-        try:
-            with open(manifest_path, encoding="utf-8") as f:
-                manifest = json.load(f)
-            if isinstance(manifest, dict):
-                return manifest, manifest_path
-        except (OSError, ValueError):
-            continue
-    return None, inside_path
+    trashed_folder_path: str, *, archive_root: str = "",
+) -> tuple[dict[str, Any] | None, str]:
+    """Compatibility entry point; the Trash store owns the protocol."""
+    return _trash_store.read_manifest(trashed_folder_path, archive_root=archive_root)
 
 
 def list_trash_entries(archive_root: str) -> dict[str, Any]:
@@ -1390,19 +1313,6 @@ def restore_trash_entry(trashed_folder_path: str, *,
             False, error=f"Trash entry is in an unsupported state: "
             f"{manifest_state}.")
 
-    # A complete trash entry has every file in quarantine. Publish the
-    # recovery intent before moving the first one back. If the process stops
-    # mid-restore, the next launch can distinguish already-restored files from
-    # real destination conflicts and continue safely.
-    if manifest_state == "complete":
-        manifest["state"] = "restoring"
-        try:
-            _write_trash_manifest(trashed_folder_path, manifest)
-        except OSError as exc:
-            return _result(
-                False, error=f"Could not start recoverable restore: {exc}.")
-        resumable_restore = True
-
     validated: list[tuple[str, str, str, bool | None]] = []
     seen_src: set[str] = set()
     seen_dest: set[str] = set()
@@ -1446,6 +1356,15 @@ def restore_trash_entry(trashed_folder_path: str, *,
                 return _result(
                     False, error=f"Restore destination is not a regular file: "
                     f"{dest}.")
+            if not src_is_file:
+                try:
+                    identity = _restore_file_identity(dest)
+                except OSError as exc:
+                    return _result(False, error=str(exc))
+                if identity != entry.get("restore_identity"):
+                    return _result(False, error=(
+                        f"Cannot verify that this operation restored {dest}. "
+                        "The destination and Trash recovery record were preserved."))
             state = "move" if src_is_file else "already_original"
             validated.append((src, dest, state, original_hidden))
             continue
@@ -1457,6 +1376,14 @@ def restore_trash_entry(trashed_folder_path: str, *,
         validated.append((src, dest, "move", original_hidden))
 
     try:
+        # Validate the complete entry before changing phase. Persist source
+        # receipts before the first move so replay verifies the exact file,
+        # including the crash window between rename and its next checkpoint.
+        for entry, (src, _dest, state, _hidden) in zip(files, validated, strict=True):
+            if state == "move":
+                entry["restore_identity"] = _restore_file_identity(src)
+        manifest["state"] = "restoring"
+        _write_trash_manifest(trashed_folder_path, manifest)
         for src, dest, state, original_hidden in validated:
             if state != "already_original":
                 os.makedirs(os.path.dirname(dest), exist_ok=True)

@@ -68,7 +68,7 @@ def test_bounded_pool_cancel_is_prompt_and_queued_work_never_starts() -> None:
 def test_duration_probe_cancel_does_not_wait_for_running_ffprobe(
         monkeypatch) -> None:
     from backend import index
-    from backend.metadata import core
+    from backend.metadata import durations as core
 
     entered = threading.Event()
     release = threading.Event()
@@ -165,13 +165,13 @@ def test_cancelled_inline_metadata_rechecks_inside_jsonl_lock(
 
     def _fetched(*_args, **_kwargs):
         fetched.set()
-        return {
+        return fetcher.MetadataFetchResult.success({
             "video_id": "abcdefghijk",
             "title": "Title",
             "thumbnail_url": "https://example.invalid/thumb.jpg",
-        }
+        })
 
-    monkeypatch.setattr(fetcher, "_fetch_video_metadata", _fetched)
+    monkeypatch.setattr(fetcher, "_fetch_video_metadata_result", _fetched)
     monkeypatch.setattr(fetcher, "_write_metadata_jsonl", wrote)
     monkeypatch.setattr(fetcher, "_download_thumbnail", thumbnail)
 

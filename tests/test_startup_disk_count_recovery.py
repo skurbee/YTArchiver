@@ -1,5 +1,4 @@
-"""Execute the real startup scan stage without importing the desktop app."""
-import ast
+"""Execute the startup components through their normal dependency boundaries."""
 import atexit
 import os
 import tempfile
@@ -16,6 +15,10 @@ os.environ["APPDATA"] = str(Path(_PROFILE.name) / "roaming")
 os.environ["LOCALAPPDATA"] = str(Path(_PROFILE.name) / "local")
 
 from backend import archive_scan
+from backend.services.config_repository import ConfigRepository
+from backend.services.event_bus import BridgeEventBus
+from backend.services.startup_scan import StartupDiskScan
+from backend.services.startup_stages import run_startup_stages
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -46,17 +49,13 @@ def stage(monkeypatch):
     cancel = threading.Event()
     stream = Mock()
     busy = Mock(return_value=False)
-    namespace = {"cancel_event": cancel, "cfg": config, "self": owner,
-                 "s": stream, "_time": SimpleNamespace(time=lambda: 10000),
-                 "_startup_low_priority_busy": busy, "update_config": update,
-                 "load_config": lambda: config, "_flush_now": Mock(),
-                 "dots_state": {"sweep": {}}, "_log": Mock()}
-    source = ast.parse((ROOT / "main.py").read_text(encoding="utf-8"))
-    node = next(n for n in ast.walk(source)
-                if isinstance(n, ast.FunctionDef) and n.name == "_stage2_disk_walk")
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(ROOT / "main.py"), "exec"),
-         namespace)
-    return SimpleNamespace(run=namespace["_stage2_disk_walk"], config=config,
+    scanner = StartupDiskScan(
+        ConfigRepository(lambda: config, lambda _cfg: True, update),
+        stream, BridgeEventBus(lambda: owner._window),
+        lambda snapshot: setattr(owner, "_config", snapshot),
+        {"sweep": {}}, clock=lambda: 10000,
+    )
+    return SimpleNamespace(run=lambda: scanner.run(cancel, config, busy), config=config,
                            cache=cache, scanned=scanned, scan=scan, publish=publish,
                            update=update, cancel=cancel, stream=stream, heal=heal,
                            owner=owner, busy=busy)
@@ -73,6 +72,14 @@ def test_recent_partial_cache_is_repaired_and_health_refreshed(stage):
     assert "refreshSubsTable" in script
     assert "_refreshIndexStats" in script
     assert "_refreshHealthOverview" in script
+    stage.stream.emit_error.assert_not_called()
+
+
+def test_startup_scan_uses_the_injected_config_for_scan_and_summary(stage, monkeypatch):
+    monkeypatch.setattr(archive_scan, "load_config",
+                        Mock(side_effect=AssertionError("use injected configuration")))
+    stage.run()
+    assert stage.scan.call_args.kwargs["cfg"] is stage.config
     stage.stream.emit_error.assert_not_called()
 
 
@@ -152,23 +159,22 @@ def test_startup_retries_a_deferred_count_once_after_sweep(
         if cancel_after_sweep:
             cancel.set()
     owner = SimpleNamespace(_autorun=Mock(), _trash_retention=Mock())
-    namespace = {"cancel_event": cancel, "_stage2_disk_walk": disk_scan,
-                 "_stage3_sweep": sweep, "_start_subscriber_backfill": Mock(),
-                 "stage3_done": finished, "self": owner, "_log": Mock(),
-                 "_clear_loading": Mock(), "_push_indicator": Mock()}
-    source = ast.parse((ROOT / "main.py").read_text(encoding="utf-8"))
-    node = next(n for n in ast.walk(source)
-                if isinstance(n, ast.FunctionDef) and n.name == "_run_stages")
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(ROOT / "main.py"), "exec"),
-         namespace)
-    namespace["_run_stages"]()
+    backfill = Mock()
+    clear_loading = Mock()
+    clear_indicator = Mock()
+    run_startup_stages(
+        cancel_event=cancel, finished=finished, disk_scan=disk_scan, sweep=sweep,
+        backfill=backfill, clear_loading=clear_loading, clear_indicator=clear_indicator,
+        ready_callbacks=(owner._autorun.notify_startup_ready,
+                         owner._trash_retention.notify_startup_ready),
+    )
     assert calls == ["scan", "sweep"] + (["scan"] if expected_calls == 2 else [])
-    assert namespace["stage3_done"].is_set()
-    namespace["_clear_loading"].assert_called_once()
-    namespace["_push_indicator"].assert_called_once_with("sweep", None)
+    assert finished.is_set()
+    clear_loading.assert_called_once()
+    clear_indicator.assert_called_once()
     if cancel_after_sweep:
-        namespace["_start_subscriber_backfill"].assert_not_called()
+        backfill.assert_not_called()
         owner._autorun.notify_startup_ready.assert_not_called()
     else:
-        namespace["_start_subscriber_backfill"].assert_called_once()
+        backfill.assert_called_once()
         owner._autorun.notify_startup_ready.assert_called_once_with("indexing")

@@ -21,6 +21,7 @@ import json
 import os
 import re
 import threading as _threading
+from contextlib import ExitStack, contextmanager
 
 from ..log import get_logger
 from ..services.sidecar_store import (
@@ -57,6 +58,25 @@ def txt_lock_for(path: str) -> _threading.RLock:
             lk = _threading.RLock()
             _TXT_LOCKS[key] = lk
         return lk
+
+
+@contextmanager
+def transcript_output_locks(txt_path: str, jsonl_path: str):
+    """Serialize a paired transcript commit, including a possible rollback.
+
+    Reuse the individual writers' reentrant locks so another append cannot
+    land between a replacement's snapshot and rollback. Canonical ordering
+    also handles callers supplying the same paths in the opposite order.
+    """
+    paths = sorted({
+        os.path.normcase(os.path.normpath(os.path.abspath(path or "")))
+        for path in (txt_path, jsonl_path)
+    })
+    with ExitStack() as stack:
+        for path in paths:
+            stack.enter_context(txt_lock_for(path))
+        yield
+
 
 _log = get_logger(__name__)
 

@@ -142,7 +142,7 @@ def run_bounded[ItemT, ResultT](
     """Run work with a bounded executor queue and cancellation polling.
 
     Results are delivered on the calling thread, so workers can be kept free
-    of durable writes.  By default only ``max_workers`` futures exist at once;
+    of durable writes. By default only ``max_workers`` futures are pending;
     therefore a large input cannot fill the executor with thousands of jobs
     that continue launching after cancellation.
     """
@@ -155,7 +155,6 @@ def run_bounded[ItemT, ResultT](
         thread_name_prefix=thread_name_prefix,
     )
     pending: dict[Future[ResultT], ItemT] = {}
-    all_futures: list[Future[ResultT]] = []
     completed = 0
     exhausted = False
 
@@ -177,7 +176,6 @@ def run_bounded[ItemT, ResultT](
                 return
             future = executor.submit(worker, item)
             pending[future] = item
-            all_futures.append(future)
 
     cancelled = False
     try:
@@ -202,7 +200,12 @@ def run_bounded[ItemT, ResultT](
                     result = WorkResult(item, future.result(), None)
                 except BaseException as error:
                     result = WorkResult(item, None, error)
-                on_complete(result)
+                try:
+                    on_complete(result)
+                finally:
+                    # The callback owns anything it retains. Do not keep an
+                    # entire pass's payloads/tracebacks in completed futures.
+                    del result
                 completed += 1
             if cancelled:
                 break
@@ -213,7 +216,7 @@ def run_bounded[ItemT, ResultT](
         if cancelled:
             unfinished = cancel_executor(
                 executor,
-                all_futures,
+                pending,
                 grace_seconds=cancel_grace_seconds,
             )
         else:
@@ -221,5 +224,5 @@ def run_bounded[ItemT, ResultT](
             unfinished = 0
         return ExecutorRun(cancelled, completed, unfinished)
     except BaseException:
-        cancel_executor(executor, all_futures)
+        cancel_executor(executor, pending)
         raise

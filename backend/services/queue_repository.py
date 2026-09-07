@@ -45,32 +45,56 @@ class QueueRepository:
 
     @staticmethod
     def _sidelined_path(path: Path) -> Path:
-        return Path(f"{path}.bak")
+        first = Path(f"{path}.bak")
+        return first if not first.exists() else Path(f"{path}.{uuid.uuid4().hex}.bak")
 
     def _read_object(self, path: Path) -> QueueReadResult:
-        if not path.exists():
-            return QueueReadResult("missing", {})
         try:
             raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return QueueReadResult("missing", {})
+        except UnicodeError as exc:
+            return self._preserve_invalid(path, exc)
+        except OSError as exc:
+            # Unreadable is not malformed. Never move an authoritative file
+            # merely because access or its backing volume is temporarily lost.
+            return QueueReadResult("blocked", {}, str(exc))
+        try:
             value = json.loads(raw)
             if not isinstance(value, dict):
                 raise ValueError("queue root must be an object")
             return QueueReadResult("ok", value)
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, ValueError) as exc:
+            return self._preserve_invalid(path, exc)
+
+    def _preserve_invalid(self, path: Path, exc: Exception) -> QueueReadResult:
+        try:
+            os.replace(path, self._sidelined_path(path))
+        except OSError as backup_exc:
+            return QueueReadResult(
+                "blocked", {},
+                f"{exc}; corrupt file could not be preserved: {backup_exc}",
+            )
+        return QueueReadResult("sidelined", {}, str(exc))
+
+    @staticmethod
+    def _version_admission(result: QueueReadResult, maximum: int) -> QueueReadResult:
+        if result.state == "ok":
             try:
-                os.replace(path, self._sidelined_path(path))
-            except OSError as backup_exc:
-                return QueueReadResult(
-                    "blocked", {},
-                    f"{exc}; corrupt file could not be preserved: {backup_exc}",
-                )
-            return QueueReadResult("sidelined", {}, str(exc))
+                version = int(result.data.get("_schema_version", 1))
+            except (TypeError, ValueError, OverflowError):
+                return result  # Existing legacy normalization preserves tasks.
+            if version > maximum:
+                return QueueReadResult("blocked", {}, (
+                    f"Queue format version {version} is newer than this app supports. "
+                    "Saved work was preserved; use a compatible application version."))
+        return result
 
     def load_main(self) -> QueueReadResult:
-        return self._read_object(self.main_path)
+        return self._version_admission(self._read_object(self.main_path), 3)
 
     def load_resuming(self) -> QueueReadResult:
-        result = self._read_object(self.resuming_path)
+        result = self._version_admission(self._read_object(self.resuming_path), 2)
         if result.state != "ok":
             return result
         resuming = result.data.get("resuming")

@@ -823,13 +823,13 @@
                 <div class="settings-traffic-custom" id="settings-traffic-custom" hidden>
                   <label>24-hour limit <input type="number" class="ctl-input" id="settings-traffic-daily" min="1" max="100000" /></label>
                   <label>Hourly limit <input type="number" class="ctl-input" id="settings-traffic-hourly" min="1" max="10000" /></label>
-                  <label>Min gap <input type="number" class="ctl-input" id="settings-traffic-min-gap" min="0" max="3600" /><span>sec</span></label>
-                  <label>Max gap <input type="number" class="ctl-input" id="settings-traffic-max-gap" min="0" max="3600" /><span>sec</span></label>
+                  <label>Min job gap <input type="number" class="ctl-input" id="settings-traffic-min-gap" min="0" max="3600" /><span>sec</span></label>
+                  <label>Max job gap <input type="number" class="ctl-input" id="settings-traffic-max-gap" min="0" max="3600" /><span>sec</span></label>
                 </div>
                 <div class="settings-traffic-meter" id="settings-traffic-meter">
                   <span class="settings-traffic-usage">
                     <strong id="settings-traffic-hourly-usage">&mdash;</strong>
-                    <small>This hour</small>
+                    <small>Last 60 minutes</small>
                   </span>
                   <span class="settings-traffic-usage">
                     <strong id="settings-traffic-daily-usage">&mdash;</strong>
@@ -838,6 +838,7 @@
                   <span class="settings-traffic-cooldown"
                         id="settings-traffic-cooldown" hidden></span>
                 </div>
+                <div class="settings-field-help">Counts YouTube page, API, caption, and artwork request attempts, plus a small allowance for starting each job. Video/audio chunks and internal redirects are not counted individually. Limits apply throughout channel downloads. The job gap spaces new operations; requests within them share a 1–2 second gap, and videos retain a 10–20 second download pause.</div>
                 <div class="settings-traffic-insight" id="settings-traffic-recommendation">
                   <span class="settings-traffic-insight-icon" aria-hidden="true">&#10003;</span>
                   <div class="settings-traffic-insight-copy">
@@ -1288,9 +1289,21 @@
         <div class="settings-view" id="settings-view-backups" hidden>
           <label class="subs-section-label">Backups</label>
           <div class="health-view-intro">
-            Backups save YTArchiver's settings, subscriptions, queues, app history, bookmarks, and notes. They do not copy downloaded videos or transcript files. The Search index is included when it fits the backup size limit and can be rebuilt when omitted; bookmarks and notes are still included.
+            Backups save YTArchiver's settings, subscriptions, queues, app history, bookmarks, and notes. They do not copy downloaded videos or transcript files. The full Search database is included by default, with no size limit.
           </div>
           <div class="edit-grid health-backup-grid">
+            <label class="edit-gl">Backup contents</label>
+            <div class="edit-gv-stack settings-field-with-help">
+              <label class="edit-gv-inline settings-checkbox-row">
+                <input type="checkbox" id="settings-backup-include-search-db" checked disabled
+                       aria-describedby="backup-search-db-help" />
+                <span>Include Search database <span id="backup-search-db-size">(loading size&hellip;)</span></span>
+              </label>
+              <div class="settings-field-help" id="backup-search-db-help">
+                Applies to manual and automatic backups. Large databases need more time and disk space. Uncheck to leave out the Search database; bookmarks and notes are still included, but Search may need rebuilding after a restore.
+              </div>
+            </div>
+
             <label class="edit-gl" for="settings-auto-backup">Automatic backups</label>
             <div class="edit-gv-stack settings-field-with-help">
               <select class="ctl-select" id="settings-auto-backup"
@@ -1310,7 +1323,7 @@
             <div class="edit-gv-stack settings-field-with-help">
               <div class="edit-gv-inline edit-gap-6">
                 <button class="btn btn-ghost btn-thin" id="btn-export-backup"
-                        title="Save app settings, subscriptions, unfinished work, history, bookmarks, and notes to a ZIP file">Save backup&hellip;</button>
+                        title="Save app settings, subscriptions, unfinished work, history, bookmarks, and notes to a ZIP file, including the Search database when selected">Save backup&hellip;</button>
                 <button class="btn btn-ghost btn-thin" id="btn-import-backup"
                         title="Restore a backup zip after safely saving the current app settings">Restore&hellip;</button>
               </div>
@@ -2043,7 +2056,7 @@
       <span id="gsb-errors-label">errors</span>
     </button>
     <span class="gsb-traffic" id="gsb-traffic" hidden
-          title="YouTube request limits. If either limit is reached, YTArchiver waits and continues automatically.">
+          title="Budget for YouTube page, API, caption, and artwork requests, including a job-start allowance. Video/audio chunks are excluded. At either limit, requests wait and continue automatically.">
       <span class="gsb-traffic-label">YT Request Limits</span>
       <span class="gsb-traffic-reading" id="gsb-traffic-hourly"></span>
       <span class="gsb-traffic-sep">·</span>
@@ -2590,7 +2603,7 @@
 
             <button type="button" class="onb-traffic-card" data-traffic-mode="conservative">
 
-              <b>Conservative</b><span>750 operations/day · 90/hour · 10–20s spacing</span>
+              <b>Conservative</b><span>750 request units/day · 90/hour · 10–20s between jobs</span>
 
               <em>Recommended</em>
 
@@ -2598,7 +2611,7 @@
 
             <button type="button" class="onb-traffic-card" data-traffic-mode="balanced">
 
-              <b>Balanced</b><span>1,500 operations/day · 180/hour · 8–15s spacing</span>
+              <b>Balanced</b><span>1,500 request units/day · 180/hour · 8–15s between jobs</span>
 
               <em>For larger, busier archives</em>
 
@@ -2614,7 +2627,7 @@
 
             <button type="button" class="onb-traffic-card" data-traffic-mode="unlimited">
 
-              <b>Unlimited</b><span>No numeric ceiling · 5–10s spacing remains</span>
+              <b>Unlimited</b><span>No numeric ceiling · 5–10s between jobs</span>
 
               <em>Not recommended</em>
 
@@ -2628,11 +2641,13 @@
 
             <label>Per hour <input type="number" id="onb-traffic-hourly" min="1" max="10000" value="90" /></label>
 
-            <label>Minimum gap <input type="number" id="onb-traffic-min-gap" min="0" max="3600" value="10" /><span>sec</span></label>
+            <label>Minimum job gap <input type="number" id="onb-traffic-min-gap" min="0" max="3600" value="10" /><span>sec</span></label>
 
-            <label>Maximum gap <input type="number" id="onb-traffic-max-gap" min="0" max="3600" value="20" /><span>sec</span></label>
+            <label>Maximum job gap <input type="number" id="onb-traffic-max-gap" min="0" max="3600" value="20" /><span>sec</span></label>
 
           </div>
+
+          <p class="onb-text">Requests within jobs share a 1–2 second gap. Video downloads also pause for 10–20 seconds.</p>
 
           <div class="onb-traffic-summary" id="onb-traffic-summary"></div>
 
@@ -2783,8 +2798,11 @@
   <!-- UI helper modules load before logs.js + app.js so their exports are ready. -->
   <script src="util.js?v=1"></script>
   <script src="bridge.js?v=3"></script>
+  <script src="pagedCollection.js?v=1"></script>
+  <script src="preferences.js?v=1"></script>
   <script src="eventState.js?v=1"></script>
   <script src="browseState.js?v=1"></script>
+  <script src="watchSession.js?v=1"></script>
   <script src="toasts.js?v=1"></script>
   <script src="modals.js?v=1"></script>
   <script src="contextMenu.js?v=3"></script>

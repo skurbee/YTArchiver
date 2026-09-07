@@ -57,11 +57,11 @@
           protect your YouTube session. You can change this later in Settings.</p>
         <div class="onb-traffic-grid" id="onb-traffic-grid">
           <button type="button" class="onb-traffic-card" data-traffic-mode="conservative">
-            <b>Conservative</b><span>750 operations/day · 90/hour · 10–20s spacing</span>
+            <b>Conservative</b><span>750 request units/day · 90/hour · 10–20s between jobs</span>
             <em>Recommended</em>
           </button>
           <button type="button" class="onb-traffic-card" data-traffic-mode="balanced">
-            <b>Balanced</b><span>1,500 operations/day · 180/hour · 8–15s spacing</span>
+            <b>Balanced</b><span>1,500 request units/day · 180/hour · 8–15s between jobs</span>
             <em>For larger, busier archives</em>
           </button>
           <button type="button" class="onb-traffic-card" data-traffic-mode="custom">
@@ -69,16 +69,17 @@
             <em>Advanced</em>
           </button>
           <button type="button" class="onb-traffic-card" data-traffic-mode="unlimited">
-            <b>Unlimited</b><span>No numeric ceiling · 5–10s spacing remains</span>
+            <b>Unlimited</b><span>No numeric ceiling · 5–10s between jobs</span>
             <em>Not recommended</em>
           </button>
         </div>
         <div class="onb-traffic-custom" id="onb-traffic-custom" hidden>
           <label>Per 24 hours <input type="number" id="onb-traffic-daily" min="1" max="100000" value="750" /></label>
           <label>Per hour <input type="number" id="onb-traffic-hourly" min="1" max="10000" value="90" /></label>
-          <label>Minimum gap <input type="number" id="onb-traffic-min-gap" min="0" max="3600" value="10" /><span>sec</span></label>
-          <label>Maximum gap <input type="number" id="onb-traffic-max-gap" min="0" max="3600" value="20" /><span>sec</span></label>
+          <label>Minimum job gap <input type="number" id="onb-traffic-min-gap" min="0" max="3600" value="10" /><span>sec</span></label>
+          <label>Maximum job gap <input type="number" id="onb-traffic-max-gap" min="0" max="3600" value="20" /><span>sec</span></label>
         </div>
+        <p class="onb-text">Requests within jobs share a 1–2 second gap. Video downloads also pause for 10–20 seconds.</p>
         <div class="onb-traffic-summary" id="onb-traffic-summary"></div>
       </section>
 

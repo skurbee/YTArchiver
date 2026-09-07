@@ -14,18 +14,19 @@ import os
 import random
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 from ..log import get_logger
 from ..log_stream import LogStreamer
-from ..sync import find_yt_dlp
-from ._refresh_proxies import (
+from ..ytdlp_options import find_yt_dlp
+from .control import (
     _enter_pause_wait,
     _exit_pause_wait,
 )
 from .fetcher import fetch_single_video_metadata
 from .io import (
+    _fetched_at_epoch,
     _folder_for_channel,
     _read_metadata_jsonl,
 )
@@ -101,7 +102,7 @@ def refresh_channel_comments(channel: dict[str, Any],
     # silently re-fetch the videos we already did in the prior partial
     # pass. Track a `_pass_start_ts` on the task dict the FIRST time
     # we run; on subsequent resumptions of the same dict, filter out
-    # any entry whose fetched_at >= _pass_start_ts (already refreshed
+    # any entry whose comments_fetched_at >= _pass_start_ts (already refreshed
     # in this pass). Manual re-trigger = brand-new dict, so no skip.
     # NB: queues.set_current_sync uses copy.deepcopy(), so mutating
     # `channel` alone DOESN'T propagate to queues.current_sync and
@@ -118,24 +119,10 @@ def refresh_channel_comments(channel: dict[str, Any],
             except Exception as e:
                 _log.debug("swallowed: %s", e)
     def _entry_already_done_this_pass(entry: dict) -> bool:
-        fa = entry.get("fetched_at") or ""
-        if not fa:
-            return False
-        try:
-            # Treat stored value as UTC. New writes use a "Z"-suffixed
-            # UTC string (see writer below). Old writes were naive
-            # local-time; parse them as UTC anyway so DST drift can't
-            # mis-classify (audit: refresh_comments H75).
-            _s = str(fa)
-            if _s.endswith("Z"):
-                _s = _s[:-1] + "+00:00"
-            _dt = datetime.fromisoformat(_s)
-            if _dt.tzinfo is None:
-                _dt = _dt.replace(tzinfo=UTC)
-            ts = _dt.timestamp()
-        except (ValueError, TypeError):
-            return False
-        return ts >= _pass_start_ts
+        # Generic metadata freshness is advanced by stats-only requests too.
+        # Legacy entries have no comment checkpoint and safely repeat the read.
+        ts = _fetched_at_epoch(entry.get("comments_fetched_at"))
+        return ts is not None and ts >= _pass_start_ts
     _skipped_already_done = 0
     for dp, _dns, fns in os.walk(str(folder)):
         for fn in fns:
@@ -262,4 +249,3 @@ def refresh_channel_comments(channel: dict[str, Any],
             "partial": cancelled and fetched > 0,
             "fetched": fetched, "errors": errors,
             "unchanged": unchanged, "skipped": 0, "took": took}
-

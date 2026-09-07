@@ -776,25 +776,10 @@ class SyncMixin:
         """Commit cancellation intent; keep the row until its worker stops."""
         try:
             wanted = str(task_id or "").strip()
-            with self._queues._lock:
-                current_id = str(
-                    (self._queues.current_sync or {}).get("task_id") or "").strip()
-                if not wanted or wanted != current_id:
-                    return {"ok": False,
-                            "error": "Queue changed; task is no longer running"}
-                cancelling = dict(self._queues.current_sync)
-                cancelling["cancel_requested"] = True
-                if not self._queues.replace_current_task_durable(
-                        "sync", cancelling, expected_task_id=wanted):
-                    return {"ok": False,
-                            "error": "Current sync task could not be saved as cancelled"}
-                # Do not let completion advance the slot between durable intent
-                # and signalling the currently owned worker.
-                self._sync_skip.set()
-                if (cancelling.get("kind") or "").lower() == "redownload":
-                    redownload_cancel = getattr(self, "_redwnl_cancel", None)
-                    if redownload_cancel is not None:
-                        redownload_cancel.set()
+            result = self._queues.command_sync_current(
+                wanted, signal=self._signal_sync_current)
+            if not result.get("ok"):
+                return result
             try:
                 self._log_stream.emit([
                     ["[Sync] ", "sync_bracket"],
@@ -818,11 +803,7 @@ class SyncMixin:
                 return {"ok": False,
                         "error": "Queue changed; task is no longer running"}
 
-            committed = self._transcribe.cancel_current_durable(
-                wanted,
-                lambda: self._queues.replace_current_task_durable(
-                    "gpu", None, expected_task_id=wanted),
-            )
+            committed = self._transcribe.queue_commands().cancel(wanted)
             if not committed:
                 return {"ok": False,
                         "error": "Current Processing task could not be saved as cancelled"}
@@ -838,46 +819,19 @@ class SyncMixin:
         except Exception as e:
             return _api_err("INTERNAL_ERROR", str(e))
 
-    def sync_defer_current(self, task_id=""):
-        """Send the currently-running sync task to the END of the queue,
-        then cancel the running pass so the next queued item picks up.
-        Different from sync_skip_current \u2014 `skip` drops the task; `defer`
-        keeps it but reorders it for later. Used by the right-click
-        "Skip this job" action where the user wants "do this one later,
-        not lose it".
+    def _signal_sync_current(self, task):
+        """Signal only after QueueState commits intent for the exact owner."""
+        self._sync_skip.set()
+        if (task.get("kind") or "").lower() == "redownload":
+            redownload_cancel = getattr(self, "_redwnl_cancel", None)
+            if redownload_cancel is not None:
+                redownload_cancel.set()
 
-        Strips the `_pass_start_ts` cursor so the deferred task starts a
-        fresh pass when it eventually runs again \u2014 otherwise its first
-        re-entry would skip every video already refreshed in this aborted
-        pass and produce an empty "no videos in scope" result.
-        """
+    def sync_defer_current(self, task_id=""):
+        """Durably reserve the exact current task at the tail, then cancel it."""
         try:
-            cur = self._queues.current_sync
-            wanted = str(task_id or "").strip()
-            if not wanted or wanted != str(
-                    (cur or {}).get("task_id") or "").strip():
-                return {"ok": False, "error": "Queue changed; task is no longer running"}
-            if cur:
-                deferred = dict(cur)
-                deferred.pop("_pass_start_ts", None)
-                deferred.pop("cancel_requested", None)
-                if not self._queues.sync_defer_task(deferred):
-                    return {"ok": False,
-                            "error": "Deferred task could not be saved"}
-                self._log_stream.emit([
-                    ["[Sync] ", "sync_bracket"],
-                    [(f"Deferred {deferred.get('name') or deferred.get('url') or 'current job'}"
-                      " \u2014 sent to end of queue\n"), "simpleline"],
-                ])
-            # Now skip the in-flight run so the next queued item starts.
-            result = self.sync_skip_current(task_id)
-            if isinstance(result, dict) and not result.get("ok") and cur:
-                try:
-                    self._queues.sync_remove_task(
-                        str(deferred.get("task_id") or ""), durable=True)
-                except Exception as e:
-                    _log.warning("sync defer rollback failed: %s", e)
-            return result
+            return self._queues.command_sync_current(
+                task_id, defer=True, signal=self._signal_sync_current)
         except Exception as e:
             return _api_err("INTERNAL_ERROR", str(e))
 

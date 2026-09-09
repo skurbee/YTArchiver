@@ -195,7 +195,7 @@
              label/select pair in Row 3 reads as one unit (was: Clear
              sat between them, breaking the visual pairing). -->
         <button class="btn btn-ghost btn-thin" id="btn-clear-menu"
-                title="Clear log or activity history">Clear <span class="clear-menu-caret">&#9662;</span></button>
+                title="Clear log or activity history"><span class="clear-menu-label">Clear</span> <span class="clear-menu-caret">&#9662;</span></button>
 
         <div class="spacer"></div>
 
@@ -296,12 +296,12 @@
 
     <!-- Paned log area -->
     <div class="log-paned" id="log-paned">
-      <div class="activity-log-frame">
+      <div class="activity-log-frame" hidden>
         <div class="activity-log" id="activity-log" tabindex="-1"></div>
       </div>
       <div class="paned-splitter" id="paned-splitter" role="separator"
            aria-orientation="horizontal" aria-label="Resize activity log"
-           tabindex="0"></div>
+           tabindex="0" hidden></div>
       <div class="main-log-frame">
         <div class="main-log" id="main-log" tabindex="-1"></div>
       </div>
@@ -945,6 +945,15 @@
                   <input type="checkbox" id="settings-show-avg-size" />
                   <span>Show average file size</span>
                 </label>
+              </div>
+
+              <label class="edit-gl">Activity history</label>
+              <div class="edit-gv-stack settings-appearance-choice">
+                <label class="edit-gv-inline settings-checkbox-row">
+                  <input type="checkbox" id="settings-show-activity-log" checked />
+                  <span>Persistent activity log on Download tab</span>
+                </label>
+                <span class="settings-inline-note">History stays saved when hidden</span>
               </div>
 
               <label class="edit-gl" for="settings-log-mode">Activity log detail</label>

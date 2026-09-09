@@ -91,6 +91,33 @@
     };
   }
 
+  const _queueActionsInFlight = new Set();
+  function _queueAction(which, fn) {
+    return async function (...args) {
+      const lanes = which === "both" ? ["sync", "gpu"] : [which];
+      if (lanes.some(lane => _queueActionsInFlight.has(lane))) return;
+      const buttonId = which === "both" ? "btn-pause" : `btn-pause-${which}-queue`;
+      const paintedState = document.getElementById(buttonId)?.dataset?.pauseState || "";
+      const state = blinkState();
+      const anyPaused = lanes.some(lane => state[lane].paused &&
+        (state[lane].running || state[lane].count > 0));
+      const idleQueued = lanes.every(lane => !state[lane].running) &&
+        lanes.some(lane => state[lane].count > 0);
+      const resuming = (anyPaused || idleQueued) &&
+        !(which === "both" && state.sync.trafficWaiting);
+      lanes.forEach(lane => _queueActionsInFlight.add(lane));
+      if (resuming) window._setQueueResumePending?.(which, true);
+      try {
+        return await fn.call(this, ...args, paintedState);
+      } catch (error) {
+        window._showToast?.(`Queue action failed. ${error}`, "error");
+      } finally {
+        lanes.forEach(lane => _queueActionsInFlight.delete(lane));
+        if (resuming) window._setQueueResumePending?.(which, false);
+      }
+    };
+  }
+
   // ─── Sync Subbed button ──────────────────────────────────────────────
   function initSyncButton() {
     const btn = document.getElementById("btn-sync-subbed");
@@ -171,7 +198,7 @@
     // This mirrors OLD's global pause button that gated every worker at
     // once. To target one queue independently, use the Pause button
     // inside the Sync Tasks / GPU Tasks popover.
-    pauseBtn?.addEventListener("click", _inFlight(async () => {
+    pauseBtn?.addEventListener("click", _queueAction("both", async () => {
       // Three click paths:
       // 1. Worker thread alive + not paused → pause (both queues)
       // 2. Worker thread alive + paused → resume (both queues)
@@ -305,7 +332,7 @@
     // worker — queue_resume alone just clears the flag and the queue
     // stays frozen. Matches the global Pause button's behavior.
     const pauseSyncBtn = document.getElementById("btn-pause-sync-queue");
-    pauseSyncBtn?.addEventListener("click", async () => {
+    pauseSyncBtn?.addEventListener("click", _queueAction("sync", async () => {
       // Keeps direct `api`: this handler feature-detects newer methods
       // (queue_is_paused, sync_start_all, resume_pending_redownloads) and
       // falls back to legacy behavior when absent — semantics the YT.api
@@ -371,7 +398,7 @@
           "Sync paused \u2014 finishing current channel.", "warn",
           "Sync pause failed.");
       }
-    });
+    }));
     document.getElementById("btn-cancel-sync-queue")?.addEventListener("click", async () => {
       if (!nativeBridgeUp()) return;
       // If the sync queue is already paused, "Pause" and "Stop now"
@@ -452,18 +479,15 @@
     });
 
     // GPU Tasks queue popover — mirror the Sync handlers.
-    document.getElementById("btn-pause-gpu-queue")?.addEventListener("click", async () => {
+    document.getElementById("btn-pause-gpu-queue")?.addEventListener("click", _queueAction("gpu", async (_event, paintedState) => {
       // Keeps direct `api`: falls back to legacy transcribe_cancel_all
       // when queue_is_paused is absent — a method-existence fallback the
       // YT.api proxy can't express (it resolves every name to a function).
       const api = window.pywebview?.api;
       if (!api) return;
-      // Act on the button's PAINTED state (queueBlink keeps
-      // dataset.pauseState current), so the click always matches the label
-      // the user sees. "start" = Auto-off backlog waiting to be drained;
-      // "paused"/"pending" = resume a paused run; else = pause a running one.
-      const st = document.getElementById("btn-pause-gpu-queue")
-        ?.dataset?.pauseState || "";
+      // Use the painted action captured before the local "Resuming" feedback
+      // replaced its label. Start drains Auto-off work; paused/pending resumes.
+      const st = paintedState;
       if (st === "start") {
         await checkedQueueApi(
           api, "gpu_start", "gpu",
@@ -480,7 +504,7 @@
           "Processing queue paused \u2014 current job will finish.", "warn",
           "Processing queue pause failed.");
       }
-    });
+    }));
     document.getElementById("btn-cancel-gpu-queue")?.addEventListener("click", async () => {
       if (!nativeBridgeUp()) return;
       const choice = await (window.askChoice

@@ -145,6 +145,7 @@ class TrayController:
         # clears that error list, while the spinner can remain visible.
         self._error_count: int = 0
         self._traffic_waiting: bool = False
+        self._queue_paused: bool = False
         # The notification-area icon and the taskbar button are distinct
         # Windows surfaces. pystray owns the former; ITaskbarList3 uses this
         # HWND for the small spinner/count overlay on the latter.
@@ -299,7 +300,7 @@ class TrayController:
     def _static_icon_image(self):
         if self._base_img is None:
             return None
-        if self._traffic_waiting or self._error_count or self._badge_count:
+        if self._traffic_waiting or self._queue_paused or self._error_count or self._badge_count:
             normalized = self._compose_tray_spin_frame(None)
             if normalized is not None:
                 return normalized
@@ -347,6 +348,7 @@ class TrayController:
         if not self._started or not self._icon:
             return
         self.set_traffic_waiting(False)
+        self.set_queue_paused(False)
         new_color = (80, 160, 240, 255) if color == "blue" else (230, 80, 80, 255)
         # OLD uses 0.18s/frame for blue (sync), 0.12s/frame for red (GPU) — red
         # spins faster to signal GPU work is active. Mirrors YTArchiver.py:3481.
@@ -422,6 +424,14 @@ class TrayController:
         self._traffic_waiting = waiting
         # stop_spin invalidates any delayed animation frame before restoring
         # the static icon. The caller starts animation again when work resumes.
+        self.stop_spin()
+
+    def set_queue_paused(self, paused: bool) -> None:
+        """Show the static yellow pause on both icons for a paused queue."""
+        paused = bool(paused)
+        if self._queue_paused == paused:
+            return
+        self._queue_paused = paused
         self.stop_spin()
 
     def set_badge(self, count: int):
@@ -541,7 +551,7 @@ class TrayController:
         try:
             img = self._Image.new("RGBA", (32, 32), (0, 0, 0, 0))
             draw = self._ImageDraw.Draw(img)
-            waiting = self._traffic_waiting
+            waiting = self._traffic_waiting or self._queue_paused
             if waiting:
                 frame = None
                 # Two high-contrast bars remain legible after the shell scales
@@ -634,8 +644,9 @@ class TrayController:
         try:
             from .taskbar_overlay import WindowsTaskbarOverlay
             with self._icon_lock, WindowsTaskbarOverlay(self._taskbar_hwnd) as overlay:
-                if self._traffic_waiting:
-                    label = "YTArchiver is waiting for a YouTube request-limit slot"
+                if self._traffic_waiting or self._queue_paused:
+                    label = ("YTArchiver is waiting for a YouTube request-limit slot"
+                             if self._traffic_waiting else "YTArchiver queue is paused")
                     if self._error_count:
                         label += "; errors also need attention"
                     overlay.set_pil_image(self._compose_taskbar_overlay(), label)

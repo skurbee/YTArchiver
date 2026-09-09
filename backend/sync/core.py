@@ -1283,7 +1283,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
             return SyncResult(ok=False, reason="cancelled", cancelled=True)
         if pause_event is not None and pause_event.is_set():
             return SyncResult(ok=False, reason="paused")
-        stream.emit_text(" Fetching channel avatar and banner...\n", "simpleline")
+        _log.debug("Fetching channel avatar and banner")
         try:
             _art_result = _ca.fetch_channel_art(
                 url or "", str(ch_dir), force=False,
@@ -1309,7 +1309,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
             stream.emit_text(
                 " Some channel artwork is unavailable; starting videos.\n", "yellow")
         elif _art_result.get("ok"):
-            stream.emit_text(" Channel artwork ready; starting videos.\n", "simpleline")
+            _log.debug("Channel artwork ready; starting videos")
         else:
             stream.emit_text(
                 " Channel artwork unavailable; continuing with videos.\n", "yellow")

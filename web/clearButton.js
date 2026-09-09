@@ -1,5 +1,5 @@
 /**
- * web/clearButton.js — consolidated Clear dropdown next to the Pause button
+ * web/clearButton.js — Clear log action and optional activity-history dropdown
  *
  * Exposed as window.initClearLog; app.js boot calls it once.
  */
@@ -15,12 +15,13 @@
   function nativeBridgeUp() {
     return !!window.YT?.bridge?.isUp?.();
   }
+  function activityLogEnabled() {
+    return typeof window._isActivityLogEnabled === "function"
+      ? !!window._isActivityLogEnabled() : true;
+  }
 
-  // Hide the whole "Clear ▾" button when there's nothing to clear (BOTH the
-  // activity log and the main log are empty). Otherwise clicking it pops an
-  // empty menu / does nothing, which reads as broken. Re-shown the instant
-  // either log gets a line. (Implements the visibility sync that the click
-  // handler's comment referenced but which was never actually defined.)
+  // Hidden activity history must not keep the Clear log action visible.
+  // When activity is enabled, either log can make the dropdown useful.
   // style.display is used rather than the [hidden] attribute because the
   // .btn class sets a display value that would override [hidden].
   function syncClearButtonVisibility() {
@@ -28,20 +29,35 @@
     if (!btn) return;
     const mainLog = document.getElementById("main-log");
     const actLog = document.getElementById("activity-log");
+    const activityEnabled = activityLogEnabled();
     const hasMain = !!(mainLog && mainLog.childElementCount > 0);
-    const hasAct = !!(actLog && actLog.childElementCount > 0);
+    const hasAct = activityEnabled && !!(actLog && actLog.childElementCount > 0);
     btn.style.display = (hasMain || hasAct) ? "" : "none";
+    const label = btn.querySelector(".clear-menu-label");
+    if (label) label.textContent = activityEnabled ? "Clear" : "Clear log";
+    const caret = btn.querySelector(".clear-menu-caret");
+    if (caret) caret.hidden = !activityEnabled;
+    const tip = activityEnabled ? "Clear log or activity history" : "Clear log";
+    btn.setAttribute("data-tooltip", tip);
+    btn.setAttribute("aria-label", tip);
+    btn.removeAttribute("title");
+    if (activityEnabled) btn.setAttribute("aria-haspopup", "menu");
+    else {
+      btn.removeAttribute("aria-haspopup");
+      const ctxRoot = document.getElementById("ctx-menu-root");
+      if (ctxRoot?.querySelector('[data-source="clear-menu"]')) {
+        ctxRoot.innerHTML = "";
+      }
+    }
   }
   window._syncClearButtonVisibility = syncClearButtonVisibility;
 
-  // ─── Clear button wiring (consolidated dropdown) ─────────────────────
+  // ─── Clear button wiring ─────────────────────────────────────────────
   function initClearLog() {
-    // Single "Clear ▾" button (next to the Pause button in the main
-    // controls row). Click opens a context menu with two options:
+    // With activity enabled, the button opens a context menu:
     //   - Clear log       (wipe the visible main log)
     //   - Clear activity  (wipe + persist the activity-log history)
-    // Replaces the two separate buttons (main "Clear log" + autorun-
-    // row "Clear") that used to take up space in different places.
+    // Otherwise it directly confirms clearing the visible main log.
     const btn = document.getElementById("btn-clear-menu");
     if (!btn) return;
 
@@ -68,11 +84,12 @@
     }
 
     async function doClearActivity() {
+      if (!activityLogEnabled()) return;
       const ok = await askConfirm(
         "Clear activity log",
         "Permanently clear the activity-log history? This cannot be undone.",
         { confirm: "Clear", danger: true });
-      if (!ok) return;
+      if (!ok || !activityLogEnabled()) return;
       if (nativeBridgeUp()) {
         try {
           const res = await bridgeCall("autorun_history_clear");
@@ -94,6 +111,13 @@
 
     btn.addEventListener("click", (ev) => {
       ev.stopPropagation();
+      const ctxRoot = document.getElementById("ctx-menu-root");
+      if (!activityLogEnabled()) {
+        if (ctxRoot) ctxRoot.innerHTML = "";
+        const mainLog = document.getElementById("main-log");
+        if (mainLog && mainLog.childElementCount > 0) return doClearMainLog();
+        return;
+      }
       // Toggle: if the menu is already open, a second button click
       // should close it instead of popping another on top. Detect via
       // the shared `ctx-menu-root` container the context-menu helper
@@ -101,7 +125,6 @@
       // Only close-and-bail when the open menu is OUR menu — otherwise
       // clicking Clear while a different context menu is open would
       // hijack it (audit: clearButton.js H132). Tag with data-source.
-      const ctxRoot = document.getElementById("ctx-menu-root");
       if (ctxRoot && ctxRoot.querySelector('[data-source="clear-menu"]')) {
         ctxRoot.innerHTML = "";
         return;

@@ -8,6 +8,7 @@
 //   window.setQueueState         (assigned by initQueueBlink; backend pushes)
 //   window._syncPauseButtonState (called by setQueueState)
 //   window._paintBlinkState      (logs.js uses to repaint after queue change)
+//   window._setQueueResumePending (immediate feedback during a resume request)
 //   window.initQueueBlink        (called by app.js boot at L10443)
 //
 // The IIFE has its OWN local lexical scope for everything else
@@ -42,9 +43,9 @@
     // pause takes hold — could be minutes).
     sync: { running: false, paused: false, pausedActive: false, count: 0,
             pausedAtMs: 0, trafficWaiting: false, trafficWait: null,
-            sessionLimited: false },
+            sessionLimited: false, resumePending: false },
     gpu: { running: false, paused: false, pausedActive: false, count: 0,
-           pausedAtMs: 0 },
+           pausedAtMs: 0, resumePending: false },
   };
   // Minimum visible duration of the pause-pending blink (ms). Without
   // this, a fast pause-handshake (worker hits its pause-wait within
@@ -63,6 +64,17 @@
   window._blinkState = _blinkState;
   window._syncPauseButtonState = _syncPauseButtonState;
   window._paintBlinkState = paintBlinkState;
+  window._setQueueResumePending = (which, pending) => {
+    // Keep click feedback separate from the backend's actual worker state.
+    // Queue pushes and timer repaints must preserve it until the call settles.
+    for (const lane of ["sync", "gpu"]) {
+      if (which === "both" || which === lane) {
+        _blinkState[lane].resumePending = !!pending;
+      }
+    }
+    paintBlinkState();
+    _syncPauseButtonState();
+  };
 
   function _touchBlinkState() {
     _blinkState.lastStateAtMs = Date.now();
@@ -221,8 +233,9 @@
     const anyAlive = s.running || g.running;
     const pausedWithItems =
       (s.paused && s.count > 0) || (g.paused && g.count > 0);
-    const enable = anyAlive || pausedWithItems || s.count > 0 || g.count > 0
-      || _isYouTubeLimitHold(s);
+    const enable = !s.resumePending && !g.resumePending && (
+      anyAlive || pausedWithItems || s.count > 0 || g.count > 0
+      || _isYouTubeLimitHold(s));
     const btn = document.getElementById("btn-pause");
     if (btn) {
       btn.disabled = !enable;
@@ -401,17 +414,21 @@
       // Also held for a minimum visible window after the click so a
       // fast pause-handshake doesn't skip the blink entirely.
       const anyPending = _isPipelinePending(s) || _isPipelinePending(g);
+      const resuming = s.resumePending || g.resumePending;
       let visState = limitWaiting
         ? "traffic-wait"
         : (idleQueued ? "start" : (anyPaused ? "paused" : "running"));
       if (anyPending) visState = "pending";
+      if (resuming) visState = "resuming";
       pauseBtn.dataset.pauseState = visState;
-      pauseBtn.classList.toggle("pause-pending", anyPending);
+      pauseBtn.classList.toggle("pause-pending", anyPending || resuming);
+      if (resuming) pauseBtn.setAttribute("aria-busy", "true");
+      else pauseBtn.removeAttribute("aria-busy");
       // Write to data-tooltip (not title) — the 700ms blink tick was
       // re-adding `title` mid-hover, after the custom tooltip system
       // had already migrated it. Both ended up visible at once. Bypass
       // the migration step by setting data-tooltip directly here.
-      const _pauseTip = anyPending
+      const _pauseTip = resuming ? "Resuming…" : anyPending
         ? "Pause queued — current job will finish first. Click to cancel pause."
         : (trafficWaiting
             ? "Waiting for a YouTube traffic slot — click to override"
@@ -427,7 +444,8 @@
       pauseBtn.removeAttribute("title");
       const svg = pauseBtn.querySelector("svg");
       if (svg) {
-        const want = (idleQueued || anyPaused || limitWaiting) ? "play" : "bars";
+        const want = !resuming && (idleQueued || anyPaused || limitWaiting)
+          ? "play" : "bars";
         if (svg.dataset.icon !== want) {
           svg.dataset.icon = want;
           svg.innerHTML = want === "play"
@@ -465,13 +483,14 @@
       const _pop = _bdom("popover-sync-tasks");
       const _popOpen = !!(_pop && _pop.classList.contains("open"));
       syncFooter.style.display =
-        (_blinkState.sync.count > 0 || _popOpen) ? "" : "none";
+        (_blinkState.sync.count > 0 || _blinkState.sync.resumePending || _popOpen)
+          ? "" : "none";
     }
     // GPU popover: footer also hosts the Manual Transcribe folder icon,
     // which should stay visible. Only hide the Pause/Cancel pair.
     _setPopoverFooterBtnsVisible("btn-pause-gpu-queue",
                                   "btn-cancel-gpu-queue",
-                                  _blinkState.gpu.count > 0);
+                                  _blinkState.gpu.count > 0 || _blinkState.gpu.resumePending);
   }
 
   // Show/hide a popover's Pause + Cancel button pair. When the queue is
@@ -505,10 +524,15 @@
     // Also held for a minimum window after the click so a fast pause
     // handshake doesn't skip the visual feedback.
     const isPending = _isPipelinePending(state);
+    const resuming = !!state.resumePending;
+    btn.disabled = resuming;
+    if (resuming) btn.setAttribute("aria-busy", "true");
+    else btn.removeAttribute("aria-busy");
     const svg = btn.querySelector("svg");
     const span = btn.querySelector("span");
-    if (span) span.textContent = startable ? "Start" : (isPaused ? "Resume" : "Pause");
-    const tip = isPending
+    if (span) span.textContent = resuming ? "Resuming…"
+      : (startable ? "Start" : (isPaused ? "Resume" : "Pause"));
+    const tip = resuming ? `Resuming ${label.toLowerCase()} queue…` : isPending
       ? `Pause queued — ${label.toLowerCase()} job finishing first. Click to cancel pause.`
       : (startable
           ? `Start the ${label.toLowerCase()} queue now (Auto stays off)`
@@ -518,13 +542,14 @@
     // The custom tooltip system owns this button. Rewriting `title` during
     // the blink repaint can resurrect a native tooltip underneath it.
     btn.setAttribute("data-tooltip", tip);
+    btn.setAttribute("aria-label", tip);
     btn.removeAttribute("title");
-    btn.dataset.pauseState = isPending
+    btn.dataset.pauseState = resuming ? "resuming" : isPending
       ? "pending"
       : (startable ? "start" : (isPaused ? "paused" : "running"));
-    btn.classList.toggle("pause-pending", isPending);
+    btn.classList.toggle("pause-pending", isPending && !resuming);
     if (svg) {
-      const want = (startable || isPaused) ? "play" : "bars";
+      const want = !resuming && (startable || isPaused) ? "play" : "bars";
       if (svg.dataset.icon !== want) {
         svg.dataset.icon = want;
         // Render the glyph off `want`, not `isPaused` — otherwise a

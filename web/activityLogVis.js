@@ -1,5 +1,5 @@
 /**
- * web/activityLogVis.js — Auto-hide the activity-log frame when it would be empty
+ * web/activityLogVis.js — Respect the activity-log preference and hide empty history
  */
 (function () {
   "use strict";
@@ -30,6 +30,8 @@
   // the next single log line render inside a 20-row empty frame,
   // which looks broken. Design: open to roughly 3 lines worth of
   // height when the first log line fires after a clear.
+  // Stay hidden until saved preferences arrive, including when history loads first.
+  let _activityLogEnabled = false;
   let _lastActivityHasItems = false;
   function syncActivityLogVisibility() {
     const el = document.getElementById("activity-log");
@@ -45,13 +47,25 @@
       try { frame.style.removeProperty("flex"); } catch (_e) { /* noop */ }
     }
     _lastActivityHasItems = hasItems;
-    frame.hidden = !hasItems;
-    if (splitter) splitter.hidden = !hasItems;
+    const visible = _activityLogEnabled && hasItems;
+    frame.hidden = !visible;
+    if (splitter) splitter.hidden = !visible;
   }
 
   // Exposed so app.js / logs.js / autorun-history hooks can re-evaluate
   // visibility whenever activity-log content changes.
   window._syncActivityLogVisibility = syncActivityLogVisibility;
+  window._isActivityLogEnabled = () => _activityLogEnabled;
+  window._setActivityLogEnabled = (enabled) => {
+    _activityLogEnabled = !!enabled;
+    syncActivityLogVisibility();
+    window._syncClearButtonVisibility?.();
+  };
+  window.YT.preferences.hydrate(settings => {
+    window._setActivityLogEnabled(settings.show_activity_log !== false);
+  }, ["show_activity_log"]).catch(error => {
+    console.warn("Activity log preference could not be loaded:", error);
+  });
 
   // Auto-re-evaluate on EVERY change to the activity log's children. The
   // runtime append paths (appendActivityLog + the batched _logBatch

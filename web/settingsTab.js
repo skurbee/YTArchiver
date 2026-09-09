@@ -475,6 +475,12 @@
         if (whisperEl) { whisperEl.value = s.whisper_model || "small"; rememberControl(whisperEl, whisperEl.value); }
         if (defaultResEl) { defaultResEl.value = s.default_resolution || "720"; rememberControl(defaultResEl, defaultResEl.value); }
         if (logModeEl) { logModeEl.value = s.log_mode || "Simple"; rememberControl(logModeEl, logModeEl.value); }
+        const activityLogEl = document.getElementById("settings-show-activity-log");
+        if (activityLogEl) {
+          activityLogEl.checked = s.show_activity_log !== false;
+          rememberControl(activityLogEl, activityLogEl.checked);
+        }
+        window._setActivityLogEnabled?.(s.show_activity_log !== false);
         const legacySubsEl = document.getElementById("settings-legacy-subs-tab");
         if (legacySubsEl) {
           legacySubsEl.checked = !!s.legacy_subs_tab;
@@ -659,6 +665,15 @@
     document.getElementById("settings-log-mode")
       ?.addEventListener("change", (e) =>
         persistControl(e.target, "log_mode", e.target.value));
+    document.getElementById("settings-show-activity-log")
+      ?.addEventListener("change", async (e) => {
+        const enabled = e.target.checked;
+        window._setActivityLogEnabled?.(enabled);
+        await persistControl(e.target, "show_activity_log", enabled, {
+          checked: true,
+          onRollback: previous => window._setActivityLogEnabled?.(!!previous),
+        });
+      });
     document.getElementById("settings-legacy-subs-tab")
       ?.addEventListener("change", async (e) => {
         const enabled = !!e.target.checked;

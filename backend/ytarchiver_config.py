@@ -92,6 +92,7 @@ DEFAULT_CONFIG = {
     "youtube_traffic_custom_max_gap": 20,
     "autorun_history": [],
     "log_mode": "Simple",
+    "show_activity_log": True,
     # Fresh installs manage channels in Browse by default. load_config()
     # overrides this to True exactly once for pre-existing config files that
     # do not yet contain the key, preserving the established Subs workflow

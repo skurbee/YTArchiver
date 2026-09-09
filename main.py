@@ -879,14 +879,19 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             tray = getattr(self, "_tray", None)
             if tray is not None:
                 _sync_paused_now = bool(payload["sync_paused"] or _sync_pa)
+                _gpu_paused_now = bool(payload["gpu_paused"] or _gpu_pa)
+                # Processing may finish its current job before parking.
+                _gpu_working_now = gpu_working and not _gpu_pa
                 _traffic_waiting = (bool(_traffic_wait.get("active"))
                                     and sync_working and not _sync_paused_now)
-                tray.set_traffic_waiting(_traffic_waiting and not gpu_working)
+                tray.set_traffic_waiting(_traffic_waiting and not _gpu_working_now)
                 _spin_color = activity_spin_color(
                     sync_working=sync_working and not _sync_paused_now,
-                    gpu_working=gpu_working,
+                    gpu_working=_gpu_working_now,
                     traffic_waiting=_traffic_waiting,
                 )
+                _queue_paused = (_sync_paused_now or _gpu_paused_now) and _spin_color is None
+                tray.set_queue_paused(_queue_paused)
                 if _spin_color == "red":
                     job = payload['gpu'][0] if payload['gpu'] else {}
                     label = (job.get("kind") or "").title() or "Processing"
@@ -928,6 +933,8 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                         except (TypeError, ValueError, OverflowError, OSError):
                             pass
                         tray.set_tooltip(tip)
+                    elif _queue_paused:
+                        tray.set_tooltip("YTArchiver — Queue paused")
                     elif getattr(tray, "error_active", False) is True:
                         tray.set_tooltip(
                             "YTArchiver — Errors need attention — open for details")

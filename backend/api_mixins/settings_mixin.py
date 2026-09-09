@@ -347,6 +347,7 @@ class SettingsMixin:
             # Subs table column visibility toggles. Default False for
             # new users — the column is optional polish, not core info.
             "show_avg_size": bool(cfg.get("show_avg_size", False)),
+            "show_activity_log": bool(cfg.get("show_activity_log", True)),
             # X-button behavior — "ask" (default modal), "tray"
             # (minimize silently), or "quit" (exit silently). Read by
             # _on_closing at main.py:7552; also written by the close
@@ -556,6 +557,8 @@ class SettingsMixin:
         # Subs table column visibility
         if "show_avg_size" in data:
             cfg["show_avg_size"] = bool(data["show_avg_size"])
+        if "show_activity_log" in data:
+            cfg["show_activity_log"] = bool(data["show_activity_log"])
         # .txt: transcript viewer text size (px). Bounded so a bad
         # value (e.g. NaN) can't render the Watch view unreadable.
         if "transcript_font_size" in data:

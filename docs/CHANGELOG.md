@@ -6,6 +6,22 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v84.7 - Clearer queue controls and optional activity history
+
+09.08.26 7:40pm
+
+### Improved
+
+- Manual queue pauses now show the same yellow pause indicator on the taskbar and tray as request-limit waits. Independent active work keeps its activity indicator.
+- Resume controls immediately show a pause icon and "Resuming..." feedback while startup checks finish. Duplicate clicks are ignored, and failed resume attempts restore the available controls.
+- Routine channel-art checks and success messages now appear only in Detailed logs, keeping the normal download log quieter across pause/resume. Artwork warnings remain visible.
+- Each custom YouTube traffic limit and job-gap input now has a bordered group with its label and unit.
+
+### Added
+
+- Added "Persistent activity log on Download tab" under App behavior, enabled by default on fresh installs and existing configurations. Turning it off hides activity history and its divider while preserving saved history.
+- With activity history hidden, the Download tab's Clear control becomes a direct "Clear log" action. Turning history back on restores the existing dropdown.
+
 ## v84.6 - Fix downloader plugin startup
 
 09.07.26 4:41pm

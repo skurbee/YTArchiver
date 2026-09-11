@@ -743,6 +743,43 @@
   font-family: var(--font-ui);
 }
 .queue-popover.open { display: flex; }
+.queue-popover.gsb-traffic-popover {
+  width: min(350px, calc(100vw - 16px));
+  min-width: 0;
+  max-height: calc(100vh - 48px);
+  overflow: visible;
+}
+.gsb-traffic-popover .queue-popover-header { flex-shrink: 0; height: auto; gap: 8px; border-radius: 4px 4px 0 0; }
+.gsb-traffic-expirations-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 10px 8px;
+  flex-shrink: 0;
+  font-size: var(--fs-sm);
+}
+.gsb-traffic-expirations-controls .yt-dd { min-width: 120px; height: 28px; font-size: var(--fs-sm); }
+.gsb-traffic-expirations-controls .yt-dd-option { font-size: var(--fs-sm); }
+.gsb-traffic-expirations-controls .yt-dd-enhanced { display: none; }
+.gsb-traffic-expirations-summary,
+.gsb-traffic-expirations-note {
+  margin: 0;
+  padding: 8px 10px;
+  font-size: var(--fs-xs);
+  line-height: 1.45;
+  flex-shrink: 0;
+}
+.gsb-traffic-expirations-note { color: var(--c-text-muted); border-top: 1px solid var(--c-border); }
+.queue-popover-body.gsb-traffic-expirations-body { min-height: 0; max-height: 320px; padding: 0; }
+.gsb-traffic-expirations-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+.gsb-traffic-expirations-table th,
+.gsb-traffic-expirations-table td { padding: 7px 10px; text-align: left; font-variant-numeric: tabular-nums; }
+.gsb-traffic-expirations-table th { position: sticky; top: 0; background: var(--c-surface); font-weight: 600; }
+.gsb-traffic-expirations-table td { border-top: 1px solid var(--c-border); }
+.gsb-traffic-expirations-table th:last-child,
+.gsb-traffic-expirations-table td:last-child { text-align: right; white-space: nowrap; }
+.gsb-traffic-expirations-table td:last-child { color: var(--c-log-green); }
 .gsb-errors-popover {
   width: min(560px, calc(100vw - 16px));
   min-width: min(420px, calc(100vw - 16px));

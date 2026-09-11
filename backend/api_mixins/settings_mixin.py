@@ -693,6 +693,13 @@ class SettingsMixin:
         except Exception as e:
             return _api_err("INTERNAL_ERROR", str(e))
 
+    def youtube_traffic_expirations(self):
+        """Minute-by-minute expiration schedule for current 24-hour usage."""
+        try:
+            return youtube_traffic.daily_expirations()
+        except Exception as e:
+            return _api_err("INTERNAL_ERROR", str(e))
+
 
     # ─── yt-dlp version / update ───────────────────────────────────────
 

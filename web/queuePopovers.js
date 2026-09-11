@@ -35,7 +35,8 @@
       ["btn-sync-tasks", "popover-sync-tasks"],
       ["btn-gpu-tasks", "popover-gpu-tasks"],
     ];
-    const triggerIds = ["btn-sync-tasks", "btn-gpu-tasks", "gsb-sync", "gsb-gpu"];
+    const triggerIds = ["btn-sync-tasks", "btn-gpu-tasks", "gsb-sync", "gsb-gpu",
+      "gsb-errors", "gsb-traffic-daily"];
     for (const [btnId, popId] of pairs) {
       const btn = document.getElementById(btnId);
       const pop = document.getElementById(popId);
@@ -81,7 +82,10 @@
       const open = Array.from(
         document.querySelectorAll(".queue-popover.open"));
       const anchor = open.length ? open[open.length - 1]._queueAnchor : null;
-      open.forEach(p => p.classList.remove("open"));
+      open.forEach(p => {
+        p.querySelectorAll("select").forEach(sel => sel._ytddClose?.());
+        p.classList.remove("open");
+      });
       triggerIds.forEach((id) => {
         document.getElementById(id)?.setAttribute("aria-expanded", "false");
       });

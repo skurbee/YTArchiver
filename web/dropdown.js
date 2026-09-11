@@ -254,8 +254,11 @@
         const rows = enabledRows();
         setActiveRow(e.key === "Home" ? rows[0] : rows[rows.length - 1]);
       } else if (e.key === "Escape") {
-        e.preventDefault();
-        closeMenu();
+        if (dd.classList.contains("open")) {
+          e.preventDefault();
+          e.stopPropagation();
+          closeMenu();
+        }
       } else if (e.key === "Tab") {
         closeMenu();
       }
@@ -265,6 +268,7 @@
     // programmatically changed (e.g. settings load populates it).
     sel.addEventListener("change", paintTrigger);
     sel._ytddRepaint = paintTrigger;
+    sel._ytddClose = closeMenu;
 
     paintTrigger();
     sel.parentNode.insertBefore(dd, sel);

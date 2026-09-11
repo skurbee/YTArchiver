@@ -3,6 +3,7 @@
 import json
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest import mock
 
@@ -10,6 +11,24 @@ import pytest
 
 from backend.log_stream import _line_is_verbose_only
 from backend.sync import core
+
+
+@dataclass(frozen=True)
+class DiscoveryCheckpoint:
+    visible: bool
+
+
+def discovery_visible(rows):
+    active = set()
+    for row in rows:
+        for text, tags in row:
+            if tags == "__control__":
+                control = json.loads(text)
+                if control.get("kind") == "clear_line":
+                    active.discard(control.get("marker"))
+            elif isinstance(tags, list):
+                active.update(tag for tag in tags if tag.startswith("sync_row_discovery_"))
+    return bool(active)
 
 
 @pytest.fixture
@@ -41,13 +60,23 @@ def replay(monkeypatch, tmp_path):
 
     monkeypatch.setattr(core, "config_transaction", transaction)
 
-    def run(lines, *, returncode=0, stop=None, simple=True):
+    def run(lines, *, returncode=0, stop=None, simple=True,
+            streams_lines=None, launch_effect=None):
         monkeypatch.setattr(core, "popen_ytdlp_process",
-                            mock.Mock(return_value=mock.Mock(returncode=returncode, pid=None)))
+                            mock.Mock(side_effect=launch_effect,
+                                      return_value=mock.Mock(returncode=returncode, pid=None)))
+        passes = [lines]
+        if streams_lines is not None:
+            monkeypatch.setattr("backend.subs.streams_url", lambda url: url + "/streams")
+            passes.append(streams_lines)
+        output_passes = iter(passes)
 
         def output(*_args):
-            for line in lines:
-                if callable(line):
+            for line in next(output_passes):
+                if isinstance(line, DiscoveryCheckpoint):
+                    rows = [call.args[0] for call in stream.emit.call_args_list]
+                    assert discovery_visible(rows) is line.visible
+                elif callable(line):
                     line()
                 else:
                     yield (line + "\n").encode()
@@ -78,11 +107,16 @@ def error_rows(rows):
     return [row for row in rows if any("error_detail" in segment[1] for segment in row)]
 
 
-def test_many_pages_update_one_visible_row_then_clear_at_video_start(replay):
+def test_many_pages_update_one_visible_row_until_actual_media_download(replay):
     pages = [f"[youtube:tab] UCfixture page {page}: Downloading API JSON"
              for page in range(1, 52)]
     completed = replay(["[youtube:tab] @DiscoveryFixture: Downloading webpage", *pages,
-                        "[youtube] fixture0001: Downloading webpage"])
+                        "[youtube] fixture0001: Downloading webpage",
+                        DiscoveryCheckpoint(True),
+                        "[info] fixture0001: Downloading 1 format(s)",
+                        DiscoveryCheckpoint(True),
+                        "[download] Destination: Fixture.f137.mp4",
+                        DiscoveryCheckpoint(False)])
     discovery = discovery_rows(completed.rows)
     assert len(discovery) == 52
     assert len({row[0][1][-1] for row in discovery}) == 1
@@ -93,7 +127,11 @@ def test_many_pages_update_one_visible_row_then_clear_at_video_start(replay):
                        if row[0][1] == "__control__")
     video_index = next(i for i, row in enumerate(completed.rows)
                        if "[youtube] fixture0001" in row[0][0])
-    assert clear_index < video_index
+    download_index = next(i for i, row in enumerate(completed.rows)
+                          if any("Downloading " in text and isinstance(tags, list)
+                                 and "simpleline_green" in tags for text, tags in row))
+    assert video_index < clear_index
+    assert clear_index + 1 == download_index
     assert completed.result["errors"] == 0
 
 
@@ -101,12 +139,100 @@ def test_lazy_paging_resumes_discovery_and_clears_after_final_page(replay):
     completed = replay([
         "[youtube:tab] UCfixture page 1: Downloading API JSON",
         "[youtube] fixture0001: Downloading webpage",
+        "[download] Destination: Fixture.f137.mp4",
+        DiscoveryCheckpoint(False),
         "[youtube:tab] UCfixture page 2: Downloading API JSON",
+        DiscoveryCheckpoint(True),
         "[download] Finished downloading playlist: Fixture Channel",
     ])
     assert len(discovery_rows(completed.rows)) == 2
     assert len(clear_rows(completed.rows)) == 2
     assert completed.result["errors"] == 0
+
+
+def test_metadata_skips_sidecars_and_nested_playlist_keep_discovery_visible(replay):
+    completed = replay([
+        "[youtube:tab] @DiscoveryFixture: Downloading webpage",
+        "[youtube] fixture0001: Downloading webpage",
+        "[info] fixture0001: Downloading 1 format(s)",
+        "[download] fixture0001: has already been recorded in the archive",
+        DiscoveryCheckpoint(True),
+        "[download] Destination: Fixture.en.vtt",
+        "[download] Destination: Fixture.info.json",
+        DiscoveryCheckpoint(True),
+        "[download] Fixture.mp4 has already been downloaded",
+        "DLTRACK:::Fixture:::Fixture Channel:::20260101:::1:::1:::fixture0001",
+        DiscoveryCheckpoint(True),
+        "[download] Finished downloading playlist: Fixture Videos",
+        DiscoveryCheckpoint(True),
+        "[youtube:tab] UCfixture page 2: Downloading API JSON",
+    ])
+    discovery = discovery_rows(completed.rows)
+    assert len(discovery) == 2
+    assert discovery[0][0][1][-1] == discovery[1][0][1][-1]
+    assert len(clear_rows(completed.rows)) == 1
+    clear_index = next(i for i, row in enumerate(completed.rows)
+                       if row[0][1] == "__control__")
+    assert completed.rows.index(discovery[-1]) < clear_index
+    assert completed.result["downloaded"] == 0
+    assert completed.result["errors"] == 0
+
+
+def test_discovery_persists_across_channel_videos_and_streams_passes(replay):
+    completed = replay([
+        "[youtube:tab] @DiscoveryFixture: Downloading webpage",
+        "[youtube] fixture0001: Downloading webpage",
+        "[download] fixture0001: has already been recorded in the archive",
+        "[download] Finished downloading playlist: Fixture Videos",
+    ], streams_lines=[
+        DiscoveryCheckpoint(True),
+        "[youtube:tab] @DiscoveryFixture/streams: Downloading webpage",
+        "[download] Finished downloading playlist: Fixture Streams",
+    ])
+    discovery = discovery_rows(completed.rows)
+    assert len(discovery) == 2
+    assert len({row[0][1][-1] for row in discovery}) == 1
+    assert len(clear_rows(completed.rows)) == 1
+    clear_index = next(i for i, row in enumerate(completed.rows)
+                       if row[0][1] == "__control__")
+    streams_finished = next(i for i, row in enumerate(completed.rows)
+                            if "Finished downloading playlist: Fixture Streams" in row[0][0])
+    assert streams_finished < clear_index
+
+
+@pytest.mark.parametrize("event_name", ["pause_event", "cancel_event"])
+def test_stop_during_next_pass_launch_clears_previous_discovery(replay, monkeypatch, event_name):
+    stopped = threading.Event()
+    monkeypatch.setattr(core.time, "sleep", mock.Mock())
+    launches = 0
+
+    def launch(*_args, **_kwargs):
+        nonlocal launches
+        launches += 1
+        if launches == 1:
+            return mock.Mock(returncode=0, pid=None)
+        stopped.set()
+        raise OSError("launch interrupted")
+
+    completed = replay([
+        "[youtube:tab] @DiscoveryFixture: Downloading webpage",
+    ], streams_lines=[], launch_effect=launch, stop={event_name: stopped})
+    assert launches == 2
+    assert len(discovery_rows(completed.rows)) == 1
+    assert len(clear_rows(completed.rows)) == 1
+    assert completed.result["reason"] == ("paused" if event_name == "pause_event" else "cancelled")
+
+
+def test_next_pass_launch_failure_clears_previous_discovery(replay, monkeypatch):
+    monkeypatch.setattr(core.time, "sleep", mock.Mock())
+    completed = replay([
+        "[youtube:tab] @DiscoveryFixture: Downloading webpage",
+    ], streams_lines=[], launch_effect=[
+        mock.Mock(returncode=0, pid=None),
+        OSError("launch failed"), OSError("launch failed"), OSError("launch failed"),
+    ])
+    assert len(discovery_rows(completed.rows)) == 1
+    assert len(clear_rows(completed.rows)) == 1
 
 
 @pytest.mark.parametrize("event_name", [None, "cancel_event", "pause_event", "kill_current"])

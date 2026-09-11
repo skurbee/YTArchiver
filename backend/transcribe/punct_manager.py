@@ -3,8 +3,8 @@ transcribe.punct_manager — PunctuationManager subprocess wrapper.
 
 Owns the persistent `punct_worker.py` subprocess that restores punctuation +
 capitalization on Whisper's raw lowercase output. The subprocess is
-started lazily on first `.punctuate()` call and kept alive between
-calls (model load is the expensive part).
+started lazily on first `.punctuate()` call and kept alive between nearby
+calls. An idle timeout releases its GPU memory when punctuation work stops.
 
 Public surface (re-exported through the transcribe package):
     PunctuationManager
@@ -50,12 +50,14 @@ def get_shared_punct_manager(stream: LogStreamer) -> PunctuationManager:
 
 
 class PunctuationManager:
-    """Persistent punctuation-restoration subprocess. Cheap when idle.
+    """Punctuation-restoration subprocess with automatic idle unloading.
 
     Call `punctuate(text)` with the raw whisper output; returns the
     capitalised / punctuated version. Subprocess boots on first call
-    and stays alive between calls.
+    and stays alive between nearby calls, then unloads until needed again.
     """
+
+    IDLE_UNLOAD_SECONDS = 30.0
 
     def __init__(self, stream: LogStreamer):
         self._stream = stream
@@ -67,6 +69,7 @@ class PunctuationManager:
         # re-acquire the lock it already held via the outer with block).
         self._lock = threading.RLock()
         self._starting = False
+        self._idle_timer: threading.Timer | None = None
         # The worker lives at backend/punct_worker.py and is bundled into the
         # same location, one package level above this module.
         self._worker_script = Path(__file__).resolve().parent.parent / "punct_worker.py"
@@ -185,6 +188,7 @@ class PunctuationManager:
 
     def _stop(self):
         with self._lock:
+            self._cancel_idle_unload_locked()
             if self._proc is not None:
                 proc = self._proc
                 try:
@@ -198,6 +202,33 @@ class PunctuationManager:
                         _log.debug("punctuation kill failed: %s", kill_exc)
                 self._proc = None
 
+    def _cancel_idle_unload_locked(self) -> None:
+        timer = self._idle_timer
+        self._idle_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_idle_unload_locked(self) -> None:
+        self._cancel_idle_unload_locked()
+        if self._proc is None or self._proc.poll() is not None:
+            return
+
+        def unload() -> None:
+            with self._lock:
+                # A cancelled callback may already be waiting for this lock.
+                # It must not stop a worker reused by a newer request.
+                if self._idle_timer is not timer:
+                    return
+                self._stop()
+
+        # Caption ingestion and restoration share this manager and can make
+        # many per-segment calls. Keep it warm across those calls, but release
+        # VRAM when Processing is paused, Auto is off, or the queue drains.
+        timer = threading.Timer(self.IDLE_UNLOAD_SECONDS, unload)
+        timer.daemon = True
+        self._idle_timer = timer
+        timer.start()
+
     def punctuate_checked(self, text: str, timeout_sec: float = 60.0) -> str:
         """Restoration must distinguish a failed worker from unchanged text."""
         with self._lock:
@@ -208,7 +239,13 @@ class PunctuationManager:
 
     def punctuate(self, text: str, timeout_sec: float = 60.0) -> str:
         with self._lock:
-            return self._punctuate_locked(text, timeout_sec)
+            self._cancel_idle_unload_locked()
+            try:
+                return self._punctuate_locked(text, timeout_sec)
+            finally:
+                # Arm only after inference finishes, so a long request or
+                # model startup can never be interrupted by the idle timer.
+                self._schedule_idle_unload_locked()
 
     def _punctuate_locked(self, text: str, timeout_sec: float) -> str:
         """Run text through the punctuation model. Returns original text on failure.

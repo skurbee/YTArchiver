@@ -27,6 +27,12 @@
   let _trafficRefreshInFlight = false;
   let _trafficRefreshPending = false;
   let _trafficRefreshTimer = null;
+  let _trafficExpirationsGeneration = 0;
+  let _trafficExpirationsInFlight = null;
+  let _trafficExpirationsSnapshot = null;
+  let _trafficExpirationGroupMinutes = 1;
+  const _trafficExpirationGroupKey = "ytarch.traffic.expirationGroupMinutes";
+  const _trafficExpirationGroups = [1, 10, 30, 60];
 
   function _syncNativeErrorIndicator() {
     if (!window.YT?.bridge?.isUp?.()) return;
@@ -199,6 +205,7 @@
       } else {
         trafficHourly?.classList.remove("near-limit", "at-limit");
         trafficDaily?.classList.remove("near-limit", "at-limit");
+        _closeTrafficExpirations();
       }
     }
   }
@@ -237,6 +244,156 @@
     }, Math.max(0, Number(delayMs) || 0));
   }
 
+  function _trafficExpirationsOpen() {
+    return !!document.getElementById("popover-traffic-expirations")
+      ?.classList.contains("open");
+  }
+
+  function _closeTrafficExpirations({ restoreFocus = false } = {}) {
+    const pop = document.getElementById("popover-traffic-expirations");
+    const anchor = document.getElementById("gsb-traffic-daily");
+    const wasOpen = _trafficExpirationsOpen();
+    document.getElementById("gsb-traffic-expirations-group")?._ytddClose?.();
+    pop?.classList.remove("open");
+    anchor?.setAttribute("aria-expanded", "false");
+    if (wasOpen) {
+      _trafficExpirationsGeneration++;
+      if (restoreFocus) anchor?.focus({ preventScroll: true });
+    }
+  }
+
+  function _closeOpenPopovers() {
+    document.querySelectorAll(".queue-popover.open").forEach(pop => {
+      pop.querySelectorAll("select").forEach(sel => sel._ytddClose?.());
+      pop.classList.remove("open");
+      document.querySelectorAll(`[aria-controls="${pop.id}"]`).forEach(anchor => {
+        anchor.setAttribute("aria-expanded", "false");
+      });
+    });
+  }
+
+  function _trafficExpirationMessage(message) {
+    _trafficExpirationsSnapshot = null;
+    const body = document.getElementById("gsb-traffic-expirations-body");
+    if (!body) return;
+    const empty = document.createElement("div");
+    empty.className = "queue-empty";
+    empty.textContent = message;
+    body.replaceChildren(empty);
+    document.getElementById("gsb-traffic-expirations-summary").textContent = "";
+  }
+
+  function _groupTrafficExpirations(expirations) {
+    const groups = new Map();
+    for (const item of expirations) {
+      const date = new Date(item.expires_at * 1000);
+      // Subtract elapsed minutes to align with the local clock without
+      // merging the two occurrences of an hour when daylight saving ends.
+      const start = item.expires_at -
+        (date.getMinutes() % _trafficExpirationGroupMinutes) * 60;
+      groups.set(start, (groups.get(start) || 0) + Number(item.units));
+    }
+    return [...groups].sort((a, b) => a[0] - b[0])
+      .map(([expires_at, units]) => ({ expires_at, units }));
+  }
+
+  function _renderTrafficExpirations(state) {
+    _trafficExpirationsSnapshot = state;
+    const body = document.getElementById("gsb-traffic-expirations-body");
+    if (!body) return;
+    if (!state.expirations.length) {
+      _trafficExpirationMessage("No requests are counted in the last 24 hours.");
+      return;
+    }
+    document.getElementById("gsb-traffic-expirations-summary").textContent =
+      `${Number(state.daily_used).toLocaleString()} currently counted`;
+    const today = new Date(state.as_of * 1000);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const table = document.createElement("table");
+    table.className = "gsb-traffic-expirations-table";
+    const head = table.createTHead().insertRow();
+    for (const title of ["Time", "Falls off"]) {
+      const cell = document.createElement("th");
+      cell.scope = "col";
+      cell.textContent = title;
+      head.appendChild(cell);
+    }
+    const rows = table.createTBody();
+    for (const item of _groupTrafficExpirations(state.expirations)) {
+      const date = new Date(item.expires_at * 1000);
+      const day = date.toDateString() === today.toDateString() ? "Today"
+        : date.toDateString() === tomorrow.toDateString() ? "Tomorrow"
+        : date.toLocaleDateString([], { month: "short", day: "numeric" });
+      const time = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      const end = new Date((item.expires_at + (_trafficExpirationGroupMinutes - 1) * 60) * 1000);
+      const endTime = end.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      const row = rows.insertRow();
+      const at = document.createElement("time");
+      at.dateTime = date.toISOString();
+      at.textContent = `${day} · ${time}${_trafficExpirationGroupMinutes > 1 ? `–${endTime}` : ""}`;
+      row.insertCell().appendChild(at);
+      row.insertCell().textContent = `−${Number(item.units).toLocaleString()}`;
+    }
+    const scrollTop = body.scrollTop;
+    body.replaceChildren(table);
+    body.scrollTop = scrollTop;
+  }
+
+  async function _refreshTrafficExpirations() {
+    if (!_trafficExpirationsOpen()) return;
+    const generation = _trafficExpirationsGeneration;
+    if (_trafficExpirationsInFlight === generation) return;
+    _trafficExpirationsInFlight = generation;
+    const body = document.getElementById("gsb-traffic-expirations-body");
+    body?.setAttribute("aria-busy", "true");
+    try {
+      if (!window.YT?.bridge?.isUp?.()) throw new Error("Bridge unavailable");
+      const state = await window.YT.bridge.bridgeCall("youtube_traffic_expirations");
+      // A late response must not reopen a dismissed popup or replace a
+      // newer snapshot after the user closes and reopens it.
+      if (generation !== _trafficExpirationsGeneration || !_trafficExpirationsOpen()) return;
+      if (!state?.ok || !Array.isArray(state.expirations) ||
+          !Number.isFinite(state.as_of) || !Number.isFinite(state.daily_used)) {
+        throw new Error("Drop-off schedule unavailable");
+      }
+      _renderTrafficExpirations(state);
+    } catch (e) {
+      if (generation === _trafficExpirationsGeneration && _trafficExpirationsOpen()) {
+        _trafficExpirationMessage("Could not load drop-offs. Try again in a moment.");
+      }
+    } finally {
+      if (_trafficExpirationsInFlight === generation) _trafficExpirationsInFlight = null;
+      if (generation === _trafficExpirationsGeneration) {
+        body?.setAttribute("aria-busy", "false");
+        if (_trafficExpirationsOpen()) {
+          _positionStatusPopover(
+            document.getElementById("popover-traffic-expirations"),
+            document.getElementById("gsb-traffic-daily"));
+        }
+      }
+    }
+  }
+
+  function _toggleTrafficExpirations(anchor) {
+    const pop = document.getElementById("popover-traffic-expirations");
+    if (!pop || !anchor) return;
+    if (_trafficExpirationsOpen()) {
+      _closeTrafficExpirations();
+      return;
+    }
+    _closeOpenPopovers();
+    _trafficExpirationsGeneration++;
+    document.getElementById("gsb-traffic-expirations-group")?._ytddClose?.();
+    _trafficExpirationMessage("Loading drop-offs…");
+    _positionStatusPopover(pop, anchor);
+    pop._queueAnchor = anchor;
+    pop.classList.add("open");
+    anchor.setAttribute("aria-expanded", "true");
+    document.getElementById("gsb-traffic-expirations-close")?.focus({ preventScroll: true });
+    _refreshTrafficExpirations();
+  }
+
   function _renderErrorsPopover() {
     const body = document.getElementById("gsb-errors-body");
     if (!body) return;
@@ -271,7 +428,7 @@
     }
   }
 
-  function _positionErrorsPopover(pop, anchor) {
+  function _positionStatusPopover(pop, anchor) {
     const br = anchor.getBoundingClientRect();
     pop.style.visibility = "hidden";
     pop.style.display = "flex";
@@ -301,18 +458,13 @@
     const pop = document.getElementById("popover-session-errors");
     if (!pop || !anchor) return;
     const wasOpen = pop.classList.contains("open");
-    document.querySelectorAll(".queue-popover.open")
-      .forEach(p => p.classList.remove("open"));
-    document.getElementById("btn-sync-tasks")
-      ?.setAttribute("aria-expanded", "false");
-    document.getElementById("btn-gpu-tasks")
-      ?.setAttribute("aria-expanded", "false");
+    _closeOpenPopovers();
     if (wasOpen) {
       anchor.setAttribute("aria-expanded", "false");
       return;
     }
     _renderErrorsPopover();
-    _positionErrorsPopover(pop, anchor);
+    _positionStatusPopover(pop, anchor);
     pop.classList.add("open");
     anchor.setAttribute("aria-expanded", "true");
   }
@@ -454,6 +606,49 @@
       e.stopPropagation();
       window.toggleQueuePopover?.("gpu", e.currentTarget);
     });
+    const dailyBtn = document.getElementById("gsb-traffic-daily");
+    const expirationGroup = document.getElementById("gsb-traffic-expirations-group");
+    if (expirationGroup) {
+      try {
+        const saved = Number(localStorage.getItem(_trafficExpirationGroupKey));
+        if (_trafficExpirationGroups.includes(saved)) _trafficExpirationGroupMinutes = saved;
+      } catch (e) { /* Keep the default if local preferences are unavailable. */ }
+      expirationGroup.value = String(_trafficExpirationGroupMinutes);
+      window.enhanceSelect?.(expirationGroup);
+      expirationGroup.addEventListener("change", () => {
+        const minutes = Number(expirationGroup.value);
+        if (!_trafficExpirationGroups.includes(minutes)) return;
+        _trafficExpirationGroupMinutes = minutes;
+        try { localStorage.setItem(_trafficExpirationGroupKey, String(minutes)); }
+        catch (e) { /* The selection still applies for this session. */ }
+        if (_trafficExpirationsSnapshot && _trafficExpirationsOpen()) {
+          document.getElementById("gsb-traffic-expirations-body").scrollTop = 0;
+          _renderTrafficExpirations(_trafficExpirationsSnapshot);
+          _positionStatusPopover(document.getElementById("popover-traffic-expirations"), dailyBtn);
+        }
+      });
+    }
+    dailyBtn?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      _toggleTrafficExpirations(e.currentTarget);
+    });
+    document.getElementById("gsb-traffic-expirations-close")?.addEventListener("click", () => {
+      _closeTrafficExpirations({ restoreFocus: true });
+    });
+    document.addEventListener("click", (e) => {
+      const pop = document.getElementById("popover-traffic-expirations");
+      if (!pop?.contains(e.target) && !dailyBtn?.contains(e.target)) {
+        _closeTrafficExpirations();
+      }
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") _closeTrafficExpirations({ restoreFocus: true });
+    });
+    window.addEventListener("resize", () => {
+      if (_trafficExpirationsOpen()) {
+        _positionStatusPopover(document.getElementById("popover-traffic-expirations"), dailyBtn);
+      }
+    });
     // Log button jumps to the full log. The error segment opens a compact
     // session list; opening it does not acknowledge or erase anything.
     const gotoLog = () => {
@@ -491,7 +686,7 @@
     window.addEventListener("resize", () => {
       const pop = document.getElementById("popover-session-errors");
       if (pop?.classList.contains("open") && errorBtn) {
-        _positionErrorsPopover(pop, errorBtn);
+        _positionStatusPopover(pop, errorBtn);
       }
     });
 
@@ -518,7 +713,10 @@
     // modest fallback poll for ordinary YouTube operations that do not alter
     // queue state, and for rolling expirations while the app is otherwise
     // idle.
-    const trafficTimer = setInterval(_refreshTraffic, 5000);
+    const trafficTimer = setInterval(() => {
+      _refreshTraffic();
+      _refreshTrafficExpirations();
+    }, 5000);
     if (window._trackBootInterval) window._trackBootInterval(trafficTimer);
   }
 

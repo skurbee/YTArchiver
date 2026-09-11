@@ -2069,7 +2069,9 @@
       <span class="gsb-traffic-label">YT Request Limits</span>
       <span class="gsb-traffic-reading" id="gsb-traffic-hourly"></span>
       <span class="gsb-traffic-sep">·</span>
-      <span class="gsb-traffic-reading" id="gsb-traffic-daily"></span>
+      <button type="button" class="gsb-traffic-reading gsb-traffic-button" id="gsb-traffic-daily"
+              aria-haspopup="dialog" aria-controls="popover-traffic-expirations"
+              aria-expanded="false" title="See when usage falls out of the 24-hour window"></button>
     </span>
   </div>
   <!-- Sync Tasks popover (button-anchored) -->
@@ -2134,6 +2136,36 @@
         <span>Manual transcription…</span>
       </button>
     </div>
+  </div>
+
+  <!-- Rolling daily usage, opened from the global bottom status bar. -->
+  <div class="queue-popover gsb-traffic-popover" id="popover-traffic-expirations"
+       role="dialog" aria-labelledby="gsb-traffic-expirations-title"
+       aria-describedby="gsb-traffic-expirations-note">
+    <div class="queue-popover-header">
+      <span class="queue-popover-title" id="gsb-traffic-expirations-title">24-hour drop-offs</span>
+      <div class="spacer"></div>
+      <button type="button" class="queue-btn queue-btn-thin" id="gsb-traffic-expirations-close"
+              aria-label="Close 24-hour drop-offs">Close</button>
+    </div>
+    <p class="gsb-traffic-expirations-summary" id="gsb-traffic-expirations-summary" aria-live="polite"></p>
+    <div class="gsb-traffic-expirations-controls">
+      <label for="gsb-traffic-expirations-group">Group by</label>
+      <select class="ctl-select" id="gsb-traffic-expirations-group">
+        <option value="1">1 minute</option>
+        <option value="10">10 minutes</option>
+        <option value="30">30 minutes</option>
+        <option value="60">1 hour</option>
+      </select>
+    </div>
+    <div class="queue-popover-body gsb-traffic-expirations-body" id="gsb-traffic-expirations-body"
+         tabindex="0" role="region" aria-label="Scheduled request drop-offs">
+      <div class="queue-empty">Loading drop-offs…</div>
+    </div>
+    <p class="gsb-traffic-expirations-note" id="gsb-traffic-expirations-note">
+      Local time. Usage falls off throughout each time block.
+      New requests can change the total.
+    </p>
   </div>
 
   <!-- Session errors popover, opened from the global bottom status bar. -->

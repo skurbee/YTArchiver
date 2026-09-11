@@ -2049,6 +2049,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                             pass
                 except Exception:
                     pass
+                _clear_discovery_row()
                 _finalize_download_archive()
                 return SyncResult(ok=False, reason="cancelled",
                                   downloaded=downloaded, errors=errors)
@@ -2069,6 +2070,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                 # without retry noise; sync_all will requeue this channel
                 # and enter its normal active-pause handshake.
                 if pause_event is not None and pause_event.is_set():
+                    _clear_discovery_row()
                     _finalize_download_archive()
                     return SyncResult(
                         ok=False, reason="paused",
@@ -2080,6 +2082,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                     # Compare the target itself, not its list index: explicit
                     # failed-video retries can legitimately run before it.
                     if _target_url == url:
+                        _clear_discovery_row()
                         _finalize_download_archive()
                         return SyncResult(ok=False, reason="launch failed",
                                           downloaded=0, errors=0)
@@ -2156,7 +2159,8 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
 
             # Channel enumeration can take minutes under the request budget.
             # Keep its current page visible, including when lazy enumeration
-            # resumes between videos, without leaving a scanning row behind.
+            # resumes between videos. Extracting metadata or skipping an
+            # archived video does not hand off to a visible download row.
             if re.match(r"(?:ERROR:\s*)?\[youtube:tab\]", s):
                 current_vid_id = ""
                 current_title = ""
@@ -2168,10 +2172,6 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                     stream.emit([[f" {_discovery_message}\n",
                                   ["simpleline", _discovery_marker]]])
                     _discovery_active = True
-            elif (extract_video_id_from_line(s)
-                  or s.startswith(("[download] Destination:", "DLTRACK:::",
-                                   "[download] Finished downloading playlist:"))):
-                _clear_discovery_row()
 
             _channel_track = _channel_identity.parse_channel_track_line(s)
             if _channel_track is not None:
@@ -2959,6 +2959,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                     if current_vid_id:
                         _vid_to_counter[current_vid_id] = _my_dlrow
                     _dl_kind = f"dlrow_{_my_dlrow}"
+                    _clear_discovery_row()
                     stream.emit([
                         [" ", ["dim", _dl_kind]],
                         ["\u2014 Downloading ", ["simpleline_green", _dl_kind]],
@@ -3354,7 +3355,6 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
             # Default: dim
             stream.emit([[f" {s}\n", "dim"]])
 
-        _clear_discovery_row()
         # Stop the watchdog. If it killed a stalled download, count the
         # in-flight video as failed so the 3-strike give-up advances toward
         # permanently skipping it.
@@ -3380,6 +3380,11 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
             break
         # End of per-URL pass (main /videos or /streams). Loop picks up the
         # next URL if there is one.
+
+    # Keep the same status through nested playlist endings and the gap
+    # between this channel's videos/streams passes. Only a real download
+    # or the channel finishing/stopping should remove it.
+    _clear_discovery_row()
 
     # Stop before the ordinary post-sync/activity path when the main channel
     # page never produced a permanent identity marker or any completed work.

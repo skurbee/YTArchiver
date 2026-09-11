@@ -6,6 +6,24 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v84.8 - Request drop-off schedule and steadier sync status
+
+09.10.26 10:20pm
+
+### Added
+
+- Click the 24-hour YouTube request counter to see when requests leave the rolling daily total and how many expire at each time. The schedule refreshes while open and displays local times.
+- Group the drop-off schedule by minute, 10 minutes, 30 minutes, or hour to make long lists easier to read. The selected grouping stays in place when the popup is reopened.
+
+### Fixed
+
+- Keep "Checking channel for videos" visible through metadata checks, skipped videos, and transitions to past livestreams. It clears when an actual download starts or the channel finishes or stops, preventing repeated flashes during sync.
+- Close the grouping menu cleanly with its popup and keep keyboard navigation and Escape behavior consistent.
+
+### Improved
+
+- Shut down the punctuation worker after 30 seconds without work and restart it when needed. Active punctuation requests remain protected from idle shutdown.
+
 ## v84.7 - Clearer queue controls and optional activity history
 
 09.08.26 7:40pm

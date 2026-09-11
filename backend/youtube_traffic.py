@@ -1089,6 +1089,36 @@ def finish_reservation(reservation_id: str | None) -> dict[str, Any]:
         }
 
 
+def daily_expirations() -> dict[str, Any]:
+    """Snapshot when current daily charges leave the rolling 24-hour window.
+
+    ``expires_at`` identifies the start of a minute; its units expire
+    throughout that minute at their original charge timestamps plus 24 hours.
+    Read the normalized live ledger so reservations and refunds match status.
+    """
+    with _lock:
+        _read_events_locked()
+        now = time.time()
+        _prune_locked(now)
+        daily_used = _window_units_locked(now, DAY_SECONDS, "daily_units")
+        buckets: dict[int, int] = {}
+        for row in _events:
+            units = int(row["daily_units"])
+            if row["ts"] <= now - DAY_SECONDS or units <= 0:
+                continue
+            minute = math.floor((float(row["ts"]) + DAY_SECONDS) / 60) * 60
+            buckets[minute] = buckets.get(minute, 0) + units
+    return {
+        "ok": True,
+        "as_of": now,
+        "daily_used": daily_used,
+        "expirations": [
+            {"expires_at": minute, "units": units}
+            for minute, units in sorted(buckets.items())
+        ],
+    }
+
+
 def status(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return live rolling usage plus projection for Settings/Onboarding."""
     if cfg is None:

@@ -435,6 +435,19 @@ body {
   font-weight: 600;
 }
 .gsb-traffic-sep { opacity: 0.55; }
+.gsb-traffic-button {
+  border: none;
+  border-radius: 3px;
+  padding: 3px 5px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.gsb-traffic-button:hover,
+.gsb-traffic-button[aria-expanded="true"] { background: var(--c-hover); }
+.gsb-traffic-button:focus-visible { outline: 1px solid var(--c-accent); outline-offset: -1px; }
 .gsb-traffic-reading.near-limit { color: var(--c-log-sum); }
 .gsb-traffic-reading.at-limit { color: var(--c-log-red); }
 .t-error_raw { display: none !important; }

@@ -6,6 +6,14 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v85.1 - Reliable validation for the channel-resume release
+
+09.12.26 2:49pm
+
+### Maintenance
+
+- Make the Manual sorting queue test wait for an explicit response signal instead of assuming UI actions finish within a short timer. This prevents false failures on slower test runners while retaining the request-ordering and concurrency checks.
+
 ## v85.0 - Faster resumes for large channel downloads
 
 09.12.26 2:25pm

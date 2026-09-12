@@ -1591,24 +1591,31 @@ test.describe("catalog-backed screen loading", () => {
       window.__manualReadActive = 0;
       window.__manualReadMax = 0;
       window.__manualSorts = [];
+      window.__releaseManualFirstRead = null;
       window.__setBridgeHandler("list_manual_videos", (sort) => {
         window.__manualSorts.push(sort);
         window.__manualReadActive += 1;
         window.__manualReadMax = Math.max(
           window.__manualReadMax, window.__manualReadActive);
-        return new Promise((resolve) => setTimeout(() => {
-          window.__manualReadActive -= 1;
-          resolve({
-            rows: [{
-              title: `${sort} manual result`,
-              filepath: `C:\\FixtureArchive\\${sort}.mp4`,
-              video_id: `manual-${sort}`,
-            }],
-            folder: "C:\\FixtureArchive",
-            total: 1,
-            has_more: false,
-          });
-        }, sort === "newest" ? 180 : 25));
+        return new Promise((resolve) => {
+          const finish = () => {
+            window.__manualReadActive -= 1;
+            resolve({
+              rows: [{
+                title: `${sort} manual result`,
+                filepath: `C:\\FixtureArchive\\${sort}.mp4`,
+                video_id: `manual-${sort}`,
+              }],
+              folder: "C:\\FixtureArchive",
+              total: 1,
+              has_more: false,
+            });
+          };
+          // Keep the first read running until both UI changes are queued,
+          // regardless of how long browser automation takes on the runner.
+          if (sort === "newest") window.__releaseManualFirstRead = finish;
+          else finish();
+        });
       });
     });
 
@@ -1617,8 +1624,12 @@ test.describe("catalog-backed screen loading", () => {
     await expect.poll(() => page.evaluate(() =>
       window.__bridgeCallsFor("list_manual_videos").length)).toBe(1);
     await page.locator("#manual-sort").selectOption("oldest");
-    await page.waitForTimeout(15);
     await page.locator("#manual-sort").selectOption("largest");
+    expect(await page.evaluate(() => ({
+      active: window.__manualReadActive,
+      sorts: window.__manualSorts,
+    }))).toEqual({ active: 1, sorts: ["newest"] });
+    await page.evaluate(() => window.__releaseManualFirstRead());
 
     await expect(page.locator("#manual-grid .video-card-title"))
       .toHaveText("largest manual result");

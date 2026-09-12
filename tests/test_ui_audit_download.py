@@ -34,6 +34,7 @@ from backend.process_runner import (  # noqa: E402
     supervise_streaming_process,
 )
 from backend.queues import QueueState  # noqa: E402
+from backend.services.channel_leases import ChannelLeaseManager  # noqa: E402
 from backend.sync.sync_all import _SyncTaskCancel  # noqa: E402
 from backend.transcribe import core, transcribe_vtt  # noqa: E402
 from backend.transcribe.punct_manager import PunctuationManager  # noqa: E402
@@ -315,7 +316,7 @@ def test_sync_cancel_and_defer_advance_only_after_worker_acknowledges(tmp_path, 
         "_resolve_sync_task_target": lambda ch: (cfg, ch, frozenset({"isolated"})),
         "_channel_folder_path": lambda *a: "",
         "_check_batch_cooldown": lambda ch: (True, ""),
-        "channel_leases": SimpleNamespace(try_acquire=lambda *a: SimpleNamespace(ok=True, lease=SimpleNamespace(release=lambda: None))),
+        "channel_leases": ChannelLeaseManager(),
         "channel_identity": SimpleNamespace(preflight_channel_identity=lambda *a, **k: {"ok": True},
                                             has_stable_identity=lambda ch: True,
                                             operational_channel_url=lambda ch: ch["url"]),

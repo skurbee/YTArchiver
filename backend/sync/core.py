@@ -81,6 +81,10 @@ _log = get_logger(__name__)
 
 # Focused helpers live in sibling modules and are re-imported here so internal
 # call sites and the established backend.sync package API remain stable.
+from .discovery_resume import (
+    finish_discovery_resume,
+    prepare_discovery_resume,
+)
 from .display_push import (
     clear_sync_progress,
     write_sync_progress,
@@ -1987,6 +1991,13 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     # wait). Empty list means no pass ran (pure cancel before launch).
     _pass_returncodes: list[int | None] = []
 
+    # A saved discovery list is followed by an ordinary incremental check of
+    # the same target, so uploads published since discovery are still found.
+    # Inserting that check only after a plan is prepared keeps ordinary syncs
+    # on their existing path.
+    _targets_to_run = [(target, False) for target in _urls_to_run]
+    _discovery_resume_plans = []
+
     # Run yt-dlp once per target URL (main channel + optional /streams pass).
     # v69.3 fix: initialize `proc` BEFORE the loop so the post-loop
     # `_exit_for_caller = ... proc.returncode if proc else 0` below
@@ -1997,7 +2008,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     # with a value" when resuming a paused sync.
     proc = None
     _disk_low_stop = False
-    for _pass_idx, _target_url in enumerate(_urls_to_run):
+    for _pass_idx, (_target_url, _resume_refresh) in enumerate(_targets_to_run):
         if cancel_event is not None and cancel_event.is_set():
             break
         if _disk_low_stop:
@@ -2011,6 +2022,8 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
         # that the user never asked for. Reported: 2x "Paused
         # stopping current download" + 1x "Sync paused at H:MMpm".
         if pause_event is not None and pause_event.is_set():
+            break
+        if kill_current is not None and kill_current.is_set():
             break
         _quickcheck_target_id = _quickcheck_url_ids.get(_target_url)
         if (_quickcheck_target_id
@@ -2029,7 +2042,48 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                 [" [Streams] ", "dim"],
                 [f"Checking {_target_url} for past livestreams...\n", "dim"],
             ])
-        cmd_this = cmd + [_target_url]
+        _resume_plan = None
+        _resume_end_seen = False
+        if not _resume_refresh:
+            try:
+                _resume_plan = prepare_discovery_resume(
+                    channel, _target_url, str(ch_dir), yt, stream,
+                    cancel_event=cancel_event, pause_event=pause_event,
+                    kill_current=kill_current)
+            except Exception as exc:
+                # A discovery cache is optional. Failure to prepare it must
+                # not prevent the existing channel traversal from running.
+                _log.debug("Saved channel discovery unavailable: %s", exc)
+            _preparation_stop_reason = (
+                "cancelled" if cancel_event is not None and cancel_event.is_set()
+                else "paused" if pause_event is not None and pause_event.is_set()
+                else "")
+            if _preparation_stop_reason:
+                # Preserve the launch loop's explicit pause/cancel result and
+                # durable archive cleanup when discovery catches the stop first.
+                _clear_discovery_row()
+                _finalize_download_archive()
+                return SyncResult(ok=False, reason=_preparation_stop_reason,
+                                  downloaded=downloaded, errors=errors)
+            if kill_current is not None and kill_current.is_set():
+                break
+        if _resume_plan is not None:
+            _discovery_resume_plans.append(_resume_plan)
+            _targets_to_run.insert(_pass_idx + 1, (_target_url, True))
+            # External yt-dlp config must not truncate a saved list using
+            # playlist limits or stop-after-errors settings. Keep the same
+            # media, filtering and commit options as the ordinary pipeline.
+            cmd_this = cmd[:1] + ["--ignore-config"] + cmd[1:] + [
+                "--no-break-on-existing", "--no-clean-info-json",
+                "--load-info-json", _resume_plan.path,
+                "--print", _resume_plan.print_template,
+            ]
+        elif _resume_refresh:
+            cmd_this = cmd[:1] + ["--ignore-config"] + cmd[1:] + [
+                "--break-on-existing", _target_url,
+            ]
+        else:
+            cmd_this = cmd + [_target_url]
 
         # Retry loop for transient launch failures
         proc = None
@@ -2098,6 +2152,8 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                 time.sleep(2)
         if proc is None:
             _pass_returncodes.append(None)
+            if _resume_plan is not None:
+                break
             continue
 
         current_vid_id = ""
@@ -2160,6 +2216,9 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
 
             s = line.rstrip()
             if not s:
+                continue
+            if _resume_plan is not None and s == _resume_plan.end_marker:
+                _resume_end_seen = True
                 continue
 
             # Channel enumeration can take minutes under the request budget.
@@ -3376,8 +3435,21 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
             swallow("ytdlp proc finish", e)
         # Retain each target's outcome. A killed process or incomplete stdout
         # drain is not a completed walk, even if another target succeeds.
-        _pass_returncodes.append(
-            proc.returncode if _watchdog.output_complete and not _wd_stalled.get("hit") else -1)
+        _target_returncode = (
+            proc.returncode if _watchdog.output_complete
+            and not _wd_stalled.get("hit") else -1)
+        if _resume_plan is not None:
+            # A zero exit alone cannot prove every saved entry was visited.
+            # The playlist-end marker is absent when traversal stops early;
+            # never let a later fresh check hide that unfinished backlog.
+            if (not _resume_end_seen
+                    or _target_returncode not in (0, 1)):
+                _target_returncode = -1
+            _pass_returncodes.append(_target_returncode)
+            if _target_returncode not in (0, 1):
+                break
+        else:
+            _pass_returncodes.append(_target_returncode)
         if (_target_url == url and _channel_page_unavailable
                 and not _main_channel_tracks):
             # A failed main channel cannot make later gap or /streams probes
@@ -3766,6 +3838,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     # subsequent sync on that channel uses `--break-on-existing` and
     # bails fast. Without this write, new channels never graduate to
     # the fast-sync path.
+    _sync_config_committed = False
     if config_is_writable():
         # normalize the URL once here so the channel-match
         # loop below can't silently fail on a trailing-slash /
@@ -3854,6 +3927,8 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                 # Last Full Sync timestamp lives at the end of sync_all.
                 if not _dirty:
                     raise ConfigUnchanged()
+            _sync_config_committed = bool(
+                _matched_any and _walked_meaningfully and _walk_completed)
             if not _matched_any:
                 # surface the mismatch as a dim warning.
                 # Before, a URL-normalization mismatch silently no-
@@ -3999,6 +4074,13 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     _exit_for_caller = next(iter(_crashed if _process_failed else _good_rcs), None)
     if _exit_for_caller is None:
         _exit_for_caller = next(iter(_crashed), proc.returncode if proc else 0)
+    if _sync_config_committed and _discovery_resume_plans:
+        try:
+            finish_discovery_resume(_discovery_resume_plans)
+        except Exception as exc:
+            # Retaining an optimization cache is harmless once the channel's
+            # completed initialization has been committed successfully.
+            _log.debug("Saved channel discovery cleanup deferred: %s", exc)
     return SyncResult(ok=_ok, downloaded=downloaded, errors=errors,
                       incomplete=_process_failed,
                       reason="channel_check_incomplete" if _process_failed else "",

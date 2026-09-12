@@ -54,14 +54,16 @@ class DownloadWatchdog:
 
 def popen_ytdlp_process(cmd: list[str], *, startupinfo: Any = None,
                         cancel_event=None, pause_event=None, stream=None,
+                        text: bool = False,
                         ) -> subprocess.Popen:
-    """Start one yt-dlp process in binary stdout mode and register it."""
+    """Start a registered process, optionally decoding its output for probes."""
     permission = youtube_traffic.acquire(
         "channel_sync", cancel_event=cancel_event,
         pause_event=pause_event, stream=stream)
     if not permission.get("ok"):
         raise OSError(
             permission.get("error") or "YouTube traffic governor cancelled")
+    output_options = {"text": True, "encoding": "utf-8", "errors": "replace"} if text else {}
     proc = popen_ytdlp(
         cmd,
         stdin=subprocess.DEVNULL,
@@ -72,6 +74,7 @@ def popen_ytdlp_process(cmd: list[str], *, startupinfo: Any = None,
         env=_utils.utf8_subprocess_env(),
         request_cancel_event=cancel_event,
         request_pause_event=pause_event,
+        **output_options,
     )
     return proc
 

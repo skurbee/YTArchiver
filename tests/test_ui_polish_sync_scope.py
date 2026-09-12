@@ -20,6 +20,7 @@ Path(_PROFILE.name, "YTArchiver").mkdir()
 
 from backend import queues  # noqa: E402
 from backend.api_mixins.sync_mixin import SyncMixin  # noqa: E402
+from backend.services.channel_leases import ChannelLeaseManager  # noqa: E402
 from backend.services.queue_repository import QueueRepository  # noqa: E402
 
 sync_all = importlib.import_module("backend.sync.sync_all")
@@ -47,8 +48,7 @@ def fixture(tmp_path, monkeypatch):
         "_resolve_sync_task_target": lambda ch: (cfg, ch, frozenset({"isolated"})),
         "_channel_folder_path": lambda *a: "",
         "_check_batch_cooldown": lambda ch: (True, ""),
-        "channel_leases": SimpleNamespace(try_acquire=lambda *a: SimpleNamespace(
-            ok=True, lease=SimpleNamespace(release=lambda: None))),
+        "channel_leases": ChannelLeaseManager(),
         "channel_identity": SimpleNamespace(
             preflight_channel_identity=lambda *a, **k: {"ok": True},
             has_stable_identity=lambda ch: True,

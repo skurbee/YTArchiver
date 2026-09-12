@@ -6,6 +6,25 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v85.0 - Faster resumes for large channel downloads
+
+09.12.26 2:25pm
+
+### Improved
+
+- Large, unfinished entire-channel syncs can save a complete video list once and reuse it after later restarts, reducing repeated channel discovery requests. Fresh syncs still begin downloading as videos are discovered.
+- Resuming a saved list uses the current download history and duration filters, then checks for newer uploads after the backlog finishes. Existing request limits and waits still apply.
+
+### Fixed
+
+- Interrupted or unusable discovery lists cannot mark a channel's initial sync complete. Saved broadcast entries refresh their live status before downloading, and changed duration filters can reconsider previously excluded videos.
+- Preserve the normal pause and cancellation results when a stop arrives during discovery preparation, including saving completed downloads to history.
+- Updated sync test fixtures to use real isolated channel locks, correcting the automated-check failure from the previous release.
+
+### Maintenance
+
+- Updated GitHub Actions to supported Node.js 24 runtimes.
+
 ## v84.9 - More reliable sync recovery and clearer controls
 
 09.12.26 11:59am

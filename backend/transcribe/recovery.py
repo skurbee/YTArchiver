@@ -104,11 +104,15 @@ class ProcessingRecord:
     compress_after: dict[str, Any] = field(default_factory=dict)
     requested_model: str = ""
     actual_model: str = ""
+    traffic_sync_pass_id: str = ""
+    traffic_override: bool = False
     recovery: RecoveryState = field(default_factory=RecoveryState)
 
     @classmethod
     def decode(cls, source: Mapping[str, Any], *, runtime: bool = False,
                interrupted: bool = False, default_model: str = "") -> "ProcessingRecord":
+        pass_id = source.get("traffic_sync_pass_id")
+        pass_id = pass_id.strip() if isinstance(pass_id, str) else ""
         return cls(
             task_id=str(source.get("task_id") or ""), path=str(source.get("path") or ""),
             title=str(source.get("title") or ""), channel=str(source.get("channel") or ""),
@@ -122,6 +126,11 @@ class ProcessingRecord:
             compress_after=dict(source.get("compress_after") or {}),
             requested_model=str(source.get("requested_model") or default_model),
             actual_model=str(source.get("actual_model") or ""),
+            traffic_sync_pass_id=pass_id,
+            traffic_override=(source.get("traffic_override") is True
+                              and bool(pass_id)
+                              and (source.get("kind") or "transcribe") == "transcribe"
+                              and not source.get("retranscribe")),
             recovery=RecoveryState.decode(source, runtime=runtime, interrupted=interrupted),
         )
 

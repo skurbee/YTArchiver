@@ -259,7 +259,7 @@ test("Health keeps every status and maintenance control in one intended section"
     await expect(details).not.toHaveAttribute("open", "");
   }
   await expect(page.locator("#health-library-metadata"))
-    .not.toHaveAttribute("open", "");
+    .toHaveAttribute("open", "");
   await expect(page.locator("#health-library-index")).not.toHaveAttribute("hidden", "");
 
   const userFacingCopy = await page.evaluate(() => {

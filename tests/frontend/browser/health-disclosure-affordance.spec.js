@@ -129,15 +129,17 @@ test("Health disclosure headers work with both Enter and Space", async ({ page }
   const summary = page.locator("#health-library-metadata > summary");
   const details = page.locator("#health-library-metadata");
 
+  await expect(details).toHaveAttribute("open", "");
+  expect(await accessibleExpanded(cdpSession, "Channel information")).toBe(true);
   await summary.focus();
   await expect(summary).toBeFocused();
   await summary.press("Enter");
-  await expect(details).toHaveAttribute("open", "");
-  expect(await accessibleExpanded(cdpSession, "Channel information")).toBe(true);
-
-  await summary.press("Space");
   await expect(details).not.toHaveAttribute("open", "");
   expect(await accessibleExpanded(cdpSession, "Channel information")).toBe(false);
+
+  await summary.press("Space");
+  await expect(details).toHaveAttribute("open", "");
+  expect(await accessibleExpanded(cdpSession, "Channel information")).toBe(true);
   await expect(summary).toBeFocused();
 });
 

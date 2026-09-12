@@ -84,6 +84,7 @@ _scope = threading.local()
 _active_waits: dict[int, dict[str, Any]] = {}
 _wait_listeners: list[Any] = []
 _budget_override_active = False
+_sync_pass_id = ""
 _override_wakeup = threading.Event()
 _circuit_memory: dict[str, Any] | None = None
 _circuit_memory_path = ""
@@ -114,7 +115,7 @@ def wait_status() -> dict[str, Any]:
         waits = list(_active_waits.values())
         override = bool(_budget_override_active)
     if not waits:
-        return {"active": False, "override_active": override}
+        return {"active": False, "override_active": override, "waits": []}
     # The latest release time is the one that governs the whole process when
     # more than one YouTube worker reaches a rolling window simultaneously.
     current = max(
@@ -123,6 +124,7 @@ def wait_status() -> dict[str, Any]:
         "active": True,
         "override_active": override,
         **current,
+        "waits": waits,
     }
 
 
@@ -142,7 +144,7 @@ def _set_wait_state(state: dict[str, Any] | None) -> None:
         _notify_wait_listeners(snapshot)
 
 
-def override_budget_limits() -> dict[str, Any]:
+def override_budget_limits(*, pass_id: str | None = None) -> dict[str, Any]:
     """Ignore configured rolling ceilings until the current sync ends.
 
     The emergency YouTube rate-limit circuit and launch spacing remain active.
@@ -150,6 +152,8 @@ def override_budget_limits() -> dict[str, Any]:
     global _budget_override_active
     before = wait_status()
     with _lock:
+        if not _sync_pass_id or (pass_id is not None and _sync_pass_id != pass_id):
+            return {"ok": False, "error": "The sync pass has already finished."}
         _budget_override_active = True
         _override_wakeup.set()
         snapshot = wait_status()
@@ -171,6 +175,70 @@ def clear_budget_override() -> None:
 def budget_override_active() -> bool:
     with _lock:
         return bool(_budget_override_active)
+
+
+def begin_sync_pass() -> str:
+    """Give downloaded follow-up work a stable identity for this pass."""
+    global _sync_pass_id, _budget_override_active
+    with _lock:
+        changed = _budget_override_active
+        _budget_override_active = False
+        _override_wakeup.clear()
+        _sync_pass_id = uuid.uuid4().hex
+        pass_id = _sync_pass_id
+        snapshot = wait_status()
+    if changed:
+        _notify_wait_listeners(snapshot)
+    return pass_id
+
+
+def current_sync_pass_id() -> str:
+    with _lock:
+        return _sync_pass_id
+
+
+def finish_sync_pass(pass_id: str) -> None:
+    global _sync_pass_id, _budget_override_active
+    with _lock:
+        if _sync_pass_id != pass_id:
+            return
+        _sync_pass_id = ""
+        changed = _budget_override_active
+        _budget_override_active = False
+        _override_wakeup.clear()
+        snapshot = wait_status()
+    if changed:
+        _notify_wait_listeners(snapshot)
+
+
+def current_request_scope() -> dict[str, Any]:
+    """Capture parent-owned context for a child request broker session."""
+    return dict(getattr(_scope, "request_context", {}) or {})
+
+
+@contextlib.contextmanager
+def request_scope(queue: str, *, override_allowed=None, task_id: str = "",
+                  sync_pass_id: str | None = None):
+    previous = current_request_scope()
+    _scope.request_context = {
+        "queue": queue if queue in {"sync", "gpu", "background"} else "background",
+        "override_allowed": override_allowed,
+        "task_id": str(task_id or ""),
+        "sync_pass_id": (current_sync_pass_id() if sync_pass_id is None and queue == "sync"
+                         else str(sync_pass_id or "")),
+    }
+    try:
+        yield
+    finally:
+        _scope.request_context = previous
+
+
+def _request_override_allowed(context: dict[str, Any]) -> bool:
+    allowed = context.get("override_allowed")
+    try:
+        return bool(allowed()) if callable(allowed) else allowed is True
+    except Exception:
+        return False
 
 
 def _load_circuit_locked(now: float | None = None) -> dict[str, Any]:
@@ -752,12 +820,24 @@ def _current_reservation() -> str:
 
 
 def acquire(kind: str, *, units: int = 1, cancel_event=None,
-            pause_event=None, stream=None) -> dict[str, Any]:
-    """Wait for and consume permission for one YouTube operation."""
+            pause_event=None, stream=None, wait_for_budget: bool = True,
+            wait_for_slot: bool = True) -> dict[str, Any]:
+    """Consume permission for one YouTube operation, waiting by default.
+
+    ``wait_for_slot=False`` defers without charging when any budget or spacing
+    wait is needed. ``wait_for_budget=False`` only skips rolling-budget waits.
+    Neither option bypasses a limit or the emergency rate-limit circuit.
+    """
     global _last_launch_ts, _next_gap_seconds
     global _last_request_ts, _next_request_gap_seconds
     requested = max(1, int(units or 1))
     reservation_id = _current_reservation()
+    context = current_request_scope()
+    queue = context.get("queue") or (
+        "gpu" if kind == "caption_fetch" else
+        "sync" if kind in {"channel_sync", "channel_discovery", "channel_quick_check",
+                           "channel_total_probe", "redownload_catalog", "redownload_video"}
+        else "background")
     announced = False
     try:
         while True:
@@ -767,7 +847,11 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
                 return {"ok": False, "paused": True}
             now = time.time()
             cfg = load_config()
-            override = budget_override_active()
+            with _lock:
+                matching_pass = bool(queue == "sync" and _sync_pass_id
+                    and context.get("sync_pass_id") == _sync_pass_id)
+                pass_override = _budget_override_active and matching_pass
+            override = pass_override or _request_override_allowed(context)
             circuit = circuit_state(now)
             if not circuit["state_known"]:
                 return {"ok": False, "circuit_error": True, "error": circuit["error"]}
@@ -877,8 +961,19 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
                         "override": override,
                     }
 
+            if not wait_for_slot:
+                return {"ok": False, "deferred": True,
+                        "reason": wait_reason, "wait_seconds": wait_seconds}
+
             if wait_reason in ("hourly_limit", "daily_limit"):
+                if not wait_for_budget:
+                    return {"ok": False, "deferred": True,
+                            "reason": wait_reason, "wait_seconds": wait_seconds}
                 _set_wait_state({
+                    "active": True,
+                    "queue": queue,
+                    "kind": kind,
+                    "task_id": str(context.get("task_id") or ""),
                     "reason": wait_reason,
                     "until": now + wait_seconds,
                     "hourly_used": int(check["hourly_used"]),
@@ -916,7 +1011,7 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
                             ],
                             [
                                 f"Waiting for the next rolling slot at "
-                                f"{resume}; sync will continue "
+                                f"{resume}; {'Processing' if queue == 'gpu' else 'sync' if queue == 'sync' else 'background work'} will continue "
                                 "automatically.\n",
                                 ["dim", "traffic_wait"],
                             ],
@@ -933,7 +1028,7 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
                             ],
                             [
                                 f"Waiting for the next rolling slot at "
-                                f"{resume}; sync will continue "
+                                f"{resume}; {'Processing' if queue == 'gpu' else 'sync' if queue == 'sync' else 'background work'} will continue "
                                 "automatically.\n",
                                 ["dim", "traffic_wait"],
                             ],
@@ -949,7 +1044,11 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
             # sits in "pause pending" for an hour-long budget wait.
             if pause_event is not None:
                 sleep_for = min(sleep_for, 0.25)
-            if not override and _override_wakeup.wait(timeout=0):
+            if callable(context.get("override_allowed")):
+                # A durable job grant can change while this task or its child
+                # is already waiting. Recheck promptly without a global bypass.
+                sleep_for = min(sleep_for, 0.25)
+            if not override and matching_pass and _override_wakeup.wait(timeout=0):
                 continue
             if cancel_event is not None:
                 if cancel_event.wait(timeout=sleep_for):
@@ -957,7 +1056,7 @@ def acquire(kind: str, *, units: int = 1, cancel_event=None,
             elif pause_event is not None:
                 if pause_event.wait(timeout=sleep_for):
                     return {"ok": False, "paused": True}
-            elif not override:
+            elif not override and matching_pass:
                 _override_wakeup.wait(timeout=sleep_for)
             else:
                 time.sleep(sleep_for)
@@ -1089,6 +1188,32 @@ def finish_reservation(reservation_id: str | None) -> dict[str, Any]:
         }
 
 
+def _expiration_snapshot(seconds: int, units_field: str,
+                         used_field: str) -> dict[str, Any]:
+    """Bucket the normalized live ledger using the same window as status."""
+    with _lock:
+        _read_events_locked()
+        now = time.time()
+        _prune_locked(now)
+        used = _window_units_locked(now, seconds, units_field)
+        buckets: dict[int, int] = {}
+        for row in _events:
+            units = int(row[units_field])
+            if row["ts"] <= now - seconds or units <= 0:
+                continue
+            minute = math.floor((float(row["ts"]) + seconds) / 60) * 60
+            buckets[minute] = buckets.get(minute, 0) + units
+    return {
+        "ok": True,
+        "as_of": now,
+        used_field: used,
+        "expirations": [
+            {"expires_at": minute, "units": units}
+            for minute, units in sorted(buckets.items())
+        ],
+    }
+
+
 def daily_expirations() -> dict[str, Any]:
     """Snapshot when current daily charges leave the rolling 24-hour window.
 
@@ -1096,27 +1221,17 @@ def daily_expirations() -> dict[str, Any]:
     throughout that minute at their original charge timestamps plus 24 hours.
     Read the normalized live ledger so reservations and refunds match status.
     """
-    with _lock:
-        _read_events_locked()
-        now = time.time()
-        _prune_locked(now)
-        daily_used = _window_units_locked(now, DAY_SECONDS, "daily_units")
-        buckets: dict[int, int] = {}
-        for row in _events:
-            units = int(row["daily_units"])
-            if row["ts"] <= now - DAY_SECONDS or units <= 0:
-                continue
-            minute = math.floor((float(row["ts"]) + DAY_SECONDS) / 60) * 60
-            buckets[minute] = buckets.get(minute, 0) + units
-    return {
-        "ok": True,
-        "as_of": now,
-        "daily_used": daily_used,
-        "expirations": [
-            {"expires_at": minute, "units": units}
-            for minute, units in sorted(buckets.items())
-        ],
-    }
+    return _expiration_snapshot(DAY_SECONDS, "daily_units", "daily_used")
+
+
+def hourly_expirations() -> dict[str, Any]:
+    """Snapshot when current hourly charges leave the rolling one-hour window.
+
+    ``expires_at`` identifies the start of a minute; its units expire
+    throughout that minute at their original charge timestamps plus one hour.
+    Read the normalized live ledger so reservations and refunds match status.
+    """
+    return _expiration_snapshot(HOUR_SECONDS, "hourly_units", "hourly_used")
 
 
 def status(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1161,7 +1276,7 @@ def _reset_for_tests(path: Path | None = None,
     """Reset process-local state; intentionally private test helper."""
     global _loaded, _events, _last_launch_ts, _next_gap_seconds
     global _last_request_ts, _next_request_gap_seconds
-    global TRAFFIC_FILE, CIRCUIT_FILE, _budget_override_active
+    global TRAFFIC_FILE, CIRCUIT_FILE, _budget_override_active, _sync_pass_id
     global _circuit_memory, _circuit_memory_path, _circuit_dirty, _circuit_error
     with _lock:
         if path is not None:
@@ -1182,5 +1297,7 @@ def _reset_for_tests(path: Path | None = None,
         _active_waits.clear()
         _wait_listeners.clear()
         _budget_override_active = False
+        _sync_pass_id = ""
         _override_wakeup.clear()
         _scope.reservation_id = ""
+        _scope.request_context = {}

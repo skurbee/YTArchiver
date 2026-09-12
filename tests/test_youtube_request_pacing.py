@@ -30,6 +30,7 @@ def clock(tmp_path, monkeypatch):
     monkeypatch.setattr(traffic, "APP_DATA_DIR", tmp_path)
     monkeypatch.setattr(traffic, "load_config", lambda: config)
     monkeypatch.setattr(traffic.time, "time", lambda: state.now)
+    monkeypatch.setattr(traffic.time, "sleep", wait)
     monkeypatch.setattr(traffic.random, "uniform", lambda low, high: low)
     monkeypatch.setattr(traffic, "_override_wakeup", SimpleNamespace(
         wait=wait, clear=lambda: None, set=lambda: None))
@@ -157,14 +158,15 @@ def test_http_requests_respect_circuit_even_with_capacity(clock):
     assert traffic.status()["daily_used"] == 0
 
 
-def test_budget_override_preserves_both_clocks(clock, monkeypatch):
-    monkeypatch.setattr(traffic, "budget_override_active", lambda: True)
-    monkeypatch.setattr(traffic.time, "sleep", clock.wait)
+def test_budget_override_preserves_both_clocks(clock):
     clock.config["youtube_traffic_custom_daily"] = 1
-    assert traffic.acquire("channel_sync")["ok"]
-    assert traffic.acquire("youtube_http")["ok"]
-    assert traffic.acquire("youtube_caption")["ok"]
-    assert clock.now == 100_001
-    assert traffic.acquire("video_metadata")["ok"]
+    pass_id = traffic.begin_sync_pass()
+    assert traffic.override_budget_limits(pass_id=pass_id)["ok"]
+    with traffic.request_scope("sync", sync_pass_id=pass_id):
+        assert traffic.acquire("channel_sync")["ok"]
+        assert traffic.acquire("youtube_http")["ok"]
+        assert traffic.acquire("youtube_caption")["ok"]
+        assert clock.now == 100_001
+        assert traffic.acquire("video_metadata")["ok"]
     assert clock.now == 100_010
     assert traffic.status()["daily_used"] == 4

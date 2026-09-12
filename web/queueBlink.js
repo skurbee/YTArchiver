@@ -45,7 +45,7 @@
             pausedAtMs: 0, trafficWaiting: false, trafficWait: null,
             sessionLimited: false, resumePending: false },
     gpu: { running: false, paused: false, pausedActive: false, count: 0,
-           pausedAtMs: 0, resumePending: false },
+           pausedAtMs: 0, trafficWaiting: false, trafficWait: null, resumePending: false },
   };
   // Minimum visible duration of the pause-pending blink (ms). Without
   // this, a fast pause-handshake (worker hits its pause-wait within
@@ -235,7 +235,7 @@
       (s.paused && s.count > 0) || (g.paused && g.count > 0);
     const enable = !s.resumePending && !g.resumePending && (
       anyAlive || pausedWithItems || s.count > 0 || g.count > 0
-      || _isYouTubeLimitHold(s));
+      || _isYouTubeLimitHold(s) || _isYouTubeLimitHold(g));
     const btn = document.getElementById("btn-pause");
     if (btn) {
       btn.disabled = !enable;
@@ -250,7 +250,8 @@
     // Pause-pending feedback has its own timer below.
     const syncActive = _blinkState.sync.running &&
       !_blinkState.sync.paused && !_isYouTubeLimitHold(_blinkState.sync);
-    const gpuActive = _blinkState.gpu.running && !_blinkState.gpu.paused;
+    const gpuActive = _blinkState.gpu.running && !_blinkState.gpu.paused
+      && !_isYouTubeLimitHold(_blinkState.gpu);
     const anyActive = syncActive || gpuActive;
     if (anyActive && !_blinkState.timer) {
       _blinkState.clockOn = false;
@@ -375,7 +376,9 @@
     if (gpuBtn) {
       const g = _blinkState.gpu;
       let state = "idle";
-      if (_isPipelinePending(g)) {
+      if (_isYouTubeLimitHold(g) && (g.running || g.count > 0)) {
+        state = "paused";
+      } else if (_isPipelinePending(g)) {
         state = _blinkState.pendingClockOn ? "paused" : "on";
       } else if (g.running && g.paused) {
         state = "paused";
@@ -404,7 +407,9 @@
       const anyPaused = syncActive || gpuActive ||
                          syncPausedWithItems || gpuPausedWithItems;
       const idleQueued = !s.running && !g.running && (s.count > 0 || g.count > 0);
-      const trafficWaiting = !!s.trafficWaiting;
+      const trafficQueue = s.trafficWaiting && !s.paused && !s.pausedActive ? "Sync"
+        : g.trafficWaiting && !g.paused && !g.pausedActive ? "Processing" : "";
+      const trafficWaiting = !!trafficQueue;
       const sessionLimited = !!s.sessionLimited;
       const limitWaiting = trafficWaiting || sessionLimited;
       // Pause-pending: the user clicked Pause but the worker is still
@@ -418,20 +423,20 @@
       let visState = limitWaiting
         ? "traffic-wait"
         : (idleQueued ? "start" : (anyPaused ? "paused" : "running"));
-      if (anyPending) visState = "pending";
+      if (anyPending && !trafficWaiting) visState = "pending";
       if (resuming) visState = "resuming";
       pauseBtn.dataset.pauseState = visState;
-      pauseBtn.classList.toggle("pause-pending", anyPending || resuming);
+      pauseBtn.classList.toggle("pause-pending", (anyPending && !trafficWaiting) || resuming);
       if (resuming) pauseBtn.setAttribute("aria-busy", "true");
       else pauseBtn.removeAttribute("aria-busy");
       // Write to data-tooltip (not title) — the 700ms blink tick was
       // re-adding `title` mid-hover, after the custom tooltip system
       // had already migrated it. Both ended up visible at once. Bypass
       // the migration step by setting data-tooltip directly here.
-      const _pauseTip = resuming ? "Resuming…" : anyPending
+      const _pauseTip = resuming ? "Resuming…" : anyPending && !trafficWaiting
         ? "Pause queued — current job will finish first. Click to cancel pause."
         : (trafficWaiting
-            ? "Waiting for a YouTube traffic slot — click to override"
+            ? `${trafficQueue} is waiting for a YouTube traffic slot — click to override`
             : sessionLimited
             ? "Paused by YouTube's session rate limit"
             : idleQueued

@@ -340,22 +340,52 @@ class QueueMixin:
         return {"ok": True, "paused": which}
 
 
-    def youtube_traffic_override(self):
-        """Force the current sync past configured rolling traffic ceilings."""
+    def youtube_traffic_override(self, queue="sync", expected_task_id=""):
+        """Authorize the selected queue without extending a global bypass."""
         try:
             from backend import youtube_traffic
+            if queue not in {"sync", "gpu"}:
+                return {"ok": False, "error": "Choose Sync or Processing."}
             waiting = youtube_traffic.wait_status()
-            if not waiting.get("active"):
+            waits = waiting.get("waits") or ([waiting] if waiting.get("active") else [])
+            if not any(row.get("queue", "sync") == queue for row in waits):
                 self._on_queue_changed()
                 return {
                     "ok": False,
-                    "error": "The sync is no longer waiting for a traffic slot.",
+                    "error": "This queue is no longer waiting for a traffic slot.",
                 }
-            result = youtube_traffic.override_budget_limits()
+            pass_id = youtube_traffic.current_sync_pass_id() if queue == "sync" else ""
+            if queue == "sync" and not pass_id:
+                return {"ok": False, "error": "The sync pass has already finished."}
+            waiting_task_id = ""
+            if queue == "gpu":
+                selected_wait = max((row for row in waits if row.get("queue") == "gpu"),
+                                    key=lambda row: float(row.get("until") or 0))
+                waiting_task_id = str(selected_wait.get("task_id") or "")
+                if expected_task_id and expected_task_id != waiting_task_id:
+                    return {"ok": False, "error": "The waiting Processing task has already changed."}
+            result = self._transcribe.authorize_traffic_followups(
+                pass_id, expected_task_id=waiting_task_id)
+            if not result.get("ok"):
+                return result
+            if queue == "sync":
+                activated = youtube_traffic.override_budget_limits(pass_id=pass_id)
+                if not activated.get("ok"):
+                    # The pass may retire while the journal is being saved.
+                    # Its matching follow-ups still received the requested
+                    # durable grant; a later pass must not inherit it.
+                    result["followups_only"] = True
+                else:
+                    result.update(activated)
+            result["queue"] = queue
+            label = ("sync pass and its queued Processing follow-ups" if queue == "sync"
+                     else "Processing task and its queued caption follow-ups")
+            if result.get("followups_only"):
+                label = "completed sync pass's queued Processing follow-ups"
             try:
                 self._queue_log_stream().emit([[
-                    "\u25b6 YouTube traffic safety override enabled for this "
-                    "sync pass. Hourly and 24-hour ceilings will be ignored; "
+                    f"\u25b6 YouTube traffic safety override enabled for this {label}. "
+                    "Hourly and 24-hour ceilings will be ignored; "
                     "emergency rate-limit protection remains active.\n",
                     "simpleline",
                 ]])

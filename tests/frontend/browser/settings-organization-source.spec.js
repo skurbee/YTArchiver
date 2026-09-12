@@ -87,7 +87,7 @@ test("Settings uses one page with three task-based sections and unique controls"
 
   const backups = markupBetween(health, "settings-view-backups", "health-mini-log");
   for (const id of [
-    "settings-auto-backup", "backup-auto-age-display",
+    "settings-auto-backup", "settings-auto-backup-keep", "backup-auto-age-display",
     "btn-export-backup", "btn-import-backup", "backup-age-display",
     "btn-export-channels", "btn-import-channels",
   ]) {
@@ -97,7 +97,7 @@ test("Settings uses one page with three task-based sections and unique controls"
   expect(backups).toContain("settings, subscriptions, queues, app history, bookmarks, and notes");
   expect(backups).toContain("do not copy downloaded videos or transcript files");
   expect(backups).toContain("While YTArchiver is open");
-  expect(backups).toContain("Keeps the newest four");
+  expect(backups).toContain("Older scheduled backup ZIPs are removed only after the next successful automatic backup");
 });
 
 test("Auto-sync timing stays in Settings instead of occupying the Download row", async () => {

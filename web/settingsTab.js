@@ -561,6 +561,13 @@
           _lastAutomaticBackupPath = s.last_auto_backup_path || "";
           _renderAutomaticBackupAge(abEl.value);
         }
+        const backupKeepEl = document.getElementById("settings-auto-backup-keep");
+        if (backupKeepEl) {
+          const keep = Number(s.auto_backup_keep);
+          backupKeepEl.value = String(Number.isInteger(keep) && keep >= 1 && keep <= 10
+            ? keep : 4);
+          rememberControl(backupKeepEl, backupKeepEl.value);
+        }
         if (backupSearchDbEl) {
           backupSearchDbEl.checked = s.backup_include_search_db !== false;
           rememberControl(backupSearchDbEl, backupSearchDbEl.checked);
@@ -703,6 +710,37 @@
         _renderBackupControls();
       }
     });
+    document.getElementById("settings-auto-backup-keep")
+      ?.addEventListener("change", async (e) => {
+        const control = e.target;
+        if (control.disabled) return;
+        const previous = control.dataset.savedValue || "4";
+        const next = Number(control.value);
+        control.disabled = true;
+        control._ytddRepaint?.();
+        try {
+          if (next < Number(previous)) {
+            const confirmed = await askDanger("Keep fewer backups?",
+              `Reduce the number of automatic backups kept from ${previous} to ${next}?\n\n` +
+              `After the next successful automatic backup, only the newest ${next} ` +
+              `backup${next === 1 ? "" : "s"} will be kept. Older backup files will be ` +
+              "permanently deleted.\n\nNothing is deleted now.",
+              `Keep ${next}`);
+            if (!confirmed) {
+              control.value = previous;
+              return;
+            }
+          }
+          await persistControl(control, "auto_backup_keep", next);
+        } catch (error) {
+          control.value = previous;
+          console.error("Backup retention change failed:", error);
+          window._showToast?.("Could not change backups to keep. Try again.", "error");
+        } finally {
+          control.disabled = false;
+          control._ytddRepaint?.();
+        }
+      });
     document.getElementById("settings-auto-backup")
       ?.addEventListener("change", async (e) => {
         const previous = e.target.dataset.savedValue || "off";
@@ -1680,6 +1718,7 @@
           }
           const bkAgeEl = document.getElementById("backup-age-display");
           if (bkAgeEl) bkAgeEl.textContent = _fmtBackupAge(res.last_backup_ts || Date.now() / 1000, res.path);
+          window._invalidateHealthOverview?.();
         } else if (!res?.cancelled) {
           window._showToast?.(res?.error || "Backup failed.", "error");
         }

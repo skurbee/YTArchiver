@@ -424,6 +424,7 @@ def _sync_all_impl(stream: LogStreamer,
 
     sum_dl = 0
     sum_err = 0
+    incomplete_channels = 0
     skipped = 0
     # Per-kind accumulators so the Pass-complete line can say the
     # verb that actually happened — "X refreshed" for a views/likes
@@ -512,17 +513,18 @@ def _sync_all_impl(stream: LogStreamer,
     # len(_sync_queue)`. Initial value is the starting queue size.
     _last_live = {"i": 0, "total": _starting_total, "name": ""}
 
-    def _wait_if_paused():
+    def _wait_if_paused(stop_event=None):
         """If pause_event is set, log pause + wait until resumed.
         Re-paints the last live row as PAUSED and back. Idempotent."""
         if pause_event is None or not pause_event.is_set():
             return
+        wait_cancel = stop_event if stop_event is not None else cancel_event
         # Pass already cancelled — skip the "Sync paused" theater.
         # A paused-then-cancelled task (which announced its own pause
         # in-run) used to hit this between-tasks handler with pause
         # still set, emitting a SECOND paused line right before "Pass
         # cancelled."
-        if cancel_event is not None and cancel_event.is_set():
+        if wait_cancel is not None and wait_cancel.is_set():
             return
         # Re-paint the last live row (if any) in paused style.
         if _last_live["name"]:
@@ -555,7 +557,7 @@ def _sync_all_impl(stream: LogStreamer,
         # the wait instead of falling through (audit: sync_all H30).
         cancelled = False
         while True:
-            cancelled = wait_for_resume(pause_event, cancel_event, tick=0.25)
+            cancelled = wait_for_resume(pause_event, wait_cancel, tick=0.25)
             if cancelled:
                 break
             # Re-check pause_event under no lock — best-effort. If it
@@ -934,8 +936,79 @@ def _sync_all_impl(stream: LogStreamer,
             task_id=task_id,
             kind=_ch_kind,
         )
+        _task_cancel = _SyncTaskCancel(cancel_event, skip_event)
         admission = channel_leases.try_acquire(
             _channel_lease_aliases, lease_owner)
+        if (_ch_kind == "download" and admission.status == "busy"
+                and admission.blockers
+                and all(item.owner == "processing" for item in admission.blockers)):
+            # Restored Processing jobs intentionally have exclusive channel
+            # leases. Let the finite backlog already ahead of this download
+            # drain before entering the channel, including gaps between jobs.
+            # Never infer a cooperating parent from a matching channel name.
+            pending_ids = frozenset()
+            capture_pending = getattr(
+                type(transcribe_mgr), "pending_channel_job_ids", None)
+            remaining_pending = getattr(
+                type(transcribe_mgr), "pending_job_ids", None)
+            if callable(capture_pending) and callable(remaining_pending):
+                pending_ids = transcribe_mgr.pending_channel_job_ids(
+                    _channel_lease_aliases, sync_job_id=job_id)
+            _last_live.update({"i": i, "total": total, "name": ch_name})
+            _sync_row_emit(
+                stream, i, total, ch_name,
+                summary="waiting for Processing", name_tag=_row_name_tag,
+                summary_tag="dim", bracket_tag=_row_bracket)
+            while True:
+                _wait_if_paused(_task_cancel)
+                if _task_cancel.is_set():
+                    break
+                if clear_event is not None and clear_event.is_set():
+                    break
+                if pending_ids:
+                    pending_ids = transcribe_mgr.pending_job_ids(pending_ids)
+                if not pending_ids:
+                    # A rename or channel edit can finish during this lease-
+                    # free wait. Refresh the destination before admitting work.
+                    cfg, ch, _channel_lease_aliases = _resolve_sync_task_target(queued_ch)
+                    ch_name = ch.get("name", "?")
+                if pending_ids:
+                    # Check for newly arrived unrelated owners without taking
+                    # a lease away from the next queued Processing job.
+                    blockers = channel_leases.blockers_for(
+                        _channel_lease_aliases, requester=lease_owner)
+                    if not any(item.owner != "processing" for item in blockers):
+                        _task_cancel.wait(0.25)
+                        continue
+                admission = channel_leases.try_acquire(
+                    _channel_lease_aliases, lease_owner,
+                    cancel_event=_task_cancel)
+                if admission.ok:
+                    if not pending_ids:
+                        break
+                    # An unrelated blocker may disappear between the snapshot
+                    # and admission. Keep waiting for the captured backlog.
+                    admission.lease.release()
+                elif (admission.status != "busy" or not admission.blockers
+                      or any(item.owner != "processing" for item in admission.blockers)):
+                    break
+                _task_cancel.wait(0.25)
+            if (_task_cancel.is_set()
+                    or (clear_event is not None and clear_event.is_set())):
+                if admission.ok and admission.lease is not None:
+                    admission.lease.release()
+                _last_live["name"] = ""
+                if ((cancel_event is not None and cancel_event.is_set())
+                        or (clear_event is not None and clear_event.is_set())):
+                    # Cancellation leaves the current recovery record intact;
+                    # Clear owns removal of that record under the queue lock.
+                    break
+                _sync_row_emit(
+                    stream, i, total, ch_name, summary="skipped",
+                    name_tag="simpleline", summary_tag="dim",
+                    bracket_tag=_row_bracket)
+                skipped += 1
+                continue
         if not admission.ok:
             _defer_busy_task(
                 queued_ch,
@@ -949,7 +1022,6 @@ def _sync_all_impl(stream: LogStreamer,
             break
         assert admission.lease is not None
         _lease_guard["lease"] = admission.lease
-        _task_cancel = _SyncTaskCancel(cancel_event, skip_event)
         # Kind dispatch. Download items (the default / no `kind` key)
         # take the full sync_channel path; metadata items take the
         # fetch_channel_metadata path. This is how metadata recheck
@@ -1693,6 +1765,7 @@ def _sync_all_impl(stream: LogStreamer,
         _err = int(res.get("errors", 0) or 0)
         sum_dl += _dl
         sum_err += _err
+        incomplete_channels += int(bool(res.get("incomplete")))
         # Detect "paused mid-download": pause_event set and the
         # readline loop bailed out. Put this channel back at the
         # FRONT of the queue so Resume continues it instead of
@@ -1758,7 +1831,9 @@ def _sync_all_impl(stream: LogStreamer,
     # for the primary label.
     emit_parts: list[list[str]] = [
         ["=== ", "simplestatus_green"],
-        ["Pass complete: ", "simplestatus_white"],
+        ["Pass incomplete: " if (incomplete_channels or _lease_busy is not None)
+         else "Pass complete: ",
+         "simplestatus_white"],
     ]
     _verb_chunks: list[tuple[str, str]] = []  # (text, tag) pairs for action verbs
     if sum_dl > 0:
@@ -1891,10 +1966,12 @@ def _sync_all_impl(stream: LogStreamer,
     try: _ROW_EMIT_PASS_ID.id = ""
     except Exception as e: swallow("pass-id clear", e)
     return {"ok": (not rate_limited and not _queue_transition_failed
-                   and _lease_busy is None),
+                   and _lease_busy is None and not incomplete_channels),
             "reason": ("queue_persistence" if _queue_transition_failed else
                        "channel_busy" if _lease_busy is not None else
-                       "youtube_rate_limit" if rate_limited else ""),
+                       "youtube_rate_limit" if rate_limited else
+                       "channel_check_incomplete" if incomplete_channels else ""),
+            "incomplete": bool(incomplete_channels),
             "rate_limited": rate_limited,
             "busy": _lease_busy,
             "downloaded": sum_dl, "errors": sum_err,

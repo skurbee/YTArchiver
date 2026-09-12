@@ -136,12 +136,16 @@
   const readyPromise = new Promise((resolve) => { _readyResolve = resolve; });
 
   function _isBridgeUp() {
-    return !!(window.pywebview && window.pywebview.api);
+    // pywebview publishes api: {} before it creates the callable proxies.
+    // Startup must wait for those methods, not just the temporary container.
+    const api = window.pywebview?.api;
+    return typeof api?.startup_ready === "function"
+      && typeof api?.get_runtime_info === "function";
   }
 
   function _markReady() {
-    if (_readyResolve) {
-      _readyResolve(window.pywebview && window.pywebview.api);
+    if (_readyResolve && _isBridgeUp()) {
+      _readyResolve(window.pywebview.api);
       _readyResolve = null;
     }
   }
@@ -166,7 +170,12 @@
           "The app connection did not finish starting, so some data may not load.",
           { level: "error" },
         );
-        _markReady();  // resolve to undefined so callers can fall back
+        // Settle the bounded wait without mistaking an incomplete API for
+        // a ready connection. seedLogs still retries on a later ready event.
+        if (_readyResolve) {
+          _readyResolve(undefined);
+          _readyResolve = null;
+        }
         return;
       }
       setTimeout(_check, 150);

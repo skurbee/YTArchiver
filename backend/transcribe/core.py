@@ -292,6 +292,7 @@ class TranscribeManager:
         # runnable queue while still including it in every durable snapshot.
         self._inline_caption_jobs: list[dict[str, Any]] = []
         self._active_inline_promotion: dict[str, Any] | None = None
+        self._authorized_traffic_passes: set[str] = set()
         # flipped True when OOM forces a subprocess into
         # CPU mode. After the next successful transcribe completes,
         # we reset WHISPER_DEVICE back to "cuda" and force a restart
@@ -470,6 +471,42 @@ class TranscribeManager:
             return _matches(self._current_job) or any(
                 _matches(job) for job in self._jobs)
 
+    def pending_channel_job_ids(self, aliases, *, sync_job_id: str = "") -> frozenset[str]:
+        """Capture existing conflicting work before Sync waits for this channel.
+
+        Resolve aliases outside the journal/jobs locks. The returned finite set lets
+        restored Processing work drain without new arrivals extending the wait.
+        Runtime children of this exact download already have permission to share.
+        """
+        with self._journal_lock, self._jobs_lock:
+            jobs = [dict(job) for job in
+                    [self._current_job, *self._inline_caption_jobs, *self._jobs]
+                    if job]
+        wanted = frozenset(aliases)
+        result = set()
+        for job in jobs:
+            task_id = str(job.get("task_id") or "")
+            if not task_id:
+                continue
+            if (sync_job_id and job.get("_download_sync_job_id") == sync_job_id
+                    and (job.get("kind") or "transcribe") == "transcribe"
+                    and job.get("from_download") and not job.get("retranscribe")):
+                continue
+            if not wanted.isdisjoint(self._channel_aliases_for_job(job)):
+                result.add(task_id)
+        return frozenset(result)
+
+    def pending_job_ids(self, task_ids) -> frozenset[str]:
+        """Return captured IDs still queued, running, or awaiting cleanup."""
+        wanted = frozenset(task_ids)
+        # Completion temporarily clears the current slot before persisting it.
+        # Do not mistake that gap for a completed job if the save later fails.
+        with self._journal_lock, self._jobs_lock:
+            return frozenset(
+                str(job.get("task_id") or "")
+                for job in [self._current_job, *self._inline_caption_jobs, *self._jobs]
+                if job and str(job.get("task_id") or "") in wanted)
+
     def _finish_successful_job(
             self, job: dict[str, Any], result: Any,
             terminal_outcome: _WorkerOutcome = _WorkerOutcome.SUCCESS) -> bool:
@@ -575,6 +612,12 @@ class TranscribeManager:
         """
         wanted = self._job_path_key(marker.get("path", ""))
         with self._journal_lock:
+            from .. import youtube_traffic
+            if marker.get("_download_sync_job_id"):
+                pass_id = youtube_traffic.current_sync_pass_id()
+                marker["traffic_sync_pass_id"] = pass_id
+                marker["traffic_override"] = bool(
+                    pass_id and pass_id in self._authorized_traffic_passes)
             with self._jobs_lock:
                 existing = [*self._inline_caption_jobs, *self._jobs]
                 if self._current_job:
@@ -591,6 +634,70 @@ class TranscribeManager:
                     if job is not marker
                 ]
             return False, False
+
+    def authorize_traffic_followups(self, pass_id: str = "", *,
+                                   expected_task_id: str = "") -> dict[str, Any]:
+        """Durably authorize only this pass, or the waiting caption cohort.
+
+        The same journal lock covers new inline markers, so an override cannot
+        miss a job that was enqueued concurrently. No grant outlives its job.
+        """
+        with self._journal_lock:
+            with self._jobs_lock:
+                all_jobs = [*self._inline_caption_jobs, *self._jobs]
+                current = self._current_job
+                if current is not None:
+                    all_jobs.append(current)
+                eligible = [job for job in all_jobs
+                            if (job.get("kind") or "transcribe") == "transcribe"
+                            and not job.get("retranscribe")]
+                if pass_id:
+                    selected = [job for job in eligible
+                                if job.get("from_download")
+                                and job.get("traffic_sync_pass_id") == pass_id]
+                    authorization_id = pass_id
+                else:
+                    if current is None or not any(job is current for job in eligible):
+                        return {"ok": False, "error": "Processing is no longer waiting for captions."}
+                    if expected_task_id and current.get("task_id") != expected_task_id:
+                        return {"ok": False, "error": "The waiting Processing task has already changed."}
+                    origin = str(current.get("traffic_sync_pass_id") or "")
+                    if origin:
+                        selected = [job for job in eligible
+                                    if job.get("traffic_sync_pass_id") == origin]
+                    elif current.get("from_download"):
+                        # Older journals have no pass identity. Authorize only
+                        # this channel's existing cohort, never future jobs.
+                        channel = str(current.get("channel") or "").strip().casefold()
+                        selected = [job for job in eligible
+                                    if job.get("from_download")
+                                    and not job.get("traffic_sync_pass_id")
+                                    and (job is current or (channel and channel ==
+                                         str(job.get("channel") or "").strip().casefold()))]
+                    else:
+                        selected = [current]
+                    authorization_id = origin or f"processing-{current['task_id']}"
+                selected_ids = {job["task_id"] for job in selected}
+            snapshot = self._pending_snapshot()
+            for row in snapshot:
+                if row["task_id"] in selected_ids:
+                    row["traffic_sync_pass_id"] = authorization_id
+                    row["traffic_override"] = True
+            # Publish to a currently waiting worker only after fsync/replace.
+            if not self._write_pending_snapshot(snapshot):
+                return {"ok": False, "error": "Could not save the traffic override; limits remain enabled."}
+            with self._jobs_lock:
+                for job in selected:
+                    job["traffic_sync_pass_id"] = authorization_id
+                    job["traffic_override"] = True
+            from .. import youtube_traffic
+            if pass_id and youtube_traffic.current_sync_pass_id() == pass_id:
+                self._authorized_traffic_passes.add(pass_id)
+            return {"ok": True, "authorized": len(selected)}
+
+    def finish_traffic_pass(self, pass_id: str) -> None:
+        with self._journal_lock:
+            self._authorized_traffic_passes.discard(pass_id)
 
     def _clear_inline_caption_recovery(self, marker: dict[str, Any]) -> bool:
         """Clear a marker only after caption files and index all committed."""
@@ -1298,6 +1405,9 @@ class TranscribeManager:
         # Sync task only. Never persist it into restart/recovery journals.
         job["_download_sync_job_id"] = str(
             (promotion or {}).get("_download_sync_job_id") or "")
+        job["traffic_sync_pass_id"] = str(
+            (promotion or {}).get("traffic_sync_pass_id") or "")
+        job["traffic_override"] = (promotion or {}).get("traffic_override") is True
         # Reserve one durable visible identity before the job may start.  A
         # stale QueueState row for this logical path is adopted instead of
         # creating a second hidden ID.  If the journal's second commit fails,
@@ -3558,7 +3668,16 @@ class TranscribeManager:
                 _log.debug("swallowed: %s", e)
 
     def _transcribe_one(self, job: dict[str, Any]) -> _WorkerOutcome:
-        return self._run_under_channel_lease(job, self._transcribe_one_unleased)
+        from .. import youtube_traffic
+
+        def authorized():
+            return (job.get("traffic_override") is True
+                    and bool(job.get("traffic_sync_pass_id"))
+                    and not job.get("retranscribe"))
+
+        with youtube_traffic.request_scope(
+                "gpu", override_allowed=authorized, task_id=job.get("task_id", "")):
+            return self._run_under_channel_lease(job, self._transcribe_one_unleased)
 
     def _transcribe_one_unleased(self, job: dict[str, Any]) -> _WorkerOutcome:
         path = job["path"]

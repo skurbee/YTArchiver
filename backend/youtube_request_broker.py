@@ -67,6 +67,7 @@ class RequestSession:
         self._broker = broker
         self._token = secrets.token_urlsafe(32)
         self._reservation_id = reservation_id
+        self._request_context = youtube_traffic.current_request_scope()
         self._created = time.monotonic()
         self._closed = threading.Event()
         self._lock = threading.RLock()
@@ -157,7 +158,9 @@ class RequestSession:
         # Serialize one child's concurrent requests and count their waiting
         # intervals as a union, not N times the same wall-clock interval.
         with self._waiting(), self._request_lock:
-            with youtube_traffic.reservation_scope(self._reservation_id):
+            with (youtube_traffic.reservation_scope(self._reservation_id),
+                  youtube_traffic.request_scope(**(
+                      self._request_context or {"queue": "background"}))):
                 while self._wait_unpaused():
                     result = youtube_traffic.acquire(
                         kind, cancel_event=self._cancel, pause_event=self._pause)

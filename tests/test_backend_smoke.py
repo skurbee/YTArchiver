@@ -6082,6 +6082,7 @@ class YouTubeTrafficGovernorTests(unittest.TestCase):
         self.assertEqual(result, {"ok": False, "paused": True})
 
     def test_hourly_wait_can_be_overridden_for_current_pass(self) -> None:
+        pass_id = youtube_traffic.begin_sync_pass()
         cfg = self._cfg(
             youtube_traffic_custom_hourly=1,
             youtube_traffic_custom_min_gap=0,
@@ -6098,9 +6099,12 @@ class YouTubeTrafficGovernorTests(unittest.TestCase):
             self.assertTrue(
                 youtube_traffic.acquire("channel_quick_check")["ok"])
 
-            worker = threading.Thread(target=lambda: result.update(
-                youtube_traffic.acquire(
-                    "channel_quick_check", stream=stream)))
+            def wait_for_current_pass():
+                with youtube_traffic.request_scope("sync", sync_pass_id=pass_id):
+                    result.update(youtube_traffic.acquire(
+                        "channel_quick_check", stream=stream))
+
+            worker = threading.Thread(target=wait_for_current_pass)
             worker.start()
             deadline = time.time() + 2
             while (not youtube_traffic.wait_status()["active"]
@@ -6120,6 +6124,7 @@ class YouTubeTrafficGovernorTests(unittest.TestCase):
         self.assertFalse(youtube_traffic.wait_status()["active"])
         self.assertTrue(any(state.get("active") for state in states))
         self.assertTrue(any(not state.get("active") for state in states))
+        youtube_traffic.finish_sync_pass(pass_id)
 
     def test_rate_limit_circuit_escalates_and_deduplicates(self) -> None:
         first = youtube_traffic.record_rate_limit(now=1000.0)

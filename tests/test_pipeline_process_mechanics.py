@@ -208,7 +208,8 @@ def test_sync_adapter_preserves_bytes_and_reports_incomplete_pipe(broken):
     output = _Pipe(release, fail=True, prefix=data) if broken else io.BytesIO(data)
     child = _Child(output=output, exited=True)
     watchdog = SimpleNamespace(stop_event=threading.Event(), output_reader=None,
-                               output_complete=False)
+                               output_complete=False, last_output=[0.0],
+                               parser_busy=threading.Event())
     assert list(iter_download_output(child, watchdog)) == [data]
     assert watchdog.output_complete == (not broken)
 

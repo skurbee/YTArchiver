@@ -949,8 +949,12 @@ def popen_ytdlp(*args, registry: ProcessRegistry | None = None,
 
 
 def run_ytdlp(*args, input=None, capture_output=False, timeout=None,
-              check=False, **kwargs):
-    """Capture a registered probe with request-budget-aware timeout handling."""
+              wall_timeout=None, check=False, **kwargs):
+    """Capture a registered probe, optionally bounding traffic waits too.
+
+    ``timeout`` excludes intentional request-budget waits. ``wall_timeout``
+    additionally limits total capture time after launch, including those waits.
+    """
     if input is not None:
         if kwargs.get("stdin") is not None:
             raise ValueError("stdin and input arguments may not both be used")
@@ -961,7 +965,14 @@ def run_ytdlp(*args, input=None, capture_output=False, timeout=None,
         kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     proc = popen_ytdlp(*args, **kwargs)
     try:
-        stdout, stderr = proc.communicate(input=input, timeout=timeout)
+        capture_options = {"input": input, "timeout": timeout}
+        if wall_timeout is not None:
+            if request_session(proc) is not None:
+                capture_options["wall_timeout"] = wall_timeout
+            else:
+                capture_options["timeout"] = (min(timeout, wall_timeout)
+                    if timeout is not None else wall_timeout)
+        stdout, stderr = proc.communicate(**capture_options)
         returncode = proc.poll()
         if check and returncode:
             raise subprocess.CalledProcessError(returncode, proc.args, stdout, stderr)

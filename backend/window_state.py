@@ -18,12 +18,93 @@ from __future__ import annotations
 
 import os
 import threading
+import time
+from collections.abc import Callable
 from typing import Any
 
 from .log import get_logger
 from .ytarchiver_config import config_transaction, load_config
 
 _log = get_logger(__name__)
+
+
+class WindowStateDebouncer:
+    """Save settled geometry on one reusable, lifecycle-owned worker.
+
+    Movement callbacks only merge the latest state and extend the deadline.
+    Stop discards pending geometry; join also waits for an in-flight save so
+    shutdown or backup restore cannot overlook a writer still using old state.
+    """
+
+    def __init__(self, save_fn: Callable[[dict[str, Any]], Any],
+                 delay_seconds: float = 0.25) -> None:
+        self._save_fn = save_fn
+        self._delay_seconds = max(0.0, float(delay_seconds))
+        self._condition = threading.Condition()
+        self._pending: dict[str, Any] = {}
+        self._deadline = 0.0
+        self._enabled = True
+        self._worker: threading.Thread | None = None
+
+    def schedule(self, updates: dict[str, Any]) -> None:
+        with self._condition:
+            if not self._enabled or not updates:
+                return
+            was_empty = not self._pending
+            self._pending.update(updates)
+            self._deadline = time.monotonic() + self._delay_seconds
+            if self._worker is None:
+                self._worker = threading.Thread(
+                    target=self._run, name="window-state", daemon=True)
+                try:
+                    # Keep start inside the lock so stop/ownership checks can
+                    # never mistake an unstarted reserved worker for quiescence.
+                    self._worker.start()
+                except Exception:
+                    self._worker = None
+                    raise
+            elif was_empty:
+                self._condition.notify()
+            # An already-pending worker rechecks the extended deadline when
+            # its current wait expires, without waking on every move event.
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._enabled and not self._pending:
+                    self._condition.wait()
+                if not self._enabled:
+                    return
+                remaining = self._deadline - time.monotonic()
+                if remaining > 0:
+                    self._condition.wait(remaining)
+                    continue
+                snapshot = self._pending
+                self._pending = {}
+            # Configuration I/O must not hold the event lock. New movement
+            # remains responsive and is saved by the next loop iteration.
+            try:
+                self._save_fn(snapshot)
+            except Exception as exc:
+                _log.debug("window state save callback failed: %s", exc)
+
+    def stop(self) -> None:
+        """Permanently reject updates and cancel saves that have not started."""
+        with self._condition:
+            self._enabled = False
+            self._pending.clear()
+            self._condition.notify_all()
+
+    def is_active(self) -> bool:
+        with self._condition:
+            return bool(self._worker is not None and self._worker.is_alive())
+
+    def join(self, timeout: float) -> bool:
+        with self._condition:
+            worker = self._worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=max(0.0, float(timeout)))
+        return not self.is_active()
 
 
 DEFAULT_STATE: dict[str, Any] = {

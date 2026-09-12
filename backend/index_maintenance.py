@@ -830,9 +830,9 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
         reconciled = _rc.rowcount or 0
         sweep_conn.commit()
         if reconciled:
-            _log.info("tx_status reconcile: flipped %d video(s) to "
-                      "'transcribed' (had segments but stale status)",
-                      reconciled)
+            _log.debug("tx_status reconcile: flipped %d video(s) to "
+                       "'transcribed' (had segments but stale status)",
+                       reconciled)
     except Exception as e:
         _log.debug("tx_status reconcile failed: %s", e)
 
@@ -841,9 +841,9 @@ def _sweep_new_videos_impl(output_dir: str, channels: list,
         title_reconciled = _reconcile_tx_status_from_transcript_titles(
             sweep_conn, output_dir, scan_channels, _wait_while_busy)
         if title_reconciled:
-            _log.info("tx_status title reconcile: flipped %d video(s) to "
-                      "'transcribed' (matched existing Transcript.txt)",
-                      title_reconciled)
+            _log.debug("tx_status title reconcile: flipped %d video(s) to "
+                       "'transcribed' (matched existing Transcript.txt)",
+                       title_reconciled)
     except Exception as e:
         _log.debug("tx_status title reconcile failed: %s", e)
 

@@ -36,8 +36,10 @@ def queue_tray(monkeypatch):
 
     def update():
         tray.reset_mock()
+        api.services.event_bus.reset_mock()
         namespace["_on_queue_changed"](api)
         namespace["_log"].debug.assert_not_called()
+        return api.services.event_bus.update_queues.call_args.args[1]
 
     return SimpleNamespace(update=update, tray=tray, payload=payload, waiting=waiting, api=api)
 
@@ -125,4 +127,101 @@ def test_missing_resume_time_keeps_pause_badge_and_clear_reason(queue_tray):
     flow.waiting.update(active=True, reason="daily_limit", until="unavailable")
     flow.update()
     flow.tray.set_traffic_waiting.assert_called_once_with(True)
-    flow.tray.set_tooltip.assert_called_once_with("YTArchiver — Paused for YouTube 24-hour limit")
+    flow.tray.set_tooltip.assert_called_once_with("YTArchiver — Paused for YouTube 24-hour limit (Sync)")
+
+
+def test_processing_caption_wait_routes_only_to_processing_and_resumes_red(queue_tray):
+    flow = queue_tray
+    flow.payload["sync"] = []
+    flow.payload["gpu"] = [{"status": "running", "kind": "transcribe", "title": "Fixture video"}]
+    flow.waiting.update(active=True, queue="gpu", kind="caption_fetch", reason="daily_limit")
+    state = flow.update()
+    assert state["sync"]["trafficWaiting"] is False
+    assert state["gpu"]["trafficWaiting"] is True
+    assert state["gpu"]["trafficWait"]["kind"] == "caption_fetch"
+    flow.tray.set_traffic_waiting.assert_called_once_with(True)
+    flow.tray.start_spin.assert_not_called()
+    flow.tray.set_tooltip.assert_called_once_with(
+        "YTArchiver — Paused for YouTube 24-hour limit (Processing)")
+
+    flow.waiting["active"] = False
+    state = flow.update()
+    assert state["gpu"]["trafficWaiting"] is False
+    flow.tray.set_traffic_waiting.assert_called_once_with(False)
+    flow.tray.start_spin.assert_called_once_with("red")
+
+
+def test_sync_keeps_blue_spinner_while_processing_waits(queue_tray):
+    flow = queue_tray
+    flow.payload["gpu"] = [{"status": "running", "kind": "transcribe", "title": "Fixture video"}]
+    flow.waiting.update(active=True, queue="gpu", reason="hourly_limit")
+    state = flow.update()
+    assert state["sync"]["trafficWaiting"] is False
+    assert state["gpu"]["trafficWaiting"] is True
+    flow.tray.set_traffic_waiting.assert_called_once_with(False)
+    flow.tray.start_spin.assert_called_once_with("blue")
+    assert "Syncing: Fixture channel" in flow.tray.set_tooltip.call_args.args[0]
+
+
+def test_concurrent_waits_keep_the_latest_deadline_for_each_queue(queue_tray):
+    flow = queue_tray
+    flow.payload["gpu"] = [{"status": "running", "kind": "transcribe", "title": "Fixture video"}]
+    now = time.time()
+    flow.waiting.update(active=True, queue="background", reason="daily_limit", waits=[
+        {"active": True, "queue": "sync", "until": now + 100, "reason": "hourly_limit"},
+        {"active": True, "queue": "gpu", "until": now + 300, "reason": "daily_limit"},
+        {"active": True, "queue": "sync", "until": now + 200, "reason": "hourly_limit"},
+        {"active": True, "queue": "background", "until": now + 900, "reason": "daily_limit"},
+    ])
+    state = flow.update()
+    assert state["sync"]["trafficWaiting"] is True
+    assert state["gpu"]["trafficWaiting"] is True
+    assert state["sync"]["trafficWait"]["until"] == now + 200
+    assert state["gpu"]["trafficWait"]["until"] == now + 300
+    flow.tray.set_traffic_waiting.assert_called_once_with(True)
+    flow.tray.start_spin.assert_not_called()
+    assert "24-hour limit (Sync and Processing)" in flow.tray.set_tooltip.call_args.args[0]
+
+
+def test_background_wait_does_not_park_either_queue(queue_tray):
+    flow = queue_tray
+    flow.waiting.update(active=True, queue="background", reason="daily_limit")
+    state = flow.update()
+    assert not state["sync"]["trafficWaiting"]
+    assert not state["gpu"]["trafficWaiting"]
+    flow.tray.set_traffic_waiting.assert_called_once_with(False)
+    flow.tray.start_spin.assert_called_once_with("blue")
+
+
+def test_processing_completion_clears_stale_wait(queue_tray):
+    flow = queue_tray
+    flow.payload["sync"] = []
+    flow.waiting.update(active=True, queue="gpu", reason="daily_limit")
+    state = flow.update()
+    assert not state["gpu"]["trafficWaiting"]
+    flow.tray.set_traffic_waiting.assert_called_once_with(False)
+    flow.tray.set_tooltip.assert_called_once_with("YTArchiver — Idle")
+
+
+@pytest.mark.parametrize("pause_key", ["gpu_paused", "gpu_paused_active"])
+def test_manual_processing_pause_takes_precedence_over_wait(queue_tray, pause_key):
+    flow = queue_tray
+    flow.payload["sync"] = []
+    flow.payload["gpu"] = [{"status": "running", "kind": "transcribe", "title": "Fixture video"}]
+    flow.payload[pause_key] = True
+    flow.waiting.update(active=True, queue="gpu", reason="hourly_limit")
+    flow.update()
+    flow.tray.set_traffic_waiting.assert_called_once_with(False)
+    flow.tray.set_queue_paused.assert_called_once_with(True)
+    flow.tray.start_spin.assert_not_called()
+    assert "YouTube" not in flow.tray.set_tooltip.call_args.args[0]
+
+
+def test_processing_pause_request_still_spins_until_active_work_finishes(queue_tray):
+    flow = queue_tray
+    flow.payload["sync"] = []
+    flow.payload["gpu"] = [{"status": "running", "kind": "transcribe", "title": "Fixture video"}]
+    flow.payload.update(gpu_paused=True, gpu_paused_active=False)
+    flow.update()
+    flow.tray.start_spin.assert_called_once_with("red")
+    flow.tray.set_queue_paused.assert_called_once_with(False)

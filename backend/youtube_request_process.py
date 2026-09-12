@@ -74,20 +74,27 @@ def attach_session(proc, session) -> None:
         session.bind(proc)
         return
 
-    def communicate(input=None, timeout=None):
+    def communicate(input=None, timeout=None, *, wall_timeout=None):
         def capture(value, **options):
             if value is not None:
                 options["input"] = value
             return original_communicate(**options)
 
-        if timeout is None:
+        if timeout is None and wall_timeout is None:
             return capture(input)
         started = time.monotonic()
         initial_wait = session.wait_seconds()
         pending_input = input
         while True:
-            remaining = float(timeout) - (time.monotonic() - started) + (
+            elapsed = time.monotonic() - started
+            remaining = (float(timeout) - elapsed + (
                 session.wait_seconds() - initial_wait)
+                if timeout is not None else float("inf"))
+            if wall_timeout is not None:
+                # Interactive preflight must return even if this child is
+                # waiting for traffic permission. Worker timeouts still
+                # exclude intentional waits unless this bound is supplied.
+                remaining = min(remaining, float(wall_timeout) - elapsed)
             if remaining <= 0:
                 # Preserve subprocess's final output/exception behavior.
                 return capture(pending_input, timeout=0)

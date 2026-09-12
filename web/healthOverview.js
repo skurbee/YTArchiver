@@ -22,6 +22,33 @@
   let refreshGeneration = 0;
   let initialized = false;
   let refreshInFlight = null;
+  const CACHE_MS = 60_000;
+  let hasResults = false;
+  let lastCompletedAt = null;
+  let cacheRevision = 0;
+  let cachedRevision = -1;
+  let cachedPreferenceRevision = -1;
+  let refreshInvalidated = false;
+
+  function overviewVisible() {
+    return $("panel-health")?.classList.contains("active")
+      && !$("settings-view-overview")?.hidden;
+  }
+
+  function preferenceRevision() {
+    return window.YT?.preferences?.writeRevision?.() ?? 0;
+  }
+
+  function invalidateOverview({ archiveChanged = false } = {}) {
+    cacheRevision++;
+    lastCompletedAt = null;
+    if (refreshInFlight) refreshInvalidated = true;
+    if (archiveChanged) {
+      // An old archive's pending replies must not populate the new archive.
+      refreshGeneration++;
+      hasResults = false;
+    }
+  }
 
   function bridgeCall(method, ...args) {
     return window.YT?.bridge?.bridgeCall?.(method, ...args);
@@ -190,17 +217,28 @@
     }
   }
 
-  async function refreshOverview() {
+  async function refreshOverview({ force = true } = {}) {
     if (refreshInFlight) return refreshInFlight;
+    const currentPreferenceRevision = preferenceRevision();
+    const savingPreferences = !!window.YT?.preferences?.isSaving?.();
+    if (!force && lastCompletedAt !== null
+        && Date.now() - lastCompletedAt < CACHE_MS
+        && cachedRevision === cacheRevision
+        && cachedPreferenceRevision === currentPreferenceRevision
+        && !savingPreferences && nativeBridgeUp()) return;
+    const startedRevision = cacheRevision;
     const generation = ++refreshGeneration;
+    refreshInvalidated = false;
+    lastCompletedAt = null;
     const status = $("health-overview-status");
     const attentionList = $("health-attention-list");
-    resetCards();
+    if (!hasResults) resetCards();
     if (status) {
-      status.textContent = "Checking current status…";
+      status.textContent = hasResults
+        ? "Refreshing current status…" : "Checking current status…";
       status.classList.remove("is-warn");
     }
-    if (attentionList) {
+    if (!hasResults && attentionList) {
       attentionList.innerHTML = '<div class="health-attention-empty">Checking…</div>';
     }
 
@@ -456,6 +494,16 @@
 
       const uniqueUnavailable = [...new Set(unavailable)];
       renderAttention(attention, uniqueUnavailable.length);
+      hasResults = true;
+      // Only a complete, unchanged read gets the navigation cache lifetime.
+      // Failed reads remain retryable, and changes during a request stay dirty.
+      if (!uniqueUnavailable.length && cacheRevision === startedRevision
+          && !savingPreferences && !window.YT?.preferences?.isSaving?.()
+          && preferenceRevision() === currentPreferenceRevision) {
+        lastCompletedAt = Date.now();
+        cachedRevision = startedRevision;
+        cachedPreferenceRevision = currentPreferenceRevision;
+      }
       if (status) {
         if (uniqueUnavailable.length) {
           status.textContent = `Checked what was available. Could not read: ${uniqueUnavailable.join(", ")}.`;
@@ -471,34 +519,39 @@
       await refreshInFlight;
     } finally {
       refreshInFlight = null;
+      if (refreshInvalidated && overviewVisible()) {
+        await refreshOverview({ force: false });
+      }
     }
   }
 
   function initHealthOverview() {
     if (initialized || !$("settings-view-overview")) return;
     initialized = true;
-    $("btn-health-overview-refresh")?.addEventListener("click", refreshOverview);
+    $("btn-health-overview-refresh")?.addEventListener("click", () => refreshOverview());
     document.querySelectorAll("#panel-health [data-health-target]").forEach((card) => {
       card.addEventListener("click", () => navigateTo(
         card.dataset.healthTarget, card.dataset.healthAnchor));
     });
     document.querySelector(
       '#panel-health .settings-subnav-btn[data-settings-view="overview"]')
-      ?.addEventListener("click", refreshOverview);
+      ?.addEventListener("click", () => refreshOverview({ force: false }));
     document.querySelector('.tab[data-tab="health"]')?.addEventListener("click", () => {
       setTimeout(() => {
-        if (!$("settings-view-overview")?.hidden) refreshOverview();
+        if (overviewVisible()) refreshOverview({ force: false });
       }, 0);
     });
+    window.addEventListener("archive-roots-changed", () => {
+      invalidateOverview({ archiveChanged: true });
+    });
     window.YT?.bridge?.ready?.then(() => {
-      const panel = $("panel-health");
-      if (panel?.classList.contains("active")
-          && !$("settings-view-overview")?.hidden) refreshOverview();
+      if (overviewVisible()) refreshOverview({ force: false });
     });
   }
 
   window.initHealthOverview = initHealthOverview;
   window._refreshHealthOverview = refreshOverview;
+  window._invalidateHealthOverview = invalidateOverview;
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", initHealthOverview, { once: true });
   } else {

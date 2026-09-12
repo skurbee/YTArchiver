@@ -77,7 +77,7 @@
             Review the information YTArchiver has about the archive and run repairs when something looks wrong.
           </div>
 
-          <details class="health-library-details"
+          <details class="health-library-details" open
                    id="health-library-metadata" data-health-section="metadata">
             <summary>
               <span>Channel information</span>
@@ -319,9 +319,30 @@
                 <option value="monthly">Every 30 days</option>
               </select>
               <div class="settings-field-help">
-                While YTArchiver is open, saves that same backup in the archive's YTArchiver Info folder. Keeps the newest four.
+                While YTArchiver is open, saves that same backup in the archive's YTArchiver Info folder.
               </div>
-              <span class="settings-inline-note backup-age-note" id="backup-auto-age-display"></span>
+              <span class="settings-inline-note backup-age-note" id="backup-auto-age-display" tabindex="0"></span>
+            </div>
+
+            <label class="edit-gl" for="settings-auto-backup-keep">Keep latest</label>
+            <div class="edit-gv-stack settings-field-with-help">
+              <select class="ctl-select" id="settings-auto-backup-keep"
+                      aria-describedby="backup-retention-help"
+                      title="Number of scheduled backup ZIPs to keep">
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4" selected>4</option>
+                <option value="5">5</option>
+                <option value="6">6</option>
+                <option value="7">7</option>
+                <option value="8">8</option>
+                <option value="9">9</option>
+                <option value="10">10</option>
+              </select>
+              <div class="settings-field-help" id="backup-retention-help">
+                Older scheduled backup ZIPs are removed only after the next successful automatic backup.
+              </div>
             </div>
 
             <label class="edit-gl">Full app backup</label>
@@ -335,7 +356,7 @@
               <div class="settings-field-help">
                 Saves the same backup once to a location you choose.
               </div>
-              <span class="settings-inline-note backup-age-note" id="backup-age-display"></span>
+              <span class="settings-inline-note backup-age-note" id="backup-age-display" tabindex="0"></span>
             </div>
 
             <label class="edit-gl">Channel list</label>

@@ -39,6 +39,23 @@
     return window._queueStateSnapshot() || {};
   }
 
+  async function syncResumeState(api, painted) {
+    const state = { ...painted, queues: queueStateSnapshot() };
+    // Painted activity can lag worker exit. Resume must start a restored
+    // queue when its worker is gone, and must not start a second live worker.
+    if (typeof api.sync_is_running === "function") {
+      state.running = !!(await api.sync_is_running());
+    }
+    if (typeof api.get_queues === "function") {
+      const queues = await api.get_queues();
+      if (!Array.isArray(queues?.sync)) throw new Error("Could not read the sync queue.");
+      state.queues = queues;
+      state.count = Number.isFinite(queues.sync_count)
+        ? Math.max(0, queues.sync_count) : queues.sync.length;
+    }
+    return state;
+  }
+
   async function checkedQueueCall(call, okMessage, okKind, failMessage) {
     let res;
     try {
@@ -104,7 +121,8 @@
       const idleQueued = lanes.every(lane => !state[lane].running) &&
         lanes.some(lane => state[lane].count > 0);
       const resuming = (anyPaused || idleQueued) &&
-        !(which === "both" && state.sync.trafficWaiting);
+        !(which === "both" && [state.sync, state.gpu].some(lane =>
+          lane.trafficWaiting && !lane.paused && !lane.pausedActive));
       lanes.forEach(lane => _queueActionsInFlight.add(lane));
       if (resuming) window._setQueueResumePending?.(which, true);
       try {
@@ -189,11 +207,9 @@
 
     // Big Pause button on the Download tab — GLOBAL pause/resume for
     // both the sync pipeline AND the GPU queue (transcribe / compress).
-    // Decision source: _blinkState (client mirror kept in sync via backend
-    // push notifications). Using client state here means the toggle always
-    // matches what the user is visually seeing on the button — no async
-    // roundtrip race, no "api.queue_is_paused undefined at click time"
-    // falsy-short-circuit bug.
+    // The painted state chooses Pause versus Resume. Before resuming, check
+    // actual sync-worker state so a stale activity indicator cannot select
+    // flag-only resume for a queue with no worker.
     //
     // This mirrors OLD's global pause button that gated every worker at
     // once. To target one queue independently, use the Pause button
@@ -214,19 +230,23 @@
       const api = window.pywebview?.api;
       if (!api) return;
       const bs = blinkState();
-      const s = bs.sync;
-      const g = bs.gpu;
-      const syncActivelyPaused = s.running && s.paused;
-      const gpuActivelyPaused = g.running && g.paused;
-      const anyActivelyPaused = syncActivelyPaused || gpuActivelyPaused;
-      const syncDeadPausedWithItems = !s.running && s.paused && s.count > 0;
-      const gpuDeadPausedWithItems = !g.running && g.paused && g.count > 0;
-      const deadPausedWithItems =
-        syncDeadPausedWithItems || gpuDeadPausedWithItems;
-      const idleWithItems = !s.running && !g.running && (s.count > 0 || g.count > 0);
+      let s = { ...bs.sync };
+      const g = { ...bs.gpu };
+      const resumeRequested = (s.paused && (s.running || s.count > 0)) ||
+        (g.paused && (g.running || g.count > 0)) ||
+        (!s.running && !g.running && (s.count > 0 || g.count > 0));
       try {
-        if (s.trafficWaiting) {
-          const wait = s.trafficWait || {};
+        const trafficQueue = s.trafficWaiting && !s.paused && !s.pausedActive ? "sync"
+          : g.trafficWaiting && !g.paused && !g.pausedActive ? "gpu" : null;
+        if (!trafficQueue && resumeRequested) s = await syncResumeState(api, s);
+        const anyActivelyPaused = (s.running && s.paused) || (g.running && g.paused);
+        const syncNeedsWorker = !s.running && s.count > 0;
+        const deadPausedWithItems = (syncNeedsWorker && s.paused) ||
+          (!g.running && g.paused && g.count > 0);
+        const idleWithItems = !s.running && !g.running && (s.count > 0 || g.count > 0);
+        if (trafficQueue) {
+          const processing = trafficQueue === "gpu";
+          const wait = (processing ? g : s).trafficWait || {};
           const until = Number(wait.until);
           const untilText = Number.isFinite(until)
             ? new Date(until * 1000).toLocaleTimeString([], {
@@ -239,10 +259,12 @@
           const go = await (window.askConfirm
             ? window.askConfirm(
                 "Override YouTube traffic limit?",
-                `The sync is waiting for a ${reason} rolling-window slot ` +
+                `${processing ? "Processing" : "Sync"} is waiting for a ${reason} rolling-window slot ` +
                 `until ${untilText}. Continuing now will ignore the ` +
-                "configured hourly and 24-hour ceilings for the rest of " +
-                "this sync pass. YTArchiver will still pause if YouTube " +
+                "configured hourly and 24-hour ceilings for " +
+                (processing ? "this task and its remaining queued caption follow-ups. "
+                  : "the rest of this sync pass and its remaining Processing follow-ups. ") +
+                "YTArchiver will still pause if YouTube " +
                 "starts rejecting requests, and launch spacing remains active.",
                 {
                   confirm: "Override and continue",
@@ -252,10 +274,16 @@
             : Promise.resolve(false));
           if (!go) return;
           if (typeof api.youtube_traffic_override === "function") {
-            const res = await api.youtube_traffic_override();
+            const res = processing
+              ? await api.youtube_traffic_override("gpu", String(wait.task_id || ""))
+              : await api.youtube_traffic_override();
             if (res?.ok) {
               window._showToast?.(
-                "Traffic ceilings overridden for this sync pass.", "warn");
+                processing
+                  ? "Traffic ceilings overridden for this task and its remaining queued caption follow-ups."
+                  : res.followups_only
+                  ? "The sync pass finished. Traffic ceilings overridden for its remaining Processing follow-ups."
+                  : "Traffic ceilings overridden for this sync pass and its remaining Processing follow-ups.", "warn");
             } else {
               window._showToast?.(
                 res?.error || "Traffic override failed.", "error");
@@ -263,11 +291,11 @@
           } else {
             window._showToast?.("Traffic override is unavailable.", "error");
           }
-        } else if (anyActivelyPaused) {
+        } else if ((anyActivelyPaused || (resumeRequested && s.running)) && !syncNeedsWorker) {
           await checkedQueueApi(
             api, "queue_resume", "both",
             "Resumed.", "ok", "Resume failed.");
-        } else if (deadPausedWithItems || idleWithItems) {
+        } else if (deadPausedWithItems || idleWithItems || (resumeRequested && syncNeedsWorker)) {
           // Clear pause flags AND start the sync thread so the queue
           // actually drains. Using sync_start_all (not queue_resume)
           // because queue_resume alone just clears flags — without a
@@ -276,15 +304,20 @@
           // we DON'T enqueue a full Sync Subbed pass on resume. The
           // user's intent is "drain what's queued", not "start a
           // brand new sync of every subscribed channel".
-          if (s.count > 0 && typeof api.sync_start_all === "function") {
+          if (syncNeedsWorker && typeof api.sync_start_all === "function") {
             let redownloadOnly = false;
             try {
-              const snap = queueStateSnapshot();
+              const snap = s.queues || queueStateSnapshot();
               const hasRedownload = (snap?.sync || []).some(
                 task => (task?.kind || "").toLowerCase() === "redownload");
               if (hasRedownload &&
                   typeof api.resume_pending_redownloads === "function") {
                 const rr = await api.resume_pending_redownloads();
+                if (!rr?.ok) {
+                  window._showToast?.(
+                    rr?.error || "Saved redownloads could not be resumed.", "error");
+                  return;
+                }
                 redownloadOnly = !!(
                   rr?.ok && rr.resumed > 0 && rr.regular_pending === 0);
                 if (redownloadOnly) {
@@ -298,7 +331,7 @@
                 }
               }
             } catch (e) {
-              console.error("resume_pending_redownloads:", e);
+              throw new Error(`Saved redownloads could not be resumed. ${e}`);
             }
             if (!redownloadOnly) {
               const res = await api.sync_start_all(false);
@@ -308,14 +341,19 @@
                 window._showToast?.(res?.error || "Resume failed.", "error");
               }
             }
-          } else if (s.count > 0) {
+          } else if (syncNeedsWorker) {
             window._showToast?.("Resume failed.", "error");
           }
-          if (g.count > 0 && !g.running) {
+          if (g.running && g.paused) {
+            await checkedQueueApi(api, "queue_resume", "gpu",
+              "Processing resumed.", "ok", "Couldn't resume processing.");
+          } else if (g.count > 0 && !g.running) {
             await checkedQueueApi(api, "gpu_start", "gpu",
               "Processing started — draining the queue.", "ok",
               "Couldn't start processing.");
           }
+        } else if (resumeRequested) {
+          window._showToast?.("No queued work to resume.", "ok");
         } else {
           await checkedQueueApi(
             api, "queue_pause", "both",
@@ -339,11 +377,11 @@
       // proxy can't express (it resolves every name to a function).
       const api = window.pywebview?.api;
       if (!api?.queue_is_paused) { api?.sync_cancel?.(); return; }
-      const s = blinkState().sync;
-      const threadAlive = s.running;
+      let s = { ...blinkState().sync };
       const st = await api.queue_is_paused();
-      if (st?.sync || (!threadAlive && s.count > 0)) {
-        if (!threadAlive && s.count > 0 && typeof api.sync_start_all === "function") {
+      if (st?.sync || (!s.running && s.count > 0)) {
+        s = await syncResumeState(api, s);
+        if (!s.running && s.count > 0 && typeof api.sync_start_all === "function") {
           // before firing sync_start_all (which runs a
           // regular Sync Subbed pass), check whether the queue has
           // any redownload tasks left over from a previous run that
@@ -354,12 +392,16 @@
           let routedRedownload = false;
           let redownloadResumeFailed = false;
           try {
-            const snap = queueStateSnapshot();
+            const snap = s.queues || queueStateSnapshot();
             const hasRedwnl = (snap?.sync || []).some(
               t => (t?.kind || "").toLowerCase() === "redownload");
             if (hasRedwnl && api.resume_pending_redownloads) {
               const rr = await api.resume_pending_redownloads();
-              if (rr?.ok && rr.resumed > 0) {
+              if (!rr?.ok) {
+                redownloadResumeFailed = true;
+                window._showToast?.(
+                  rr?.error || "Saved redownloads could not be resumed.", "error");
+              } else if (rr.resumed > 0) {
                 routedRedownload = rr.regular_pending === 0;
                 window._showToast?.(
                   routedRedownload
@@ -374,7 +416,8 @@
               }
             }
           } catch (e) {
-            console.error("resume_pending_redownloads:", e);
+            redownloadResumeFailed = true;
+            window._showToast?.(`Saved redownloads could not be resumed. ${e}`, "error");
           }
           if (!routedRedownload && !redownloadResumeFailed) {
             // Pass false so resume only drains the existing queue \u2014

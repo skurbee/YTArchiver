@@ -849,6 +849,31 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 _traffic_wait = _yt_traffic.wait_status()
             except Exception:
                 _traffic_wait = {"active": False}
+            # One governor serves both queues and independent maintenance.
+            # Attribute each hold to its caller instead of parking Sync for
+            # a caption request that belongs to the Processing worker.
+            _queue_waits = {"sync": {"active": False}, "gpu": {"active": False}}
+            _wait_rows = _traffic_wait.get("waits")
+            if not isinstance(_wait_rows, list):
+                _wait_rows = [_traffic_wait]  # older governor snapshots
+
+            def _wait_deadline(wait):
+                try:
+                    return float(wait.get("until") or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+
+            for _wait in _wait_rows:
+                if not isinstance(_wait, dict) or not _wait.get("active"):
+                    continue
+                _queue = _wait.get("queue", "sync")
+                if _queue not in _queue_waits:
+                    continue
+                if (not _queue_waits[_queue].get("active") or
+                        _wait_deadline(_wait) >= _wait_deadline(_queue_waits[_queue])):
+                    _queue_waits[_queue] = _wait
+            _sync_waiting = bool(_queue_waits["sync"].get("active")) and sync_working
+            _gpu_waiting = bool(_queue_waits["gpu"].get("active")) and gpu_working
             try:
                 from backend import youtube_session as _yt_session
                 _session_limited = bool(_yt_session.rate_limit_detected())
@@ -859,8 +884,8 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     "running": sync_running,
                     "paused": bool(payload["sync_paused"]),
                     "pausedActive": _sync_pa,
-                    "trafficWaiting": bool(_traffic_wait.get("active")),
-                    "trafficWait": _traffic_wait,
+                    "trafficWaiting": _sync_waiting,
+                    "trafficWait": _queue_waits["sync"],
                     # YouTube's emergency "current session has been
                     # rate-limited" hold is separate from the configured
                     # hourly/24-hour rolling-budget wait above. Forward it
@@ -871,6 +896,8 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     "running": gpu_running,
                     "paused": bool(payload["gpu_paused"]),
                     "pausedActive": _gpu_pa,
+                    "trafficWaiting": _gpu_waiting,
+                    "trafficWait": _queue_waits["gpu"],
                 },
             })
             # Drive tray icon spin + tooltip with current task name.
@@ -881,14 +908,20 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 _sync_paused_now = bool(payload["sync_paused"] or _sync_pa)
                 _gpu_paused_now = bool(payload["gpu_paused"] or _gpu_pa)
                 # Processing may finish its current job before parking.
-                _gpu_working_now = gpu_working and not _gpu_pa
-                _traffic_waiting = (bool(_traffic_wait.get("active"))
-                                    and sync_working and not _sync_paused_now)
-                tray.set_traffic_waiting(_traffic_waiting and not _gpu_working_now)
+                _gpu_working_now = gpu_working and not _gpu_pa and not _gpu_waiting
+                _sync_working_now = sync_working and not _sync_paused_now and not _sync_waiting
+                _held_queues = []
+                if _sync_waiting and not _sync_paused_now:
+                    _held_queues.append(("Sync", _queue_waits["sync"]))
+                if _gpu_waiting and not _gpu_paused_now:
+                    _held_queues.append(("Processing", _queue_waits["gpu"]))
+                _traffic_waiting = bool(_held_queues)
+                tray.set_traffic_waiting(
+                    _traffic_waiting and not (_sync_working_now or _gpu_working_now))
                 _spin_color = activity_spin_color(
-                    sync_working=sync_working and not _sync_paused_now,
+                    sync_working=_sync_working_now,
                     gpu_working=_gpu_working_now,
-                    traffic_waiting=_traffic_waiting,
+                    traffic_waiting=_sync_waiting and not _sync_paused_now,
                 )
                 _queue_paused = (_sync_paused_now or _gpu_paused_now) and _spin_color is None
                 tray.set_queue_paused(_queue_paused)
@@ -916,13 +949,16 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 else:
                     tray.stop_spin()
                     if _traffic_waiting:
+                        _display_wait = max(
+                            (_wait for _, _wait in _held_queues), key=_wait_deadline)
                         _wait_label = (
-                            "24-hour" if _traffic_wait.get("reason")
+                            "24-hour" if _display_wait.get("reason")
                             == "daily_limit" else "hourly"
                         )
                         tip = f"YTArchiver — Paused for YouTube {_wait_label} limit"
+                        tip += " (" + " and ".join(label for label, _ in _held_queues) + ")"
                         try:
-                            _until = float(_traffic_wait.get("until") or 0)
+                            _until = float(_display_wait.get("until") or 0)
                             if _until > time.time():
                                 _resume_local = time.localtime(_until)
                                 _resume_time = time.strftime("%I:%M %p", _resume_local).lstrip("0")
@@ -1327,89 +1363,21 @@ def main():
             _log.debug("dark titlebar thread failed: %s", e)
     _boot_trace("dark titlebar deferred")
 
-    # Debounced window-state save. pywebview emits resize/move at ~60Hz
-    # during a drag — without debounce that's 60 config-file writes per
-    # second, each loading/mutating/saving the same JSON file (audit:
-    # main.py:1057-1076 + window_state.py:146-163). We coalesce all
-    # in-flight {width,height,x,y,maximized} updates into one save 250ms
-    # after the last event arrives.
-    _ws_lock = threading.Lock()
-    _ws_pending: dict = {}
-    _ws_timer: list = [None]  # holds the current Timer, if any
-    _state_writes_enabled = {"value": True}
+    # Preserve the 250ms quiet-period save without starting a Timer thread
+    # for every move/resize event. The worker sleeps between geometry bursts.
+    _ws_debouncer = winstate.WindowStateDebouncer(winstate.save_window_state)
+    _ws_schedule = _ws_debouncer.schedule
+    _stop_window_state_writes = _ws_debouncer.stop
 
-    def _stop_window_state_writes() -> None:
-        """Cancel stale config timers before a restore swaps live state."""
-        with _ws_lock:
-            _state_writes_enabled["value"] = False
-            _ws_pending.clear()
-            timer = _ws_timer[0]
-            if timer is not None:
-                try: timer.cancel()
-                except Exception: pass
-
-    def _ws_flush(expected_timer=None):
-        try:
-            with _ws_lock:
-                # A cancelled older timer may already be inside its callback
-                # while a newer debounce generation is scheduled. It must not
-                # consume the newer generation's pending geometry.
-                if (expected_timer is not None
-                        and _ws_timer[0] is not expected_timer):
-                    return
-                snap = _ws_pending.copy()
-                _ws_pending.clear()
-                _ws_timer[0] = None
-                enabled = _state_writes_enabled["value"]
-            if snap and enabled:
-                winstate.save_window_state(snap)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-    def _ws_schedule(updates: dict):
-        with _ws_lock:
-            if not _state_writes_enabled["value"]:
-                return
-            _ws_pending.update(updates)
-            t = _ws_timer[0]
-            if t is not None:
-                try: t.cancel()
-                except Exception: pass
-            timer = None
-
-            def _flush_this_generation():
-                _ws_flush(timer)
-
-            timer = threading.Timer(0.25, _flush_this_generation)
-            timer.daemon = True
-            _ws_timer[0] = timer
-            timer.start()
-
-    def _ws_owner_active() -> bool:
-        with _ws_lock:
-            timer = _ws_timer[0]
-        return bool(timer is not None and timer.is_alive())
-
-    def _ws_owner_join(timeout: float) -> bool:
-        with _ws_lock:
-            timer = _ws_timer[0]
-        if timer is not None and timer is not threading.current_thread():
-            try:
-                timer.join(timeout=max(0.0, float(timeout)))
-            except (RuntimeError, TypeError):
-                pass
-        return not _ws_owner_active()
-
-    # The debouncer is intentionally a Timer because pywebview can emit
-    # dozens of resize/move events per second.  It is nevertheless a named,
-    # joinable lifecycle owner: restore/shutdown cancels it before the config
-    # swap and the supervisor proves that no delayed writer remains.
+    # Restore/shutdown stops this owner and waits for any in-flight save
+    # before replacing configuration or completing the final state write.
     try:
         api._job_supervisor.register_owner(OwnerAdapter(
             owner="window-state",
             label="Window-state debouncer",
-            active=_ws_owner_active,
+            active=_ws_debouncer.is_active,
             prepare=_stop_window_state_writes,
-            join=_ws_owner_join,
+            join=_ws_debouncer.join,
             force=_stop_window_state_writes,
         ))
     except ValueError:

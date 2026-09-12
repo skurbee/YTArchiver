@@ -47,32 +47,65 @@ test("an existing installation loads without opening setup", async ({ page }) =>
   await expect(page.locator("#boot-issue-retry-seed")).toHaveCount(0);
 });
 
-test("a partially published native API recovers on bridge readiness without opening setup", async ({ page }) => {
+for (const signal of ["ready event", "poll fallback", "early ready event"]) {
+test(`a partially published native API waits for callable methods via ${signal}`, async ({ page }) => {
+  await page.clock.install();
   await page.addInitScript(() => {
     Object.defineProperty(window, "pywebview", {
       configurable: true,
       set(bridge) {
         const completeApi = bridge.api;
-        window.__publishCompleteApi = () => {
+        window.__publishCompleteApi = (fireEvent) => {
           bridge.api = completeApi;
-          window.dispatchEvent(new Event("pywebviewready"));
+          if (fireEvent) window.dispatchEvent(new Event("pywebviewready"));
         };
         bridge.api = {};
         Object.defineProperty(window, "pywebview", { configurable: true, writable: true, value: bridge });
       },
     });
   });
-  await loadApp(page);
-  await page.evaluate(() => window.seedLogs());
-  await expect(page.locator("#boot-issue-retry-seed")).toBeVisible();
+  await loadApp(page, { waitFor: "handlers" });
+  await page.evaluate(() => {
+    window.__readyResolved = false;
+    window.YT.bridge.ready.then(() => { window.__readyResolved = true; });
+  });
+  if (signal === "early ready event") {
+    await page.evaluate(() => window.dispatchEvent(new Event("pywebviewready")));
+  }
+  await page.clock.runFor(2000);
+  expect(await page.evaluate(() => window.YT.bridge.isUp())).toBe(false);
+  expect(await page.evaluate(() => window.__readyResolved)).toBe(false);
+  await expect(page.locator("#boot-issue-retry-seed")).toHaveCount(0);
+  await expect(page.locator("#boot-issue-banner")).not.toBeVisible();
+  expect(await page.evaluate(() => window.YT.bootIssues)).toEqual([]);
   await expect(page.locator("#onboarding-overlay")).not.toBeVisible();
-  await page.evaluate(() => window.__publishCompleteApi());
+  await page.evaluate(fireEvent => window.__publishCompleteApi(fireEvent), signal === "ready event");
+  await page.clock.runFor(200);
+  await page.evaluate(() => window.seedLogs());
+  expect(await page.evaluate(() => window.__readyResolved)).toBe(true);
   await expect(page.locator("#boot-issue-retry-seed")).toHaveCount(0);
   await expect(page.locator("#boot-issue-banner")).not.toBeVisible();
   await expect(page.locator("#onboarding-overlay")).not.toBeVisible();
   for (const method of ["startup_ready", "get_runtime_info", "get_subs_channels", "get_index_summary", "get_queues"]) {
     expect(await page.evaluate(method => window.__bridgeCallsFor(method).length, method)).toBeGreaterThan(0);
   }
+});
+}
+
+test("an API that never publishes its methods still warns and can recover after the timeout", async ({ page }) => {
+  await page.clock.install();
+  await page.addInitScript(() => { window.pywebview = { api: {} }; });
+  await loadApp(page, { bridgeDelayed: true });
+  await page.clock.runFor(6500);
+  await expect(page.locator("#boot-issue-banner")).toBeVisible();
+  await expect(page.locator("#boot-issue-retry-seed")).toBeVisible();
+  expect(await page.evaluate(() => window.YT.bootIssues.map(issue => issue.name)))
+    .toContain("App connection");
+  const { installDelayedBridge } = require("./fixtures");
+  await installDelayedBridge(page);
+  await page.evaluate(() => window.seedLogs());
+  await expect(page.locator("#boot-issue-banner")).not.toBeVisible();
+  await expect(page.locator("#boot-issue-retry-seed")).toHaveCount(0);
 });
 
 test("runtime recovery retries after an in-flight seed and retains unrelated startup warnings", async ({ page }) => {

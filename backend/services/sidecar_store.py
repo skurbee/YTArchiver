@@ -112,6 +112,7 @@ def _parse_jsonl_bytes(
         invalid: Literal["raise", "skip"] = "raise",
         require_trailing_newline: bool = False,
         path: str | os.PathLike[str] = "<memory>",
+        collect_records: bool = True,
         ) -> tuple[tuple[dict[str, Any], ...], tuple[int, ...]]:
     if require_trailing_newline and payload and not payload.endswith(b"\n"):
         raise SidecarValidationError(
@@ -137,17 +138,19 @@ def _parse_jsonl_bytes(
                 continue
             raise SidecarValidationError(
                 f"invalid JSONL object at {path}:{line_no}: {exc}") from exc
-        records.append(value)
+        if collect_records:
+            records.append(value)
     return tuple(records), tuple(invalid_lines)
 
 
 def validate_jsonl_bytes(payload: bytes, *,
                          require_trailing_newline: bool = True) -> None:
-    """Raise unless every nonblank JSONL record is an object."""
+    """Validate every record without retaining the decoded records in memory."""
     _parse_jsonl_bytes(
         payload,
         invalid="raise",
         require_trailing_newline=require_trailing_newline,
+        collect_records=False,
     )
 
 

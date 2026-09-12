@@ -1885,6 +1885,10 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
         except Exception:
             _ch_snapshot = dict(channel) if isinstance(channel, dict) else {}
 
+        from .. import youtube_traffic as _traffic
+        _traffic_context = _traffic.current_request_scope() or {
+            "queue": "sync", "sync_pass_id": _traffic.current_sync_pass_id()}
+
         def _task():
             from ..metadata.fetcher import emit_inline_metadata_outcome
             res = {"ok": False, "cancelled": True}
@@ -1907,13 +1911,14 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                         return
                     time.sleep(0.5)
                 from .. import metadata as _meta
-                res = _meta.fetch_single_video_metadata(
-                    _ch_snapshot, vid_id, final_path, title, stream,
-                    emit_terminal_log=False,
-                    cancel_event=_meta_cancel,
-                    process_owner="sync",
-                    process_task_id=_ch_snapshot.get("task_id") or "",
-                )
+                with _traffic.request_scope(**_traffic_context):
+                    res = _meta.fetch_single_video_metadata(
+                        _ch_snapshot, vid_id, final_path, title, stream,
+                        emit_terminal_log=False,
+                        cancel_event=_meta_cancel,
+                        process_owner="sync",
+                        process_task_id=_ch_snapshot.get("task_id") or "",
+                    )
                 if res.get("ok") and res.get("fetched"):
                     _bump_meta_counts("fetched")
                 elif res.get("ok") and res.get("skipped"):
@@ -2085,13 +2090,15 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                         _clear_discovery_row()
                         _finalize_download_archive()
                         return SyncResult(ok=False, reason="launch failed",
-                                          downloaded=0, errors=0)
+                                          downloaded=downloaded, errors=errors + 1,
+                                          incomplete=True)
                     proc = None
                     break
                 stream.emit_dim(f" Launch attempt {attempt+1} failed ({e}); retrying in 2s...")
                 time.sleep(2)
         if proc is None:
-            continue # streams pass launch failed — skip, main pass completed
+            _pass_returncodes.append(None)
+            continue
 
         current_vid_id = ""
 
@@ -2112,13 +2119,11 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
             pause_event=pause_event,
             kill_sec=_NO_OUTPUT_KILL_SEC,
         )
-        _last_out = _watchdog.last_output
         _wd_stop = _watchdog.stop_event
         _wd_stalled = _watchdog.stalled
         # Manual line iteration on the bytes stream so we can apply our
         # UTF-8-first-cp1252-fallback decoder (`_utils.decode_subprocess_line`).
         for _line_bytes in iter_download_output(proc, _watchdog):
-            _last_out[0] = time.time()   # watchdog heartbeat
             line = _utils.decode_subprocess_line(_line_bytes)
             if cancel_event is not None and cancel_event.is_set():
                 try:
@@ -3369,10 +3374,10 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
             finish_ytdlp_process(proc, watchdog=_watchdog)
         except Exception as e:
             swallow("ytdlp proc finish", e)
-        # record this pass's returncode for the final
-        # _ok check. None = terminated mid-flight without wait (treated
-        # below as not-a-failure if any other pass succeeded).
-        _pass_returncodes.append(proc.returncode if _watchdog.output_complete else -1)
+        # Retain each target's outcome. A killed process or incomplete stdout
+        # drain is not a completed walk, even if another target succeeds.
+        _pass_returncodes.append(
+            proc.returncode if _watchdog.output_complete and not _wd_stalled.get("hit") else -1)
         if (_target_url == url and _channel_page_unavailable
                 and not _main_channel_tracks):
             # A failed main channel cannot make later gap or /streams probes
@@ -3420,7 +3425,28 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     _sync_interrupted_now = bool(
         (cancel_event is not None and cancel_event.is_set())
         or (pause_event is not None and pause_event.is_set())
+        or (kill_current is not None and kill_current.is_set())
     )
+    # Decide traversal completeness before publishing activity or promoting a
+    # first sync to the incremental fast path. A later streams/retry success
+    # cannot prove that an earlier channel walk reached its end.
+    # 1 permits per-video errors already counted by the output parser; those
+    # IDs have their own retries. 101 is yt-dlp's expected break-on-existing
+    # exit from a nested channel playlist, not a process crash.
+    _NORMAL_RCS = (0, 1, 101)
+    _good_rcs = [rc for rc in _pass_returncodes if rc in _NORMAL_RCS]
+    _crashed = [rc for rc in _pass_returncodes if rc not in _NORMAL_RCS]
+    _process_failed = bool(_crashed) and not _sync_interrupted_now
+    if _process_failed:
+        errors += len(_crashed)
+        stream.emit([
+            [" ⚠ Channel check did not finish. ", "yellow"],
+            ["Downloaded videos were saved; sync again to check the "
+             "remaining videos.\n", "yellow"],
+        ])
+        stream.emit_dim(f" (incomplete download process exit codes: {_crashed})")
+    _sync_interrupted_now = _sync_interrupted_now or _process_failed
+    _walk_completed = bool(_pass_returncodes) and not _sync_interrupted_now
 
     # yt-dlp either ran without an archive (empty-folder refill) or against a
     # private per-run snapshot. Only YTArchiver's stricter committed set may
@@ -3481,7 +3507,8 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
             from .. import metadata as _md
             _bg_channel_maintenance(
                 "thumbs", _md.sweep_missing_thumbnails,
-                channel, stream=None, cancel_event=cancel_event)
+                channel, stream=None, cancel_event=cancel_event,
+                wait_for_budget=False)
         except Exception as _ts_e:
             _log.debug("thumbnail sweep spawn skipped: %s", _ts_e)
 
@@ -3796,7 +3823,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                     c["last_sync"] = now.strftime("%Y-%m-%d %H:%M")
                     _dirty = True
                     _was_interrupted = _sync_interrupted_now
-                    if _walked_meaningfully and not _was_interrupted:
+                    if _walked_meaningfully and _walk_completed:
                         if not c.get("initialized", False):
                             c["initialized"] = True
                             _dirty = True
@@ -3818,7 +3845,7 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                             swallow("sync-interrupted emit", e)
                     # Only stamp channel-level refresh timestamps on a bootstrap
                     # pass; an incremental sync may refresh only a few entries.
-                    if _meta_did_fetch and _was_bootstrap_pass:
+                    if _meta_did_fetch and _was_bootstrap_pass and _walk_completed:
                         c["last_views_refresh_ts"] = _now_ts
                         c["last_comments_refresh_ts"] = _now_ts
                         _dirty = True
@@ -3932,45 +3959,6 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
     except Exception as e:
         swallow("orphan-dlrow sweep", e)
 
-    # derive _ok from ANY pass's returncode instead of
-    # reading the last proc.returncode (which could be None if the loop
-    # broke via terminate, and could belong to a /streams pass that
-    # failed even if the main pass succeeded). Normal yt-dlp exit codes:
-    #   0   = clean exit
-    #   1   = "some entries failed" (already counted in errors)
-    # 101   = --break-on-existing aborted a multi-playlist iteration.
-    #         This happens on EVERY fully-synced channel root URL (no
-    #         /videos suffix) because the channel root expands to Videos
-    #         + Shorts as a "multi-playlist", and yt-dlp returns 101 when
-    #         it aborts the outer iteration after the first inner playlist
-    #         hits the break. NOT a crash. Without 101 in the OK set, the
-    #         status emit below would flag every fully-synced channel as
-    #         having an error.
-    # Anything else = real crash. If all rcs are None (cancelled/paused
-    # before any pass finished) treat as ok-but-partial when downloaded > 0.
-    _NORMAL_RCS = (0, 1, 101)
-    _good_rcs = [rc for rc in _pass_returncodes if rc in _NORMAL_RCS]
-    _crashed = [rc for rc in _pass_returncodes if rc is not None and rc not in _NORMAL_RCS]
-    # If yt-dlp crashed before emitting any output (corrupt exe,
-    # antivirus quarantine, DLL missing), the readline loop saw zero
-    # ERROR: lines and `errors` stayed 0 — the per-channel summary
-    # rolled up as "no new videos" instead of the real crash. Bump
-    # errors here so the summary tells the truth (audit:
-    # sync/core.py H31).
-    if _crashed and downloaded == 0:
-        errors = max(errors, 1)
-        try:
-            _rc_hex = ", ".join(f"0x{(rc & 0xFFFFFFFF):08X}" for rc in _crashed)
-            # Verbose-only: these are almost always transient (network
-            # blip, YouTube rate-limit, cookie expiry) — not actionable
-            # for a Simple-mode user. The channel row's "— N error"
-            # summary stays visible in both modes so the failure isn't
-            # invisible; Verbose users still get the exit-code detail.
-            stream.emit_dim(
-                f"yt-dlp crashed with no output (exit {_rc_hex}) — "
-                "no videos checked.")
-        except Exception as _e:
-            swallow("crash-exit emit", _e)
     # Stale-yt-dlp nudge. A pass that downloaded NOTHING while hitting several
     # nsig signature-decrypt failures almost always means an out-of-date yt-dlp
     # that can't decrypt YouTube's current signatures — the "idle a while,
@@ -3995,24 +3983,25 @@ def _sync_channel_impl(channel: dict[str, Any], stream: LogStreamer,
                           "Tools → yt-dlp → Update, then sync again.",
                           "red"], ["\n", "red"]])
             stream.emit([[_sbar + "\n\n", "red"]])
-    if _good_rcs:
-        _ok = True
-    elif _crashed:
+    if _process_failed:
         _ok = False
+    elif _good_rcs:
+        _ok = True
     else:
-        # All None: every pass was terminated mid-flight. Treat as
-        # successful if any work was actually done (partial cancel),
-        # otherwise as a no-op failure.
+        # No target completed. Preserve the partial-work result for an
+        # intentional stop; unexpected process failures were handled above.
         _ok = (downloaded > 0
                or _existing_file_skipped > 0
                or _archived_skipped > 0
                or bool(_filtered_this_run))
     # Report the most informative exit code: prefer a real one, fall
     # back to last proc.returncode if it exists, else 0.
-    _exit_for_caller = next(iter(_good_rcs), None)
+    _exit_for_caller = next(iter(_crashed if _process_failed else _good_rcs), None)
     if _exit_for_caller is None:
         _exit_for_caller = next(iter(_crashed), proc.returncode if proc else 0)
     return SyncResult(ok=_ok, downloaded=downloaded, errors=errors,
+                      incomplete=_process_failed,
+                      reason="channel_check_incomplete" if _process_failed else "",
                       took=took, exit=_exit_for_caller,
                       channel_tracks=_channel_tracks,
                       total=(downloaded + _archived_skipped

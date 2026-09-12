@@ -54,6 +54,25 @@ TRASH_RETENTION_MAX_DAYS = 3650
 TRASH_RETENTION_UPGRADE_GRACE_SECONDS = 30 * 24 * 60 * 60
 TRASH_RETENTION_CHANGE_GRACE_SECONDS = 24 * 60 * 60
 
+AUTO_BACKUP_KEEP_DEFAULT = 4
+AUTO_BACKUP_KEEP_MAX = 10
+TRAFFIC_EXPIRATION_GROUP_DEFAULT = 1
+TRAFFIC_EXPIRATION_GROUP_CHOICES = (1, 10, 30, 60)
+
+
+def normalize_auto_backup_keep(value: Any) -> int:
+    """Preserve the existing four-backup policy for malformed stored values."""
+    if type(value) is int and 1 <= value <= AUTO_BACKUP_KEEP_MAX:
+        return value
+    return AUTO_BACKUP_KEEP_DEFAULT
+
+
+def normalize_traffic_expiration_group(value: Any) -> int:
+    """Use minute detail when a stored popup grouping is missing or invalid."""
+    if type(value) is int and value in TRAFFIC_EXPIRATION_GROUP_CHOICES:
+        return value
+    return TRAFFIC_EXPIRATION_GROUP_DEFAULT
+
 
 def _safe_retention_grace(value: Any) -> float:
     try:
@@ -149,6 +168,8 @@ DEFAULT_CONFIG = {
     # the AutoBackupScheduler writes the full-state export into
     # `<archive root>\YTArchiver Info\` on that cadence.
     "auto_backup_interval": "off",
+    # Prune older scheduled ZIPs only after a new backup succeeds.
+    "auto_backup_keep": AUTO_BACKUP_KEEP_DEFAULT,
     # Include the Search database in manual and scheduled full backups,
     # regardless of its size. Only an explicit False opts out.
     "backup_include_search_db": True,
@@ -156,6 +177,8 @@ DEFAULT_CONFIG = {
     # touch this — the schedule stays honest even if the user also
     # exports by hand).
     "last_auto_backup_ts": 0.0,
+    # The daily request drop-off popup's display grouping, independent of limits.
+    "traffic_expiration_group_minutes": TRAFFIC_EXPIRATION_GROUP_DEFAULT,
     # App-managed Trash is kept for 30 days by default. 0 means Never.
     # The grace timestamp is maintained by migrations/settings code and is
     # deliberately not user-settable through settings_save.

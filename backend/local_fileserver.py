@@ -259,33 +259,48 @@ class _FileRequestHandler(BaseHTTPRequestHandler):
         start, end, is_range = parsed
         content_length = end - start + 1
 
-        if is_range:
-            self.send_response(206)
-            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-        else:
-            self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(content_length))
-        # Accept-Ranges: bytes tells the browser this resource is seekable.
-        # Without it, <video> won't even try range requests and falls back
-        # to sequential-only playback, which breaks scrubbing.
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Cache-Control", "public, max-age=86400")
-        self.end_headers()
+        response_started = False
         try:
             with open(path, "rb") as f:
                 f.seek(start)
+                # A directory entry can survive while its storage device is
+                # unavailable. Verify the first read before promising a body:
+                # an incomplete HTTP/1.1 success otherwise parks image loads.
+                first_size = min(64 * 1024, content_length)
+                chunk = f.read(first_size)
+                if len(chunk) != first_size:
+                    raise OSError("File ended before its advertised size")
+                response_started = True
+                if is_range:
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                else:
+                    self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(content_length))
+                # Preserve video seeking and ordinary image cache behavior.
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
                 remaining = content_length
                 while remaining > 0:
-                    chunk = f.read(min(64 * 1024, remaining))
                     if not chunk:
-                        break
+                        raise OSError("File ended during its response")
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
+                    if remaining:
+                        chunk = f.read(min(64 * 1024, remaining))
         except (OSError, ConnectionError):
-            # Client closed the connection (common on seek — browser
-            # aborts the in-flight range to issue a new one). Silent.
-            pass
+            # After success headers, closing is the only valid way to signal
+            # a short body. Reusing this connection would make the browser
+            # wait for missing bytes or consume the next response as image data.
+            # This also covers ordinary client disconnects during video seeks.
+            self.close_connection = True
+            if not response_started:
+                try:
+                    self.send_error(500, "File could not be read")
+                except (OSError, ConnectionError):
+                    pass
 
 
 def _pick_free_port() -> int:

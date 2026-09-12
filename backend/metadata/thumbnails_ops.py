@@ -86,16 +86,17 @@ def _output_dir_where() -> tuple[str, list[str]]:
 
 
 def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
-                              cancel_event=None) -> dict[str, int]:
+                              cancel_event=None, *,
+                              wait_for_budget: bool = True) -> dict[str, int]:
     """Issue #147/#158: scan a channel folder for .mp4 files that lack a
     thumbnail in `.Thumbnails/` and download any missing ones from the
     URLs cached in metadata.jsonl. Use after a sync pass to catch
     thumbnails that yt-dlp's bulk download missed (rate-limited, racy,
     transient network blips). Returns {checked, fetched, missing}.
 
-    `cancel_event` (audit: thumbnails_ops H38) is checked per-bucket so
-    a user-pressed Cancel during the post-sync sweep returns promptly
-    instead of waiting for hundreds of HTTP fetches.
+    Cancellation also interrupts request pacing and prevents late writes.
+    Post-sync callers can defer previews when hourly/daily budgets are
+    exhausted, releasing their channel lease for foreground processing.
     """
     def _is_cancelled():
         return cancel_event is not None and cancel_event.is_set()
@@ -103,6 +104,7 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
     if not folder or not folder.exists():
         return {"checked": 0, "fetched": 0, "missing": 0}
     checked = fetched = still_missing = 0
+    budget_deferred = False
     # _scan_channel_videos returns (vid_id, title, year, month, filepath).
     # Group by (year, month) so each metadata.jsonl is read exactly once
     # per bucket. The jsonl path depends on the channel's split_years +
@@ -126,6 +128,8 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
     _all_thumb_vids: set = set()
     try:
         for _dp, _dns, _fns in os.walk(ch_root):
+            if _is_cancelled():
+                return {"checked": 0, "fetched": 0, "missing": 0}
             if os.path.basename(_dp) != ".Thumbnails":
                 continue
             for _fn in _fns:
@@ -144,11 +148,13 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
     by_bucket: dict[tuple[int | None, int | None],
                     list[tuple[str, str]]] = {}
     for vid_id, _title, _y, _m, path in _scan_channel_videos(folder):
+        if _is_cancelled():
+            return {"checked": 0, "fetched": 0, "missing": 0}
         if not vid_id:
             continue
         by_bucket.setdefault((_y, _m), []).append((path, vid_id))
     for (yr, mo), items in by_bucket.items():
-        if _is_cancelled():
+        if _is_cancelled() or budget_deferred:
             break
         jp, sub = _get_metadata_jsonl_path(
             name, ch_root, split_years, split_months, yr, mo)
@@ -171,8 +177,19 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
                 still_missing += 1
                 continue
             try:
+                outcome: dict[str, Any] = {}
                 downloaded = _download_thumbnail(url, thumb_dir, title, vid_id,
-                                                 stream=stream)
+                                                 stream=stream,
+                                                 commit_allowed=lambda: not _is_cancelled(),
+                                                 wait_for_budget=wait_for_budget,
+                                                 result_out=outcome)
+                if _is_cancelled():
+                    break
+                if outcome.get("deferred"):
+                    budget_deferred = True
+                    still_missing += 1
+                    _log.debug("Thumbnail sweep deferred until request budget is available.")
+                    break
                 if downloaded and _thumbnail_exists_for(thumb_dir, vid_id):
                     fetched += 1
                     _all_thumb_vids.add(vid_id)

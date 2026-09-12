@@ -64,8 +64,9 @@ def run_bootstrap(tmp_path, monkeypatch):
         monkeypatch.setattr(queues, "_write_resuming_payload", lambda *_a, **_k: True)
         try:
             assert queues.sync_enqueue(channel)
-            sync_all.sync_all(
-                mock.Mock(), queues=queues, add_downloads_from_config=False,
+            stream = mock.Mock()
+            outcome = sync_all.sync_all(
+                stream, queues=queues, add_downloads_from_config=False,
                 cancel_event=cancel, pause_event=pause, skip_event=skip,
             )
             download_mock.assert_called_once()
@@ -73,6 +74,14 @@ def run_bootstrap(tmp_path, monkeypatch):
                 assert queues.current_sync is None
                 assert len(queues.sync_snapshot()) == 1
             assert channel_leases.active_snapshot() == ()
+            if result.get("incomplete"):
+                text = "".join(str(segment[0]) for call in stream.emit.call_args_list
+                               for segment in call.args[0])
+                assert "Pass incomplete:" in text
+                assert "Pass complete:" not in text
+                assert not outcome["ok"]
+                assert outcome["reason"] == "channel_check_incomplete"
+                assert outcome["errors"] == result["errors"]
             return cooldown
         finally:
             queues.mark_orphan()
@@ -90,6 +99,8 @@ def run_bootstrap(tmp_path, monkeypatch):
     {"ok": True, "downloaded": 1, "errors": 0, "total": 100001,
      "cancelled": True},
     {"ok": True, "downloaded": 1, "errors": 0, "total": 100000},
+    {"ok": False, "downloaded": 1, "errors": 1, "total": 100001,
+     "incomplete": True},
 ])
 def test_failed_empty_partial_or_small_bootstrap_does_not_cool_down(
         run_bootstrap, result):

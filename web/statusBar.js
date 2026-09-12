@@ -30,8 +30,9 @@
   let _trafficExpirationsGeneration = 0;
   let _trafficExpirationsInFlight = null;
   let _trafficExpirationsSnapshot = null;
+  let _trafficExpirationWindow = "daily";
   let _trafficExpirationGroupMinutes = 1;
-  const _trafficExpirationGroupKey = "ytarch.traffic.expirationGroupMinutes";
+  const _trafficExpirationGroupKey = "traffic_expiration_group_minutes";
   const _trafficExpirationGroups = [1, 10, 30, 60];
 
   function _syncNativeErrorIndicator() {
@@ -70,7 +71,11 @@
     const list = _queues[kind] || [];
     const st = _state[kind] || {};
     const count = _queueCount(kind);
-    if (kind === "sync" && st.trafficWaiting) {
+    if (st.paused || st.pausedActive) {
+      return count ? `${idleLabel.split(" ")[0]} paused (${count})`
+                   : `${idleLabel.split(" ")[0]} paused`;
+    }
+    if (st.trafficWaiting) {
       const wait = st.trafficWait || {};
       const until = Number(wait.until);
       const at = Number.isFinite(until)
@@ -79,11 +84,7 @@
           })
         : "";
       const windowName = wait.reason === "daily_limit" ? "24-hour" : "hourly";
-      return `Waiting for ${windowName} slot${at ? ` (${at})` : ""}`;
-    }
-    if (st.paused) {
-      return count ? `${idleLabel.split(" ")[0]} paused (${count})`
-                   : `${idleLabel.split(" ")[0]} paused`;
+      return `${idleLabel.split(" ")[0]} waiting for ${windowName} slot${at ? ` (${at})` : ""}`;
     }
     const running = _runningItem(list);
     if (running || st.running) {
@@ -116,10 +117,12 @@
 
     const sSt = _state.sync || {}, gSt = _state.gpu || {};
     const syncLimitHold = !!(sSt.trafficWaiting || sSt.sessionLimited);
+    const gpuLimitHold = !!gSt.trafficWaiting;
     _setSeg("gsb-sync",
       !syncLimitHold && (sSt.running || _runningItem(_queues.sync)),
-      sSt.paused || syncLimitHold);
-    _setSeg("gsb-gpu", gSt.running || _runningItem(_queues.gpu), gSt.paused);
+      sSt.paused || sSt.pausedActive || syncLimitHold);
+    _setSeg("gsb-gpu", !gpuLimitHold && (gSt.running || _runningItem(_queues.gpu)),
+      gSt.paused || gSt.pausedActive || gpuLimitHold);
 
     // Index / sweep indicator.
     const idxEl = document.getElementById("gsb-index");
@@ -249,13 +252,19 @@
       ?.classList.contains("open");
   }
 
+  function _trafficExpirationAnchor() {
+    return document.getElementById(`gsb-traffic-${_trafficExpirationWindow}`);
+  }
+
   function _closeTrafficExpirations({ restoreFocus = false } = {}) {
     const pop = document.getElementById("popover-traffic-expirations");
-    const anchor = document.getElementById("gsb-traffic-daily");
+    const anchor = _trafficExpirationAnchor();
     const wasOpen = _trafficExpirationsOpen();
     document.getElementById("gsb-traffic-expirations-group")?._ytddClose?.();
     pop?.classList.remove("open");
-    anchor?.setAttribute("aria-expanded", "false");
+    for (const id of ["gsb-traffic-hourly", "gsb-traffic-daily"]) {
+      document.getElementById(id)?.setAttribute("aria-expanded", "false");
+    }
     if (wasOpen) {
       _trafficExpirationsGeneration++;
       if (restoreFocus) anchor?.focus({ preventScroll: true });
@@ -280,17 +289,16 @@
     empty.className = "queue-empty";
     empty.textContent = message;
     body.replaceChildren(empty);
-    document.getElementById("gsb-traffic-expirations-summary").textContent = "";
   }
 
-  function _groupTrafficExpirations(expirations) {
+  function _groupTrafficExpirations(expirations, groupMinutes) {
     const groups = new Map();
     for (const item of expirations) {
       const date = new Date(item.expires_at * 1000);
       // Subtract elapsed minutes to align with the local clock without
       // merging the two occurrences of an hour when daylight saving ends.
       const start = item.expires_at -
-        (date.getMinutes() % _trafficExpirationGroupMinutes) * 60;
+        (date.getMinutes() % groupMinutes) * 60;
       groups.set(start, (groups.get(start) || 0) + Number(item.units));
     }
     return [...groups].sort((a, b) => a[0] - b[0])
@@ -301,15 +309,19 @@
     _trafficExpirationsSnapshot = state;
     const body = document.getElementById("gsb-traffic-expirations-body");
     if (!body) return;
+    const hourly = _trafficExpirationWindow === "hourly";
+    const groupMinutes = hourly ? 1 : _trafficExpirationGroupMinutes;
     if (!state.expirations.length) {
-      _trafficExpirationMessage("No requests are counted in the last 24 hours.");
+      _trafficExpirationMessage(`No requests are counted in the last ${hourly ? "hour" : "24 hours"}.`);
       return;
     }
-    document.getElementById("gsb-traffic-expirations-summary").textContent =
-      `${Number(state.daily_used).toLocaleString()} currently counted`;
     const today = new Date(state.as_of * 1000);
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
+    const dayLabel = (date) => date.toDateString() === today.toDateString() ? "Today"
+      : date.toDateString() === tomorrow.toDateString() ? "Tomorrow"
+      : date.toLocaleDateString([], { month: "short", day: "numeric" });
+    const grouped = _groupTrafficExpirations(state.expirations, groupMinutes);
     const table = document.createElement("table");
     table.className = "gsb-traffic-expirations-table";
     const head = table.createTHead().insertRow();
@@ -320,18 +332,16 @@
       head.appendChild(cell);
     }
     const rows = table.createTBody();
-    for (const item of _groupTrafficExpirations(state.expirations)) {
+    for (const item of grouped) {
       const date = new Date(item.expires_at * 1000);
-      const day = date.toDateString() === today.toDateString() ? "Today"
-        : date.toDateString() === tomorrow.toDateString() ? "Tomorrow"
-        : date.toLocaleDateString([], { month: "short", day: "numeric" });
+      const day = dayLabel(date);
       const time = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-      const end = new Date((item.expires_at + (_trafficExpirationGroupMinutes - 1) * 60) * 1000);
+      const end = new Date((item.expires_at + (groupMinutes - 1) * 60) * 1000);
       const endTime = end.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
       const row = rows.insertRow();
       const at = document.createElement("time");
       at.dateTime = date.toISOString();
-      at.textContent = `${day} · ${time}${_trafficExpirationGroupMinutes > 1 ? `–${endTime}` : ""}`;
+      at.textContent = `${day} · ${time}${groupMinutes > 1 ? `–${endTime}` : ""}`;
       row.insertCell().appendChild(at);
       row.insertCell().textContent = `−${Number(item.units).toLocaleString()}`;
     }
@@ -343,18 +353,23 @@
   async function _refreshTrafficExpirations() {
     if (!_trafficExpirationsOpen()) return;
     const generation = _trafficExpirationsGeneration;
+    const windowName = _trafficExpirationWindow;
+    const anchor = _trafficExpirationAnchor();
     if (_trafficExpirationsInFlight === generation) return;
     _trafficExpirationsInFlight = generation;
     const body = document.getElementById("gsb-traffic-expirations-body");
     body?.setAttribute("aria-busy", "true");
     try {
       if (!window.YT?.bridge?.isUp?.()) throw new Error("Bridge unavailable");
-      const state = await window.YT.bridge.bridgeCall("youtube_traffic_expirations");
+      const state = windowName === "hourly"
+        ? await window.YT.bridge.bridgeCall("youtube_traffic_expirations", "hourly")
+        : await window.YT.bridge.bridgeCall("youtube_traffic_expirations");
       // A late response must not reopen a dismissed popup or replace a
       // newer snapshot after the user closes and reopens it.
       if (generation !== _trafficExpirationsGeneration || !_trafficExpirationsOpen()) return;
       if (!state?.ok || !Array.isArray(state.expirations) ||
-          !Number.isFinite(state.as_of) || !Number.isFinite(state.daily_used)) {
+          !Number.isFinite(state.as_of) ||
+          !Number.isFinite(windowName === "hourly" ? state.hourly_used : state.daily_used)) {
         throw new Error("Drop-off schedule unavailable");
       }
       _renderTrafficExpirations(state);
@@ -369,23 +384,30 @@
         if (_trafficExpirationsOpen()) {
           _positionStatusPopover(
             document.getElementById("popover-traffic-expirations"),
-            document.getElementById("gsb-traffic-daily"));
+            anchor);
         }
       }
     }
   }
 
-  function _toggleTrafficExpirations(anchor) {
+  function _toggleTrafficExpirations(anchor, windowName) {
     const pop = document.getElementById("popover-traffic-expirations");
     if (!pop || !anchor) return;
-    if (_trafficExpirationsOpen()) {
+    if (_trafficExpirationsOpen() && _trafficExpirationWindow === windowName) {
       _closeTrafficExpirations();
       return;
     }
     _closeOpenPopovers();
+    _trafficExpirationWindow = windowName;
     _trafficExpirationsGeneration++;
     document.getElementById("gsb-traffic-expirations-group")?._ytddClose?.();
+    const hourly = windowName === "hourly";
+    const title = hourly ? "Hourly drop-offs" : "24-hour drop-offs";
+    document.getElementById("gsb-traffic-expirations-title").textContent = title;
+    document.getElementById("gsb-traffic-expirations-close").setAttribute("aria-label", `Close ${title}`);
+    document.getElementById("gsb-traffic-expirations-controls").hidden = hourly;
     _trafficExpirationMessage("Loading drop-offs…");
+    document.getElementById("gsb-traffic-expirations-body").scrollTop = 0;
     _positionStatusPopover(pop, anchor);
     pop._queueAnchor = anchor;
     pop.classList.add("open");
@@ -607,37 +629,65 @@
       window.toggleQueuePopover?.("gpu", e.currentTarget);
     });
     const dailyBtn = document.getElementById("gsb-traffic-daily");
+    const hourlyBtn = document.getElementById("gsb-traffic-hourly");
     const expirationGroup = document.getElementById("gsb-traffic-expirations-group");
     if (expirationGroup) {
-      try {
-        const saved = Number(localStorage.getItem(_trafficExpirationGroupKey));
-        if (_trafficExpirationGroups.includes(saved)) _trafficExpirationGroupMinutes = saved;
-      } catch (e) { /* Keep the default if local preferences are unavailable. */ }
-      expirationGroup.value = String(_trafficExpirationGroupMinutes);
-      window.enhanceSelect?.(expirationGroup);
-      expirationGroup.addEventListener("change", () => {
-        const minutes = Number(expirationGroup.value);
-        if (!_trafficExpirationGroups.includes(minutes)) return;
+      const preferences = window.YT.preferences;
+      const applyGrouping = (minutes) => {
         _trafficExpirationGroupMinutes = minutes;
-        try { localStorage.setItem(_trafficExpirationGroupKey, String(minutes)); }
-        catch (e) { /* The selection still applies for this session. */ }
+        expirationGroup.value = String(minutes);
+        expirationGroup._ytddRepaint?.();
         if (_trafficExpirationsSnapshot && _trafficExpirationsOpen()) {
           document.getElementById("gsb-traffic-expirations-body").scrollTop = 0;
           _renderTrafficExpirations(_trafficExpirationsSnapshot);
-          _positionStatusPopover(document.getElementById("popover-traffic-expirations"), dailyBtn);
+          _positionStatusPopover(document.getElementById("popover-traffic-expirations"), _trafficExpirationAnchor());
+        }
+      };
+      expirationGroup.value = String(_trafficExpirationGroupMinutes);
+      window.enhanceSelect?.(expirationGroup);
+      // Native private browser sessions do not retain localStorage across restarts.
+      // Hydration's per-setting revision guard protects a newer user selection.
+      const hydrateGrouping = () => preferences.hydrate(settings => {
+        const saved = settings[_trafficExpirationGroupKey];
+        applyGrouping(_trafficExpirationGroups.includes(saved) ? saved : 1);
+      }, [_trafficExpirationGroupKey]).catch(error => {
+        console.warn("Request drop-off grouping could not be loaded:", error);
+      });
+      hydrateGrouping();
+      expirationGroup.addEventListener("change", async () => {
+        if (expirationGroup.disabled) return;
+        const minutes = Number(expirationGroup.value);
+        if (!_trafficExpirationGroups.includes(minutes)) return;
+        const previous = _trafficExpirationGroupMinutes;
+        expirationGroup.disabled = true;
+        applyGrouping(minutes);
+        try {
+          await preferences.save({ [_trafficExpirationGroupKey]: minutes });
+        } catch (error) {
+          const saved = preferences.snapshot()?.[_trafficExpirationGroupKey];
+          applyGrouping(_trafficExpirationGroups.includes(saved) ? saved : previous);
+          // A failed early save may precede the first read of the saved value.
+          // Retry hydration with a new guard, still yielding to any later edit.
+          hydrateGrouping();
+          window._showToast?.("Could not save grouping. Please try again.", "error");
+        } finally {
+          expirationGroup.disabled = false;
+          expirationGroup._ytddRepaint?.();
         }
       });
     }
-    dailyBtn?.addEventListener("click", (e) => {
-      e.stopPropagation();
-      _toggleTrafficExpirations(e.currentTarget);
-    });
+    for (const [button, windowName] of [[hourlyBtn, "hourly"], [dailyBtn, "daily"]]) {
+      button?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        _toggleTrafficExpirations(e.currentTarget, windowName);
+      });
+    }
     document.getElementById("gsb-traffic-expirations-close")?.addEventListener("click", () => {
       _closeTrafficExpirations({ restoreFocus: true });
     });
     document.addEventListener("click", (e) => {
       const pop = document.getElementById("popover-traffic-expirations");
-      if (!pop?.contains(e.target) && !dailyBtn?.contains(e.target)) {
+      if (!pop?.contains(e.target) && !dailyBtn?.contains(e.target) && !hourlyBtn?.contains(e.target)) {
         _closeTrafficExpirations();
       }
     });
@@ -646,7 +696,7 @@
     });
     window.addEventListener("resize", () => {
       if (_trafficExpirationsOpen()) {
-        _positionStatusPopover(document.getElementById("popover-traffic-expirations"), dailyBtn);
+        _positionStatusPopover(document.getElementById("popover-traffic-expirations"), _trafficExpirationAnchor());
       }
     });
     // Log button jumps to the full log. The error segment opens a compact

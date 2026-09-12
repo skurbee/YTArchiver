@@ -307,8 +307,11 @@ def check_configured_cookie_session(*, context: str) -> bool:
     Firefox can retain unexpired-looking cookie rows after YouTube has
     invalidated the server-side session.  ``:ytfav`` is yt-dlp's authenticated
     Liked Videos feed; a one-item flat probe verifies the real session without
-    downloading media.
+    downloading media. If traffic limits or spacing prevent an immediate
+    probe, let the worker perform its normal governed authentication check
+    instead of blocking the Resume action until a request slot opens.
     """
+    global _cookie_alert_fired
     with _lock:
         if _stream is None or _pause_event is None or _queues is None:
             # Narrow unit-test/CLI helpers do not own the desktop app's pause
@@ -322,12 +325,16 @@ def check_configured_cookie_session(*, context: str) -> bool:
         return True
     if not check_cookie_source(args, context=context):
         return False
+    # A retry that passes the local check must be able to report server-side
+    # sign-out again, even if the remote probe is deferred or inconclusive.
+    with _lock:
+        _cookie_alert_fired = False
     if not args:
         return True
     yt = find_yt_dlp()
     if not yt:
         return True
-    permission = youtube_traffic.acquire("session_probe")
+    permission = youtube_traffic.acquire("session_probe", wait_for_slot=False)
     if not permission.get("ok"):
         if permission.get("cooldown"):
             return False
@@ -352,6 +359,7 @@ def check_configured_cookie_session(*, context: str) -> bool:
             encoding="utf-8",
             errors="replace",
             timeout=25,
+            wall_timeout=25,
             startupinfo=make_startupinfo(),
             env=utf8_subprocess_env(),
         )
@@ -379,9 +387,6 @@ def check_configured_cookie_session(*, context: str) -> bool:
             "YouTube session probe inconclusive (rc=%s): %s",
             proc.returncode, " ".join(output.split())[:300])
         return True
-    global _cookie_alert_fired
-    with _lock:
-        _cookie_alert_fired = False
     return True
 
 

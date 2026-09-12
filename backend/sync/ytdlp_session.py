@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .. import utils as _utils
@@ -40,6 +40,7 @@ class DownloadWatchdog:
     last_output: list[float]
     stalled: dict[str, bool]
     thread: threading.Thread
+    parser_busy: threading.Event = field(default_factory=threading.Event)
     output_reader: ProcessOutputReader | None = None
     output_complete: bool = False
 
@@ -86,8 +87,9 @@ def start_download_watchdog(
 ) -> DownloadWatchdog:
     """Kill a silent yt-dlp process when it stalls or pause/cancel fires."""
     stop_event = threading.Event()
-    last_output = [time.time()]
+    last_output = [time.monotonic()]
     stalled = {"hit": False}
+    parser_busy = threading.Event()
 
     def _run() -> None:
         accounted_wait = budget_wait_seconds(proc)
@@ -104,12 +106,19 @@ def start_download_watchdog(
                 except Exception as exc:
                     swallow("cancel kill", exc)
                 return
-            if time.time() - last_output[0] > kill_sec:
+            # The parser performs local caption/index work between reads.
+            # During that work a full output queue can also block the child;
+            # neither condition is evidence of a stalled YouTube request.
+            # Cancellation above remains active throughout local processing.
+            if parser_busy.is_set():
+                continue
+            if time.monotonic() - last_output[0] > kill_sec:
                 stalled["hit"] = True
                 try:
                     stream.emit([[f" ⚠ No response for "
-                                  f"{kill_sec}s — skipping this "
-                                  f"download and moving on.\n", "red"]])
+                                  f"{kill_sec}s — stopping this channel "
+                                  f"check. Sync again to check the "
+                                  f"remaining videos.\n", "red"]])
                     stream.flush()
                 except Exception as exc:
                     swallow("stall-warn stream flush", exc)
@@ -126,6 +135,7 @@ def start_download_watchdog(
         last_output=last_output,
         stalled=stalled,
         thread=thread,
+        parser_busy=parser_busy,
     )
 
 
@@ -146,7 +156,16 @@ def iter_download_output(proc: subprocess.Popen, watchdog: DownloadWatchdog):
                 post_exit_deadline = None
                 channel, line = item
                 if channel == "stdout":
-                    yield line
+                    watchdog.parser_busy.set()
+                    try:
+                        yield line
+                    finally:
+                        # Start a fresh silence interval only once the caller
+                        # is ready to consume output again. Set the timestamp
+                        # before clearing busy so the watchdog cannot see the
+                        # old deadline between those two operations.
+                        watchdog.last_output[0] = time.monotonic()
+                        watchdog.parser_busy.clear()
                 continue
             if reader.finished:
                 break

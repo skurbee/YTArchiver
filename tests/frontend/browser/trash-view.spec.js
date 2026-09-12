@@ -57,7 +57,8 @@ test("source templates wire Trash, retention choices, and truthful backup copy",
   expect(settings).not.toContain("does not free space until");
   expect(settings).not.toContain('id="settings-auto-backup"');
   expect(health).toContain('id="settings-auto-backup"');
-  expect(health).toContain("Keeps the newest four.");
+  expect(health).toContain('id="settings-auto-backup-keep"');
+  expect(health).toContain("Older scheduled backup ZIPs are removed only after the next successful automatic backup");
   expect(health).not.toContain("older ones move to the archive trash");
   expect(assembled).toContain('id="view-trash"');
   expect(assembled).toContain('id="settings-trash-retention-days"');

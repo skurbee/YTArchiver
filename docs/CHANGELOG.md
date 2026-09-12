@@ -6,6 +6,32 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v84.9 - More reliable sync recovery and clearer controls
+
+09.12.26 11:59am
+
+### Added
+
+- Click the hourly YouTube request counter to see upcoming drop-offs, alongside the existing 24-hour schedule. The daily schedule now remembers its grouping setting across restarts.
+- Choose how many automatic backups to retain. Lowering the limit asks for confirmation; older scheduled backups are removed only after the next successful automatic backup.
+
+### Fixed
+
+- Resume can start queued work without getting stuck waiting for a request slot during session checks. Session checks have a bounded timeout, and traffic waits remain associated with the queue that owns them.
+- Channel sync waits for restored Processing jobs to finish before taking the channel lock, then continues automatically. Pause, cancel, and skip remain available while waiting, and unfinished passes are no longer reported as complete.
+- Long-running channel checks no longer time out while local caption and indexing work is active. Interrupted traversal stays incomplete so later syncs can check the remaining videos.
+- Delayed caption work retains the initiating task's traffic-limit authorization while emergency rate-limit protection remains active.
+- Channel artwork uses bounded loading attempts and fallback URLs when cached images fail. Local media responses now report initial read failures and close interrupted transfers so failed loads can recover.
+- Reduced overhead during window movement and large transcript validation, improving responsiveness during sync.
+- Fixed startup initialization and request-schedule loading errors instead of suppressing their warnings.
+- Reduce temporary memory use when validating large transcript sidecars while retaining the same validation checks.
+
+### Improved
+
+- Health Overview reuses recently loaded results when returning to the tab, and Library channel information starts expanded.
+- Simplified request-limit popup text and aligned hourly and daily tooltips. Routine transcript-status reconciliation stays out of Simple logs.
+- Long backup paths truncate with an ellipsis and show their full text on hover. Backup-count choices display just the number.
+
 ## v84.8 - Request drop-off schedule and steadier sync status
 
 09.10.26 10:20pm

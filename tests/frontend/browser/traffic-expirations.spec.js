@@ -22,9 +22,9 @@ async function chooseGrouping(page, value) {
   await expect(page.locator(GROUP)).toHaveValue(value);
 }
 
-async function loadTraffic(page, { expirations = EXPIRATIONS, configure } = {}) {
+async function loadTraffic(page, { expirations = EXPIRATIONS, configure, settings, waitFor } = {}) {
   await loadApp(page, {
-    bridge: { responses: {
+    bridge: { settings, responses: {
       youtube_traffic_status: {
         ok: true, mode: "custom", paused: false,
         hourly_used: 100, hourly_limit: 500, daily_used: 1858, daily_limit: 6000,
@@ -36,6 +36,7 @@ async function loadTraffic(page, { expirations = EXPIRATIONS, configure } = {}) 
       },
     } },
     configure,
+    waitFor,
   });
   await expect(page.locator(BUTTON)).toBeVisible();
 }
@@ -49,6 +50,9 @@ test("daily drop-offs show local times, midnight day labels, and counted units i
 
   await expect(page.locator(POPUP)).toBeVisible();
   await expect(page.locator(POPUP)).toHaveAttribute("role", "dialog");
+  await expect(page.locator("#gsb-traffic-expirations-summary, #gsb-traffic-expirations-next, #gsb-traffic-expirations-note")).toHaveCount(0);
+  await expect(page.locator(POPUP)).not.toContainText(/currently counted|Next drop-off|Local time|Usage falls off|New requests|Other limits/);
+  await expect(page.locator(POPUP)).not.toHaveAttribute("aria-describedby");
   const rows = page.locator(`${BODY} tbody tr`);
   await expect(rows).toHaveCount(3);
   await expect(rows.nth(0)).toContainText(/Today\s*·\s*11:45\s*PM/);
@@ -64,10 +68,6 @@ test("daily drop-offs support keyboard and close controls alongside other status
   await loadTraffic(page);
   const button = page.locator(BUTTON);
   const popup = page.locator(POPUP);
-
-  await page.locator("#gsb-traffic-hourly").click();
-  await expect(popup).toBeHidden();
-  expect(await page.evaluate(() => window.__bridgeCallsFor("youtube_traffic_expirations").length)).toBe(0);
 
   await button.focus();
   await page.keyboard.press("Enter");
@@ -286,7 +286,6 @@ test("grouping choices combine charges into ordered local clock blocks and resto
     await expect(rows).toHaveCount(times.length);
     await expect(rows.locator("td:first-child")).toHaveText(times);
     await expect(rows.locator("td:last-child")).toHaveText(charges);
-    await expect(page.locator("#gsb-traffic-expirations-summary")).toContainText("70 currently counted");
   }
   expect(await page.evaluate(() => window.__bridgeCallsFor("youtube_traffic_expirations").length)).toBe(1);
 });
@@ -318,11 +317,10 @@ test("ten-minute, half-hour, and hourly groups keep midnight boundary charges on
     await expect(rows).toHaveCount(times.length);
     await expect(rows.locator("td:first-child")).toHaveText(times);
     await expect(rows.locator("td:last-child")).toHaveText(charges);
-    await expect(page.locator("#gsb-traffic-expirations-summary")).toContainText("101 currently counted");
   }
 });
 
-test("grouping preference survives fresh results, reopening, and a page reload", async ({ page }) => {
+test("grouping preference survives fresh results, reopening, and a fresh browser context", async ({ page, browser }) => {
   await page.clock.install();
   await loadTraffic(page);
   await page.locator(BUTTON).click();
@@ -349,12 +347,118 @@ test("grouping preference survives fresh results, reopening, and a page reload",
   await expect(page.locator(`${BODY} tbody tr`)).toHaveCount(1);
   await expect(page.locator(BODY)).toContainText("−30");
 
-  await page.reload({ waitUntil: "load" });
-  await expect(page.locator(BUTTON)).toBeVisible();
+  const saved = await page.evaluate(() => window.__bridgeCallsFor("settings_save")
+    .map(call => call.args[0]).find(values => Object.hasOwn(values, "traffic_expiration_group_minutes")));
+  expect(saved).toEqual({ traffic_expiration_group_minutes: 30 });
+  const restarted = await browser.newContext({ locale: "en-US", timezoneId: "America/Chicago" });
+  try {
+    // Only the captured native setting crosses this boundary; browser storage does not.
+    expect((await restarted.storageState()).origins).toEqual([]);
+    const freshPage = await restarted.newPage();
+    await loadTraffic(freshPage, { settings: saved });
+    await freshPage.locator(BUTTON).click();
+    await expect(freshPage.locator(GROUP)).toHaveValue("30");
+    await expect(freshPage.locator(`${BODY} tbody tr`)).toHaveCount(3);
+    await expect(freshPage.locator(`${BODY} tbody tr`).first()).toContainText("Today · 11:30 PM–11:59 PM");
+    expect(await freshPage.evaluate(() => window.__bridgeCallsFor("settings_save"))).toEqual([]);
+    expect(await freshPage.evaluate(() => window.__unexpectedBridgeCalls)).toEqual([]);
+  } finally {
+    await restarted.close();
+  }
+});
+
+for (const [minutes, firstTime] of [
+  [10, "Today · 11:40 PM–11:49 PM"],
+  [30, "Today · 11:30 PM–11:59 PM"],
+  [60, "Today · 11:00 PM–11:59 PM"],
+]) {
+  test(`the saved ${minutes}-minute grouping hydrates without writing settings`, async ({ page }) => {
+    await loadTraffic(page, { settings: { traffic_expiration_group_minutes: minutes } });
+    await page.locator(BUTTON).click();
+    await expect(page.locator(GROUP)).toHaveValue(String(minutes));
+    const rows = page.locator(`${BODY} tbody tr`);
+    await expect(rows.first().locator("td:first-child")).toHaveText(firstTime);
+    await expect(rows.locator("td:last-child")).toHaveText(["−1,350", "−223", "−285"]);
+    expect(await page.evaluate(() => window.__bridgeCallsFor("settings_save"))).toEqual([]);
+  });
+}
+
+test("a delayed initial settings read cannot replace a newer grouping choice", async ({ page }) => {
+  await loadTraffic(page, {
+    waitFor: "handlers",
+    settings: { traffic_expiration_group_minutes: 10 },
+    configure: () => {
+      const oldSettings = window.__fixtureDefaultResult("settings_load");
+      const pending = new Promise(resolve => {
+        window.__finishTrafficSettings = () => resolve(oldSettings);
+      });
+      window.__setBridgeHandler("settings_load", () => pending);
+    },
+  });
   await page.locator(BUTTON).click();
+  await chooseGrouping(page, "60");
+  await expect.poll(() => page.evaluate(() => window.YT.preferences.isSaving())).toBe(false);
+  expect(await page.evaluate(() => window.__bridgeCallsFor("settings_save").map(call => call.args)))
+    .toEqual([[{ traffic_expiration_group_minutes: 60 }]]);
+  await page.evaluate(async () => {
+    window.__finishTrafficSettings();
+    await window.YT.settingsReady;
+  });
+  await expect(page.locator(GROUP)).toHaveValue("60");
+  await expect(page.locator(`${BODY} tbody tr`).first()).toContainText("Today · 11:00 PM–11:59 PM");
+  expect(await page.evaluate(() => window.YT.preferences.snapshot().traffic_expiration_group_minutes)).toBe(60);
+});
+
+test("a failed early grouping save recovers the saved value when the initial read arrives", async ({ page }) => {
+  await loadTraffic(page, {
+    waitFor: "handlers",
+    settings: { traffic_expiration_group_minutes: 30 },
+    configure: () => {
+      const oldSettings = window.__fixtureDefaultResult("settings_load");
+      const pending = new Promise(resolve => {
+        window.__finishTrafficSettings = () => resolve(oldSettings);
+      });
+      window.__setBridgeHandler("settings_load", () => pending);
+      window.__setBridgeHandler("settings_save", () => new Promise(resolve => {
+        window.__finishGroupingSave = resolve;
+      }));
+    },
+  });
+  await page.locator(BUTTON).click();
+  await chooseGrouping(page, "60");
+  await expect.poll(() => page.evaluate(() => typeof window.__finishGroupingSave)).toBe("function");
+  await page.evaluate(() => window.__finishGroupingSave({ ok: false, error: "Fixture early grouping save failed" }));
+  await expect(page.locator("#toast-root")).toContainText("Could not save grouping. Please try again.");
+  await page.evaluate(async () => {
+    window.__finishTrafficSettings();
+    await window.YT.settingsReady;
+  });
   await expect(page.locator(GROUP)).toHaveValue("30");
-  await expect(page.locator(`${BODY} tbody tr`)).toHaveCount(3);
+  await expect(page.getByRole("combobox", { name: "Group by", exact: true })).toContainText("30 minutes");
   await expect(page.locator(`${BODY} tbody tr`).first()).toContainText("Today · 11:30 PM–11:59 PM");
+  expect(await page.evaluate(() => window.__bridgeCallsFor("settings_save").map(call => call.args)))
+    .toEqual([[{ traffic_expiration_group_minutes: 60 }]]);
+});
+
+test("a failed grouping save restores the saved grouping and schedule and explains the failure", async ({ page }) => {
+  await loadTraffic(page, { settings: { traffic_expiration_group_minutes: 30 } });
+  await page.locator(BUTTON).click();
+  await page.evaluate(() => {
+    window.__setBridgeHandler("settings_save", () => new Promise(resolve => {
+      window.__finishGroupingSave = resolve;
+    }));
+  });
+  await chooseGrouping(page, "60");
+  await expect(page.locator(`${BODY} tbody tr`).first()).toContainText("Today · 11:00 PM–11:59 PM");
+  await expect.poll(() => page.evaluate(() => typeof window.__finishGroupingSave)).toBe("function");
+  await page.evaluate(() => window.__finishGroupingSave({ ok: false, error: "Fixture grouping save failed" }));
+  await expect(page.locator(GROUP)).toHaveValue("30");
+  await expect(page.getByRole("combobox", { name: "Group by", exact: true })).toContainText("30 minutes");
+  await expect(page.locator(`${BODY} tbody tr`).first()).toContainText("Today · 11:30 PM–11:59 PM");
+  await expect(page.locator(`${BODY} tbody tr td:last-child`)).toHaveText(["−1,350", "−223", "−285"]);
+  await expect(page.locator("#toast-root")).toContainText("Could not save grouping. Please try again.");
+  expect(await page.evaluate(() => window.__bridgeCallsFor("settings_save").map(call => call.args)))
+    .toEqual([[{ traffic_expiration_group_minutes: 60 }]]);
 });
 
 test("grouping a full day shortens the list without dropping charges", async ({ page }) => {
@@ -374,7 +478,6 @@ test("grouping a full day shortens the list without dropping charges", async ({ 
     const total = await rows.locator("td:last-child").evaluateAll((cells) =>
       cells.reduce((sum, cell) => sum + Number(cell.textContent.replace(/[^0-9]/g, "")), 0));
     expect(total).toBe(1440);
-    await expect(page.locator("#gsb-traffic-expirations-summary")).toContainText("1,440 currently counted");
     await expect(page.getByRole("combobox", { name: "Group by", exact: true })).toBeInViewport();
     await expect(page.locator("#gsb-traffic-expirations-close")).toBeInViewport();
     const width = await page.locator(BODY).evaluate((element) => ({

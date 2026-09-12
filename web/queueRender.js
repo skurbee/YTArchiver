@@ -206,6 +206,8 @@
       row.dataset.idx = i;
       row.dataset.queue = queueKind;
       row.dataset.taskId = taskId;
+      row.dataset.taskStatus = statusCls;
+      row.dataset.cancelRequested = String(cancelling);
 
       const stateGlyph =
         statusCls === "running" ? "▶" :
@@ -240,6 +242,7 @@
         ${closeBtnHtml}
       `;
       row.querySelector(".queue-task-name").innerHTML = nameHtml;
+      _paintTrafficWait(row);
 
       row.querySelector(".queue-task-close")?.addEventListener("click", async (e) => {
         e.stopPropagation();
@@ -480,6 +483,43 @@
       body.appendChild(row);
     });
   }
+
+  function _paintTrafficWait(row) {
+    // A blocked task still owns the running slot. Change its presentation
+    // without changing the identity or cancellation actions captured above.
+    const state = window.YT?.eventState?.snapshot("queue-state")?.[row.dataset.queue] || {};
+    const running = row.dataset.taskStatus === "running";
+    const waiting = running && state.trafficWaiting && !state.paused && !state.pausedActive
+      && row.dataset.cancelRequested !== "true";
+    row.classList.toggle("running", running && !waiting);
+    row.classList.toggle("paused", row.dataset.taskStatus === "paused" || !!waiting);
+    row.dataset.trafficWaiting = String(!!waiting);
+    const glyph = row.querySelector(".queue-task-state");
+    if (glyph && running) {
+      glyph.classList.toggle("running", !waiting);
+      glyph.classList.toggle("paused", !!waiting);
+      glyph.textContent = waiting ? "❚❚" : "▶";
+    }
+    const dots = row.querySelector(".queue-task-dots");
+    if (dots) dots.style.display = waiting ? "none" : "";
+    let note = row.querySelector(".queue-task-wait");
+    if (!waiting) {
+      note?.remove();
+      return;
+    }
+    if (!note) {
+      note = document.createElement("span");
+      note.className = "queue-task-wait";
+      row.querySelector(".queue-task-name")?.appendChild(note);
+    }
+    const windowName = state.trafficWait?.reason === "daily_limit" ? "24-hour" : "hourly";
+    note.textContent = ` — Waiting for YouTube ${windowName} limit`;
+  }
+
+  window.YT?.eventState?.subscribe("queue-state", () => {
+    document.querySelectorAll("#sync-tasks-body .queue-task-row, #gpu-tasks-body .queue-task-row")
+      .forEach(_paintTrafficWait);
+  });
 
   function colorizeTaskName(name) {
     name = name || "";   // GPU tasks may carry `title` but no `name`; never deref undefined

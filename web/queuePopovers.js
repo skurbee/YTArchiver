@@ -36,7 +36,7 @@
       ["btn-gpu-tasks", "popover-gpu-tasks"],
     ];
     const triggerIds = ["btn-sync-tasks", "btn-gpu-tasks", "gsb-sync", "gsb-gpu",
-      "gsb-errors", "gsb-traffic-daily"];
+      "gsb-errors", "gsb-traffic-hourly", "gsb-traffic-daily"];
     for (const [btnId, popId] of pairs) {
       const btn = document.getElementById(btnId);
       const pop = document.getElementById(popId);

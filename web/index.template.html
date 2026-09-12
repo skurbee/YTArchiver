@@ -127,11 +127,13 @@
     <span class="gsb-traffic" id="gsb-traffic" hidden
           title="Budget for YouTube page, API, caption, and artwork requests, including a job-start allowance. Video/audio chunks are excluded. At either limit, requests wait and continue automatically.">
       <span class="gsb-traffic-label">YT Request Limits</span>
-      <span class="gsb-traffic-reading" id="gsb-traffic-hourly"></span>
+      <button type="button" class="gsb-traffic-reading gsb-traffic-button" id="gsb-traffic-hourly"
+              aria-haspopup="dialog" aria-controls="popover-traffic-expirations"
+              aria-expanded="false" title="YouTube requests counted in the last hour. At either limit, requests wait and resume automatically. Click to see when requests leave the hourly count."></button>
       <span class="gsb-traffic-sep">·</span>
       <button type="button" class="gsb-traffic-reading gsb-traffic-button" id="gsb-traffic-daily"
               aria-haspopup="dialog" aria-controls="popover-traffic-expirations"
-              aria-expanded="false" title="See when usage falls out of the 24-hour window"></button>
+              aria-expanded="false" title="YouTube requests counted in the last 24 hours. At either limit, requests wait and resume automatically. Click to see when requests leave the 24-hour count."></button>
     </span>
   </div>
 

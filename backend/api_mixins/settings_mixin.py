@@ -27,11 +27,15 @@ from backend.services.processing_defaults import (
     validate_model,
 )
 from backend.ytarchiver_config import (
+    AUTO_BACKUP_KEEP_MAX,
+    TRAFFIC_EXPIRATION_GROUP_CHOICES,
     TRASH_RETENTION_CHANGE_GRACE_SECONDS,
     TRASH_RETENTION_DEFAULT_DAYS,
     TRASH_RETENTION_MAX_DAYS,
     config_is_writable,
     load_config,
+    normalize_auto_backup_keep,
+    normalize_traffic_expiration_group,
 )
 
 from ._shared import _api_err, _log
@@ -334,6 +338,7 @@ class SettingsMixin:
             # Automatic full-backup cadence shown beside manual backup tools.
             "auto_backup_interval": (cfg.get("auto_backup_interval")
                                      or "off"),
+            "auto_backup_keep": normalize_auto_backup_keep(cfg.get("auto_backup_keep")),
             "backup_include_search_db": (
                 cfg.get("backup_include_search_db", True) is not False),
             "backup_search_db_size_bytes": _backup_search_db_size_bytes(),
@@ -364,6 +369,8 @@ class SettingsMixin:
             "caption_overlay_bg": (cfg.get("caption_overlay_bg") or ""),
             "caption_overlay_mode": (cfg.get("caption_overlay_mode") or ""),
             "youtube_traffic_mode": traffic["mode"],
+            "traffic_expiration_group_minutes": normalize_traffic_expiration_group(
+                cfg.get("traffic_expiration_group_minutes")),
             "youtube_traffic_custom_daily": int(
                 cfg.get("youtube_traffic_custom_daily", 750) or 750),
             "youtube_traffic_custom_hourly": int(
@@ -399,6 +406,21 @@ class SettingsMixin:
             return self._settings_save_inner(data)
 
     def _settings_save_inner(self, data):
+        if "traffic_expiration_group_minutes" in data and (
+                type(data["traffic_expiration_group_minutes"]) is not int
+                or data["traffic_expiration_group_minutes"] not in
+                TRAFFIC_EXPIRATION_GROUP_CHOICES):
+            return {
+                "ok": False,
+                "error": "Request drop-off grouping must be 1, 10, 30, or 60 minutes.",
+            }
+        if "auto_backup_keep" in data and (
+                type(data["auto_backup_keep"]) is not int
+                or not 1 <= data["auto_backup_keep"] <= AUTO_BACKUP_KEEP_MAX):
+            return {
+                "ok": False,
+                "error": f"Backups to keep must be a whole number from 1 to {AUTO_BACKUP_KEEP_MAX}.",
+            }
         if ("backup_include_search_db" in data
                 and not isinstance(data["backup_include_search_db"], bool)):
             return {
@@ -511,6 +533,8 @@ class SettingsMixin:
         if data.get("auto_backup_interval") in ("off", "daily", "weekly",
                                                 "monthly"):
             cfg["auto_backup_interval"] = data["auto_backup_interval"]
+        if "auto_backup_keep" in data:
+            cfg["auto_backup_keep"] = data["auto_backup_keep"]
         if "backup_include_search_db" in data:
             cfg["backup_include_search_db"] = data["backup_include_search_db"]
         if "trash_retention_days" in data:
@@ -594,6 +618,12 @@ class SettingsMixin:
         if data.get("youtube_traffic_mode") in (
                 "conservative", "balanced", "custom", "unlimited"):
             cfg["youtube_traffic_mode"] = data["youtube_traffic_mode"]
+        if "traffic_expiration_group_minutes" in data:
+            # Rewrite malformed stored types even when Python considers a
+            # float or boolean equal to the requested integer.
+            if type(original_cfg.get("traffic_expiration_group_minutes")) is not int:
+                original_cfg.pop("traffic_expiration_group_minutes", None)
+            cfg["traffic_expiration_group_minutes"] = data["traffic_expiration_group_minutes"]
         _budget_autosync_disabled = False
         if (cfg.get("youtube_traffic_mode") == "unlimited"
                 and int(cfg.get("autorun_interval", 0) or 0) == -1):
@@ -693,9 +723,13 @@ class SettingsMixin:
         except Exception as e:
             return _api_err("INTERNAL_ERROR", str(e))
 
-    def youtube_traffic_expirations(self):
-        """Minute-by-minute expiration schedule for current 24-hour usage."""
+    def youtube_traffic_expirations(self, window_name: str = "daily"):
+        """Minute-by-minute expiration schedule for the selected rolling window."""
+        if window_name not in ("daily", "hourly"):
+            return _api_err("INVALID_WINDOW", "Window must be 'daily' or 'hourly'.")
         try:
+            if window_name == "hourly":
+                return youtube_traffic.hourly_expirations()
             return youtube_traffic.daily_expirations()
         except Exception as e:
             return _api_err("INTERNAL_ERROR", str(e))

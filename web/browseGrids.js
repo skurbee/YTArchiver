@@ -85,6 +85,104 @@
     return compactCountFormatter.format(count);
   }
 
+  const CHANNEL_ART_TIMEOUT_MS = 5000;
+  let _channelArtGeneration = 0;
+  let _channelArtObserver = null;
+  const _channelArtLoads = new Map();
+
+  function _channelArtRetryUrl(source, fallback) {
+    try {
+      const original = new URL(source);
+      // Retries are only for files supplied by the local archive server.
+      // Preserve its authentication query and never broaden the source.
+      if (original.protocol !== "http:" || original.hostname !== "127.0.0.1"
+          || !original.pathname.startsWith("/file/")) return "";
+      let retry = original;
+      if (fallback) {
+        const candidate = new URL(fallback);
+        if (candidate.origin === original.origin && candidate.pathname.startsWith("/file/")) {
+          retry = candidate;
+        }
+      }
+      retry.searchParams.set("art_retry", `${_channelArtGeneration}-${Date.now()}`);
+      return retry.href;
+    } catch (_) { return ""; }
+  }
+
+  function _cancelChannelArtLoads() {
+    _channelArtGeneration++;
+    _channelArtObserver?.disconnect();
+    for (const cancel of _channelArtLoads.values()) cancel();
+    _channelArtLoads.clear();
+    _prefetchQueue = [];
+    for (const cancel of Array.from(_prefetchCancels)) cancel();
+  }
+
+  function _loadChannelArt(img, card, source, fallback, failed) {
+    const generation = _channelArtGeneration;
+    let timer = null, settled = false, retried = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      img.removeEventListener("load", loaded);
+      img.removeEventListener("error", error);
+      _channelArtObserver?.unobserve(img);
+      _channelArtLoads.delete(img);
+    };
+    const cancel = () => {
+      settled = true;
+      cleanup();
+      img.removeAttribute("src");
+    };
+    const current = () => !settled && generation === _channelArtGeneration && card.isConnected;
+    const loaded = () => {
+      if (!current()) return cancel();
+      if (!img.naturalWidth) return error();
+      settled = true;
+      cleanup();
+      img.style.visibility = "";
+    };
+    const begin = (url) => {
+      if (!current()) return cancel();
+      clearTimeout(timer);
+      // The shared observer has already established that this card is
+      // nearby. Set policy before src so it cannot remain in a lazy queue.
+      img.loading = "eager";
+      img.src = url;
+      timer = setTimeout(error, CHANNEL_ART_TIMEOUT_MS);
+    };
+    const error = () => {
+      if (!current()) return cancel();
+      const retry = !retried && _channelArtRetryUrl(source, fallback);
+      if (retry) {
+        retried = true;
+        begin(retry);
+        return;
+      }
+      settled = true;
+      cleanup();
+      img.removeAttribute("src");
+      failed();
+    };
+    img.loading = "lazy";
+    img.decoding = "async";
+    img.style.visibility = "hidden";
+    img.addEventListener("load", loaded);
+    img.addEventListener("error", error);
+    _channelArtLoads.set(img, cancel);
+    if (!_channelArtObserver) {
+      _channelArtObserver = new IntersectionObserver(entries => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          _channelArtObserver.unobserve(entry.target);
+          entry.target._startChannelArt?.();
+          delete entry.target._startChannelArt;
+        }
+      }, { rootMargin: "300px" });
+    }
+    img._startChannelArt = () => begin(source);
+    _channelArtObserver.observe(img);
+  }
+
   function _paintChannelCardMeta(card, channel) {
     const metaEl = card.querySelector(".channel-card-meta");
     if (!metaEl) return;
@@ -141,10 +239,8 @@
     card.setAttribute("aria-keyshortcuts", "Shift+F10");
     card.setAttribute(
       "aria-label", `Open channel ${displayText(name || "Untitled")}`);
-    if (!bannerSrc) {
-      // Pure-gradient fallback gets the tinted bg directly.
-      card.style.background = gradientFor(name);
-    }
+    // Keep a useful surface while local art is loading or unavailable.
+    card.style.background = gradientFor(name);
     if (typeof c.transcription_pending === "number") {
       card.dataset.pendingTx = String(c.transcription_pending);
     }
@@ -176,20 +272,19 @@
     if (bannerSrc) {
       const bgEl = document.createElement("img");
       bgEl.className = "channel-card-bg";
-      bgEl.src = bannerSrc;
-      bgEl.loading = "lazy";
-      bgEl.decoding = "async";
       bgEl.alt = "";
       card.insertBefore(bgEl, card.firstChild);
+      _loadChannelArt(bgEl, card, bannerSrc,
+        bannerUrl ? c.banner_fallback_url : c.avatar_fallback_url,
+        () => { bgEl.remove(); _showChannelLetter(); });
     }
     if (avatarUrl) {
       const avEl = document.createElement("img");
       avEl.className = "channel-avatar";
-      avEl.src = avatarUrl;
-      avEl.loading = "lazy";
-      avEl.decoding = "async";
       avEl.alt = "";
       card.appendChild(avEl);
+      _loadChannelArt(avEl, card, avatarUrl, c.avatar_fallback_url,
+        () => { avEl.remove(); _showChannelLetter(); });
     }
     const nameEl = card.querySelector(".channel-card-name");
     nameEl.textContent = displayText(name);
@@ -204,19 +299,13 @@
     }
     _paintChannelCardMeta(card, c);
 
-    // Swap to gradient if the banner image fails to load.
-    const bgEl = card.querySelector(".channel-card-bg");
-    if (bgEl) {
-      bgEl.addEventListener("error", () => {
-        bgEl.remove();
-        card.style.background = gradientFor(name);
-        if (!avatarUrl && !card.querySelector(".channel-letter")) {
-          const d = document.createElement("div");
-          d.className = "channel-letter";
-          d.textContent = first;
-          card.insertBefore(d, card.firstChild);
-        }
-      }, { once: true });
+    function _showChannelLetter() {
+      if (!card.querySelector(".channel-card-bg, .channel-avatar, .channel-letter")) {
+        const letter = document.createElement("div");
+        letter.className = "channel-letter";
+        letter.textContent = first;
+        card.insertBefore(letter, card.firstChild);
+      }
     }
     return card;
   }
@@ -227,6 +316,7 @@
   ) {
     const grid = document.getElementById("channel-grid");
     if (!grid) return;
+    _cancelChannelArtLoads();
     _unobserveGridSentinel(grid);
     grid._channelItems = [];
     grid._onChannelClick = null;
@@ -264,6 +354,7 @@
   window.renderChannelGrid = function (channels, onChannelClick) {
     const grid = document.getElementById("channel-grid");
     if (!grid) return;
+    _cancelChannelArtLoads();
     _unobserveGridSentinel(grid);
     grid.innerHTML = "";
     grid.setAttribute("aria-busy", "false");
@@ -421,6 +512,7 @@
 
   let _prefetchQueue = [];
   let _prefetchActive = 0;
+  const _prefetchCancels = new Set();
   // 2 concurrent is enough — more than this stacks decode work on
   // the main thread and creates the very lag we're trying to prevent.
   const PREFETCH_MAX_CONCURRENT = 2;
@@ -456,11 +548,15 @@
     };
     const urls = [];
     for (const c of first) {
-      if (c.banner_url && _safeScheme(c.banner_url)) urls.push(c.banner_url);
+      if (c.banner_url && _safeScheme(c.banner_url)) {
+        urls.push({ url: c.banner_url, fallback: c.banner_fallback_url });
+      }
     }
     for (const c of first) {
       if (c.avatar_url && c.avatar_url !== c.banner_url
-          && _safeScheme(c.avatar_url)) urls.push(c.avatar_url);
+          && _safeScheme(c.avatar_url)) {
+        urls.push({ url: c.avatar_url, fallback: c.avatar_fallback_url });
+      }
     }
     _prefetchQueue = urls;
     for (let i = 0; i < PREFETCH_MAX_CONCURRENT; i++) _pumpPrefetch();
@@ -469,26 +565,57 @@
   function _pumpPrefetch() {
     if (!_prefetchQueue.length) return;
     if (_prefetchActive >= PREFETCH_MAX_CONCURRENT) return;
-    const url = _prefetchQueue.shift();
-    if (!url) return;
+    const item = _prefetchQueue.shift();
+    if (!item) return;
+    const generation = _channelArtGeneration;
     _prefetchActive++;
-    const img = new Image();
-    img.decoding = "async";
-    img.fetchPriority = "low";
-    const done = () => {
+    let img = null, timer = null, settled = false, retried = false;
+    const detach = () => {
+      clearTimeout(timer);
+      if (!img) return;
+      img.onload = null;
+      img.onerror = null;
+      img.removeAttribute("src");
+    };
+    const done = (cancelled = false) => {
+      if (settled) return;
+      settled = true;
+      detach();
       _prefetchActive--;
+      _prefetchCancels.delete(cancel);
+      if (cancelled || generation !== _channelArtGeneration) return;
       // Schedule the next pump inside an idle callback so decodes
       // only run when the main thread isn't busy rendering scrolls.
-      const next = () => _pumpPrefetch();
+      const next = () => {
+        if (generation === _channelArtGeneration) _pumpPrefetch();
+      };
       if (typeof requestIdleCallback === "function") {
         requestIdleCallback(next, { timeout: 500 });
       } else {
         setTimeout(next, 100);
       }
     };
-    img.addEventListener("load", done, { once: true });
-    img.addEventListener("error", done, { once: true });
-    img.src = url;
+    const cancel = () => done(true);
+    const failed = () => {
+      if (settled) return;
+      const retry = !retried && _channelArtRetryUrl(item.url, item.fallback);
+      if (retry) {
+        retried = true;
+        start(retry);
+      } else done();
+    };
+    const start = (url) => {
+      detach();
+      img = new Image();
+      img.decoding = "async";
+      img.fetchPriority = "low";
+      img.onload = () => done();
+      img.onerror = failed;
+      timer = setTimeout(failed, CHANNEL_ART_TIMEOUT_MS);
+      img.src = url;
+    };
+    _prefetchCancels.add(cancel);
+    start(item.url);
   }
 
   /** Render the Videos grid (inside a channel). */

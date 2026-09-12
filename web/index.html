@@ -1081,7 +1081,7 @@
             Review the information YTArchiver has about the archive and run repairs when something looks wrong.
           </div>
 
-          <details class="health-library-details"
+          <details class="health-library-details" open
                    id="health-library-metadata" data-health-section="metadata">
             <summary>
               <span>Channel information</span>
@@ -1323,9 +1323,30 @@
                 <option value="monthly">Every 30 days</option>
               </select>
               <div class="settings-field-help">
-                While YTArchiver is open, saves that same backup in the archive's YTArchiver Info folder. Keeps the newest four.
+                While YTArchiver is open, saves that same backup in the archive's YTArchiver Info folder.
               </div>
-              <span class="settings-inline-note backup-age-note" id="backup-auto-age-display"></span>
+              <span class="settings-inline-note backup-age-note" id="backup-auto-age-display" tabindex="0"></span>
+            </div>
+
+            <label class="edit-gl" for="settings-auto-backup-keep">Keep latest</label>
+            <div class="edit-gv-stack settings-field-with-help">
+              <select class="ctl-select" id="settings-auto-backup-keep"
+                      aria-describedby="backup-retention-help"
+                      title="Number of scheduled backup ZIPs to keep">
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4" selected>4</option>
+                <option value="5">5</option>
+                <option value="6">6</option>
+                <option value="7">7</option>
+                <option value="8">8</option>
+                <option value="9">9</option>
+                <option value="10">10</option>
+              </select>
+              <div class="settings-field-help" id="backup-retention-help">
+                Older scheduled backup ZIPs are removed only after the next successful automatic backup.
+              </div>
             </div>
 
             <label class="edit-gl">Full app backup</label>
@@ -1339,7 +1360,7 @@
               <div class="settings-field-help">
                 Saves the same backup once to a location you choose.
               </div>
-              <span class="settings-inline-note backup-age-note" id="backup-age-display"></span>
+              <span class="settings-inline-note backup-age-note" id="backup-age-display" tabindex="0"></span>
             </div>
 
             <label class="edit-gl">Channel list</label>
@@ -2067,11 +2088,13 @@
     <span class="gsb-traffic" id="gsb-traffic" hidden
           title="Budget for YouTube page, API, caption, and artwork requests, including a job-start allowance. Video/audio chunks are excluded. At either limit, requests wait and continue automatically.">
       <span class="gsb-traffic-label">YT Request Limits</span>
-      <span class="gsb-traffic-reading" id="gsb-traffic-hourly"></span>
+      <button type="button" class="gsb-traffic-reading gsb-traffic-button" id="gsb-traffic-hourly"
+              aria-haspopup="dialog" aria-controls="popover-traffic-expirations"
+              aria-expanded="false" title="YouTube requests counted in the last hour. At either limit, requests wait and resume automatically. Click to see when requests leave the hourly count."></button>
       <span class="gsb-traffic-sep">·</span>
       <button type="button" class="gsb-traffic-reading gsb-traffic-button" id="gsb-traffic-daily"
               aria-haspopup="dialog" aria-controls="popover-traffic-expirations"
-              aria-expanded="false" title="See when usage falls out of the 24-hour window"></button>
+              aria-expanded="false" title="YouTube requests counted in the last 24 hours. At either limit, requests wait and resume automatically. Click to see when requests leave the 24-hour count."></button>
     </span>
   </div>
   <!-- Sync Tasks popover (button-anchored) -->
@@ -2138,18 +2161,16 @@
     </div>
   </div>
 
-  <!-- Rolling daily usage, opened from the global bottom status bar. -->
+  <!-- Rolling request usage, opened from the global bottom status bar. -->
   <div class="queue-popover gsb-traffic-popover" id="popover-traffic-expirations"
-       role="dialog" aria-labelledby="gsb-traffic-expirations-title"
-       aria-describedby="gsb-traffic-expirations-note">
+       role="dialog" aria-labelledby="gsb-traffic-expirations-title">
     <div class="queue-popover-header">
       <span class="queue-popover-title" id="gsb-traffic-expirations-title">24-hour drop-offs</span>
       <div class="spacer"></div>
       <button type="button" class="queue-btn queue-btn-thin" id="gsb-traffic-expirations-close"
               aria-label="Close 24-hour drop-offs">Close</button>
     </div>
-    <p class="gsb-traffic-expirations-summary" id="gsb-traffic-expirations-summary" aria-live="polite"></p>
-    <div class="gsb-traffic-expirations-controls">
+    <div class="gsb-traffic-expirations-controls" id="gsb-traffic-expirations-controls">
       <label for="gsb-traffic-expirations-group">Group by</label>
       <select class="ctl-select" id="gsb-traffic-expirations-group">
         <option value="1">1 minute</option>
@@ -2162,10 +2183,6 @@
          tabindex="0" role="region" aria-label="Scheduled request drop-offs">
       <div class="queue-empty">Loading drop-offs…</div>
     </div>
-    <p class="gsb-traffic-expirations-note" id="gsb-traffic-expirations-note">
-      Local time. Usage falls off throughout each time block.
-      New requests can change the total.
-    </p>
   </div>
 
   <!-- Session errors popover, opened from the global bottom status bar. -->

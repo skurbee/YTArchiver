@@ -54,6 +54,7 @@ class _FakeProc:
 class _FakeWatchdog:
     def __init__(self) -> None:
         self.last_output = [0.0]
+        self.parser_busy = threading.Event()
         self.stop_event = threading.Event()
         self.stalled: dict[str, bool] = {}
 

@@ -1,4 +1,4 @@
-"""Statically verify literal frontend bridge calls have Python handlers."""
+"""Statically verify frontend bridge handlers and generated-proxy parameters."""
 from __future__ import annotations
 
 import ast
@@ -65,7 +65,7 @@ def frontend_methods(web_dir: Path = WEB) -> set[str]:
     return methods
 
 
-def backend_methods(root: Path = ROOT) -> set[str]:
+def backend_method_parameters(root: Path = ROOT) -> dict[str, list[str]]:
     """Resolve Api's real source inheritance without importing application code."""
     modules: dict[str, tuple[dict, dict]] = {}
     classes: dict[tuple[str, str], ast.ClassDef] = {}
@@ -159,18 +159,36 @@ def backend_methods(root: Path = ROOT) -> set[str]:
         linearizations[key] = result
         return result
 
-    methods: set[str] = set()
+    methods: dict[str, list[str]] = {}
     for key in reversed(mro(resolve("main.Api"))):
         for member in classes[key].body:
             if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if not member.name.startswith("_"):
-                    methods.add(member.name)
+                    # pywebview copies positional Python parameter names into
+                    # its generated JavaScript function signature.
+                    methods[member.name] = [
+                        arg.arg for arg in (*member.args.posonlyargs, *member.args.args)
+                        if arg.arg != "self"
+                    ]
             elif isinstance(member, (ast.Assign, ast.AnnAssign)):
                 targets = member.targets if isinstance(member, ast.Assign) else [member.target]
                 for target in targets:
                     if isinstance(target, ast.Name):
-                        methods.discard(target.id)
+                        methods.pop(target.id, None)
     return methods
+
+
+def backend_methods(root: Path = ROOT) -> set[str]:
+    return set(backend_method_parameters(root))
+
+
+def unsafe_bridge_parameters(root: Path = ROOT) -> list[str]:
+    """Reject names that shadow the browser window used by pywebview's proxy."""
+    return sorted(
+        f"{method}: window"
+        for method, parameters in backend_method_parameters(root).items()
+        if "window" in parameters
+    )
 
 
 def missing_bridge_methods(root: Path = ROOT) -> list[str]:
@@ -180,10 +198,16 @@ def missing_bridge_methods(root: Path = ROOT) -> list[str]:
 def main() -> int:
     used = frontend_methods()
     missing = missing_bridge_methods()
+    unsafe = unsafe_bridge_parameters()
     if missing:
         print("Frontend bridge contract failed. Missing Python handlers:")
         for name in missing:
             print(f"  {name}")
+    if unsafe:
+        print("Frontend bridge contract failed. Parameters shadow the pywebview browser window:")
+        for parameter in unsafe:
+            print(f"  {parameter}")
+    if missing or unsafe:
         return 1
     print(f"Bridge contract passed ({len(used)} literal frontend calls checked).")
     return 0

@@ -378,6 +378,7 @@ def _download_thumbnail(url: str, thumb_dir: str,
                         commit_allowed: Callable[[], bool] | None = None,
                         force: bool = False,
                         result_out: dict[str, Any] | None = None,
+                        wait_for_budget: bool = True,
                         ) -> bool:
     """Download a thumbnail to `{thumb_dir}/{safe_title} [{video_id}].jpg`.
     Dedupes against an existing file with the same [{video_id}] bracket.
@@ -489,7 +490,9 @@ def _download_thumbnail(url: str, thumb_dir: str,
                 if youtube_request:
                     permission = youtube_traffic.acquire(
                         "youtube_thumbnail", cancel_event=request_cancel,
-                        stream=stream)
+                        stream=stream, wait_for_budget=wait_for_budget)
+                    if permission.get("deferred") and result_out is not None:
+                        result_out["deferred"] = True
                     if not permission.get("ok") or not _may_commit():
                         return False
                 # Pre-check Content-Length: YouTube thumbs are typically <200KB,

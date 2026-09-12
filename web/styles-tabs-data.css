@@ -762,15 +762,6 @@
 .gsb-traffic-expirations-controls .yt-dd { min-width: 120px; height: 28px; font-size: var(--fs-sm); }
 .gsb-traffic-expirations-controls .yt-dd-option { font-size: var(--fs-sm); }
 .gsb-traffic-expirations-controls .yt-dd-enhanced { display: none; }
-.gsb-traffic-expirations-summary,
-.gsb-traffic-expirations-note {
-  margin: 0;
-  padding: 8px 10px;
-  font-size: var(--fs-xs);
-  line-height: 1.45;
-  flex-shrink: 0;
-}
-.gsb-traffic-expirations-note { color: var(--c-text-muted); border-top: 1px solid var(--c-border); }
 .queue-popover-body.gsb-traffic-expirations-body { min-height: 0; max-height: 320px; padding: 0; }
 .gsb-traffic-expirations-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
 .gsb-traffic-expirations-table th,

@@ -266,7 +266,7 @@ class SyncMixin:
         # is meant for mid-pass pausing, not from a cold start.
         # Overrides are scoped to one sync pass. A fresh pass always starts
         # with the configured rolling ceilings armed.
-        youtube_traffic.clear_budget_override()
+        traffic_pass_id = youtube_traffic.begin_sync_pass()
         self._sync_cancel.clear()
         self._sync_skip.clear()
         self._sync_pause.clear()
@@ -308,8 +308,8 @@ class SyncMixin:
                     background=bool(scheduled),
                     cancel_event=self._sync_cancel,
                 )
-                with youtube_traffic.reservation_scope(
-                        traffic_reservation_id):
+                with (youtube_traffic.reservation_scope(traffic_reservation_id),
+                      youtube_traffic.request_scope("sync", sync_pass_id=traffic_pass_id)):
                     sync_result = sync_backend.sync_all(
                         self._log_stream, self._sync_cancel,
                         queues=self._queues,
@@ -327,7 +327,10 @@ class SyncMixin:
                 youtube_session.end_sync_scope()
                 youtube_traffic.finish_reservation(
                     traffic_reservation_id)
-                youtube_traffic.clear_budget_override()
+                youtube_traffic.finish_sync_pass(traffic_pass_id)
+                finish_traffic = getattr(self._transcribe, "finish_traffic_pass", None)
+                if callable(finish_traffic):
+                    finish_traffic(traffic_pass_id)
                 # Stop the tray spin + restore idle tooltip.
                 try:
                     if getattr(self, "_tray", None):
@@ -437,6 +440,7 @@ class SyncMixin:
                     # and shutdown/restore owns the next transition.
                     _log.debug("post-sync follow-up not started: %s", e)
         if not self._start_sync_thread_unlocked(_run):
+            youtube_traffic.finish_sync_pass(traffic_pass_id)
             return {
                 "ok": False,
                 "started": False,

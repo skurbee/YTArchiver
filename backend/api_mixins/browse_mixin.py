@@ -743,6 +743,8 @@ class BrowseMixin:
             # Pillow isn't available or the thumbnail write fails.
             avatar_url = None
             banner_url = None
+            avatar_fallback_url = None
+            banner_fallback_url = None
             pending_redownload = False
             redownload_res = ""
             if base:
@@ -764,8 +766,16 @@ class BrowseMixin:
                     ap = None
                 if not ap:
                     ap = avatar_path_for(folder)
-                if ap: avatar_url = _file_url(ap)
-                if bp: banner_url = _file_url(bp)
+                if ap:
+                    avatar_url = _file_url(ap)
+                    original = avatar_path_for(folder)
+                    if original and original != ap:
+                        avatar_fallback_url = _file_url(original)
+                if bp:
+                    banner_url = _file_url(bp)
+                    original = banner_path_for(folder)
+                    if original and original != bp:
+                        banner_fallback_url = _file_url(original)
                 # Keep the Browse-first channel grid at feature parity with
                 # the legacy Subs table. An interrupted resolution upgrade
                 # leaves this progress file behind; the frontend uses these
@@ -794,6 +804,10 @@ class BrowseMixin:
                 "subscriber_count": subscriber_count,
                 "avatar_url": avatar_url,
                 "banner_url": banner_url,
+                # A cached preview can exist while its data is unreadable.
+                # The UI tries this existing local original only on failure.
+                "avatar_fallback_url": avatar_fallback_url,
+                "banner_fallback_url": banner_fallback_url,
                 # Pending counters for live-count context-menu labels.
                 # folder-menu labels.
                 "transcription_pending": int(ch.get("transcription_pending") or 0),

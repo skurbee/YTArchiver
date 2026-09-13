@@ -45,13 +45,13 @@ async function currentState(page, queue, patch) {
 test("a Processing caption hold parks only Processing and keeps running-task actions safe", async ({ page }) => {
   await loadQueues(page);
   await showQueues(page);
-  await expect(page.locator("#gsb-sync-text")).toHaveText("Sync idle");
-  await expect(page.locator("#gsb-gpu-text")).toContainText("Processing waiting for 24-hour slot");
+  await expect(page.locator("#gsb-sync-text")).toHaveText("Idle");
+  await expect(page.locator("#gsb-gpu-text")).toContainText("Waiting for 24-hour slot");
   await expect(page.locator("#gsb-gpu .gsb-dot")).toHaveClass(/paused/);
   await expect(page.locator("#gsb-gpu .gsb-dot")).not.toHaveClass(/\bon\b/);
-  await expect(page.locator("#btn-gpu-tasks")).toHaveAttribute("data-blink-state", "paused");
+  await expect(page.locator("#gsb-gpu")).toHaveAttribute("data-blink-state", "paused");
   await page.waitForTimeout(760);
-  await expect(page.locator("#btn-gpu-tasks")).toHaveAttribute("data-blink-state", "paused");
+  await expect(page.locator("#gsb-gpu")).toHaveAttribute("data-blink-state", "paused");
   expect(await page.evaluate(() => window._blinkState.timer)).toBeNull();
 
   await page.locator("#gsb-gpu").click();
@@ -79,9 +79,9 @@ test("a queue-state-only release restores the running row and keeps later payloa
   await expect(row).toHaveClass(/running/);
   await expect(row.locator(".queue-task-wait")).toHaveCount(0);
   await expect(row.locator(".queue-task-dots")).toBeVisible();
-  await expect(page.locator("#gsb-gpu-text")).toContainText("Processing Transcribing Fixture video");
+  await expect(page.locator("#gsb-gpu-text")).toContainText("Transcribing Fixture video");
   await expect(page.locator("#gsb-gpu .gsb-dot")).toHaveClass(/\bon\b/);
-  await expect(page.locator("#gsb-sync-text")).toHaveText("Sync idle");
+  await expect(page.locator("#gsb-sync-text")).toHaveText("Idle");
 });
 
 for (const waiting of ["sync", "gpu"]) {
@@ -89,10 +89,10 @@ for (const waiting of ["sync", "gpu"]) {
     await loadQueues(page);
     await showQueues(page, { sync: true, gpu: true, waiting, reason: "hourly_limit" });
     const active = waiting === "sync" ? "gpu" : "sync";
-    await expect(page.locator(`#gsb-${waiting}-text`)).toContainText("waiting for hourly slot");
+    await expect(page.locator(`#gsb-${waiting}-text`)).toContainText("Waiting for hourly slot");
     await expect(page.locator(`#gsb-${waiting} .gsb-dot`)).not.toHaveClass(/\bon\b/);
     await expect(page.locator(`#gsb-${active} .gsb-dot`)).toHaveClass(/\bon\b/);
-    await expect(page.locator(`#gsb-${active}-text`)).not.toContainText("waiting");
+    await expect(page.locator(`#gsb-${active}-text`)).not.toContainText("Waiting");
     await page.locator(`#gsb-${active}`).click();
     await expect(page.locator(`#${active}-tasks-body .queue-task-row`).first()).toHaveClass(/running/);
   });
@@ -101,7 +101,7 @@ for (const waiting of ["sync", "gpu"]) {
 test("manual Processing pause takes precedence over a stale traffic wait", async ({ page }) => {
   await loadQueues(page);
   await showQueues(page, { paused: true });
-  await expect(page.locator("#gsb-gpu-text")).toHaveText("Processing paused (2)");
+  await expect(page.locator("#gsb-gpu-text")).toHaveText("Paused");
   await expect(page.locator("#btn-pause")).toHaveAttribute("aria-label", "Resume all queues");
   await page.locator("#gsb-gpu").click();
   await expect(page.locator("#gpu-tasks-body .queue-task-wait")).toHaveCount(0);
@@ -141,7 +141,7 @@ test("cancelling the Processing override dialog never changes a queue", async ({
   await dialog.getByRole("button", { name: "Keep waiting", exact: true }).click();
   await expect(dialog).toBeHidden();
   expect(await page.evaluate(() => window.__bridgeCallsFor("youtube_traffic_override"))).toEqual([]);
-  await expect(page.locator("#gsb-gpu-text")).toContainText("Processing waiting for 24-hour slot");
+  await expect(page.locator("#gsb-gpu-text")).toContainText("Waiting for 24-hour slot");
 });
 
 test("an expired Processing override request surfaces the backend response without starting Sync", async ({ page }) => {
@@ -153,7 +153,7 @@ test("an expired Processing override request surfaces the backend response witho
   await page.getByRole("dialog", { name: "Override YouTube traffic limit?" })
     .getByRole("button", { name: "Override and continue", exact: true }).click();
   await expect(page.getByText("Processing is no longer waiting for a traffic slot.", { exact: true })).toBeVisible();
-  await expect(page.locator("#gsb-sync-text")).toHaveText("Sync idle");
+  await expect(page.locator("#gsb-sync-text")).toHaveText("Idle");
 });
 
 test("a Processing confirmation keeps the captured task ID when another task takes its place", async ({ page }) => {
@@ -188,5 +188,5 @@ test("a Processing override remains accurately labelled while Sync has a pending
   await currentState(page, "sync", { paused: true, pausedActive: false });
   await expect(page.locator("#btn-pause")).toHaveAttribute("data-pause-state", "traffic-wait");
   await expect(page.locator("#btn-pause")).toHaveAttribute("aria-label", /Processing is waiting.*override/);
-  await expect(page.locator("#gsb-sync-text")).toHaveText("Sync paused (1)");
+  await expect(page.locator("#gsb-sync-text")).toHaveText("Paused");
 });

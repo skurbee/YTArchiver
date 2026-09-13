@@ -6,6 +6,30 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v85.2 - Cleaner Download controls and manual transcription
+
+09.12.26 10:11pm
+
+### Improved
+
+- Refined the Download tab around the existing log: compact aligned URL and action controls, consistent buttons, labeled pause/resume actions, and clearer placement of Last Full Sync and Clear log. Log rendering is unchanged.
+- Open each queue from one consistent footer button on every tab, with queue status and counts. Controls adapt to narrow windows, and request-limit tooltips are shorter.
+- Show the Download button when URL text is entered, enable it for valid video links, and present a clearer Add this channel callout for channel links.
+- Group manual download options into aligned rows. Transcribe video and Metadata & thumbnail start checked, and both remember the selected setting.
+
+### Added
+
+- Manual downloads can queue transcription after the saved file is verified and indexed, using the existing caption and transcription pipeline. Processing pause and Auto settings still apply; failed queue admission keeps the video and explains how to retry.
+
+### Fixed
+
+- Keep transcripts beside manually saved videos in custom destinations, including videos from subscribed uploaders, and protect the actual destination during processing.
+- Restore queued transcription by video identity so another video's same-title transcript cannot discard unfinished work.
+
+### Maintenance
+
+- Expanded download and transcription regression coverage; browser layout checks now wait for the channel editor's opening animation before measuring field positions.
+
 ## v85.1 - Reliable validation for the channel-resume release
 
 09.12.26 2:49pm

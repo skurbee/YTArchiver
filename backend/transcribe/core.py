@@ -1702,10 +1702,9 @@ class TranscribeManager:
     def load_pending(self) -> int:
         """Load any jobs left behind from a previous session. Returns count.
 
-        "Already transcribed" means the title already has an entry in the
-        aggregated {channel} Transcript.txt (matches YTArchiver.py's
-        _scan_existing_transcripts). Falls back to checking a legacy
-        per-video {base}.jsonl sidecar from older builds.
+        Jobs with a saved video ID require transcript content or a no-speech
+        status for that identity. Legacy jobs without an ID retain the title
+        lookup in aggregated transcripts and per-video sidecar fallback.
         """
         try:
             import json as _json
@@ -1716,6 +1715,34 @@ class TranscribeManager:
             _no_speech_title_cache: dict[str, set] = {}
             def _already_transcribed(video_path: str, title: str,
                                      channel: str, video_id: str = "") -> bool:
+                # A saved identity must not be satisfied by another video's
+                # same-title transcript or no-speech status. Manual downloads
+                # can place unrelated videos in the same output folder.
+                known_id = (video_id or "").strip()
+                if known_id:
+                    try:
+                        from .. import index as _idx
+                        if _idx.video_tx_status(video_id=known_id).lower() == "no_speech":
+                            return True
+                    except Exception as exc:
+                        _log.debug("identity no-speech restore lookup failed: %s", exc)
+                    try:
+                        from .transcript_presence import has_existing_transcript
+                        paths = _resolve_transcript_paths(video_path, title, channel)
+                        base = os.path.splitext(video_path)[0]
+                        candidates = [(base + ".txt", base + ".jsonl")]
+                        if paths is not None:
+                            candidates.insert(0, (paths[0], paths[1]))
+                        for txt_path, jsonl_path in candidates:
+                            with transcript_output_locks(txt_path, jsonl_path):
+                                if has_existing_transcript(
+                                        txt_path, jsonl_path, title, known_id):
+                                    return True
+                    except (OSError, ValueError) as exc:
+                        # Unreadable or malformed evidence cannot justify
+                        # dropping durable work. Keep it available for retry.
+                        _log.debug("identity transcript restore lookup failed: %s", exc)
+                    return False
                 try:
                     from .. import index as _idx
                     vid = (video_id or _extract_video_id(video_path) or "").strip()
@@ -3424,7 +3451,11 @@ class TranscribeManager:
                 pass
         if not root:
             root = os.path.dirname(path) or path
-        return channel_aliases(matched, paths=[root])
+        # Loose copies may share an uploader with a subscription while living
+        # elsewhere. Reserve their real parent too: captions and per-video
+        # transcripts are written beside the media, and a manual download can
+        # still be finalizing that folder when Processing is queued.
+        return channel_aliases(matched, paths=[root, os.path.dirname(path)])
 
     def _emit_processing_wait(self, job, blockers=()):
         kind = "Compression" if job.get("kind") == "compress" else "Transcription"

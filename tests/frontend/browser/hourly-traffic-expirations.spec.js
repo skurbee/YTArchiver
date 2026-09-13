@@ -181,13 +181,13 @@ test("hourly controls restore focus and coordinate with the other status popover
   await hour.click();
   await expect(popup).toBeHidden();
 
-  await page.locator("#btn-sync-tasks").click();
+  await page.locator("#gsb-sync").click();
   await expect(page.locator("#popover-sync-tasks")).toBeVisible();
   await hour.click();
   await expect(popup).toBeVisible();
   await expect(page.locator("#popover-sync-tasks")).toBeHidden();
-  await expect(page.locator("#btn-sync-tasks")).toHaveAttribute("aria-expanded", "false");
-  await page.locator("#btn-sync-tasks").click();
+  await expect(page.locator("#gsb-sync")).toHaveAttribute("aria-expanded", "false");
+  await page.locator("#gsb-sync").click();
   await expect(popup).toBeHidden();
   await expect(hour).toHaveAttribute("aria-expanded", "false");
   await hour.click();

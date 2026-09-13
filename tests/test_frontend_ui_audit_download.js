@@ -45,6 +45,14 @@ class Element {
   get lastElementChild() { return this.children.at(-1); }
   querySelector(selector) { return this.named.get(selector) || null; }
   querySelectorAll(selector) { return this.named.get(selector) || []; }
+  closest(selector) {
+    for (let node = this; node; node = node.parent) {
+      if (selector.startsWith(".") && node.classList.contains(selector.slice(1))) return node;
+      if (selector.startsWith("#") && node.id === selector.slice(1)) return node;
+      if (node.tagName === selector.toUpperCase()) return node;
+    }
+    return null;
+  }
   focus() {}
   contains(target) { return target === this || this.children.includes(target); }
   getBoundingClientRect() { return { top: 0, height: 20 }; }

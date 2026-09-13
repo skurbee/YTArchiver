@@ -289,7 +289,7 @@ test.describe("YTArchiver real frontend behavior", () => {
       });
     });
 
-    await page.locator("#btn-sync-tasks").click();
+    await page.locator("#gsb-sync").click();
     await expect(page.locator("#popover-sync-tasks")).toHaveClass(/open/);
     await page.locator('[data-task-id="task-b"] .queue-task-close').click();
 

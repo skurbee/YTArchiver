@@ -223,8 +223,8 @@ def _resolve_transcript_paths(video_path: str, title: str,
     # derivation above points at a bogus path like "<root>/<root_basename>"
     # and would strand the transcript in a phantom folder away from the
     # video — so the loose .mp4 appeared to get NO on-disk transcript.
-    # Detect that (video not under the resolved folder + no matching
-    # subscription) and write a per-video CONJOINED sidecar NEXT TO the
+    # Detect that (video not under the resolved folder) and write a per-video
+    # CONJOINED sidecar NEXT TO the
     # video: a visible "<stem> Transcript.txt" + hidden
     # ".<stem> Transcript.jsonl". Channel videos are unaffected (their
     # video IS under the resolved channel folder).
@@ -235,7 +235,9 @@ def _resolve_transcript_paths(video_path: str, title: str,
         _under = (_nv == _nf or _nv.startswith(_nf + os.sep))
     except Exception:
         _under = True
-    if not ch and not _under:
+    # An uploader can also be subscribed while this particular copy was
+    # saved elsewhere. Its transcript still belongs beside the actual file.
+    if not _under:
         return _per_video_transcript_paths(video_path, year, month, upload_date)
 
     # combined rule:

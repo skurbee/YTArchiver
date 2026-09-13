@@ -165,7 +165,7 @@
       // Ctrl+P: open Sync Tasks popover
       if ((e.ctrlKey || e.metaKey) && key === "p") {
         e.preventDefault();
-        document.getElementById("btn-sync-tasks")?.click();
+        document.getElementById("gsb-sync")?.click();
         return;
       }
       // Number keys 1-5: switch the currently visible tabs. The optional

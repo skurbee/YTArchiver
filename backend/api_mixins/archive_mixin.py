@@ -687,6 +687,10 @@ class ArchiveMixin:
         # drawer + a grid thumbnail). Both sidecars are hidden after the
         # download so the folder still shows only the video (+ transcript).
         grab_metadata = bool(opts.get("grab_metadata", False))
+        # Manual downloads remain media-only unless this download requests
+        # transcription. Processing resolves/fetches captions from the
+        # committed video identity, independently of the metadata checkbox.
+        transcribe = bool(opts.get("transcribe", False))
 
         # Per-URL inplace-replace marker so the "[Dwnld] ..." line stays
         # at the same scroll position from URL → filename → NN% → Done.
@@ -1044,7 +1048,7 @@ class ArchiveMixin:
                                     _channel_name,
                                     _title,
                                     video_id=_vid,
-                                    auto_transcribe=False,
+                                    auto_transcribe=transcribe,
                                     duration=_duration_secs,
                                     upload_date=_upload_date,
                                     filename_id_is_provenance=(
@@ -1068,7 +1072,8 @@ class ArchiveMixin:
                                             final_path,
                                             _channel_name,
                                             _title,
-                                            tx_status="no_captions",
+                                            tx_status=("pending" if transcribe
+                                                       else "no_captions"),
                                             video_id=_vid,
                                             duration_secs=_duration_secs,
                                             upload_date=_upload_date,
@@ -1145,6 +1150,25 @@ class ArchiveMixin:
                     if not _recorded:
                         self._log_stream.emit_dim(
                             " (not added to Recent — try Rescan)")
+                    if transcribe and not cancel_event.is_set():
+                        # Queue only the verified, promoted file. The existing
+                        # Processing worker owns caption acquisition, model
+                        # selection, durable queue state and transcript writes.
+                        # Its folder lease waits until this download releases
+                        # its final bookkeeping reservation in finally.
+                        try:
+                            accepted = self._transcribe_manager().enqueue_result(
+                                _fp_now, _title, channel=_channel_name,
+                                video_id=_vid, from_download=True)
+                            if not accepted.accepted:
+                                from backend.transcribe.acceptance import EnqueueStatus
+                                if accepted.status is not EnqueueStatus.DUPLICATE:
+                                    raise RuntimeError(
+                                        accepted.error or "Processing did not accept the task")
+                        except Exception as exc:
+                            self._log_stream.emit_error(
+                                "Download saved, but transcription could not be queued: "
+                                f"{exc}. Retry with Transcribe now in Browse.")
                 elif _outcome == "downloaded_unindexed":
                     # Downloaded fine but the index write was dropped (most
                     # likely a locked DB during a concurrent disk scan). The

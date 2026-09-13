@@ -25,17 +25,17 @@
 
   // ─── Queue popovers (Sync Tasks, GPU Tasks) ──────────────────────────
   //
-  // Anchor to the icon button. Clicking the button toggles; clicking
+  // Anchor to the global queue button. Clicking the button toggles; clicking
   // outside closes. Escape closes. No backdrop dim — the popover is a
   // dropdown, not a modal.
   function initQueueModals() {
     if (window._queueModalsInited) return;
     window._queueModalsInited = true;
     const pairs = [
-      ["btn-sync-tasks", "popover-sync-tasks"],
-      ["btn-gpu-tasks", "popover-gpu-tasks"],
+      ["gsb-sync", "popover-sync-tasks"],
+      ["gsb-gpu", "popover-gpu-tasks"],
     ];
-    const triggerIds = ["btn-sync-tasks", "btn-gpu-tasks", "gsb-sync", "gsb-gpu",
+    const triggerIds = ["gsb-sync", "gsb-gpu",
       "gsb-errors", "gsb-traffic-hourly", "gsb-traffic-daily"];
     for (const [btnId, popId] of pairs) {
       const btn = document.getElementById(btnId);
@@ -48,11 +48,8 @@
       });
     }
 
-    // Shared open/close toggle so the SAME popover can be summoned from
-    // the toolbar buttons AND the global status-bar segments, anchored to
-    // whichever element was clicked. Anchoring to the clicked element (not
-    // always the toolbar button) matters because the status bar lives on
-    // every tab, while the toolbar button is only visible on Download.
+    // Queue controls live in the global footer so their popovers have a
+    // visible anchor on every tab, including keyboard-triggered openings.
     function _togglePopover(popId, anchorEl) {
       const pop = document.getElementById(popId);
       if (!pop || !anchorEl) return;
@@ -65,11 +62,11 @@
         anchorEl.setAttribute("aria-expanded", "true");
       }
     }
-    // Public entry point for the status bar. `which` = "sync" | "gpu".
+    // Public entry point for other UI actions. `which` = "sync" | "gpu".
     window.toggleQueuePopover = function (which, anchorEl) {
       const popId = which === "gpu" ? "popover-gpu-tasks" : "popover-sync-tasks";
       const fallbackBtn = document.getElementById(
-        which === "gpu" ? "btn-gpu-tasks" : "btn-sync-tasks");
+        which === "gpu" ? "gsb-gpu" : "gsb-sync");
       _togglePopover(popId, anchorEl || fallbackBtn);
     };
 

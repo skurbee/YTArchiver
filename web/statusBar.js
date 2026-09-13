@@ -86,6 +86,9 @@
       const windowName = wait.reason === "daily_limit" ? "24-hour" : "hourly";
       return `${idleLabel.split(" ")[0]} waiting for ${windowName} slot${at ? ` (${at})` : ""}`;
     }
+    if (st.sessionLimited) {
+      return `${idleLabel.split(" ")[0]} paused by YouTube's session rate limit`;
+    }
     const running = _runningItem(list);
     if (running || st.running) {
       const name = _cleanName(running);
@@ -109,11 +112,30 @@
     }
   }
 
+  function _renderQueueSegment(kind, name, runningLabel, idleLabel) {
+    const seg = document.getElementById(`gsb-${kind}`);
+    const text = document.getElementById(`gsb-${kind}-text`);
+    if (!seg || !text) return;
+    const st = _state[kind] || {};
+    const count = _queueCount(kind);
+    const detail = _segText(kind, runningLabel, idleLabel);
+    let compact = "Idle";
+    if (st.paused || st.pausedActive) compact = "Paused";
+    else if (st.trafficWaiting) compact = detail.slice(idleLabel.split(" ")[0].length + 1);
+    else if (st.sessionLimited) compact = "Paused by YouTube";
+    else if (_runningItem(_queues[kind]) || st.running) {
+      compact = _truncate(_cleanName(_runningItem(_queues[kind])), 34) || "Running";
+    } else if (count > 0) compact = "Queued";
+    text.textContent = compact.charAt(0).toUpperCase() + compact.slice(1);
+    const summary = `${name}: ${detail}${count > 0 ? `; ${count} total` : ""}`;
+    seg.setAttribute("aria-label", `${summary}. Open queue`);
+    seg.removeAttribute("data-tooltip");
+    seg.removeAttribute("title");
+  }
+
   function _render() {
-    const syncText = document.getElementById("gsb-sync-text");
-    const gpuText = document.getElementById("gsb-gpu-text");
-    if (syncText) syncText.textContent = _segText("sync", "Syncing", "Sync idle");
-    if (gpuText) gpuText.textContent = _segText("gpu", "Processing", "Processing idle");
+    _renderQueueSegment("sync", "Sync queue", "Syncing", "Sync idle");
+    _renderQueueSegment("gpu", "Processing queue", "Processing", "Processing idle");
 
     const sSt = _state.sync || {}, gSt = _state.gpu || {};
     const syncLimitHold = !!(sSt.trafficWaiting || sSt.sessionLimited);
@@ -615,19 +637,7 @@
       };
     }
 
-    // Sync / Processing segments open their existing queue popovers,
-    // anchored to the SEGMENT (so it works on any tab — the toolbar button
-    // is only on Download). stopPropagation so this same click doesn't
-    // bubble to the document outside-click handler and instantly re-close
-    // the popover we just opened (the bug where "clicking did nothing").
-    document.getElementById("gsb-sync")?.addEventListener("click", (e) => {
-      e.stopPropagation();
-      window.toggleQueuePopover?.("sync", e.currentTarget);
-    });
-    document.getElementById("gsb-gpu")?.addEventListener("click", (e) => {
-      e.stopPropagation();
-      window.toggleQueuePopover?.("gpu", e.currentTarget);
-    });
+    // Queue open/close and keyboard focus are owned by queuePopovers.js.
     const dailyBtn = document.getElementById("gsb-traffic-daily");
     const hourlyBtn = document.getElementById("gsb-traffic-hourly");
     const expirationGroup = document.getElementById("gsb-traffic-expirations-group");

@@ -47,8 +47,8 @@
   // ─── URL field + Download button ────────────────────────────────────
   //
   // Behavior matches YTArchiver.py:19706-19708 + _validate_download_btn:
-  // - Field is empty → "▶ Download" hidden, Sync Subbed is the main action
-  // - YouTube URL typed → "▶ Download" appears next to the URL field
+  // - Field is empty → Download and URL-specific options stay hidden
+  // - Text entered → Download appears, enabled for a valid video URL
   // - Click Download OR press Enter → calls archive_single_video + clears input
   // - Escape clears the field
   //
@@ -230,6 +230,31 @@
     const voPanel = document.getElementById("video-opts-panel");
     const nudgePanel = document.getElementById("channel-nudge-panel");
     if (!input || !btn) return;
+    // Follow the actual toolbar width as labels, scheduling, and window size
+    // change. Hidden tabs report zero-sized controls; retain the last width.
+    const controls = input.closest(".controls-area");
+    const alignUrlWithSchedule = () => {
+      const select = document.getElementById("auto-sync-select");
+      const dropdown = select?.previousElementSibling?.matches(".yt-dd")
+        ? select.previousElementSibling : select;
+      if (!controls || !dropdown) return;
+      const bounds = dropdown.getBoundingClientRect();
+      if (!bounds.width) return;
+      const width = bounds.right - input.getBoundingClientRect().left;
+      if (width <= 0) return;
+      const value = `${width}px`;
+      if (controls.style.getPropertyValue("--download-url-width") !== value) {
+        controls.style.setProperty("--download-url-width", value);
+      }
+    };
+    if (controls && window.ResizeObserver) {
+      const observer = new ResizeObserver(alignUrlWithSchedule);
+      for (const target of [controls, controls.querySelector(".download-sync-actions"),
+        controls.querySelector(".download-schedule")]) {
+        if (target) observer.observe(target);
+      }
+    }
+    alignUrlWithSchedule();
     initManualDownloads();
     // Hydrate bridge-backed defaults both now and when pywebview becomes
     // ready. The Download tab is initialized before bridge injection on a
@@ -290,9 +315,12 @@
       if (nudgePanel) nudgePanel.hidden = !isChan;
     };
 
-    const updateBtnVisibility = () => {
-      const show = urlLooksLikeVideo(input.value);
-      btn.hidden = !show;
+    const updateButtonState = () => {
+      btn.hidden = !(input.value || "").trim();
+      btn.disabled = submitInFlight || !urlLooksLikeVideo(input.value);
+    };
+    const refreshUrl = () => {
+      updateButtonState();
       refreshErr();
       refreshPanels();
     };
@@ -307,6 +335,7 @@
       add_date: "ytarch.vo.add_date",
       use_yt_title: "ytarch.vo.use_yt_title",
       grab_metadata: "ytarch.vo.grab_metadata",
+      transcribe: "ytarch.vo.transcribe",
     };
     try {
       const _load = (k, fallback) => {
@@ -330,6 +359,9 @@
       const _gm = document.getElementById("vo-grab-metadata");
       const _v_gm = localStorage.getItem(_VO_KEYS.grab_metadata);
       if (_gm && _v_gm != null) _gm.checked = _v_gm === "1";
+      const _tx = document.getElementById("vo-transcribe");
+      const _v_tx = localStorage.getItem(_VO_KEYS.transcribe);
+      if (_tx && _v_tx != null) _tx.checked = _v_tx === "1";
     } catch {}
     // Persist on every change.
     const _persistVoField = (id, key, kind) => {
@@ -350,6 +382,7 @@
     _persistVoField("vo-add-date", _VO_KEYS.add_date, "bool");
     _persistVoField("vo-use-yt-title", _VO_KEYS.use_yt_title, "bool");
     _persistVoField("vo-grab-metadata", _VO_KEYS.grab_metadata, "bool");
+    _persistVoField("vo-transcribe", _VO_KEYS.transcribe, "bool");
 
     // Read the Video-options panel into a plain dict to send to the backend.
     const readVideoOptions = () => {
@@ -368,6 +401,7 @@
         use_yt_title: useYtTitle,
         custom_name: customName,
         grab_metadata: grabMeta,
+        transcribe: !!document.getElementById("vo-transcribe")?.checked,
       };
     };
     // Expose on window so cross-IIFE callers (e.g. downloadDragDrop.js
@@ -426,15 +460,15 @@
         window._showToast?.("Queued: " + url.slice(0, 60), "ok");
         if ((input.value || "").trim() === rawUrl) {
           input.value = "";
-          updateBtnVisibility();
+          refreshUrl();
         }
       } finally {
         submitInFlight = false;
-        btn.disabled = false;
+        updateButtonState();
       }
     };
 
-    input.addEventListener("input", updateBtnVisibility);
+    input.addEventListener("input", refreshUrl);
     input.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
         e.preventDefault();
@@ -442,12 +476,12 @@
         else if (!input.value.trim()) document.getElementById("btn-sync-subbed")?.click();
       } else if (e.key === "Escape") {
         input.value = "";
-        updateBtnVisibility();
+        refreshUrl();
       }
     });
     // paste fires before `input` in some engines — delay the sync so the
     // pasted text is actually reflected in input.value
-    input.addEventListener("paste", () => setTimeout(updateBtnVisibility, 10));
+    input.addEventListener("paste", () => setTimeout(refreshUrl, 10));
     btn.addEventListener("click", submit);
 
     // Video options: Use-YT-title ↔ custom-name enable/disable.
@@ -493,7 +527,7 @@
       window._openAddChannelEditor?.(url);
       // Clear the Download-tab URL so the nudge hides
       input.value = "";
-      updateBtnVisibility();
+      refreshUrl();
     };
     // The whole nudge box is clickable (it looked actionable but only the
     // button worked); the button stops propagation so the box handler
@@ -505,7 +539,7 @@
     });
 
     // Initial sync in case there's a value restored from somewhere
-    updateBtnVisibility();
+    refreshUrl();
   }
 
   window.initUrlField = initUrlField;

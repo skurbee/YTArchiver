@@ -41,10 +41,11 @@ test("Download URL validation uses the real hostname", async ({ page }) => {
   const input = page.locator("#url-input");
   const button = page.locator("#btn-download-single");
   await input.fill("https://www.youtube.com.evil.example/watch?v=fixture12345");
-  await expect(button).toBeHidden();
+  await expect(button).toBeVisible();
+  await expect(button).toBeDisabled();
   await expect(page.locator("#url-error-row")).toBeVisible();
   await input.fill("https://music.youtube.com/watch?v=fixture12345");
-  await expect(button).toBeVisible();
+  await expect(button).toBeEnabled();
   await expect(page.locator("#url-error-row")).toBeHidden();
 });
 
@@ -73,7 +74,7 @@ test("pasting a single-video URL still queues it normally", async ({ page }) => 
     element.dispatchEvent(new Event("paste", { bubbles: true }));
     element.value = pastedUrl;
   }, url);
-  await expect(button).toBeVisible();
+  await expect(button).toBeEnabled();
   await button.click();
 
   await expect.poll(() => page.evaluate(() =>
@@ -84,6 +85,7 @@ test("pasting a single-video URL still queues it normally", async ({ page }) => 
   )).toBe(url);
   await expect(input).toHaveValue("");
   await expect(button).toBeHidden();
+  await expect(button).toBeDisabled();
 });
 
 test("dropped foreign URLs never reach the download bridge", async ({ page }) => {
@@ -111,7 +113,7 @@ test("Escape returns queue-popover focus to its invoking control", async ({ page
   await loadApp(page);
 
   const cases = [
-    ["#btn-sync-tasks", "#popover-sync-tasks", "#btn-pause-sync-queue"],
+    ["#gsb-sync", "#popover-sync-tasks", "#btn-pause-sync-queue"],
     ["#gsb-gpu", "#popover-gpu-tasks", "#btn-pause-gpu-queue"],
   ];
   for (const [triggerSelector, popoverSelector, insideSelector] of cases) {

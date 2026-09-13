@@ -350,8 +350,8 @@
     // which means this cleanly distinguishes "actively
     // paused mid-pass" (solid) from "persisted paused flag
     // at idle" (grey).
-    const syncBtn = _bdom("btn-sync-tasks");
-    const gpuBtn = _bdom("btn-gpu-tasks");
+    const syncBtn = _bdom("gsb-sync");
+    const gpuBtn = _bdom("gsb-gpu");
     // Use a separate `pause-pending` state when the user has clicked
     // pause but the worker hasn't reached its wait block yet (e.g.
     // metadata refresh's long re-fetch loop has to finish first).
@@ -447,6 +447,14 @@
       pauseBtn.setAttribute("data-tooltip", _pauseTip);
       pauseBtn.setAttribute("aria-label", _pauseTip);
       pauseBtn.removeAttribute("title");
+      const pauseLabel = pauseBtn.querySelector(".pause-label");
+      if (pauseLabel) {
+        pauseLabel.textContent = resuming ? "Resuming…"
+          : anyPending && !trafficWaiting ? "Pausing…"
+          : limitWaiting ? "Waiting…"
+          : idleQueued ? "Start queued"
+          : anyPaused ? "Resume all" : "Pause all";
+      }
       const svg = pauseBtn.querySelector("svg");
       if (svg) {
         const want = !resuming && (idleQueued || anyPaused || limitWaiting)

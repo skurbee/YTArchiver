@@ -147,7 +147,7 @@ test.describe("state-changing controls recover from failures", () => {
       }, { kind });
 
       const checkbox = page.locator(`#${checkboxId}`);
-      await page.locator(kind === "sync" ? "#btn-sync-tasks" : "#btn-gpu-tasks")
+      await page.locator(kind === "sync" ? "#gsb-sync" : "#gsb-gpu")
         .click();
       // The generic bridge fixture has no autorun label, which autoSync.js
       // conservatively treats as an active schedule and locks Sync Auto on.

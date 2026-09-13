@@ -92,22 +92,25 @@
 
   <!-- @include partials/tab-browse.html -->
 
-  <!-- Global status bar — always-visible one-line summary of what the app
-       is doing (sync / processing / indexing) so "what's happening?" has a
-       single answer instead of being scattered across the log, the italic
-       indicator line, two popover buttons, and the tray. Sync/Processing
-       segments open their queue popovers; Log jumps to the full log. -->
+  <!-- Global queue controls and status, available from every tab. -->
   <div class="global-status-bar" id="global-status-bar">
-    <button type="button" class="gsb-seg" id="gsb-sync" title="Sync queue — click for details"
+    <button type="button" class="gsb-seg gsb-queue" id="gsb-sync" aria-label="Sync queue: idle. Open queue"
             aria-haspopup="dialog" aria-controls="popover-sync-tasks"
             aria-expanded="false">
-      <span class="gsb-dot gsb-dot-sync"></span><span class="gsb-text" id="gsb-sync-text">Sync idle</span>
+      <span class="gsb-dot gsb-dot-sync" aria-hidden="true"></span>
+      <span class="gsb-queue-name">Sync queue</span>
+      <span class="gsb-text" id="gsb-sync-text">Idle</span>
+      <span class="gsb-queue-count" id="badge-sync" hidden>0</span>
+      <svg class="gsb-chevron" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="m3 7 3-3 3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
-    <span class="gsb-sep"></span>
-    <button type="button" class="gsb-seg" id="gsb-gpu" title="Processing queue — click for details"
+    <button type="button" class="gsb-seg gsb-queue" id="gsb-gpu" aria-label="Processing queue: idle. Open queue"
             aria-haspopup="dialog" aria-controls="popover-gpu-tasks"
             aria-expanded="false">
-      <span class="gsb-dot gsb-dot-gpu"></span><span class="gsb-text" id="gsb-gpu-text">Processing idle</span>
+      <span class="gsb-dot gsb-dot-gpu" aria-hidden="true"></span>
+      <span class="gsb-queue-name">Processing queue</span>
+      <span class="gsb-text" id="gsb-gpu-text">Idle</span>
+      <span class="gsb-queue-count" id="badge-gpu" hidden>0</span>
+      <svg class="gsb-chevron" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="m3 7 3-3 3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
     <span class="gsb-seg gsb-index" id="gsb-index" hidden>
       <span class="gsb-index-text" id="gsb-index-text"></span>
@@ -125,15 +128,15 @@
       <span id="gsb-errors-label">errors</span>
     </button>
     <span class="gsb-traffic" id="gsb-traffic" hidden
-          title="Budget for YouTube page, API, caption, and artwork requests, including a job-start allowance. Video/audio chunks are excluded. At either limit, requests wait and continue automatically.">
+          title="Requests pause at the limit and resume automatically.">
       <span class="gsb-traffic-label">YT Request Limits</span>
       <button type="button" class="gsb-traffic-reading gsb-traffic-button" id="gsb-traffic-hourly"
               aria-haspopup="dialog" aria-controls="popover-traffic-expirations"
-              aria-expanded="false" title="YouTube requests counted in the last hour. At either limit, requests wait and resume automatically. Click to see when requests leave the hourly count."></button>
+              aria-expanded="false" title="Click to see hourly drop-offs."></button>
       <span class="gsb-traffic-sep">·</span>
       <button type="button" class="gsb-traffic-reading gsb-traffic-button" id="gsb-traffic-daily"
               aria-haspopup="dialog" aria-controls="popover-traffic-expirations"
-              aria-expanded="false" title="YouTube requests counted in the last 24 hours. At either limit, requests wait and resume automatically. Click to see when requests leave the 24-hour count."></button>
+              aria-expanded="false" title="Click to see 24-hour drop-offs."></button>
     </span>
   </div>
 

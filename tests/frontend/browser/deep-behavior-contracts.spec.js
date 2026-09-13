@@ -149,10 +149,10 @@ for (const hold of ["trafficWaiting", "sessionLimited"]) {
     await page.evaluate(hold => window.setQueueState({
       sync: { running: true, count: 1, [hold]: true }, gpu: {},
     }), hold);
-    await expect(page.locator("#btn-sync-tasks")).toHaveAttribute("data-blink-state", "paused");
+    await expect(page.locator("#gsb-sync")).toHaveAttribute("data-blink-state", "paused");
     await page.waitForTimeout(760);
-    await expect(page.locator("#btn-sync-tasks")).toHaveAttribute("data-blink-state", "paused");
-    await page.locator("#btn-sync-tasks").click();
+    await expect(page.locator("#gsb-sync")).toHaveAttribute("data-blink-state", "paused");
+    await page.locator("#gsb-sync").click();
     const pause = page.locator("#btn-pause-sync-queue");
     await expect(pause).toHaveAttribute("data-tooltip", /queue/);
     await expect(pause).not.toHaveAttribute("title");

@@ -17,6 +17,10 @@ test("canonical channel links clearly require a folder and validation does not m
   await page.locator("#edit-url").fill("https://www.youtube.com/channel/UCaaaaaaaaaaaaaaaaaaaaaa");
   await expect(page.locator("#edit-folder")).toHaveValue("");
   await expect(page.locator("#btn-edit-update")).toBeDisabled();
+  // Compare validation layout after the editor's opening scale animation.
+  await page.locator(".channel-editor-dialog").evaluate(async dialog => {
+    await Promise.all(dialog.getAnimations().map(animation => animation.finished));
+  });
   const before = await page.locator("#edit-folder").boundingBox();
   await page.locator("#edit-folder").fill("Example Archive");
   await expect(page.locator("#btn-edit-update")).toBeEnabled();

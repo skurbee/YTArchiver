@@ -95,13 +95,13 @@ test("daily drop-offs support keyboard and close controls alongside other status
   await expect(button).toHaveAttribute("aria-expanded", "false");
 
   await page.locator('.tab[data-tab="download"]').click();
-  await page.locator("#btn-sync-tasks").click();
+  await page.locator("#gsb-sync").click();
   await expect(page.locator("#popover-sync-tasks")).toBeVisible();
   await button.click();
   await expect(popup).toBeVisible();
   await expect(page.locator("#popover-sync-tasks")).toBeHidden();
-  await expect(page.locator("#btn-sync-tasks")).toHaveAttribute("aria-expanded", "false");
-  await page.locator("#btn-sync-tasks").click();
+  await expect(page.locator("#gsb-sync")).toHaveAttribute("aria-expanded", "false");
+  await page.locator("#gsb-sync").click();
   await expect(popup).toBeHidden();
   await expect(button).toHaveAttribute("aria-expanded", "false");
 

@@ -52,7 +52,7 @@ async function loadResume(page, options = {}) {
 }
 
 async function resumeButton(page, control = "sync") {
-  if (control === "sync") await page.locator("#btn-sync-tasks").click();
+  if (control === "sync") await page.locator("#gsb-sync").click();
   return page.locator(control === "sync" ? "#btn-pause-sync-queue" : "#btn-pause");
 }
 
@@ -164,7 +164,7 @@ test("global Resume starts missing Sync while resuming an already live paused Pr
 test("a resumed queue's budget wait exposes the existing confirmed override action", async ({ page }) => {
   await loadResume(page, { paintedRunning: true, actualRunning: false });
   await (await resumeButton(page)).click();
-  await expect(page.locator("#gsb-sync-text")).toContainText("waiting for 24-hour slot");
+  await expect(page.locator("#gsb-sync-text")).toContainText("Waiting for 24-hour slot");
   const globalButton = page.locator("#btn-pause");
   await expect(globalButton).toBeEnabled();
   await expect(globalButton).toHaveAttribute("aria-label", /click to override/);
